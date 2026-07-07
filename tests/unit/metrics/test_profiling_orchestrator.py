@@ -243,6 +243,7 @@ class TestDispatch:
         cfg = MetricsConfig(
             pmc_set="basic", emit_trace="pftrace", perf=True, roofline=True
         )
+<<<<<<< HEAD
         with (
             patch.object(
                 orch._pmc_mod, "run", return_value={"pmc": {"ok": True}}
@@ -257,6 +258,17 @@ class TestDispatch:
                 orch._roofline_mod, "run", return_value={"roofline": {"ok": True}}
             ) as roof,
         ):
+=======
+        with patch.object(
+            orch._pmc_mod, "run", return_value={"pmc": {"ok": True}}
+        ) as pmc, patch.object(
+            orch._trace_mod, "run", return_value={"trace": {"ok": True}}
+        ) as trace, patch.object(
+            orch._perf_mod, "run", return_value={"perf": {"ok": True}}
+        ) as perf, patch.object(
+            orch._roofline_mod, "run", return_value={"roofline": {"ok": True}}
+        ) as roof:
+>>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
             result = orch.run_profiling_passes(
                 graph_path=tmp_path / "g.json",
                 engine_id=1,
@@ -310,6 +322,7 @@ class TestDispatch:
 
             return fake
 
+<<<<<<< HEAD
         with (
             patch.object(orch._pmc_mod, "run", side_effect=make_capture("pmc")),
             patch.object(orch._trace_mod, "run", side_effect=make_capture("trace")),
@@ -317,6 +330,16 @@ class TestDispatch:
             patch.object(
                 orch._roofline_mod, "run", side_effect=make_capture("roofline")
             ),
+=======
+        with patch.object(
+            orch._pmc_mod, "run", side_effect=make_capture("pmc")
+        ), patch.object(
+            orch._trace_mod, "run", side_effect=make_capture("trace")
+        ), patch.object(
+            orch._perf_mod, "run", side_effect=make_capture("perf")
+        ), patch.object(
+            orch._roofline_mod, "run", side_effect=make_capture("roofline")
+>>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
         ):
             orch.run_profiling_passes(
                 graph_path=tmp_path / "g.json",
@@ -343,9 +366,14 @@ class TestDispatch:
             captured["trace_dir"] = out_dir
             return {"trace": {}}
 
+<<<<<<< HEAD
         with (
             patch.object(orch._pmc_mod, "run", side_effect=fake_pmc),
             patch.object(orch._trace_mod, "run", side_effect=fake_trace),
+=======
+        with patch.object(orch._pmc_mod, "run", side_effect=fake_pmc), patch.object(
+            orch._trace_mod, "run", side_effect=fake_trace
+>>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
         ):
             orch.run_profiling_passes(
                 graph_path=Path("graphs/sample_conv.json"),

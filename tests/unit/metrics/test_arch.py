@@ -17,6 +17,7 @@ class TestDetectArchTorchPath:
     on a CI box without ROCm or torch installed."""
 
     def test_torch_returns_gfx942(self):
+<<<<<<< HEAD
         with (
             patch.object(_arch, "_detect_via_torch", return_value="gfx942"),
             patch.object(_arch, "_detect_via_rocminfo", return_value=None),
@@ -27,6 +28,16 @@ class TestDetectArchTorchPath:
         with (
             patch.object(_arch, "_detect_via_torch", return_value=None),
             patch.object(_arch, "_detect_via_rocminfo", return_value="gfx90a"),
+=======
+        with patch.object(
+            _arch, "_detect_via_torch", return_value="gfx942"
+        ), patch.object(_arch, "_detect_via_rocminfo", return_value=None):
+            assert detect_arch() == "gfx942"
+
+    def test_torch_path_returns_none_falls_through_to_rocminfo(self):
+        with patch.object(_arch, "_detect_via_torch", return_value=None), patch.object(
+            _arch, "_detect_via_rocminfo", return_value="gfx90a"
+>>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
         ):
             assert detect_arch() == "gfx90a"
 
@@ -38,6 +49,7 @@ class TestDetectArchRocminfoPath:
         # Patch resolve_rocm_tool (not bare shutil.which) so the test
         # mirrors production resolution: rocminfo is found under
         # $ROCM_PATH/bin even when /opt/rocm/bin isn't on PATH.
+<<<<<<< HEAD
         with (
             patch.object(_arch, "_detect_via_torch", return_value=None),
             patch.object(
@@ -51,14 +63,29 @@ class TestDetectArchRocminfoPath:
         with (
             patch.object(_arch, "_detect_via_torch", return_value=None),
             patch.object(_arch, "resolve_rocm_tool", return_value=None),
+=======
+        with patch.object(_arch, "_detect_via_torch", return_value=None), patch.object(
+            _arch, "resolve_rocm_tool", return_value="/opt/rocm/bin/rocminfo"
+        ), patch("subprocess.run", return_value=proc):
+            assert detect_arch() == "gfx942"
+
+    def test_rocminfo_missing_returns_unknown(self):
+        with patch.object(_arch, "_detect_via_torch", return_value=None), patch.object(
+            _arch, "resolve_rocm_tool", return_value=None
+>>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
         ):
             assert detect_arch() == "unknown"
 
 
 class TestDetectArchUnknown:
     def test_no_torch_no_rocminfo_returns_unknown(self):
+<<<<<<< HEAD
         with (
             patch.object(_arch, "_detect_via_torch", return_value=None),
             patch.object(_arch, "_detect_via_rocminfo", return_value=None),
+=======
+        with patch.object(_arch, "_detect_via_torch", return_value=None), patch.object(
+            _arch, "_detect_via_rocminfo", return_value=None
+>>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
         ):
             assert detect_arch() == "unknown"
