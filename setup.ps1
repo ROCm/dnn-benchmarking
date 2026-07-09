@@ -29,36 +29,35 @@
 .PARAMETER TorchIndexUrl
     Override the pip index URL used for torch (setup.sh --torch-index-url).
 
-.PARAMETER ForceBuild
-    Build hipDNN (with bindings) and the MIOpen provider from source, then install
-    them to -InstallDir (setup.sh --force-build). This is the default; the switch
-    is accepted for explicitness/scripting but has no additional effect. Needs the
-    MSVC toolchain and a ROCm devel prefix (the _rocm_sdk_devel wheel, or
-    -RocmPrefix).
+.PARAMETER RocmLibrariesRef
+    Build hipDNN/the MIOpen provider from this rocm-libraries ref (branch name
+    or commit hash) instead of the submodule's default (develop) (setup.sh
+    --rocm-libraries-ref). Works on a fresh checkout or to switch an already
+    fetched ./rocm-libraries to a different ref.
 
 .PARAMETER ReuseArtifacts
-    Opposite of -ForceBuild (setup.sh --reuse-artifacts): skip building hipDNN/the
-    MIOpen provider and use whatever is already installed instead. rocm-libraries
-    is fetched at its develop-tracking submodule commit, but the ROCm PyTorch
-    nightly wheel's bundled hipDNN runtime is baked from whatever commit happened
-    to be develop's tip at wheel-build time -- the two can drift out of sync, and
-    the wheel currently ships no hipDNN devel component (headers/CMake configs)
-    at all, which is why building from source is the default rather than
-    something opt-in.
+    Skip building hipDNN/the MIOpen provider from source and use whatever is
+    already installed instead (setup.sh --reuse-artifacts). rocm-libraries is
+    fetched at a develop-tracking (or -RocmLibrariesRef-pinned) commit, but
+    the ROCm PyTorch nightly wheel's bundled hipDNN runtime is baked from
+    whatever commit happened to be develop's tip at wheel-build time -- the
+    two can drift out of sync, and the wheel currently ships no hipDNN devel
+    component (headers/CMake configs) at all, which is why building from
+    source is the default rather than something opt-in.
 
 .PARAMETER RocmPrefix
     Explicit ROCm/hipDNN prefix for the binding/provider build (setup.sh
     --rocm-prefix). Takes precedence over _rocm_sdk_devel wheel discovery.
 
 .PARAMETER InstallDir
-    Install prefix for -ForceBuild. Default: <hipdnn>/install.
+    Install prefix for the from-source build. Default: <hipdnn>/install.
 
 .PARAMETER GpuArch
     GPU architecture to build for, i.e. GPU_TARGETS (setup.sh --gpu-arch).
     Default: gfx1151 (matches wheel_build_setup.ps1).
 
 .PARAMETER Force
-    Clean reconfigure: wipe build dirs before -ForceBuild, and rewrite the .pth.
+    Clean reconfigure: wipe build dirs before building, and rewrite the .pth.
 
 .EXAMPLE
     pwsh ./setup.ps1
@@ -77,7 +76,7 @@ param(
     [ValidateSet('rocm', 'cpu', 'existing', 'none')]
     [string]$TorchMode = 'rocm',
     [string]$TorchIndexUrl,
-    [switch]$ForceBuild,
+    [string]$RocmLibrariesRef,
     [switch]$ReuseArtifacts,
     [string]$RocmPrefix,
     [string]$InstallDir,
@@ -89,12 +88,8 @@ $ErrorActionPreference = 'Stop'
 # Let intentional exit-code probes (e.g. "does rocm_sdk import?") not throw.
 $PSNativeCommandUseErrorActionPreference = $false
 
-if ($ForceBuild -and $ReuseArtifacts) {
-    throw "-ForceBuild and -ReuseArtifacts are mutually exclusive."
-}
 # Build hipDNN + the MIOpen provider from source by default -- see
-# .PARAMETER ReuseArtifacts above for why. -ForceBuild is accepted for
-# explicitness/scripting; -ReuseArtifacts opts out.
+# .PARAMETER ReuseArtifacts above for why.
 $DoBuild = -not $ReuseArtifacts
 
 # --- Paths -----------------------------------------------------------------
@@ -115,29 +110,41 @@ if (-not $InstallDir) { $InstallDir = Join-Path $HipdnnRoot 'install' }
 $WheelSetupScript = Join-Path $HipdnnRoot 'scripts\windows\wheel_build_setup.ps1'
 
 # rocm-libraries is a git submodule (see .gitmodules) tracking the develop
-# branch (no fixed pinned commit). `git submodule update --init` (no special
-# flags) fetches it in full, exactly like any other submodule;
-# Get-RocmLibrariesCheckout below is only this script's own fast path, run
-# when the submodule hasn't been populated yet: it fetches just the develop
-# tip via a sparse, blobless clone limited to the two subtrees this tool
-# actually builds (projects/hipdnn, dnn-providers), skipping the rest of the
-# ~9GB monorepo. A submodule already populated by hand
-# (`git submodule update --init`) or by a previous run of this script is left
-# untouched.
+# branch by default. `git submodule update --init` (no special flags) fetches
+# it in full, exactly like any other submodule; Get-RocmLibrariesCheckout
+# below is this script's own fast path:
+#   - Not yet populated: fetch just the requested ref (-RocmLibrariesRef,
+#     default the .gitmodules branch) via a sparse, blobless clone limited to
+#     the two subtrees this tool actually builds (projects/hipdnn,
+#     dnn-providers), skipping the rest of the ~9GB monorepo.
+#   - Already populated, no -RocmLibrariesRef passed: left untouched (whether
+#     populated by hand via `git submodule update --init`, or by a previous
+#     run of this script).
+#   - Already populated, -RocmLibrariesRef passed: re-checked-out in place at
+#     that ref (branch name or commit hash both work -- both are fetched the
+#     same way, then checked out via FETCH_HEAD).
 function Get-RocmLibrariesCheckout {
-    if (Test-Path (Join-Path $RocmLibrariesDir '.git')) { return }
-
     $gitmodules = Join-Path $ScriptDir '.gitmodules'
     $url = (& git config -f $gitmodules submodule.rocm-libraries.url).Trim()
-    $branch = (& git config -f $gitmodules submodule.rocm-libraries.branch).Trim()
+    $defaultBranch = (& git config -f $gitmodules submodule.rocm-libraries.branch).Trim()
+    $ref = if ($RocmLibrariesRef) { $RocmLibrariesRef } else { $defaultBranch }
 
-    Write-Step "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)"
+    if (Test-Path (Join-Path $RocmLibrariesDir '.git')) {
+        if (-not $RocmLibrariesRef) { return }
+        Write-Step "Checking out rocm-libraries at $ref (sparse: projects/hipdnn, dnn-providers)"
+        Invoke-Native git @('-C', $RocmLibrariesDir, 'fetch', '--quiet', '--depth', '1', 'origin', $ref)
+        Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', 'FETCH_HEAD')
+        return
+    }
+
+    Write-Step "Fetching rocm-libraries ($ref) via sparse checkout (projects/hipdnn, dnn-providers)"
     if (Test-Path $RocmLibrariesDir) { Remove-Item -Recurse -Force $RocmLibrariesDir }
     Invoke-Native git @('clone', '--quiet', '--filter=blob:none', '--sparse',
-        '--branch', $branch, '--no-checkout', $url, $RocmLibrariesDir)
+        '--no-checkout', $url, $RocmLibrariesDir)
     Invoke-Native git @('-C', $RocmLibrariesDir, 'sparse-checkout', 'set',
         'projects/hipdnn', 'dnn-providers')
-    Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', $branch)
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'fetch', '--quiet', '--depth', '1', 'origin', $ref)
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', 'FETCH_HEAD')
 }
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -292,7 +299,7 @@ if ($DoBuild) {
     else {
         $Wheel = (& $Python -c "import os,_rocm_sdk_devel as d; print(os.path.dirname(d.__file__))" 2>$null)
         if ($LASTEXITCODE -ne 0 -or -not $Wheel) {
-            throw "-ForceBuild needs the ROCm devel wheel (_rocm_sdk_devel) in $Python's env, or pass -RocmPrefix."
+            throw "Building from source needs the ROCm devel wheel (_rocm_sdk_devel) in $Python's env, or pass -RocmPrefix."
         }
         $Wheel = $Wheel.Trim()
     }
@@ -416,8 +423,8 @@ if ($DoBuild) {
 # --- 4. Wire the compiled bindings onto the environment via a .pth ----------
 # Bindings build out-of-tree. Add python/ (the package) plus the directory that
 # holds the compiled extension to site-packages. The .pyd can land in build/lib
-# (Ninja, -ForceBuild) or build/<config>/lib (multi-config generators), so probe
-# all three and prefer a release build over a debug one.
+# (Ninja, the from-source build) or build/<config>/lib (multi-config
+# generators), so probe all three and prefer a release build over a debug one.
 $pydDir = $null
 foreach ($cand in @($BindingsLib,
                     (Join-Path $BuildDir 'release\lib'),
@@ -453,8 +460,8 @@ elseif ($pydDir) {
 }
 else {
     Write-Warn ("hipdnn_frontend is not importable and no compiled extension was found " +
-                "under $BindingsLib or $BuildDir\<config>\lib. Re-run with -ForceBuild, or " +
-                "pip-install the bindings from $BindingsPkg (see python/README.md).")
+                "under $BindingsLib or $BuildDir\<config>\lib. Drop -ReuseArtifacts to " +
+                "build from source, or pip-install the bindings from $BindingsPkg (see python/README.md).")
 }
 
 # --- 5. Install the dnn-benchmark package + PyTorch ------------------------

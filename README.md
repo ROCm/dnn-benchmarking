@@ -42,11 +42,16 @@ compared offline. See [Cross-Machine Comparison](#cross-machine-comparison-rocm-
 Run the provided setup script from the `dnn-benchmarking` directory:
 
 `rocm-libraries` (hipDNN sources and provider plugins) is a git submodule
-tracking its `develop` branch. `setup.sh`/`setup.ps1` fetch it automatically
-on first run via a sparse, blobless clone limited to the two subtrees this
-tool builds (`projects/hipdnn`, `dnn-providers`) rather than the full ~9GB
-monorepo. A submodule already populated by `git submodule update --init`
-(a full, non-sparse checkout) is left as-is.
+tracking its `develop` branch by default. `setup.sh`/`setup.ps1` fetch it
+automatically on first run via a sparse, blobless clone limited to the two
+subtrees this tool builds (`projects/hipdnn`, `dnn-providers`) rather than
+the full ~9GB monorepo, and build hipDNN plus the provider plugins from it
+by default (pass `--reuse-artifacts` to skip and reuse whatever is already
+installed instead). Pass `--rocm-libraries-ref <branch|sha>` to build against
+a specific rocm-libraries ref instead of `develop`. A submodule already
+populated by `git submodule update --init` (a full, non-sparse checkout) is
+left as-is unless `--rocm-libraries-ref` is passed, in which case it's
+switched to that ref in place.
 
 Requires Python 3.12 or newer.
 

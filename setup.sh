@@ -23,49 +23,61 @@ HIPBLASLT_PROVIDER_DIR="$WORKSPACE_ROOT/dnn-providers/hipblaslt-provider"
 HIPBLASLT_BUILD_DIR="$HIPBLASLT_PROVIDER_DIR/build"
 
 # rocm-libraries is a git submodule (see .gitmodules) tracking the develop
-# branch (no fixed pinned commit). `git submodule update --init` (no special
-# flags) fetches it in full, exactly like any other submodule;
-# ensure_rocm_libraries_checkout below is only setup.sh's own fast path, run
-# when the submodule hasn't been populated yet: it fetches just the develop
-# tip via a sparse, blobless clone limited to the two subtrees this tool
-# actually builds (projects/hipdnn, dnn-providers), skipping the rest of the
-# ~9GB monorepo. A submodule already populated by hand
-# (`git submodule update --init`) or by a previous setup.sh run is left
-# untouched.
+# branch by default. `git submodule update --init` (no special flags) fetches
+# it in full, exactly like any other submodule; ensure_rocm_libraries_checkout
+# below is setup.sh's own fast path:
+#   - Not yet populated: fetch just the requested ref (--rocm-libraries-ref,
+#     default the .gitmodules branch) via a sparse, blobless clone limited to
+#     the two subtrees this tool actually builds (projects/hipdnn,
+#     dnn-providers), skipping the rest of the ~9GB monorepo.
+#   - Already populated, no --rocm-libraries-ref passed: left untouched
+#     (whether populated by hand via `git submodule update --init`, or by a
+#     previous setup.sh run).
+#   - Already populated, --rocm-libraries-ref passed: re-checked-out in place
+#     at that ref (branch name or commit hash both work -- both are fetched
+#     the same way, then checked out via FETCH_HEAD).
 ensure_rocm_libraries_checkout() {
+    local url default_branch ref
+    url=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.url)
+    default_branch=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.branch)
+    ref="${ROCM_LIBRARIES_REF:-$default_branch}"
+
     if [ -d "$ROCM_LIBRARIES_DIR/.git" ]; then
+        if [ -z "$ROCM_LIBRARIES_REF" ]; then
+            return 0
+        fi
+        echo "Checking out rocm-libraries at $ref (sparse: projects/hipdnn, dnn-providers)..."
+        git -C "$ROCM_LIBRARIES_DIR" fetch --quiet --depth 1 origin "$ref"
+        git -C "$ROCM_LIBRARIES_DIR" checkout --quiet FETCH_HEAD
         return 0
     fi
 
-    local url branch
-    url=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.url)
-    branch=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.branch)
-
-    echo "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)..."
+    echo "Fetching rocm-libraries ($ref) via sparse checkout (projects/hipdnn, dnn-providers)..."
     rm -rf "$ROCM_LIBRARIES_DIR"
-    git clone --quiet --filter=blob:none --sparse --branch "$branch" --no-checkout \
+    git clone --quiet --filter=blob:none --sparse --no-checkout \
         "$url" "$ROCM_LIBRARIES_DIR"
     git -C "$ROCM_LIBRARIES_DIR" sparse-checkout set projects/hipdnn dnn-providers
-    git -C "$ROCM_LIBRARIES_DIR" checkout --quiet "$branch"
+    git -C "$ROCM_LIBRARIES_DIR" fetch --quiet --depth 1 origin "$ref"
+    git -C "$ROCM_LIBRARIES_DIR" checkout --quiet FETCH_HEAD
 }
 
-# Force-build hipDNN + the provider plugins from source by default. Two
-# reasons: (1) rocm-libraries is fetched above at the develop-tracking
-# submodule's current commit, but the ROCm PyTorch nightly wheel's bundled
-# hipDNN runtime is baked on its own release schedule from whatever
-# rocm-libraries commit happened to be develop's tip at build time -- the two
-# can silently drift out of sync, so a from-source build is the only way to
-# guarantee hipDNN/the providers/the Python bindings all correspond to the
-# submodule commit actually checked out; (2) the wheel ships hipDNN's runtime
-# .so + plugins but not its devel component (headers + *Config.cmake), so
-# prefix_has_hipdnn below returns false and a from-source build already runs
-# on every fresh setup regardless (see rocm-libraries issue tracked against
-# PR #8581). Pass --reuse-artifacts to skip the rebuild and use whatever is
-# already installed in the selected ROCm prefix instead (the wheel's shipped
-# runtime, once it ships devel artifacts, or a prior build's output).
-FORCE_BUILD=1
-FORCE_BUILD_EXPLICIT=0
-REUSE_ARTIFACTS_EXPLICIT=0
+# Build hipDNN + the provider plugins from source by default. Two reasons:
+# (1) rocm-libraries is fetched above at a develop-tracking (or explicitly
+# pinned, via --rocm-libraries-ref) commit, but the ROCm PyTorch nightly
+# wheel's bundled hipDNN runtime is baked on its own release schedule from
+# whatever rocm-libraries commit happened to be develop's tip at wheel-build
+# time -- the two can silently drift out of sync, so a from-source build is
+# the only way to guarantee hipDNN/the providers/the Python bindings all
+# correspond to the rocm-libraries commit actually checked out; (2) the wheel
+# ships hipDNN's runtime .so + plugins but not its devel component (headers +
+# *Config.cmake), so prefix_has_hipdnn below returns false and a from-source
+# build already runs on every fresh setup regardless (see rocm-libraries
+# issue tracked against PR #8581). Pass --reuse-artifacts to skip the build
+# and use whatever is already installed in the selected ROCm prefix instead
+# (the wheel's shipped runtime, once it ships devel artifacts, or a prior
+# build's output in the same workspace).
+DO_BUILD=1
+ROCM_LIBRARIES_REF="${DNN_BENCH_ROCM_LIBRARIES_REF:-}"
 AUTO_YES=0
 REUSE_VENV=0
 TORCH_MODE="${DNN_BENCH_TORCH_MODE:-rocm}"
@@ -109,14 +121,16 @@ usage() {
     echo "                       nightly selection. Supported: gfx90a, gfx942, gfx950."
     echo "  --rocm-prefix <path> Explicit ROCm/hipDNN prefix for binding/provider"
     echo "                       builds. Takes precedence over venv discovery."
-    echo "  --force-build        Build hipDNN and provider plugins from source,"
-    echo "                       overwriting artifacts under the selected ROCm prefix."
-    echo "                       This is the default; the flag is accepted for"
-    echo "                       explicitness/scripting but has no additional effect."
-    echo "  --reuse-artifacts    Opposite of --force-build: skip building hipDNN/the"
-    echo "                       provider plugins and use whatever is already"
-    echo "                       installed in the selected ROCm prefix (fails with"
-    echo "                       --torch-mode rocm/existing if hipDNN is absent there)."
+    echo "  --rocm-libraries-ref <branch|sha>"
+    echo "                       Build hipDNN/the providers from this rocm-libraries"
+    echo "                       ref instead of the submodule's default (develop)."
+    echo "                       Works on a fresh checkout or to switch an already"
+    echo "                       fetched ./rocm-libraries to a different ref."
+    echo "  --reuse-artifacts    Skip building hipDNN/the provider plugins from"
+    echo "                       source and use whatever is already installed in"
+    echo "                       the selected ROCm prefix (e.g. a prior build in"
+    echo "                       the same workspace). Fails if hipDNN is absent"
+    echo "                       there -- this never falls back to building."
     echo "  -y                   Skip confirmation prompts."
     echo "  The selected ROCm prefix is exported as ROCM_PATH and its"
     echo "  lib directory is prepended to LD_LIBRARY_PATH by the venv"
@@ -172,8 +186,12 @@ write_activation_local() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --force-build) FORCE_BUILD=1; FORCE_BUILD_EXPLICIT=1 ;;
-        --reuse-artifacts) FORCE_BUILD=0; REUSE_ARTIFACTS_EXPLICIT=1 ;;
+        --reuse-artifacts) DO_BUILD=0 ;;
+        --rocm-libraries-ref)
+            require_arg "$1" "${2:-}"
+            shift
+            ROCM_LIBRARIES_REF="$1"
+            ;;
         --rocm-prefix)
             require_arg "$1" "${2:-}"
             shift
@@ -208,12 +226,6 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-if [ "$FORCE_BUILD_EXPLICIT" -eq 1 ] && [ "$REUSE_ARTIFACTS_EXPLICIT" -eq 1 ]; then
-    echo "ERROR: --force-build and --reuse-artifacts are mutually exclusive." >&2
-    exit 1
-fi
-
-
 case "$TORCH_MODE" in
     rocm|cuda|cpu|existing|none) ;;
     *)
@@ -222,15 +234,11 @@ case "$TORCH_MODE" in
         ;;
 esac
 
+# CUDA mode never builds hipDNN/the providers (see the CUDA early-exit
+# below); DO_BUILD defaulting to on is a no-op there, so reset it to keep the
+# pre-build confirmation prompt honest about what will actually happen.
 if [ "$TORCH_MODE" = "cuda" ]; then
-    if [ "$FORCE_BUILD_EXPLICIT" -eq 1 ]; then
-        echo "ERROR: --force-build is not supported with --torch-mode cuda;" >&2
-        echo "hipDNN and provider plugins require a ROCm toolchain." >&2
-        exit 1
-    fi
-    # --force-build defaults to on, but CUDA mode never builds hipDNN/the
-    # providers (see the CUDA early-exit below); the default is a no-op here.
-    FORCE_BUILD=0
+    DO_BUILD=0
 fi
 
 if [ "$TORCH_MODE" = "existing" ]; then
@@ -635,10 +643,10 @@ install_torch() {
 
 select_binding_prefix() {
     # An explicit --rocm-prefix wins. Otherwise the prefix follows the torch
-    # mode (where ROCm comes from), NOT whether --force-build was passed:
-    # force-build only controls *whether* hipDNN is rebuilt, not *where*. In
-    # rocm/existing-rocm mode that is the torch wheel's bundled SDK, so a forced
-    # rebuild works with no system ROCm.
+    # mode (where ROCm comes from), NOT whether the build is on (the default)
+    # or skipped (--reuse-artifacts): that only controls *whether* hipDNN is
+    # rebuilt, not *where*. In rocm/existing-rocm mode that is the torch
+    # wheel's bundled SDK, so a from-source build works with no system ROCm.
     if [ -n "$ROCM_PREFIX" ]; then
         resolve_installed_rocm_prefix
         return
@@ -664,7 +672,7 @@ select_binding_prefix() {
 select_provider_toolchain_prefix() {
     # Same rule as select_binding_prefix: the compiler/devel toolchain follows
     # the torch mode. For rocm/existing-rocm that is the wheel's devel SDK
-    # (clang + lib/cmake/hip), which a forced rebuild must use too -- the
+    # (clang + lib/cmake/hip), which a from-source build must use too -- the
     # libraries wheel ships no compiler.
     if [ -n "$ROCM_PREFIX" ]; then
         resolve_installed_rocm_prefix
@@ -702,7 +710,10 @@ build_hipdnn() {
     echo "Building and installing hipDNN to $install_prefix..."
     echo "Using ROCm compiler/devel prefix: $toolchain_prefix"
     rm -rf "$BUILD_DIR"
-    cmake -S "$HIPDNN_ROOT" -B "$BUILD_DIR" \
+    # hipDNN's ClangToolChain warns when ROCM_PATH leaks via the environment
+    # (e.g. from a prior run's activate.local, sourced above); clear it for
+    # the build and pass the prefix as -DROCM_PATH in the args instead.
+    env -u ROCM_PATH cmake -S "$HIPDNN_ROOT" -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE=Release \
         "${HIPDNN_HIP_ARCH_ARGS[@]}" \
         -DCMAKE_INSTALL_PREFIX="$install_prefix" \
@@ -740,7 +751,9 @@ build_provider() {
     echo "Building and installing $name to $install_prefix..."
     echo "Using ROCm compiler/devel prefix: $toolchain_prefix"
     rm -rf "$build_dir"
-    cmake -S "$provider_dir" -B "$build_dir" \
+    # See build_hipdnn: clear a possibly-leaked ROCM_PATH so it can't
+    # override the -DROCM_PATH passed below.
+    env -u ROCM_PATH cmake -S "$provider_dir" -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
         "${HIPDNN_HIP_ARCH_ARGS[@]}" \
         -DCMAKE_INSTALL_PREFIX="$install_prefix" \
@@ -819,7 +832,7 @@ warn_no_native_engine_plugins() {
     echo "Pass --plugin-path or config plugin_path to use custom provider plugins." >&2
 }
 
-if [ "$FORCE_BUILD" -eq 1 ] && [ "$AUTO_YES" -eq 0 ]; then
+if [ "$DO_BUILD" -eq 1 ] && [ "$AUTO_YES" -eq 0 ]; then
     # The exact install prefix depends on the torch mode and is only resolved
     # after torch is installed (rocm/existing-rocm build into the torch wheel's
     # bundled SDK, not the system ROCm prefix), so it is reported at build time
@@ -863,15 +876,12 @@ ACTIVATE_LOCAL="$VENV_DIR/bin/activate.local"
 } > "$ACTIVATE_LOCAL"
 INSTALLED_TORCH_MODE=$(get_torch_mode)
 # An existing venv with CUDA torch reaches the CUDA skip path below even when
-# --torch-mode existing was passed; building hipDNN there would silently be
-# skipped, so reject the build request as early as possible.
+# --torch-mode existing was passed; hipDNN can't be built there (requires a
+# ROCm toolchain), so reset DO_BUILD to keep the actual build decision below
+# consistent (the earlier confirmation prompt can't know this yet -- it runs
+# before the venv exists to inspect).
 if [ "$INSTALLED_TORCH_MODE" = "cuda" ]; then
-    if [ "$FORCE_BUILD_EXPLICIT" -eq 1 ]; then
-        echo "ERROR: --force-build is not supported with an existing CUDA torch venv;" >&2
-        echo "building hipDNN requires a ROCm toolchain. Remove $VENV_DIR or use a ROCm torch mode." >&2
-        exit 1
-    fi
-    FORCE_BUILD=0
+    DO_BUILD=0
 fi
 if ! grep -q "activate.local" "$VENV_DIR/bin/activate"; then
     # shellcheck disable=SC2016
@@ -927,36 +937,26 @@ BINDING_PREFIX=$(select_binding_prefix)
 echo "Using hipDNN/ROCm prefix: $BINDING_PREFIX"
 
 PROVIDER_TOOLCHAIN_PREFIX=""
-if [ "$FORCE_BUILD" -eq 1 ] || ! prefix_has_hipdnn "$BINDING_PREFIX"; then
+if [ "$DO_BUILD" -eq 1 ] || ! prefix_has_hipdnn "$BINDING_PREFIX"; then
     PROVIDER_TOOLCHAIN_PREFIX=$(select_provider_toolchain_prefix)
 fi
 
 BUILT_HIPDNN=0
-if [ "$FORCE_BUILD" -eq 1 ]; then
+if [ "$DO_BUILD" -eq 1 ]; then
     build_hipdnn "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX"
     BUILT_HIPDNN=1
 elif ! prefix_has_hipdnn "$BINDING_PREFIX"; then
-    if [ "$REUSE_ARTIFACTS_EXPLICIT" -eq 1 ]; then
-        echo "ERROR: --reuse-artifacts was passed, but hipDNN CMake configs were not" >&2
-        echo "found under $BINDING_PREFIX." >&2
-        echo "Expected:" >&2
-        echo "  $(hipdnn_config_path "$BINDING_PREFIX")" >&2
-        echo "  $(hipdnn_backend_config_path "$BINDING_PREFIX")" >&2
-        echo "There is nothing to reuse there yet (e.g. the ROCm wheel currently ships" >&2
-        echo "hipDNN's runtime but not its devel/CMake artifacts). Drop --reuse-artifacts" >&2
-        echo "to build from source, or point --rocm-prefix at a prefix that has them." >&2
-        exit 1
-    elif [ "$TORCH_MODE" = "rocm" ] || { [ "$TORCH_MODE" = "existing" ] && [ "$INSTALLED_TORCH_MODE" = "rocm" ]; }; then
-        build_hipdnn "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX"
-        BUILT_HIPDNN=1
-    else
-        echo "ERROR: hipDNN CMake configs were not found under $BINDING_PREFIX." >&2
-        echo "Expected:" >&2
-        echo "  $(hipdnn_config_path "$BINDING_PREFIX")" >&2
-        echo "  $(hipdnn_backend_config_path "$BINDING_PREFIX")" >&2
-        echo "Install ROCm/hipDNN artifacts there, use --rocm-prefix, or pass --force-build." >&2
-        exit 1
-    fi
+    # Reachable only via --reuse-artifacts (the only way DO_BUILD is 0 here --
+    # CUDA torch mode always exits before this point).
+    echo "ERROR: --reuse-artifacts was passed, but hipDNN CMake configs were not" >&2
+    echo "found under $BINDING_PREFIX." >&2
+    echo "Expected:" >&2
+    echo "  $(hipdnn_config_path "$BINDING_PREFIX")" >&2
+    echo "  $(hipdnn_backend_config_path "$BINDING_PREFIX")" >&2
+    echo "There is nothing to reuse there yet (e.g. the ROCm wheel currently ships" >&2
+    echo "hipDNN's runtime but not its devel/CMake artifacts). Drop --reuse-artifacts" >&2
+    echo "to build from source, or point --rocm-prefix at a prefix that has them." >&2
+    exit 1
 fi
 
 
@@ -968,7 +968,7 @@ PLUGIN_DIR="$BINDING_PREFIX/lib/hipdnn_plugins/engines"
 MIOPEN_PLUGIN="$PLUGIN_DIR/libmiopen_plugin.so"
 HIPBLASLT_PLUGIN="$PLUGIN_DIR/libhipblaslt_plugin.so"
 HIP_KERNEL_PLUGIN="$PLUGIN_DIR/libhip_kernel_provider.so"
-if [ "$FORCE_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || \
+if [ "$DO_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || \
     [ ! -f "$MIOPEN_PLUGIN" ] || [ ! -f "$HIPBLASLT_PLUGIN" ] || \
     [ ! -f "$HIP_KERNEL_PLUGIN" ]; then
     if [ -z "$PROVIDER_TOOLCHAIN_PREFIX" ]; then
@@ -977,19 +977,19 @@ if [ "$FORCE_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || \
 fi
 
 PROVIDER_BUILD_FAILED=0
-if [ "$FORCE_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || [ ! -f "$MIOPEN_PLUGIN" ]; then
+if [ "$DO_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || [ ! -f "$MIOPEN_PLUGIN" ]; then
     try_build_optional_provider \
         "MIOpen provider" \
         build_miopen_provider "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX" ||
         PROVIDER_BUILD_FAILED=1
 fi
-if [ "$FORCE_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || [ ! -f "$HIPBLASLT_PLUGIN" ]; then
+if [ "$DO_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || [ ! -f "$HIPBLASLT_PLUGIN" ]; then
     try_build_optional_provider \
         "hipBLASLt provider" \
         build_hipblaslt_provider "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX" ||
         PROVIDER_BUILD_FAILED=1
 fi
-if [ "$FORCE_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || [ ! -f "$HIP_KERNEL_PLUGIN" ]; then
+if [ "$DO_BUILD" -eq 1 ] || [ "$BUILT_HIPDNN" -eq 1 ] || [ ! -f "$HIP_KERNEL_PLUGIN" ]; then
     try_build_optional_provider \
         "hip-kernel-provider" \
         build_hip_kernel_provider "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX" ||
