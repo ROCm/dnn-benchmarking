@@ -49,7 +49,23 @@ ensure_rocm_libraries_checkout() {
     git -C "$ROCM_LIBRARIES_DIR" checkout --quiet "$branch"
 }
 
-FORCE_BUILD=0
+# Force-build hipDNN + the provider plugins from source by default. Two
+# reasons: (1) rocm-libraries is fetched above at the develop-tracking
+# submodule's current commit, but the ROCm PyTorch nightly wheel's bundled
+# hipDNN runtime is baked on its own release schedule from whatever
+# rocm-libraries commit happened to be develop's tip at build time -- the two
+# can silently drift out of sync, so a from-source build is the only way to
+# guarantee hipDNN/the providers/the Python bindings all correspond to the
+# submodule commit actually checked out; (2) the wheel ships hipDNN's runtime
+# .so + plugins but not its devel component (headers + *Config.cmake), so
+# prefix_has_hipdnn below returns false and a from-source build already runs
+# on every fresh setup regardless (see rocm-libraries issue tracked against
+# PR #8581). Pass --reuse-artifacts to skip the rebuild and use whatever is
+# already installed in the selected ROCm prefix instead (the wheel's shipped
+# runtime, once it ships devel artifacts, or a prior build's output).
+FORCE_BUILD=1
+FORCE_BUILD_EXPLICIT=0
+REUSE_ARTIFACTS_EXPLICIT=0
 AUTO_YES=0
 REUSE_VENV=0
 TORCH_MODE="${DNN_BENCH_TORCH_MODE:-rocm}"
@@ -95,6 +111,12 @@ usage() {
     echo "                       builds. Takes precedence over venv discovery."
     echo "  --force-build        Build hipDNN and provider plugins from source,"
     echo "                       overwriting artifacts under the selected ROCm prefix."
+    echo "                       This is the default; the flag is accepted for"
+    echo "                       explicitness/scripting but has no additional effect."
+    echo "  --reuse-artifacts    Opposite of --force-build: skip building hipDNN/the"
+    echo "                       provider plugins and use whatever is already"
+    echo "                       installed in the selected ROCm prefix (fails with"
+    echo "                       --torch-mode rocm/existing if hipDNN is absent there)."
     echo "  -y                   Skip confirmation prompts."
     echo "  The selected ROCm prefix is exported as ROCM_PATH and its"
     echo "  lib directory is prepended to LD_LIBRARY_PATH by the venv"
@@ -150,7 +172,8 @@ write_activation_local() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --force-build) FORCE_BUILD=1 ;;
+        --force-build) FORCE_BUILD=1; FORCE_BUILD_EXPLICIT=1 ;;
+        --reuse-artifacts) FORCE_BUILD=0; REUSE_ARTIFACTS_EXPLICIT=1 ;;
         --rocm-prefix)
             require_arg "$1" "${2:-}"
             shift
@@ -185,6 +208,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+if [ "$FORCE_BUILD_EXPLICIT" -eq 1 ] && [ "$REUSE_ARTIFACTS_EXPLICIT" -eq 1 ]; then
+    echo "ERROR: --force-build and --reuse-artifacts are mutually exclusive." >&2
+    exit 1
+fi
+
 
 case "$TORCH_MODE" in
     rocm|cuda|cpu|existing|none) ;;
@@ -194,10 +222,15 @@ case "$TORCH_MODE" in
         ;;
 esac
 
-if [ "$TORCH_MODE" = "cuda" ] && [ "$FORCE_BUILD" -eq 1 ]; then
-    echo "ERROR: --force-build is not supported with --torch-mode cuda;" >&2
-    echo "hipDNN and provider plugins require a ROCm toolchain." >&2
-    exit 1
+if [ "$TORCH_MODE" = "cuda" ]; then
+    if [ "$FORCE_BUILD_EXPLICIT" -eq 1 ]; then
+        echo "ERROR: --force-build is not supported with --torch-mode cuda;" >&2
+        echo "hipDNN and provider plugins require a ROCm toolchain." >&2
+        exit 1
+    fi
+    # --force-build defaults to on, but CUDA mode never builds hipDNN/the
+    # providers (see the CUDA early-exit below); the default is a no-op here.
+    FORCE_BUILD=0
 fi
 
 if [ "$TORCH_MODE" = "existing" ]; then
@@ -832,10 +865,13 @@ INSTALLED_TORCH_MODE=$(get_torch_mode)
 # An existing venv with CUDA torch reaches the CUDA skip path below even when
 # --torch-mode existing was passed; building hipDNN there would silently be
 # skipped, so reject the build request as early as possible.
-if [ "$INSTALLED_TORCH_MODE" = "cuda" ] && [ "$FORCE_BUILD" -eq 1 ]; then
-    echo "ERROR: --force-build is not supported with an existing CUDA torch venv;" >&2
-    echo "building hipDNN requires a ROCm toolchain. Remove $VENV_DIR or use a ROCm torch mode." >&2
-    exit 1
+if [ "$INSTALLED_TORCH_MODE" = "cuda" ]; then
+    if [ "$FORCE_BUILD_EXPLICIT" -eq 1 ]; then
+        echo "ERROR: --force-build is not supported with an existing CUDA torch venv;" >&2
+        echo "building hipDNN requires a ROCm toolchain. Remove $VENV_DIR or use a ROCm torch mode." >&2
+        exit 1
+    fi
+    FORCE_BUILD=0
 fi
 if ! grep -q "activate.local" "$VENV_DIR/bin/activate"; then
     # shellcheck disable=SC2016
@@ -900,7 +936,17 @@ if [ "$FORCE_BUILD" -eq 1 ]; then
     build_hipdnn "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX"
     BUILT_HIPDNN=1
 elif ! prefix_has_hipdnn "$BINDING_PREFIX"; then
-    if [ "$TORCH_MODE" = "rocm" ] || { [ "$TORCH_MODE" = "existing" ] && [ "$INSTALLED_TORCH_MODE" = "rocm" ]; }; then
+    if [ "$REUSE_ARTIFACTS_EXPLICIT" -eq 1 ]; then
+        echo "ERROR: --reuse-artifacts was passed, but hipDNN CMake configs were not" >&2
+        echo "found under $BINDING_PREFIX." >&2
+        echo "Expected:" >&2
+        echo "  $(hipdnn_config_path "$BINDING_PREFIX")" >&2
+        echo "  $(hipdnn_backend_config_path "$BINDING_PREFIX")" >&2
+        echo "There is nothing to reuse there yet (e.g. the ROCm wheel currently ships" >&2
+        echo "hipDNN's runtime but not its devel/CMake artifacts). Drop --reuse-artifacts" >&2
+        echo "to build from source, or point --rocm-prefix at a prefix that has them." >&2
+        exit 1
+    elif [ "$TORCH_MODE" = "rocm" ] || { [ "$TORCH_MODE" = "existing" ] && [ "$INSTALLED_TORCH_MODE" = "rocm" ]; }; then
         build_hipdnn "$BINDING_PREFIX" "$PROVIDER_TOOLCHAIN_PREFIX"
         BUILT_HIPDNN=1
     else

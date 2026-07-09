@@ -6,9 +6,10 @@
 .DESCRIPTION
     Installs dnn-benchmark into the ROCm wheel env named by the ROCM_WHEEL_VENV env
     var (published by wheel_build_setup.ps1); if it's unset, wheel_build_setup.ps1 is
-    run to create the venv and set it. Optionally builds hipDNN + the Python bindings
-    and the MIOpen provider from source (-ForceBuild), wires the bindings onto the env
-    via a .pth, installs the tool (editable) and PyTorch per -TorchMode, then verifies
+    run to create the venv and set it. Builds hipDNN + the Python bindings and the
+    MIOpen provider from source by default (pass -ReuseArtifacts to skip and use
+    whatever is already installed instead), wires the bindings onto the env via a
+    .pth, installs the tool (editable) and PyTorch per -TorchMode, then verifies
     the result.
 
     Parameters mirror setup.sh where they apply on Windows. setup.sh's venv
@@ -30,8 +31,20 @@
 
 .PARAMETER ForceBuild
     Build hipDNN (with bindings) and the MIOpen provider from source, then install
-    them to -InstallDir (setup.sh --force-build). Needs the MSVC toolchain and a
-    ROCm devel prefix (the _rocm_sdk_devel wheel, or -RocmPrefix).
+    them to -InstallDir (setup.sh --force-build). This is the default; the switch
+    is accepted for explicitness/scripting but has no additional effect. Needs the
+    MSVC toolchain and a ROCm devel prefix (the _rocm_sdk_devel wheel, or
+    -RocmPrefix).
+
+.PARAMETER ReuseArtifacts
+    Opposite of -ForceBuild (setup.sh --reuse-artifacts): skip building hipDNN/the
+    MIOpen provider and use whatever is already installed instead. rocm-libraries
+    is fetched at its develop-tracking submodule commit, but the ROCm PyTorch
+    nightly wheel's bundled hipDNN runtime is baked from whatever commit happened
+    to be develop's tip at wheel-build time -- the two can drift out of sync, and
+    the wheel currently ships no hipDNN devel component (headers/CMake configs)
+    at all, which is why building from source is the default rather than
+    something opt-in.
 
 .PARAMETER RocmPrefix
     Explicit ROCm/hipDNN prefix for the binding/provider build (setup.sh
@@ -51,7 +64,7 @@
     pwsh ./setup.ps1
 
 .EXAMPLE
-    pwsh ./setup.ps1 -ForceBuild
+    pwsh ./setup.ps1 -ReuseArtifacts
 
 .EXAMPLE
     pwsh ./setup.ps1 -TorchMode existing
@@ -65,6 +78,7 @@ param(
     [string]$TorchMode = 'rocm',
     [string]$TorchIndexUrl,
     [switch]$ForceBuild,
+    [switch]$ReuseArtifacts,
     [string]$RocmPrefix,
     [string]$InstallDir,
     [string]$GpuArch = 'gfx1151',
@@ -74,6 +88,14 @@ param(
 $ErrorActionPreference = 'Stop'
 # Let intentional exit-code probes (e.g. "does rocm_sdk import?") not throw.
 $PSNativeCommandUseErrorActionPreference = $false
+
+if ($ForceBuild -and $ReuseArtifacts) {
+    throw "-ForceBuild and -ReuseArtifacts are mutually exclusive."
+}
+# Build hipDNN + the MIOpen provider from source by default -- see
+# .PARAMETER ReuseArtifacts above for why. -ForceBuild is accepted for
+# explicitness/scripting; -ReuseArtifacts opts out.
+$DoBuild = -not $ReuseArtifacts
 
 # --- Paths -----------------------------------------------------------------
 $ScriptDir        = $PSScriptRoot
@@ -257,9 +279,9 @@ if (-not (Test-RocmRuntime)) {
 }
 
 # --- 3. Build from source --------------------------------------------------
-if ($ForceBuild) {
+if ($DoBuild) {
     # rocm-libraries provides the hipDNN sources and MIOpen provider plugin
-    # this build step compiles; only needed for -ForceBuild.
+    # this build step compiles; only needed when actually building.
     Get-RocmLibrariesCheckout
 
     # ROCm devel prefix: provides clang++, hipcc, and the CMake configs. Prefer
@@ -523,7 +545,7 @@ Write-Host ""
 Write-Step "Setup complete."
 Write-Host "  Run benchmarks with:" -ForegroundColor Green
 Write-Host "    & '$DnnExe' --graph <graph.json>"
-if ($ForceBuild) {
+if ($DoBuild) {
     # Point at the engines dir the provider actually installed to (bin/ on Windows).
     if (-not $PluginEnginesDir) { $PluginEnginesDir = Join-Path $InstallDir 'bin\hipdnn_plugins\engines' }
     Write-Host "    & '$DnnExe' --graph <graph.json> ``"
