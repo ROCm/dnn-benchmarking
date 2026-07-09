@@ -41,6 +41,13 @@ compared offline. See [Cross-Machine Comparison](#cross-machine-comparison-rocm-
 
 Run the provided setup script from the `dnn-benchmarking` directory:
 
+`rocm-libraries` (hipDNN sources and provider plugins) is a git submodule
+tracking its `develop` branch. `setup.sh`/`setup.ps1` fetch it automatically
+on first run via a sparse, blobless clone limited to the two subtrees this
+tool builds (`projects/hipdnn`, `dnn-providers`) rather than the full ~9GB
+monorepo. A submodule already populated by `git submodule update --init`
+(a full, non-sparse checkout) is left as-is.
+
 Requires Python 3.12 or newer.
 
 ```bash

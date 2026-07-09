@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HIPDNN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE_ROOT="$(cd "$HIPDNN_ROOT/../.." && pwd)"
+ROCM_LIBRARIES_DIR="$SCRIPT_DIR/rocm-libraries"
+HIPDNN_ROOT="$ROCM_LIBRARIES_DIR/projects/hipdnn"
+WORKSPACE_ROOT="$ROCM_LIBRARIES_DIR"
 
 DEFAULT_DNN_BENCH_WORKSPACE="$SCRIPT_DIR/.workspace"
 if [ -d /workspace ] && [ -w /workspace ]; then
@@ -20,6 +21,33 @@ HIP_KERNEL_PROVIDER_DIR="$WORKSPACE_ROOT/dnn-providers/hip-kernel-provider"
 HIP_KERNEL_BUILD_DIR="$HIP_KERNEL_PROVIDER_DIR/build"
 HIPBLASLT_PROVIDER_DIR="$WORKSPACE_ROOT/dnn-providers/hipblaslt-provider"
 HIPBLASLT_BUILD_DIR="$HIPBLASLT_PROVIDER_DIR/build"
+
+# rocm-libraries is a git submodule (see .gitmodules) tracking the develop
+# branch (no fixed pinned commit). `git submodule update --init` (no special
+# flags) fetches it in full, exactly like any other submodule;
+# ensure_rocm_libraries_checkout below is only setup.sh's own fast path, run
+# when the submodule hasn't been populated yet: it fetches just the develop
+# tip via a sparse, blobless clone limited to the two subtrees this tool
+# actually builds (projects/hipdnn, dnn-providers), skipping the rest of the
+# ~9GB monorepo. A submodule already populated by hand
+# (`git submodule update --init`) or by a previous setup.sh run is left
+# untouched.
+ensure_rocm_libraries_checkout() {
+    if [ -d "$ROCM_LIBRARIES_DIR/.git" ]; then
+        return 0
+    fi
+
+    local url branch
+    url=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.url)
+    branch=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.branch)
+
+    echo "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)..."
+    rm -rf "$ROCM_LIBRARIES_DIR"
+    git clone --quiet --filter=blob:none --sparse --branch "$branch" --no-checkout \
+        "$url" "$ROCM_LIBRARIES_DIR"
+    git -C "$ROCM_LIBRARIES_DIR" sparse-checkout set projects/hipdnn dnn-providers
+    git -C "$ROCM_LIBRARIES_DIR" checkout --quiet "$branch"
+}
 
 FORCE_BUILD=0
 AUTO_YES=0
@@ -837,6 +865,10 @@ if [ "$INSTALLED_TORCH_MODE" = "cuda" ] || [ "$TORCH_MODE" = "cuda" ]; then
     echo "  python -m dnn_benchmarking --graph <graph.json> --backend pytorch"
     exit 0
 fi
+
+# rocm-libraries provides the hipDNN sources and provider plugins the rest of
+# this script builds; not needed for the CUDA-only PyTorch backend above.
+ensure_rocm_libraries_checkout
 
 # Resolve the GPU arch once and hand it to the HIP device-code builds. The
 # wheel-bundled ROCm SDK ships no rocm_agent_enumerator/offload-arch on PATH and

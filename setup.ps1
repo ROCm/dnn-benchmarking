@@ -76,20 +76,47 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
 # --- Paths -----------------------------------------------------------------
-$ScriptDir   = $PSScriptRoot
-$HipdnnRoot  = (Resolve-Path (Join-Path $ScriptDir '..\..')).Path
-$BindingsPkg = Join-Path $HipdnnRoot 'python'
-$BindingsLib = Join-Path $HipdnnRoot 'build\lib'
-$BuildDir    = Join-Path $HipdnnRoot 'build'
-$ProviderDir = Join-Path $HipdnnRoot '..\..\dnn-providers\miopen-provider'
-$BuildType   = 'Release'
-$WinSdkRoot  = 'C:\Program Files (x86)\Windows Kits\10'
+$ScriptDir        = $PSScriptRoot
+$RocmLibrariesDir = Join-Path $ScriptDir 'rocm-libraries'
+$HipdnnRoot       = Join-Path $RocmLibrariesDir 'projects\hipdnn'
+$BindingsPkg      = Join-Path $HipdnnRoot 'python'
+$BindingsLib      = Join-Path $HipdnnRoot 'build\lib'
+$BuildDir         = Join-Path $HipdnnRoot 'build'
+$ProviderDir      = Join-Path $RocmLibrariesDir 'dnn-providers\miopen-provider'
+$BuildType        = 'Release'
+$WinSdkRoot       = 'C:\Program Files (x86)\Windows Kits\10'
 if (-not $InstallDir) { $InstallDir = Join-Path $HipdnnRoot 'install' }
 
 # wheel_build_setup.ps1 owns the wheel-venv location and publishes it as the
 # ROCM_WHEEL_VENV env var. Step 1 reads that (or runs the script to bootstrap a venv
 # and set it) -- so the venv path is never hardcoded here.
 $WheelSetupScript = Join-Path $HipdnnRoot 'scripts\windows\wheel_build_setup.ps1'
+
+# rocm-libraries is a git submodule (see .gitmodules) tracking the develop
+# branch (no fixed pinned commit). `git submodule update --init` (no special
+# flags) fetches it in full, exactly like any other submodule;
+# Get-RocmLibrariesCheckout below is only this script's own fast path, run
+# when the submodule hasn't been populated yet: it fetches just the develop
+# tip via a sparse, blobless clone limited to the two subtrees this tool
+# actually builds (projects/hipdnn, dnn-providers), skipping the rest of the
+# ~9GB monorepo. A submodule already populated by hand
+# (`git submodule update --init`) or by a previous run of this script is left
+# untouched.
+function Get-RocmLibrariesCheckout {
+    if (Test-Path (Join-Path $RocmLibrariesDir '.git')) { return }
+
+    $gitmodules = Join-Path $ScriptDir '.gitmodules'
+    $url = (& git config -f $gitmodules submodule.rocm-libraries.url).Trim()
+    $branch = (& git config -f $gitmodules submodule.rocm-libraries.branch).Trim()
+
+    Write-Step "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)"
+    if (Test-Path $RocmLibrariesDir) { Remove-Item -Recurse -Force $RocmLibrariesDir }
+    Invoke-Native git @('clone', '--quiet', '--filter=blob:none', '--sparse',
+        '--branch', $branch, '--no-checkout', $url, $RocmLibrariesDir)
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'sparse-checkout', 'set',
+        'projects/hipdnn', 'dnn-providers')
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', $branch)
+}
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Warn($msg) { Write-Host "WARNING: $msg" -ForegroundColor Yellow }
@@ -231,6 +258,10 @@ if (-not (Test-RocmRuntime)) {
 
 # --- 3. Build from source --------------------------------------------------
 if ($ForceBuild) {
+    # rocm-libraries provides the hipDNN sources and MIOpen provider plugin
+    # this build step compiles; only needed for -ForceBuild.
+    Get-RocmLibrariesCheckout
+
     # ROCm devel prefix: provides clang++, hipcc, and the CMake configs. Prefer
     # -RocmPrefix, else discover the _rocm_sdk_devel wheel in the env.
     if ($RocmPrefix) {
