@@ -25,59 +25,46 @@ HIPBLASLT_BUILD_DIR="$HIPBLASLT_PROVIDER_DIR/build"
 # rocm-libraries is a git submodule (see .gitmodules) tracking the develop
 # branch by default. `git submodule update --init` (no special flags) fetches
 # it in full, exactly like any other submodule; ensure_rocm_libraries_checkout
-# below is setup.sh's own fast path:
-#   - Not yet populated: fetch just the requested ref (--rocm-libraries-ref,
-#     default the .gitmodules branch) via a sparse, blobless clone limited to
-#     the two subtrees this tool actually builds (projects/hipdnn,
-#     dnn-providers), skipping the rest of the ~9GB monorepo.
-#   - Already populated, no --rocm-libraries-ref passed: left untouched
-#     (whether populated by hand via `git submodule update --init`, or by a
-#     previous setup.sh run).
-#   - Already populated, --rocm-libraries-ref passed: re-checked-out in place
-#     at that ref (branch name or commit hash both work -- both are fetched
-#     the same way, then checked out via FETCH_HEAD).
+# below is setup.sh's own fast path, used only when the directory isn't
+# already populated: fetch just the .gitmodules-pinned branch via a sparse,
+# blobless clone limited to the two subtrees this tool actually builds
+# (projects/hipdnn, dnn-providers), skipping the rest of the ~9GB monorepo.
+# To build against a different rocm-libraries ref, check it out directly,
+# e.g. `git -C rocm-libraries fetch --depth 1 origin <ref> && git -C
+# rocm-libraries checkout FETCH_HEAD`.
 ensure_rocm_libraries_checkout() {
-    local url default_branch ref
-    url=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.url)
-    default_branch=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.branch)
-    ref="${ROCM_LIBRARIES_REF:-$default_branch}"
-
+    local url branch
     if [ -d "$ROCM_LIBRARIES_DIR/.git" ]; then
-        if [ -z "$ROCM_LIBRARIES_REF" ]; then
-            return 0
-        fi
-        echo "Checking out rocm-libraries at $ref (sparse: projects/hipdnn, dnn-providers)..."
-        git -C "$ROCM_LIBRARIES_DIR" fetch --quiet --depth 1 origin "$ref"
-        git -C "$ROCM_LIBRARIES_DIR" checkout --quiet FETCH_HEAD
         return 0
     fi
 
-    echo "Fetching rocm-libraries ($ref) via sparse checkout (projects/hipdnn, dnn-providers)..."
+    url=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.url)
+    branch=$(git config -f "$SCRIPT_DIR/.gitmodules" submodule.rocm-libraries.branch)
+    echo "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)..."
     rm -rf "$ROCM_LIBRARIES_DIR"
     git clone --quiet --filter=blob:none --sparse --no-checkout \
         "$url" "$ROCM_LIBRARIES_DIR"
     git -C "$ROCM_LIBRARIES_DIR" sparse-checkout set projects/hipdnn dnn-providers
-    git -C "$ROCM_LIBRARIES_DIR" fetch --quiet --depth 1 origin "$ref"
+    git -C "$ROCM_LIBRARIES_DIR" fetch --quiet --depth 1 origin "$branch"
     git -C "$ROCM_LIBRARIES_DIR" checkout --quiet FETCH_HEAD
 }
 
 # Build hipDNN + the provider plugins from source by default. Two reasons:
-# (1) rocm-libraries is fetched above at a develop-tracking (or explicitly
-# pinned, via --rocm-libraries-ref) commit, but the ROCm PyTorch nightly
-# wheel's bundled hipDNN runtime is baked on its own release schedule from
-# whatever rocm-libraries commit happened to be develop's tip at wheel-build
-# time -- the two can silently drift out of sync, so a from-source build is
-# the only way to guarantee hipDNN/the providers/the Python bindings all
-# correspond to the rocm-libraries commit actually checked out; (2) the wheel
-# ships hipDNN's runtime .so + plugins but not its devel component (headers +
-# *Config.cmake), so prefix_has_hipdnn below returns false and a from-source
-# build already runs on every fresh setup regardless (see rocm-libraries
-# issue tracked against PR #8581). Pass --reuse-artifacts to skip the build
-# and use whatever is already installed in the selected ROCm prefix instead
-# (the wheel's shipped runtime, once it ships devel artifacts, or a prior
+# (1) rocm-libraries is fetched above at a develop-tracking commit, but the
+# ROCm PyTorch nightly wheel's bundled hipDNN runtime is baked on its own
+# release schedule from whatever rocm-libraries commit happened to be
+# develop's tip at wheel-build time -- the two can silently drift out of
+# sync, so a from-source build is the only way to guarantee hipDNN/the
+# providers/the Python bindings all correspond to the rocm-libraries commit
+# actually checked out; (2) the wheel ships hipDNN's runtime .so + plugins
+# but not its devel component (headers + *Config.cmake), so
+# prefix_has_hipdnn below returns false and a from-source build already
+# runs on every fresh setup regardless (see rocm-libraries issue tracked
+# against PR #8581). Pass --reuse-artifacts to skip the build and use
+# whatever is already installed in the selected ROCm prefix instead (the
+# wheel's shipped runtime, once it ships devel artifacts, or a prior
 # build's output in the same workspace).
 DO_BUILD=1
-ROCM_LIBRARIES_REF="${DNN_BENCH_ROCM_LIBRARIES_REF:-}"
 AUTO_YES=0
 REUSE_VENV=0
 TORCH_MODE="${DNN_BENCH_TORCH_MODE:-rocm}"
@@ -121,11 +108,6 @@ usage() {
     echo "                       nightly selection. Supported: gfx90a, gfx942, gfx950."
     echo "  --rocm-prefix <path> Explicit ROCm/hipDNN prefix for binding/provider"
     echo "                       builds. Takes precedence over venv discovery."
-    echo "  --rocm-libraries-ref <branch|sha>"
-    echo "                       Build hipDNN/the providers from this rocm-libraries"
-    echo "                       ref instead of the submodule's default (develop)."
-    echo "                       Works on a fresh checkout or to switch an already"
-    echo "                       fetched ./rocm-libraries to a different ref."
     echo "  --reuse-artifacts    Skip building hipDNN/the provider plugins from"
     echo "                       source and use whatever is already installed in"
     echo "                       the selected ROCm prefix (e.g. a prior build in"
@@ -187,11 +169,6 @@ write_activation_local() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --reuse-artifacts) DO_BUILD=0 ;;
-        --rocm-libraries-ref)
-            require_arg "$1" "${2:-}"
-            shift
-            ROCM_LIBRARIES_REF="$1"
-            ;;
         --rocm-prefix)
             require_arg "$1" "${2:-}"
             shift

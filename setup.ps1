@@ -29,17 +29,11 @@
 .PARAMETER TorchIndexUrl
     Override the pip index URL used for torch (setup.sh --torch-index-url).
 
-.PARAMETER RocmLibrariesRef
-    Build hipDNN/the MIOpen provider from this rocm-libraries ref (branch name
-    or commit hash) instead of the submodule's default (develop) (setup.sh
-    --rocm-libraries-ref). Works on a fresh checkout or to switch an already
-    fetched ./rocm-libraries to a different ref.
-
 .PARAMETER ReuseArtifacts
     Skip building hipDNN/the MIOpen provider from source and use whatever is
     already installed instead (setup.sh --reuse-artifacts). rocm-libraries is
-    fetched at a develop-tracking (or -RocmLibrariesRef-pinned) commit, but
-    the ROCm PyTorch nightly wheel's bundled hipDNN runtime is baked from
+    fetched at a develop-tracking commit, but the ROCm PyTorch nightly wheel's
+    bundled hipDNN runtime is baked from
     whatever commit happened to be develop's tip at wheel-build time -- the
     two can drift out of sync, and the wheel currently ships no hipDNN devel
     component (headers/CMake configs) at all, which is why building from
@@ -76,7 +70,6 @@ param(
     [ValidateSet('rocm', 'cpu', 'existing', 'none')]
     [string]$TorchMode = 'rocm',
     [string]$TorchIndexUrl,
-    [string]$RocmLibrariesRef,
     [switch]$ReuseArtifacts,
     [string]$RocmPrefix,
     [string]$InstallDir,
@@ -112,38 +105,27 @@ $WheelSetupScript = Join-Path $HipdnnRoot 'scripts\windows\wheel_build_setup.ps1
 # rocm-libraries is a git submodule (see .gitmodules) tracking the develop
 # branch by default. `git submodule update --init` (no special flags) fetches
 # it in full, exactly like any other submodule; Get-RocmLibrariesCheckout
-# below is this script's own fast path:
-#   - Not yet populated: fetch just the requested ref (-RocmLibrariesRef,
-#     default the .gitmodules branch) via a sparse, blobless clone limited to
-#     the two subtrees this tool actually builds (projects/hipdnn,
-#     dnn-providers), skipping the rest of the ~9GB monorepo.
-#   - Already populated, no -RocmLibrariesRef passed: left untouched (whether
-#     populated by hand via `git submodule update --init`, or by a previous
-#     run of this script).
-#   - Already populated, -RocmLibrariesRef passed: re-checked-out in place at
-#     that ref (branch name or commit hash both work -- both are fetched the
-#     same way, then checked out via FETCH_HEAD).
+# below is this script's own fast path, used only when the directory isn't
+# already populated: fetch just the .gitmodules-pinned branch via a sparse,
+# blobless clone limited to the two subtrees this tool actually builds
+# (projects/hipdnn, dnn-providers), skipping the rest of the ~9GB monorepo.
+# To build against a different rocm-libraries ref, check it out directly,
+# e.g. `git -C rocm-libraries fetch --depth 1 origin <ref>; git -C
+# rocm-libraries checkout FETCH_HEAD`.
 function Get-RocmLibrariesCheckout {
+    if (Test-Path (Join-Path $RocmLibrariesDir '.git')) { return }
+
     $gitmodules = Join-Path $ScriptDir '.gitmodules'
     $url = (& git config -f $gitmodules submodule.rocm-libraries.url).Trim()
-    $defaultBranch = (& git config -f $gitmodules submodule.rocm-libraries.branch).Trim()
-    $ref = if ($RocmLibrariesRef) { $RocmLibrariesRef } else { $defaultBranch }
+    $branch = (& git config -f $gitmodules submodule.rocm-libraries.branch).Trim()
 
-    if (Test-Path (Join-Path $RocmLibrariesDir '.git')) {
-        if (-not $RocmLibrariesRef) { return }
-        Write-Step "Checking out rocm-libraries at $ref (sparse: projects/hipdnn, dnn-providers)"
-        Invoke-Native git @('-C', $RocmLibrariesDir, 'fetch', '--quiet', '--depth', '1', 'origin', $ref)
-        Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', 'FETCH_HEAD')
-        return
-    }
-
-    Write-Step "Fetching rocm-libraries ($ref) via sparse checkout (projects/hipdnn, dnn-providers)"
+    Write-Step "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)"
     if (Test-Path $RocmLibrariesDir) { Remove-Item -Recurse -Force $RocmLibrariesDir }
     Invoke-Native git @('clone', '--quiet', '--filter=blob:none', '--sparse',
         '--no-checkout', $url, $RocmLibrariesDir)
     Invoke-Native git @('-C', $RocmLibrariesDir, 'sparse-checkout', 'set',
         'projects/hipdnn', 'dnn-providers')
-    Invoke-Native git @('-C', $RocmLibrariesDir, 'fetch', '--quiet', '--depth', '1', 'origin', $ref)
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'fetch', '--quiet', '--depth', '1', 'origin', $branch)
     Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', 'FETCH_HEAD')
 }
 
