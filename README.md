@@ -41,7 +41,6 @@ compared offline. See [Cross-Machine Comparison](#cross-machine-comparison-rocm-
 
 Run the provided setup script from the `dnn-benchmarking` directory:
 
-<<<<<<< HEAD
 `rocm-libraries` (hipDNN sources and provider plugins) is a git submodule
 tracking its `develop` branch by default. `setup_env.py` fetches it
 automatically on first run via a sparse, blobless clone limited to the two
@@ -54,8 +53,6 @@ To build against a different rocm-libraries ref, check it out directly,
 e.g. `git -C rocm-libraries fetch --depth 1 origin <ref> && git -C
 rocm-libraries checkout FETCH_HEAD`.
 
-=======
->>>>>>> 93a828f (Initial import of dnn-benchmarking from rocm-libraries)
 Requires Python 3.12 or newer.
 
 ```bash
