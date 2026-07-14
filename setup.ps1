@@ -6,10 +6,11 @@
 .DESCRIPTION
     Installs dnn-benchmark into the ROCm wheel env named by the ROCM_WHEEL_VENV env
     var (published by wheel_build_setup.ps1); if it's unset, wheel_build_setup.ps1 is
-    run to create the venv and set it. Optionally builds hipDNN, the standalone
-    Python bindings, and the MIOpen provider from source (-ForceBuild), wires the
-    bindings onto the env via a .pth, installs the tool (editable) and PyTorch per
-    -TorchMode, then verifies the result.
+    run to create the venv and set it. Builds hipDNN, the standalone Python
+    bindings, and the MIOpen provider from source by default (pass -ReuseArtifacts to
+    skip and use whatever is already installed instead), wires the bindings onto the
+    env via a .pth, installs the tool (editable) and PyTorch per -TorchMode, then
+    verifies the result.
 
     Parameters mirror setup.sh where they apply on Windows. setup.sh's venv
     management (--reuse-venv / --workspace) is omitted: this script installs into
@@ -28,31 +29,35 @@
 .PARAMETER TorchIndexUrl
     Override the pip index URL used for torch (setup.sh --torch-index-url).
 
-.PARAMETER ForceBuild
-    Build hipDNN, the standalone Python bindings, and the MIOpen provider from
-    source. hipDNN/provider artifacts install to -InstallDir; Python bindings stay
-    in their build tree and are wired onto the env via a .pth. Needs the MSVC
-    toolchain and a ROCm devel prefix (the _rocm_sdk_devel wheel, or -RocmPrefix).
+.PARAMETER ReuseArtifacts
+    Skip building hipDNN, its standalone Python bindings, and the MIOpen provider
+    from source. Use the selected ROCm prefix's existing artifacts instead. Because
+    rocm-libraries tracks develop independently of ROCm PyTorch wheels, and those
+    wheels currently lack hipDNN development artifacts, building from source is the
+    default rather than opt-in. The from-source artifacts install to -InstallDir;
+    bindings are packaged into their frontend wheel layout and wired onto the env.
+    Needs the MSVC toolchain and a ROCm devel prefix (the _rocm_sdk_devel wheel, or
+    -RocmPrefix) only when not specified.
 
 .PARAMETER RocmPrefix
     Explicit ROCm/hipDNN prefix for the binding/provider build (setup.sh
     --rocm-prefix). Takes precedence over _rocm_sdk_devel wheel discovery.
 
 .PARAMETER InstallDir
-    Install prefix for -ForceBuild. Default: <hipdnn>/install.
+    Install prefix for the from-source build. Default: <hipdnn>/install.
 
 .PARAMETER GpuArch
     GPU architecture to build for, i.e. GPU_TARGETS (setup.sh --gpu-arch).
     Default: gfx1151 (matches wheel_build_setup.ps1).
 
 .PARAMETER Force
-    Clean reconfigure: wipe build dirs before -ForceBuild, and rewrite the .pth.
+    Clean reconfigure: wipe build dirs before building, and rewrite the .pth.
 
 .EXAMPLE
     pwsh ./setup.ps1
 
 .EXAMPLE
-    pwsh ./setup.ps1 -ForceBuild
+    pwsh ./setup.ps1 -ReuseArtifacts
 
 .EXAMPLE
     pwsh ./setup.ps1 -TorchMode existing
@@ -65,7 +70,7 @@ param(
     [ValidateSet('rocm', 'cpu', 'existing', 'none')]
     [string]$TorchMode = 'rocm',
     [string]$TorchIndexUrl,
-    [switch]$ForceBuild,
+    [switch]$ReuseArtifacts,
     [string]$RocmPrefix,
     [string]$InstallDir,
     [string]$GpuArch = 'gfx1151',
@@ -76,25 +81,57 @@ $ErrorActionPreference = 'Stop'
 # Let intentional exit-code probes (e.g. "does rocm_sdk import?") not throw.
 $PSNativeCommandUseErrorActionPreference = $false
 
+# Build hipDNN + the MIOpen provider from source by default -- see
+# .PARAMETER ReuseArtifacts above for why.
+$DoBuild = -not $ReuseArtifacts
+
 # --- Paths -----------------------------------------------------------------
-$ScriptDir   = $PSScriptRoot
-$HipdnnRoot  = (Resolve-Path (Join-Path $ScriptDir '..\..')).Path
-$BuildDir = Join-Path $HipdnnRoot 'build'
-$BindingsRoot  = Join-Path $HipdnnRoot 'python'
-$BindingsSrc   = Join-Path $BindingsRoot 'frontend_bindings'
-$BindingsBuild = Join-Path $BuildDir 'python'
-$BindingsPackage = Join-Path $BindingsBuild 'wheel_package'
-$BindingsPkgDir = Join-Path $BindingsPackage 'hipdnn_frontend'
+$ScriptDir        = $PSScriptRoot
+$RocmLibrariesDir = Join-Path $ScriptDir 'rocm-libraries'
+$HipdnnRoot       = Join-Path $RocmLibrariesDir 'projects\hipdnn'
+$BuildDir         = Join-Path $HipdnnRoot 'build'
+$BindingsRoot     = Join-Path $HipdnnRoot 'python'
+$BindingsSrc      = Join-Path $BindingsRoot 'frontend_bindings'
+$BindingsBuild    = Join-Path $BuildDir 'python'
+$BindingsPackage  = Join-Path $BindingsBuild 'wheel_package'
+$BindingsPkgDir   = Join-Path $BindingsPackage 'hipdnn_frontend'
 $BindingsPackScript = Join-Path $BindingsRoot 'frontend_wheel_package\pack_frontend_wheel.py'
-$ProviderDir = Join-Path $HipdnnRoot '..\..\dnn-providers\miopen-provider'
-$BuildType   = 'Release'
-$WinSdkRoot  = 'C:\Program Files (x86)\Windows Kits\10'
+$ProviderDir      = Join-Path $RocmLibrariesDir 'dnn-providers\miopen-provider'
+$BuildType        = 'Release'
+$WinSdkRoot       = 'C:\Program Files (x86)\Windows Kits\10'
 if (-not $InstallDir) { $InstallDir = Join-Path $HipdnnRoot 'install' }
 
 # wheel_build_setup.ps1 owns the wheel-venv location and publishes it as the
 # ROCM_WHEEL_VENV env var. Step 1 reads that (or runs the script to bootstrap a venv
 # and set it) -- so the venv path is never hardcoded here.
 $WheelSetupScript = Join-Path $HipdnnRoot 'scripts\windows\wheel_build_setup.ps1'
+
+# rocm-libraries is a git submodule (see .gitmodules) tracking the develop
+# branch by default. `git submodule update --init` (no special flags) fetches
+# it in full, exactly like any other submodule; Get-RocmLibrariesCheckout
+# below is this script's own fast path, used only when the directory isn't
+# already populated: fetch just the .gitmodules-pinned branch via a sparse,
+# blobless clone limited to the two subtrees this tool actually builds
+# (projects/hipdnn, dnn-providers), skipping the rest of the ~9GB monorepo.
+# To build against a different rocm-libraries ref, check it out directly,
+# e.g. `git -C rocm-libraries fetch --depth 1 origin <ref>; git -C
+# rocm-libraries checkout FETCH_HEAD`.
+function Get-RocmLibrariesCheckout {
+    if (Test-Path (Join-Path $RocmLibrariesDir '.git')) { return }
+
+    $gitmodules = Join-Path $ScriptDir '.gitmodules'
+    $url = (& git config -f $gitmodules submodule.rocm-libraries.url).Trim()
+    $branch = (& git config -f $gitmodules submodule.rocm-libraries.branch).Trim()
+
+    Write-Step "Fetching rocm-libraries ($branch) via sparse checkout (projects/hipdnn, dnn-providers)"
+    if (Test-Path $RocmLibrariesDir) { Remove-Item -Recurse -Force $RocmLibrariesDir }
+    Invoke-Native git @('clone', '--quiet', '--filter=blob:none', '--sparse',
+        '--no-checkout', $url, $RocmLibrariesDir)
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'sparse-checkout', 'set',
+        'projects/hipdnn', 'dnn-providers')
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'fetch', '--quiet', '--depth', '1', 'origin', $branch)
+    Invoke-Native git @('-C', $RocmLibrariesDir, 'checkout', '--quiet', 'FETCH_HEAD')
+}
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Warn($msg) { Write-Host "WARNING: $msg" -ForegroundColor Yellow }
@@ -235,7 +272,11 @@ if (-not (Test-RocmRuntime)) {
 }
 
 # --- 3. Build from source --------------------------------------------------
-if ($ForceBuild) {
+if ($DoBuild) {
+    # rocm-libraries provides the hipDNN sources and MIOpen provider plugin
+    # this build step compiles; only needed when actually building.
+    Get-RocmLibrariesCheckout
+
     # ROCm devel prefix: provides clang++, hipcc, and the CMake configs. Prefer
     # -RocmPrefix, else discover the _rocm_sdk_devel wheel in the env.
     if ($RocmPrefix) {
@@ -244,7 +285,7 @@ if ($ForceBuild) {
     else {
         $Wheel = (& $Python -c "import os,_rocm_sdk_devel as d; print(os.path.dirname(d.__file__))" 2>$null)
         if ($LASTEXITCODE -ne 0 -or -not $Wheel) {
-            throw "-ForceBuild needs the ROCm devel wheel (_rocm_sdk_devel) in $Python's env, or pass -RocmPrefix."
+            throw "Building from source needs the ROCm devel wheel (_rocm_sdk_devel) in $Python's env, or pass -RocmPrefix."
         }
         $Wheel = $Wheel.Trim()
     }
@@ -427,8 +468,8 @@ elseif ($pydDir) {
 }
 else {
     Write-Warn ("hipdnn_frontend is not importable and no compiled extension was found " +
-                "under $BindingsPkgDir or legacy build lib directories. Re-run with -ForceBuild, " +
-                "or build the standalone CMake project under $BindingsSrc.")
+                "under $BindingsPkgDir or legacy build lib directories. Re-run without -ReuseArtifacts " +
+                "to build from source, or build the standalone CMake project under $BindingsSrc.")
 }
 
 # --- 5. Install the dnn-benchmark package + PyTorch ------------------------
@@ -519,7 +560,7 @@ Write-Host ""
 Write-Step "Setup complete."
 Write-Host "  Run benchmarks with:" -ForegroundColor Green
 Write-Host "    & '$DnnExe' --graph <graph.json>"
-if ($ForceBuild) {
+if ($DoBuild) {
     # Point at the engines dir the provider actually installed to (bin/ on Windows).
     if (-not $PluginEnginesDir) { $PluginEnginesDir = Join-Path $InstallDir 'bin\hipdnn_plugins\engines' }
     Write-Host "    & '$DnnExe' --graph <graph.json> ``"

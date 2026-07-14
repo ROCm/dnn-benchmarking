@@ -1,0 +1,4 @@
+[submodule "rocm-libraries"]
+	path = rocm-libraries
+	url = https://github.com/ROCm/rocm-libraries.git
+	branch = develop
