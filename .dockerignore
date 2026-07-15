@@ -1,0 +1,22 @@
+# Local VCS/worktree state is not needed inside the image.
+.git
+**/.git
+
+# Local build/test/cache artifacts.
+.workspace
+build
+dist
+*.egg-info
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# dnn-benchmarking files not copied by Dockerfile.dnn-benchmark-performance.
+/tests
+/graphs
+/sample_configs
+/docs

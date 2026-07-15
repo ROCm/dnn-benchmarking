@@ -1,0 +1,153 @@
+# syntax=docker/dockerfile:1.7
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+ARG BASE_IMAGE=ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS builder
+
+ARG DEVICE_TARGET=gfx942
+ARG GPU_TARGET=gfx94X-dcgpu
+ARG ROCM_WHEEL_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HIP_PLATFORM=amd \
+    VENV_PATH=/opt/rocm-wheel-venv \
+    ROCM_SDK_PATH=/opt/rocm-wheel-venv/lib/python3.12/site-packages/_rocm_sdk_devel \
+    THIRD_PARTY_DEPS_DIR=/opt/third-party-deps \
+    PYTHON_BUILD_DIR=/workspace/build/hipdnn-python \
+    RUNTIME_VENV=/opt/dnn-benchmark/venv
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        git \
+        ninja-build \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY rocm-libraries ./rocm-libraries
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3.12 -m venv "${VENV_PATH}" && \
+    "${VENV_PATH}/bin/python" -m pip install --upgrade pip setuptools wheel && \
+    "${VENV_PATH}/bin/python" -m pip install \
+        --index-url "${ROCM_WHEEL_INDEX}" \
+        "rocm[libraries,devel,device-${DEVICE_TARGET}]" && \
+    "${VENV_PATH}/bin/rocm-sdk" init
+
+RUN cmake -S rocm-libraries -B build/rocm-libraries -GNinja \
+        -DROCM_LIBS_ENABLE_COMPONENTS="hipdnn;miopen-provider;hipblaslt-provider;hip-kernel-provider" \
+        -DROCM_PATH="${ROCM_SDK_PATH}" \
+        -DCMAKE_INSTALL_PREFIX="${ROCM_SDK_PATH}" \
+        -DCMAKE_PROGRAM_PATH="${ROCM_SDK_PATH}/lib/llvm/bin" \
+        -DGPU_TARGETS="${GPU_TARGET}" \
+        -DROCM_LIBS_ENABLE_ROOT_CTEST=OFF \
+        -DHIPDNN_SKIP_TESTS=ON \
+        -DMIOPENPROVIDER_SKIP_TESTS=ON \
+        -DHIPKERNELPROVIDER_ENABLE_TESTS=OFF \
+        -DHIPKERNELPROVIDER_ENABLE_ROCKE=OFF \
+        -DENABLE_CLANG_FORMAT=OFF \
+        -DENABLE_CLANG_TIDY=OFF && \
+    cmake --build build/rocm-libraries && \
+    cmake --install build/rocm-libraries --prefix "${ROCM_SDK_PATH}"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    "${VENV_PATH}/bin/python" -m pip install --upgrade build numpy && \
+    "${VENV_PATH}/bin/python" rocm-libraries/projects/hipdnn/python/download_third_party_deps.py \
+        --deps-dir "${THIRD_PARTY_DEPS_DIR}"
+
+RUN cmake -S rocm-libraries/projects/hipdnn/python/frontend_bindings \
+        -B "${PYTHON_BUILD_DIR}" \
+        -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE=/workspace/rocm-libraries/cmake/toolchains/rocm-clang.cmake \
+        -DROCM_PATH="${ROCM_SDK_PATH}" \
+        -DCMAKE_PREFIX_PATH="${ROCM_SDK_PATH}" \
+        -DCMAKE_PROGRAM_PATH="${ROCM_SDK_PATH}/lib/llvm/bin" \
+        -DFETCHCONTENT_SOURCE_DIR_NANOBIND="${THIRD_PARTY_DEPS_DIR}/nanobind-2.12.0" \
+        -DFETCHCONTENT_SOURCE_DIR_TSL_ROBIN_MAP="${THIRD_PARTY_DEPS_DIR}/robin-map-1.4.1" \
+        -DPython_EXECUTABLE="${VENV_PATH}/bin/python" && \
+    cmake --build "${PYTHON_BUILD_DIR}" && \
+    "${VENV_PATH}/bin/python" rocm-libraries/projects/hipdnn/python/frontend_wheel_package/pack_frontend_wheel.py \
+        --build-dir "${PYTHON_BUILD_DIR}" \
+        --wheel-dir "${PYTHON_BUILD_DIR}/wheel_package"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3.12 -m venv "${RUNTIME_VENV}" && \
+    "${RUNTIME_VENV}/bin/python" -m pip install --upgrade pip setuptools wheel && \
+    "${RUNTIME_VENV}/bin/python" -m pip install "${PYTHON_BUILD_DIR}"/wheel_package/hipdnn_frontend-*.whl && \
+    "${RUNTIME_VENV}/bin/python" -m pip install .
+
+FROM ${BASE_IMAGE} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HIP_PLATFORM=amd \
+    ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    LD_LIBRARY_PATH=/opt/rocm/lib \
+    PATH=/opt/dnn-benchmark/venv/bin:/opt/rocm/bin:${PATH}
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libdrm2 \
+        libelf1 \
+        libgcc-s1 \
+        libnuma1 \
+        libstdc++6 \
+        libtinfo6 \
+        python3.12 \
+        python3.12-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/rocm-wheel-venv/lib/python3.12/site-packages/_rocm_sdk_devel /opt/rocm
+COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
+
+RUN <<'EOF'
+cat > /usr/local/bin/dnn-benchmark-performance <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+export HIP_PATH="${HIP_PATH:-${ROCM_PATH}}"
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LD_LIBRARY_PATH}"
+else
+    export LD_LIBRARY_PATH="${ROCM_PATH}/lib"
+fi
+
+plugin_path_seen=0
+for arg in "$@"; do
+    case "${arg}" in
+        --plugin-path|--plugin-path=*)
+            plugin_path_seen=1
+            ;;
+    esac
+done
+
+if [[ "${plugin_path_seen}" -eq 0 ]]; then
+    exec /opt/dnn-benchmark/venv/bin/dnn-benchmark \
+        --plugin-path "${ROCM_PATH}/lib/hipdnn_plugins/engines" \
+        "$@"
+fi
+
+exec /opt/dnn-benchmark/venv/bin/dnn-benchmark "$@"
+SCRIPT
+chmod 0755 /usr/local/bin/dnn-benchmark-performance
+EOF
+
+ENTRYPOINT ["dnn-benchmark-performance"]
