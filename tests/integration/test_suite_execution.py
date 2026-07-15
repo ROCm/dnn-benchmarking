@@ -513,7 +513,7 @@ class TestPyTorchBackendCLIIntegration:
     """Suite-CLI tests for --backend pytorch (no hipDNN/plugins required).
 
     Separate from TestSuiteCLIIntegration so these run on CUDA-only hosts,
-    where setup.sh --torch-mode cuda intentionally skips hipDNN and plugins.
+    where setup_env.py --torch-mode cuda intentionally skips hipDNN and plugins.
     Each test only needs a torch GPU.
     """
 

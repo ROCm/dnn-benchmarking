@@ -12,10 +12,7 @@ A `--backend pytorch` executor runs the same graphs through PyTorch (ROCm or CUD
 
 ```bash
 # Full setup (venv, requirements, hipDNN bindings) — skips hipDNN/provider build if already installed
-./setup.sh
-
-# Full setup AND build hipDNN + MIOpen provider from source (overwrites existing artifacts)
-./setup.sh --force-build
+python3 setup_env.py
 
 # Manual setup for ROCm/AMD GPU development (gfx90X or gfx94X)
 pip install --pre torch --index-url https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/
@@ -25,21 +22,20 @@ pip install -e .                              # package + PyPI deps (numpy, pyte
 cd /path/to/hipdnn/python && pip install -e . --no-deps
 
 # CUDA host (NVIDIA): PyTorch backend only, skips all ROCm/hipDNN setup
-./setup.sh --torch-mode cuda --workspace .workspace
+python3 setup_env.py --torch-mode cuda --workspace .workspace
 ```
 
-`--force-build` installs hipDNN and the MIOpen plugin to `/opt/rocm` (prompts for confirmation).
 Pass `/opt/rocm/lib/hipdnn_plugins/engines/` to `--plugin-path` when running benchmarks.
 
-`--torch-mode cuda` installs a CUDA PyTorch wheel (from PyPI, or `--torch-index-url`) and skips hipDNN/provider builds, hipDNN bindings, amdsmi, and ROCm env wiring. `--force-build` is rejected in this mode. Only `--backend pytorch` works on CUDA hosts.
+`--torch-mode cuda` installs a CUDA PyTorch wheel (from PyPI, or `--torch-index-url`) and skips hipDNN/provider builds, hipDNN bindings, amdsmi, and ROCm env wiring. Only `--backend pytorch` works on CUDA hosts.
 
 ### ROCm PyTorch Setup
 
-`setup.sh` auto-detects the GPU architecture and installs PyTorch from the matching ROCm nightly index. Supported architectures:
+`setup_env.py` auto-detects the GPU architecture and installs PyTorch from the matching ROCm nightly index. Supported architectures:
 
 | GPU | `--gpu-arch` | Torch index bucket |
 |-----|--------------|--------------------|
-| MI200/MI210/MI250 | `gfx90a` | `gfx90X-dcgpu` |
+| MI200/MI210/MI250 | `gfx90a` | `gfx90a` |
 | MI300X/MI300A | `gfx942` | `gfx94X-dcgpu` |
 | MI350 | `gfx950` | `gfx950-dcgpu` |
 

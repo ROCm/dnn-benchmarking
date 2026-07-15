@@ -42,7 +42,7 @@ compared offline. See [Cross-Machine Comparison](#cross-machine-comparison-rocm-
 Run the provided setup script from the `dnn-benchmarking` directory:
 
 `rocm-libraries` (hipDNN sources and provider plugins) is a git submodule
-tracking its `develop` branch by default. `setup.sh`/`setup.ps1` fetch it
+tracking its `develop` branch by default. `setup_env.py` fetches it
 automatically on first run via a sparse, blobless clone limited to the two
 subtrees this tool builds (`projects/hipdnn`, `dnn-providers`) rather than
 the full ~9GB monorepo, and build hipDNN plus the provider plugins from it
@@ -56,7 +56,7 @@ rocm-libraries checkout FETCH_HEAD`.
 Requires Python 3.12 or newer.
 
 ```bash
-bash setup.sh --workspace .workspace
+python3 setup_env.py --workspace .workspace
 source .workspace/.venv/bin/activate
 ```
 
@@ -66,7 +66,7 @@ otherwise it uses `.workspace` under the `dnn-benchmarking` directory. Use
 and runtime benchmark caches somewhere else:
 
 ```bash
-bash setup.sh --workspace /tmp/dnn-bench
+python3 setup_env.py --workspace /tmp/dnn-bench
 source /tmp/dnn-bench/.venv/bin/activate
 ```
 
@@ -95,7 +95,7 @@ so Python reference validation can use torch without pulling conflicting ROCm
 torch wheels:
 
 ```bash
-bash setup.sh --torch-mode cpu --rocm-prefix /opt/rocm
+python3 setup_env.py --torch-mode cpu --rocm-prefix /opt/rocm
 source /workspace/.venv/bin/activate
 ```
 
@@ -117,7 +117,7 @@ comparison against ROCm results — install a CUDA PyTorch build with
 `--torch-mode cuda`:
 
 ```bash
-bash setup.sh --torch-mode cuda --workspace .workspace
+python3 setup_env.py --torch-mode cuda --workspace .workspace
 source .workspace/.venv/bin/activate
 ```
 
@@ -126,8 +126,7 @@ source .workspace/.venv/bin/activate
 ROCm setup**: no hipDNN build, engine plugins, hipDNN Python bindings, amdsmi,
 or `ROCM_PATH`/`LD_LIBRARY_PATH` wiring. Only the `--backend pytorch` executor
 is available in this mode — the hipDNN backend requires `hipdnn_frontend` and
-ROCm. `--force-build` is rejected with `--torch-mode cuda` because building
-hipDNN requires a ROCm toolchain.
+ROCm.
 
 ```bash
 # Benchmark a graph suite through PyTorch CUDA and emit comparable JSON
@@ -212,7 +211,7 @@ Extracted 42 graph(s) from ./Workloads/conv_workloads.tar.gz
 
 Run multiple engines by passing comma-separated engine IDs. By default,
 dnn-benchmarking infers the plugin directory from
-`$ROCM_PATH/lib/hipdnn_plugins/engines` when `ROCM_PATH` is set by `setup.sh`
+`$ROCM_PATH/lib/hipdnn_plugins/engines` when `ROCM_PATH` is set by `setup_env.py`
 activation. Plugin paths may also be a single shared directory or a
 comma-separated list matching `--engine` order.
 
@@ -458,7 +457,7 @@ pytest -m gpu --dnn-plugin-paths /path/to/hipdnn_plugins/engines
 ### GPU Tests
 
 GPU tests require hipDNN Python bindings and ROCm libraries. When using
-`setup.sh`, activate the venv first; activation sets `ROCM_PATH` and prepends
+`setup_env.py`, activate the venv first; activation sets `ROCM_PATH` and prepends
 the selected prefix's `lib` directory to `LD_LIBRARY_PATH`:
 
 ```bash

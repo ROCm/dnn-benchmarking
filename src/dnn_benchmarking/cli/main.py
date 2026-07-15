@@ -11,7 +11,7 @@ from pathlib import Path
 # Redirect ROCm/tool caches away from the network home directory before any
 # ROCm library is imported. MIOpen, comgr, pip, and torch all default to
 # ~/.cache/ or ~/.miopen/, which is a network filesystem on AMD dev machines.
-# DNN_BENCH_WORKSPACE is set by setup.sh; fall back to /tmp/dnn-bench-cache.
+# DNN_BENCH_WORKSPACE is set by setup_env.py; fall back to /tmp/dnn-bench-cache.
 _CACHE_BASE = Path(os.environ.get("DNN_BENCH_WORKSPACE", "/workspace"))
 _LOCAL_CACHE_DEFAULTS = {
     "XDG_CACHE_HOME": _CACHE_BASE / "cache",

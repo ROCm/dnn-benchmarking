@@ -1,0 +1,90 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: setup
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# setup_env.py is the single cross-platform entry point (replaces setup.sh /
+# setup.ps1). This workflow proves the shared front half and a full no-GPU
+# install work on both Linux and Windows. No GPU is required or used: the
+# install smoke uses --torch-mode cuda, whose CUDA early-exit completes without
+# hardware. The CUDA wheel download (~large) is the cost of a genuine cross-OS
+# install verification. The ROCm from-source build (Linux/Windows) is NOT
+# exercised here — CI runners have no GPU by design.
+defaults:
+  run:
+    # GitHub's windows-2022 runners ship Git-bash, so a single bash step keeps
+    # the assertions identical across OSes.
+    shell: bash
+
+jobs:
+  setup:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # No submodules: the rocm-libraries submodule stays empty; the tested
+      # paths (validation + CUDA early-exit) never need it.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Validation smoke (no venv/network)
+        run: |
+          set -x
+          python setup_env.py --help
+          test $? -eq 0
+
+          set +e
+          python setup_env.py --torch-mode bogus
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+
+          set +e
+          python setup_env.py --nope
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+
+      # cu124 torch yields a CUDA-enabled wheel on both linux-64 and win-64
+      # (bare PyPI torch is CPU-only on Windows, which would report mode 'cpu'
+      # and fail require_torch_mode cuda). cu124 torch reports torch.version.cuda
+      # set even with no GPU, so get_torch_mode -> cuda and the CUDA early-exit
+      # path completes without hardware.
+      - name: Install smoke (no-GPU CUDA path)
+        run: |
+          python setup_env.py \
+            --torch-mode cuda \
+            --torch-index-url https://download.pytorch.org/whl/cu124 \
+            --workspace .ci-workspace \
+            --yes
+
+      # dnn_benchmarking picks its cache root from DNN_BENCH_WORKSPACE at import
+      # (on Linux the venv activation sets it; set it explicitly here so the
+      # console-script assert works uniformly on both OSes without sourcing).
+      - name: Assert install (Linux)
+        if: runner.os == 'Linux'
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-workspace
+        run: |
+          .ci-workspace/.venv/bin/python -c "import dnn_benchmarking; print('OK')"
+          .ci-workspace/.venv/bin/dnn-benchmark --help
+
+      - name: Assert install (Windows)
+        if: runner.os == 'Windows'
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-workspace
+        run: |
+          .ci-workspace/.venv/Scripts/python -c "import dnn_benchmarking; print('OK')"
+          .ci-workspace/.venv/Scripts/dnn-benchmark --help
