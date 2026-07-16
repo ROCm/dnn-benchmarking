@@ -140,14 +140,27 @@ jobs:
         run: |
           python setup_env.py --gpu-arch gfx90a --workspace .ci-rocm-workspace -y
 
+      # The from-source build installs the whole tool (dnn_benchmarking) on top
+      # of the compiled bindings. Assert the full no-GPU surface: the compiled
+      # hipdnn_frontend extension loads and its ROCm deps resolve, and the tool
+      # itself imports and its CLI runs. A real benchmark needs a GPU (hipDNN
+      # Handle + kernel dispatch), so it stays on the on-hardware gfx90a run.
       - name: Assert install (Linux)
         if: runner.os == 'Linux'
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
         run: |
           .ci-rocm-workspace/.venv/bin/python -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
+          .ci-rocm-workspace/.venv/bin/python -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          .ci-rocm-workspace/.venv/bin/dnn-benchmark --help
 
       # Windows rocm-mode retargets the venv to workspace/rocm-wheel-venv
       # (ROCM_WHEEL_VENV back-compat; see setup_env.py's setup_venv).
       - name: Assert install (Windows)
         if: runner.os == 'Windows'
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
         run: |
           .ci-rocm-workspace/rocm-wheel-venv/Scripts/python.exe -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
+          .ci-rocm-workspace/rocm-wheel-venv/Scripts/python.exe -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          .ci-rocm-workspace/rocm-wheel-venv/Scripts/dnn-benchmark --help
