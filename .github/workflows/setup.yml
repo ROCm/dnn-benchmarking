@@ -5,25 +5,42 @@ name: setup
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'graphs/**'
+      - 'Workloads/**'
+      - 'sample_configs/**'
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'graphs/**'
+      - 'Workloads/**'
+      - 'sample_configs/**'
 
 permissions:
   contents: read
 
-# setup_env.py is the single cross-platform entry point (replaces setup.sh /
-# setup.ps1). Two jobs prove the tool without needing a GPU:
-#   setup:      argument-validation contracts + a full --torch-mode cuda
-#               install on both OSes (CUDA torch's early-exit path completes
-#               without hardware).
-#   rocm-build: a real --torch-mode rocm from-source build (hipDNN + all
-#               provider plugins + Python bindings) against the ROCm torch
-#               nightly's bundled SDK wheels. Compiling/linking needs no GPU,
-#               only --gpu-arch to pick the nightly bucket and set
-#               GPU_TARGETS/AMDGPU_TARGETS. Verified end-to-end on real gfx90a
-#               hardware in addition to this job; Windows is best-effort
-#               (continue-on-error) since no Windows/ROCm host exists to
-#               confirm it.
+# rocm-build pulls ~13 GB of ROCm SDK wheels, so never let rapid pushes queue
+# duplicate runs of it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# setup_env.py is the single cross-platform entry point. Two jobs cover it with
+# no GPU on either OS:
+#   setup:      setup_env.py's own error contracts, a full --torch-mode cuda
+#               install (CUDA torch's early-exit path completes without
+#               hardware), and the unit suite.
+#   rocm-build: a real --torch-mode rocm from-source build (hipDNN + all provider
+#               plugins + Python bindings) against the ROCm torch nightly's
+#               bundled SDK wheels. Compiling and linking need no device, only
+#               --gpu-arch to pick the nightly bucket and set
+#               GPU_TARGETS/AMDGPU_TARGETS. Linux is additionally verified on
+#               real gfx90a hardware; Windows is gated here but has never been
+#               confirmed on a Windows/ROCm host.
 defaults:
   run:
     # GitHub's windows-2022 runners ship Git-bash, so a single bash step keeps
@@ -37,6 +54,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       # No submodules: the rocm-libraries submodule stays empty; the tested
       # paths (validation + CUDA early-exit) never need it.
@@ -45,83 +63,79 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Validation smoke (no venv/network)
+      # Assert setup_env.py's own error paths. The parser contract (bad choice,
+      # unknown flag) is argparse's and is already covered by
+      # tests/unit/cli/test_setup_script.py. -y is required: these modes leave
+      # do_build on, so confirm_build() would otherwise block on stdin.
+      - name: Validation smoke (no network)
         run: |
-          set -x
-          python setup_env.py --help
-          test $? -eq 0
+          rc=0
+          python setup_env.py --torch-mode existing -y \
+            --workspace .no-such-ws 2> existing.err || rc=$?
+          cat existing.err
+          test "$rc" -eq 1
+          grep -q "requires an existing virtual environment" existing.err
 
-          set +e
-          python setup_env.py --torch-mode bogus
-          rc=$?
-          set -e
-          test "$rc" -eq 2
+      # Linux-only: Windows torch wheels are published per-arch under v2/, so any
+      # arch resolves to a URL and a bad one surfaces from pip, not from us.
+      - name: Validation smoke (unsupported arch)
+        if: runner.os == 'Linux'
+        run: |
+          rc=0
+          python setup_env.py --gpu-arch bogus -y \
+            --workspace .bad-arch-ws 2> arch.err || rc=$?
+          cat arch.err
+          test "$rc" -eq 1
+          grep -q "Unsupported GPU architecture 'bogus'" arch.err
 
-          set +e
-          python setup_env.py --nope
-          rc=$?
-          set -e
-          test "$rc" -eq 2
-
-      # cu124 torch yields a CUDA-enabled wheel on both linux-64 and win-64
-      # (bare PyPI torch is CPU-only on Windows, which would report mode 'cpu'
-      # and fail require_torch_mode cuda). cu124 torch reports torch.version.cuda
-      # set even with no GPU, so get_torch_mode -> cuda and the CUDA early-exit
-      # path completes without hardware.
+      # cu124 torch yields a CUDA-enabled wheel on both linux-64 and win-64 (bare
+      # PyPI torch is CPU-only on Windows, which would report mode 'cpu' and fail
+      # require_torch_mode cuda). cu124 torch reports torch.version.cuda set even
+      # with no GPU, so get_torch_mode -> cuda and the early-exit path completes
+      # without hardware.
       - name: Install smoke (no-GPU CUDA path)
         run: |
           python setup_env.py \
             --torch-mode cuda \
             --torch-index-url https://download.pytorch.org/whl/cu124 \
-            --workspace .ci-workspace \
-            --yes
+            --workspace .ci-workspace
 
-      # dnn_benchmarking picks its cache root from DNN_BENCH_WORKSPACE at import
-      # (on Linux the venv activation sets it; set it explicitly here so the
-      # console-script assert works uniformly on both OSes without sourcing).
-      - name: Assert install (Linux)
-        if: runner.os == 'Linux'
-        env:
-          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-workspace
+      - name: Assert install and run unit tests
         run: |
-          .ci-workspace/.venv/bin/python -c "import dnn_benchmarking; print('OK')"
-          .ci-workspace/.venv/bin/dnn-benchmark --help
-
-      - name: Assert install (Windows)
-        if: runner.os == 'Windows'
-        env:
-          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-workspace
-        run: |
-          .ci-workspace/.venv/Scripts/python -c "import dnn_benchmarking; print('OK')"
-          .ci-workspace/.venv/Scripts/dnn-benchmark --help
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            VENV=.ci-workspace/.venv/Scripts
+          else
+            VENV=.ci-workspace/.venv/bin
+          fi
+          "$VENV/python" -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          "$VENV/dnn-benchmark" --help
+          "$VENV/python" -m pytest -m "not gpu" -q
 
   rocm-build:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        include:
+          # gfx90a is a datacenter arch served by the Linux nightly buckets;
+          # gfx1151 is the only arch with published Windows torch wheels.
+          - os: ubuntu-24.04
+            gpu-arch: gfx90a
+          - os: windows-2022
+            gpu-arch: gfx1151
     runs-on: ${{ matrix.os }}
-    # Windows rocm-mode is unverified: no Windows/ROCm host exists to confirm
-    # it end-to-end, so a failure here doesn't gate the PR. Linux is a required
-    # check (verified against real hardware and this exact CI job). Known open
-    # issue: wheel_build_setup.ps1's bootstrap and install_torch() each pull
-    # an independent, unpinned "latest nightly" snapshot into the same venv;
-    # a version skew between the two can leave hipdnn_frontend built against
-    # newer devel headers than the runtime DLLs actually installed, failing
-    # import with "procedure could not be found" even though hipDNN, the
-    # providers, and the extension itself compile and link successfully.
-    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    timeout-minutes: 180
     steps:
       # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
-      # with only ~16 GB free, which isn't enough headroom alongside pip's
-      # download cache and the sparse rocm-libraries checkout. Reclaim
-      # preinstalled toolchains this job doesn't use (~26 GB back on a real
-      # runner) and skip pip's cache to keep the build's footprint self-contained.
+      # with only ~16 GB free, which isn't enough headroom alongside the sparse
+      # rocm-libraries checkout. Reclaim preinstalled toolchains this job doesn't
+      # use and skip pip's cache to keep the build's footprint self-contained.
+      # $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) is deliberately left alone:
+      # setup-python below reads it, and wiping it forces a redownload.
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup || true
           docker system prune -af || true
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -129,38 +143,29 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Full from-source build (hipDNN + MIOpen/hipBLASLt/hip-kernel providers +
-      # Python bindings) via the ROCm torch nightly's bundled SDK wheels. No GPU
-      # is required or present: compiling and linking against the ROCm devel
-      # wheel's headers/libs needs no device, only --gpu-arch to pick the
-      # nightly bucket and the GPU_TARGETS/AMDGPU_TARGETS compile flags.
       - name: Full rocm-mode build (no GPU)
         env:
           PIP_NO_CACHE_DIR: "1"
         run: |
-          python setup_env.py --gpu-arch gfx90a --workspace .ci-rocm-workspace -y
+          python setup_env.py \
+            --gpu-arch ${{ matrix.gpu-arch }} \
+            --workspace .ci-rocm-workspace \
+            -y
 
-      # The from-source build installs the whole tool (dnn_benchmarking) on top
-      # of the compiled bindings. Assert the full no-GPU surface: the compiled
-      # hipdnn_frontend extension loads and its ROCm deps resolve, and the tool
-      # itself imports and its CLI runs. A real benchmark needs a GPU (hipDNN
-      # Handle + kernel dispatch), so it stays on the on-hardware gfx90a run.
-      - name: Assert install (Linux)
-        if: runner.os == 'Linux'
-        env:
-          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
+      # The build installs the whole tool on top of the compiled bindings. Assert
+      # the full no-GPU surface: the hipdnn_frontend extension loads and its ROCm
+      # deps resolve, and the tool imports and its CLI runs. A real benchmark
+      # needs a GPU (hipDNN Handle + kernel dispatch), so that stays on the
+      # on-hardware gfx90a run.
+      - name: Assert install
         run: |
-          .ci-rocm-workspace/.venv/bin/python -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
-          .ci-rocm-workspace/.venv/bin/python -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
-          .ci-rocm-workspace/.venv/bin/dnn-benchmark --help
-
-      # Windows rocm-mode retargets the venv to workspace/rocm-wheel-venv
-      # (ROCM_WHEEL_VENV back-compat; see setup_env.py's setup_venv).
-      - name: Assert install (Windows)
-        if: runner.os == 'Windows'
-        env:
-          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
-        run: |
-          .ci-rocm-workspace/rocm-wheel-venv/Scripts/python.exe -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
-          .ci-rocm-workspace/rocm-wheel-venv/Scripts/python.exe -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
-          .ci-rocm-workspace/rocm-wheel-venv/Scripts/dnn-benchmark --help
+          # Windows rocm mode installs into the wheel env wheel_build_setup.ps1
+          # owns; see setup_env.py's _select_windows_wheel_venv.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            VENV=.ci-rocm-workspace/rocm-wheel-venv/Scripts
+          else
+            VENV=.ci-rocm-workspace/.venv/bin
+          fi
+          "$VENV/python" -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
+          "$VENV/python" -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          "$VENV/dnn-benchmark" --help
