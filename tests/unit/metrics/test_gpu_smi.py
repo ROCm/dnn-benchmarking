@@ -170,6 +170,42 @@ class TestSnapshot:
         assert snap["power_w"] == pytest.approx(250.0)
         assert snap["sclk_mhz"] == pytest.approx(1700.0)
 
+    def test_unavailable_values_do_not_warn(self, capsys):
+        fake = _build_fake_amdsmi()
+
+        def amdsmi_get_power_info(_h):
+            return {"average_socket_power": "N/A", "current_socket_power": "241.5"}
+
+        def amdsmi_get_temp_metric(_h, sensor, _metric):
+            if sensor == "edge":
+                raise _FakeAmdSmiException(
+                    "Error code:\n"
+                    "\t2 | AMDSMI_STATUS_NOT_SUPPORTED - Feature not supported"
+                )
+            return 65
+
+        def amdsmi_get_gpu_metrics_info(_h):
+            return {
+                "average_gfx_activity": "N/A",
+                "average_umc_activity": "42",
+                "throttle_status": "N/A",
+            }
+
+        fake.amdsmi_get_power_info = amdsmi_get_power_info
+        fake.amdsmi_get_temp_metric = amdsmi_get_temp_metric
+        fake.amdsmi_get_gpu_metrics_info = amdsmi_get_gpu_metrics_info
+
+        with patch.dict(sys.modules, {"amdsmi": fake}):
+            snap = gpu_smi.GpuSmiProbe().snapshot()
+
+        assert snap["power_w"] == pytest.approx(241.5)
+        assert snap["temp_edge_c"] is None
+        assert snap["temp_hotspot_c"] == pytest.approx(65.0)
+        assert snap["gpu_utilization_pct"] is None
+        assert snap["memory_utilization_pct"] == pytest.approx(42.0)
+        assert snap["throttle_status"] is None
+        assert "[metrics:amdsmi]" not in capsys.readouterr().err
+
     def test_init_failure_returns_empty_snapshot(self):
         fake = _build_fake_amdsmi(raises={"init": _FakeAmdSmiException})
         with patch.dict(sys.modules, {"amdsmi": fake}):

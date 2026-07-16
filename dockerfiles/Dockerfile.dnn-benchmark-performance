@@ -1,0 +1,250 @@
+# syntax=docker/dockerfile:1.7
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+ARG BASE_IMAGE=ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS builder
+
+ARG DEVICE_TARGET=gfx1152
+ARG GPU_TARGET=
+ARG TORCH_INDEX_URL=
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HIP_PLATFORM=amd \
+    BENCHMARK_VENV=/opt/dnn-benchmark/venv \
+    WORKSPACE_DIR=/workspace \
+    THIRD_PARTY_DEPS_DIR=/opt/third-party-deps \
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+
+ENV ROCM_SDK_PREFIX_FILE=${WORKSPACE_DIR}/rocm-sdk-prefixes.env \
+    PYTHON_BUILD_DIR=${WORKSPACE_DIR}/build/hipdnn-python
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        git \
+        ninja-build \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        python3-build \
+        python3-numpy \
+        python3-psutil && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR ${WORKSPACE_DIR}
+
+COPY dockerfiles/.rocm-cmake ./rocm-cmake
+COPY dockerfiles/.third-party ./third-party
+COPY rocm-libraries ./rocm-libraries
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
+set -eu
+
+case "${DEVICE_TARGET}" in
+    gfx90a) torch_index_bucket="gfx90a" ;;
+    gfx942) torch_index_bucket="gfx94X-dcgpu" ;;
+    gfx1152) torch_index_bucket="gfx1152" ;;
+    gfx950) torch_index_bucket="gfx950-dcgpu" ;;
+    *)
+        echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, or gfx1152." >&2
+        exit 1
+        ;;
+esac
+torch_index_url="${TORCH_INDEX_URL:-https://rocm.nightlies.amd.com/v2-staging/${torch_index_bucket}/}"
+printf '[global]\nindex-url = %s\n' "${torch_index_url}" > /etc/pip.conf
+
+python3.12 -m venv --system-site-packages "${BENCHMARK_VENV}"
+"${BENCHMARK_VENV}/bin/python" -m pip install --pre torch "rocm[devel,libraries]" --index-url "${torch_index_url}"
+"${BENCHMARK_VENV}/bin/python" -m rocm_sdk init
+
+rocm_devel_prefix="$("${BENCHMARK_VENV}/bin/python" -m rocm_sdk path --root)"
+rocm_core_prefix="$("${BENCHMARK_VENV}/bin/python" - <<'PY'
+from pathlib import Path
+import rocm_sdk
+
+print(Path(rocm_sdk.find_libraries("amd_comgr")[0]).resolve().parent.parent)
+PY
+)"
+rocm_libraries_prefix="$("${BENCHMARK_VENV}/bin/python" - <<'PY'
+from pathlib import Path
+import rocm_sdk
+
+print(Path(rocm_sdk.find_libraries("miopen")[0]).resolve().parent.parent)
+PY
+)"
+
+"${BENCHMARK_VENV}/bin/python" - "${rocm_libraries_prefix}" "${rocm_core_prefix}" "${rocm_devel_prefix}" "${ROCM_SDK_PREFIX_FILE}" <<'PY'
+from pathlib import Path
+import shlex
+import sys
+
+rocm_libraries_prefix, rocm_core_prefix, rocm_devel_prefix, prefix_file = sys.argv[1:]
+Path(prefix_file).write_text(
+    f"ROCM_LIBRARIES_PREFIX={shlex.quote(rocm_libraries_prefix)}\n"
+    f"ROCM_CORE_PREFIX={shlex.quote(rocm_core_prefix)}\n"
+    f"ROCM_DEVEL_PREFIX={shlex.quote(rocm_devel_prefix)}\n"
+)
+PY
+printf 'ROCm SDK libraries: %s\n' "${rocm_libraries_prefix}"
+printf 'ROCm SDK core: %s\n' "${rocm_core_prefix}"
+printf 'ROCm SDK devel: %s\n' "${rocm_devel_prefix}"
+EOF
+
+RUN . "${ROCM_SDK_PREFIX_FILE}" && \
+    gpu_target="${GPU_TARGET:-${DEVICE_TARGET}}" && \
+    cmake -S rocm-libraries -B build/rocm-libraries -GNinja \
+        -DCMAKE_TOOLCHAIN_FILE="${WORKSPACE_DIR}/rocm-libraries/cmake/toolchains/rocm-clang.cmake" \
+        -DROCM_PATH="${ROCM_DEVEL_PREFIX}" \
+        -DCMAKE_INSTALL_PREFIX="${ROCM_LIBRARIES_PREFIX}" \
+        -DROCM_LIBS_ENABLE_COMPONENTS="hipdnn;miopen-provider;hipblaslt-provider;hip-kernel-provider" \
+        -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX}" \
+        "-DFETCHCONTENT_SOURCE_DIR_ROCM-CMAKE=${WORKSPACE_DIR}/rocm-cmake" \
+        "-DFETCHCONTENT_SOURCE_DIR_FLATBUFFERS=${WORKSPACE_DIR}/third-party/flatbuffers" \
+        "-DFETCHCONTENT_SOURCE_DIR_SPDLOG=${WORKSPACE_DIR}/third-party/spdlog" \
+        "-DFETCHCONTENT_SOURCE_DIR_JSON=${WORKSPACE_DIR}/third-party/nlohmann_json" \
+        -DGPU_TARGETS="${gpu_target}" \
+        -DAMDGPU_TARGETS="${gpu_target}" \
+        -DROCM_LIBS_ENABLE_ROOT_CTEST=OFF \
+        -DHIPDNN_SKIP_TESTS=ON \
+        -DHIPDNN_ENABLE_SDPA=ON \
+        -DMIOPENPROVIDER_SKIP_TESTS=ON \
+        -DHIPKERNELPROVIDER_ENABLE_TESTS=OFF \
+        -DHIPKERNELPROVIDER_ENABLE_ROCKE=OFF \
+        -DENABLE_CLANG_FORMAT=OFF \
+        -DENABLE_CLANG_TIDY=OFF && \
+    cmake --build build/rocm-libraries && \
+    cmake --install build/rocm-libraries --prefix "${ROCM_LIBRARIES_PREFIX}"
+
+RUN "${BENCHMARK_VENV}/bin/python" -c "import build, numpy" && \
+    "${BENCHMARK_VENV}/bin/python" rocm-libraries/projects/hipdnn/python/download_third_party_deps.py \
+        --deps-dir "${THIRD_PARTY_DEPS_DIR}"
+
+RUN . "${ROCM_SDK_PREFIX_FILE}" && \
+    cmake -S rocm-libraries/projects/hipdnn/python/frontend_bindings \
+        -B "${PYTHON_BUILD_DIR}" \
+        -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE="${WORKSPACE_DIR}/rocm-libraries/projects/hipdnn/cmake/ClangToolChain.cmake" \
+        -DROCM_CMAKE_PATH="${ROCM_DEVEL_PREFIX}" \
+        -Dhip_DIR="${ROCM_DEVEL_PREFIX}/lib/cmake/hip" \
+        -DCMAKE_INSTALL_PREFIX="${ROCM_LIBRARIES_PREFIX}" \
+        -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX}" \
+        "-DFETCHCONTENT_SOURCE_DIR_ROCM-CMAKE=${WORKSPACE_DIR}/rocm-cmake" \
+        -DFETCHCONTENT_SOURCE_DIR_NANOBIND="${THIRD_PARTY_DEPS_DIR}/nanobind-2.12.0" \
+        -DFETCHCONTENT_SOURCE_DIR_TSL_ROBIN_MAP="${THIRD_PARTY_DEPS_DIR}/robin-map-1.4.1" \
+        -DPython_EXECUTABLE="${BENCHMARK_VENV}/bin/python" && \
+    cmake --build "${PYTHON_BUILD_DIR}" && \
+    "${BENCHMARK_VENV}/bin/python" rocm-libraries/projects/hipdnn/python/frontend_wheel_package/pack_frontend_wheel.py \
+        --build-dir "${PYTHON_BUILD_DIR}" \
+        --wheel-dir "${PYTHON_BUILD_DIR}/wheel_package"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    "${BENCHMARK_VENV}/bin/python" -m pip install --force-reinstall "${PYTHON_BUILD_DIR}"/wheel_package/hipdnn_frontend-*.whl && \
+    "${BENCHMARK_VENV}/bin/python" -m pip install --no-deps .
+
+# The benchmark's metrics tier samples GPU telemetry through the amdsmi Python
+# package. ROCm SDK wheels ship the binding sources under share/amd_smi but do
+# not install the Python module automatically, so install it into the benchmark
+# venv before copying the venv into the final image.
+RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
+set -eu
+amdsmi_dir="$("${BENCHMARK_VENV}/bin/python" - <<'PY'
+from pathlib import Path
+import sysconfig
+
+site = Path(sysconfig.get_paths()["purelib"])
+for candidate in site.glob("_rocm_sdk_core*/share/amd_smi"):
+    if (candidate / "setup.py").is_file() or (candidate / "pyproject.toml").is_file():
+        print(candidate)
+        break
+else:
+    raise SystemExit("amdsmi Python bindings not found in ROCm SDK core wheel")
+PY
+)"
+"${BENCHMARK_VENV}/bin/python" -m pip install --no-build-isolation -e "${amdsmi_dir}"
+"${BENCHMARK_VENV}/bin/python" -c "import amdsmi"
+EOF
+
+# rocm-sdk-devel is a build input. Runtime uses ROCm torch plus the patched
+# ROCm SDK libraries package that now contains hipDNN and the provider plugins.
+RUN . "${ROCM_SDK_PREFIX_FILE}" && \
+    tools_target="$(readlink -f "${ROCM_DEVEL_PREFIX}")" && \
+    "${BENCHMARK_VENV}/bin/python" -m pip uninstall -y rocm-sdk-devel && \
+    rm -rf "${tools_target}"
+
+
+FROM ${BASE_IMAGE} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HIP_PLATFORM=amd \
+    BENCHMARK_VENV=/opt/dnn-benchmark/venv \
+    WORKSPACE_DIR=/workspace \
+    PATH=/opt/dnn-benchmark/venv/bin:${PATH}
+
+# hipDNN engine plugins JIT-compile kernels through HIPRTC at runtime. The ROCm
+# libc++ headers include the system C headers, so libc6-dev must be present even
+# in the runtime image.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libc6-dev \
+        libatomic1 \
+        libdrm2 \
+        libelf1 \
+        libgcc-s1 \
+        libgomp1 \
+        libnuma1 \
+        libstdc++6 \
+        libtinfo6 \
+        python3.12 \
+        python3-numpy \
+        python3-typing-extensions \
+        python3-psutil \
+        linux-tools-common \
+        linux-tools-generic \
+        libsqlite3-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# linux-tools-{common,generic} provide the `perf` binary required by
+# dnn-benchmarking's `--perf` source (CPU cycles/IPC). Two runtime
+# gotchas the apt install can't fix:
+#
+#  * Container kernel mismatch — the perf wrapper dispatches to
+#    `perf_<kernel-version>`. If that build isn't present, perf
+#    complains and falls back; sometimes the user needs
+#    `apt install linux-tools-$(uname -r)` matching the host kernel.
+#  * Kernel-event collection (`cycles:k`) requires
+#    `/proc/sys/kernel/perf_event_paranoid <= 1`. Containers inherit
+#    the host value, so either run the container with
+#    `--cap-add=SYS_ADMIN` and `sysctl kernel.perf_event_paranoid=1`
+#    on the host first, or accept user-space-only counters
+#    (cycles:u / instructions:u — dnn-benchmarking records these
+#    unconditionally and surfaces the paranoid value next to the
+#    None kernel fields). See docs/troubleshooting.md.
+
+COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
+
+WORKDIR ${WORKSPACE_DIR}
+COPY graphs ./graphs
+
+RUN cat > /usr/local/bin/dnn-benchmark-performance <<'SCRIPT' && \
+    chmod 0755 /usr/local/bin/dnn-benchmark-performance
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+exec /opt/dnn-benchmark/venv/bin/dnn-benchmark "$@"
+SCRIPT
+
+CMD ["dnn-benchmark-performance"]

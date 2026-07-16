@@ -2,3 +2,8 @@
 	path = rocm-libraries
 	url = https://github.com/ROCm/rocm-libraries.git
 	branch = develop
+
+[submodule "dockerfiles/.rocm-cmake"]
+	path = dockerfiles/.rocm-cmake
+	url = https://github.com/ROCm/rocm-cmake.git
+	branch = develop

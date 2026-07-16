@@ -17,6 +17,5 @@ htmlcov
 
 # dnn-benchmarking files not copied by Dockerfile.dnn-benchmark-performance.
 /tests
-/graphs
 /sample_configs
 /docs
