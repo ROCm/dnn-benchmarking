@@ -429,6 +429,12 @@ class Setup:
         if IS_WINDOWS:
             wheel_venv = os.environ.get("ROCM_WHEEL_VENV")
             if not wheel_venv and self.torch_mode == "rocm" and self.do_build:
+                # wheel_build_setup.ps1 lives inside the rocm-libraries
+                # submodule; ensure it's checked out before invoking it (fixes
+                # a pre-existing setup.ps1 ordering bug: Step 1's bootstrap ran
+                # before Step 3's checkout, so a fresh clone with no venv
+                # published yet couldn't find the script that publishes one).
+                self.ensure_rocm_libraries_checkout()
                 wheel_setup = (
                     HIPDNN_ROOT / "scripts" / "windows" / "wheel_build_setup.ps1"
                 )
@@ -437,11 +443,25 @@ class Setup:
                     "wheel_build_setup.ps1"
                 )
                 gpu_arch = self.gpu_arch_override or "gfx1151"
+                # wheel_build_setup.ps1 publishes its venv path by setting
+                # $env:ROCM_WHEEL_VENV in its own process; that can never
+                # propagate back to us across the subprocess boundary (unlike
+                # setup.ps1, which dot-sourced it in the same PowerShell
+                # session). Pass -VenvPath explicitly instead, so the target
+                # is known without reading state back from the child.
+                wheel_venv_path = self.workspace / "rocm-wheel-venv"
                 run(
-                    ["pwsh", str(wheel_setup), "-GpuTarget", gpu_arch],
+                    [
+                        "pwsh",
+                        str(wheel_setup),
+                        "-GpuTarget",
+                        gpu_arch,
+                        "-VenvPath",
+                        str(wheel_venv_path),
+                    ],
                     env=self.env,
                 )
-                wheel_venv = os.environ.get("ROCM_WHEEL_VENV")
+                wheel_venv = str(wheel_venv_path)
             if wheel_venv:
                 # Reuse the wheel venv in place (setup.ps1 never recreated it).
                 self.venv_dir = Path(wheel_venv)
@@ -1368,6 +1388,10 @@ class Setup:
             bindings_stages = self._cmake_stages(
                 cmake_exe, str(bindings_src), str(bindings_build), bindings_args
             )
+            # The packer stages the built extension into a wheel via `python -m
+            # build`; ensure that build tool is present in the venv (matches
+            # the Linux bindings method).
+            self.pip("install", "build")
             bindings_pack_cmd = (
                 '"{0}" "{1}" --build-dir "{2}" --wheel-dir "{3}"'.format(
                     python_fwd,
@@ -1455,13 +1479,13 @@ class Setup:
         if already_importable:
             print("==> hipdnn_frontend already importable; leaving it as-is.")
         elif pyd_dir:
-            # The extension links hipdnn_backend.dll dropped in a sibling bin/;
-            # register it via os.add_dll_directory from the .pth (handle stashed
-            # on sys so it isn't GC'd before import).
+            # hipdnn_backend.dll is installed to install_dir/bin; register it
+            # via os.add_dll_directory from the .pth (handle stashed on sys so
+            # it isn't GC'd before import).
             lines = [str(bindings_package)]
             if pyd_dir != bindings_pkg_dir:
                 lines.append(str(pyd_dir))
-            backend_bin = pyd_dir.parent / "bin"
+            backend_bin = Path(install_dir) / "bin"
             if (backend_bin / "hipdnn_backend.dll").exists():
                 lines.append(
                     "import os, sys; _p = r'{0}'; "

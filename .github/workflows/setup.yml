@@ -12,12 +12,18 @@ permissions:
   contents: read
 
 # setup_env.py is the single cross-platform entry point (replaces setup.sh /
-# setup.ps1). This workflow proves the shared front half and a full no-GPU
-# install work on both Linux and Windows. No GPU is required or used: the
-# install smoke uses --torch-mode cuda, whose CUDA early-exit completes without
-# hardware. The CUDA wheel download (~large) is the cost of a genuine cross-OS
-# install verification. The ROCm from-source build (Linux/Windows) is NOT
-# exercised here — CI runners have no GPU by design.
+# setup.ps1). Two jobs prove the tool without needing a GPU:
+#   setup:      argument-validation contracts + a full --torch-mode cuda
+#               install on both OSes (CUDA torch's early-exit path completes
+#               without hardware).
+#   rocm-build: a real --torch-mode rocm from-source build (hipDNN + all
+#               provider plugins + Python bindings) against the ROCm torch
+#               nightly's bundled SDK wheels. Compiling/linking needs no GPU,
+#               only --gpu-arch to pick the nightly bucket and set
+#               GPU_TARGETS/AMDGPU_TARGETS. Verified end-to-end on real gfx90a
+#               hardware in addition to this job; Windows is best-effort
+#               (continue-on-error) since no Windows/ROCm host exists to
+#               confirm it.
 defaults:
   run:
     # GitHub's windows-2022 runners ship Git-bash, so a single bash step keeps
@@ -88,3 +94,42 @@ jobs:
         run: |
           .ci-workspace/.venv/Scripts/python -c "import dnn_benchmarking; print('OK')"
           .ci-workspace/.venv/Scripts/dnn-benchmark --help
+
+  rocm-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    # Windows rocm-mode is unverified: no Windows/ROCm host exists to confirm
+    # it end-to-end, so a failure here doesn't gate the PR. Linux is a required
+    # check (verified against real hardware and this exact CI job).
+    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    steps:
+      # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
+      # with only ~16 GB free, which isn't enough headroom alongside pip's
+      # download cache and the sparse rocm-libraries checkout. Reclaim
+      # preinstalled toolchains this job doesn't use (~26 GB back on a real
+      # runner) and skip pip's cache to keep the build's footprint self-contained.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          docker system prune -af || true
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      # Full from-source build (hipDNN + MIOpen/hipBLASLt/hip-kernel providers +
+      # Python bindings) via the ROCm torch nightly's bundled SDK wheels. No GPU
+      # is required or present: compiling and linking against the ROCm devel
+      # wheel's headers/libs needs no device, only --gpu-arch to pick the
+      # nightly bucket and the GPU_TARGETS/AMDGPU_TARGETS compile flags.
+      - name: Full rocm-mode build (no GPU)
+        env:
+          PIP_NO_CACHE_DIR: "1"
+        run: |
+          python setup_env.py --gpu-arch gfx90a --workspace ${{ runner.temp }}/ci-ws -y
