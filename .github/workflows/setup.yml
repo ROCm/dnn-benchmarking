@@ -103,7 +103,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Windows rocm-mode is unverified: no Windows/ROCm host exists to confirm
     # it end-to-end, so a failure here doesn't gate the PR. Linux is a required
-    # check (verified against real hardware and this exact CI job).
+    # check (verified against real hardware and this exact CI job). Known open
+    # issue: wheel_build_setup.ps1's bootstrap and install_torch() each pull
+    # an independent, unpinned "latest nightly" snapshot into the same venv;
+    # a version skew between the two can leave hipdnn_frontend built against
+    # newer devel headers than the runtime DLLs actually installed, failing
+    # import with "procedure could not be found" even though hipDNN, the
+    # providers, and the extension itself compile and link successfully.
     continue-on-error: ${{ matrix.os == 'windows-2022' }}
     steps:
       # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
@@ -132,4 +138,16 @@ jobs:
         env:
           PIP_NO_CACHE_DIR: "1"
         run: |
-          python setup_env.py --gpu-arch gfx90a --workspace ${{ runner.temp }}/ci-ws -y
+          python setup_env.py --gpu-arch gfx90a --workspace .ci-rocm-workspace -y
+
+      - name: Assert install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          .ci-rocm-workspace/.venv/bin/python -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
+
+      # Windows rocm-mode retargets the venv to workspace/rocm-wheel-venv
+      # (ROCM_WHEEL_VENV back-compat; see setup_env.py's setup_venv).
+      - name: Assert install (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .ci-rocm-workspace/rocm-wheel-venv/Scripts/python.exe -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
