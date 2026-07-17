@@ -873,9 +873,13 @@ class Setup:
         """Nightly index for the resolved GPU arch."""
         print(f"GPU arch: {self.gpu_arch}")
         if IS_WINDOWS:
-            # Windows torch wheels are published per-arch under v2/, not in the
-            # dcgpu family buckets Linux uses.
-            return f"{ROCM_NIGHTLY_BASE}/v2/{self.gpu_arch}/"
+            # v2-staging is the actively-updated per-arch bucket (matches the
+            # Linux side below); v2/{arch}/ is a legacy path that stops
+            # receiving new torch builds for some archs -- e.g. v2/gfx1151/
+            # is stuck at a March 2026 torch build, which is missing MIOpen
+            # symbols the current (submodule-tracked develop HEAD)
+            # rocm-libraries hipDNN provider code needs.
+            return f"{ROCM_NIGHTLY_BASE}/v2-staging/{self.gpu_arch}/"
         bucket = LINUX_TORCH_BUCKETS.get(self.gpu_arch)
         if bucket is None:
             fail(
