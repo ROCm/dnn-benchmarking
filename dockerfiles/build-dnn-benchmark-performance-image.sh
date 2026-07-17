@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-device_target="gfx1152"
+device_target="gfx942"
 gpu_target=""
 tag=""
 docker_args=()
@@ -13,7 +13,7 @@ Usage: ./build-dnn-benchmark-performance-image.sh [options] [-- docker-build-arg
 Build the dnn-benchmark-performance Docker image from the local workspace.
 
 Options:
-  --device-target TARGET  ROCm PyTorch GPU architecture. Default: gfx1152
+  --device-target TARGET  ROCm PyTorch GPU architecture. Default: gfx942
   --gpu-target TARGET     Optional hipDNN/provider CMake GPU_TARGETS override. Default: <device-target>
   --tag TAG               Docker image tag. Default: dnn-benchmark-performance:<device-target>
   -h, --help              Show this help.
