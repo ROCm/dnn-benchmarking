@@ -90,20 +90,9 @@ ensure_rocm_libraries_checkout() {
     git -C "${repo_root}/rocm-libraries" checkout --quiet FETCH_HEAD
 }
 
-ensure_rocm_cmake_checkout() {
-    if [[ -f "${script_dir}/.rocm-cmake/share/rocmcmakebuildtools/cmake/ROCMSetupVersion.cmake" ]]; then
-        return
-    fi
-
-    echo "Fetching rocm-cmake (rocm-6.4.3) for Docker build..."
-    rm -rf "${script_dir}/.rocm-cmake"
-    git clone --quiet --depth 1 --branch rocm-6.4.3 \
-        https://github.com/ROCm/rocm-cmake.git "${script_dir}/.rocm-cmake"
-}
 
 
 ensure_rocm_libraries_checkout
-ensure_rocm_cmake_checkout
 
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance" \

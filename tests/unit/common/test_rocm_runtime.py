@@ -52,9 +52,7 @@ def test_rocm_path_wins_for_default_plugin_path(
 def test_pip_rocm_plugin_path_discovered_from_hipdnn_library(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    sdk_prefix = (
-        tmp_path / "venv" / "site-packages" / "_rocm_sdk_libraries_gfx94X"
-    )
+    sdk_prefix = tmp_path / "venv" / "site-packages" / "_rocm_sdk_libraries_gfx94X"
     lib_dir = sdk_prefix / "lib"
     plugin_dir = lib_dir / "hipdnn_plugins" / "engines"
     plugin_dir.mkdir(parents=True)

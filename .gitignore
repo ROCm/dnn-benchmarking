@@ -55,6 +55,9 @@ results.json
 *.log
 .planning/
 
+# Local Docker build inputs.
+dockerfiles/.rocm-cmake/
+
 # Crash artifacts (e.g. ROCm/GPU process core dumps)
 core
 core.*

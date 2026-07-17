@@ -40,7 +40,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR ${WORKSPACE_DIR}
 
-COPY dockerfiles/.rocm-cmake ./rocm-cmake
 COPY rocm-libraries ./rocm-libraries
 COPY pyproject.toml README.md ./
 COPY src ./src
@@ -106,8 +105,7 @@ RUN . "${ROCM_SDK_PREFIX_FILE}" && \
         -DROCM_PATH="${ROCM_DEVEL_PREFIX}" \
         -DCMAKE_INSTALL_PREFIX="${ROCM_LIBRARIES_PREFIX}" \
         -DROCM_LIBS_ENABLE_COMPONENTS="hipdnn;miopen-provider;hipblaslt-provider;hip-kernel-provider" \
-        -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX}" \
-        "-DFETCHCONTENT_SOURCE_DIR_ROCM-CMAKE=${WORKSPACE_DIR}/rocm-cmake" \
+        -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX};${ROCM_DEVEL_PREFIX}" \
         -DGPU_TARGETS="${gpu_target}" \
         -DAMDGPU_TARGETS="${gpu_target}" \
         -DROCM_LIBS_ENABLE_ROOT_CTEST=OFF \
@@ -132,8 +130,7 @@ RUN . "${ROCM_SDK_PREFIX_FILE}" && \
         -DROCM_CMAKE_PATH="${ROCM_DEVEL_PREFIX}" \
         -Dhip_DIR="${ROCM_DEVEL_PREFIX}/lib/cmake/hip" \
         -DCMAKE_INSTALL_PREFIX="${ROCM_LIBRARIES_PREFIX}" \
-        -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX}" \
-        "-DFETCHCONTENT_SOURCE_DIR_ROCM-CMAKE=${WORKSPACE_DIR}/rocm-cmake" \
+        -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX};${ROCM_DEVEL_PREFIX}" \
         -DPython_EXECUTABLE="${BENCHMARK_VENV}/bin/python" && \
     cmake --build "${PYTHON_BUILD_DIR}" && \
     "${BENCHMARK_VENV}/bin/python" rocm-libraries/projects/hipdnn/python/frontend_wheel_package/pack_frontend_wheel.py \
