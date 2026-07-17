@@ -37,7 +37,7 @@ concurrency:
 #   rocm-build: a real --torch-mode rocm from-source build (hipDNN + all provider
 #               plugins + Python bindings) against the ROCm torch nightly's
 #               bundled SDK wheels. Compiling and linking need no device, only
-#               --gpu-arch to pick the nightly bucket and set
+#               --gpu-arch to pick the torch[device-<arch>] extra and set
 #               GPU_TARGETS/AMDGPU_TARGETS. Linux is additionally verified on
 #               real gfx90a hardware; Windows is gated here but has never been
 #               confirmed on a Windows/ROCm host.
@@ -76,17 +76,20 @@ jobs:
           test "$rc" -eq 1
           grep -q "requires an existing virtual environment" existing.err
 
-      # Linux-only: Windows torch wheels are published per-arch under v2/, so any
-      # arch resolves to a URL and a bad one surfaces from pip, not from us.
-      - name: Validation smoke (unsupported arch)
+      # Linux-only: with no rocm_agent_enumerator/rocminfo on the runner and no
+      # --gpu-arch override, detection returns "" and install_torch fails fast
+      # before touching the network. Windows always has a default arch, so
+      # this path never fires there -- an arch the index doesn't recognize is
+      # a pip resolver problem, not one setup_env.py can catch itself.
+      - name: Validation smoke (missing GPU arch)
         if: runner.os == 'Linux'
         run: |
           rc=0
-          python setup_env.py --gpu-arch bogus -y \
+          python setup_env.py -y \
             --workspace .bad-arch-ws 2> arch.err || rc=$?
           cat arch.err
           test "$rc" -eq 1
-          grep -q "Unsupported GPU architecture 'bogus'" arch.err
+          grep -q "could not detect a GPU architecture" arch.err
 
       # cu124 torch yields a CUDA-enabled wheel on both linux-64 and win-64 (bare
       # PyPI torch is CPU-only on Windows, which would report mode 'cpu' and fail
@@ -118,8 +121,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # gfx90a is a datacenter arch served by the Linux nightly buckets;
-          # gfx1151 is the only arch with published Windows torch wheels.
+          # gfx90a is a datacenter arch, verified against real hardware below;
+          # gfx1151 is an arbitrary Windows-published arch to exercise the
+          # from-source build path there.
           - os: ubuntu-24.04
             gpu-arch: gfx90a
           - os: windows-2022

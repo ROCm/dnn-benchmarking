@@ -67,19 +67,14 @@ PROVIDERS = (
 
 ROCM_NIGHTLY_BASE = "https://rocm.nightlies.amd.com"
 
-# Only archs with published Windows torch wheels work (gfx1151 has them,
-# gfx1150 does not). Matches wheel_build_setup.ps1's default target.
-WINDOWS_DEFAULT_GPU_ARCH = "gfx1151"
+# Single multi-arch nightly index for every OS: GPU selection is a pip extra
+# (torch[device-<arch>]) rather than a per-arch/per-OS URL bucket, so Linux
+# and Windows always resolve the exact same torch/rocm-sdk-* build.
+ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-multi-arch/"
 
-# ROCm nightly bucket per GPU arch. gfx90a's current torch + ROCm SDK builds
-# live in the bare "gfx90a" bucket; the older "gfx90X-dcgpu" family bucket is
-# frozen at a release that predates several SDK libraries (e.g. hipdnn).
-# gfx942/gfx950 are still served by their "-dcgpu" family buckets.
-LINUX_TORCH_BUCKETS = {
-    "gfx90a": "gfx90a",
-    "gfx942": "gfx94X-dcgpu",
-    "gfx950": "gfx950-dcgpu",
-}
+# Windows has no rocm_agent_enumerator/rocminfo to detect the local arch with,
+# so fall back to a default target known to have published wheels.
+WINDOWS_DEFAULT_GPU_ARCH = "gfx1151"
 
 
 # --- Small process helpers -------------------------------------------------
@@ -159,7 +154,12 @@ for root in roots:
         if not child.is_dir():
             continue
         if kind == "libraries":
-            if not child.name.startswith("_rocm_sdk_libraries_"):
+            # whl-multi-arch ships a single arch-agnostic "_rocm_sdk_libraries"
+            # package; older per-arch indexes (e.g. v2-staging) name it
+            # "_rocm_sdk_libraries_<arch>". Match both.
+            if child.name != "_rocm_sdk_libraries" and not child.name.startswith(
+                "_rocm_sdk_libraries_"
+            ):
                 continue
             lib_dir = child.joinpath("lib")
             if not lib_dir.is_dir() or not any(lib_dir.glob("libMIOpen.so*")):
@@ -295,8 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Override GPU architecture detection for ROCm torch nightly "
-            "selection. Supported on Linux: gfx90a, gfx942, gfx950. On Windows "
-            f"any arch with published wheels; defaults to {WINDOWS_DEFAULT_GPU_ARCH}."
+            "selection (selects the torch[device-<arch>] extra). On Linux, "
+            "detected via rocm_agent_enumerator/rocminfo when not passed; on "
+            f"Windows, defaults to {WINDOWS_DEFAULT_GPU_ARCH} when not detected."
         ),
     )
     parser.add_argument(
@@ -589,9 +590,9 @@ class Setup:
     def gpu_arch(self) -> str:
         """--gpu-arch, else detection, else the Windows default.
 
-        Linux keeps "" when detection fails so the unsupported-arch error below
-        can name it. On Windows there is no rocm_agent_enumerator to detect with,
-        so the default stands in.
+        Linux keeps "" when detection fails so install_torch's missing-arch
+        error can name it. On Windows there is no rocm_agent_enumerator to
+        detect with, so the default stands in.
         """
         arch = self.gpu_arch_override or self._detect_gpu_arch()
         if not arch and IS_WINDOWS:
@@ -654,8 +655,8 @@ class Setup:
             sys.exit(1)
         fail(
             "ERROR: no usable ROCm SDK libraries package found in this venv.",
-            "Expected exactly one _rocm_sdk_libraries_* package containing "
-            "MIOpen libraries.",
+            "Expected a _rocm_sdk_libraries (or _rocm_sdk_libraries_<arch>) "
+            "package containing MIOpen libraries.",
             "Use a ROCm torch wheel that includes ROCm SDK libraries, or pass "
             "--rocm-prefix explicitly.",
         )
@@ -869,26 +870,15 @@ class Setup:
 
     # -- torch install ------------------------------------------------------
 
-    def _rocm_torch_index_url(self) -> str:
-        """Nightly index for the resolved GPU arch."""
-        print(f"GPU arch: {self.gpu_arch}")
-        if IS_WINDOWS:
-            # v2-staging is the actively-updated per-arch bucket (matches the
-            # Linux side below); v2/{arch}/ is a legacy path that stops
-            # receiving new torch builds for some archs -- e.g. v2/gfx1151/
-            # is stuck at a March 2026 torch build, which is missing MIOpen
-            # symbols the current (submodule-tracked develop HEAD)
-            # rocm-libraries hipDNN provider code needs.
-            return f"{ROCM_NIGHTLY_BASE}/v2-staging/{self.gpu_arch}/"
-        bucket = LINUX_TORCH_BUCKETS.get(self.gpu_arch)
-        if bucket is None:
+    def _require_gpu_arch(self) -> str:
+        """The resolved --gpu-arch, or a fatal error naming what's missing."""
+        if not self.gpu_arch:
             fail(
-                f"ERROR: Unsupported GPU architecture '{self.gpu_arch or 'none'}'.",
-                "Supported: gfx90a (MI200/MI210/MI250), gfx942 (MI300X/MI300A), "
-                "gfx950 (MI350)",
-                "Pass --gpu-arch or --torch-index-url to override detection.",
+                "ERROR: could not detect a GPU architecture.",
+                "Pass --gpu-arch (e.g. gfx90a, gfx942, gfx950) or --torch-index-url "
+                "to override detection.",
             )
-        return f"{ROCM_NIGHTLY_BASE}/v2-staging/{bucket}/"
+        return self.gpu_arch
 
     def install_torch(self) -> None:
         mode = self.torch_mode
@@ -927,15 +917,23 @@ class Setup:
                 print("Installing CUDA PyTorch from PyPI")
                 self.pip("install", "torch")
         elif mode == "rocm":
-            index_url = self.torch_index_url or self._rocm_torch_index_url()
+            index_url = self.torch_index_url or ROCM_TORCH_INDEX_URL
             self.resolved_torch_index_url = index_url
             if self.installed_torch_mode != "missing":
                 self.require_torch_mode("rocm")
                 print(f"Using existing ROCm PyTorch in {self.venv_dir}.")
                 return
+            arch = self._require_gpu_arch()
+            print(f"GPU arch: {arch}")
             print(f"Installing ROCm PyTorch from {index_url}")
             # ROCm nightlies are pre-release, so --pre lets pip select them.
-            self.pip("install", "--pre", "torch", "--index-url", index_url)
+            # device-<arch> is the pip extra that pulls the matching
+            # rocm-sdk-device-<arch> package; the base rocm-sdk-core/-libraries
+            # packages are OS/arch-agnostic on this index, so Linux and
+            # Windows always resolve the exact same nightly.
+            self.pip(
+                "install", "--pre", f"torch[device-{arch}]", "--index-url", index_url
+            )
 
         self.installed_torch_mode = self.get_torch_mode()
         self.require_torch_mode(mode)

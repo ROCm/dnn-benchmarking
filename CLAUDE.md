@@ -14,8 +14,8 @@ A `--backend pytorch` executor runs the same graphs through PyTorch (ROCm or CUD
 # Full setup (venv, requirements, hipDNN bindings) — skips hipDNN/provider build if already installed
 python3 setup_env.py
 
-# Manual setup for ROCm/AMD GPU development (gfx90X or gfx94X)
-pip install --pre torch --index-url https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/
+# Manual setup for ROCm/AMD GPU development (pick your arch's device extra)
+pip install --pre "torch[device-gfx942]" --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
 pip install -e .                              # package + PyPI deps (numpy, pytest)
 
 # hipDNN bindings must be installed separately from your hipDNN build
@@ -31,13 +31,15 @@ Pass `/opt/rocm/lib/hipdnn_plugins/engines/` to `--plugin-path` when running ben
 
 ### ROCm PyTorch Setup
 
-`setup_env.py` auto-detects the GPU architecture and installs PyTorch from the matching ROCm nightly index. Supported architectures:
+`setup_env.py` auto-detects the GPU architecture and installs PyTorch from the
+unified ROCm nightly index using the matching `torch[device-<arch>]` extra.
+Supported architectures include:
 
-| GPU | `--gpu-arch` | Torch index bucket |
-|-----|--------------|--------------------|
-| MI200/MI210/MI250 | `gfx90a` | `gfx90a` |
-| MI300X/MI300A | `gfx942` | `gfx94X-dcgpu` |
-| MI350 | `gfx950` | `gfx950-dcgpu` |
+| GPU | `--gpu-arch` |
+|-----|--------------|
+| MI200/MI210/MI250 | `gfx90a` |
+| MI300X/MI300A | `gfx942` |
+| MI350 | `gfx950` |
 
 ## Running Tests
 
