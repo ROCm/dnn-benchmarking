@@ -95,7 +95,7 @@ ensure_rocm_libraries_checkout() {
 ensure_rocm_libraries_checkout
 
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build \
-    -f "${script_dir}/Dockerfile.dnn-benchmark-performance" \
+    -f "${script_dir}/Dockerfile.dnn-benchmark-performance-linux" \
     --build-arg "DEVICE_TARGET=${device_target}" \
     --build-arg "GPU_TARGET=${gpu_target}" \
     -t "${tag}" \

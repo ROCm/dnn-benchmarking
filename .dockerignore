@@ -15,7 +15,7 @@ __pycache__
 .coverage
 htmlcov
 
-# dnn-benchmarking files not copied by Dockerfile.dnn-benchmark-performance.
+# dnn-benchmarking files not copied by Dockerfile.dnn-benchmark-performance-linux.
 /tests
 /sample_configs
 /docs
