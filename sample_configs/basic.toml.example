@@ -11,7 +11,7 @@ warmup = 10
 iters = 100
 verbose = true
 
-# Optional plugin discovery directory. setup.sh prints the selected prefix; pass
+# Optional plugin discovery directory. setup_env.py prints the selected prefix; pass
 # <selected-prefix>/lib/hipdnn_plugins/engines when plugin discovery is not
 # already configured by the runtime environment.
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"

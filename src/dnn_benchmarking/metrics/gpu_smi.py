@@ -4,7 +4,7 @@
 """GPU telemetry probe using the AMD SMI Python library.
 
 The amdsmi library ships with system ROCm installs and ROCm SDK wheels under
-``share/amd_smi/``. ``setup.sh`` installs the bindings when it finds a usable
+``share/amd_smi/``. ``setup_env.py`` installs the bindings when it finds a usable
 source tree, but they are not a hard dependency — ``GpuSmiProbe.snapshot()``
 returns a stable-shape dict whose values are ``None`` whenever the library,
 init, or a per-metric query fails.

@@ -16,17 +16,21 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
 ]
-# torch is intentionally not listed here — setup.sh selects either CPU-only
+# torch is intentionally not listed here — setup_env.py selects either CPU-only
 # torch for CI/testing or ROCm torch nightlies for benchmarking, and pip cannot
 # express those mutually exclusive indices in pyproject.toml.
 dependencies = [
     "numpy>=1.19.0",
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
     # psutil powers the always-on host RAM / process RSS probes in
     # metrics/host.py. Soft requirement at runtime: a missing module is
     # logged once via warn_once and the corresponding fields stay None.
     "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
 ]
 
 [project.scripts]

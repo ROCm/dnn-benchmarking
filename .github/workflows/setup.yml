@@ -1,0 +1,139 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: setup
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'graphs/**'
+      - 'Workloads/**'
+      - 'sample_configs/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'graphs/**'
+      - 'Workloads/**'
+      - 'sample_configs/**'
+
+permissions:
+  contents: read
+
+# rocm-build pulls ~13 GB of ROCm SDK wheels, so never let rapid pushes queue
+# duplicate runs of it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# setup validates the cross-platform CUDA install path. rocm-build validates the
+# Linux source build against the ROCm SDK wheels without requiring a GPU.
+defaults:
+  run:
+    # GitHub's windows-2022 runners ship Git-bash, so a single bash step keeps
+    # the assertions identical across OSes.
+    shell: bash
+
+jobs:
+  setup:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      # No submodules: the rocm-libraries submodule stays empty; the tested
+      # paths (validation + CUDA early-exit) never need it.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      # Linux-only: with no rocm_agent_enumerator/rocminfo on the runner and no
+      # --gpu-arch override, detection returns "" and install_torch fails fast
+      # before touching the network. Windows always has a default arch, so
+      # this path never fires there -- an arch the index doesn't recognize is
+      # a pip resolver problem, not one setup_env.py can catch itself.
+      - name: Validation smoke (missing GPU arch)
+        if: runner.os == 'Linux'
+        run: |
+          rc=0
+          python setup_env.py -y \
+            --workspace .bad-arch-ws 2> arch.err || rc=$?
+          cat arch.err
+          test "$rc" -eq 1
+          grep -q "could not detect a GPU architecture" arch.err
+
+      # cu124 torch yields a CUDA-enabled wheel on both linux-64 and win-64 (bare
+      # PyPI torch is CPU-only on Windows, which would report mode 'cpu' and fail
+      # require_torch_mode cuda). cu124 torch reports torch.version.cuda set even
+      # with no GPU, so get_torch_mode -> cuda and the early-exit path completes
+      # without hardware.
+      - name: Install smoke (no-GPU CUDA path)
+        run: |
+          python setup_env.py \
+            --torch-mode cuda \
+            --torch-index-url https://download.pytorch.org/whl/cu124 \
+            --workspace .ci-workspace
+
+      - name: Assert install and run unit tests
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-workspace
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            VENV=.ci-workspace/.venv/Scripts
+          else
+            VENV=.ci-workspace/.venv/bin
+          fi
+          "$VENV/python" -m pip install -e ".[test]"
+          "$VENV/python" -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          "$VENV/dnn-benchmark" --help
+          "$VENV/python" -m pytest -m "not gpu" -q
+
+  rocm-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
+      # with only ~16 GB free, which isn't enough headroom alongside the sparse
+      # rocm-libraries checkout. Reclaim preinstalled toolchains this job doesn't
+      # use and skip pip's cache to keep the build's footprint self-contained.
+      # $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) is deliberately left alone:
+      # setup-python below reads it, and wiping it forces a redownload.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup || true
+          docker system prune -af || true
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Full rocm-mode build (no GPU)
+        env:
+          PIP_NO_CACHE_DIR: "1"
+        run: |
+          python setup_env.py \
+            --gpu-arch gfx90a \
+            --workspace .ci-rocm-workspace \
+            -y
+
+      # The build installs the whole tool on top of the compiled bindings. Assert
+      # the full no-GPU surface: the hipdnn_frontend extension loads and its ROCm
+      # deps resolve, and the tool imports and its CLI runs. A real benchmark
+      # needs a GPU (hipDNN Handle + kernel dispatch), so that stays on the
+      # on-hardware gfx90a run.
+      - name: Assert install
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
+        run: |
+          VENV=.ci-rocm-workspace/.venv/bin
+          "$VENV/python" -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
+          "$VENV/python" -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          "$VENV/dnn-benchmark" --help
