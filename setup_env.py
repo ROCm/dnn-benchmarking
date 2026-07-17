@@ -104,9 +104,7 @@ def run_git(args, **kwargs):
 
 def git_output(args) -> str:
     """Run git and return its stdout, stripped; raise on nonzero exit."""
-    result = subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True
-    )
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
 
 
@@ -507,7 +505,10 @@ class Setup:
                     [
                         "pwsh",
                         str(
-                            HIPDNN_ROOT / "scripts" / "windows" / "wheel_build_setup.ps1"
+                            HIPDNN_ROOT
+                            / "scripts"
+                            / "windows"
+                            / "wheel_build_setup.ps1"
                         ),
                         "-GpuTarget",
                         self.gpu_arch,
@@ -1319,11 +1320,13 @@ class Setup:
             )
             # The packer stages the extension into a wheel via `python -m build`.
             self.pip("install", "build")
-            bindings_pack_cmd = '"{0}" "{1}" --build-dir "{2}" --wheel-dir "{3}"'.format(
-                python_fwd,
-                self._fwd(str(bindings_pack_script)),
-                self._fwd(str(bindings_build)),
-                self._fwd(str(bindings_package)),
+            bindings_pack_cmd = (
+                '"{0}" "{1}" --build-dir "{2}" --wheel-dir "{3}"'.format(
+                    python_fwd,
+                    self._fwd(str(bindings_pack_script)),
+                    self._fwd(str(bindings_build)),
+                    self._fwd(str(bindings_package)),
+                )
             )
             self._invoke_toolchain_build(
                 "Building hipDNN Python bindings",
@@ -1403,7 +1406,9 @@ class Setup:
             self.env.get("HIP_PATH", ""), self.env.get("ROCM_PATH", "")
         )
 
-    def _install_windows_bindings(self, bindings_package: Path, install_dir: str) -> None:
+    def _install_windows_bindings(
+        self, bindings_package: Path, install_dir: str
+    ) -> None:
         """Install the packed wheel, then register the backend DLL directory.
 
         pack_frontend_wheel.py writes both the staged package and the .whl into

@@ -101,6 +101,8 @@ jobs:
             --workspace .ci-workspace
 
       - name: Assert install and run unit tests
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-workspace
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             VENV=.ci-workspace/.venv/Scripts
@@ -123,6 +125,10 @@ jobs:
           - os: windows-2022
             gpu-arch: gfx1151
     runs-on: ${{ matrix.os }}
+    # Windows rocm-mode is unverified: no Windows/ROCm host exists to confirm
+    # it end-to-end, so a failure here doesn't gate the PR. Linux is a required
+    # check (verified against real hardware and this exact CI job).
+    continue-on-error: ${{ matrix.os == 'windows-2022' }}
     timeout-minutes: 180
     steps:
       # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
@@ -158,6 +164,8 @@ jobs:
       # needs a GPU (hipDNN Handle + kernel dispatch), so that stays on the
       # on-hardware gfx90a run.
       - name: Assert install
+        env:
+          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
         run: |
           # Windows rocm mode installs into the wheel env wheel_build_setup.ps1
           # owns; see setup_env.py's _select_windows_wheel_venv.
