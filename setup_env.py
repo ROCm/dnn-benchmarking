@@ -222,6 +222,17 @@ else:
 print("\n" + mode)
 """
 
+# Reads the installed rocm-sdk-core version, so the devel toolchain can be
+# re-pinned to match it (see _sync_rocm_sdk_devel_version). Empty output means
+# rocm-sdk-core isn't installed.
+_GET_ROCM_SDK_CORE_VERSION = r"""
+try:
+    from importlib.metadata import version
+    print(version("rocm-sdk-core"))
+except Exception:
+    pass
+"""
+
 
 # --- CLI -------------------------------------------------------------------
 
@@ -700,6 +711,54 @@ class Setup:
             "not resolve the devel prefix (see the error above).",
             "The rocm_sdk module comes from the `rocm` package; installing "
             "rocm[devel] pins both at matching versions.",
+        )
+
+    def sync_rocm_sdk_devel_version(self, index_url: str) -> None:
+        """Re-pin rocm-sdk-devel to match the installed rocm-sdk-core version.
+
+        Windows bootstraps its wheel venv via wheel_build_setup.ps1, which
+        installs rocm-sdk-devel from the latest nightly *before* install_torch()
+        runs. install_torch() then installs torch pinned to a (usually older,
+        independently-versioned) nightly that pulls its own rocm-sdk-core,
+        downgrading it in the same venv -- but the already-expanded devel tree
+        is never resynced. hipDNN then builds against newer devel headers than
+        the runtime DLLs actually installed, and the compiled extension fails
+        to import with a DLL symbol mismatch ("procedure could not be found").
+        Linux doesn't hit this: it installs devel from resolved_torch_index_url
+        *after* install_torch(), so the two are pinned together from the start.
+
+        No-op when index_url is empty (e.g. --torch-mode existing, where there
+        is no resolved nightly index to re-pin from).
+        """
+        if not index_url:
+            return
+        core_version = self.probe(_GET_ROCM_SDK_CORE_VERSION).stdout.strip()
+        if not core_version:
+            return
+        devel_version = self.probe(
+            "from importlib.metadata import version, PackageNotFoundError\n"
+            "try:\n"
+            '    print(version("rocm-sdk-devel"))\n'
+            "except PackageNotFoundError:\n"
+            "    pass\n"
+        ).stdout.strip()
+        if devel_version == core_version:
+            return
+        print(
+            f"rocm-sdk-devel ({devel_version or 'missing'}) doesn't match the "
+            f"installed rocm-sdk-core ({core_version}); re-pinning devel to "
+            f"{core_version} from {index_url}..."
+        )
+        # --force-reinstall: pip treats an already-satisfied exact-version pin
+        # as a no-op otherwise, which would leave a stale expanded devel tree
+        # (rocm-sdk-devel's own package dir) in place with the old payload.
+        self.pip(
+            "install",
+            "--pre",
+            "--force-reinstall",
+            f"rocm-sdk-devel=={core_version}",
+            "--index-url",
+            index_url,
         )
 
     # -- amdsmi (powers the GPU SMI snapshot; optional) ---------------------
@@ -1252,16 +1311,17 @@ class Setup:
             if self.rocm_prefix:
                 wheel = self.rocm_prefix
             else:
-                result = self.probe(
-                    "import os,_rocm_sdk_devel as d; print(os.path.dirname(d.__file__))"
-                )
-                if result.returncode != 0 or not result.stdout.strip():
+                # See sync_rocm_sdk_devel_version: wheel_build_setup.ps1's
+                # bootstrap and install_torch() can pin rocm-sdk-devel and
+                # rocm-sdk-core to different nightlies in the same venv.
+                self.sync_rocm_sdk_devel_version(self.resolved_torch_index_url)
+                wheel = self._rocm_sdk_devel_root(report_errors=True)
+                if not wheel:
                     fail(
                         "Building from source needs the ROCm devel wheel "
                         f"(_rocm_sdk_devel) in {self.py}'s env, or pass "
                         "--rocm-prefix."
                     )
-                wheel = result.stdout.strip()
 
             cmake_exe, ninja_exe, vcvars, winsdk_root, winsdk_version = (
                 self._windows_toolchain()
