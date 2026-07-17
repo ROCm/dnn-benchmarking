@@ -9,12 +9,12 @@ FROM ${BASE_IMAGE} AS builder
 ARG DEVICE_TARGET=gfx1152
 ARG GPU_TARGET=
 ARG TORCH_INDEX_URL=
+ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
     BENCHMARK_VENV=/opt/dnn-benchmark/venv \
     WORKSPACE_DIR=/workspace \
-    THIRD_PARTY_DEPS_DIR=/opt/third-party-deps \
     GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
 
 ENV ROCM_SDK_PREFIX_FILE=${WORKSPACE_DIR}/rocm-sdk-prefixes.env \
@@ -41,7 +41,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 WORKDIR ${WORKSPACE_DIR}
 
 COPY dockerfiles/.rocm-cmake ./rocm-cmake
-COPY dockerfiles/.third-party ./third-party
 COPY rocm-libraries ./rocm-libraries
 COPY pyproject.toml README.md ./
 COPY src ./src
@@ -50,20 +49,20 @@ RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
 set -eu
 
 case "${DEVICE_TARGET}" in
-    gfx90a) torch_index_bucket="gfx90a" ;;
-    gfx942) torch_index_bucket="gfx94X-dcgpu" ;;
-    gfx1152) torch_index_bucket="gfx1152" ;;
-    gfx950) torch_index_bucket="gfx950-dcgpu" ;;
+    gfx90a | gfx942 | gfx950 | gfx1152) ;;
     *)
         echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, or gfx1152." >&2
         exit 1
         ;;
 esac
-torch_index_url="${TORCH_INDEX_URL:-https://rocm.nightlies.amd.com/v2-staging/${torch_index_bucket}/}"
+torch_index_url="${TORCH_INDEX_URL:-https://rocm.nightlies.amd.com/whl-multi-arch/}"
 printf '[global]\nindex-url = %s\n' "${torch_index_url}" > /etc/pip.conf
 
 python3.12 -m venv --system-site-packages "${BENCHMARK_VENV}"
-"${BENCHMARK_VENV}/bin/python" -m pip install --pre torch "rocm[devel,libraries]" --index-url "${torch_index_url}"
+"${BENCHMARK_VENV}/bin/python" -m pip install --pre \
+    "torch[device-${DEVICE_TARGET}]" \
+    "rocm[libraries,devel,device-${DEVICE_TARGET}]" \
+    --index-url "${torch_index_url}"
 "${BENCHMARK_VENV}/bin/python" -m rocm_sdk init
 
 rocm_devel_prefix="$("${BENCHMARK_VENV}/bin/python" -m rocm_sdk path --root)"
@@ -101,6 +100,7 @@ EOF
 
 RUN . "${ROCM_SDK_PREFIX_FILE}" && \
     gpu_target="${GPU_TARGET:-${DEVICE_TARGET}}" && \
+    if [ "${FETCHCONTENT_GIT_SSL_NO_VERIFY}" = "true" ]; then export GIT_SSL_NO_VERIFY=true; fi && \
     cmake -S rocm-libraries -B build/rocm-libraries -GNinja \
         -DCMAKE_TOOLCHAIN_FILE="${WORKSPACE_DIR}/rocm-libraries/cmake/toolchains/rocm-clang.cmake" \
         -DROCM_PATH="${ROCM_DEVEL_PREFIX}" \
@@ -108,9 +108,6 @@ RUN . "${ROCM_SDK_PREFIX_FILE}" && \
         -DROCM_LIBS_ENABLE_COMPONENTS="hipdnn;miopen-provider;hipblaslt-provider;hip-kernel-provider" \
         -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX}" \
         "-DFETCHCONTENT_SOURCE_DIR_ROCM-CMAKE=${WORKSPACE_DIR}/rocm-cmake" \
-        "-DFETCHCONTENT_SOURCE_DIR_FLATBUFFERS=${WORKSPACE_DIR}/third-party/flatbuffers" \
-        "-DFETCHCONTENT_SOURCE_DIR_SPDLOG=${WORKSPACE_DIR}/third-party/spdlog" \
-        "-DFETCHCONTENT_SOURCE_DIR_JSON=${WORKSPACE_DIR}/third-party/nlohmann_json" \
         -DGPU_TARGETS="${gpu_target}" \
         -DAMDGPU_TARGETS="${gpu_target}" \
         -DROCM_LIBS_ENABLE_ROOT_CTEST=OFF \
@@ -124,11 +121,9 @@ RUN . "${ROCM_SDK_PREFIX_FILE}" && \
     cmake --build build/rocm-libraries && \
     cmake --install build/rocm-libraries --prefix "${ROCM_LIBRARIES_PREFIX}"
 
-RUN "${BENCHMARK_VENV}/bin/python" -c "import build, numpy" && \
-    "${BENCHMARK_VENV}/bin/python" rocm-libraries/projects/hipdnn/python/download_third_party_deps.py \
-        --deps-dir "${THIRD_PARTY_DEPS_DIR}"
 
 RUN . "${ROCM_SDK_PREFIX_FILE}" && \
+    if [ "${FETCHCONTENT_GIT_SSL_NO_VERIFY}" = "true" ]; then export GIT_SSL_NO_VERIFY=true; fi && \
     cmake -S rocm-libraries/projects/hipdnn/python/frontend_bindings \
         -B "${PYTHON_BUILD_DIR}" \
         -GNinja \
@@ -139,8 +134,6 @@ RUN . "${ROCM_SDK_PREFIX_FILE}" && \
         -DCMAKE_INSTALL_PREFIX="${ROCM_LIBRARIES_PREFIX}" \
         -DCMAKE_PREFIX_PATH="${ROCM_LIBRARIES_PREFIX};${ROCM_CORE_PREFIX}" \
         "-DFETCHCONTENT_SOURCE_DIR_ROCM-CMAKE=${WORKSPACE_DIR}/rocm-cmake" \
-        -DFETCHCONTENT_SOURCE_DIR_NANOBIND="${THIRD_PARTY_DEPS_DIR}/nanobind-2.12.0" \
-        -DFETCHCONTENT_SOURCE_DIR_TSL_ROBIN_MAP="${THIRD_PARTY_DEPS_DIR}/robin-map-1.4.1" \
         -DPython_EXECUTABLE="${BENCHMARK_VENV}/bin/python" && \
     cmake --build "${PYTHON_BUILD_DIR}" && \
     "${BENCHMARK_VENV}/bin/python" rocm-libraries/projects/hipdnn/python/frontend_wheel_package/pack_frontend_wheel.py \
@@ -190,15 +183,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WORKSPACE_DIR=/workspace \
     PATH=/opt/dnn-benchmark/venv/bin:${PATH}
 
-# hipDNN engine plugins JIT-compile kernels through HIPRTC at runtime. The ROCm
-# libc++ headers include the system C headers, so libc6-dev must be present even
-# in the runtime image.
+# Keep development headers out of the runtime image. MIOpen's HIPRTC path ships
+# its own cstdint shim; installing libc6-dev exposes system stdint typedefs that
+# conflict with that shim during runtime kernel compilation.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
-        libc6-dev \
         libatomic1 \
         libdrm2 \
         libelf1 \
@@ -215,6 +207,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         linux-tools-generic \
         libsqlite3-0 && \
     rm -rf /var/lib/apt/lists/*
+
 
 # linux-tools-{common,generic} provide the `perf` binary required by
 # dnn-benchmarking's `--perf` source (CPU cycles/IPC). Two runtime
@@ -234,6 +227,24 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #    None kernel fields). See docs/troubleshooting.md.
 
 COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
+
+# MIOpen's HIPRTC activation path includes libc++ <cstdint> before MIOpen's own
+# miopen_cstdint.hpp. Runtime must not install glibc development headers (their
+# LP64 fixed-width typedefs conflict with MIOpen's HIPRTC LL64 shim), but libc++
+# still needs global intmax_t/uintmax_t for std::intmax_t. Provide only those
+# max-width typedefs and let miopen_cstdint.hpp define int8_t/int64_t/etc.
+RUN cat > /usr/local/include/stdint.h <<'EOF'
+#ifndef DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
+#define DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
+typedef long long intmax_t;
+typedef unsigned long long uintmax_t;
+#define INTMAX_MAX 9223372036854775807LL
+#define INTMAX_MIN (-9223372036854775807LL - 1)
+#define UINTMAX_MAX 18446744073709551615ULL
+#define INTMAX_C(v) v##LL
+#define UINTMAX_C(v) v##ULL
+#endif
+EOF
 
 WORKDIR ${WORKSPACE_DIR}
 COPY graphs ./graphs

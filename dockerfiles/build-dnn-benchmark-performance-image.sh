@@ -101,45 +101,9 @@ ensure_rocm_cmake_checkout() {
         https://github.com/ROCm/rocm-cmake.git "${script_dir}/.rocm-cmake"
 }
 
-ensure_third_party_checkout() {
-    local dir="$1"
-    local url="$2"
-    local tag="$3"
-    local check_file="$4"
-
-    if [[ -f "${dir}/${check_file}" ]]; then
-        return
-    fi
-
-    echo "Fetching $(basename "${dir}") (${tag}) for Docker build..."
-    rm -rf "${dir}"
-    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${tag}" \
-        "${url}" "${dir}"
-}
-
-ensure_third_party_checkouts() {
-    local deps_dir="${script_dir}/.third-party"
-    mkdir -p "${deps_dir}"
-    ensure_third_party_checkout \
-        "${deps_dir}/flatbuffers" \
-        https://github.com/google/flatbuffers.git \
-        v25.9.23 \
-        CMakeLists.txt
-    ensure_third_party_checkout \
-        "${deps_dir}/spdlog" \
-        https://github.com/gabime/spdlog.git \
-        v1.15.3 \
-        CMakeLists.txt
-    ensure_third_party_checkout \
-        "${deps_dir}/nlohmann_json" \
-        https://github.com/nlohmann/json.git \
-        v3.12.0 \
-        CMakeLists.txt
-}
 
 ensure_rocm_libraries_checkout
 ensure_rocm_cmake_checkout
-ensure_third_party_checkouts
 
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance" \
