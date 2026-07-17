@@ -14,12 +14,10 @@ A `--backend pytorch` executor runs the same graphs through PyTorch (ROCm or CUD
 # Full setup (venv, requirements, hipDNN bindings) — skips hipDNN/provider build if already installed
 python3 setup_env.py
 
-# Manual setup for ROCm/AMD GPU development (pick your arch's device extra)
-pip install --pre "torch[device-gfx942]" --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
-pip install -e .                              # package + PyPI deps (numpy, pytest)
+# Manual package setup
+pip install -e ".[test]"
 
-# hipDNN bindings must be installed separately from your hipDNN build
-cd /path/to/hipdnn/python && pip install -e . --no-deps
+# setup_env.py builds the hipDNN frontend extension and installs its wheel
 
 # CUDA host (NVIDIA): PyTorch backend only, skips all ROCm/hipDNN setup
 python3 setup_env.py --torch-mode cuda --workspace .workspace

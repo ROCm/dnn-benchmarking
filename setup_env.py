@@ -27,8 +27,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
-import uuid
 from pathlib import Path
 from typing import NoReturn
 
@@ -38,32 +36,8 @@ IS_WINDOWS = platform.system() == "Windows"
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
-BUILD_DIR = HIPDNN_ROOT / "build"
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
-PROVIDERS_DIR = ROCM_LIBRARIES_DIR / "dnn-providers"
-MIOPEN_PROVIDER_DIR = PROVIDERS_DIR / "miopen-provider"
-
-# Engine plugin providers built from source alongside hipDNN, as
-# (name, source dir, extra configure flags). Each builds in <source dir>/build.
-# Windows builds only the MIOpen provider (see build_and_install_windows).
-PROVIDERS = (
-    (
-        "MIOpen provider",
-        MIOPEN_PROVIDER_DIR,
-        ["-DMIOPENPROVIDER_SKIP_TESTS=ON"],
-    ),
-    (
-        "hipBLASLt provider",
-        PROVIDERS_DIR / "hipblaslt-provider",
-        ["-DHIPDNN_SKIP_TESTS=ON"],
-    ),
-    (
-        "hip-kernel-provider",
-        PROVIDERS_DIR / "hip-kernel-provider",
-        ["-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF", "-DENABLE_ASM_SDPA_ENGINE=ON"],
-    ),
-)
 
 ROCM_NIGHTLY_BASE = "https://rocm.nightlies.amd.com"
 
@@ -222,17 +196,6 @@ else:
 print("\n" + mode)
 """
 
-# Reads the installed rocm-sdk-core version, so the devel toolchain can be
-# re-pinned to match it (see _sync_rocm_sdk_devel_version). Empty output means
-# rocm-sdk-core isn't installed.
-_GET_ROCM_SDK_CORE_VERSION = r"""
-try:
-    from importlib.metadata import version
-    print(version("rocm-sdk-core"))
-except Exception:
-    pass
-"""
-
 
 # --- CLI -------------------------------------------------------------------
 
@@ -269,11 +232,6 @@ def build_parser() -> argparse.ArgumentParser:
             "  none: leave torch uninstalled and build bindings against installed "
             "ROCm/hipDNN."
         ),
-    )
-    parser.add_argument(
-        "--reuse-venv",
-        action="store_true",
-        help="Reuse an existing venv instead of deleting it.",
     )
     parser.add_argument(
         "--workspace",
@@ -336,7 +294,6 @@ class Setup:
     def __init__(self, args: argparse.Namespace) -> None:
         self.torch_mode = args.torch_mode
         self.reuse_artifacts = args.reuse_artifacts
-        self.reuse_venv = args.reuse_venv
         self.auto_yes = args.yes
         self.rocm_prefix = args.rocm_prefix
         self.gpu_arch_override = args.gpu_arch
@@ -345,12 +302,7 @@ class Setup:
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
 
-        # do_build defaults on; --reuse-artifacts / cuda mode turn it off.
-        self.do_build = not self.reuse_artifacts
-        if self.torch_mode == "cuda":
-            self.do_build = False
-        if self.torch_mode == "existing":
-            self.reuse_venv = True
+        self.do_build = not self.reuse_artifacts and self.torch_mode != "cuda"
 
         # Resolve: this path is written into activate.local, which is sourced
         # from arbitrary working directories.
@@ -399,13 +351,23 @@ class Setup:
         It is a git submodule (see .gitmodules) tracking develop by default, so
         `git submodule update --init` also works. This is the fast path used only
         when the directory isn't already populated: a sparse, blobless clone of
-        the .gitmodules-pinned branch limited to the two subtrees this tool builds
-        (projects/hipdnn, dnn-providers), skipping the rest of the ~9GB monorepo.
+        the .gitmodules-pinned branch limited to the hipDNN/provider sources and
+        root CMake tooling this script builds.
         To build against a different ref, check it out directly, e.g.
         `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
         if (ROCM_LIBRARIES_DIR / ".git").exists():
+            if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
+                run_git(
+                    [
+                        "-C",
+                        str(ROCM_LIBRARIES_DIR),
+                        "sparse-checkout",
+                        "add",
+                        "cmake",
+                    ]
+                )
             return
         gitmodules = str(SCRIPT_DIR / ".gitmodules")
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
@@ -414,7 +376,7 @@ class Setup:
         )
         print(
             f"Fetching rocm-libraries ({branch}) via sparse checkout "
-            "(projects/hipdnn, dnn-providers)..."
+            "(cmake, projects/hipdnn, dnn-providers)..."
         )
         if ROCM_LIBRARIES_DIR.exists():
             shutil.rmtree(ROCM_LIBRARIES_DIR)
@@ -435,6 +397,7 @@ class Setup:
                 str(ROCM_LIBRARIES_DIR),
                 "sparse-checkout",
                 "set",
+                "cmake",
                 "projects/hipdnn",
                 "dnn-providers",
             ]
@@ -456,12 +419,6 @@ class Setup:
     # -- venv lifecycle -----------------------------------------------------
 
     def setup_venv(self) -> None:
-        # Windows ROCm source builds install into the ROCm wheel env that
-        # wheel_build_setup.ps1 owns. Every other mode keeps the workspace venv,
-        # so a stray ROCM_WHEEL_VENV in the environment cannot hijack --workspace.
-        if IS_WINDOWS and self.torch_mode == "rocm" and self.do_build:
-            self._select_windows_wheel_venv()
-
         if self.torch_mode == "existing" and not self.venv_dir.is_dir():
             fail(
                 f"ERROR: --torch-mode existing requires an existing virtual "
@@ -469,12 +426,9 @@ class Setup:
                 "Use --torch-mode rocm or --torch-mode cpu to create one and "
                 "install torch automatically.",
             )
-        if self.venv_dir.is_dir():
-            if self.reuse_venv:
-                print(f"Reusing existing virtual environment at {self.venv_dir}...")
-            else:
-                print(f"Removing existing virtual environment at {self.venv_dir}...")
-                shutil.rmtree(self.venv_dir)
+        if self.venv_dir.is_dir() and self.torch_mode != "existing":
+            print(f"Removing existing virtual environment at {self.venv_dir}...")
+            shutil.rmtree(self.venv_dir)
         if not self.venv_dir.is_dir():
             print(f"Creating virtual environment at {self.venv_dir}...")
             run([sys.executable, "-m", "venv", str(self.venv_dir)])
@@ -482,73 +436,23 @@ class Setup:
         self.env["PYTHONPYCACHEPREFIX"] = str(self.workspace / "pycache")
         self.env["DNN_BENCH_WORKSPACE"] = str(self.workspace)
         if not IS_WINDOWS:
-            # Windows has no activate.local sourcing; the child env above covers
-            # subprocesses there instead.
             self.write_activate_local()
 
         self.installed_torch_mode = self.get_torch_mode()
-        # An existing venv with CUDA torch reaches the CUDA skip path even when
-        # --torch-mode existing was passed; hipDNN can't be built there, so keep
-        # the build decision consistent.
         if self.installed_torch_mode == "cuda":
             self.do_build = False
 
-    def _select_windows_wheel_venv(self) -> None:
-        wheel_venv = os.environ.get("ROCM_WHEEL_VENV")
-        if not wheel_venv:
-            wheel_venv_path = self.workspace / "rocm-wheel-venv"
-            if wheel_venv_path.is_dir():
-                # wheel_build_setup.ps1 prompts (Read-Host "Pull new wheels?")
-                # whenever its venv already exists, and -y cannot answer that;
-                # reuse the env rather than re-running the bootstrap.
-                print(f"Reusing existing ROCm wheel env at {wheel_venv_path}")
-            else:
-                # wheel_build_setup.ps1 lives inside the rocm-libraries submodule,
-                # so the checkout has to precede the bootstrap.
-                self.ensure_rocm_libraries_checkout()
-                print(
-                    "ROCM_WHEEL_VENV not set; bootstrapping a wheel env via "
-                    "wheel_build_setup.ps1"
-                )
-                # The script publishes its venv path as $env:ROCM_WHEEL_VENV in
-                # its own process, which cannot cross the subprocess boundary;
-                # pass -VenvPath so the target is known without reading it back.
-                run(
-                    [
-                        "pwsh",
-                        str(
-                            HIPDNN_ROOT
-                            / "scripts"
-                            / "windows"
-                            / "wheel_build_setup.ps1"
-                        ),
-                        "-GpuTarget",
-                        self.gpu_arch,
-                        "-VenvPath",
-                        str(wheel_venv_path),
-                    ],
-                    env=self.env,
-                )
-            wheel_venv = str(wheel_venv_path)
-        # Reuse the wheel env in place; never recreate it.
-        self.venv_dir = Path(wheel_venv)
-        self.reuse_venv = True
-
-    def write_activate_local(self, rocm_prefix: str = "", lib_dir: str = "") -> None:
-        """Write the venv's activate.local and make activate source it.
-
-        PYTHONPYCACHEPREFIX redirects Python's bytecode cache away from a network
-        home directory. It must be set before the interpreter starts (setting it
-        from Python is too late for that process's own imports), so it belongs in
-        the activation script rather than the child env.
-        """
+    def write_activate_local(
+        self, rocm_prefix: str = "", lib_dirs: tuple[str, ...] = ()
+    ) -> None:
+        """Write the venv's activate.local and make activate source it."""
         lines = [
             f"export PYTHONPYCACHEPREFIX={shlex.quote(str(self.workspace / 'pycache'))}",
             f"export DNN_BENCH_WORKSPACE={shlex.quote(str(self.workspace))}",
         ]
         if rocm_prefix:
             lines.append(f"export ROCM_PATH={shlex.quote(rocm_prefix)}")
-        if lib_dir:
+        for lib_dir in reversed(lib_dirs):
             lines += [
                 'case ":${LD_LIBRARY_PATH:-}:" in',
                 f"    *:{lib_dir}:*) ;;",
@@ -712,54 +616,6 @@ class Setup:
             "not resolve the devel prefix (see the error above).",
             "The rocm_sdk module comes from the `rocm` package; installing "
             "rocm[devel] pins both at matching versions.",
-        )
-
-    def sync_rocm_sdk_devel_version(self, index_url: str) -> None:
-        """Re-pin rocm-sdk-devel to match the installed rocm-sdk-core version.
-
-        Windows bootstraps its wheel venv via wheel_build_setup.ps1, which
-        installs rocm-sdk-devel from the latest nightly *before* install_torch()
-        runs. install_torch() then installs torch pinned to a (usually older,
-        independently-versioned) nightly that pulls its own rocm-sdk-core,
-        downgrading it in the same venv -- but the already-expanded devel tree
-        is never resynced. hipDNN then builds against newer devel headers than
-        the runtime DLLs actually installed, and the compiled extension fails
-        to import with a DLL symbol mismatch ("procedure could not be found").
-        Linux doesn't hit this: it installs devel from resolved_torch_index_url
-        *after* install_torch(), so the two are pinned together from the start.
-
-        No-op when index_url is empty (e.g. --torch-mode existing, where there
-        is no resolved nightly index to re-pin from).
-        """
-        if not index_url:
-            return
-        core_version = self.probe(_GET_ROCM_SDK_CORE_VERSION).stdout.strip()
-        if not core_version:
-            return
-        devel_version = self.probe(
-            "from importlib.metadata import version, PackageNotFoundError\n"
-            "try:\n"
-            '    print(version("rocm-sdk-devel"))\n'
-            "except PackageNotFoundError:\n"
-            "    pass\n"
-        ).stdout.strip()
-        if devel_version == core_version:
-            return
-        print(
-            f"rocm-sdk-devel ({devel_version or 'missing'}) doesn't match the "
-            f"installed rocm-sdk-core ({core_version}); re-pinning devel to "
-            f"{core_version} from {index_url}..."
-        )
-        # --force-reinstall: pip treats an already-satisfied exact-version pin
-        # as a no-op otherwise, which would leave a stale expanded devel tree
-        # (rocm-sdk-devel's own package dir) in place with the old payload.
-        self.pip(
-            "install",
-            "--pre",
-            "--force-reinstall",
-            f"rocm-sdk-devel=={core_version}",
-            "--index-url",
-            index_url,
         )
 
     # -- amdsmi (powers the GPU SMI snapshot; optional) ---------------------
@@ -932,288 +788,28 @@ class Setup:
             # packages are OS/arch-agnostic on this index, so Linux and
             # Windows always resolve the exact same nightly.
             self.pip(
-                "install", "--pre", f"torch[device-{arch}]", "--index-url", index_url
+                "install",
+                "--pre",
+                f"torch[device-{arch}]",
+                f"rocm[libraries,devel,device-{arch}]",
+                "--index-url",
+                index_url,
             )
 
         self.installed_torch_mode = self.get_torch_mode()
         self.require_torch_mode(mode)
 
-    # -- Linux build backend ------------------------------------------------
+    # -- Source build -------------------------------------------------------
 
-    def _build_env(self):
-        # hipDNN's ClangToolChain warns when ROCM_PATH leaks via the environment
-        # (e.g. from a prior run's activate.local); clear it for the build and
-        # pass the prefix as -DROCM_PATH instead.
-        build_env = dict(self.env)
-        build_env.pop("ROCM_PATH", None)
-        return build_env
-
-    def _cmake_paths(self, install_prefix: str, toolchain_prefix: str):
-        cmake_prefix_path = install_prefix
-        if toolchain_prefix != install_prefix:
-            cmake_prefix_path = f"{install_prefix};{toolchain_prefix}"
-        cmake_program_path = f"{toolchain_prefix}/bin;{toolchain_prefix}/lib/llvm/bin"
-        return cmake_prefix_path, cmake_program_path
-
-    def build_hipdnn(self, install_prefix: str, toolchain_prefix: str) -> None:
-        cmake_prefix_path, cmake_program_path = self._cmake_paths(
-            install_prefix, toolchain_prefix
-        )
-        print(f"Building and installing hipDNN to {install_prefix}...")
-        print(f"Using ROCm compiler/devel prefix: {toolchain_prefix}")
-        if BUILD_DIR.exists():
-            shutil.rmtree(BUILD_DIR)
-        build_env = self._build_env()
-        run(
-            [
-                "cmake",
-                "-S",
-                str(HIPDNN_ROOT),
-                "-B",
-                str(BUILD_DIR),
-                "-DCMAKE_BUILD_TYPE=Release",
-                *self.hip_arch_args,
-                f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
-                f"-DCMAKE_PREFIX_PATH={cmake_prefix_path}",
-                f"-DCMAKE_PROGRAM_PATH={cmake_program_path}",
-                f"-DROCM_PATH={toolchain_prefix}",
-                "-DHIPDNN_SKIP_TESTS=ON",
-                "-DHIPDNN_ENABLE_SDPA=ON",
-                "-DENABLE_CLANG_FORMAT=OFF",
-                "-DENABLE_CLANG_TIDY=OFF",
-            ],
-            env=build_env,
-        )
-        run(["cmake", "--build", str(BUILD_DIR)], env=build_env)
-        run(["cmake", "--install", str(BUILD_DIR)], env=build_env)
-
-    def build_provider(
-        self,
-        name: str,
-        provider_dir: Path,
-        install_prefix: str,
-        toolchain_prefix: str,
-        extra_args,
-    ) -> bool:
-        if not provider_dir.is_dir():
-            print(f"Warning: {name} not found at {provider_dir}", file=sys.stderr)
-            return False
-
-        build_dir = provider_dir / "build"
-        cmake_prefix_path, cmake_program_path = self._cmake_paths(
-            install_prefix, toolchain_prefix
-        )
-        print(f"Building and installing {name} to {install_prefix}...")
-        print(f"Using ROCm compiler/devel prefix: {toolchain_prefix}")
-        if build_dir.exists():
-            shutil.rmtree(build_dir)
-        build_env = self._build_env()
-        try:
-            run(
-                [
-                    "cmake",
-                    "-S",
-                    str(provider_dir),
-                    "-B",
-                    str(build_dir),
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    *self.hip_arch_args,
-                    f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
-                    f"-DCMAKE_PREFIX_PATH={cmake_prefix_path}",
-                    f"-DCMAKE_PROGRAM_PATH={cmake_program_path}",
-                    f"-DROCM_PATH={toolchain_prefix}",
-                    "-DENABLE_CLANG_FORMAT=OFF",
-                    "-DENABLE_CLANG_TIDY=OFF",
-                    *extra_args,
-                ],
-                env=build_env,
-            )
-            run(["cmake", "--build", str(build_dir)], env=build_env)
-            run(["cmake", "--install", str(build_dir)], env=build_env)
-        except subprocess.CalledProcessError:
-            return False
-        return True
-
-    @staticmethod
-    def has_engine_plugins(plugin_dir: Path) -> bool:
-        return plugin_dir.is_dir() and any(plugin_dir.glob("*.so"))
-
-    @staticmethod
-    def prepend_ld_library_path(env: dict, lib_dir: str) -> None:
-        current = env.get("LD_LIBRARY_PATH", "")
-        parts = current.split(":") if current else []
-        if lib_dir in parts:
-            return
-        env["LD_LIBRARY_PATH"] = lib_dir + (f":{current}" if current else "")
-
-    def build_and_install_linux(self, binding_prefix: str) -> None:
-        if self.do_build:
-            self.build_hipdnn(binding_prefix, self.toolchain_prefix)
-        elif not self.prefix_has_hipdnn(binding_prefix):
-            # Reachable only via --reuse-artifacts (cuda mode exits earlier).
-            fail(
-                "ERROR: --reuse-artifacts was passed, but hipDNN CMake configs "
-                f"were not found under {binding_prefix}.",
-                "Expected:",
-                f"  {self.hipdnn_config_path(binding_prefix)}",
-                f"  {self.hipdnn_backend_config_path(binding_prefix)}",
-                "There is nothing to reuse there yet (e.g. the ROCm wheel "
-                "currently ships hipDNN's runtime but not its devel/CMake "
-                "artifacts).",
-                "Drop --reuse-artifacts to build from source, or point "
-                "--rocm-prefix at a prefix that has them.",
-            )
-
-        # Provider plugins are only ever built alongside hipDNN: --reuse-artifacts
-        # promises never to build, and any other path has just rebuilt hipDNN, so
-        # its plugins must be rebuilt against it.
-        provider_build_failed = False
-        if self.do_build:
-            for name, provider_dir, extra_args in PROVIDERS:
-                if not self.build_provider(
-                    name,
-                    provider_dir,
-                    binding_prefix,
-                    self.toolchain_prefix,
-                    extra_args,
-                ):
-                    print(
-                        f"Warning: {name} plugin build failed; continuing with "
-                        "any available providers.",
-                        file=sys.stderr,
-                    )
-                    provider_build_failed = True
-
-        plugin_dir = Path(binding_prefix) / "lib/hipdnn_plugins/engines"
-        plugins_available = self.has_engine_plugins(plugin_dir)
-        if not plugins_available:
-            print(
-                f"Warning: no native hipDNN engine plugins were found in "
-                f"{plugin_dir}.",
-                file=sys.stderr,
-            )
-            print(
-                "Setup will still finish, but default hipDNN benchmark runs need "
-                "engine plugins.",
-                file=sys.stderr,
-            )
-            print(
-                "Pass --plugin-path or config plugin_path to use custom provider "
-                "plugins.",
-                file=sys.stderr,
-            )
-        if provider_build_failed:
-            print(
-                "Warning: one or more provider plugins failed to build.",
-                file=sys.stderr,
-            )
-            print(
-                "Continuing with available or user-specified plugins.",
-                file=sys.stderr,
-            )
-
-        print("")
-        if plugins_available:
-            print(f"hipDNN plugins available at: {plugin_dir}/")
-        else:
-            print(f"hipDNN plugin search path: {plugin_dir}/ (no .so files found)")
-
-        self.env["ROCM_PATH"] = binding_prefix
-        self.prepend_ld_library_path(self.env, f"{binding_prefix}/lib")
-        self.write_activate_local(binding_prefix, f"{binding_prefix}/lib")
-
-        self.maybe_install_amdsmi(
-            binding_prefix,
-            self.toolchain_prefix,
-            self.rocm_prefix,
-            DEFAULT_ROCM_PREFIX,
-        )
-        self.build_and_install_bindings_linux(binding_prefix, self.toolchain_prefix)
-
-    def build_and_install_bindings_linux(
-        self, binding_prefix: str, toolchain_prefix: str
-    ) -> None:
-        # The bindings are a standalone CMake project (python/frontend_bindings)
-        # plus a wheel packer (python/frontend_wheel_package/pack_frontend_wheel.py):
-        # build the nanobind extension against the installed hipDNN, pack a wheel,
-        # then install it. `pip install -e HIPDNN_ROOT/python` does not work --
-        # python/ has no pyproject.toml.
-        python_dir = HIPDNN_ROOT / "python"
-        bindings_src = python_dir / "frontend_bindings"
-        bindings_build_dir = python_dir / "build" / "frontend_bindings"
-        wheel_dir = python_dir / "build" / "wheel_package"
-        packer = python_dir / "frontend_wheel_package" / "pack_frontend_wheel.py"
-
-        cmake_prefix_path = binding_prefix
-        if toolchain_prefix != binding_prefix:
-            cmake_prefix_path = f"{binding_prefix};{toolchain_prefix}"
-
-        self.pip("install", "build")
-        # Wipe any stale CMake cache (it can reference deleted pip temp envs).
-        py_build_root = python_dir / "build"
-        if py_build_root.exists():
-            shutil.rmtree(py_build_root)
-
-        binding_env = dict(self.env)
-        binding_env["ROCM_PATH"] = toolchain_prefix
-        run(
-            [
-                "cmake",
-                "-S",
-                str(bindings_src),
-                "-B",
-                str(bindings_build_dir),
-                "-GNinja",
-                "-DCMAKE_BUILD_TYPE=Release",
-                f"-DCMAKE_PREFIX_PATH={cmake_prefix_path}",
-                f"-DPython_EXECUTABLE={self.py}",
-            ],
-            env=binding_env,
-        )
-        run(["cmake", "--build", str(bindings_build_dir)], env=binding_env)
-        run(
-            [
-                self.py,
-                str(packer),
-                "--build-dir",
-                str(bindings_build_dir),
-                "--wheel-dir",
-                str(wheel_dir),
-            ],
-            env=self.env,
-        )
-        wheels = sorted(wheel_dir.glob("hipdnn_frontend-*.whl"))
-        if len(wheels) != 1:
-            fail(f"ERROR: expected exactly one hipdnn_frontend wheel in {wheel_dir}")
-        self.pip("install", "--force-reinstall", str(wheels[0]))
-
-    # -- Windows build backend ----------------------------------------------
-    # Unverified against a real Windows/ROCm host; CI's rocm-build job exercises
-    # compile + link only (no GPU).
-
-    @staticmethod
-    def _fwd(path: str) -> str:
-        """Forward-slash a Windows path: backslashes would be read as escapes
-        inside the .bat command lines."""
-        return path.replace("\\", "/")
-
-    def _windows_toolchain(self):
-        """Locate cmake, ninja, vcvars64 and the Windows SDK."""
-        cmake_exe = shutil.which("cmake")
-        if not cmake_exe:
-            fail("cmake not found on PATH.")
-        ninja_exe = shutil.which("ninja")
-        if not ninja_exe:
-            fail("ninja not found on PATH.")
-
-        vcvars = None
-        vswhere = (
+    def _windows_host_env(self) -> dict:
+        vswhere = Path(
             r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
         )
-        if Path(vswhere).exists():
-            vs_path = subprocess.run(
+        vcvars = None
+        if vswhere.is_file():
+            result = subprocess.run(
                 [
-                    vswhere,
+                    str(vswhere),
                     "-latest",
                     "-products",
                     "*",
@@ -1225,297 +821,233 @@ class Setup:
                 capture_output=True,
                 text=True,
                 check=False,
-            ).stdout.strip()
-            if vs_path:
-                vcvars = str(Path(vs_path) / "VC/Auxiliary/Build/vcvars64.bat")
-        if not vcvars or not Path(vcvars).exists():
-            fallback = r"C:\develop\dist\vs-buildtools\VC\Auxiliary\Build\vcvars64.bat"
-            if Path(fallback).exists():
-                vcvars = fallback
-        if not vcvars or not Path(vcvars).exists():
-            fail("vcvars64.bat not found.")
+            )
+            if result.stdout.strip():
+                vcvars = (
+                    Path(result.stdout.strip())
+                    / "VC"
+                    / "Auxiliary"
+                    / "Build"
+                    / "vcvars64.bat"
+                )
+        if not vcvars or not vcvars.is_file():
+            for candidate in (
+                Path(
+                    r"C:\Program Files\Microsoft Visual Studio\2022"
+                    r"\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+                ),
+                Path(
+                    r"C:\develop\dist\vs-buildtools" r"\VC\Auxiliary\Build\vcvars64.bat"
+                ),
+            ):
+                if candidate.is_file():
+                    vcvars = candidate
+                    break
+        if not vcvars or not vcvars.is_file():
+            fail("Visual Studio 2022 C++ Build Tools and the Windows SDK are required.")
 
-        winsdk_root = r"C:\Program Files (x86)\Windows Kits\10"
-        lib_root = Path(winsdk_root) / "Lib"
-        versions = []
-        if lib_root.is_dir():
-            for child in lib_root.iterdir():
-                if child.is_dir() and child.name[:1].isdigit() and "." in child.name:
-                    versions.append(child.name)
-        if not versions:
-            fail(f"No Windows SDK found under {winsdk_root}\\Lib.")
-        return cmake_exe, ninja_exe, vcvars, winsdk_root, sorted(versions)[-1]
+        result = subprocess.run(
+            ["cmd", "/d", "/s", "/c", f'call "{vcvars}" >nul && set'],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        env = dict(self.env)
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env[key] = value
+        return env
+
+    def _build_env(self) -> dict:
+        env = self._windows_host_env() if IS_WINDOWS else dict(self.env)
+        env.pop("ROCM_PATH", None)
+        return env
 
     @staticmethod
-    def _cmake_stages(cmake_exe: str, source: str, build: str, configure_args):
-        """Turn one CMake project into its configure/build/install command lines
-        for the toolchain .bat."""
-        cmake = f'"{cmake_exe}"'
-        src = '"{0}"'.format(Setup._fwd(source))
-        bld = '"{0}"'.format(Setup._fwd(build))
-        return [
-            f"{cmake} -S {src} -B {bld} {' '.join(configure_args)}",
-            f"{cmake} --build {bld}",
-            f"{cmake} --install {bld}",
-        ]
+    def _cmake_paths(install_prefix: str, toolchain_prefix: str):
+        prefix_path = install_prefix
+        if toolchain_prefix != install_prefix:
+            prefix_path = f"{install_prefix};{toolchain_prefix}"
+        program_path = f"{toolchain_prefix}/bin;{toolchain_prefix}/lib/llvm/bin"
+        return prefix_path, program_path
 
-    def _invoke_toolchain_build(
-        self, title, commands, vcvars, winsdk_root, winsdk_version, best_effort=False
-    ) -> bool:
-        """Run CMake inside an MSVC + Windows SDK env via a throwaway .bat
-        (vcvars64 can't be sourced into this process); append the SDK lib/include
-        paths an unregistered BuildTools instance can't locate."""
-        lines = [
-            "@echo off",
-            'set "PATH=C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer;%PATH%"',
-            f'call "{vcvars}" >nul || (echo VCVARS FAILED & exit /b 1)',
-            f'set "WINSDK={winsdk_root}"',
-            f'set "WINSDKVER={winsdk_version}"',
-            'set "LIB=%LIB%;%WINSDK%\\Lib\\%WINSDKVER%\\um\\x64;%WINSDK%\\Lib\\%WINSDKVER%\\ucrt\\x64"',
-            'set "INCLUDE=%INCLUDE%;%WINSDK%\\Include\\%WINSDKVER%\\um;%WINSDK%\\Include\\%WINSDKVER%\\ucrt;%WINSDK%\\Include\\%WINSDKVER%\\shared"',
-            # Clear a leaked ROCM_PATH; the prefix is passed as -DROCM_PATH.
-            'set "ROCM_PATH="',
-        ]
-        for command in commands:
-            lines.append(command)
-            lines.append("if errorlevel 1 exit /b 1")
+    def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
+        if not shutil.which("cmake"):
+            fail("cmake not found on PATH.")
+        if not shutil.which("ninja"):
+            fail("ninja not found on PATH.")
 
-        bat = Path(tempfile.gettempdir()) / f"hipdnn_build_{uuid.uuid4().hex}.bat"
-        bat.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
-        print(f"==> {title}")
-        code = subprocess.run(
-            ["cmd", "/c", str(bat)], env=self.env, check=False
-        ).returncode
-        bat.unlink(missing_ok=True)
-        if code != 0:
-            if best_effort:
-                print(
-                    f"WARNING: {title} failed (exit {code}); continuing.",
-                    file=sys.stderr,
-                )
-                return False
-            fail(f"{title} failed (exit {code}).")
-        return True
-
-    def build_and_install_windows(self) -> None:
-        bindings_root = HIPDNN_ROOT / "python"
-        bindings_src = bindings_root / "frontend_bindings"
-        bindings_build = BUILD_DIR / "python"
-        bindings_package = bindings_build / "wheel_package"
-        bindings_pack_script = (
-            bindings_root / "frontend_wheel_package" / "pack_frontend_wheel.py"
-        )
-        build_type = "Release"
-        install_dir = str(HIPDNN_ROOT / "install")
-
-        if self.do_build:
-            # devel prefix: --rocm-prefix, else _rocm_sdk_devel wheel discovery.
-            if self.rocm_prefix:
-                wheel = self.rocm_prefix
-            else:
-                # See sync_rocm_sdk_devel_version: wheel_build_setup.ps1's
-                # bootstrap and install_torch() can pin rocm-sdk-devel and
-                # rocm-sdk-core to different nightlies in the same venv.
-                self.sync_rocm_sdk_devel_version(self.resolved_torch_index_url)
-                wheel = self._rocm_sdk_devel_root(report_errors=True)
-                if not wheel:
-                    fail(
-                        "Building from source needs the ROCm devel wheel "
-                        f"(_rocm_sdk_devel) in {self.py}'s env, or pass "
-                        "--rocm-prefix."
-                    )
-
-            cmake_exe, ninja_exe, vcvars, winsdk_root, winsdk_version = (
-                self._windows_toolchain()
-            )
-            print(f"Toolchain: cmake={cmake_exe} ninja={ninja_exe}")
-            print(f"           vcvars={vcvars}  winsdk={winsdk_version}")
-            print(
-                f"           rocm={wheel}  gpu={self.gpu_arch}  install={install_dir}"
-            )
-
-            wheel_fwd = self._fwd(wheel)
-            ninja_fwd = self._fwd(ninja_exe)
-            python_fwd = self._fwd(self.py)
-            install_fwd = self._fwd(install_dir)
-
-            hipdnn_args = [
+        build_dir = ROCM_LIBRARIES_DIR / "build"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
+        print(f"Building hipDNN and providers to {install_prefix}...")
+        run(
+            [
+                "cmake",
+                "--preset",
+                "hipdnn-providers-all",
                 "-GNinja",
-                f"-DCMAKE_BUILD_TYPE={build_type}",
-                f'-DCMAKE_CXX_COMPILER="{wheel_fwd}/lib/llvm/bin/clang++.exe"',
-                f'-DCMAKE_MAKE_PROGRAM="{ninja_fwd}"',
-                f'-DCMAKE_PREFIX_PATH="{wheel_fwd}"',
-                f'-DROCM_CMAKE_PATH="{wheel_fwd}"',
-                f'-DROCM_PATH="{wheel_fwd}"',
-                f'-DPython_EXECUTABLE="{python_fwd}"',
-                f"-DGPU_TARGETS={self.gpu_arch}",
-                f"-DAMDGPU_TARGETS={self.gpu_arch}",
+                f"-DROCM_PATH={toolchain_prefix}",
+                f"-DCMAKE_PREFIX_PATH={prefix_path}",
+                f"-DCMAKE_PROGRAM_PATH={program_path}",
+                f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+                "-DROCM_LIBS_ENABLE_COMPONENTS=hipdnn;miopen-provider;"
+                "hipblaslt-provider;hip-kernel-provider",
+                *self.hip_arch_args,
                 "-DHIPDNN_SKIP_TESTS=ON",
-                # clang-format/-tidy are required-by-default dev lints that
-                # hard-fail configure when the tools aren't on PATH.
+                "-DHIPDNN_ENABLE_SDPA=ON",
+                "-DMIOPENPROVIDER_SKIP_TESTS=ON",
+                "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
+                "-DENABLE_ASM_SDPA_ENGINE=ON",
                 "-DENABLE_CLANG_FORMAT=OFF",
                 "-DENABLE_CLANG_TIDY=OFF",
-                f'-DCMAKE_INSTALL_PREFIX="{install_fwd}"',
-            ]
-            self._invoke_toolchain_build(
-                "Building + installing hipDNN",
-                self._cmake_stages(
-                    cmake_exe, str(HIPDNN_ROOT), str(BUILD_DIR), hipdnn_args
-                ),
-                vcvars,
-                winsdk_root,
-                winsdk_version,
-            )
+            ],
+            cwd=ROCM_LIBRARIES_DIR,
+            env=self._build_env(),
+        )
+        run(
+            ["cmake", "--build", str(build_dir)],
+            env=self._build_env(),
+        )
+        run(
+            ["cmake", "--install", str(build_dir)],
+            env=self._build_env(),
+        )
 
-            # Python bindings: standalone CMake project against the installed
-            # hipDNN artifacts, packed into the frontend wheel layout.
-            bindings_args = [
+    def build_and_install_bindings(
+        self, install_prefix: str, toolchain_prefix: str
+    ) -> None:
+        python_dir = HIPDNN_ROOT / "python"
+        bindings_source = python_dir / "frontend_bindings"
+        if not bindings_source.is_dir():
+            fail(f"hipDNN frontend bindings not found at {bindings_source}")
+        bindings_build = python_dir / "build" / "frontend_bindings"
+        wheel_dir = python_dir / "build" / "wheel_package"
+        build_root = python_dir / "build"
+        if build_root.exists():
+            shutil.rmtree(build_root)
+
+        prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
+        self.pip("install", "build")
+        run(
+            [
+                "cmake",
+                "-S",
+                str(bindings_source),
+                "-B",
+                str(bindings_build),
                 "-GNinja",
-                f"-DCMAKE_BUILD_TYPE={build_type}",
-                f'-DCMAKE_CXX_COMPILER="{wheel_fwd}/lib/llvm/bin/clang++.exe"',
-                f'-DCMAKE_MAKE_PROGRAM="{ninja_fwd}"',
-                f'-DCMAKE_PREFIX_PATH="{install_fwd};{wheel_fwd}"',
-                f'-DPython_EXECUTABLE="{python_fwd}"',
-            ]
-            bindings_stages = self._cmake_stages(
-                cmake_exe, str(bindings_src), str(bindings_build), bindings_args
-            )
-            # The packer stages the extension into a wheel via `python -m build`.
-            self.pip("install", "build")
-            bindings_pack_cmd = (
-                '"{0}" "{1}" --build-dir "{2}" --wheel-dir "{3}"'.format(
-                    python_fwd,
-                    self._fwd(str(bindings_pack_script)),
-                    self._fwd(str(bindings_build)),
-                    self._fwd(str(bindings_package)),
-                )
-            )
-            self._invoke_toolchain_build(
-                "Building hipDNN Python bindings",
-                [bindings_stages[0], bindings_stages[1], bindings_pack_cmd],
-                vcvars,
-                winsdk_root,
-                winsdk_version,
-            )
+                "-DCMAKE_BUILD_TYPE=Release",
+                f"-DCMAKE_TOOLCHAIN_FILE={ROCM_LIBRARIES_DIR / 'cmake/toolchains/rocm-clang.cmake'}",
+                f"-DROCM_PATH={toolchain_prefix}",
+                f"-DCMAKE_PREFIX_PATH={prefix_path}",
+                f"-DCMAKE_PROGRAM_PATH={program_path}",
+                f"-DPython_EXECUTABLE={self.py}",
+            ],
+            env=self._build_env(),
+        )
+        run(["cmake", "--build", str(bindings_build)], env=self._build_env())
+        run(
+            [
+                self.py,
+                str(python_dir / "frontend_wheel_package" / "pack_frontend_wheel.py"),
+                "--build-dir",
+                str(bindings_build),
+                "--wheel-dir",
+                str(wheel_dir),
+            ],
+            env=self.env,
+        )
+        wheels = sorted(wheel_dir.glob("hipdnn_frontend-*.whl"))
+        if len(wheels) != 1:
+            fail(f"ERROR: expected exactly one hipdnn_frontend wheel in {wheel_dir}")
+        self.pip("install", "--force-reinstall", str(wheels[0]))
 
-            if MIOPEN_PROVIDER_DIR.is_dir():
-                prov_args = [
-                    "-GNinja",
-                    f"-DCMAKE_BUILD_TYPE={build_type}",
-                    f'-DCMAKE_MAKE_PROGRAM="{ninja_fwd}"',
-                    f'-DCMAKE_PREFIX_PATH="{install_fwd};{wheel_fwd}"',
-                    f'-DROCM_CMAKE_PATH="{wheel_fwd}"',
-                    f'-DROCM_PATH="{wheel_fwd}"',
-                    f"-DGPU_TARGETS={self.gpu_arch}",
-                    f"-DAMDGPU_TARGETS={self.gpu_arch}",
-                    "-DMIOPENPROVIDER_SKIP_TESTS=ON",
-                    "-DENABLE_CLANG_FORMAT=OFF",
-                    "-DENABLE_CLANG_TIDY=OFF",
-                    f'-DCMAKE_INSTALL_PREFIX="{install_fwd}"',
-                ]
-                self._invoke_toolchain_build(
-                    "Building + installing MIOpen provider",
-                    self._cmake_stages(
-                        cmake_exe,
-                        str(MIOPEN_PROVIDER_DIR),
-                        str(MIOPEN_PROVIDER_DIR / "build"),
-                        prov_args,
-                    ),
-                    vcvars,
-                    winsdk_root,
-                    winsdk_version,
-                    best_effort=True,
-                )
-                # Report on the artifact, not the build's exit status -- the
-                # plugin .dll landing in engines/ is the signal that matters. The
-                # RUNTIME .dll installs under bin/; lib/ is the Linux layout.
-                for candidate in (
-                    Path(install_dir) / "bin/hipdnn_plugins/engines",
-                    Path(install_dir) / "lib/hipdnn_plugins/engines",
-                ):
-                    if candidate.is_dir() and any(candidate.glob("*.dll")):
-                        self.plugin_engines_dir = candidate
-                        break
-                if self.plugin_engines_dir:
-                    print(f"==> MIOpen plugin installed to {self.plugin_engines_dir}")
-                else:
-                    print(
-                        "WARNING: MIOpen provider produced no plugin under "
-                        f"{install_dir}\\{{bin,lib}}\\hipdnn_plugins\\engines "
-                        "(see build output above).",
-                        file=sys.stderr,
-                    )
-            else:
-                print(
-                    f"WARNING: MIOpen provider not found at {MIOPEN_PROVIDER_DIR}; "
-                    "skipping.",
-                    file=sys.stderr,
+        if IS_WINDOWS:
+            backend_bin = Path(install_prefix) / "bin"
+            if (backend_bin / "hipdnn_backend.dll").exists():
+                site_pkgs = self.probe(
+                    "import sysconfig; print(sysconfig.get_path('purelib'))"
+                ).stdout.strip()
+                pth = Path(site_pkgs) / "hipdnn_frontend_dll_path.pth"
+                pth.write_text(
+                    "import os, sys; _p = r'{0}'; "
+                    "sys.__dict__.setdefault('_hipdnn_dll_dirs', [])"
+                    ".append(os.add_dll_directory(_p))\n".format(backend_bin),
+                    encoding="ascii",
                 )
 
-            self._install_windows_bindings(bindings_package, install_dir)
-        elif self.probe("import hipdnn_frontend").returncode != 0:
+    def build_and_install(self, install_prefix: str) -> None:
+        toolchain_prefix = self.toolchain_prefix
+        if self.do_build:
+            self.build_superbuild(install_prefix, toolchain_prefix)
+        elif not self.prefix_has_hipdnn(install_prefix):
+            fail(
+                "ERROR: --reuse-artifacts was passed, but hipDNN CMake configs "
+                f"were not found under {install_prefix}.",
+                "Drop --reuse-artifacts to build from source, or pass a usable "
+                "--rocm-prefix.",
+            )
+
+        plugin_candidates = (
+            Path(install_prefix) / "bin/hipdnn_plugins/engines",
+            Path(install_prefix) / "lib/hipdnn_plugins/engines",
+        )
+        suffix = "*.dll" if IS_WINDOWS else "*.so"
+        for candidate in plugin_candidates:
+            if candidate.is_dir() and any(candidate.glob(suffix)):
+                self.plugin_engines_dir = candidate
+                break
+        if not self.plugin_engines_dir:
             print(
-                "WARNING: --reuse-artifacts was passed and hipdnn_frontend is not "
-                "importable in this env. Re-run without --reuse-artifacts to build "
-                "and install the bindings from source.",
+                f"Warning: no native hipDNN engine plugins found under "
+                f"{install_prefix}.",
                 file=sys.stderr,
             )
 
-        # amdsmi ships with the HIP SDK rather than PyPI, so point the shared
-        # installer at the SDK roots. Its ROCm-wheel probe globs libamd_smi.so*
-        # and simply finds nothing here, which it treats as "no candidate".
-        self.maybe_install_amdsmi(
-            self.env.get("HIP_PATH", ""), self.env.get("ROCM_PATH", "")
-        )
-
-    def _install_windows_bindings(
-        self, bindings_package: Path, install_dir: str
-    ) -> None:
-        """Install the packed wheel, then register the backend DLL directory.
-
-        pack_frontend_wheel.py writes both the staged package and the .whl into
-        bindings_package, so the wheel installs exactly as it does on Linux. The
-        extension links hipdnn_backend.dll out of install_dir/bin, which it cannot
-        find alone: extension modules load with LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-        so neither PATH nor RPATH applies. Register that directory from a .pth,
-        stashing the handle on sys so it isn't GC'd before the import. The ROCm
-        deps are preloaded by the package __init__ (rocm_sdk / ROCM_PATH).
-        """
-        wheels = sorted(bindings_package.glob("hipdnn_frontend-*.whl"))
-        if len(wheels) != 1:
-            fail(
-                "ERROR: expected exactly one hipdnn_frontend wheel in "
-                f"{bindings_package}"
+        self.env["ROCM_PATH"] = install_prefix
+        if not IS_WINDOWS:
+            lib_dirs = tuple(
+                str(Path(prefix) / "lib")
+                for prefix in (toolchain_prefix, install_prefix)
+                if prefix and (Path(prefix) / "lib").is_dir()
             )
-        self.pip("install", "--force-reinstall", str(wheels[0]))
+            current = self.env.get("LD_LIBRARY_PATH", "")
+            existing = current.split(":") if current else []
+            ordered = [path for path in lib_dirs if path not in existing] + existing
+            self.env["LD_LIBRARY_PATH"] = ":".join(ordered)
+            self.write_activate_local(install_prefix, lib_dirs)
 
-        backend_bin = Path(install_dir) / "bin"
-        if not (backend_bin / "hipdnn_backend.dll").exists():
-            return
-        site_pkgs = self.probe(
-            "import sysconfig; print(sysconfig.get_path('purelib'))"
-        ).stdout.strip()
-        pth = Path(site_pkgs) / "hipdnn_frontend_dll_path.pth"
-        print(f"==> Registering {backend_bin} for hipdnn_backend.dll via {pth}")
-        pth.write_text(
-            "import os, sys; _p = r'{0}'; "
-            "sys.__dict__.setdefault('_hipdnn_dll_dirs', [])"
-            ".append(os.add_dll_directory(_p))\n".format(backend_bin),
-            encoding="ascii",
+        self.maybe_install_amdsmi(
+            install_prefix,
+            toolchain_prefix,
+            self.rocm_prefix,
+            DEFAULT_ROCM_PREFIX,
         )
+        if self.do_build:
+            self.build_and_install_bindings(install_prefix, toolchain_prefix)
+        elif self.probe("import hipdnn_frontend").returncode != 0:
+            print(
+                "WARNING: hipdnn_frontend is not importable in this environment.",
+                file=sys.stderr,
+            )
 
     # -- confirmation prompt ------------------------------------------------
 
     def confirm_build(self) -> None:
-        if not self.do_build or self.auto_yes:
+        if self.auto_yes:
             return
-        # The exact install prefix depends on the torch mode and is only resolved
-        # after torch is installed, so it is reported at build time, not here.
-        confirm = input(
-            "This will build and install hipDNN and provider plugins from "
-            "source into the selected ROCm prefix. Continue? [Y/n] "
-        )
-        if confirm.strip() in ("n", "N"):
+        actions = []
+        if self.venv_dir.is_dir() and self.torch_mode != "existing":
+            actions.append(f"replace the virtual environment at {self.venv_dir}")
+        if self.do_build:
+            actions.append("build and install hipDNN and provider plugins from source")
+        if not actions:
+            return
+        confirm = input(f"This will {' and '.join(actions)}. Continue? [Y/n] ")
+        if confirm.strip().lower() == "n":
             print("Aborted.")
             sys.exit(0)
 
@@ -1583,12 +1115,9 @@ class Setup:
             # today: the bindings are nanobind host code linking hip::host).
             self.env.setdefault("PYTORCH_ROCM_ARCH", self.gpu_arch)
 
-        if IS_WINDOWS:
-            self.build_and_install_windows()
-        else:
-            binding_prefix = self.select_binding_prefix()
-            print(f"Using hipDNN/ROCm prefix: {binding_prefix}")
-            self.build_and_install_linux(binding_prefix)
+        binding_prefix = self.select_binding_prefix()
+        print(f"Using hipDNN/ROCm prefix: {binding_prefix}")
+        self.build_and_install(binding_prefix)
 
         self.verify()
         self._print_complete()
@@ -1623,7 +1152,7 @@ class Setup:
         rocm_path = self.env.get("ROCM_PATH", "")
         print("The activation script sets:")
         print(f"  ROCM_PATH={rocm_path}")
-        print(f"  LD_LIBRARY_PATH={rocm_path}/lib:${{LD_LIBRARY_PATH}}")
+        print(f"  LD_LIBRARY_PATH={self.env.get('LD_LIBRARY_PATH', '')}")
         print(
             "dnn-benchmarking infers plugins from "
             "$ROCM_PATH/lib/hipdnn_plugins/engines."
