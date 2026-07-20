@@ -16,7 +16,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     BENCHMARK_WORKSPACE=/opt/dnn-benchmark \
     BENCHMARK_VENV=/opt/dnn-benchmark/.venv \
     WORKSPACE_DIR=/workspace \
-    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -30,16 +31,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ninja-build \
         python3.12 \
         python3.12-dev \
-        python3.12-venv \
-        python3-build \
-        python3-numpy \
-        python3-psutil && \
+        python3.12-venv && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR ${WORKSPACE_DIR}
 
-COPY rocm-libraries ./rocm-libraries
-COPY setup_env.py pyproject.toml README.md ./
+COPY .gitmodules setup_env.py pyproject.toml README.md ./
 COPY src ./src
 
 RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
@@ -53,11 +50,10 @@ case "${DEVICE_TARGET}" in
         ;;
 esac
 
-torch_index_url="${TORCH_INDEX_URL:-https://rocm.nightlies.amd.com/whl-multi-arch/}"
-printf '[global]\nindex-url = %s\n' "${torch_index_url}" > /etc/pip.conf
 
 if [ "${FETCHCONTENT_GIT_SSL_NO_VERIFY}" = "true" ]; then
     export GIT_SSL_NO_VERIFY=true
+    export PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
 fi
 
 if [ -n "${TORCH_INDEX_URL}" ]; then
@@ -66,14 +62,12 @@ if [ -n "${TORCH_INDEX_URL}" ]; then
         --torch-mode rocm \
         --gpu-arch "${DEVICE_TARGET}" \
         --torch-index-url "${TORCH_INDEX_URL}" \
-        --system-site-packages \
         -y
 else
     python3.12 setup_env.py \
         --workspace "${BENCHMARK_WORKSPACE}" \
         --torch-mode rocm \
         --gpu-arch "${DEVICE_TARGET}" \
-        --system-site-packages \
         -y
 fi
 
@@ -118,9 +112,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libstdc++6 \
         libtinfo6 \
         python3.12 \
-        python3-numpy \
-        python3-typing-extensions \
-        python3-psutil \
         linux-tools-common \
         linux-tools-generic \
         libsqlite3-0 && \

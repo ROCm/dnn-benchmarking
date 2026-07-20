@@ -19,3 +19,6 @@ htmlcov
 /tests
 /sample_configs
 /docs
+
+# setup_env.py sparse-clones this source during the Docker build.
+/rocm-libraries

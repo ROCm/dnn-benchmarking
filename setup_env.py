@@ -244,7 +244,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-
         "--torch-index-url",
         default="",
         help="Override the pip index URL used for torch.",
@@ -309,7 +308,6 @@ class Setup:
         # from arbitrary working directories.
         self.workspace = Path(args.workspace).resolve()
         self.venv_dir = self.workspace / ".venv"
-
 
         # Child-process environment; PYTHONPYCACHEPREFIX/DNN_BENCH_WORKSPACE and
         # (later) ROCM_PATH are layered onto this before subprocess use.
