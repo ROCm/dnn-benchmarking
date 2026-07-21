@@ -419,7 +419,7 @@ This downloads the tar files tracked by any `.dvc` pointer files in `Workloads/`
 
 ### Adding new workload tar files
 
-Write access to the DVC remote (`s3://therock-dvc/rocm-libraries`) is restricted. Before adding a new tar file:
+Write access to the DVC remote (`s3://therock-dvc/dnn-benchmarking`) is restricted. Before adding a new tar file:
 
 1. **Request write permissions** from Joseph Macaranas.
 2. Once you have access, track and push the new file:
@@ -432,6 +432,23 @@ git commit -m "track <new_file>.tar.gz with DVC"
 ```
 
 Commit only the `.dvc` pointer file and the updated `.gitignore` — never the tar archive itself.
+
+### Validating graphs
+
+`tools/check_deserialize.py` checks that graph JSON files deserialize and validate
+without building a plan or running a kernel. It has three escalating levels:
+
+```bash
+# Pure-Python loader only (no hipDNN build required)
+python tools/check_deserialize.py --level json --src src 'Workloads/**/*.json'
+
+# Full deserialize + build/finalize the backend operation graph (needs a built hipDNN)
+python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+```
+
+Run this after adding new workload graphs to confirm hipDNN can load them. Paths may
+be globs, directories, or tarball-extracted trees; the script exits non-zero on any
+failure and prints the first failures with their error messages.
 
 ## Running Tests
 
