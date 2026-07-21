@@ -36,3 +36,4 @@ jobs:
           name: bandit-report
           path: bandit.json
           if-no-files-found: warn
+          retention-days: 7

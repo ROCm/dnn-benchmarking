@@ -4,17 +4,24 @@
 name: SBOM
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - '.github/workflows/sbom.yml'
   push:
     branches: [main]
     tags: ['v*']
     paths:
       - 'pyproject.toml'
-      - 'uv.lock'
       - '.github/workflows/sbom.yml'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  actions: read
+  contents: write
 
 jobs:
   generate:
@@ -28,3 +35,4 @@ jobs:
         with:
           format: spdx-json
           artifact-name: dnn-benchmarking-sbom
+          upload-artifact-retention: 90
