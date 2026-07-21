@@ -167,11 +167,11 @@ LDS` bandwidth lines and per-kernel AI points (`AI_HBM_K0`, etc.).
 rocprof-compute analyze --path <workload_path> --gui
 ```
 
-Starts a Dash app on `http://0.0.0.0:8050/`. On a remote host
-(Alola, etc.), open an SSH tunnel from your local machine:
+Starts a Dash app on `http://0.0.0.0:8050/`. On a remote host, open an SSH
+tunnel from your local machine:
 
 ```bash
-ssh -L 8050:localhost:8050 sareeder@ctr2-alola-login-04.adc.amd.com
+ssh -L 8050:localhost:8050 <user>@<remote-host>
 ```
 
 Then browse to `http://localhost:8050`. The GUI offers an

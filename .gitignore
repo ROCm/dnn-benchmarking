@@ -52,3 +52,15 @@ results.json
 # Crash artifacts (e.g. ROCm/GPU process core dumps)
 core
 core.*
+
+# Local overrides, temporary files, and generated security evidence
+.env.*
+!.env.example
+*.local
+tmp/
+*.dump
+*.key
+*.pem
+*.sarif
+*.spdx
+*.spdx.json

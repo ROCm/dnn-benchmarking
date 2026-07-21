@@ -46,7 +46,7 @@ def _detect_via_torch() -> Optional[str]:
 
 def _detect_via_rocminfo() -> Optional[str]:
     # Use resolve_rocm_tool so hosts where /opt/rocm/bin isn't on PATH
-    # (Alola login nodes, sandboxed containers) still find rocminfo. A
+    # (remote login nodes, sandboxed containers) still find rocminfo. A
     # bare shutil.which silently misses it and downgrades the user to
     # the "unknown" sentinel + the conservative PMC counter set.
     binary = resolve_rocm_tool("rocminfo")

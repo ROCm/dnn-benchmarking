@@ -162,6 +162,11 @@ def _build_argv(
     return argv
 
 
+def _quote_sqlite_identifier(identifier: str) -> str:
+    """Return a SQLite identifier quoted against interpolation attacks."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _parse_rocpd_db(db_path: Path) -> Dict[str, Any]:
     """Walk the rocpd schema and aggregate per-kernel PMC values.
 
@@ -220,22 +225,25 @@ def _parse_rocpd_db(db_path: Path) -> Dict[str, Any]:
         # otherwise fall back to numeric ids in the output.
         id_to_name: Dict[int, str] = {}
         if info_pmc_table is not None:
-            for row in conn.execute(f"SELECT id, name FROM {info_pmc_table}"):
+            for row in conn.execute(
+                f"SELECT id, name FROM {_quote_sqlite_identifier(info_pmc_table)}"  # nosec B608
+            ):
                 id_to_name[int(row[0])] = str(row[1])
 
         per_kernel_totals: Dict[str, Dict[str, float]] = defaultdict(dict)
         per_counter_running: Dict[str, Dict[str, float]] = defaultdict(
             lambda: {"sum": 0.0, "n": 0.0}
         )
-        rows = conn.execute(
+        # The table identifiers originate in sqlite_master and are quoted above.
+        rows = conn.execute(  # nosec B608
             f"""
             SELECT sym.kernel_name, p.pmc_id,
                    AVG(p.value), SUM(p.value), COUNT(p.value)
-            FROM {pmc_event_table} p
-            JOIN {kernel_table} k  ON p.event_id  = k.dispatch_id
-            JOIN {symbol_table}  sym ON k.kernel_id = sym.id
+            FROM {_quote_sqlite_identifier(pmc_event_table)} p
+            JOIN {_quote_sqlite_identifier(kernel_table)} k  ON p.event_id = k.dispatch_id
+            JOIN {_quote_sqlite_identifier(symbol_table)} sym ON k.kernel_id = sym.id
             GROUP BY sym.kernel_name, p.pmc_id
-            """
+            """  # nosec B608
         )
         for kname, pmc_id, mean_v, sum_v, count_v in rows:
             counter_name = id_to_name.get(int(pmc_id), f"pmc_id_{pmc_id}")

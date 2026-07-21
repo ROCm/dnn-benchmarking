@@ -102,7 +102,7 @@ def _graph_segment(graph_path: Path) -> str:
     hash is opaque on its own; ``_subdir`` writes a ``.source`` file in
     the graph dir so users can map it back without re-hashing.
     """
-    digest = hashlib.sha1(_graph_anchor(graph_path).encode("utf-8")).hexdigest()[:6]
+    digest = hashlib.sha256(_graph_anchor(graph_path).encode("utf-8")).hexdigest()[:6]
     return f"{_safe_segment(graph_path.stem)}-{digest}"
 
 

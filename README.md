@@ -401,37 +401,14 @@ Reference Validation: SKIPPED (no reference comparison performed)
 
 ## Related Tools
 
-For the MIOpen shape conversion tool, see the standalone [`dnn-convert-shapes`](../dnn-convert-shapes/) package.
+For the MIOpen shape conversion tool, see [`dnn-convert-shapes`](https://github.com/ROCm/rocm-libraries/tree/develop/projects/hipdnn/tools/dnn-convert-shapes).
 
-## Workload Files (DVC)
+## Workload Inputs
 
-The `Workloads/` directory contains performance benchmark workload tar files (graph collections used for benchmarking). These are tracked with [DVC](https://dvc.org/) (backed by S3). The actual archives are **not stored in git** — only the `.dvc` pointer files are. You must pull them separately.
-
-### Pulling workload files
-
-After cloning, switching branches, or pulling commits that change `.dvc` files:
-
-```bash
-dvc pull
-```
-
-This downloads the tar files tracked by any `.dvc` pointer files in `Workloads/`. If the files are already cached locally, DVC will restore them from cache without re-downloading.
-
-### Adding new workload tar files
-
-Write access to the DVC remote (`s3://therock-dvc/rocm-libraries`) is restricted. Before adding a new tar file:
-
-1. **Request write permissions** from Joseph Macaranas.
-2. Once you have access, track and push the new file:
-
-```bash
-dvc add Workloads/<new_file>.tar.gz
-dvc push
-git add Workloads/<new_file>.tar.gz.dvc Workloads/.gitignore
-git commit -m "track <new_file>.tar.gz with DVC"
-```
-
-Commit only the `.dvc` pointer file and the updated `.gitignore` — never the tar archive itself.
+The repository includes representative JSON graphs under `graphs/`. Tarball
+workload suites are optional external inputs: obtain or create them separately,
+then pass a local archive to `--graph`. This public repository does not host or
+distribute workload archives.
 
 ## Running Tests
 
