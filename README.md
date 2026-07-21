@@ -420,12 +420,31 @@ dvc pull
 
 To fetch one workload instead:
 
+This downloads the tar files tracked by `.dvc` pointer files in `Workloads/`. If the file is already cached locally, DVC restores it without re-downloading.
+
 ```bash
 dvc pull Workloads/conv_fwd.tar.gz.dvc
 ```
 
 Keep credentials in DVC's ignored local configuration (`.dvc/config.local`);
 the committed configuration supports anonymous access and contains no secrets.
+
+### Validating graphs
+
+`tools/check_deserialize.py` checks that graph JSON files deserialize and validate
+without building a plan or running a kernel. It has three escalating levels:
+
+```bash
+# Pure-Python loader only (no hipDNN build required)
+python tools/check_deserialize.py --level json --src src 'Workloads/**/*.json'
+
+# Full deserialize + build/finalize the backend operation graph (needs a built hipDNN)
+python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+```
+
+Run this after adding new workload graphs to confirm hipDNN can load them. Paths may
+be globs, directories, or tarball-extracted trees; the script exits non-zero on any
+failure and prints the first failures with their error messages.
 
 ## Running Tests
 
