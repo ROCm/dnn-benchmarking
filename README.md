@@ -138,19 +138,6 @@ fields (`rocm_version`, amdsmi GPU snapshot) are `None` in the JSON, while
 `gpu_arch` is the sentinel `"unknown"` (no ROCm gfx target is detectable); the
 timing statistics and graph structure are identical to a ROCm run.
 
-### Other Non-ROCm PyTorch (CPU)
-
-hipDNN timing requires ROCm HIP runtime libraries and the hipDNN frontend
-bindings. CPU-only PyTorch wheels can be used only for reference validation;
-they do not enable GPU benchmarking in this tool.
-
-**Note**: hipDNN Python bindings (`hipdnn_frontend`) must be installed separately
-for hipDNN benchmarking.
-**Note**: PyTorch is optional for the hipDNN backend. CPU-only PyTorch enables
-`--validate pytorch` reference computation; ROCm or CUDA PyTorch also enables
-`--backend pytorch`. hipDNN-backend GPU timing and E2E synchronization always
-use direct HIP APIs from `hipdnn_frontend`; the PyTorch backend uses HIP events
-on ROCm and `torch.cuda` events on CUDA.
 
 ## Usage
 
@@ -283,49 +270,9 @@ python -m dnn_benchmarking --config sample_configs/basic.toml.example --graph ./
 python -m dnn_benchmarking --config sample_configs/config.toml.example --iters 500
 ```
 
-### CLI Options
+### Command-line reference
 
-#### Basic Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--graph`, `-g` | Path to a JSON graph file, glob pattern (e.g. `'graphs/*.json'`), or tarball (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`) containing JSON graph files | Required unless provided by `--config` |
-| `--config` | TOML benchmark recipe; CLI flags override config values | None |
-| `--warmup`, `-w` | Number of warmup iterations | 10 |
-| `--iters`, `-i` | Number of benchmark iterations | 100 |
-| `--engine`, `-e` | Engine ID or comma-separated list (e.g. `1` or `1,2,3`); default = all discovered engines | None |
-| `--seed`, `-s` | Random seed for reproducible input data | None |
-| `--backend`, `-b` | Execution backend: `hipdnn` (AMD GPU via hipDNN engine plugins) or `pytorch` (GPU via PyTorch; ROCm or CUDA). `pytorch` is incompatible with `--engine`, `--plugin-path`, `--validate pytorch`, and the profiling flags. | `hipdnn` |
-
-#### Output Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--output`, `-o` | Export benchmark results to JSON file (full SuiteResult; independent of `-v`) | None |
-| `--verbose`, `-v` | Show detailed per-engine block per graph (default: summary table) | False |
-
-#### Reference Validation Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--validate` | Reference provider for correctness validation: `pytorch` or `none`. `--validate pytorch` also reports a timed PyTorch reference row when PyTorch GPU execution is available. | `none` |
-
-#### Suite Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--plugin-path` | Plugin directory, or comma-separated plugin directories matching `--engine` order. Overrides the plugin directory inferred from `ROCM_PATH`. | `$ROCM_PATH/lib/hipdnn_plugins/engines` if `ROCM_PATH` is set, otherwise system default |
-
-#### Comparison Options
-
-Used by reference validation and suite-mode tolerance checks.
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--rtol` | Relative tolerance for output comparison. Overrides dtype-aware defaults when set; if set without `--atol`, also applies as absolute tolerance. | dtype-aware |
-| `--atol` | Absolute tolerance for output comparison. Overrides dtype-aware defaults when set; if set without `--rtol`, also applies as relative tolerance. | dtype-aware |
-
-Automatic validation tolerances are dtype-aware. BF16 outputs use `rtol=1e-2`, `atol=1e-3`; this allows BF16 output quantization and accumulation-order differences while keeping the absolute floor low enough to catch small-magnitude failures.
+Run `dnn-benchmark --help` for the authoritative option list and defaults.
 
 ## Output
 
@@ -361,43 +308,8 @@ Suite Summary:
 
 ### Verbose Output (`-v`)
 
-`-v` switches to a rich per-engine block per graph (matches the legacy
-single-graph format). Useful when debugging a single graph or comparing engines
-side-by-side.
-
-```
-================================================================================
-hipDNN Benchmark: sample_conv_fwd_16x16x16x16_k16_3x3
-================================================================================
-Graph:      ./graphs/sample_conv_fwd.json
-Engine ID:  1 (MIOpen)
-Warmup:     10 iterations
-Benchmark:  100 iterations
---------------------------------------------------------------------------------
-
-Initialization:
-  Graph build time:     45.23 ms
-
-E2E Execution Statistics:
-  Mean:                 1.234 ms
-  Std Dev:              0.045 ms
-  Min:                  1.156 ms
-  Max:                  1.456 ms
-  P95:                  1.312 ms
-  P99:                  1.398 ms
-
-Kernel Execution Statistics:
-  Mean:                 0.872 ms
-  Std Dev:              0.012 ms
-  Min:                  0.851 ms
-  Max:                  0.921 ms
-  P95:                  0.897 ms
-  P99:                  0.910 ms
-
-Reference Validation: SKIPPED (no reference comparison performed)
-  Provider: none
-================================================================================
-```
+`-v` switches to a detailed per-engine block per graph. Use it when debugging a
+single graph or comparing engines side-by-side.
 
 ## Related Tools
 
@@ -469,12 +381,10 @@ pytest -m gpu --dnn-plugin-paths /path/to/hipdnn_plugins/engines
 
 ### GPU Tests
 
-GPU tests require hipDNN Python bindings and ROCm libraries. When using
-`setup_env.py`, activate the venv first; activation sets `ROCM_PATH` and prepends
-the selected prefix's `lib` directory to `LD_LIBRARY_PATH`:
+GPU tests require hipDNN Python bindings and ROCm libraries. After activating
+the setup environment from Quick Start, run:
 
 ```bash
-source /workspace/.venv/bin/activate  # or $DNN_BENCH_WORKSPACE/.venv/bin/activate
 pytest -m gpu
 ```
 
