@@ -403,12 +403,29 @@ Reference Validation: SKIPPED (no reference comparison performed)
 
 For the MIOpen shape conversion tool, see [`dnn-convert-shapes`](https://github.com/ROCm/rocm-libraries/tree/develop/projects/hipdnn/tools/dnn-convert-shapes).
 
-## Workload Inputs
+## Workload Files
 
-The repository includes representative JSON graphs under `graphs/`. Tarball
-workload suites are optional external inputs: obtain or create them separately,
-then pass a local archive to `--graph`. This public repository does not host or
-distribute workload archives.
+The `Workloads/` directory contains benchmark workload tarballs tracked with
+[DVC](https://dvc.org/). The public DVC remote is configured in `.dvc/config`
+for anonymous reads; archive contents are not stored directly in Git.
+
+### Download workload archives
+
+Install DVC with S3 support, then pull every tracked workload:
+
+```bash
+python -m pip install "dvc[s3]"
+dvc pull
+```
+
+To fetch one workload instead:
+
+```bash
+dvc pull Workloads/conv_fwd.tar.gz.dvc
+```
+
+Keep credentials in DVC's ignored local configuration (`.dvc/config.local`);
+the committed configuration supports anonymous access and contains no secrets.
 
 ## Running Tests
 
