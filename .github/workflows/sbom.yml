@@ -35,4 +35,4 @@ jobs:
         with:
           format: spdx-json
           artifact-name: dnn-benchmarking-sbom
-          upload-artifact-retention: 90
+          upload-artifact-retention: 14
