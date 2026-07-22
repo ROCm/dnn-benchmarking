@@ -45,6 +45,12 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
     try:
         initialize_pip_rocm_runtime()
         import hipdnn_frontend as hipdnn
+    except RuntimeError as e:
+        print(
+            f"internal-profiling-run: failed to initialize ROCm runtime: {e}",
+            file=sys.stderr,
+        )
+        return 1
     except ImportError:
         print(
             "internal-profiling-run: hipdnn_frontend not importable",

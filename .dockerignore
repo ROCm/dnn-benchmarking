@@ -2,6 +2,12 @@
 .git
 **/.git
 
+# Local Kubernetes credentials and configuration.
+.kube/
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+
 # Local build/test/cache artifacts.
 .workspace
 build

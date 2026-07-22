@@ -152,4 +152,5 @@ set -euo pipefail
 exec /opt/dnn-benchmark/.venv/bin/dnn-benchmark "$@"
 SCRIPT
 
-CMD ["dnn-benchmark-performance"]
+ENTRYPOINT ["dnn-benchmark-performance"]
+CMD []
