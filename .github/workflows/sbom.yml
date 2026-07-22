@@ -4,11 +4,6 @@
 name: SBOM
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'pyproject.toml'
-      - '.github/workflows/sbom.yml'
   push:
     branches: [main]
     tags: ['v*']
