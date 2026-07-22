@@ -45,6 +45,52 @@ def _empty_snapshot() -> Dict[str, Optional[Any]]:
     return {k: None for k in _SNAPSHOT_KEYS}
 
 
+_UNAVAILABLE_VALUES = {"", "N/A", "NA", "NONE", "NULL", "UNSUPPORTED"}
+
+
+def _is_unavailable(value: Any) -> bool:
+    if value is None:
+        return True
+    return isinstance(value, str) and value.strip().upper() in _UNAVAILABLE_VALUES
+
+
+def _first_available(*values: Any) -> Any:
+    for value in values:
+        if not _is_unavailable(value):
+            return value
+    return None
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if _is_unavailable(value):
+        return None
+    return float(value)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if _is_unavailable(value):
+        return None
+    return int(value)
+
+
+def _is_not_supported_error(e: Exception) -> bool:
+    text = str(e)
+    return "AMDSMI_STATUS_NOT_SUPPORTED" in text or "Feature not supported" in text
+
+
+def _warn_optional_query_failure(
+    amdsmi: Any,
+    reason: str,
+    e: Exception,
+) -> None:
+    # Some platforms expose a subset of SMI counters and report unsupported
+    # values either as "N/A" payloads or AMDSMI_STATUS_NOT_SUPPORTED. These are
+    # expected missing telemetry, not actionable benchmark diagnostics.
+    if isinstance(e, amdsmi.AmdSmiException) and _is_not_supported_error(e):
+        return
+    warn_once("amdsmi", f"{reason} failed: {e}")
+
+
 def is_amdsmi_available() -> bool:
     """Return True if amdsmi can be imported."""
     try:
@@ -182,34 +228,34 @@ class GpuSmiProbe:
         try:
             vram = amdsmi.amdsmi_get_gpu_vram_usage(handle)
             # amdsmi reports MB already
-            snap["vram_used_mb"] = float(vram.get("vram_used", 0))
-            snap["vram_total_mb"] = float(vram.get("vram_total", 0))
+            snap["vram_used_mb"] = _optional_float(vram.get("vram_used"))
+            snap["vram_total_mb"] = _optional_float(vram.get("vram_total"))
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"vram_usage failed: {e}")
+            _warn_optional_query_failure(amdsmi, "vram_usage", e)
 
         # Power
         try:
             power = amdsmi.amdsmi_get_power_info(handle)
-            socket_w = power.get("average_socket_power") or power.get(
-                "current_socket_power"
+            socket_w = _first_available(
+                power.get("average_socket_power"),
+                power.get("current_socket_power"),
             )
-            if socket_w is not None:
-                snap["power_w"] = float(socket_w)
+            snap["power_w"] = _optional_float(socket_w)
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"power_info failed: {e}")
+            _warn_optional_query_failure(amdsmi, "power_info", e)
 
         # Clocks (GFX = sclk, MEM = mclk)
         try:
             sclk = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)
-            snap["sclk_mhz"] = float(sclk.get("clk", 0)) or None
+            snap["sclk_mhz"] = _optional_float(sclk.get("clk"))
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"clock_info GFX failed: {e}")
+            _warn_optional_query_failure(amdsmi, "clock_info GFX", e)
 
         try:
             mclk = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.MEM)
-            snap["mclk_mhz"] = float(mclk.get("clk", 0)) or None
+            snap["mclk_mhz"] = _optional_float(mclk.get("clk"))
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"clock_info MEM failed: {e}")
+            _warn_optional_query_failure(amdsmi, "clock_info MEM", e)
 
         # Temperatures
         try:
@@ -218,9 +264,9 @@ class GpuSmiProbe:
                 amdsmi.AmdSmiTemperatureType.EDGE,
                 amdsmi.AmdSmiTemperatureMetric.CURRENT,
             )
-            snap["temp_edge_c"] = float(edge)
+            snap["temp_edge_c"] = _optional_float(edge)
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"temp EDGE failed: {e}")
+            _warn_optional_query_failure(amdsmi, "temp EDGE", e)
 
         try:
             hot = amdsmi.amdsmi_get_temp_metric(
@@ -228,9 +274,9 @@ class GpuSmiProbe:
                 amdsmi.AmdSmiTemperatureType.HOTSPOT,
                 amdsmi.AmdSmiTemperatureMetric.CURRENT,
             )
-            snap["temp_hotspot_c"] = float(hot)
+            snap["temp_hotspot_c"] = _optional_float(hot)
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"temp HOTSPOT failed: {e}")
+            _warn_optional_query_failure(amdsmi, "temp HOTSPOT", e)
 
         # Utilisation + throttle status from gpu_metrics
         try:
@@ -238,14 +284,11 @@ class GpuSmiProbe:
             gpu_util = metrics.get("average_gfx_activity")
             mem_util = metrics.get("average_umc_activity")
             throttle = metrics.get("throttle_status")
-            if gpu_util is not None:
-                snap["gpu_utilization_pct"] = float(gpu_util)
-            if mem_util is not None:
-                snap["memory_utilization_pct"] = float(mem_util)
-            if throttle is not None:
-                snap["throttle_status"] = int(throttle)
+            snap["gpu_utilization_pct"] = _optional_float(gpu_util)
+            snap["memory_utilization_pct"] = _optional_float(mem_util)
+            snap["throttle_status"] = _optional_int(throttle)
         except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"gpu_metrics_info failed: {e}")
+            _warn_optional_query_failure(amdsmi, "gpu_metrics_info", e)
 
         return snap
 

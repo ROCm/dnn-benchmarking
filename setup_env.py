@@ -244,6 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-editable",
+        dest="editable_install",
+        action="store_false",
+        help="Install dnn-benchmarking into the venv instead of linking to the source tree.",
+    )
+    parser.add_argument(
         "--torch-index-url",
         default="",
         help="Override the pip index URL used for torch.",
@@ -298,6 +304,7 @@ class Setup:
         self.rocm_prefix = args.rocm_prefix
         self.gpu_arch_override = args.gpu_arch
         self.torch_index_url = args.torch_index_url
+        self.editable_install = args.editable_install
         self.resolved_torch_index_url = ""
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
@@ -357,6 +364,7 @@ class Setup:
         `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
+
         if (ROCM_LIBRARIES_DIR / ".git").exists():
             if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
                 run_git(
@@ -1094,7 +1102,10 @@ class Setup:
         # pyproject.toml intentionally omits torch so pip never replaces the
         # selected wheel; install it explicitly, before the package.
         self.install_torch()
-        self.pip("install", "-e", str(SCRIPT_DIR))
+        if self.editable_install:
+            self.pip("install", "-e", str(SCRIPT_DIR))
+        else:
+            self.pip("install", str(SCRIPT_DIR))
 
         # CUDA torch supports only the PyTorch execution backend: no hipDNN
         # Python bindings, engine plugins, amdsmi, or ROCm prefix.

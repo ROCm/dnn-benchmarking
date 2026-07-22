@@ -44,6 +44,12 @@ dmypy.json
 .env
 .envrc
 
+# Kubernetes cluster configs
+.kube/
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+
 # Project-specific
 results.json
 *.log

@@ -6,6 +6,7 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import SuiteConfig
 from ..execution.suite_runner import run_graph_all_providers, set_plugin_path
 from ..reporting.reporter import Reporter
@@ -46,6 +47,7 @@ def run_hipdnn_suite_benchmark(
     # this backend. Apply plugin paths before constructing the handle; do
     # not depend on optional telemetry tools such as amd-smi.
     try:
+        initialize_pip_rocm_runtime()
         import hipdnn_frontend as hipdnn
 
         plugin_paths = config.plugin_paths
