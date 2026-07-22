@@ -49,6 +49,16 @@ def test_rocm_path_wins_for_default_plugin_path(
     assert fake_sdk.initialize_calls == []
 
 
+def test_rocm_sdk_not_installed_disables_pip_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "rocm_sdk", None)
+
+    assert rocm_runtime.pip_rocm_plugin_path() is None
+    assert rocm_runtime.default_hipdnn_plugin_paths() is None
+    assert rocm_runtime.initialize_pip_rocm_runtime() is False
+
+
 def test_pip_rocm_plugin_path_discovered_from_hipdnn_library(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -66,6 +76,23 @@ def test_pip_rocm_plugin_path_discovered_from_hipdnn_library(
 
     assert rocm_runtime.pip_rocm_plugin_path() == plugin_dir
     assert rocm_runtime.default_hipdnn_plugin_paths() == [plugin_dir]
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, ModuleNotFoundError])
+def test_pip_rocm_plugin_path_ignores_find_libraries_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    fake_sdk = FakeRocmSdk({})
+
+    def fail_find_libraries(_shortname: str):
+        raise error_type("hipdnn unavailable")
+
+    monkeypatch.setattr(fake_sdk, "find_libraries", fail_find_libraries)
+    monkeypatch.setitem(sys.modules, "rocm_sdk", fake_sdk)
+
+    assert rocm_runtime.pip_rocm_plugin_path() is None
+    assert rocm_runtime.default_hipdnn_plugin_paths() is None
 
 
 def test_pip_rocm_initialize_preloads_available_libraries(
@@ -90,6 +117,53 @@ def test_pip_rocm_initialize_preloads_available_libraries(
             "env_override": True,
         }
     ]
+
+
+def test_pip_rocm_initialize_skips_one_missing_preload_library(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing_shortname = "hiprtc"
+    expected_shortnames = [
+        shortname
+        for shortname in rocm_runtime._ROCM_PRELOAD_ORDER
+        if shortname != missing_shortname
+    ]
+    fake_sdk = FakeRocmSdk(
+        {
+            shortname: tmp_path / f"lib{shortname}.so"
+            for shortname in expected_shortnames
+        }
+    )
+    monkeypatch.setitem(sys.modules, "rocm_sdk", fake_sdk)
+
+    assert rocm_runtime.initialize_pip_rocm_runtime() is True
+    assert fake_sdk.initialize_calls == [
+        {
+            "preload_shortnames": expected_shortnames,
+            "env_override": True,
+        }
+    ]
+
+
+def test_pip_rocm_initialize_wraps_initialize_process_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lib_dir = tmp_path / "sdk" / "lib"
+    fake_sdk = FakeRocmSdk({"hipdnn": lib_dir / "libhipdnn_backend.so"})
+
+    def fail_initialize_process(**_kwargs) -> None:
+        raise OSError("dlopen failed")
+
+    monkeypatch.setattr(fake_sdk, "initialize_process", fail_initialize_process)
+    monkeypatch.setitem(sys.modules, "rocm_sdk", fake_sdk)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Failed to initialize pip-installed ROCm runtime: dlopen failed",
+    ) as exc_info:
+        rocm_runtime.initialize_pip_rocm_runtime()
+
+    assert isinstance(exc_info.value.__cause__, OSError)
 
 
 def test_pip_rocm_initialize_is_idempotent(
