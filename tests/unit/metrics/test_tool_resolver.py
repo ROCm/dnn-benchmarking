@@ -75,7 +75,7 @@ class TestResolveRocmTool:
         Otherwise a stray data file would mask a working PATH binary."""
         rocm_tool = fake_rocm_root / "rocprofv3"
         rocm_tool.write_text("not executable")  # no +x bit
-        os.chmod(rocm_tool, 0o644)
+        os.chmod(rocm_tool, 0o600)
         monkeypatch.setattr(
             _tool_resolver.shutil, "which", lambda _name: "/fallback/rocprofv3"
         )
