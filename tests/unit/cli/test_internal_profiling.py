@@ -62,6 +62,37 @@ class TestRunInternalProfilingErrorPaths:
         err = capsys.readouterr().err
         assert "internal-profiling-run requires" in err
 
+    def test_rocm_runtime_initialization_failure_returns_error(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        graph_path = tmp_path / "g.json"
+        graph_path.write_text('{"name": "g"}')
+        ns = argparse.Namespace(
+            internal_profiling_graph=graph_path,
+            internal_profiling_engine=42,
+            warmup=1,
+            iters=1,
+            seed=None,
+            plugin_path=None,
+        )
+
+        def fail_initialization():
+            raise RuntimeError("ROCm SDK preload failed")
+
+        monkeypatch.setattr(
+            internal_profiling,
+            "initialize_pip_rocm_runtime",
+            fail_initialization,
+        )
+
+        rc = internal_profiling.run_internal_profiling(ns)
+
+        assert rc == 1
+        assert (
+            "internal-profiling-run: failed to initialize ROCm runtime: "
+            "ROCm SDK preload failed"
+        ) in capsys.readouterr().err
+
 
 class TestRunInternalProfilingSuccessPath:
     """Positive-path coverage. Mocks hipdnn_frontend + GraphLoader +

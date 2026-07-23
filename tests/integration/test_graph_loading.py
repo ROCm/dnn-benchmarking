@@ -271,6 +271,32 @@ class TestGraphLoading:
         assert len(graph_json["nodes"]) == 1
         assert graph_json["nodes"][0]["type"] == "PointwiseAttributes"
 
+    @pytest.mark.parametrize("graph_name", ["sample_relu.json", "sample_add.json"])
+    def test_sample_pointwise_graphs_include_backend_optional_keys(
+        self, graph_name: str
+    ) -> None:
+        """Pointwise JSON must include nullable fields required by hipDNN's parser."""
+        sample_path = Path(__file__).parent.parent.parent / "graphs" / graph_name
+
+        if not sample_path.exists():
+            pytest.skip(f"Sample graph not found: {sample_path}")
+
+        loader = GraphLoader()
+        graph_json = loader.load_json(sample_path)
+        inputs = graph_json["nodes"][0]["inputs"]
+
+        for key in (
+            "relu_lower_clip",
+            "relu_upper_clip",
+            "relu_lower_clip_slope",
+            "axis_tensor_uid",
+            "in_2_tensor_uid",
+            "swish_beta",
+            "elu_alpha",
+            "softplus_beta",
+        ):
+            assert key in inputs
+
     def test_validate_sample_add(self) -> None:
         """Test validating the sample add graph."""
         sample_path = Path(__file__).parent.parent.parent / "graphs" / "sample_add.json"

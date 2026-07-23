@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from ..common.exceptions import GraphLoadError
+from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import MetricsConfig, SuiteConfig
 from ..execution.buffer_manager import generate_input_data
 from ..execution.suite_runner import run_single_provider_engine, set_plugin_path
@@ -42,7 +43,14 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        initialize_pip_rocm_runtime()
         import hipdnn_frontend as hipdnn
+    except RuntimeError as e:
+        print(
+            f"internal-profiling-run: failed to initialize ROCm runtime: {e}",
+            file=sys.stderr,
+        )
+        return 1
     except ImportError:
         print(
             "internal-profiling-run: hipdnn_frontend not importable",

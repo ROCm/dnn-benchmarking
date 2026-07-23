@@ -42,7 +42,7 @@ def _require_rocm_tool(name: str) -> str:
     Production paths (``rocprof_pmc``, ``rocprof_trace``, ``roofline``)
     resolve ROCm tools via ``resolve_rocm_tool``, which prefers
     ``$ROCM_PATH/bin``. A bare ``shutil.which`` skip-gate would silently
-    skip on hosts where ``/opt/rocm/bin`` isn't on PATH (Alola login
+    skip on hosts where ``/opt/rocm/bin`` isn't on PATH (remote login
     nodes, sandboxed containers) even though production would run.
     """
     binary = resolve_rocm_tool(name)

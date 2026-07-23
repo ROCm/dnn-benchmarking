@@ -1,0 +1,30 @@
+# Local VCS/worktree state is not needed inside the image.
+.git
+**/.git
+
+# Local Kubernetes credentials and configuration.
+.kube/
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+
+# Local build/test/cache artifacts.
+.workspace
+build
+dist
+*.egg-info
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Source trees not needed by the image build.
+/tests
+/sample_configs
+/docs
+
+# setup_env.py sparse-clones this source during the Docker build.
+/rocm-libraries
