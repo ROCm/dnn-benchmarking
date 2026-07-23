@@ -104,6 +104,8 @@ class ProviderEngineResult:
         role: ``engine`` for hipDNN engine rows, ``reference`` for timed
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
+        pytorch_sdpa_backend: Requested PyTorch SDPA backend for timed PyTorch
+            rows; None for non-PyTorch rows.
         cpu_build_time_ms: CPU graph-build time.
         gpu_kernel_stats: GPU kernel timing statistics.
         host_stats: Host-side submission timing statistics.
@@ -159,6 +161,7 @@ class ProviderEngineResult:
     engine_id: int
     status: Literal["success", "error", "skipped"]
     role: Literal["engine", "reference"] = "engine"
+    pytorch_sdpa_backend: Optional[str] = None
     plugin_path: Optional[str] = None
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
@@ -211,6 +214,8 @@ class ProviderEngineResult:
         }
         if self.role != "engine":
             d["role"] = self.role
+        if self.pytorch_sdpa_backend is not None:
+            d["pytorch_sdpa_backend"] = self.pytorch_sdpa_backend
         if self.plugin_path is not None:
             d["plugin_path"] = self.plugin_path
         if self.warnings:
@@ -361,6 +366,8 @@ class SuiteMetadata:
         fail_combinations: Combinations that failed correctness.
         skip_combinations: Combinations skipped (unsupported).
         error_combinations: Combinations that errored during execution.
+        pytorch_sdpa_backend: Requested PyTorch SDPA backend for PyTorch timing
+            or reference validation; None when PyTorch was not selected.
         rocm_version: ROCm/HIP version string (None on CUDA hosts).
         cuda_version: CUDA toolkit version the torch wheel was built
             against (None on ROCm hosts).
@@ -400,6 +407,7 @@ class SuiteMetadata:
     fail_combinations: int
     skip_combinations: int
     error_combinations: int
+    pytorch_sdpa_backend: Optional[str] = None
     rocm_version: Optional[str] = None
     cuda_version: Optional[str] = None
     cudnn_version: Optional[str] = None
@@ -432,6 +440,7 @@ class SuiteMetadata:
             "fail_combinations": self.fail_combinations,
             "skip_combinations": self.skip_combinations,
             "error_combinations": self.error_combinations,
+            "pytorch_sdpa_backend": self.pytorch_sdpa_backend,
             "rocm_version": self.rocm_version,
             "cuda_version": self.cuda_version,
             "cudnn_version": self.cudnn_version,
@@ -469,7 +478,11 @@ class SuiteResult:
 
     @classmethod
     def from_graph_results(
-        cls, graph_results: List[GraphResult], total_graphs: int
+        cls,
+        graph_results: List[GraphResult],
+        total_graphs: int,
+        *,
+        pytorch_sdpa_backend: Optional[str] = None,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
         env_info = collect_environment_info()
@@ -515,6 +528,7 @@ class SuiteResult:
             fail_combinations=total_fail,
             skip_combinations=total_skip,
             error_combinations=total_error,
+            pytorch_sdpa_backend=pytorch_sdpa_backend,
             rocm_version=env_info.get("rocm_version"),
             cuda_version=env_info.get("cuda_version"),
             cudnn_version=env_info.get("cudnn_version"),

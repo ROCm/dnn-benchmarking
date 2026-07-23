@@ -200,6 +200,18 @@ class TestProviderEngineResult:
         assert d["provider"] == "pytorch"
         assert "comparison_to_baseline" not in d
 
+    def test_pytorch_sdpa_backend_serializes_only_when_present(self):
+        pytorch = ProviderEngineResult(
+            provider="pytorch",
+            engine_id=0,
+            status="success",
+            pytorch_sdpa_backend="aotriton",
+        )
+        legacy = ProviderEngineResult(provider="miopen", engine_id=1, status="success")
+
+        assert pytorch.to_dict()["pytorch_sdpa_backend"] == "aotriton"
+        assert "pytorch_sdpa_backend" not in legacy.to_dict()
+
     def test_warnings_serialize_for_reference_timing_rows(self):
         pe = ProviderEngineResult(
             provider="pytorch",
@@ -463,6 +475,7 @@ class TestSuiteResult:
         assert meta_d["gpu_arch"] == "gfx942"
         assert meta_d["python_version"] == "3.12.3"
         assert meta_d["hipdnn_version"] == "0.1.0"
+        assert meta_d["pytorch_sdpa_backend"] is None
 
     def test_to_dict_graph_first_nesting(self):
         """SuiteResult.to_dict() produces graph-first nesting: top-level
@@ -511,6 +524,16 @@ class TestSuiteResult:
             assert "max_ms" in stats
             assert "p95_ms" in stats
             assert "p99_ms" in stats
+
+    def test_from_graph_results_preserves_pytorch_sdpa_backend(self) -> None:
+        result = SuiteResult.from_graph_results(
+            [],
+            total_graphs=0,
+            pytorch_sdpa_backend="aotriton",
+        )
+
+        assert result.metadata.pytorch_sdpa_backend == "aotriton"
+        assert result.to_dict()["metadata"]["pytorch_sdpa_backend"] == "aotriton"
 
 
 class TestCollectEnvironmentInfo:

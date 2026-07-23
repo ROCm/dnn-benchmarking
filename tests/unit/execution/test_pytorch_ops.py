@@ -3,6 +3,9 @@
 
 """Unit tests for PyTorch operation handlers error paths."""
 
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -1497,6 +1500,138 @@ class TestPyTorchOpsNewHandlers:
             v.repeat_interleave(4, dim=-3),
         )
         torch.testing.assert_close(tensors[4], expected, rtol=1e-5, atol=1e-5)
+
+
+class TestPyTorchSdpaBackendSelection:
+    """Strict PyTorch SDPA backend selection behavior."""
+
+    @staticmethod
+    def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = torch.rand(1, 1, 2, 4)
+        return query, query, query
+
+    def test_aotriton_maps_to_flash_attention_on_rocm(self) -> None:
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
+
+        selected = []
+
+        def fake_sdpa_kernel(backend):
+            selected.append(backend)
+            return nullcontext()
+
+        query, key, value = self._inputs()
+        with (
+            patch.object(
+                _sdpa_backend.torch_support,
+                "is_rocm_build",
+                return_value=True,
+            ),
+            patch.object(attention, "sdpa_kernel", side_effect=fake_sdpa_kernel),
+            pytorch_ops.use_pytorch_sdpa_backend(
+                pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.AOTRITON)
+            ),
+        ):
+            pytorch_ops.execute_selected_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+            )
+
+        assert selected == [attention.SDPBackend.FLASH_ATTENTION]
+
+    def test_default_opens_no_selection_context(self) -> None:
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        query, key, value = self._inputs()
+        sdpa_kernel = MagicMock(
+            side_effect=AssertionError("default must not select an SDPA backend")
+        )
+        with (
+            patch.object(attention, "sdpa_kernel", sdpa_kernel),
+            pytorch_ops.use_pytorch_sdpa_backend(
+                pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
+            ),
+        ):
+            pytorch_ops.execute_selected_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+            )
+
+        sdpa_kernel.assert_not_called()
+
+    def test_unavailable_kernel_errors_without_default_retry(self) -> None:
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        query, key, value = self._inputs()
+        sdpa = MagicMock(
+            side_effect=RuntimeError("No available kernel for selected backend")
+        )
+        with (
+            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+            pytorch_ops.use_pytorch_sdpa_backend(
+                pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
+            ),
+            pytest.raises(
+                pytorch_ops.PyTorchSdpaBackendUnavailableError,
+                match="Requested PyTorch SDPA backend 'math' is unavailable; "
+                "no fallback is used.",
+            ),
+        ):
+            pytorch_ops.execute_selected_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+            )
+
+        sdpa.assert_called_once()
+
+    def test_unrelated_runtime_error_is_not_swallowed(self) -> None:
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        query, key, value = self._inputs()
+        sdpa = MagicMock(side_effect=RuntimeError("unrelated dispatcher failure"))
+        with (
+            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+            pytorch_ops.use_pytorch_sdpa_backend(
+                pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
+            ),
+            pytest.raises(RuntimeError, match="unrelated dispatcher failure"),
+        ):
+            pytorch_ops.execute_selected_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+            )
+
+        sdpa.assert_called_once()
 
 
 class TestReplayTensorsScalarCache:

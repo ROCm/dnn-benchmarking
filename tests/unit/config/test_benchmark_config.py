@@ -11,6 +11,7 @@ from dnn_benchmarking.config import (
     BenchmarkConfig,
     ExecutionBackendName,
     ReferenceProviderName,
+    PyTorchSdpaBackendName,
     SuiteConfig,
     TimingBackendName,
     ValidationConfig,
@@ -27,6 +28,7 @@ class TestBenchmarkConfig:
         assert config.warmup_iters == 10
         assert config.benchmark_iters == 100
         assert config.engine_id == 1
+        assert config.pytorch_sdpa_backend is PyTorchSdpaBackendName.DEFAULT
 
     def test_custom_values(self) -> None:
         """Test that custom values are stored correctly."""
@@ -77,6 +79,48 @@ class TestBenchmarkConfig:
             engine_id=-4567890123456789012,
         )
         assert config.engine_id == -4567890123456789012
+
+
+class TestPyTorchSdpaBackendConfig:
+    """PyTorch SDPA backend selection validation."""
+
+    def test_defaults_to_unrestricted_dispatch(self) -> None:
+        assert (
+            BenchmarkConfig(graph_path=Path("/test/graph.json")).pytorch_sdpa_backend
+            is PyTorchSdpaBackendName.DEFAULT
+        )
+        assert SuiteConfig().pytorch_sdpa_backend is PyTorchSdpaBackendName.DEFAULT
+
+    @pytest.mark.parametrize(
+        "backend",
+        [backend.value for backend in PyTorchSdpaBackendName],
+    )
+    def test_accepts_every_backend_for_both_config_types(self, backend: str) -> None:
+        assert (
+            BenchmarkConfig(
+                graph_path=Path("/test/graph.json"),
+                pytorch_sdpa_backend=backend,
+            ).pytorch_sdpa_backend.value
+            == backend
+        )
+        assert (
+            SuiteConfig(pytorch_sdpa_backend=backend).pytorch_sdpa_backend.value
+            == backend
+        )
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: BenchmarkConfig(
+                graph_path=Path("/test/graph.json"),
+                pytorch_sdpa_backend="invalid",
+            ),
+            lambda: SuiteConfig(pytorch_sdpa_backend="invalid"),
+        ],
+    )
+    def test_rejects_invalid_backend_for_both_config_types(self, factory) -> None:
+        with pytest.raises(ValueError, match="Invalid PyTorch SDPA backend"):
+            factory()
 
 
 class TestSuiteConfigPluginPaths:

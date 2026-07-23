@@ -88,6 +88,7 @@ class TestBenchmarkMetadata:
         assert metadata.engine_id == 0
         assert metadata.timing_backend == ""
         # hostname and timestamp are auto-generated
+        assert metadata.pytorch_sdpa_backend == ""
         assert metadata.hostname != ""
         assert metadata.timestamp != ""
 
@@ -163,6 +164,17 @@ class TestBenchmarkResult:
         assert data["metadata"]["graph_name"] == "test"
         assert data["metadata"]["timing_backend"] == "hip"
         assert data["metadata"]["benchmark_iters"] == 100
+
+    def test_sdpa_backend_round_trips_through_result_json(self) -> None:
+        result = BenchmarkResult(
+            host_timings=[1.0],
+            metadata=BenchmarkMetadata(pytorch_sdpa_backend="aotriton"),
+        )
+
+        loaded = BenchmarkResult.from_dict(result.to_dict())
+
+        assert loaded.metadata is not None
+        assert loaded.metadata.pytorch_sdpa_backend == "aotriton"
 
     def test_to_json(self) -> None:
         """Test to_json produces valid JSON."""

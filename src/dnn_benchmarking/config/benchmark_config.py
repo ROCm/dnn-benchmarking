@@ -32,6 +32,22 @@ class ExecutionBackendName(str, Enum):
     PYTORCH = "pytorch"
 
 
+class PyTorchSdpaBackendName(str, Enum):
+    """Supported PyTorch scaled-dot-product-attention backend selections."""
+
+    DEFAULT = "default"
+    AOTRITON = "aotriton"
+    FLASH = "flash"
+    MATH = "math"
+    EFFICIENT = "efficient"
+    CUDNN = "cudnn"
+    OVERRIDEABLE = "overrideable"
+
+
+PYTORCH_SDPA_BACKEND_CHOICES = frozenset(
+    backend.value for backend in PyTorchSdpaBackendName
+)
+
 EXECUTION_BACKEND_CHOICES = frozenset(backend.value for backend in ExecutionBackendName)
 
 
@@ -49,12 +65,14 @@ class BenchmarkConfig:
         warmup_iters: Number of warmup iterations before benchmarking.
         benchmark_iters: Number of benchmark iterations for timing.
         engine_id: Engine ID to use (1 = MIOpen).
+        pytorch_sdpa_backend: PyTorch SDPA backend selection.
     """
 
     graph_path: Path
     warmup_iters: int = 10
     benchmark_iters: int = 100
     engine_id: int = 1
+    pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
 
     def __post_init__(self) -> None:
         """Validate configuration values.
@@ -65,6 +83,16 @@ class BenchmarkConfig:
         """
         if isinstance(self.graph_path, str):
             self.graph_path = Path(self.graph_path)
+
+        try:
+            self.pytorch_sdpa_backend = PyTorchSdpaBackendName(
+                self.pytorch_sdpa_backend
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid PyTorch SDPA backend: '{self.pytorch_sdpa_backend}'. "
+                f"Valid options: {PYTORCH_SDPA_BACKEND_CHOICES}"
+            ) from e
 
         if self.warmup_iters < 0:
             raise ValueError("warmup_iters must be non-negative")
@@ -298,6 +326,8 @@ class SuiteConfig:
         backend: Execution backend (``hipdnn`` runs discovered engine plugins,
             ``pytorch`` runs the graph through the PyTorch executor as a single
             engine row per graph).
+        pytorch_sdpa_backend: PyTorch SDPA backend selection for PyTorch
+            timing or reference execution.
     """
 
     warmup_iters: int = 10
@@ -309,6 +339,7 @@ class SuiteConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None
     backend: ExecutionBackendName = ExecutionBackendName.HIPDNN
+    pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -340,6 +371,15 @@ class SuiteConfig:
             raise ValueError(
                 f"Invalid backend: '{self.backend}'. "
                 f"Valid options: {EXECUTION_BACKEND_CHOICES}"
+            ) from e
+        try:
+            self.pytorch_sdpa_backend = PyTorchSdpaBackendName(
+                self.pytorch_sdpa_backend
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid PyTorch SDPA backend: '{self.pytorch_sdpa_backend}'. "
+                f"Valid options: {PYTORCH_SDPA_BACKEND_CHOICES}"
             ) from e
 
     @property

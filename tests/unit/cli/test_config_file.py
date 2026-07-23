@@ -106,6 +106,30 @@ iters = 7
     assert args.iters == 11
 
 
+def test_pytorch_sdpa_backend_config_and_cli_precedence(tmp_path: Path) -> None:
+    config = _write_config(
+        tmp_path / "bench.toml",
+        """
+version = 1
+graphs = ["from_config.json"]
+pytorch_sdpa_backend = "flash"
+""",
+    )
+
+    assert _parse_with_config(["--config", str(config)]).pytorch_sdpa_backend == "flash"
+    assert (
+        _parse_with_config(
+            [
+                "--config",
+                str(config),
+                "--pytorch-sdpa-backend",
+                "math",
+            ]
+        ).pytorch_sdpa_backend
+        == "math"
+    )
+
+
 def test_cli_engine_replaces_config_engine_matrix(tmp_path: Path) -> None:
     config = _write_config(
         tmp_path / "bench.toml",
@@ -249,6 +273,7 @@ id = 1
         ("metrics_tier", '"full"'),
         ("emit_trace", '"json"'),
         ("pmc", '"everything"'),
+        ("pytorch_sdpa_backend", '"invalid"'),
     ],
 )
 def test_invalid_config_choice_values_are_rejected(

@@ -119,6 +119,16 @@ class TestParserGlobAndFilters:
         args = parser.parse_args(["--graph", "g.json", "--verbose"])
         assert args.verbose is True
 
+    def test_pytorch_sdpa_backend_defaults_to_default(self) -> None:
+        args = create_parser().parse_args(["--graph", "g.json"])
+        assert args.pytorch_sdpa_backend == "default"
+
+    def test_pytorch_sdpa_backend_accepts_explicit_selection(self) -> None:
+        args = create_parser().parse_args(
+            ["--graph", "g.json", "--pytorch-sdpa-backend", "aotriton"]
+        )
+        assert args.pytorch_sdpa_backend == "aotriton"
+
 
 class TestMainRouting:
     """Tests for main() routing — single and multi files both go through the orchestrator."""
@@ -777,6 +787,41 @@ class TestRunSuiteWorkflow:
         assert result == 1
 
 
+class TestPyTorchSdpaBackendCli:
+    """PyTorch SDPA selector compatibility and SuiteConfig forwarding."""
+
+    @pytest.mark.parametrize(
+        "flow",
+        [
+            ["--backend", "pytorch"],
+            ["--validate", "pytorch"],
+        ],
+    )
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_selector_is_allowed_for_each_pytorch_flow(
+        self, mock_benchmark: MagicMock, flow: list[str]
+    ) -> None:
+        from dnn_benchmarking.cli.suite_runner_cli import run_suite_cli
+
+        mock_benchmark.return_value = 0
+        args = create_parser().parse_args(
+            ["--graph", "g.json", *flow, "--pytorch-sdpa-backend", "aotriton"]
+        )
+
+        assert (
+            run_suite_cli(
+                args,
+                graph_paths=[Path("g.json")],
+                reporter=MagicMock(spec=Reporter),
+            )
+            == 0
+        )
+        assert (
+            mock_benchmark.call_args.kwargs["config"].pytorch_sdpa_backend.value
+            == "aotriton"
+        )
+
+
 class TestBackendEngineRouting:
     """Tests for engine selection rules across execution backends."""
 
@@ -843,7 +888,13 @@ class TestBackendEngineRouting:
     def test_validate_pytorch_with_pytorch_backend_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             graph = self._create_graph(Path(tmpdir))
-            assert self._run_main_with_args(graph, ["--validate", "pytorch"]) == 1
+            assert (
+                self._run_main_with_args(
+                    graph,
+                    ["--validate", "pytorch", "--pytorch-sdpa-backend", "aotriton"],
+                )
+                == 1
+            )
 
     def test_profiling_flags_with_pytorch_backend_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

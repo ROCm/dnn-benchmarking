@@ -12,6 +12,8 @@ from typing import Any, FrozenSet, List, Optional
 from ..config.benchmark_config import (
     EXECUTION_BACKEND_CHOICES,
     ExecutionBackendName,
+    PYTORCH_SDPA_BACKEND_CHOICES,
+    PyTorchSdpaBackendName,
     REFERENCE_PROVIDER_CHOICES,
     ReferenceProviderName,
 )
@@ -103,6 +105,7 @@ def _parse_plugin_path_list(s: str) -> List[Path]:
 
 _BACKEND_CHOICES = EXECUTION_BACKEND_CHOICES
 _REFERENCE_PROVIDER_HELP = ", ".join(sorted(REFERENCE_PROVIDER_CHOICES))
+_PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
 _METRICS_TIER_CHOICES = frozenset({"basic", "off"})
 _EMIT_TRACE_CHOICES = frozenset({"pftrace", "kineto"})
 _PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
@@ -250,6 +253,24 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "PyTorch GPU execution is available."
         ),
         config_key="validate",
+        config_kind=ConfigKind.CHOICE,
+        config_type=str,
+    ),
+    CliOption(
+        flags=("--pytorch-sdpa-backend",),
+        dest="pytorch_sdpa_backend",
+        parser_type=str,
+        choices=PYTORCH_SDPA_BACKEND_CHOICES,
+        default=PyTorchSdpaBackendName.DEFAULT.value,
+        metavar="BACKEND",
+        group="Reference Validation",
+        help=(
+            "PyTorch scaled-dot-product-attention backend (default: default). "
+            f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default choices are "
+            "strict: an unavailable or ineligible backend errors and no default "
+            "backend is tried."
+        ),
+        config_key="pytorch_sdpa_backend",
         config_kind=ConfigKind.CHOICE,
         config_type=str,
     ),
@@ -475,6 +496,9 @@ Examples:
 PyTorch Backend (GPU via PyTorch):
   dnn-benchmark -g ./graph.json --backend pytorch
   dnn-benchmark -g ./graph.json --backend pytorch -o pytorch_results.json
+  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton -o pytorch_aotriton.json
+  default preserves normal dispatch; aotriton, flash, math, efficient, cudnn, and
+  overrideable force their selected backend. A non-default choice never falls back.
 
 Reference Validation:
   dnn-benchmark -g ./graph.json --validate pytorch

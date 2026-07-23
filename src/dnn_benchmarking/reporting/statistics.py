@@ -103,6 +103,7 @@ class BenchmarkMetadata:
         engine_id: Engine ID used for execution.
         timing_backend: GPU timer backend used ("hip" or "").
         execution_backend: Execution backend used ("hipdnn", "pytorch", or "").
+        pytorch_sdpa_backend: Requested PyTorch SDPA backend, when applicable.
         hostname: Machine hostname where benchmark was run.
     """
 
@@ -114,6 +115,7 @@ class BenchmarkMetadata:
     engine_id: int = 0
     timing_backend: str = ""
     execution_backend: str = ""
+    pytorch_sdpa_backend: str = ""
     hostname: str = field(default_factory=_get_hostname)
 
 

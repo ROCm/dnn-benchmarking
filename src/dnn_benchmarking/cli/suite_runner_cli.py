@@ -101,7 +101,18 @@ def _run_suite_graphs_after_startup(
             reporter.print_graph_result_table(gr)
         graph_results.append(gr)
 
-    suite_result = SuiteResult.from_graph_results(graph_results, total_graphs=total)
+    suite_result = SuiteResult.from_graph_results(
+        graph_results,
+        total_graphs=total,
+        pytorch_sdpa_backend=(
+            config.pytorch_sdpa_backend.value
+            if (
+                config.backend is ExecutionBackendName.PYTORCH
+                or config.validation.provider is ReferenceProviderName.PYTORCH
+            )
+            else None
+        ),
+    )
 
     reporter.print_suite_summary(suite_result.metadata)
     reporter.print_suite_footer()
@@ -238,6 +249,7 @@ def run_suite_cli(
             validation=validation,
             plugin_paths=plugin_paths,
             backend=backend,
+            pytorch_sdpa_backend=args.pytorch_sdpa_backend,
         )
     except ValueError as e:
         reporter.print_error(f"Suite configuration error: {e}")

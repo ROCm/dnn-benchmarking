@@ -348,6 +348,7 @@ class TestSuiteCLIIntegration:
 
         assert "metadata" in data
         assert "graphs" in data
+        assert data["metadata"]["pytorch_sdpa_backend"] is None
         assert data["metadata"]["total_graphs"] > 0
         assert len(data["graphs"]) == data["metadata"]["total_graphs"]
 
@@ -355,6 +356,8 @@ class TestSuiteCLIIntegration:
         for g in data["graphs"]:
             assert "graph_name" in g
             assert "results" in g
+            for row in g["results"]:
+                assert "pytorch_sdpa_backend" not in row
             assert len(g["results"]) > 0
 
     def test_suite_mode_single_graph_failure_continues(
@@ -573,6 +576,8 @@ class TestPyTorchBackendCLIIntegration:
                 str(_graphs_dir() / "sample_relu.json"),
                 "--backend",
                 "pytorch",
+                "--pytorch-sdpa-backend",
+                "math",
                 "--warmup",
                 "1",
                 "--iters",
@@ -591,6 +596,7 @@ class TestPyTorchBackendCLIIntegration:
         )
         assert output_file.exists(), result.stdout
         data = json.loads(output_file.read_text())
+        assert data["metadata"]["pytorch_sdpa_backend"] == "math"
         assert len(data["graphs"]) == 2
         for graph in data["graphs"]:
             providers = {r["provider"] for r in graph["results"]}
@@ -601,3 +607,4 @@ class TestPyTorchBackendCLIIntegration:
                 # "auto" timing yields HIP events on ROCm and torch.cuda
                 # events on CUDA, so kernel stats exist on both.
                 assert row["gpu_kernel_stats"], row
+                assert row["pytorch_sdpa_backend"] == "math"

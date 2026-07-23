@@ -72,6 +72,9 @@ class PyTorchCudaExecutor:
 
         self._graph_json = graph_json
         self._config = config
+        self._sdpa_backend_state = pytorch_ops.PyTorchSdpaBackendState(
+            config.pytorch_sdpa_backend
+        )
         self._device = torch.device(device)
         self._collect_kernel_timing = collect_kernel_timing
         self._init_time_ms: float = 0.0
@@ -238,6 +241,7 @@ class PyTorchCudaExecutor:
             engine_id=self._config.engine_id,
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.PYTORCH.value,
+            pytorch_sdpa_backend=self._config.pytorch_sdpa_backend.value,
         )
 
         return BenchmarkResult(
@@ -285,6 +289,7 @@ class PyTorchCudaExecutor:
             engine_id=self._config.engine_id,
             timing_backend=TimingBackendName.HIP.value,
             execution_backend=ExecutionBackendName.PYTORCH.value,
+            pytorch_sdpa_backend=self._config.pytorch_sdpa_backend.value,
         )
 
         return BenchmarkResult(
@@ -352,8 +357,9 @@ class PyTorchCudaExecutor:
         """
         try:
             assert self._compiled is not None
-            self._compiled.execute(tensors)
-        except UnsupportedGraphError:
+            with pytorch_ops.use_pytorch_sdpa_backend(self._sdpa_backend_state):
+                self._compiled.execute(tensors)
+        except (UnsupportedGraphError, pytorch_ops.PyTorchSdpaBackendUnavailableError):
             raise
         except Exception as e:
             raise PyTorchExecutionError(f"Graph execution failed: {e}") from e

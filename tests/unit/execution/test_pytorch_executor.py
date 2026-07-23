@@ -172,8 +172,17 @@ def pytorch_executor_module(monkeypatch: pytest.MonkeyPatch):
     yield from _load_executor_module(monkeypatch, fake_cuda)
 
 
-def _make_executor(module: Any, collect_kernel_timing: bool = True):
-    config = BenchmarkConfig(graph_path="test.json", warmup_iters=2, benchmark_iters=2)
+def _make_executor(
+    module: Any,
+    collect_kernel_timing: bool = True,
+    pytorch_sdpa_backend: str = "default",
+):
+    config = BenchmarkConfig(
+        graph_path="test.json",
+        warmup_iters=2,
+        benchmark_iters=2,
+        pytorch_sdpa_backend=pytorch_sdpa_backend,
+    )
     executor = module.PyTorchCudaExecutor(
         graph_json={"nodes": []},
         config=config,
@@ -232,7 +241,11 @@ def test_collect_kernel_timing_collects_kernel_timings(
         "compile_graph",
         lambda graph_json: _RecordingCompiled([]),
     )
-    executor = _make_executor(module, collect_kernel_timing=True)
+    executor = _make_executor(
+        module,
+        collect_kernel_timing=True,
+        pytorch_sdpa_backend="flash",
+    )
     executor.prepare()
 
     result = executor.benchmark(tensors={}, graph_name="pytorch_hip")
@@ -240,6 +253,7 @@ def test_collect_kernel_timing_collects_kernel_timings(
     assert result.kernel_timings == [1.25, 1.25]
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
+    assert result.metadata.pytorch_sdpa_backend == "flash"
     assert FakeHipTimer.created_streams == [0xCAFE, 0xCAFE]
     assert FakeHipTimer.start_calls == 2
     assert FakeHipTimer.stop_calls == 2
@@ -289,7 +303,11 @@ def test_staged_path_used_when_available(
         lambda *a, **k: pytest.fail("staged path must not build create_gpu_timer"),
     )
 
-    executor = _make_executor(module, collect_kernel_timing=True)
+    executor = _make_executor(
+        module,
+        collect_kernel_timing=True,
+        pytorch_sdpa_backend="aotriton",
+    )
     executor.prepare()
     result = executor.benchmark(tensors={}, graph_name="pytorch_staged")
 
@@ -298,6 +316,7 @@ def test_staged_path_used_when_available(
     assert result.host_timings == [0.5, 0.5]
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
+    assert result.metadata.pytorch_sdpa_backend == "aotriton"
     # Staged timer built from the torch graph-stream pointer.
     assert created_streams == [0xCAFE]
     # One untimed priming execute, then one execute per measured iteration.

@@ -18,6 +18,8 @@ from dnn_benchmarking.execution.suite_runner import (
     _BFLOAT16_RTOL,
     _BFLOAT16_ATOL,
     _run_timed_pytorch_row,
+    _TimedPytorchRow,
+    _compute_reference_outputs_once,
     set_plugin_path,
 )
 from dnn_benchmarking.config.benchmark_config import (
@@ -27,6 +29,7 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
+from dnn_benchmarking.reporting.statistics import BenchmarkMetadata
 from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
@@ -846,6 +849,7 @@ class TestCorrectnessChecking:
             result=timed_result,
             outputs=ref_outputs,
         )
+        mock_timed_reference.return_value.backend_unavailable = False
         mock_check_corr.return_value = CorrectnessResult(
             execution_success=True,
             tolerance_match=True,
@@ -904,6 +908,7 @@ class TestCorrectnessChecking:
             result=skipped_result,
             outputs=None,
         )
+        mock_timed_reference.return_value.backend_unavailable = False
         mock_check_corr.return_value = CorrectnessResult(
             execution_success=True,
             tolerance_match=True,
@@ -926,6 +931,84 @@ class TestCorrectnessChecking:
         assert ref_provider.compute_reference.call_count == 1
         assert mock_check_corr.call_args.args[3] is ref_outputs
 
+    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
+    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_validate_pytorch_never_falls_back_after_strict_backend_skip(
+        self,
+        mock_bm_cls,
+        mock_exec_cls,
+        mock_check_corr,
+        mock_get_ref,
+        mock_resolve_name,
+        mock_timed_reference,
+    ):
+        reason = (
+            "Requested PyTorch SDPA backend 'aotriton' is unavailable; "
+            "no fallback is used."
+        )
+        ref_provider = MagicMock()
+        mock_get_ref.return_value = ref_provider
+        mock_timed_reference.return_value = _TimedPytorchRow(
+            result=ProviderEngineResult(
+                provider="pytorch",
+                engine_id=0,
+                status="skipped",
+                role="reference",
+                skip_reason=reason,
+            ),
+            outputs=None,
+            backend_unavailable=True,
+        )
+        mock_resolve_name.return_value = "engine_1"
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[1])
+        mock_bm_cls.return_value = _make_bm_mock()
+
+        result = run_graph_all_providers(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            tensor_infos=[_make_tensor_info(1)],
+            config=_make_config(
+                validation=ValidationConfig(provider="pytorch"),
+                pytorch_sdpa_backend="aotriton",
+            ),
+            handle=MagicMock(),
+        )
+
+        ref_provider.compute_reference.assert_not_called()
+        mock_check_corr.assert_not_called()
+        assert result.results[0].skip_reason == reason
+
+    def test_cpu_pytorch_reference_uses_selected_sdpa_scope(self) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            PyTorchReferenceProvider,
+        )
+
+        class ScopedProvider(PyTorchReferenceProvider):
+            def compute_reference(self, graph_json, input_data):
+                state = _sdpa_backend._ACTIVE_SDPA_BACKEND.get()
+                assert state is not None
+                assert state.selection is PyTorchSdpaBackendName.MATH
+                return {}
+
+        outputs, error = _compute_reference_outputs_once(
+            ScopedProvider(),
+            _make_graph_json(),
+            {},
+            _make_config(
+                validation=ValidationConfig(provider="pytorch"),
+                pytorch_sdpa_backend="math",
+            ),
+        )
+
+        assert outputs == {}
+        assert error is None
+
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
     def test_timed_pytorch_reference_uses_auto_timing(
@@ -941,6 +1024,7 @@ class TestCorrectnessChecking:
         bench_result.kernel_timings = None
         bench_result.has_kernel_timings = False
         executor.benchmark.return_value = bench_result
+        bench_result.metadata = BenchmarkMetadata(pytorch_sdpa_backend="efficient")
         mock_pytorch_executor_cls.return_value = executor
 
         buffer_manager = _make_bm_mock()
@@ -956,6 +1040,7 @@ class TestCorrectnessChecking:
             config=_make_config(
                 validation=ValidationConfig(provider="pytorch"),
                 metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="efficient",
             ),
             input_data={},
             analytical_flops=None,
@@ -967,6 +1052,11 @@ class TestCorrectnessChecking:
         assert result.result.host_stats is not None
         assert result.result.gpu_kernel_stats is None
         assert result.result.status == "success"
+        assert result.result.pytorch_sdpa_backend == "efficient"
+        assert (
+            mock_pytorch_executor_cls.call_args.args[1].pytorch_sdpa_backend.value
+            == "efficient"
+        )
 
 
 @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
@@ -1523,3 +1613,39 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "skipped"
         assert "no GPU" in (row.result.skip_reason or "")
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    def test_reference_role_strict_backend_unavailable_is_marked_for_no_fallback(
+        self, mock_pytorch_executor_cls
+    ):
+        from dnn_benchmarking.execution.pytorch_ops import (
+            PyTorchSdpaBackendUnavailableError,
+        )
+
+        reason = (
+            "Requested PyTorch SDPA backend 'aotriton' is unavailable; "
+            "no fallback is used."
+        )
+        mock_pytorch_executor_cls.side_effect = PyTorchSdpaBackendUnavailableError(
+            reason
+        )
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="aotriton",
+            ),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "skipped"
+        assert row.result.skip_reason == reason
+        assert row.backend_unavailable is True

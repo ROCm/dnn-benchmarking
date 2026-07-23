@@ -67,6 +67,7 @@ class _TimedPytorchRow:
 
     result: ProviderEngineResult
     outputs: Optional[Dict[int, ReferenceOutput]]
+    backend_unavailable: bool = False
 
 
 def _output_node_types(graph_json: Dict[str, Any]) -> Dict[int, str]:
@@ -344,8 +345,20 @@ def _compute_reference_outputs_once(
     ref_provider: ReferenceProvider,
     graph_json: Dict[str, Any],
     input_data: Dict[int, Any],
+    config: SuiteConfig,
 ) -> tuple[Optional[Dict[int, ReferenceOutput]], Optional[str]]:
     try:
+        from ..validation.providers.pytorch_provider import PyTorchReferenceProvider
+
+        if isinstance(ref_provider, PyTorchReferenceProvider):
+            from .pytorch_ops import (
+                PyTorchSdpaBackendState,
+                use_pytorch_sdpa_backend,
+            )
+
+            state = PyTorchSdpaBackendState(config.pytorch_sdpa_backend)
+            with use_pytorch_sdpa_backend(state):
+                return ref_provider.compute_reference(graph_json, input_data), None
         return ref_provider.compute_reference(graph_json, input_data), None
     except (ImportError, ValueError, RuntimeError, ExecutionError) as e:
         return None, str(e)
@@ -422,6 +435,7 @@ def _run_timed_pytorch_row(
         role=role,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    backend_unavailable = False
 
     with Timer() as elapsed_timer:
         try:
@@ -434,6 +448,7 @@ def _run_timed_pytorch_row(
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
                 engine_id=0,
+                pytorch_sdpa_backend=config.pytorch_sdpa_backend,
             )
             executor = PyTorchCudaExecutor(graph_json, bench_config)
             executor.prepare()
@@ -465,6 +480,8 @@ def _run_timed_pytorch_row(
                     result.gpu_kernel_stats = BenchmarkStats.from_timings(
                         bench_result.kernel_timings
                     )
+                assert bench_result.metadata is not None
+                result.pytorch_sdpa_backend = bench_result.metadata.pytorch_sdpa_backend
 
                 if config.metrics.basic_enabled:
                     _collect_basic_metrics_post_loop(
@@ -506,7 +523,14 @@ def _run_timed_pytorch_row(
                     rtol=rtol, atol=atol, error_message=str(e)
                 )
         except Exception as e:
-            if role == "engine":
+            if (
+                role == "reference"
+                and "pytorch_ops" in locals()
+                and isinstance(e, pytorch_ops.PyTorchSdpaBackendUnavailableError)
+            ):
+                result.skip_reason = str(e)
+                backend_unavailable = True
+            elif role == "engine":
                 msg = str(e)
                 rtol, atol = _fallback_tolerance_for_config(config)
                 result.status = "error"
@@ -516,9 +540,12 @@ def _run_timed_pytorch_row(
                 )
             else:
                 result.skip_reason = str(e)
-
     result.elapsed_time_ms = elapsed_timer.elapsed_ms
-    return _TimedPytorchRow(result=result, outputs=outputs)
+    return _TimedPytorchRow(
+        result=result,
+        outputs=outputs,
+        backend_unavailable=backend_unavailable,
+    )
 
 
 def run_graph_all_providers(
@@ -654,6 +681,7 @@ def run_graph_all_providers(
         )
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
     reference_error: Optional[str] = None
+    timed_reference_backend_unavailable = False
 
     (
         analytical_flops,
@@ -680,18 +708,23 @@ def run_graph_all_providers(
             analytical_io_bytes=analytical_io_bytes,
         )
         reference_outputs = timed_reference.outputs
+        timed_reference_backend_unavailable = timed_reference.backend_unavailable
         if reporter is not None:
             reporter.print_engine_result(timed_reference.result)
         pe_results.append(timed_reference.result)
 
-    # A failed timed CUDA reference row is reported as skipped, but validation can
-    # still use the regular reference provider output computed on the same inputs.
+    # An unavailable strict backend must not fall back to an unrestricted CPU
+    # reference. Other timed-reference failures still use the CPU provider.
     if ref_provider is not None and reference_outputs is None:
-        reference_outputs, reference_error = _compute_reference_outputs_once(
-            ref_provider,
-            graph_json,
-            graph_input_data,
-        )
+        if timed_reference_backend_unavailable:
+            reference_error = timed_reference.result.skip_reason
+        else:
+            reference_outputs, reference_error = _compute_reference_outputs_once(
+                ref_provider,
+                graph_json,
+                graph_input_data,
+                config,
+            )
 
     for selection in engine_selections:
         engine_id = selection.engine_id

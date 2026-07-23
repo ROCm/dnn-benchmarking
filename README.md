@@ -239,7 +239,16 @@ dnn-benchmark --graph ./graphs/sample_conv_fwd.json --backend pytorch
 
 # A whole suite through PyTorch, with JSON output
 dnn-benchmark --graph 'graphs/*.json' --backend pytorch -o pytorch_results.json
+
+# Force ROCm AOTriton SDPA and record the selection in JSON
+dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton -o pytorch_aotriton.json
 ```
+
+`--pytorch-sdpa-backend default` preserves normal PyTorch SDPA dispatch.
+`aotriton`, `flash`, `math`, `efficient`, `cudnn`, and `overrideable` force the
+named backend. Every selected non-default backend is strict: if it is
+unavailable or ineligible for an input, the benchmark errors instead of falling
+back to normal dispatch. `aotriton` is ROCm-only.
 
 The PyTorch backend ignores hipDNN-specific selection and profiling options;
 the following are rejected with `--backend pytorch`:
@@ -309,6 +318,7 @@ python -m dnn_benchmarking --config sample_configs/config.toml.example --iters 5
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--validate` | Reference provider for correctness validation: `pytorch` or `none`. `--validate pytorch` also reports a timed PyTorch reference row when PyTorch GPU execution is available. | `none` |
+| `--pytorch-sdpa-backend` | PyTorch SDPA backend: `default` preserves normal dispatch; `aotriton`, `flash`, `math`, `efficient`, `cudnn`, and `overrideable` are strict selections that never fall back. | `default` |
 
 #### Suite Options
 
