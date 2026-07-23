@@ -821,6 +821,24 @@ class TestPyTorchSdpaBackendCli:
             == "aotriton"
         )
 
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_non_default_selector_warns_without_a_pytorch_path(
+        self, mock_benchmark: MagicMock
+    ) -> None:
+        from dnn_benchmarking.cli.suite_runner_cli import run_suite_cli
+
+        mock_benchmark.return_value = 0
+        reporter = MagicMock(spec=Reporter)
+        args = create_parser().parse_args(
+            ["--graph", "g.json", "--pytorch-sdpa-backend", "aotriton"]
+        )
+
+        assert run_suite_cli(args, graph_paths=[Path("g.json")], reporter=reporter) == 0
+        reporter.print_warning.assert_called_once_with(
+            "--pytorch-sdpa-backend is ignored unless --backend pytorch or "
+            "--validate pytorch is selected"
+        )
+
 
 class TestBackendEngineRouting:
     """Tests for engine selection rules across execution backends."""

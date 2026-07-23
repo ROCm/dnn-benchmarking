@@ -250,6 +250,10 @@ named backend. Every selected non-default backend is strict: if it is
 unavailable or ineligible for an input, the benchmark errors instead of falling
 back to normal dispatch. `aotriton` is ROCm-only.
 
+For `--validate pytorch`, any CPU reference fallback retains the same selection.
+If that backend cannot execute the CPU input, validation is reported unavailable;
+the tool does not retry under normal PyTorch dispatch.
+
 The PyTorch backend ignores hipDNN-specific selection and profiling options;
 the following are rejected with `--backend pytorch`:
 

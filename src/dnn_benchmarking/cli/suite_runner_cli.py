@@ -12,6 +12,7 @@ from ..common.exceptions import ExecutionError, GraphLoadError
 from ..config.benchmark_config import (
     ExecutionBackendName,
     MetricsConfig,
+    PyTorchSdpaBackendName,
     ReferenceProviderName,
     SuiteConfig,
     ValidationConfig,
@@ -235,6 +236,15 @@ def run_suite_cli(
                 "--profiling-output-dir set but no opt-in profiling "
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
+            )
+        if (
+            args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value
+            and backend is not ExecutionBackendName.PYTORCH
+            and validation.provider is not ReferenceProviderName.PYTORCH
+        ):
+            reporter.print_warning(
+                "--pytorch-sdpa-backend is ignored unless --backend pytorch or "
+                "--validate pytorch is selected"
             )
         plugin_paths = None
         if backend is not ExecutionBackendName.PYTORCH:

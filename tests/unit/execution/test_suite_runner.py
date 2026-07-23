@@ -1009,6 +1009,55 @@ class TestCorrectnessChecking:
         assert outputs == {}
         assert error is None
 
+    def test_cpu_pytorch_reference_preserves_unavailable_selection(self) -> None:
+        from contextlib import nullcontext
+
+        import torch
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution import pytorch_ops
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            PyTorchReferenceProvider,
+        )
+
+        class StrictCpuProvider(PyTorchReferenceProvider):
+            def compute_reference(self, graph_json, input_data):
+                query = torch.rand(1, 1, 2, 4)
+                return pytorch_ops.execute_selected_sdpa(
+                    query,
+                    query,
+                    query,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=None,
+                )
+
+        dispatch_error = RuntimeError("selected backend cannot run this CPU input")
+        sdpa = MagicMock(side_effect=dispatch_error)
+        with (
+            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+        ):
+            outputs, error = _compute_reference_outputs_once(
+                StrictCpuProvider(),
+                _make_graph_json(),
+                {},
+                _make_config(
+                    validation=ValidationConfig(provider="pytorch"),
+                    pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT,
+                ),
+            )
+
+        assert outputs is None
+        assert error is not None
+        assert error.startswith(
+            "Requested PyTorch SDPA backend 'efficient' is unavailable; "
+            "no fallback is used."
+        )
+        sdpa.assert_called_once()
+
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
     def test_timed_pytorch_reference_uses_auto_timing(

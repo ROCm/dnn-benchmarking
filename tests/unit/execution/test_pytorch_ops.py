@@ -1606,20 +1606,25 @@ class TestPyTorchSdpaBackendSelection:
 
         sdpa.assert_called_once()
 
-    def test_unrelated_runtime_error_is_not_swallowed(self) -> None:
+    def test_unrecognized_runtime_error_is_strict_backend_failure(self) -> None:
         from torch.nn import attention
 
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
         query, key, value = self._inputs()
-        sdpa = MagicMock(side_effect=RuntimeError("unrelated dispatcher failure"))
+        dispatch_error = RuntimeError("backend refused the selected operation")
+        sdpa = MagicMock(side_effect=dispatch_error)
         with (
             patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(
                 pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
             ),
-            pytest.raises(RuntimeError, match="unrelated dispatcher failure"),
+            pytest.raises(
+                pytorch_ops.PyTorchSdpaBackendUnavailableError,
+                match="Requested PyTorch SDPA backend 'math' is unavailable; "
+                "no fallback is used.",
+            ) as caught,
         ):
             pytorch_ops.execute_selected_sdpa(
                 query,
@@ -1631,6 +1636,7 @@ class TestPyTorchSdpaBackendSelection:
                 scale=None,
             )
 
+        assert caught.value.__cause__ is dispatch_error
         sdpa.assert_called_once()
 
 

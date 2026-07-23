@@ -428,6 +428,8 @@ def _run_timed_pytorch_row(
     ``--backend pytorch`` path) no outputs are extracted and failures are
     reported as engine errors.
     """
+    from . import pytorch_ops
+
     result = ProviderEngineResult(
         provider=ReferenceProviderName.PYTORCH.value,
         engine_id=0,
@@ -441,7 +443,6 @@ def _run_timed_pytorch_row(
         try:
             from ..execution.pytorch_buffer_manager import PyTorchCudaBufferManager
             from ..execution.pytorch_executor import PyTorchCudaExecutor
-            from . import pytorch_ops
 
             bench_config = BenchmarkConfig(
                 graph_path=graph_path,
@@ -523,10 +524,8 @@ def _run_timed_pytorch_row(
                     rtol=rtol, atol=atol, error_message=str(e)
                 )
         except Exception as e:
-            if (
-                role == "reference"
-                and "pytorch_ops" in locals()
-                and isinstance(e, pytorch_ops.PyTorchSdpaBackendUnavailableError)
+            if role == "reference" and isinstance(
+                e, pytorch_ops.PyTorchSdpaBackendUnavailableError
             ):
                 result.skip_reason = str(e)
                 backend_unavailable = True

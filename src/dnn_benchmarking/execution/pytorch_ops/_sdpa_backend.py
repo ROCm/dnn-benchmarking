@@ -77,6 +77,8 @@ def _selected_sdp_backend(selection: PyTorchSdpaBackendName):
             "PyTorch does not expose the public sdpa_kernel API.",
         )
 
+    # AOTriton uses PyTorch's FLASH_ATTENTION selector on ROCm. The
+    # `aotriton` choice adds the ROCm-only eligibility check; `flash` is generic.
     member_names = {
         PyTorchSdpaBackendName.AOTRITON: "FLASH_ATTENTION",
         PyTorchSdpaBackendName.FLASH: "FLASH_ATTENTION",
@@ -131,7 +133,4 @@ def execute_selected_sdpa(
                 scale=scale,
             )
     except RuntimeError as error:
-        message = str(error)
-        if "No available kernel" in message or "No viable backend" in message:
-            raise _unavailable_error(state.selection, message) from error
-        raise
+        raise _unavailable_error(state.selection, str(error)) from error
