@@ -140,6 +140,14 @@ class TestResolveCounterGroups:
         assert rocprof_pmc._resolve_counter_groups("gfx942", "bogus") == []
 
 
+class TestSqliteIdentifierQuoting:
+    def test_escapes_embedded_quotes(self):
+        assert (
+            rocprof_pmc._quote_sqlite_identifier('rocpd_pmc_event_"quoted"')
+            == '"rocpd_pmc_event_""quoted"""'
+        )
+
+
 class TestRunHappyPath:
     def _make_synthetic_rocpd_db(self, db_path: Path) -> None:
         """Mirror the rocpd schema closely enough to exercise the parser.

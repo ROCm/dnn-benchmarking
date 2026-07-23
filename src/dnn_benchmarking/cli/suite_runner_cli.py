@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from ..common.rocm_runtime import default_hipdnn_plugin_paths
 from ..common.exceptions import ExecutionError, GraphLoadError
 from ..config.benchmark_config import (
     ExecutionBackendName,
@@ -31,10 +32,7 @@ LoadedGraphRunner = Callable[
 
 
 def _plugin_paths_from_environment() -> Optional[List[Path]]:
-    rocm_path = os.environ.get("ROCM_PATH")
-    if not rocm_path:
-        return None
-    return [Path(rocm_path) / "lib" / "hipdnn_plugins" / "engines"]
+    return default_hipdnn_plugin_paths()
 
 
 def _error_graph_result(graph_path: Path, error_message: str) -> GraphResult:

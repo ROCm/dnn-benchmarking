@@ -3,3 +3,4 @@
     autostage = true
 ['remote "storage"']
     url = s3://therock-dvc/dnn-benchmarking
+    allow_anonymous_login = true

@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.7
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+ARG BASE_IMAGE=ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS builder
+
+ARG DEVICE_TARGET=gfx942
+ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HIP_PLATFORM=amd \
+    BENCHMARK_WORKSPACE=/opt/dnn-benchmark \
+    BENCHMARK_VENV=/opt/dnn-benchmark/.venv \
+    WORKSPACE_DIR=/workspace \
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        git \
+        ninja-build \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR ${WORKSPACE_DIR}
+
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
+set -eu
+
+case "${DEVICE_TARGET}" in
+    gfx90a | gfx942 | gfx950 | gfx1152) ;;
+    *)
+        echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, or gfx1152." >&2
+        exit 1
+        ;;
+esac
+
+
+if [ "${FETCHCONTENT_GIT_SSL_NO_VERIFY}" = "true" ]; then
+    export GIT_SSL_NO_VERIFY=true
+    export PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
+fi
+
+python3.12 setup_env.py \
+    --workspace "${BENCHMARK_WORKSPACE}" \
+    --torch-mode rocm \
+    --gpu-arch "${DEVICE_TARGET}" \
+    --no-editable \
+    -y
+
+
+# rocm-sdk-devel is build-only. Runtime keeps the ROCm torch/core/libraries
+# wheels plus the hipDNN/providers installed into the libraries wheel prefix.
+tools_target="$("${BENCHMARK_VENV}/bin/python" -m rocm_sdk path --root | tail -n 1)"
+"${BENCHMARK_VENV}/bin/python" -m pip uninstall -y rocm-sdk-devel
+rm -rf "${tools_target}"
+
+printf 'Benchmark venv: %s\n' "${BENCHMARK_VENV}"
+EOF
+
+
+FROM ${BASE_IMAGE} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HIP_PLATFORM=amd \
+    BENCHMARK_WORKSPACE=/opt/dnn-benchmark \
+    BENCHMARK_VENV=/opt/dnn-benchmark/.venv \
+    WORKSPACE_DIR=/workspace \
+    PATH=/opt/dnn-benchmark/.venv/bin:${PATH}
+
+# Keep development headers out of the runtime image. MIOpen's HIPRTC path ships
+# its own cstdint shim; installing libc6-dev exposes system stdint typedefs that
+# conflict with that shim during runtime kernel compilation.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libatomic1 \
+        libdrm2 \
+        libelf1 \
+        libgcc-s1 \
+        libgomp1 \
+        libnuma1 \
+        libstdc++6 \
+        libtinfo6 \
+        python3.12 \
+        linux-tools-common \
+        linux-tools-generic \
+        libsqlite3-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+
+# linux-tools-{common,generic} provide the `perf` binary required by
+# dnn-benchmarking's `--perf` source (CPU cycles/IPC). Two runtime
+# gotchas the apt install can't fix:
+#
+#  * Container kernel mismatch — the perf wrapper dispatches to
+#    `perf_<kernel-version>`. If that build isn't present, perf
+#    complains and falls back; sometimes the user needs
+#    `apt install linux-tools-$(uname -r)` matching the host kernel.
+#  * Kernel-event collection (`cycles:k`) requires
+#    `/proc/sys/kernel/perf_event_paranoid <= 1`. Containers inherit
+#    the host value, so either run the container with
+#    `--cap-add=SYS_ADMIN` and `sysctl kernel.perf_event_paranoid=1`
+#    on the host first, or accept user-space-only counters
+#    (cycles:u / instructions:u — dnn-benchmarking records these
+#    unconditionally and surfaces the paranoid value next to the
+#    None kernel fields). See docs/troubleshooting.md.
+
+COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
+
+# MIOpen's HIPRTC activation path includes libc++ <cstdint> before MIOpen's own
+# miopen_cstdint.hpp. Runtime must not install glibc development headers (their
+# LP64 fixed-width typedefs conflict with MIOpen's HIPRTC LL64 shim), but libc++
+# still needs global intmax_t/uintmax_t for std::intmax_t. Provide only those
+# max-width typedefs and let miopen_cstdint.hpp define int8_t/int64_t/etc.
+RUN cat > /usr/local/include/stdint.h <<'EOF'
+#ifndef DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
+#define DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
+typedef long long intmax_t;
+typedef unsigned long long uintmax_t;
+#define INTMAX_MAX 9223372036854775807LL
+#define INTMAX_MIN (-9223372036854775807LL - 1)
+#define UINTMAX_MAX 18446744073709551615ULL
+#define INTMAX_C(v) v##LL
+#define UINTMAX_C(v) v##ULL
+#endif
+EOF
+
+WORKDIR ${WORKSPACE_DIR}
+COPY graphs ./graphs
+
+RUN cat > /usr/local/bin/dnn-benchmark-performance <<'SCRIPT' && \
+    chmod 0755 /usr/local/bin/dnn-benchmark-performance
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+exec /opt/dnn-benchmark/.venv/bin/dnn-benchmark "$@"
+SCRIPT
+
+ENTRYPOINT ["dnn-benchmark-performance"]
+CMD []
