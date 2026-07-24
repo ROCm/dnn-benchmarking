@@ -346,7 +346,11 @@ def _compute_reference_outputs_once(
     graph_json: Dict[str, Any],
     input_data: Dict[int, Any],
     config: SuiteConfig,
-) -> tuple[Optional[Dict[int, ReferenceOutput]], Optional[str]]:
+) -> tuple[
+    Optional[Dict[int, ReferenceOutput]],
+    Optional[str],
+    Optional[str],
+]:
     try:
         from ..validation.providers.pytorch_provider import PyTorchReferenceProvider
 
@@ -358,10 +362,11 @@ def _compute_reference_outputs_once(
 
             state = PyTorchSdpaBackendState(config.pytorch_sdpa_backend)
             with use_pytorch_sdpa_backend(state):
-                return ref_provider.compute_reference(graph_json, input_data), None
-        return ref_provider.compute_reference(graph_json, input_data), None
+                outputs = ref_provider.compute_reference(graph_json, input_data)
+            return outputs, None, state.executed_category
+        return ref_provider.compute_reference(graph_json, input_data), None, None
     except (ImportError, ValueError, RuntimeError, ExecutionError) as e:
-        return None, str(e)
+        return None, str(e), None
 
 
 def _pytorch_reference_outputs_from_buffer(
@@ -439,6 +444,7 @@ def _run_timed_pytorch_row(
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     backend_unavailable = False
+    executed_category: Optional[str] = None
 
     with Timer() as elapsed_timer:
         try:
@@ -483,12 +489,6 @@ def _run_timed_pytorch_row(
                         bench_result.kernel_timings
                     )
                 assert bench_result.metadata is not None
-                result.pytorch_sdpa_backend_requested = (
-                    bench_result.metadata.pytorch_sdpa_backend_requested
-                )
-                result.pytorch_sdpa_category_executed = (
-                    bench_result.metadata.pytorch_sdpa_category_executed or None
-                )
 
                 if config.metrics.basic_enabled:
                     _collect_basic_metrics_post_loop(
@@ -519,6 +519,9 @@ def _run_timed_pytorch_row(
                     atol=atol,
                     error_message="No reference provider requested",
                 )
+            assert bench_result.metadata is not None
+            executed_category = bench_result.metadata.pytorch_sdpa_category_executed
+            result.pytorch_sdpa_category_executed = executed_category
             result.status = "success"
 
         except UnsupportedGraphError as e:
@@ -686,6 +689,7 @@ def run_graph_all_providers(
         )
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
     reference_error: Optional[str] = None
+    reference_category_executed: Optional[str] = None
     timed_reference_backend_unavailable = False
 
     (
@@ -724,7 +728,11 @@ def run_graph_all_providers(
         if timed_reference_backend_unavailable:
             reference_error = timed_reference.result.skip_reason
         else:
-            reference_outputs, reference_error = _compute_reference_outputs_once(
+            (
+                reference_outputs,
+                reference_error,
+                reference_category_executed,
+            ) = _compute_reference_outputs_once(
                 ref_provider,
                 graph_json,
                 graph_input_data,
@@ -796,6 +804,7 @@ def run_graph_all_providers(
         graph_path=str(graph_path),
         results=pe_results,
         engine_ids=engine_ids,
+        pytorch_sdpa_category_executed=reference_category_executed,
     )
 
 

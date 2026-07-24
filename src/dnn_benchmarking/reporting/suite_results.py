@@ -304,12 +304,15 @@ class GraphResult:
         graph_name: Name of the graph.
         graph_path: File path to the graph JSON.
         results: List of ProviderEngineResult for each combination.
+        pytorch_sdpa_category_executed: Public category executed outside a
+            serialized provider row, such as the CPU PyTorch reference fallback.
     """
 
     graph_name: str
     graph_path: str
     results: List[ProviderEngineResult]
     engine_ids: List[int] = field(default_factory=list)
+    pytorch_sdpa_category_executed: Optional[str] = None
 
     def is_no_engine_graph(self) -> bool:
         """True when this graph result represents a no-engine outcome."""
@@ -355,6 +358,15 @@ class GraphResult:
             "graph_name": self.graph_name,
             "graph_path": self.graph_path,
             "results": [r.to_dict() for r in self.results],
+            **(
+                {
+                    "pytorch_sdpa_category_executed": (
+                        self.pytorch_sdpa_category_executed
+                    )
+                }
+                if self.pytorch_sdpa_category_executed is not None
+                else {}
+            ),
         }
 
 

@@ -369,6 +369,16 @@ class TestGraphResult:
         assert len(d["results"]) == 1
         assert d["results"][0]["status"] == "error"
 
+    def test_cpu_fallback_category_serializes_at_graph_level(self):
+        graph = GraphResult(
+            graph_name="sdpa",
+            graph_path="/p/sdpa.json",
+            results=[],
+            pytorch_sdpa_category_executed="math",
+        )
+
+        assert graph.to_dict()["pytorch_sdpa_category_executed"] == "math"
+
     def test_count_by_status_buckets_all_outcomes(self):
         """count_by_status returns the correct bucket counts."""
         pass_corr = CorrectnessResult(

@@ -110,6 +110,11 @@ def _run_suite_graphs_after_startup(
         for row in graph_result.results
         if row.pytorch_sdpa_category_executed is not None
     }
+    executed_categories.update(
+        graph_result.pytorch_sdpa_category_executed
+        for graph_result in graph_results
+        if graph_result.pytorch_sdpa_category_executed is not None
+    )
     if len(executed_categories) > 1:
         raise RuntimeError(
             "PyTorch SDPA rows reported inconsistent executed categories: "

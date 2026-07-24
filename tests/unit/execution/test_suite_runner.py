@@ -29,8 +29,11 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
-from dnn_benchmarking.reporting.statistics import BenchmarkMetadata
-from dnn_benchmarking.reporting.statistics import BenchmarkStats
+from dnn_benchmarking.reporting.statistics import (
+    BenchmarkMetadata,
+    BenchmarkResult,
+    BenchmarkStats,
+)
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
@@ -996,7 +999,7 @@ class TestCorrectnessChecking:
                 assert state.selection is PyTorchSdpaBackendName.MATH
                 return {}
 
-        outputs, error = _compute_reference_outputs_once(
+        outputs, error, executed_category = _compute_reference_outputs_once(
             ScopedProvider(),
             _make_graph_json(),
             {},
@@ -1008,6 +1011,42 @@ class TestCorrectnessChecking:
 
         assert outputs == {}
         assert error is None
+        assert executed_category is None
+
+    def test_cpu_pytorch_reference_returns_executed_category(self) -> None:
+        import torch
+
+        from dnn_benchmarking.execution import pytorch_ops
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            PyTorchReferenceProvider,
+        )
+
+        class ExecutedProvider(PyTorchReferenceProvider):
+            def compute_reference(self, graph_json, input_data):
+                query = torch.rand(1, 1, 2, 4)
+                return pytorch_ops.execute_selected_sdpa(
+                    query,
+                    query,
+                    query,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=None,
+                )
+
+        outputs, error, executed_category = _compute_reference_outputs_once(
+            ExecutedProvider(),
+            _make_graph_json(),
+            {},
+            _make_config(
+                validation=ValidationConfig(provider="pytorch"),
+                pytorch_sdpa_backend="math",
+            ),
+        )
+
+        assert outputs is not None
+        assert error is None
+        assert executed_category == "math"
 
     def test_cpu_pytorch_reference_preserves_unavailable_selection(self) -> None:
         from contextlib import nullcontext
@@ -1040,7 +1079,7 @@ class TestCorrectnessChecking:
             patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
         ):
-            outputs, error = _compute_reference_outputs_once(
+            outputs, error, executed_category = _compute_reference_outputs_once(
                 StrictCpuProvider(),
                 _make_graph_json(),
                 {},
@@ -1052,6 +1091,7 @@ class TestCorrectnessChecking:
 
         assert outputs is None
         assert error is not None
+        assert executed_category is None
         assert error.startswith(
             "Requested PyTorch SDPA backend 'efficient' is unavailable; "
             "no fallback is used."
@@ -1675,6 +1715,47 @@ class TestTimedPytorchRowEngineRole:
         assert row.result.status == "skipped"
         assert "no GPU" in (row.result.skip_reason or "")
         assert row.result.pytorch_sdpa_backend_requested == "efficient"
+        assert row.result.pytorch_sdpa_category_executed is None
+
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    def test_reference_output_failure_does_not_retain_executed_category(
+        self,
+        mock_pytorch_executor_cls,
+        mock_buffer_manager_cls,
+    ):
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+        executor.benchmark.return_value = BenchmarkResult(
+            host_timings=[1.0],
+            kernel_timings=[0.5],
+            metadata=BenchmarkMetadata(
+                pytorch_sdpa_backend_requested="math",
+                pytorch_sdpa_category_executed="math",
+            ),
+        )
+        executor.execute_once.side_effect = RuntimeError("output pass failed")
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="math",
+            ),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "skipped"
+        assert row.result.pytorch_sdpa_backend_requested == "math"
         assert row.result.pytorch_sdpa_category_executed is None
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
