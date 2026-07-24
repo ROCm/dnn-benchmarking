@@ -122,6 +122,22 @@ class TestPyTorchSdpaBackendConfig:
         with pytest.raises(ValueError, match="Invalid PyTorch SDPA backend"):
             factory()
 
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: BenchmarkConfig(
+                graph_path=Path("/test/graph.json"),
+                pytorch_sdpa_backend="aotriton",
+            ),
+            lambda: SuiteConfig(pytorch_sdpa_backend="aotriton"),
+        ],
+    )
+    def test_rejects_removed_aotriton_value_for_both_config_types(
+        self, factory
+    ) -> None:
+        with pytest.raises(ValueError, match="Invalid PyTorch SDPA backend"):
+            factory()
+
 
 class TestSuiteConfigPluginPaths:
     """Tests for SuiteConfig engine/plugin path selection."""

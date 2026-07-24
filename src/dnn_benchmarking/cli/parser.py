@@ -265,10 +265,12 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         metavar="BACKEND",
         group="Reference Validation",
         help=(
-            "PyTorch scaled-dot-product-attention backend (default: default). "
-            f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default choices are "
-            "strict: an unavailable or ineligible backend errors and no default "
-            "backend is tried."
+            "PyTorch scaled-dot-product-attention category (default: default). "
+            f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default categories are "
+            "strict: an unavailable or ineligible category errors and no default "
+            "category is tried. On ROCm, aotriton_preferred selects the Flash "
+            "Attention category and prefers AOTriton, but PyTorch may use another "
+            "ROCm Flash implementation."
         ),
         config_key="pytorch_sdpa_backend",
         config_kind=ConfigKind.CHOICE,
@@ -496,9 +498,10 @@ Examples:
 PyTorch Backend (GPU via PyTorch):
   dnn-benchmark -g ./graph.json --backend pytorch
   dnn-benchmark -g ./graph.json --backend pytorch -o pytorch_results.json
-  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton -o pytorch_aotriton.json
-  default preserves normal dispatch; aotriton, flash, math, efficient, cudnn, and
-  overrideable force their selected backend. A non-default choice never falls back.
+  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton_preferred -o pytorch_aotriton_preferred.json
+  default preserves normal dispatch. Non-default categories are strict.
+  On ROCm, aotriton_preferred prefers AOTriton within Flash Attention, but PyTorch
+  may use another ROCm Flash implementation.
 
 Reference Validation:
   dnn-benchmark -g ./graph.json --validate pytorch

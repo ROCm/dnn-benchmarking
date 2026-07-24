@@ -226,6 +226,8 @@ def test_no_kernel_timing_uses_stream_sync_only(
     assert result.kernel_timings is None
     assert result.metadata is not None
     assert result.metadata.timing_backend == ""
+    assert result.metadata.pytorch_sdpa_backend_requested == "default"
+    assert result.metadata.pytorch_sdpa_category_executed is None
     assert FakeHipTimer.created_streams == [0xCAFE]
     assert FakeHipTimer.start_calls == 0
     assert FakeHipTimer.stop_calls == 0
@@ -236,6 +238,19 @@ def test_collect_kernel_timing_collects_kernel_timings(
     pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = pytorch_executor_module
+    scopes = []
+
+    @contextmanager
+    def record_scope(state):
+        assert state.selection.value == "flash"
+        state.executed_category = "flash"
+        scopes.append("enter")
+        try:
+            yield
+        finally:
+            scopes.append("exit")
+
+    monkeypatch.setattr(module.pytorch_ops, "use_pytorch_sdpa_backend", record_scope)
     monkeypatch.setattr(
         module.pytorch_ops,
         "compile_graph",
@@ -253,11 +268,13 @@ def test_collect_kernel_timing_collects_kernel_timings(
     assert result.kernel_timings == [1.25, 1.25]
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
-    assert result.metadata.pytorch_sdpa_backend == "flash"
+    assert result.metadata.pytorch_sdpa_backend_requested == "flash"
+    assert result.metadata.pytorch_sdpa_category_executed == "flash"
     assert FakeHipTimer.created_streams == [0xCAFE, 0xCAFE]
     assert FakeHipTimer.start_calls == 2
     assert FakeHipTimer.stop_calls == 2
     assert FakeHipTimer.sync_calls == 0
+    assert scopes == ["enter", "exit"] * 2
 
 
 class _FakeStagedTimer:
@@ -283,6 +300,19 @@ def test_staged_path_used_when_available(
     """On a ROCm build with staging available, benchmark uses the staged
     timer: a priming execute, then one staged measure per iteration."""
     module = pytorch_executor_module
+    scopes = []
+
+    @contextmanager
+    def record_scope(state):
+        assert state.selection.value == "aotriton_preferred"
+        state.executed_category = "flash"
+        scopes.append("enter")
+        try:
+            yield
+        finally:
+            scopes.append("exit")
+
+    monkeypatch.setattr(module.pytorch_ops, "use_pytorch_sdpa_backend", record_scope)
     executed: List[str] = []
     monkeypatch.setattr(
         module.pytorch_ops,
@@ -306,7 +336,7 @@ def test_staged_path_used_when_available(
     executor = _make_executor(
         module,
         collect_kernel_timing=True,
-        pytorch_sdpa_backend="aotriton",
+        pytorch_sdpa_backend="aotriton_preferred",
     )
     executor.prepare()
     result = executor.benchmark(tensors={}, graph_name="pytorch_staged")
@@ -316,11 +346,46 @@ def test_staged_path_used_when_available(
     assert result.host_timings == [0.5, 0.5]
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
-    assert result.metadata.pytorch_sdpa_backend == "aotriton"
+    assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
+    assert result.metadata.pytorch_sdpa_category_executed == "flash"
     # Staged timer built from the torch graph-stream pointer.
     assert created_streams == [0xCAFE]
     # One untimed priming execute, then one execute per measured iteration.
     assert executed == ["execute", "execute", "execute"]
+    assert scopes == ["enter", "exit"] * 3
+
+
+def test_unavailable_backend_has_no_successful_fallback(
+    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = pytorch_executor_module
+    executions = []
+    error = module.pytorch_ops.PyTorchSdpaBackendUnavailableError(
+        "Requested PyTorch SDPA backend 'math' is unavailable; no fallback is used."
+    )
+
+    class UnavailableCompiled:
+        def execute(self, tensors):
+            executions.append("execute")
+            raise error
+
+    monkeypatch.setattr(
+        module.pytorch_ops,
+        "compile_graph",
+        lambda graph_json: UnavailableCompiled(),
+    )
+    executor = _make_executor(
+        module,
+        collect_kernel_timing=False,
+        pytorch_sdpa_backend="math",
+    )
+    executor.prepare()
+
+    with pytest.raises(module.pytorch_ops.PyTorchSdpaBackendUnavailableError) as caught:
+        executor.benchmark(tensors={}, graph_name="unavailable")
+
+    assert caught.value is error
+    assert executions == ["execute"]
 
 
 def test_cuda_build_skips_staging_even_if_bindings_available(
@@ -354,6 +419,18 @@ def test_warmup_and_execute_once_use_stream_sync(
     pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = pytorch_executor_module
+    scopes = []
+
+    @contextmanager
+    def record_scope(state):
+        assert state.selection.value == "default"
+        scopes.append("enter")
+        try:
+            yield
+        finally:
+            scopes.append("exit")
+
+    monkeypatch.setattr(module.pytorch_ops, "use_pytorch_sdpa_backend", record_scope)
     executed = []
     monkeypatch.setattr(
         module.pytorch_ops,
@@ -369,6 +446,7 @@ def test_warmup_and_execute_once_use_stream_sync(
     assert executed == ["execute", "execute", "execute"]
     assert FakeHipTimer.sync_calls == 2
     assert module.torch.cuda.stream_entries == [0xCAFE, 0xCAFE]
+    assert scopes == ["enter", "exit"] * 3
 
 
 @pytest.fixture

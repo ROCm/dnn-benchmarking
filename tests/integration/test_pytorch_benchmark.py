@@ -285,8 +285,8 @@ class TestPyTorchCudaExecutor:
 
         assert len(result.host_timings) == 1
 
-    def test_aotriton_sdpa_backend_reports_timing_and_metadata(self):
-        """ROCm AOTriton SDPA timing is strict and retained in result metadata."""
+    def test_aotriton_preferred_sdpa_reports_category_and_metadata(self):
+        """AOTriton preference reports the public Flash category after success."""
         from dnn_benchmarking.common import torch_support
 
         skip_if_no_gpu_torch()
@@ -301,7 +301,7 @@ class TestPyTorchCudaExecutor:
             graph_path=graph_path,
             warmup_iters=1,
             benchmark_iters=1,
-            pytorch_sdpa_backend="aotriton",
+            pytorch_sdpa_backend="aotriton_preferred",
         )
 
         executor = PyTorchCudaExecutor(graph_json, config)
@@ -314,13 +314,14 @@ class TestPyTorchCudaExecutor:
             executor.warmup(tensors)
             result = executor.benchmark(
                 tensors,
-                graph_name="aotriton_sdpa_backend",
+                graph_name="aotriton_preferred_sdpa_backend",
             )
 
         assert result.host_timings and result.host_timings[0] > 0
         assert result.kernel_timings and result.kernel_timings[0] > 0
         assert result.metadata is not None
-        assert result.metadata.pytorch_sdpa_backend == "aotriton"
+        assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
+        assert result.metadata.pytorch_sdpa_category_executed == "flash"
 
     def test_json_export(self, sample_conv_graph, tmp_path):
         """Test that benchmark results can be exported to JSON."""

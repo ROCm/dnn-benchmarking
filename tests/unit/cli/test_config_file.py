@@ -112,11 +112,14 @@ def test_pytorch_sdpa_backend_config_and_cli_precedence(tmp_path: Path) -> None:
         """
 version = 1
 graphs = ["from_config.json"]
-pytorch_sdpa_backend = "flash"
+pytorch_sdpa_backend = "aotriton_preferred"
 """,
     )
 
-    assert _parse_with_config(["--config", str(config)]).pytorch_sdpa_backend == "flash"
+    assert (
+        _parse_with_config(["--config", str(config)]).pytorch_sdpa_backend
+        == "aotriton_preferred"
+    )
     assert (
         _parse_with_config(
             [
@@ -274,6 +277,7 @@ id = 1
         ("emit_trace", '"json"'),
         ("pmc", '"everything"'),
         ("pytorch_sdpa_backend", '"invalid"'),
+        ("pytorch_sdpa_backend", '"aotriton"'),
     ],
 )
 def test_invalid_config_choice_values_are_rejected(

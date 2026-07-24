@@ -435,6 +435,7 @@ def _run_timed_pytorch_row(
         engine_id=0,
         status="skipped",
         role=role,
+        pytorch_sdpa_backend_requested=config.pytorch_sdpa_backend.value,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     backend_unavailable = False
@@ -482,7 +483,12 @@ def _run_timed_pytorch_row(
                         bench_result.kernel_timings
                     )
                 assert bench_result.metadata is not None
-                result.pytorch_sdpa_backend = bench_result.metadata.pytorch_sdpa_backend
+                result.pytorch_sdpa_backend_requested = (
+                    bench_result.metadata.pytorch_sdpa_backend_requested
+                )
+                result.pytorch_sdpa_category_executed = (
+                    bench_result.metadata.pytorch_sdpa_category_executed or None
+                )
 
                 if config.metrics.basic_enabled:
                     _collect_basic_metrics_post_loop(
@@ -832,6 +838,7 @@ def run_graph_pytorch_backend(
             provider=provider,
             engine_id=0,
             status="skipped",
+            pytorch_sdpa_backend_requested=config.pytorch_sdpa_backend.value,
             skip_reason=msg,
             correctness=CorrectnessResult.failed(
                 rtol=rtol, atol=atol, error_message=msg
@@ -859,6 +866,7 @@ def run_graph_pytorch_backend(
                     provider=provider,
                     engine_id=0,
                     status="error",
+                    pytorch_sdpa_backend_requested=config.pytorch_sdpa_backend.value,
                     error_message=msg,
                     correctness=CorrectnessResult.failed(
                         rtol=rtol, atol=atol, error_message=msg

@@ -227,15 +227,17 @@ dnn-benchmark --graph ./graphs/sample_conv_fwd.json --backend pytorch
 # A whole suite through PyTorch, with JSON output
 dnn-benchmark --graph 'graphs/*.json' --backend pytorch -o pytorch_results.json
 
-# Force ROCm AOTriton SDPA and record the selection in JSON
-dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton -o pytorch_aotriton.json
+# Prefer ROCm AOTriton within Flash Attention and record the request in JSON
+dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton_preferred -o pytorch_aotriton_preferred.json
 ```
 
 `--pytorch-sdpa-backend default` preserves normal PyTorch SDPA dispatch.
-`aotriton`, `flash`, `math`, `efficient`, `cudnn`, and `overrideable` force the
-named backend. Every selected non-default backend is strict: if it is
-unavailable or ineligible for an input, the benchmark errors instead of falling
-back to normal dispatch. `aotriton` is ROCm-only.
+`aotriton_preferred`, `flash`, `math`, `efficient`, `cudnn`, and `overrideable`
+select public PyTorch SDPA categories. Every selected non-default category is
+strict: if that category is unavailable or ineligible for an input, the
+benchmark errors instead of falling back to normal dispatch.
+`aotriton_preferred` is ROCm-only: it selects the Flash Attention category and
+prefers AOTriton, but PyTorch may use another ROCm Flash implementation.
 
 For `--validate pytorch`, any CPU reference fallback retains the same selection.
 If that backend cannot execute the CPU input, validation is reported unavailable;

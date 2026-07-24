@@ -36,7 +36,7 @@ class PyTorchSdpaBackendName(str, Enum):
     """Supported PyTorch scaled-dot-product-attention backend selections."""
 
     DEFAULT = "default"
-    AOTRITON = "aotriton"
+    AOTRITON_PREFERRED = "aotriton_preferred"
     FLASH = "flash"
     MATH = "math"
     EFFICIENT = "efficient"

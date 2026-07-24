@@ -88,7 +88,8 @@ class TestBenchmarkMetadata:
         assert metadata.engine_id == 0
         assert metadata.timing_backend == ""
         # hostname and timestamp are auto-generated
-        assert metadata.pytorch_sdpa_backend == ""
+        assert metadata.pytorch_sdpa_backend_requested is None
+        assert metadata.pytorch_sdpa_category_executed is None
         assert metadata.hostname != ""
         assert metadata.timestamp != ""
 
@@ -165,16 +166,44 @@ class TestBenchmarkResult:
         assert data["metadata"]["timing_backend"] == "hip"
         assert data["metadata"]["benchmark_iters"] == 100
 
-    def test_sdpa_backend_round_trips_through_result_json(self) -> None:
+    def test_sdpa_selection_round_trips_through_result_json(self) -> None:
         result = BenchmarkResult(
             host_timings=[1.0],
-            metadata=BenchmarkMetadata(pytorch_sdpa_backend="aotriton"),
+            metadata=BenchmarkMetadata(
+                pytorch_sdpa_backend_requested="aotriton_preferred",
+                pytorch_sdpa_category_executed="flash",
+            ),
         )
 
-        loaded = BenchmarkResult.from_dict(result.to_dict())
+        serialized = result.to_dict()
+        loaded = BenchmarkResult.from_dict(serialized)
 
+        assert serialized["metadata"]["pytorch_sdpa_backend_requested"] == (
+            "aotriton_preferred"
+        )
+        assert serialized["metadata"]["pytorch_sdpa_category_executed"] == ("flash")
         assert loaded.metadata is not None
-        assert loaded.metadata.pytorch_sdpa_backend == "aotriton"
+        assert loaded.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
+        assert loaded.metadata.pytorch_sdpa_category_executed == "flash"
+
+    def test_sdpa_selection_nulls_round_trip_through_result_json(self) -> None:
+        result = BenchmarkResult(
+            host_timings=[1.0],
+            metadata=BenchmarkMetadata(
+                pytorch_sdpa_backend_requested="aotriton_preferred"
+            ),
+        )
+
+        serialized = result.to_dict()
+        loaded = BenchmarkResult.from_dict(serialized)
+
+        assert serialized["metadata"]["pytorch_sdpa_backend_requested"] == (
+            "aotriton_preferred"
+        )
+        assert serialized["metadata"]["pytorch_sdpa_category_executed"] is None
+        assert loaded.metadata is not None
+        assert loaded.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
+        assert loaded.metadata.pytorch_sdpa_category_executed is None
 
     def test_to_json(self) -> None:
         """Test to_json produces valid JSON."""

@@ -123,11 +123,22 @@ class TestParserGlobAndFilters:
         args = create_parser().parse_args(["--graph", "g.json"])
         assert args.pytorch_sdpa_backend == "default"
 
-    def test_pytorch_sdpa_backend_accepts_explicit_selection(self) -> None:
+    def test_pytorch_sdpa_backend_accepts_aotriton_preference(self) -> None:
         args = create_parser().parse_args(
-            ["--graph", "g.json", "--pytorch-sdpa-backend", "aotriton"]
+            ["--graph", "g.json", "--pytorch-sdpa-backend", "aotriton_preferred"]
         )
-        assert args.pytorch_sdpa_backend == "aotriton"
+        assert args.pytorch_sdpa_backend == "aotriton_preferred"
+
+    def test_pytorch_sdpa_backend_rejects_removed_aotriton_value(self) -> None:
+        with pytest.raises(SystemExit):
+            create_parser().parse_args(
+                ["--graph", "g.json", "--pytorch-sdpa-backend", "aotriton"]
+            )
+
+    def test_pytorch_sdpa_backend_help_describes_rocm_preference(self) -> None:
+        help_text = create_parser().format_help()
+        assert "prefers AOTriton" in help_text
+        assert "may use another ROCm Flash implementation" in help_text
 
 
 class TestMainRouting:
@@ -805,7 +816,13 @@ class TestPyTorchSdpaBackendCli:
 
         mock_benchmark.return_value = 0
         args = create_parser().parse_args(
-            ["--graph", "g.json", *flow, "--pytorch-sdpa-backend", "aotriton"]
+            [
+                "--graph",
+                "g.json",
+                *flow,
+                "--pytorch-sdpa-backend",
+                "aotriton_preferred",
+            ]
         )
 
         assert (
@@ -818,7 +835,7 @@ class TestPyTorchSdpaBackendCli:
         )
         assert (
             mock_benchmark.call_args.kwargs["config"].pytorch_sdpa_backend.value
-            == "aotriton"
+            == "aotriton_preferred"
         )
 
     @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
@@ -830,7 +847,12 @@ class TestPyTorchSdpaBackendCli:
         mock_benchmark.return_value = 0
         reporter = MagicMock(spec=Reporter)
         args = create_parser().parse_args(
-            ["--graph", "g.json", "--pytorch-sdpa-backend", "aotriton"]
+            [
+                "--graph",
+                "g.json",
+                "--pytorch-sdpa-backend",
+                "aotriton_preferred",
+            ]
         )
 
         assert run_suite_cli(args, graph_paths=[Path("g.json")], reporter=reporter) == 0
@@ -909,7 +931,12 @@ class TestBackendEngineRouting:
             assert (
                 self._run_main_with_args(
                     graph,
-                    ["--validate", "pytorch", "--pytorch-sdpa-backend", "aotriton"],
+                    [
+                        "--validate",
+                        "pytorch",
+                        "--pytorch-sdpa-backend",
+                        "aotriton_preferred",
+                    ],
                 )
                 == 1
             )

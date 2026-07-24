@@ -5,7 +5,8 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator, Optional
+from threading import RLock
+from typing import Iterator, Optional, Tuple
 
 import torch
 
@@ -18,16 +19,22 @@ class PyTorchSdpaBackendUnavailableError(RuntimeError):
 
 
 class PyTorchSdpaBackendState:
-    """The PyTorch SDPA backend selection active for one execution scope."""
+    """The requested selection and successfully executed public category."""
 
     def __init__(self, selection: PyTorchSdpaBackendName) -> None:
         self.selection = PyTorchSdpaBackendName(selection)
+        self.executed_category: Optional[str] = None
 
 
 _ACTIVE_SDPA_BACKEND: ContextVar[Optional[PyTorchSdpaBackendState]] = ContextVar(
     "active_pytorch_sdpa_backend",
     default=None,
 )
+
+# torch.nn.attention.sdpa_kernel and preferred_rocm_fa_library mutate
+# process-wide PyTorch state. Serialize every SDPA call so a default call cannot
+# overlap and observe another thread's temporary selected-backend flags.
+_SDPA_SELECTION_LOCK = RLock()
 
 
 @contextmanager
@@ -52,14 +59,16 @@ def _unavailable_error(
     return PyTorchSdpaBackendUnavailableError(f"{prefix} {reason}")
 
 
-def _selected_sdp_backend(selection: PyTorchSdpaBackendName):
-    """Resolve a strict public PyTorch SDPA backend selection."""
+def _selected_sdp_backend(
+    selection: PyTorchSdpaBackendName,
+) -> Tuple[object, object, str]:
+    """Resolve one strict public PyTorch SDPA category."""
     if (
-        selection is PyTorchSdpaBackendName.AOTRITON
+        selection is PyTorchSdpaBackendName.AOTRITON_PREFERRED
         and not torch_support.is_rocm_build()
     ):
         raise _unavailable_error(
-            selection, "AOTriton is available only in ROCm builds."
+            selection, "The AOTriton preference is available only in ROCm builds."
         )
 
     try:
@@ -77,24 +86,69 @@ def _selected_sdp_backend(selection: PyTorchSdpaBackendName):
             "PyTorch does not expose the public sdpa_kernel API.",
         )
 
-    # AOTriton uses PyTorch's FLASH_ATTENTION selector on ROCm. The
-    # `aotriton` choice adds the ROCm-only eligibility check; `flash` is generic.
     member_names = {
-        PyTorchSdpaBackendName.AOTRITON: "FLASH_ATTENTION",
-        PyTorchSdpaBackendName.FLASH: "FLASH_ATTENTION",
-        PyTorchSdpaBackendName.MATH: "MATH",
-        PyTorchSdpaBackendName.EFFICIENT: "EFFICIENT_ATTENTION",
-        PyTorchSdpaBackendName.CUDNN: "CUDNN_ATTENTION",
-        PyTorchSdpaBackendName.OVERRIDEABLE: "OVERRIDEABLE",
+        PyTorchSdpaBackendName.AOTRITON_PREFERRED: (
+            "FLASH_ATTENTION",
+            "flash",
+        ),
+        PyTorchSdpaBackendName.FLASH: ("FLASH_ATTENTION", "flash"),
+        PyTorchSdpaBackendName.MATH: ("MATH", "math"),
+        PyTorchSdpaBackendName.EFFICIENT: (
+            "EFFICIENT_ATTENTION",
+            "efficient",
+        ),
+        PyTorchSdpaBackendName.CUDNN: ("CUDNN_ATTENTION", "cudnn"),
+        PyTorchSdpaBackendName.OVERRIDEABLE: (
+            "OVERRIDEABLE",
+            "overrideable",
+        ),
     }
-    member_name = member_names[selection]
+    member_name, category = member_names[selection]
     backend = getattr(sdp_backend, member_name, None)
     if backend is None:
         raise _unavailable_error(
             selection,
             f"PyTorch does not expose SDPBackend.{member_name}.",
         )
-    return sdpa_kernel, backend
+    return sdpa_kernel, backend, category
+
+
+@contextmanager
+def _prefer_aotriton(
+    selection: PyTorchSdpaBackendName,
+) -> Iterator[None]:
+    """Temporarily prefer AOTriton without claiming it was observed."""
+    if selection is not PyTorchSdpaBackendName.AOTRITON_PREFERRED:
+        yield
+        return
+
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    preference = getattr(cuda_backends, "preferred_rocm_fa_library", None)
+    if not callable(preference):
+        raise _unavailable_error(
+            selection,
+            "PyTorch does not expose preferred_rocm_fa_library.",
+        )
+
+    try:
+        previous = preference()
+        preference("aotriton")
+    except (RuntimeError, ValueError) as error:
+        raise _unavailable_error(
+            selection,
+            f"PyTorch could not set the AOTriton preference: {error}",
+        ) from error
+
+    try:
+        yield
+    finally:
+        preference(previous)
+
+
+def _is_backend_unavailable_error(error: RuntimeError) -> bool:
+    """Recognize PyTorch's forced-dispatch no-backend diagnostics."""
+    message = str(error).lower()
+    return "no available kernel" in message or "no viable backend" in message
 
 
 def execute_selected_sdpa(
@@ -110,19 +164,7 @@ def execute_selected_sdpa(
     """Execute SDPA with the current strict selection, if one is active."""
     state = _ACTIVE_SDPA_BACKEND.get()
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
-        return torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=scale,
-        )
-
-    sdpa_kernel, backend = _selected_sdp_backend(state.selection)
-    try:
-        with sdpa_kernel(backend):
+        with _SDPA_SELECTION_LOCK:
             return torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,
@@ -132,5 +174,23 @@ def execute_selected_sdpa(
                 is_causal=is_causal,
                 scale=scale,
             )
-    except RuntimeError as error:
-        raise _unavailable_error(state.selection, str(error)) from error
+
+    sdpa_kernel, backend, category = _selected_sdp_backend(state.selection)
+    with _SDPA_SELECTION_LOCK:
+        try:
+            with _prefer_aotriton(state.selection), sdpa_kernel(backend):
+                result = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                )
+        except RuntimeError as error:
+            if _is_backend_unavailable_error(error):
+                raise _unavailable_error(state.selection, str(error)) from error
+            raise
+        state.executed_category = category
+        return result

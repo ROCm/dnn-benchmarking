@@ -947,7 +947,7 @@ class TestCorrectnessChecking:
         mock_timed_reference,
     ):
         reason = (
-            "Requested PyTorch SDPA backend 'aotriton' is unavailable; "
+            "Requested PyTorch SDPA backend 'aotriton_preferred' is unavailable; "
             "no fallback is used."
         )
         ref_provider = MagicMock()
@@ -973,7 +973,7 @@ class TestCorrectnessChecking:
             tensor_infos=[_make_tensor_info(1)],
             config=_make_config(
                 validation=ValidationConfig(provider="pytorch"),
-                pytorch_sdpa_backend="aotriton",
+                pytorch_sdpa_backend="aotriton_preferred",
             ),
             handle=MagicMock(),
         )
@@ -1034,7 +1034,7 @@ class TestCorrectnessChecking:
                     scale=None,
                 )
 
-        dispatch_error = RuntimeError("selected backend cannot run this CPU input")
+        dispatch_error = RuntimeError("No viable backend for this CPU input")
         sdpa = MagicMock(side_effect=dispatch_error)
         with (
             patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
@@ -1073,7 +1073,10 @@ class TestCorrectnessChecking:
         bench_result.kernel_timings = None
         bench_result.has_kernel_timings = False
         executor.benchmark.return_value = bench_result
-        bench_result.metadata = BenchmarkMetadata(pytorch_sdpa_backend="efficient")
+        bench_result.metadata = BenchmarkMetadata(
+            pytorch_sdpa_backend_requested="efficient",
+            pytorch_sdpa_category_executed="efficient",
+        )
         mock_pytorch_executor_cls.return_value = executor
 
         buffer_manager = _make_bm_mock()
@@ -1101,7 +1104,8 @@ class TestCorrectnessChecking:
         assert result.result.host_stats is not None
         assert result.result.gpu_kernel_stats is None
         assert result.result.status == "success"
-        assert result.result.pytorch_sdpa_backend == "efficient"
+        assert result.result.pytorch_sdpa_backend_requested == "efficient"
+        assert result.result.pytorch_sdpa_category_executed == "efficient"
         assert (
             mock_pytorch_executor_cls.call_args.args[1].pytorch_sdpa_backend.value
             == "efficient"
@@ -1632,7 +1636,10 @@ class TestTimedPytorchRowEngineRole:
             graph_json=_make_graph_json(),
             graph_name="test_graph",
             tensor_infos=[],
-            config=_make_config(metrics=MetricsConfig(tier="off")),
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="flash",
+            ),
             input_data={},
             analytical_flops=None,
             analytical_flops_partial=False,
@@ -1642,6 +1649,8 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "error"
         assert "no GPU" in (row.result.error_message or "")
+        assert row.result.pytorch_sdpa_backend_requested == "flash"
+        assert row.result.pytorch_sdpa_category_executed is None
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_reference_role_failure_is_skip(self, mock_pytorch_executor_cls):
@@ -1652,7 +1661,10 @@ class TestTimedPytorchRowEngineRole:
             graph_json=_make_graph_json(),
             graph_name="test_graph",
             tensor_infos=[],
-            config=_make_config(metrics=MetricsConfig(tier="off")),
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="efficient",
+            ),
             input_data={},
             analytical_flops=None,
             analytical_flops_partial=False,
@@ -1662,6 +1674,8 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "skipped"
         assert "no GPU" in (row.result.skip_reason or "")
+        assert row.result.pytorch_sdpa_backend_requested == "efficient"
+        assert row.result.pytorch_sdpa_category_executed is None
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_reference_role_strict_backend_unavailable_is_marked_for_no_fallback(
@@ -1672,7 +1686,7 @@ class TestTimedPytorchRowEngineRole:
         )
 
         reason = (
-            "Requested PyTorch SDPA backend 'aotriton' is unavailable; "
+            "Requested PyTorch SDPA backend 'aotriton_preferred' is unavailable; "
             "no fallback is used."
         )
         mock_pytorch_executor_cls.side_effect = PyTorchSdpaBackendUnavailableError(
@@ -1686,7 +1700,7 @@ class TestTimedPytorchRowEngineRole:
             tensor_infos=[],
             config=_make_config(
                 metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="aotriton",
+                pytorch_sdpa_backend="aotriton_preferred",
             ),
             input_data={},
             analytical_flops=None,
@@ -1697,4 +1711,6 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "skipped"
         assert row.result.skip_reason == reason
+        assert row.result.pytorch_sdpa_backend_requested == "aotriton_preferred"
+        assert row.result.pytorch_sdpa_category_executed is None
         assert row.backend_unavailable is True
