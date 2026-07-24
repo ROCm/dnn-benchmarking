@@ -5,14 +5,32 @@
 
 import os
 import sys
+import tempfile
 
 from pathlib import Path
+
 
 # Redirect ROCm/tool caches away from the network home directory before any
 # ROCm library is imported. MIOpen, comgr, pip, and torch all default to
 # ~/.cache/ or ~/.miopen/, which is a network filesystem on AMD dev machines.
-# DNN_BENCH_WORKSPACE is set by setup_env.py; fall back to /tmp/dnn-bench-cache.
-_CACHE_BASE = Path(os.environ.get("DNN_BENCH_WORKSPACE", "/tmp/dnn-bench-cache"))
+# DNN_BENCH_WORKSPACE is set by setup_env.py; otherwise use a private,
+# process-scoped temporary directory rather than the network home directory.
+def _create_cache_base(
+    workspace: str | None,
+) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    """Return the cache base and the fallback directory object, if allocated."""
+    if workspace:
+        return Path(workspace), None
+
+    temporary_directory = tempfile.TemporaryDirectory(prefix="dnn-bench-cache-")
+    return Path(temporary_directory.name), temporary_directory
+
+
+# Retaining this object keeps the fallback directory alive; its finalizer
+# removes it when the CLI process exits.
+_CACHE_BASE, _TEMPORARY_CACHE_DIRECTORY_LIFETIME = _create_cache_base(
+    os.environ.get("DNN_BENCH_WORKSPACE")
+)
 _LOCAL_CACHE_DEFAULTS = {
     "XDG_CACHE_HOME": _CACHE_BASE / "cache",
     "MIOPEN_USER_DB_PATH": _CACHE_BASE / "miopen_cache",
