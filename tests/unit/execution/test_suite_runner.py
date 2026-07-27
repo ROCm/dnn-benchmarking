@@ -1105,9 +1105,7 @@ class TestCorrectnessChecking:
         bench_result.kernel_timings = None
         bench_result.has_kernel_timings = False
         executor.benchmark.return_value = bench_result
-        bench_result.metadata = BenchmarkMetadata(
-            pytorch_sdpa_backend_requested="efficient",
-        )
+        bench_result.metadata = BenchmarkMetadata()
         mock_pytorch_executor_cls.return_value = executor
 
         buffer_manager = _make_bm_mock()
@@ -1135,7 +1133,6 @@ class TestCorrectnessChecking:
         assert result.result.host_stats is not None
         assert result.result.gpu_kernel_stats is None
         assert result.result.status == "success"
-        assert result.result.pytorch_sdpa_backend_requested == "efficient"
         assert (
             mock_pytorch_executor_cls.call_args.args[1].pytorch_sdpa_backend.value
             == "efficient"
@@ -1679,7 +1676,6 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "error"
         assert "no GPU" in (row.result.error_message or "")
-        assert row.result.pytorch_sdpa_backend_requested == "flash"
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_reference_role_strict_failure_is_error(self, mock_pytorch_executor_cls):
@@ -1703,7 +1699,6 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "error"
         assert "no GPU" in (row.result.error_message or "")
-        assert row.result.pytorch_sdpa_backend_requested == "efficient"
 
     @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
@@ -1717,9 +1712,7 @@ class TestTimedPytorchRowEngineRole:
         executor.benchmark.return_value = BenchmarkResult(
             host_timings=[1.0],
             kernel_timings=[0.5],
-            metadata=BenchmarkMetadata(
-                pytorch_sdpa_backend_requested="math",
-            ),
+            metadata=BenchmarkMetadata(),
         )
         executor.execute_once.side_effect = RuntimeError("output pass failed")
         mock_pytorch_executor_cls.return_value = executor
@@ -1742,7 +1735,6 @@ class TestTimedPytorchRowEngineRole:
         )
 
         assert row.result.status == "error"
-        assert row.result.pytorch_sdpa_backend_requested == "math"
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_reference_role_strict_backend_unavailable_is_marked_for_no_fallback(
@@ -1778,4 +1770,3 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "error"
         assert row.result.error_message == reason
-        assert row.result.pytorch_sdpa_backend_requested == "aotriton_preferred"

@@ -605,7 +605,7 @@ class TestPyTorchBackendCLIIntegration:
                 # "auto" timing yields HIP events on ROCm and torch.cuda
                 # events on CUDA, so kernel stats exist on both.
                 assert row["gpu_kernel_stats"], row
-                assert row["pytorch_sdpa_backend_requested"] == "default"
+                assert "pytorch_sdpa_backend_requested" not in row
 
     def test_nondefault_pytorch_selection_errors_without_native_sdpa(
         self, project_root: Path, tmp_path: Path
@@ -645,7 +645,7 @@ class TestPyTorchBackendCLIIntegration:
         for graph in data["graphs"]:
             row = graph["results"][0]
             assert row["status"] == "error"
-            assert row["pytorch_sdpa_backend_requested"] == "math"
             assert "native forward SDPA call" in row["error_message"]
+            assert "pytorch_sdpa_backend_requested" not in row
             assert "host_stats" not in row
             assert "gpu_kernel_stats" not in row

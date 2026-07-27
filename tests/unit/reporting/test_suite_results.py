@@ -201,7 +201,7 @@ class TestProviderEngineResult:
         assert "comparison_to_baseline" not in d
 
     @pytest.mark.parametrize("status", ["success", "skipped", "error"])
-    def test_pytorch_sdpa_selection_serializes_for_every_status(self, status):
+    def test_rows_do_not_repeat_suite_sdpa_selection(self, status):
         kwargs = {}
         if status == "skipped":
             kwargs["skip_reason"] = "requested category unavailable"
@@ -211,20 +211,10 @@ class TestProviderEngineResult:
             provider="pytorch",
             engine_id=0,
             status=status,
-            pytorch_sdpa_backend_requested="aotriton_preferred",
             **kwargs,
         )
 
-        result = pytorch.to_dict()
-
-        assert result["pytorch_sdpa_backend_requested"] == "aotriton_preferred"
-
-    def test_legacy_hipdnn_row_omits_sdpa_selection_fields(self):
-        legacy = ProviderEngineResult(provider="miopen", engine_id=1, status="success")
-
-        result = legacy.to_dict()
-
-        assert "pytorch_sdpa_backend_requested" not in result
+        assert "pytorch_sdpa_backend_requested" not in pytorch.to_dict()
 
     def test_warnings_serialize_for_reference_timing_rows(self):
         pe = ProviderEngineResult(

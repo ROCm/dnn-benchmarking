@@ -435,8 +435,6 @@ def _run_timed_pytorch_row(
         provider=ReferenceProviderName.PYTORCH.value,
         engine_id=0,
         status="skipped",
-        role=role,
-        pytorch_sdpa_backend_requested=config.pytorch_sdpa_backend.value,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
@@ -845,7 +843,6 @@ def run_graph_pytorch_backend(
             provider=provider,
             engine_id=0,
             status="error" if strict_selection else "skipped",
-            pytorch_sdpa_backend_requested=config.pytorch_sdpa_backend.value,
             error_message=msg if strict_selection else None,
             skip_reason=None if strict_selection else msg,
             correctness=CorrectnessResult.failed(
@@ -874,7 +871,6 @@ def run_graph_pytorch_backend(
                     provider=provider,
                     engine_id=0,
                     status="error",
-                    pytorch_sdpa_backend_requested=config.pytorch_sdpa_backend.value,
                     error_message=msg,
                     correctness=CorrectnessResult.failed(
                         rtol=rtol, atol=atol, error_message=msg

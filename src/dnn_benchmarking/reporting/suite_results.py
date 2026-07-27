@@ -104,8 +104,6 @@ class ProviderEngineResult:
         role: ``engine`` for hipDNN engine rows, ``reference`` for timed
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
-        pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend for
-            timed PyTorch rows; None for non-PyTorch rows.
         cpu_build_time_ms: CPU graph-build time.
         gpu_kernel_stats: GPU kernel timing statistics.
         host_stats: Host-side submission timing statistics.
@@ -161,7 +159,6 @@ class ProviderEngineResult:
     engine_id: int
     status: Literal["success", "error", "skipped"]
     role: Literal["engine", "reference"] = "engine"
-    pytorch_sdpa_backend_requested: Optional[str] = None
     plugin_path: Optional[str] = None
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
@@ -214,8 +211,6 @@ class ProviderEngineResult:
         }
         if self.role != "engine":
             d["role"] = self.role
-        if self.pytorch_sdpa_backend_requested is not None:
-            d["pytorch_sdpa_backend_requested"] = self.pytorch_sdpa_backend_requested
         if self.plugin_path is not None:
             d["plugin_path"] = self.plugin_path
         if self.warnings:
