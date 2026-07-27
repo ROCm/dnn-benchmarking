@@ -1583,6 +1583,7 @@ class TestPyTorchSdpaBackendSelection:
                 torch.backends.cuda,
                 "preferred_rocm_fa_library",
                 side_effect=fake_preferred_rocm_fa_library,
+                create=True,
             ),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(state),
@@ -1623,6 +1624,7 @@ class TestPyTorchSdpaBackendSelection:
                 torch.backends.cuda,
                 "preferred_rocm_fa_library",
                 side_effect=fake_preference,
+                create=True,
             ),
             patch.object(
                 torch.nn.functional,
@@ -1646,7 +1648,9 @@ class TestPyTorchSdpaBackendSelection:
         with (
             patch.object(attention, "sdpa_kernel") as sdpa_kernel,
             patch.object(
-                torch.backends.cuda, "preferred_rocm_fa_library"
+                torch.backends.cuda,
+                "preferred_rocm_fa_library",
+                create=True,
             ) as preferred_library,
             pytorch_ops.use_pytorch_sdpa_backend(state),
         ):
@@ -1710,6 +1714,7 @@ class TestPyTorchSdpaBackendSelection:
                 torch.backends.cuda,
                 "preferred_rocm_fa_library",
                 None,
+                create=True,
             ),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(state),
@@ -1740,6 +1745,7 @@ class TestPyTorchSdpaBackendSelection:
                 torch.backends.cuda,
                 "preferred_rocm_fa_library",
                 preference,
+                create=True,
             ),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(state),
