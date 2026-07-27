@@ -111,6 +111,9 @@ def _run_suite_graphs_after_startup(
         pytorch_sdpa_backend_requested=(
             config.pytorch_sdpa_backend.value if pytorch_selected else None
         ),
+        pytorch_rocm_fa_library_requested=(
+            config.pytorch_rocm_fa_library if pytorch_selected else None
+        ),
     )
 
     reporter.print_suite_summary(suite_result.metadata)
@@ -236,12 +239,15 @@ def run_suite_cli(
                 "--roofline); the directory will not be written to"
             )
         if (
-            args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value
+            (
+                args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value
+                or args.pytorch_rocm_fa_library is not None
+            )
             and backend is not ExecutionBackendName.PYTORCH
             and validation.provider is not ReferenceProviderName.PYTORCH
         ):
             reporter.print_warning(
-                "--pytorch-sdpa-backend is ignored unless --backend pytorch or "
+                "PyTorch SDPA options are ignored unless --backend pytorch or "
                 "--validate pytorch is selected"
             )
         plugin_paths = None
@@ -258,6 +264,7 @@ def run_suite_cli(
             plugin_paths=plugin_paths,
             backend=backend,
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
+            pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
         )
     except ValueError as e:
         reporter.print_error(f"Suite configuration error: {e}")

@@ -36,7 +36,6 @@ class PyTorchSdpaBackendName(str, Enum):
     """Supported PyTorch scaled-dot-product-attention backend selections."""
 
     DEFAULT = "default"
-    AOTRITON_PREFERRED = "aotriton_preferred"
     FLASH = "flash"
     MATH = "math"
     EFFICIENT = "efficient"
@@ -47,6 +46,29 @@ class PyTorchSdpaBackendName(str, Enum):
 PYTORCH_SDPA_BACKEND_CHOICES = frozenset(
     backend.value for backend in PyTorchSdpaBackendName
 )
+
+
+def _normalize_pytorch_sdpa_settings(
+    selection: PyTorchSdpaBackendName | str,
+    rocm_fa_library: Optional[str],
+) -> tuple[PyTorchSdpaBackendName, Optional[str]]:
+    """Normalize and validate the strict SDPA category and ROCm preference."""
+    try:
+        selection = PyTorchSdpaBackendName(selection)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid PyTorch SDPA backend: '{selection}'. "
+            f"Valid options: {PYTORCH_SDPA_BACKEND_CHOICES}"
+        ) from e
+
+    if rocm_fa_library is not None and not isinstance(rocm_fa_library, str):
+        raise ValueError("pytorch_rocm_fa_library must be a string when set")
+    if rocm_fa_library is not None and selection is not PyTorchSdpaBackendName.FLASH:
+        raise ValueError(
+            "pytorch_rocm_fa_library requires pytorch_sdpa_backend='flash'"
+        )
+    return selection, rocm_fa_library
+
 
 EXECUTION_BACKEND_CHOICES = frozenset(backend.value for backend in ExecutionBackendName)
 
@@ -65,7 +87,9 @@ class BenchmarkConfig:
         warmup_iters: Number of warmup iterations before benchmarking.
         benchmark_iters: Number of benchmark iterations for timing.
         engine_id: Engine ID to use (1 = MIOpen).
-        pytorch_sdpa_backend: PyTorch SDPA backend selection.
+        pytorch_sdpa_backend: Strict PyTorch SDPA category selection.
+        pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
+            preference forwarded to PyTorch with the Flash category.
     """
 
     graph_path: Path
@@ -73,6 +97,7 @@ class BenchmarkConfig:
     benchmark_iters: int = 100
     engine_id: int = 1
     pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
+    pytorch_rocm_fa_library: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate configuration values.
@@ -84,15 +109,13 @@ class BenchmarkConfig:
         if isinstance(self.graph_path, str):
             self.graph_path = Path(self.graph_path)
 
-        try:
-            self.pytorch_sdpa_backend = PyTorchSdpaBackendName(
-                self.pytorch_sdpa_backend
-            )
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid PyTorch SDPA backend: '{self.pytorch_sdpa_backend}'. "
-                f"Valid options: {PYTORCH_SDPA_BACKEND_CHOICES}"
-            ) from e
+        (
+            self.pytorch_sdpa_backend,
+            self.pytorch_rocm_fa_library,
+        ) = _normalize_pytorch_sdpa_settings(
+            self.pytorch_sdpa_backend,
+            self.pytorch_rocm_fa_library,
+        )
 
         if self.warmup_iters < 0:
             raise ValueError("warmup_iters must be non-negative")
@@ -326,8 +349,10 @@ class SuiteConfig:
         backend: Execution backend (``hipdnn`` runs discovered engine plugins,
             ``pytorch`` runs the graph through the PyTorch executor as a single
             engine row per graph).
-        pytorch_sdpa_backend: PyTorch SDPA backend selection for PyTorch
-            timing or reference execution.
+        pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
+            PyTorch timing or reference execution.
+        pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
+            preference forwarded to PyTorch with the Flash category.
     """
 
     warmup_iters: int = 10
@@ -340,6 +365,7 @@ class SuiteConfig:
     plugin_paths: Optional[List[Path]] = None
     backend: ExecutionBackendName = ExecutionBackendName.HIPDNN
     pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
+    pytorch_rocm_fa_library: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -372,15 +398,13 @@ class SuiteConfig:
                 f"Invalid backend: '{self.backend}'. "
                 f"Valid options: {EXECUTION_BACKEND_CHOICES}"
             ) from e
-        try:
-            self.pytorch_sdpa_backend = PyTorchSdpaBackendName(
-                self.pytorch_sdpa_backend
-            )
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid PyTorch SDPA backend: '{self.pytorch_sdpa_backend}'. "
-                f"Valid options: {PYTORCH_SDPA_BACKEND_CHOICES}"
-            ) from e
+        (
+            self.pytorch_sdpa_backend,
+            self.pytorch_rocm_fa_library,
+        ) = _normalize_pytorch_sdpa_settings(
+            self.pytorch_sdpa_backend,
+            self.pytorch_rocm_fa_library,
+        )
 
     @property
     def plugin_path(self) -> Optional[Path]:

@@ -105,6 +105,8 @@ class BenchmarkMetadata:
         execution_backend: Execution backend used ("hipdnn", "pytorch", or "").
         pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend; None
             when PyTorch SDPA selection does not apply.
+        pytorch_rocm_fa_library_requested: Requested ROCm Flash Attention
+            implementation preference; None when not requested.
         hostname: Machine hostname where benchmark was run.
     """
 
@@ -117,6 +119,7 @@ class BenchmarkMetadata:
     timing_backend: str = ""
     execution_backend: str = ""
     pytorch_sdpa_backend_requested: Optional[str] = None
+    pytorch_rocm_fa_library_requested: Optional[str] = None
     hostname: str = field(default_factory=_get_hostname)
 
 

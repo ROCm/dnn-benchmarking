@@ -356,7 +356,10 @@ def _compute_reference_outputs_once(
                 use_pytorch_sdpa_backend,
             )
 
-            state = PyTorchSdpaBackendState(config.pytorch_sdpa_backend)
+            state = PyTorchSdpaBackendState(
+                config.pytorch_sdpa_backend,
+                config.pytorch_rocm_fa_library,
+            )
             with use_pytorch_sdpa_backend(state):
                 outputs = ref_provider.compute_reference(graph_json, input_data)
             return outputs, None
@@ -450,6 +453,7 @@ def _run_timed_pytorch_row(
                 benchmark_iters=config.benchmark_iters,
                 engine_id=0,
                 pytorch_sdpa_backend=config.pytorch_sdpa_backend,
+                pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
             )
             executor = PyTorchCudaExecutor(graph_json, bench_config)
             executor.prepare()

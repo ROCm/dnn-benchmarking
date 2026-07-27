@@ -127,14 +127,58 @@ class TestPyTorchSdpaBackendConfig:
         [
             lambda: BenchmarkConfig(
                 graph_path=Path("/test/graph.json"),
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
+            ),
+            lambda: SuiteConfig(
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="third-party-library",
+            ),
+        ],
+    )
+    def test_accepts_arbitrary_rocm_fa_library_with_flash(self, factory) -> None:
+        config = factory()
+
+        assert config.pytorch_sdpa_backend is PyTorchSdpaBackendName.FLASH
+        assert config.pytorch_rocm_fa_library is not None
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: BenchmarkConfig(
+                graph_path=Path("/test/graph.json"),
+                pytorch_sdpa_backend="math",
+                pytorch_rocm_fa_library="aotriton",
+            ),
+            lambda: SuiteConfig(
+                pytorch_sdpa_backend="default",
+                pytorch_rocm_fa_library="aotriton",
+            ),
+        ],
+    )
+    def test_rejects_rocm_fa_library_outside_flash(self, factory) -> None:
+        with pytest.raises(
+            ValueError,
+            match="pytorch_rocm_fa_library requires pytorch_sdpa_backend='flash'",
+        ):
+            factory()
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: BenchmarkConfig(
+                graph_path=Path("/test/graph.json"),
+                pytorch_sdpa_backend="aotriton_preferred",
+            ),
+            lambda: SuiteConfig(pytorch_sdpa_backend="aotriton_preferred"),
+            lambda: BenchmarkConfig(
+                graph_path=Path("/test/graph.json"),
                 pytorch_sdpa_backend="aotriton",
             ),
             lambda: SuiteConfig(pytorch_sdpa_backend="aotriton"),
         ],
     )
-    def test_rejects_removed_aotriton_value_for_both_config_types(
-        self, factory
-    ) -> None:
+    def test_rejects_removed_aotriton_shorthand(self, factory) -> None:
         with pytest.raises(ValueError, match="Invalid PyTorch SDPA backend"):
             factory()
 

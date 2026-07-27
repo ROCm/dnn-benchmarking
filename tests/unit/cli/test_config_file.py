@@ -106,31 +106,53 @@ iters = 7
     assert args.iters == 11
 
 
-def test_pytorch_sdpa_backend_config_and_cli_precedence(tmp_path: Path) -> None:
+def test_pytorch_rocm_fa_library_config_and_cli_precedence(tmp_path: Path) -> None:
     config = _write_config(
         tmp_path / "bench.toml",
         """
 version = 1
 graphs = ["from_config.json"]
-pytorch_sdpa_backend = "aotriton_preferred"
+pytorch_sdpa_backend = "flash"
+pytorch_rocm_fa_library = "aotriton"
 """,
     )
 
-    assert (
-        _parse_with_config(["--config", str(config)]).pytorch_sdpa_backend
-        == "aotriton_preferred"
+    args = _parse_with_config(["--config", str(config)])
+    assert args.pytorch_sdpa_backend == "flash"
+    assert args.pytorch_rocm_fa_library == "aotriton"
+
+    args = _parse_with_config(
+        [
+            "--config",
+            str(config),
+            "--pytorch-rocm-fa-library",
+            "ck",
+        ]
     )
-    assert (
-        _parse_with_config(
-            [
-                "--config",
-                str(config),
-                "--pytorch-sdpa-backend",
-                "math",
-            ]
-        ).pytorch_sdpa_backend
-        == "math"
+    assert args.pytorch_sdpa_backend == "flash"
+    assert args.pytorch_rocm_fa_library == "ck"
+
+
+def test_pytorch_sdpa_backend_cli_overrides_toml(tmp_path: Path) -> None:
+    config = _write_config(
+        tmp_path / "bench.toml",
+        """
+version = 1
+graphs = ["from_config.json"]
+pytorch_sdpa_backend = "math"
+""",
     )
+
+    args = _parse_with_config(
+        [
+            "--config",
+            str(config),
+            "--pytorch-sdpa-backend",
+            "flash",
+        ]
+    )
+    assert args.pytorch_sdpa_backend == "flash"
+    assert args.pytorch_rocm_fa_library is None
 
 
 def test_cli_engine_replaces_config_engine_matrix(tmp_path: Path) -> None:
@@ -278,6 +300,7 @@ id = 1
         ("pmc", '"everything"'),
         ("pytorch_sdpa_backend", '"invalid"'),
         ("pytorch_sdpa_backend", '"aotriton"'),
+        ("pytorch_sdpa_backend", '"aotriton_preferred"'),
     ],
 )
 def test_invalid_config_choice_values_are_rejected(

@@ -176,12 +176,14 @@ def _make_executor(
     module: Any,
     collect_kernel_timing: bool = True,
     pytorch_sdpa_backend: str = "default",
+    pytorch_rocm_fa_library: str | None = None,
 ):
     config = BenchmarkConfig(
         graph_path="test.json",
         warmup_iters=2,
         benchmark_iters=2,
         pytorch_sdpa_backend=pytorch_sdpa_backend,
+        pytorch_rocm_fa_library=pytorch_rocm_fa_library,
     )
     executor = module.PyTorchCudaExecutor(
         graph_json={"nodes": []},
@@ -227,6 +229,7 @@ def test_no_kernel_timing_uses_stream_sync_only(
     assert result.metadata is not None
     assert result.metadata.timing_backend == ""
     assert result.metadata.pytorch_sdpa_backend_requested == "default"
+    assert result.metadata.pytorch_rocm_fa_library_requested is None
     assert FakeHipTimer.created_streams == [0xCAFE]
     assert FakeHipTimer.start_calls == 0
     assert FakeHipTimer.stop_calls == 0
@@ -242,6 +245,7 @@ def test_collect_kernel_timing_collects_kernel_timings(
     @contextmanager
     def record_scope(state):
         assert state.selection.value == "flash"
+        assert state.rocm_fa_library == "aotriton"
         scopes.append("enter")
         try:
             yield
@@ -258,6 +262,7 @@ def test_collect_kernel_timing_collects_kernel_timings(
         module,
         collect_kernel_timing=True,
         pytorch_sdpa_backend="flash",
+        pytorch_rocm_fa_library="aotriton",
     )
     executor.prepare()
 
@@ -267,6 +272,7 @@ def test_collect_kernel_timing_collects_kernel_timings(
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
     assert result.metadata.pytorch_sdpa_backend_requested == "flash"
+    assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
     assert FakeHipTimer.created_streams == [0xCAFE, 0xCAFE]
     assert FakeHipTimer.start_calls == 2
     assert FakeHipTimer.stop_calls == 2
@@ -301,7 +307,8 @@ def test_staged_path_used_when_available(
 
     @contextmanager
     def record_scope(state):
-        assert state.selection.value == "aotriton_preferred"
+        assert state.selection.value == "flash"
+        assert state.rocm_fa_library == "aotriton"
         scopes.append("enter")
         try:
             yield
@@ -332,7 +339,8 @@ def test_staged_path_used_when_available(
     executor = _make_executor(
         module,
         collect_kernel_timing=True,
-        pytorch_sdpa_backend="aotriton_preferred",
+        pytorch_sdpa_backend="flash",
+        pytorch_rocm_fa_library="aotriton",
     )
     executor.prepare()
     result = executor.benchmark(tensors={}, graph_name="pytorch_staged")
@@ -342,7 +350,8 @@ def test_staged_path_used_when_available(
     assert result.host_timings == [0.5, 0.5]
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
-    assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
+    assert result.metadata.pytorch_sdpa_backend_requested == "flash"
+    assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
     # Staged timer built from the torch graph-stream pointer.
     assert created_streams == [0xCAFE]
     # One untimed priming execute, then one execute per measured iteration.

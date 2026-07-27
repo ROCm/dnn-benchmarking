@@ -1553,7 +1553,8 @@ class TestPyTorchSdpaBackendSelection:
             **kwargs,
         )
 
-    def test_aotriton_preferred_scopes_and_restores_rocm_preference(self) -> None:
+    @pytest.mark.parametrize("library", ["aotriton", "third-party-library"])
+    def test_flash_scopes_and_restores_rocm_preference(self, library: str) -> None:
         from torch.nn import attention
 
         from dnn_benchmarking.config import PyTorchSdpaBackendName
@@ -1575,12 +1576,13 @@ class TestPyTorchSdpaBackendSelection:
             return nullcontext()
 
         def successful_sdpa(*args, **kwargs):
-            assert preference[0] == "aotriton"
+            assert preference[0] == library
             return torch.empty(0)
 
         sdpa = MagicMock(side_effect=successful_sdpa)
         state = pytorch_ops.PyTorchSdpaBackendState(
-            PyTorchSdpaBackendName.AOTRITON_PREFERRED
+            PyTorchSdpaBackendName.FLASH,
+            library,
         )
         with (
             patch.object(
@@ -1598,12 +1600,10 @@ class TestPyTorchSdpaBackendSelection:
             self._execute()
 
         assert selected == [attention.SDPBackend.FLASH_ATTENTION]
-        assert preference_calls == [None, "aotriton", "ck"]
+        assert preference_calls == [None, library, "ck"]
         assert preference == ["ck"]
-        # A successful restricted Flash call is sufficient; the concrete
-        # Flash implementation remains intentionally unreported.
 
-    def test_aotriton_preference_is_restored_when_sdpa_raises(self) -> None:
+    def test_rocm_preference_is_restored_when_sdpa_raises(self) -> None:
         from torch.nn import attention
 
         from dnn_benchmarking.config import PyTorchSdpaBackendName
@@ -1619,7 +1619,8 @@ class TestPyTorchSdpaBackendSelection:
 
         failure = RuntimeError("unexpected operator failure")
         state = pytorch_ops.PyTorchSdpaBackendState(
-            PyTorchSdpaBackendName.AOTRITON_PREFERRED
+            PyTorchSdpaBackendName.FLASH,
+            "aotriton",
         )
         with (
             pytest.raises(RuntimeError) as caught,
@@ -1639,7 +1640,6 @@ class TestPyTorchSdpaBackendSelection:
 
         assert caught.value is failure
         assert preference == ["ck"]
-        # The original preference is restored even when dispatch fails.
 
     def test_default_opens_no_selection_context(self) -> None:
         from torch.nn import attention
@@ -1688,6 +1688,43 @@ class TestPyTorchSdpaBackendSelection:
 
         sdpa.assert_not_called()
 
+    def test_rejected_rocm_preference_does_not_call_sdpa(self) -> None:
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
+
+        sdpa = MagicMock()
+
+        def rejected_preference(value=None):
+            if value is None:
+                return "ck"
+            raise RuntimeError(f"unknown ROCm Flash library: {value}")
+
+        state = pytorch_ops.PyTorchSdpaBackendState(
+            PyTorchSdpaBackendName.FLASH,
+            "third-party-library",
+        )
+        with (
+            pytest.raises(
+                pytorch_ops.PyTorchSdpaBackendUnavailableError,
+                match=(
+                    "Requested PyTorch ROCm Flash Attention library "
+                    "'third-party-library' is unavailable; no fallback is used."
+                ),
+            ),
+            patch.object(
+                _sdpa_backend.torch_support, "is_rocm_build", return_value=True
+            ),
+            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
+            self._patch_rocm_preference(side_effect=rejected_preference),
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+        ):
+            self._execute()
+
+        sdpa.assert_not_called()
+
     def test_missing_rocm_preference_api_does_not_call_sdpa(self) -> None:
         from torch.nn import attention
 
@@ -1696,13 +1733,16 @@ class TestPyTorchSdpaBackendSelection:
 
         sdpa = MagicMock()
         state = pytorch_ops.PyTorchSdpaBackendState(
-            PyTorchSdpaBackendName.AOTRITON_PREFERRED
+            PyTorchSdpaBackendName.FLASH,
+            "aotriton",
         )
         with (
             pytest.raises(
                 pytorch_ops.PyTorchSdpaBackendUnavailableError,
-                match="Requested PyTorch SDPA backend 'aotriton_preferred' "
-                "is unavailable; no fallback is used.",
+                match=(
+                    "Requested PyTorch ROCm Flash Attention library 'aotriton' "
+                    "is unavailable; no fallback is used."
+                ),
             ),
             patch.object(
                 _sdpa_backend.torch_support, "is_rocm_build", return_value=True
@@ -1716,20 +1756,23 @@ class TestPyTorchSdpaBackendSelection:
 
         sdpa.assert_not_called()
 
-    def test_non_rocm_aotriton_preference_does_not_call_sdpa(self) -> None:
+    def test_non_rocm_preference_does_not_call_sdpa(self) -> None:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
         from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
 
         sdpa = MagicMock()
         preference = MagicMock()
         state = pytorch_ops.PyTorchSdpaBackendState(
-            PyTorchSdpaBackendName.AOTRITON_PREFERRED
+            PyTorchSdpaBackendName.FLASH,
+            "aotriton",
         )
         with (
             pytest.raises(
                 pytorch_ops.PyTorchSdpaBackendUnavailableError,
-                match="Requested PyTorch SDPA backend 'aotriton_preferred' "
-                "is unavailable; no fallback is used.",
+                match=(
+                    "Requested PyTorch ROCm Flash Attention library 'aotriton' "
+                    "is unavailable; no fallback is used."
+                ),
             ),
             patch.object(
                 _sdpa_backend.torch_support, "is_rocm_build", return_value=False

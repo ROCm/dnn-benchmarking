@@ -73,7 +73,8 @@ class PyTorchCudaExecutor:
         self._graph_json = graph_json
         self._config = config
         self._sdpa_backend_state = pytorch_ops.PyTorchSdpaBackendState(
-            config.pytorch_sdpa_backend
+            config.pytorch_sdpa_backend,
+            config.pytorch_rocm_fa_library,
         )
         self._device = torch.device(device)
         self._collect_kernel_timing = collect_kernel_timing
@@ -242,6 +243,7 @@ class PyTorchCudaExecutor:
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.PYTORCH.value,
             pytorch_sdpa_backend_requested=self._config.pytorch_sdpa_backend.value,
+            pytorch_rocm_fa_library_requested=self._config.pytorch_rocm_fa_library,
         )
 
         return BenchmarkResult(
@@ -290,6 +292,7 @@ class PyTorchCudaExecutor:
             timing_backend=TimingBackendName.HIP.value,
             execution_backend=ExecutionBackendName.PYTORCH.value,
             pytorch_sdpa_backend_requested=self._config.pytorch_sdpa_backend.value,
+            pytorch_rocm_fa_library_requested=self._config.pytorch_rocm_fa_library,
         )
 
         return BenchmarkResult(

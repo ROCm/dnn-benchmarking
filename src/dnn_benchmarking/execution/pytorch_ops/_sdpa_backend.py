@@ -19,10 +19,15 @@ class PyTorchSdpaBackendUnavailableError(RuntimeError):
 
 
 class PyTorchSdpaBackendState:
-    """The requested selection and whether its native SDPA call completed."""
+    """The requested strict SDPA category and ROCm Flash preference."""
 
-    def __init__(self, selection: PyTorchSdpaBackendName) -> None:
+    def __init__(
+        self,
+        selection: PyTorchSdpaBackendName,
+        rocm_fa_library: Optional[str] = None,
+    ) -> None:
         self.selection = PyTorchSdpaBackendName(selection)
+        self.rocm_fa_library = rocm_fa_library
         self._native_forward_sdpa_executed = False
 
 
@@ -72,17 +77,20 @@ def _unavailable_error(
     return PyTorchSdpaBackendUnavailableError(f"{prefix} {reason}")
 
 
+def _rocm_fa_library_unavailable_error(
+    library: str, reason: str
+) -> PyTorchSdpaBackendUnavailableError:
+    prefix = (
+        f"Requested PyTorch ROCm Flash Attention library '{library}' is "
+        "unavailable; no fallback is used."
+    )
+    return PyTorchSdpaBackendUnavailableError(f"{prefix} {reason}")
+
+
 def _selected_sdp_backend(
     selection: PyTorchSdpaBackendName,
 ) -> Tuple[object, object]:
     """Resolve one strict public PyTorch SDPA category."""
-    if (
-        selection is PyTorchSdpaBackendName.AOTRITON_PREFERRED
-        and not torch_support.is_rocm_build()
-    ):
-        raise _unavailable_error(
-            selection, "The AOTriton preference is available only in ROCm builds."
-        )
 
     try:
         from torch.nn import attention
@@ -100,7 +108,6 @@ def _selected_sdp_backend(
         )
 
     member_names = {
-        PyTorchSdpaBackendName.AOTRITON_PREFERRED: "FLASH_ATTENTION",
         PyTorchSdpaBackendName.FLASH: "FLASH_ATTENTION",
         PyTorchSdpaBackendName.MATH: "MATH",
         PyTorchSdpaBackendName.EFFICIENT: "EFFICIENT_ATTENTION",
@@ -118,29 +125,37 @@ def _selected_sdp_backend(
 
 
 @contextmanager
-def _prefer_aotriton(
+def _prefer_rocm_fa_library(
     selection: PyTorchSdpaBackendName,
+    library: Optional[str],
 ) -> Iterator[None]:
-    """Temporarily prefer AOTriton for restricted Flash dispatch."""
-    if selection is not PyTorchSdpaBackendName.AOTRITON_PREFERRED:
+    """Temporarily set PyTorch's ROCm Flash implementation preference."""
+    if library is None:
         yield
         return
+    if selection is not PyTorchSdpaBackendName.FLASH:
+        raise ValueError("ROCm Flash preference requires the Flash SDPA category")
+    if not torch_support.is_rocm_build():
+        raise _rocm_fa_library_unavailable_error(
+            library,
+            "The ROCm Flash Attention preference is available only in ROCm builds.",
+        )
 
     cuda_backends = getattr(torch.backends, "cuda", None)
     preference = getattr(cuda_backends, "preferred_rocm_fa_library", None)
     if not callable(preference):
-        raise _unavailable_error(
-            selection,
+        raise _rocm_fa_library_unavailable_error(
+            library,
             "PyTorch does not expose preferred_rocm_fa_library.",
         )
 
     try:
         previous = preference()
-        preference("aotriton")
+        preference(library)
     except (RuntimeError, ValueError) as error:
-        raise _unavailable_error(
-            selection,
-            f"PyTorch could not set the AOTriton preference: {error}",
+        raise _rocm_fa_library_unavailable_error(
+            library,
+            f"PyTorch could not set the ROCm Flash Attention preference: {error}",
         ) from error
 
     try:
@@ -182,7 +197,13 @@ def execute_selected_sdpa(
     sdpa_kernel, backend = _selected_sdp_backend(state.selection)
     with _SDPA_SELECTION_LOCK:
         try:
-            with _prefer_aotriton(state.selection), sdpa_kernel(backend):
+            with (
+                _prefer_rocm_fa_library(
+                    state.selection,
+                    state.rocm_fa_library,
+                ),
+                sdpa_kernel(backend),
+            ):
                 result = torch.nn.functional.scaled_dot_product_attention(
                     query,
                     key,

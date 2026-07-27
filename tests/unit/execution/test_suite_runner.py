@@ -979,7 +979,7 @@ class TestCorrectnessChecking:
         mock_check_corr.assert_not_called()
         assert result.results[0].error_message == reason
 
-    def test_cpu_pytorch_reference_requires_native_forward_sdpa(self) -> None:
+    def test_cpu_pytorch_reference_receives_rocm_fa_preference(self) -> None:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
         from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
         from dnn_benchmarking.validation.providers.pytorch_provider import (
@@ -990,7 +990,8 @@ class TestCorrectnessChecking:
             def compute_reference(self, graph_json, input_data):
                 state = _sdpa_backend._ACTIVE_SDPA_BACKEND.get()
                 assert state is not None
-                assert state.selection is PyTorchSdpaBackendName.MATH
+                assert state.selection is PyTorchSdpaBackendName.FLASH
+                assert state.rocm_fa_library == "aotriton"
                 return {}
 
         outputs, error = _compute_reference_outputs_once(
@@ -999,7 +1000,8 @@ class TestCorrectnessChecking:
             {},
             _make_config(
                 validation=ValidationConfig(provider="pytorch"),
-                pytorch_sdpa_backend="math",
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
             ),
         )
 
@@ -1121,7 +1123,8 @@ class TestCorrectnessChecking:
             config=_make_config(
                 validation=ValidationConfig(provider="pytorch"),
                 metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="efficient",
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
             ),
             input_data={},
             analytical_flops=None,
@@ -1133,10 +1136,9 @@ class TestCorrectnessChecking:
         assert result.result.host_stats is not None
         assert result.result.gpu_kernel_stats is None
         assert result.result.status == "success"
-        assert (
-            mock_pytorch_executor_cls.call_args.args[1].pytorch_sdpa_backend.value
-            == "efficient"
-        )
+        benchmark_config = mock_pytorch_executor_cls.call_args.args[1]
+        assert benchmark_config.pytorch_sdpa_backend.value == "flash"
+        assert benchmark_config.pytorch_rocm_fa_library == "aotriton"
 
 
 @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
@@ -1745,8 +1747,8 @@ class TestTimedPytorchRowEngineRole:
         )
 
         reason = (
-            "Requested PyTorch SDPA backend 'aotriton_preferred' is unavailable; "
-            "no fallback is used."
+            "Requested PyTorch ROCm Flash Attention library 'aotriton' is "
+            "unavailable; no fallback is used."
         )
         mock_pytorch_executor_cls.side_effect = PyTorchSdpaBackendUnavailableError(
             reason
@@ -1759,7 +1761,8 @@ class TestTimedPytorchRowEngineRole:
             tensor_infos=[],
             config=_make_config(
                 metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="aotriton_preferred",
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
             ),
             input_data={},
             analytical_flops=None,

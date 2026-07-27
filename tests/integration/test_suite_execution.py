@@ -607,6 +607,48 @@ class TestPyTorchBackendCLIIntegration:
                 assert row["gpu_kernel_stats"], row
                 assert "pytorch_sdpa_backend_requested" not in row
 
+    def test_flash_rocm_preference_serializes_suite_metadata(
+        self, project_root: Path, tmp_path: Path
+    ) -> None:
+        """Suite JSON owns the requested ROCm Flash library preference."""
+        output_file = tmp_path / "pytorch_flash_aotriton.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "dnn_benchmarking",
+                "--graph",
+                str(_graphs_dir() / "sample_sdpa.json"),
+                "--backend",
+                "pytorch",
+                "--pytorch-sdpa-backend",
+                "flash",
+                "--pytorch-rocm-fa-library",
+                "aotriton",
+                "--warmup",
+                "1",
+                "--iters",
+                "1",
+                "-o",
+                str(output_file),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0, (
+            f"Unexpected exit code {result.returncode}. "
+            f"stdout: {result.stdout} stderr: {result.stderr}"
+        )
+        data = json.loads(output_file.read_text())
+        metadata = data["metadata"]
+        assert metadata["pytorch_sdpa_backend_requested"] == "flash"
+        assert metadata["pytorch_rocm_fa_library_requested"] == "aotriton"
+        assert (
+            "pytorch_rocm_fa_library_requested" not in data["graphs"][0]["results"][0]
+        )
+
     def test_nondefault_pytorch_selection_errors_without_native_sdpa(
         self, project_root: Path, tmp_path: Path
     ) -> None:

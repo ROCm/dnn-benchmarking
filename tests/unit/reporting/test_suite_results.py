@@ -480,6 +480,7 @@ class TestSuiteResult:
         assert meta_d["python_version"] == "3.12.3"
         assert meta_d["hipdnn_version"] == "0.1.0"
         assert meta_d["pytorch_sdpa_backend_requested"] is None
+        assert meta_d["pytorch_rocm_fa_library_requested"] is None
         assert "pytorch_sdpa_category_executed" not in meta_d
 
     def test_to_dict_graph_first_nesting(self):
@@ -530,16 +531,19 @@ class TestSuiteResult:
             assert "p95_ms" in stats
             assert "p99_ms" in stats
 
-    def test_from_graph_results_preserves_pytorch_sdpa_selection(self) -> None:
+    def test_from_graph_results_preserves_pytorch_sdpa_requests(self) -> None:
         result = SuiteResult.from_graph_results(
             [],
             total_graphs=0,
-            pytorch_sdpa_backend_requested="aotriton_preferred",
+            pytorch_sdpa_backend_requested="flash",
+            pytorch_rocm_fa_library_requested="aotriton",
         )
 
-        assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
+        assert result.metadata.pytorch_sdpa_backend_requested == "flash"
+        assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
         metadata = result.to_dict()["metadata"]
-        assert metadata["pytorch_sdpa_backend_requested"] == "aotriton_preferred"
+        assert metadata["pytorch_sdpa_backend_requested"] == "flash"
+        assert metadata["pytorch_rocm_fa_library_requested"] == "aotriton"
         assert "pytorch_sdpa_category_executed" not in metadata
 
 

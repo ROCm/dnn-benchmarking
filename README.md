@@ -227,17 +227,21 @@ dnn-benchmark --graph ./graphs/sample_conv_fwd.json --backend pytorch
 # A whole suite through PyTorch, with JSON output
 dnn-benchmark --graph 'graphs/*.json' --backend pytorch -o pytorch_results.json
 
-# Prefer ROCm AOTriton within Flash Attention and record the request in JSON
-dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton_preferred -o pytorch_aotriton_preferred.json
+# Select the strict Flash category and prefer AOTriton within it on ROCm
+dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend flash --pytorch-rocm-fa-library aotriton -o pytorch_flash_aotriton.json
 ```
 
 `--pytorch-sdpa-backend default` preserves normal PyTorch SDPA dispatch.
-`aotriton_preferred`, `flash`, `math`, `efficient`, `cudnn`, and `overrideable`
-are strict selectors: the graph must execute native forward SDPA through the
-selected public category or the benchmark errors. No non-default selection
-falls back to normal dispatch or a CPU PyTorch reference.
-`aotriton_preferred` is ROCm-only: it selects the Flash Attention category and
-prefers AOTriton, but PyTorch may use another ROCm Flash implementation.
+`flash`, `math`, `efficient`, `cudnn`, and `overrideable` are strict selectors:
+the graph must execute native forward SDPA through the selected public category
+or the benchmark errors. No non-default selection falls back to normal dispatch
+or a CPU PyTorch reference.
+
+`--pytorch-rocm-fa-library LIBRARY` is ROCm-only and requires
+`--pytorch-sdpa-backend flash`. It forwards `LIBRARY` unchanged to PyTorch's
+`preferred_rocm_fa_library`; for example, use `aotriton`. PyTorch rejects an
+unknown library and may use another Flash implementation when the preferred one
+cannot serve an input.
 
 The PyTorch backend ignores hipDNN-specific selection and profiling options;
 the following are rejected with `--backend pytorch`:

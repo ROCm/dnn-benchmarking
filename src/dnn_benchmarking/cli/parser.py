@@ -268,13 +268,27 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "PyTorch scaled-dot-product-attention category (default: default). "
             f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default categories are "
             "strict: the graph must execute native forward SDPA through the "
-            "selected category or it errors; no default or CPU fallback is tried. "
-            "On ROCm, aotriton_preferred selects the Flash Attention category and "
-            "prefers AOTriton, but PyTorch may use another ROCm Flash "
-            "implementation."
+            "selected category or it errors; no default or CPU fallback is tried."
         ),
         config_key="pytorch_sdpa_backend",
         config_kind=ConfigKind.CHOICE,
+        config_type=str,
+    ),
+    CliOption(
+        flags=("--pytorch-rocm-fa-library",),
+        dest="pytorch_rocm_fa_library",
+        parser_type=str,
+        default=None,
+        metavar="LIBRARY",
+        group="Reference Validation",
+        help=(
+            "ROCm Flash Attention implementation preference forwarded unchanged "
+            "to PyTorch (for example: aotriton). Requires "
+            "--pytorch-sdpa-backend flash; ROCm-only. PyTorch rejects unknown "
+            "preferences."
+        ),
+        config_key="pytorch_rocm_fa_library",
+        config_kind=ConfigKind.SCALAR,
         config_type=str,
     ),
     CliOption(
@@ -499,10 +513,10 @@ Examples:
 PyTorch Backend (GPU via PyTorch):
   dnn-benchmark -g ./graph.json --backend pytorch
   dnn-benchmark -g ./graph.json --backend pytorch -o pytorch_results.json
-  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend aotriton_preferred -o pytorch_aotriton_preferred.json
+  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend flash --pytorch-rocm-fa-library aotriton -o pytorch_flash_aotriton.json
   default preserves normal dispatch. Non-default categories are strict.
-  On ROCm, aotriton_preferred prefers AOTriton within Flash Attention, but PyTorch
-  may use another ROCm Flash implementation.
+  On ROCm, --pytorch-rocm-fa-library forwards a Flash implementation preference
+  (for example, aotriton); PyTorch may use another implementation.
 
 Reference Validation:
   dnn-benchmark -g ./graph.json --validate pytorch
