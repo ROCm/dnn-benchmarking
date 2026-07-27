@@ -242,7 +242,6 @@ class PyTorchCudaExecutor:
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.PYTORCH.value,
             pytorch_sdpa_backend_requested=self._config.pytorch_sdpa_backend.value,
-            pytorch_sdpa_category_executed=(self._sdpa_backend_state.executed_category),
         )
 
         return BenchmarkResult(
@@ -291,7 +290,6 @@ class PyTorchCudaExecutor:
             timing_backend=TimingBackendName.HIP.value,
             execution_backend=ExecutionBackendName.PYTORCH.value,
             pytorch_sdpa_backend_requested=self._config.pytorch_sdpa_backend.value,
-            pytorch_sdpa_category_executed=(self._sdpa_backend_state.executed_category),
         )
 
         return BenchmarkResult(

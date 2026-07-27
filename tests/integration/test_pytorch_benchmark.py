@@ -285,8 +285,8 @@ class TestPyTorchCudaExecutor:
 
         assert len(result.host_timings) == 1
 
-    def test_aotriton_preferred_sdpa_reports_category_and_metadata(self):
-        """AOTriton preference reports the public Flash category after success."""
+    def test_aotriton_preferred_sdpa_reports_requested_metadata(self):
+        """AOTriton preference completes a native SDPA benchmark."""
         from dnn_benchmarking.common import torch_support
 
         skip_if_no_gpu_torch()
@@ -321,7 +321,6 @@ class TestPyTorchCudaExecutor:
         assert result.kernel_timings and result.kernel_timings[0] > 0
         assert result.metadata is not None
         assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
-        assert result.metadata.pytorch_sdpa_category_executed == "flash"
 
     def test_json_export(self, sample_conv_graph, tmp_path):
         """Test that benchmark results can be exported to JSON."""

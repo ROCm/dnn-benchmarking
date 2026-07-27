@@ -349,7 +349,6 @@ class TestSuiteCLIIntegration:
         assert "metadata" in data
         assert "graphs" in data
         assert data["metadata"]["pytorch_sdpa_backend_requested"] is None
-        assert data["metadata"]["pytorch_sdpa_category_executed"] is None
         assert data["metadata"]["total_graphs"] > 0
         assert len(data["graphs"]) == data["metadata"]["total_graphs"]
 
@@ -359,7 +358,6 @@ class TestSuiteCLIIntegration:
             assert "results" in g
             for row in g["results"]:
                 assert "pytorch_sdpa_backend_requested" not in row
-                assert "pytorch_sdpa_category_executed" not in row
             assert len(g["results"]) > 0
 
     def test_suite_mode_single_graph_failure_continues(
@@ -566,8 +564,54 @@ class TestPyTorchBackendCLIIntegration:
     def test_pytorch_backend_multi_graph_suite_json(
         self, project_root: Path, tmp_path: Path
     ) -> None:
-        """--backend pytorch with multiple graphs emits one SuiteResult JSON."""
+        """Default PyTorch dispatch succeeds for multiple non-SDPA graphs."""
         output_file = tmp_path / "pytorch_results.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "dnn_benchmarking",
+                "--graph",
+                str(_graphs_dir() / "sample_conv_fwd.json"),
+                str(_graphs_dir() / "sample_relu.json"),
+                "--backend",
+                "pytorch",
+                "--warmup",
+                "1",
+                "--iters",
+                "2",
+                "-o",
+                str(output_file),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0, (
+            f"Unexpected exit code {result.returncode}. "
+            f"stdout: {result.stdout} stderr: {result.stderr}"
+        )
+        assert output_file.exists(), result.stdout
+        data = json.loads(output_file.read_text())
+        assert data["metadata"]["pytorch_sdpa_backend_requested"] == "default"
+        assert len(data["graphs"]) == 2
+        for graph in data["graphs"]:
+            providers = {r["provider"] for r in graph["results"]}
+            assert providers == {"pytorch"}
+            for row in graph["results"]:
+                assert row["status"] == "success", row
+                assert row["host_stats"], row
+                # "auto" timing yields HIP events on ROCm and torch.cuda
+                # events on CUDA, so kernel stats exist on both.
+                assert row["gpu_kernel_stats"], row
+                assert row["pytorch_sdpa_backend_requested"] == "default"
+
+    def test_nondefault_pytorch_selection_errors_without_native_sdpa(
+        self, project_root: Path, tmp_path: Path
+    ) -> None:
+        """A selected backend rejects graphs that never reach native SDPA."""
+        output_file = tmp_path / "strict_pytorch_results.json"
         result = subprocess.run(
             [
                 sys.executable,
@@ -592,23 +636,16 @@ class TestPyTorchBackendCLIIntegration:
             cwd=project_root,
         )
 
-        assert result.returncode == 0, (
+        assert result.returncode == 1, (
             f"Unexpected exit code {result.returncode}. "
             f"stdout: {result.stdout} stderr: {result.stderr}"
         )
-        assert output_file.exists(), result.stdout
         data = json.loads(output_file.read_text())
         assert data["metadata"]["pytorch_sdpa_backend_requested"] == "math"
-        assert data["metadata"]["pytorch_sdpa_category_executed"] is None
-        assert len(data["graphs"]) == 2
         for graph in data["graphs"]:
-            providers = {r["provider"] for r in graph["results"]}
-            assert providers == {"pytorch"}
-            for row in graph["results"]:
-                assert row["status"] == "success", row
-                assert row["host_stats"], row
-                # "auto" timing yields HIP events on ROCm and torch.cuda
-                # events on CUDA, so kernel stats exist on both.
-                assert row["gpu_kernel_stats"], row
-                assert row["pytorch_sdpa_backend_requested"] == "math"
-                assert "pytorch_sdpa_category_executed" not in row
+            row = graph["results"][0]
+            assert row["status"] == "error"
+            assert row["pytorch_sdpa_backend_requested"] == "math"
+            assert "native forward SDPA call" in row["error_message"]
+            assert "host_stats" not in row
+            assert "gpu_kernel_stats" not in row

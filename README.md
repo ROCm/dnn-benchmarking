@@ -233,15 +233,11 @@ dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa
 
 `--pytorch-sdpa-backend default` preserves normal PyTorch SDPA dispatch.
 `aotriton_preferred`, `flash`, `math`, `efficient`, `cudnn`, and `overrideable`
-select public PyTorch SDPA categories. Every selected non-default category is
-strict: if that category is unavailable or ineligible for an input, the
-benchmark errors instead of falling back to normal dispatch.
+are strict selectors: the graph must execute native forward SDPA through the
+selected public category or the benchmark errors. No non-default selection
+falls back to normal dispatch or a CPU PyTorch reference.
 `aotriton_preferred` is ROCm-only: it selects the Flash Attention category and
 prefers AOTriton, but PyTorch may use another ROCm Flash implementation.
-
-For `--validate pytorch`, any CPU reference fallback retains the same selection.
-If that backend cannot execute the CPU input, validation is reported unavailable;
-the tool does not retry under normal PyTorch dispatch.
 
 The PyTorch backend ignores hipDNN-specific selection and profiling options;
 the following are rejected with `--backend pytorch`:

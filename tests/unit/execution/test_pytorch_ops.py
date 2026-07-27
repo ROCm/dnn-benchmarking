@@ -1471,7 +1471,7 @@ class TestPyTorchOpsNewHandlers:
         with pytest.raises(UnsupportedGraphError, match="stat tensor"):
             self._run_sdpa_backward(q, q, q, q, q, stats, {"attn_scale_value": scale})
 
-    def test_sdpa_backward_does_not_record_executed_category(self) -> None:
+    def test_sdpa_backward_requires_native_forward_for_strict_selection(self) -> None:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
         torch.manual_seed(6)
@@ -1481,10 +1481,14 @@ class TestPyTorchOpsNewHandlers:
         o, lse, _, _, _ = self._sdpa_autograd_reference(q, q, q, do, scale, False, 1, 1)
         state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
 
-        with pytorch_ops.use_pytorch_sdpa_backend(state):
-            self._run_sdpa_backward(q, q, q, o, do, lse, {"attn_scale_value": scale})
-
-        assert state.executed_category is None
+        with pytest.raises(
+            pytorch_ops.PyTorchSdpaBackendUnavailableError,
+            match="The graph did not execute a native forward SDPA call.",
+        ):
+            with pytorch_ops.use_pytorch_sdpa_backend(state):
+                self._run_sdpa_backward(
+                    q, q, q, o, do, lse, {"attn_scale_value": scale}
+                )
 
     def test_sdpa_forward_independent_kv_heads(self) -> None:
         # Hk != Hv (2 and 1, both divide Hq=4): explicit independent repeat.
@@ -1588,7 +1592,8 @@ class TestPyTorchSdpaBackendSelection:
         assert selected == [attention.SDPBackend.FLASH_ATTENTION]
         assert preference_calls == [None, "aotriton", "ck"]
         assert preference == ["ck"]
-        assert state.executed_category == "flash"
+        # A successful restricted Flash call is sufficient; the concrete
+        # Flash implementation remains intentionally unreported.
 
     def test_aotriton_preference_is_restored_when_sdpa_raises(self) -> None:
         from torch.nn import attention
@@ -1609,6 +1614,7 @@ class TestPyTorchSdpaBackendSelection:
             PyTorchSdpaBackendName.AOTRITON_PREFERRED
         )
         with (
+            pytest.raises(RuntimeError) as caught,
             patch.object(
                 _sdpa_backend.torch_support, "is_rocm_build", return_value=True
             ),
@@ -1624,15 +1630,14 @@ class TestPyTorchSdpaBackendSelection:
                 side_effect=failure,
             ),
             pytorch_ops.use_pytorch_sdpa_backend(state),
-            pytest.raises(RuntimeError) as caught,
         ):
             self._execute()
 
         assert caught.value is failure
         assert preference == ["ck"]
-        assert state.executed_category is None
+        # The original preference is restored even when dispatch fails.
 
-    def test_default_opens_no_selection_context_or_records_category(self) -> None:
+    def test_default_opens_no_selection_context(self) -> None:
         from torch.nn import attention
 
         from dnn_benchmarking.config import PyTorchSdpaBackendName
@@ -1649,7 +1654,6 @@ class TestPyTorchSdpaBackendSelection:
 
         sdpa_kernel.assert_not_called()
         preferred_library.assert_not_called()
-        assert state.executed_category is None
 
     @pytest.mark.parametrize("missing", ["sdpa_kernel", "backend_member"])
     def test_missing_public_api_or_backend_member_does_not_call_sdpa(
@@ -1669,19 +1673,18 @@ class TestPyTorchSdpaBackendSelection:
             else patch.object(attention, "SDPBackend", SimpleNamespace())
         )
         with (
-            api_patch,
-            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
-            pytorch_ops.use_pytorch_sdpa_backend(state),
             pytest.raises(
                 pytorch_ops.PyTorchSdpaBackendUnavailableError,
                 match="Requested PyTorch SDPA backend 'math' is unavailable; "
                 "no fallback is used.",
             ),
+            api_patch,
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
         ):
             self._execute()
 
         sdpa.assert_not_called()
-        assert state.executed_category is None
 
     def test_missing_rocm_preference_api_does_not_call_sdpa(self) -> None:
         from torch.nn import attention
@@ -1694,6 +1697,11 @@ class TestPyTorchSdpaBackendSelection:
             PyTorchSdpaBackendName.AOTRITON_PREFERRED
         )
         with (
+            pytest.raises(
+                pytorch_ops.PyTorchSdpaBackendUnavailableError,
+                match="Requested PyTorch SDPA backend 'aotriton_preferred' "
+                "is unavailable; no fallback is used.",
+            ),
             patch.object(
                 _sdpa_backend.torch_support, "is_rocm_build", return_value=True
             ),
@@ -1705,16 +1713,10 @@ class TestPyTorchSdpaBackendSelection:
             ),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(state),
-            pytest.raises(
-                pytorch_ops.PyTorchSdpaBackendUnavailableError,
-                match="Requested PyTorch SDPA backend 'aotriton_preferred' "
-                "is unavailable; no fallback is used.",
-            ),
         ):
             self._execute()
 
         sdpa.assert_not_called()
-        assert state.executed_category is None
 
     def test_non_rocm_aotriton_preference_does_not_call_sdpa(self) -> None:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
@@ -1726,6 +1728,11 @@ class TestPyTorchSdpaBackendSelection:
             PyTorchSdpaBackendName.AOTRITON_PREFERRED
         )
         with (
+            pytest.raises(
+                pytorch_ops.PyTorchSdpaBackendUnavailableError,
+                match="Requested PyTorch SDPA backend 'aotriton_preferred' "
+                "is unavailable; no fallback is used.",
+            ),
             patch.object(
                 _sdpa_backend.torch_support, "is_rocm_build", return_value=False
             ),
@@ -1736,17 +1743,11 @@ class TestPyTorchSdpaBackendSelection:
             ),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(state),
-            pytest.raises(
-                pytorch_ops.PyTorchSdpaBackendUnavailableError,
-                match="Requested PyTorch SDPA backend 'aotriton_preferred' "
-                "is unavailable; no fallback is used.",
-            ),
         ):
             self._execute()
 
         preference.assert_not_called()
         sdpa.assert_not_called()
-        assert state.executed_category is None
 
     def test_unavailable_kernel_errors_without_default_retry(self) -> None:
         from torch.nn import attention
@@ -1758,19 +1759,18 @@ class TestPyTorchSdpaBackendSelection:
         )
         state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
         with (
-            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
-            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
-            pytorch_ops.use_pytorch_sdpa_backend(state),
             pytest.raises(
                 pytorch_ops.PyTorchSdpaBackendUnavailableError,
                 match="Requested PyTorch SDPA backend 'math' is unavailable; "
                 "no fallback is used.",
             ),
+            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
         ):
             self._execute()
 
         sdpa.assert_called_once()
-        assert state.executed_category is None
 
     def test_unrelated_runtime_error_propagates_unchanged(self) -> None:
         from torch.nn import attention
@@ -1781,40 +1781,48 @@ class TestPyTorchSdpaBackendSelection:
         sdpa = MagicMock(side_effect=dispatch_error)
         state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
         with (
+            pytest.raises(RuntimeError) as caught,
             patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
             patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
             pytorch_ops.use_pytorch_sdpa_backend(state),
-            pytest.raises(RuntimeError) as caught,
         ):
             self._execute()
 
         assert caught.value is dispatch_error
         sdpa.assert_called_once()
-        assert state.executed_category is None
 
-    def test_success_records_category_only_after_forward_returns(self) -> None:
+    def test_successful_forward_satisfies_strict_selection(self) -> None:
         from torch.nn import attention
 
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
         state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
 
-        def successful_sdpa(*args, **kwargs):
-            assert state.executed_category is None
-            return torch.empty(0)
-
         with (
             patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
             patch.object(
                 torch.nn.functional,
                 "scaled_dot_product_attention",
-                side_effect=successful_sdpa,
+                return_value=torch.empty(0),
             ),
             pytorch_ops.use_pytorch_sdpa_backend(state),
         ):
             self._execute()
 
-        assert state.executed_category == "math"
+    def test_strict_selection_errors_without_native_forward_sdpa(self) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
+        with pytest.raises(
+            pytorch_ops.PyTorchSdpaBackendUnavailableError,
+            match=(
+                "Requested PyTorch SDPA backend 'math' is unavailable; "
+                "no fallback is used. The graph did not execute a native forward "
+                "SDPA call."
+            ),
+        ):
+            with pytorch_ops.use_pytorch_sdpa_backend(state):
+                pass
 
     def test_default_call_waits_for_selected_process_scope(self) -> None:
         from torch.nn import attention
@@ -1870,8 +1878,8 @@ class TestPyTorchSdpaBackendSelection:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
         from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
 
-        outer = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
-        inner = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.FLASH)
+        outer = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
+        inner = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
         assert _sdpa_backend._ACTIVE_SDPA_BACKEND.get() is None
 
         with pytorch_ops.use_pytorch_sdpa_backend(outer):

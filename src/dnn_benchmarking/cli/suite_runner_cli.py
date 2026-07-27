@@ -104,23 +104,6 @@ def _run_suite_graphs_after_startup(
         config.backend is ExecutionBackendName.PYTORCH
         or config.validation.provider is ReferenceProviderName.PYTORCH
     )
-    executed_categories = {
-        row.pytorch_sdpa_category_executed
-        for graph_result in graph_results
-        for row in graph_result.results
-        if row.pytorch_sdpa_category_executed is not None
-    }
-    executed_categories.update(
-        graph_result.pytorch_sdpa_category_executed
-        for graph_result in graph_results
-        if graph_result.pytorch_sdpa_category_executed is not None
-    )
-    if len(executed_categories) > 1:
-        raise RuntimeError(
-            "PyTorch SDPA rows reported inconsistent executed categories: "
-            f"{sorted(executed_categories)}"
-        )
-    executed_category = next(iter(executed_categories), None)
 
     suite_result = SuiteResult.from_graph_results(
         graph_results,
@@ -128,7 +111,6 @@ def _run_suite_graphs_after_startup(
         pytorch_sdpa_backend_requested=(
             config.pytorch_sdpa_backend.value if pytorch_selected else None
         ),
-        pytorch_sdpa_category_executed=executed_category,
     )
 
     reporter.print_suite_summary(suite_result.metadata)

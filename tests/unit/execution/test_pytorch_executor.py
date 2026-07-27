@@ -227,7 +227,6 @@ def test_no_kernel_timing_uses_stream_sync_only(
     assert result.metadata is not None
     assert result.metadata.timing_backend == ""
     assert result.metadata.pytorch_sdpa_backend_requested == "default"
-    assert result.metadata.pytorch_sdpa_category_executed is None
     assert FakeHipTimer.created_streams == [0xCAFE]
     assert FakeHipTimer.start_calls == 0
     assert FakeHipTimer.stop_calls == 0
@@ -243,7 +242,6 @@ def test_collect_kernel_timing_collects_kernel_timings(
     @contextmanager
     def record_scope(state):
         assert state.selection.value == "flash"
-        state.executed_category = "flash"
         scopes.append("enter")
         try:
             yield
@@ -269,7 +267,6 @@ def test_collect_kernel_timing_collects_kernel_timings(
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
     assert result.metadata.pytorch_sdpa_backend_requested == "flash"
-    assert result.metadata.pytorch_sdpa_category_executed == "flash"
     assert FakeHipTimer.created_streams == [0xCAFE, 0xCAFE]
     assert FakeHipTimer.start_calls == 2
     assert FakeHipTimer.stop_calls == 2
@@ -305,7 +302,6 @@ def test_staged_path_used_when_available(
     @contextmanager
     def record_scope(state):
         assert state.selection.value == "aotriton_preferred"
-        state.executed_category = "flash"
         scopes.append("enter")
         try:
             yield
@@ -347,7 +343,6 @@ def test_staged_path_used_when_available(
     assert result.metadata is not None
     assert result.metadata.timing_backend == "hip"
     assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
-    assert result.metadata.pytorch_sdpa_category_executed == "flash"
     # Staged timer built from the torch graph-stream pointer.
     assert created_streams == [0xCAFE]
     # One untimed priming execute, then one execute per measured iteration.
@@ -385,6 +380,32 @@ def test_unavailable_backend_has_no_successful_fallback(
         executor.benchmark(tensors={}, graph_name="unavailable")
 
     assert caught.value is error
+    assert executions == ["execute"]
+
+
+def test_nondefault_backend_requires_native_sdpa_execution(
+    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = pytorch_executor_module
+    executions: List[str] = []
+    monkeypatch.setattr(
+        module.pytorch_ops,
+        "compile_graph",
+        lambda graph_json: _RecordingCompiled(executions),
+    )
+    executor = _make_executor(
+        module,
+        collect_kernel_timing=False,
+        pytorch_sdpa_backend="math",
+    )
+    executor.prepare()
+
+    with pytest.raises(
+        module.pytorch_ops.PyTorchSdpaBackendUnavailableError,
+        match="The graph did not execute a native forward SDPA call.",
+    ):
+        executor.benchmark(tensors={}, graph_name="missing_sdpa")
+
     assert executions == ["execute"]
 
 

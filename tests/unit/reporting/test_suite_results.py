@@ -212,27 +212,12 @@ class TestProviderEngineResult:
             engine_id=0,
             status=status,
             pytorch_sdpa_backend_requested="aotriton_preferred",
-            pytorch_sdpa_category_executed=None,
             **kwargs,
         )
 
         result = pytorch.to_dict()
 
         assert result["pytorch_sdpa_backend_requested"] == "aotriton_preferred"
-        assert "pytorch_sdpa_category_executed" not in result
-
-    def test_success_serializes_executed_sdpa_category(self):
-        pytorch = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="success",
-            pytorch_sdpa_backend_requested="aotriton_preferred",
-            pytorch_sdpa_category_executed="flash",
-        )
-
-        result = pytorch.to_dict()
-
-        assert result["pytorch_sdpa_category_executed"] == "flash"
 
     def test_legacy_hipdnn_row_omits_sdpa_selection_fields(self):
         legacy = ProviderEngineResult(provider="miopen", engine_id=1, status="success")
@@ -240,7 +225,6 @@ class TestProviderEngineResult:
         result = legacy.to_dict()
 
         assert "pytorch_sdpa_backend_requested" not in result
-        assert "pytorch_sdpa_category_executed" not in result
 
     def test_warnings_serialize_for_reference_timing_rows(self):
         pe = ProviderEngineResult(
@@ -368,16 +352,6 @@ class TestGraphResult:
         assert d["graph_path"] == "/p/conv.json"
         assert len(d["results"]) == 1
         assert d["results"][0]["status"] == "error"
-
-    def test_cpu_fallback_category_serializes_at_graph_level(self):
-        graph = GraphResult(
-            graph_name="sdpa",
-            graph_path="/p/sdpa.json",
-            results=[],
-            pytorch_sdpa_category_executed="math",
-        )
-
-        assert graph.to_dict()["pytorch_sdpa_category_executed"] == "math"
 
     def test_count_by_status_buckets_all_outcomes(self):
         """count_by_status returns the correct bucket counts."""
@@ -516,7 +490,7 @@ class TestSuiteResult:
         assert meta_d["python_version"] == "3.12.3"
         assert meta_d["hipdnn_version"] == "0.1.0"
         assert meta_d["pytorch_sdpa_backend_requested"] is None
-        assert meta_d["pytorch_sdpa_category_executed"] is None
+        assert "pytorch_sdpa_category_executed" not in meta_d
 
     def test_to_dict_graph_first_nesting(self):
         """SuiteResult.to_dict() produces graph-first nesting: top-level
@@ -571,14 +545,12 @@ class TestSuiteResult:
             [],
             total_graphs=0,
             pytorch_sdpa_backend_requested="aotriton_preferred",
-            pytorch_sdpa_category_executed="flash",
         )
 
         assert result.metadata.pytorch_sdpa_backend_requested == "aotriton_preferred"
-        assert result.metadata.pytorch_sdpa_category_executed == "flash"
         metadata = result.to_dict()["metadata"]
         assert metadata["pytorch_sdpa_backend_requested"] == "aotriton_preferred"
-        assert metadata["pytorch_sdpa_category_executed"] == "flash"
+        assert "pytorch_sdpa_category_executed" not in metadata
 
 
 class TestCollectEnvironmentInfo:

@@ -19,11 +19,11 @@ class PyTorchSdpaBackendUnavailableError(RuntimeError):
 
 
 class PyTorchSdpaBackendState:
-    """The requested selection and successfully executed public category."""
+    """The requested selection and whether its native SDPA call completed."""
 
     def __init__(self, selection: PyTorchSdpaBackendName) -> None:
         self.selection = PyTorchSdpaBackendName(selection)
-        self.executed_category: Optional[str] = None
+        self._native_forward_sdpa_executed = False
 
 
 _ACTIVE_SDPA_BACKEND: ContextVar[Optional[PyTorchSdpaBackendState]] = ContextVar(
@@ -41,11 +41,24 @@ _SDPA_SELECTION_LOCK = RLock()
 def use_pytorch_sdpa_backend(
     state: PyTorchSdpaBackendState,
 ) -> Iterator[None]:
-    """Activate an SDPA selection for the current context only."""
+    """Activate and require a native forward SDPA call for strict selections."""
+    previous_execution = state._native_forward_sdpa_executed
+    state._native_forward_sdpa_executed = False
     token = _ACTIVE_SDPA_BACKEND.set(state)
     try:
         yield
+        if (
+            state.selection is not PyTorchSdpaBackendName.DEFAULT
+            and not state._native_forward_sdpa_executed
+        ):
+            raise _unavailable_error(
+                state.selection,
+                "The graph did not execute a native forward SDPA call.",
+            )
     finally:
+        state._native_forward_sdpa_executed = (
+            previous_execution or state._native_forward_sdpa_executed
+        )
         _ACTIVE_SDPA_BACKEND.reset(token)
 
 
@@ -61,7 +74,7 @@ def _unavailable_error(
 
 def _selected_sdp_backend(
     selection: PyTorchSdpaBackendName,
-) -> Tuple[object, object, str]:
+) -> Tuple[object, object]:
     """Resolve one strict public PyTorch SDPA category."""
     if (
         selection is PyTorchSdpaBackendName.AOTRITON_PREFERRED
@@ -87,37 +100,28 @@ def _selected_sdp_backend(
         )
 
     member_names = {
-        PyTorchSdpaBackendName.AOTRITON_PREFERRED: (
-            "FLASH_ATTENTION",
-            "flash",
-        ),
-        PyTorchSdpaBackendName.FLASH: ("FLASH_ATTENTION", "flash"),
-        PyTorchSdpaBackendName.MATH: ("MATH", "math"),
-        PyTorchSdpaBackendName.EFFICIENT: (
-            "EFFICIENT_ATTENTION",
-            "efficient",
-        ),
-        PyTorchSdpaBackendName.CUDNN: ("CUDNN_ATTENTION", "cudnn"),
-        PyTorchSdpaBackendName.OVERRIDEABLE: (
-            "OVERRIDEABLE",
-            "overrideable",
-        ),
+        PyTorchSdpaBackendName.AOTRITON_PREFERRED: "FLASH_ATTENTION",
+        PyTorchSdpaBackendName.FLASH: "FLASH_ATTENTION",
+        PyTorchSdpaBackendName.MATH: "MATH",
+        PyTorchSdpaBackendName.EFFICIENT: "EFFICIENT_ATTENTION",
+        PyTorchSdpaBackendName.CUDNN: "CUDNN_ATTENTION",
+        PyTorchSdpaBackendName.OVERRIDEABLE: "OVERRIDEABLE",
     }
-    member_name, category = member_names[selection]
+    member_name = member_names[selection]
     backend = getattr(sdp_backend, member_name, None)
     if backend is None:
         raise _unavailable_error(
             selection,
             f"PyTorch does not expose SDPBackend.{member_name}.",
         )
-    return sdpa_kernel, backend, category
+    return sdpa_kernel, backend
 
 
 @contextmanager
 def _prefer_aotriton(
     selection: PyTorchSdpaBackendName,
 ) -> Iterator[None]:
-    """Temporarily prefer AOTriton without claiming it was observed."""
+    """Temporarily prefer AOTriton for restricted Flash dispatch."""
     if selection is not PyTorchSdpaBackendName.AOTRITON_PREFERRED:
         yield
         return
@@ -175,7 +179,7 @@ def execute_selected_sdpa(
                 scale=scale,
             )
 
-    sdpa_kernel, backend, category = _selected_sdp_backend(state.selection)
+    sdpa_kernel, backend = _selected_sdp_backend(state.selection)
     with _SDPA_SELECTION_LOCK:
         try:
             with _prefer_aotriton(state.selection), sdpa_kernel(backend):
@@ -192,5 +196,5 @@ def execute_selected_sdpa(
             if _is_backend_unavailable_error(error):
                 raise _unavailable_error(state.selection, str(error)) from error
             raise
-        state.executed_category = category
+        state._native_forward_sdpa_executed = True
         return result

@@ -267,10 +267,11 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         help=(
             "PyTorch scaled-dot-product-attention category (default: default). "
             f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default categories are "
-            "strict: an unavailable or ineligible category errors and no default "
-            "category is tried. On ROCm, aotriton_preferred selects the Flash "
-            "Attention category and prefers AOTriton, but PyTorch may use another "
-            "ROCm Flash implementation."
+            "strict: the graph must execute native forward SDPA through the "
+            "selected category or it errors; no default or CPU fallback is tried. "
+            "On ROCm, aotriton_preferred selects the Flash Attention category and "
+            "prefers AOTriton, but PyTorch may use another ROCm Flash "
+            "implementation."
         ),
         config_key="pytorch_sdpa_backend",
         config_kind=ConfigKind.CHOICE,

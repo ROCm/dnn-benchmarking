@@ -106,8 +106,6 @@ class ProviderEngineResult:
             counted as pass/fail engine combinations.
         pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend for
             timed PyTorch rows; None for non-PyTorch rows.
-        pytorch_sdpa_category_executed: Public PyTorch SDPA category that
-            successfully executed; None when no forward SDPA call completed.
         cpu_build_time_ms: CPU graph-build time.
         gpu_kernel_stats: GPU kernel timing statistics.
         host_stats: Host-side submission timing statistics.
@@ -164,7 +162,6 @@ class ProviderEngineResult:
     status: Literal["success", "error", "skipped"]
     role: Literal["engine", "reference"] = "engine"
     pytorch_sdpa_backend_requested: Optional[str] = None
-    pytorch_sdpa_category_executed: Optional[str] = None
     plugin_path: Optional[str] = None
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
@@ -219,8 +216,6 @@ class ProviderEngineResult:
             d["role"] = self.role
         if self.pytorch_sdpa_backend_requested is not None:
             d["pytorch_sdpa_backend_requested"] = self.pytorch_sdpa_backend_requested
-        if self.pytorch_sdpa_category_executed is not None:
-            d["pytorch_sdpa_category_executed"] = self.pytorch_sdpa_category_executed
         if self.plugin_path is not None:
             d["plugin_path"] = self.plugin_path
         if self.warnings:
@@ -304,15 +299,12 @@ class GraphResult:
         graph_name: Name of the graph.
         graph_path: File path to the graph JSON.
         results: List of ProviderEngineResult for each combination.
-        pytorch_sdpa_category_executed: Public category executed outside a
-            serialized provider row, such as the CPU PyTorch reference fallback.
     """
 
     graph_name: str
     graph_path: str
     results: List[ProviderEngineResult]
     engine_ids: List[int] = field(default_factory=list)
-    pytorch_sdpa_category_executed: Optional[str] = None
 
     def is_no_engine_graph(self) -> bool:
         """True when this graph result represents a no-engine outcome."""
@@ -358,15 +350,6 @@ class GraphResult:
             "graph_name": self.graph_name,
             "graph_path": self.graph_path,
             "results": [r.to_dict() for r in self.results],
-            **(
-                {
-                    "pytorch_sdpa_category_executed": (
-                        self.pytorch_sdpa_category_executed
-                    )
-                }
-                if self.pytorch_sdpa_category_executed is not None
-                else {}
-            ),
         }
 
 
@@ -386,8 +369,6 @@ class SuiteMetadata:
         pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend for
             PyTorch timing or reference validation; None when PyTorch was not
             selected.
-        pytorch_sdpa_category_executed: Public PyTorch SDPA category that
-            successfully executed; None when no forward SDPA call completed.
         rocm_version: ROCm/HIP version string (None on CUDA hosts).
         cuda_version: CUDA toolkit version the torch wheel was built
             against (None on ROCm hosts).
@@ -428,7 +409,6 @@ class SuiteMetadata:
     skip_combinations: int
     error_combinations: int
     pytorch_sdpa_backend_requested: Optional[str] = None
-    pytorch_sdpa_category_executed: Optional[str] = None
     rocm_version: Optional[str] = None
     cuda_version: Optional[str] = None
     cudnn_version: Optional[str] = None
@@ -462,7 +442,6 @@ class SuiteMetadata:
             "skip_combinations": self.skip_combinations,
             "error_combinations": self.error_combinations,
             "pytorch_sdpa_backend_requested": self.pytorch_sdpa_backend_requested,
-            "pytorch_sdpa_category_executed": self.pytorch_sdpa_category_executed,
             "rocm_version": self.rocm_version,
             "cuda_version": self.cuda_version,
             "cudnn_version": self.cudnn_version,
@@ -505,7 +484,6 @@ class SuiteResult:
         total_graphs: int,
         *,
         pytorch_sdpa_backend_requested: Optional[str] = None,
-        pytorch_sdpa_category_executed: Optional[str] = None,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
         env_info = collect_environment_info()
@@ -552,7 +530,6 @@ class SuiteResult:
             skip_combinations=total_skip,
             error_combinations=total_error,
             pytorch_sdpa_backend_requested=pytorch_sdpa_backend_requested,
-            pytorch_sdpa_category_executed=pytorch_sdpa_category_executed,
             rocm_version=env_info.get("rocm_version"),
             cuda_version=env_info.get("cuda_version"),
             cudnn_version=env_info.get("cudnn_version"),
