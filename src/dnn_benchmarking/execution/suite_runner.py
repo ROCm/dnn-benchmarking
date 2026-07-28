@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Literal, Optional
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import (
     BenchmarkConfig,
+    PyTorchSdpaBackendName,
     ReferenceProviderName,
     SuiteConfig,
 )
@@ -344,8 +345,24 @@ def _compute_reference_outputs_once(
     ref_provider: ReferenceProvider,
     graph_json: Dict[str, Any],
     input_data: Dict[int, Any],
+    config: SuiteConfig,
 ) -> tuple[Optional[Dict[int, ReferenceOutput]], Optional[str]]:
     try:
+        from ..validation.providers.pytorch_provider import PyTorchReferenceProvider
+
+        if isinstance(ref_provider, PyTorchReferenceProvider):
+            from .pytorch_ops import (
+                PyTorchSdpaBackendState,
+                use_pytorch_sdpa_backend,
+            )
+
+            state = PyTorchSdpaBackendState(
+                config.pytorch_sdpa_backend,
+                config.pytorch_rocm_fa_library,
+            )
+            with use_pytorch_sdpa_backend(state):
+                outputs = ref_provider.compute_reference(graph_json, input_data)
+            return outputs, None
         return ref_provider.compute_reference(graph_json, input_data), None
     except (ImportError, ValueError, RuntimeError, ExecutionError) as e:
         return None, str(e)
@@ -410,30 +427,33 @@ def _run_timed_pytorch_row(
     """Run PyTorch once as a timed suite row.
 
     With ``role="reference"`` this is the timed validation-provider row: it
-    additionally extracts reference outputs for engine comparison, and any
-    failure downgrades the row to "skipped". With ``role="engine"`` (the
-    ``--backend pytorch`` path) no outputs are extracted and failures are
-    reported as engine errors.
+    additionally extracts reference outputs for engine comparison. Failed
+    default-dispatch references are skipped; failed strict selections are
+    errors because their requested native SDPA path was not fulfilled. With
+    ``role="engine"`` (the ``--backend pytorch`` path), failures are errors.
     """
+    from . import pytorch_ops
+
     result = ProviderEngineResult(
         provider=ReferenceProviderName.PYTORCH.value,
         engine_id=0,
         status="skipped",
-        role=role,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
 
     with Timer() as elapsed_timer:
         try:
             from ..execution.pytorch_buffer_manager import PyTorchCudaBufferManager
             from ..execution.pytorch_executor import PyTorchCudaExecutor
-            from . import pytorch_ops
 
             bench_config = BenchmarkConfig(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
                 engine_id=0,
+                pytorch_sdpa_backend=config.pytorch_sdpa_backend,
+                pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
             )
             executor = PyTorchCudaExecutor(graph_json, bench_config)
             executor.prepare()
@@ -465,6 +485,7 @@ def _run_timed_pytorch_row(
                     result.gpu_kernel_stats = BenchmarkStats.from_timings(
                         bench_result.kernel_timings
                     )
+                assert bench_result.metadata is not None
 
                 if config.metrics.basic_enabled:
                     _collect_basic_metrics_post_loop(
@@ -498,25 +519,30 @@ def _run_timed_pytorch_row(
             result.status = "success"
 
         except UnsupportedGraphError as e:
-            result.status = "skipped"
-            result.skip_reason = str(e)
-            if role == "engine":
-                rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult.failed(
-                    rtol=rtol, atol=atol, error_message=str(e)
-                )
-        except Exception as e:
-            if role == "engine":
-                msg = str(e)
-                rtol, atol = _fallback_tolerance_for_config(config)
+            msg = str(e)
+            if strict_selection:
                 result.status = "error"
                 result.error_message = msg
+            else:
+                result.status = "skipped"
+                result.skip_reason = msg
+            if role == "engine":
+                rtol, atol = _fallback_tolerance_for_config(config)
                 result.correctness = CorrectnessResult.failed(
                     rtol=rtol, atol=atol, error_message=msg
                 )
+        except Exception as e:
+            msg = str(e)
+            if role == "engine" or strict_selection:
+                result.status = "error"
+                result.error_message = msg
+                if role == "engine":
+                    rtol, atol = _fallback_tolerance_for_config(config)
+                    result.correctness = CorrectnessResult.failed(
+                        rtol=rtol, atol=atol, error_message=msg
+                    )
             else:
-                result.skip_reason = str(e)
-
+                result.skip_reason = msg
     result.elapsed_time_ms = elapsed_timer.elapsed_ms
     return _TimedPytorchRow(result=result, outputs=outputs)
 
@@ -654,6 +680,7 @@ def run_graph_all_providers(
         )
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
     reference_error: Optional[str] = None
+    timed_reference: Optional[_TimedPytorchRow] = None
 
     (
         analytical_flops,
@@ -684,14 +711,31 @@ def run_graph_all_providers(
             reporter.print_engine_result(timed_reference.result)
         pe_results.append(timed_reference.result)
 
-    # A failed timed CUDA reference row is reported as skipped, but validation can
-    # still use the regular reference provider output computed on the same inputs.
+    # A strict PyTorch selection must run through the timed native path. It
+    # never falls back to CPU reference execution after that path fails.
     if ref_provider is not None and reference_outputs is None:
-        reference_outputs, reference_error = _compute_reference_outputs_once(
-            ref_provider,
-            graph_json,
-            graph_input_data,
-        )
+        if (
+            config.validation.provider is ReferenceProviderName.PYTORCH
+            and config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
+        ):
+            assert timed_reference is not None
+            reference_error = (
+                timed_reference.result.error_message
+                or timed_reference.result.skip_reason
+                or (
+                    f"Requested PyTorch SDPA backend "
+                    f"'{config.pytorch_sdpa_backend.value}' is unavailable; "
+                    "no fallback is used. The timed PyTorch reference did not "
+                    "produce outputs."
+                )
+            )
+        else:
+            reference_outputs, reference_error = _compute_reference_outputs_once(
+                ref_provider,
+                graph_json,
+                graph_input_data,
+                config,
+            )
 
     for selection in engine_selections:
         engine_id = selection.engine_id
@@ -796,22 +840,26 @@ def run_graph_pytorch_backend(
         pass
     if unsupported:
         msg = f"Graph contains unsupported operations: {unsupported}"
-        skipped = ProviderEngineResult(
+        strict_selection = (
+            config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
+        )
+        row = ProviderEngineResult(
             provider=provider,
             engine_id=0,
-            status="skipped",
-            skip_reason=msg,
+            status="error" if strict_selection else "skipped",
+            error_message=msg if strict_selection else None,
+            skip_reason=None if strict_selection else msg,
             correctness=CorrectnessResult.failed(
                 rtol=rtol, atol=atol, error_message=msg
             ),
         )
         if reporter is not None:
             reporter.print_engine_start(provider)
-            reporter.print_engine_result(skipped)
+            reporter.print_engine_result(row)
         return GraphResult(
             graph_name=graph_name,
             graph_path=str(graph_path),
-            results=[skipped],
+            results=[row],
             engine_ids=[0],
         )
 

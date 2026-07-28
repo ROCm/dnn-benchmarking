@@ -361,6 +361,11 @@ class SuiteMetadata:
         fail_combinations: Combinations that failed correctness.
         skip_combinations: Combinations skipped (unsupported).
         error_combinations: Combinations that errored during execution.
+        pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend for
+            PyTorch timing or reference validation; None when PyTorch was not
+            selected.
+        pytorch_rocm_fa_library_requested: Requested ROCm Flash Attention
+            implementation preference; None when not requested.
         rocm_version: ROCm/HIP version string (None on CUDA hosts).
         cuda_version: CUDA toolkit version the torch wheel was built
             against (None on ROCm hosts).
@@ -400,6 +405,8 @@ class SuiteMetadata:
     fail_combinations: int
     skip_combinations: int
     error_combinations: int
+    pytorch_sdpa_backend_requested: Optional[str] = None
+    pytorch_rocm_fa_library_requested: Optional[str] = None
     rocm_version: Optional[str] = None
     cuda_version: Optional[str] = None
     cudnn_version: Optional[str] = None
@@ -432,6 +439,10 @@ class SuiteMetadata:
             "fail_combinations": self.fail_combinations,
             "skip_combinations": self.skip_combinations,
             "error_combinations": self.error_combinations,
+            "pytorch_sdpa_backend_requested": self.pytorch_sdpa_backend_requested,
+            "pytorch_rocm_fa_library_requested": (
+                self.pytorch_rocm_fa_library_requested
+            ),
             "rocm_version": self.rocm_version,
             "cuda_version": self.cuda_version,
             "cudnn_version": self.cudnn_version,
@@ -469,7 +480,12 @@ class SuiteResult:
 
     @classmethod
     def from_graph_results(
-        cls, graph_results: List[GraphResult], total_graphs: int
+        cls,
+        graph_results: List[GraphResult],
+        total_graphs: int,
+        *,
+        pytorch_sdpa_backend_requested: Optional[str] = None,
+        pytorch_rocm_fa_library_requested: Optional[str] = None,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
         env_info = collect_environment_info()
@@ -515,6 +531,8 @@ class SuiteResult:
             fail_combinations=total_fail,
             skip_combinations=total_skip,
             error_combinations=total_error,
+            pytorch_sdpa_backend_requested=pytorch_sdpa_backend_requested,
+            pytorch_rocm_fa_library_requested=pytorch_rocm_fa_library_requested,
             rocm_version=env_info.get("rocm_version"),
             cuda_version=env_info.get("cuda_version"),
             cudnn_version=env_info.get("cudnn_version"),

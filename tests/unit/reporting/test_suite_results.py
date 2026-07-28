@@ -200,6 +200,22 @@ class TestProviderEngineResult:
         assert d["provider"] == "pytorch"
         assert "comparison_to_baseline" not in d
 
+    @pytest.mark.parametrize("status", ["success", "skipped", "error"])
+    def test_rows_do_not_repeat_suite_sdpa_selection(self, status):
+        kwargs = {}
+        if status == "skipped":
+            kwargs["skip_reason"] = "requested category unavailable"
+        elif status == "error":
+            kwargs["error_message"] = "execution failed"
+        pytorch = ProviderEngineResult(
+            provider="pytorch",
+            engine_id=0,
+            status=status,
+            **kwargs,
+        )
+
+        assert "pytorch_sdpa_backend_requested" not in pytorch.to_dict()
+
     def test_warnings_serialize_for_reference_timing_rows(self):
         pe = ProviderEngineResult(
             provider="pytorch",
@@ -463,6 +479,9 @@ class TestSuiteResult:
         assert meta_d["gpu_arch"] == "gfx942"
         assert meta_d["python_version"] == "3.12.3"
         assert meta_d["hipdnn_version"] == "0.1.0"
+        assert meta_d["pytorch_sdpa_backend_requested"] is None
+        assert meta_d["pytorch_rocm_fa_library_requested"] is None
+        assert "pytorch_sdpa_category_executed" not in meta_d
 
     def test_to_dict_graph_first_nesting(self):
         """SuiteResult.to_dict() produces graph-first nesting: top-level
@@ -511,6 +530,21 @@ class TestSuiteResult:
             assert "max_ms" in stats
             assert "p95_ms" in stats
             assert "p99_ms" in stats
+
+    def test_from_graph_results_preserves_pytorch_sdpa_requests(self) -> None:
+        result = SuiteResult.from_graph_results(
+            [],
+            total_graphs=0,
+            pytorch_sdpa_backend_requested="flash",
+            pytorch_rocm_fa_library_requested="aotriton",
+        )
+
+        assert result.metadata.pytorch_sdpa_backend_requested == "flash"
+        assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
+        metadata = result.to_dict()["metadata"]
+        assert metadata["pytorch_sdpa_backend_requested"] == "flash"
+        assert metadata["pytorch_rocm_fa_library_requested"] == "aotriton"
+        assert "pytorch_sdpa_category_executed" not in metadata
 
 
 class TestCollectEnvironmentInfo:

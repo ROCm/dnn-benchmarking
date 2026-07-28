@@ -18,6 +18,8 @@ from dnn_benchmarking.execution.suite_runner import (
     _BFLOAT16_RTOL,
     _BFLOAT16_ATOL,
     _run_timed_pytorch_row,
+    _TimedPytorchRow,
+    _compute_reference_outputs_once,
     set_plugin_path,
 )
 from dnn_benchmarking.config.benchmark_config import (
@@ -27,7 +29,11 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
-from dnn_benchmarking.reporting.statistics import BenchmarkStats
+from dnn_benchmarking.reporting.statistics import (
+    BenchmarkMetadata,
+    BenchmarkResult,
+    BenchmarkStats,
+)
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
@@ -926,6 +932,166 @@ class TestCorrectnessChecking:
         assert ref_provider.compute_reference.call_count == 1
         assert mock_check_corr.call_args.args[3] is ref_outputs
 
+    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
+    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_validate_pytorch_nondefault_never_falls_back_after_timed_failure(
+        self,
+        mock_bm_cls,
+        mock_exec_cls,
+        mock_check_corr,
+        mock_get_ref,
+        mock_resolve_name,
+        mock_timed_reference,
+    ):
+        reason = "The graph did not execute a native forward SDPA call."
+        ref_provider = MagicMock()
+        mock_get_ref.return_value = ref_provider
+        mock_timed_reference.return_value = _TimedPytorchRow(
+            result=ProviderEngineResult(
+                provider="pytorch",
+                engine_id=0,
+                status="error",
+                role="reference",
+                error_message=reason,
+            ),
+            outputs=None,
+        )
+        mock_resolve_name.return_value = "engine_1"
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[1])
+        mock_bm_cls.return_value = _make_bm_mock()
+
+        result = run_graph_all_providers(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            tensor_infos=[_make_tensor_info(1)],
+            config=_make_config(
+                validation=ValidationConfig(provider="pytorch"),
+                pytorch_sdpa_backend="math",
+            ),
+            handle=MagicMock(),
+        )
+
+        ref_provider.compute_reference.assert_not_called()
+        mock_check_corr.assert_not_called()
+        assert result.results[0].error_message == reason
+
+    def test_cpu_pytorch_reference_receives_rocm_fa_preference(self) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            PyTorchReferenceProvider,
+        )
+
+        class ScopedProvider(PyTorchReferenceProvider):
+            def compute_reference(self, graph_json, input_data):
+                state = _sdpa_backend._ACTIVE_SDPA_BACKEND.get()
+                assert state is not None
+                assert state.selection is PyTorchSdpaBackendName.FLASH
+                assert state.rocm_fa_library == "aotriton"
+                return {}
+
+        outputs, error = _compute_reference_outputs_once(
+            ScopedProvider(),
+            _make_graph_json(),
+            {},
+            _make_config(
+                validation=ValidationConfig(provider="pytorch"),
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
+            ),
+        )
+
+        assert outputs is None
+        assert error is not None
+        assert "The graph did not execute a native forward SDPA call." in error
+
+    def test_cpu_pytorch_reference_succeeds_after_native_sdpa(self) -> None:
+        import torch
+
+        from dnn_benchmarking.execution import pytorch_ops
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            PyTorchReferenceProvider,
+        )
+
+        class ExecutedProvider(PyTorchReferenceProvider):
+            def compute_reference(self, graph_json, input_data):
+                query = torch.rand(1, 1, 2, 4)
+                return pytorch_ops.execute_selected_sdpa(
+                    query,
+                    query,
+                    query,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=None,
+                )
+
+        outputs, error = _compute_reference_outputs_once(
+            ExecutedProvider(),
+            _make_graph_json(),
+            {},
+            _make_config(
+                validation=ValidationConfig(provider="pytorch"),
+                pytorch_sdpa_backend="math",
+            ),
+        )
+
+        assert outputs is not None
+        assert error is None
+
+    def test_cpu_pytorch_reference_preserves_unavailable_selection(self) -> None:
+        from contextlib import nullcontext
+
+        import torch
+        from torch.nn import attention
+
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution import pytorch_ops
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            PyTorchReferenceProvider,
+        )
+
+        class StrictCpuProvider(PyTorchReferenceProvider):
+            def compute_reference(self, graph_json, input_data):
+                query = torch.rand(1, 1, 2, 4)
+                return pytorch_ops.execute_selected_sdpa(
+                    query,
+                    query,
+                    query,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=None,
+                )
+
+        dispatch_error = RuntimeError("No viable backend for this CPU input")
+        sdpa = MagicMock(side_effect=dispatch_error)
+        with (
+            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
+            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
+        ):
+            outputs, error = _compute_reference_outputs_once(
+                StrictCpuProvider(),
+                _make_graph_json(),
+                {},
+                _make_config(
+                    validation=ValidationConfig(provider="pytorch"),
+                    pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT,
+                ),
+            )
+
+        assert outputs is None
+        assert error is not None
+        assert error.startswith(
+            "Requested PyTorch SDPA backend 'efficient' is unavailable; "
+            "no fallback is used."
+        )
+        sdpa.assert_called_once()
+
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
     def test_timed_pytorch_reference_uses_auto_timing(
@@ -941,6 +1107,7 @@ class TestCorrectnessChecking:
         bench_result.kernel_timings = None
         bench_result.has_kernel_timings = False
         executor.benchmark.return_value = bench_result
+        bench_result.metadata = BenchmarkMetadata()
         mock_pytorch_executor_cls.return_value = executor
 
         buffer_manager = _make_bm_mock()
@@ -956,6 +1123,8 @@ class TestCorrectnessChecking:
             config=_make_config(
                 validation=ValidationConfig(provider="pytorch"),
                 metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
             ),
             input_data={},
             analytical_flops=None,
@@ -967,6 +1136,9 @@ class TestCorrectnessChecking:
         assert result.result.host_stats is not None
         assert result.result.gpu_kernel_stats is None
         assert result.result.status == "success"
+        benchmark_config = mock_pytorch_executor_cls.call_args.args[1]
+        assert benchmark_config.pytorch_sdpa_backend.value == "flash"
+        assert benchmark_config.pytorch_rocm_fa_library == "aotriton"
 
 
 @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
@@ -1493,7 +1665,10 @@ class TestTimedPytorchRowEngineRole:
             graph_json=_make_graph_json(),
             graph_name="test_graph",
             tensor_infos=[],
-            config=_make_config(metrics=MetricsConfig(tier="off")),
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="flash",
+            ),
             input_data={},
             analytical_flops=None,
             analytical_flops_partial=False,
@@ -1505,7 +1680,7 @@ class TestTimedPytorchRowEngineRole:
         assert "no GPU" in (row.result.error_message or "")
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    def test_reference_role_failure_is_skip(self, mock_pytorch_executor_cls):
+    def test_reference_role_strict_failure_is_error(self, mock_pytorch_executor_cls):
         mock_pytorch_executor_cls.side_effect = RuntimeError("no GPU")
 
         row = _run_timed_pytorch_row(
@@ -1513,7 +1688,10 @@ class TestTimedPytorchRowEngineRole:
             graph_json=_make_graph_json(),
             graph_name="test_graph",
             tensor_infos=[],
-            config=_make_config(metrics=MetricsConfig(tier="off")),
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="efficient",
+            ),
             input_data={},
             analytical_flops=None,
             analytical_flops_partial=False,
@@ -1521,5 +1699,77 @@ class TestTimedPytorchRowEngineRole:
             role="reference",
         )
 
-        assert row.result.status == "skipped"
-        assert "no GPU" in (row.result.skip_reason or "")
+        assert row.result.status == "error"
+        assert "no GPU" in (row.result.error_message or "")
+
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    def test_strict_reference_output_failure_is_error(
+        self,
+        mock_pytorch_executor_cls,
+        mock_buffer_manager_cls,
+    ):
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+        executor.benchmark.return_value = BenchmarkResult(
+            host_timings=[1.0],
+            kernel_timings=[0.5],
+            metadata=BenchmarkMetadata(),
+        )
+        executor.execute_once.side_effect = RuntimeError("output pass failed")
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="math",
+            ),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "error"
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    def test_reference_role_strict_backend_unavailable_is_marked_for_no_fallback(
+        self, mock_pytorch_executor_cls
+    ):
+        from dnn_benchmarking.execution.pytorch_ops import (
+            PyTorchSdpaBackendUnavailableError,
+        )
+
+        reason = (
+            "Requested PyTorch ROCm Flash Attention library 'aotriton' is "
+            "unavailable; no fallback is used."
+        )
+        mock_pytorch_executor_cls.side_effect = PyTorchSdpaBackendUnavailableError(
+            reason
+        )
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(
+                metrics=MetricsConfig(tier="off"),
+                pytorch_sdpa_backend="flash",
+                pytorch_rocm_fa_library="aotriton",
+            ),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "error"
+        assert row.result.error_message == reason

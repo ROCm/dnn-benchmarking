@@ -12,6 +12,8 @@ from typing import Any, FrozenSet, List, Optional
 from ..config.benchmark_config import (
     EXECUTION_BACKEND_CHOICES,
     ExecutionBackendName,
+    PYTORCH_SDPA_BACKEND_CHOICES,
+    PyTorchSdpaBackendName,
     REFERENCE_PROVIDER_CHOICES,
     ReferenceProviderName,
 )
@@ -103,6 +105,7 @@ def _parse_plugin_path_list(s: str) -> List[Path]:
 
 _BACKEND_CHOICES = EXECUTION_BACKEND_CHOICES
 _REFERENCE_PROVIDER_HELP = ", ".join(sorted(REFERENCE_PROVIDER_CHOICES))
+_PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
 _METRICS_TIER_CHOICES = frozenset({"basic", "off"})
 _EMIT_TRACE_CHOICES = frozenset({"pftrace", "kineto"})
 _PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
@@ -251,6 +254,41 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         ),
         config_key="validate",
         config_kind=ConfigKind.CHOICE,
+        config_type=str,
+    ),
+    CliOption(
+        flags=("--pytorch-sdpa-backend",),
+        dest="pytorch_sdpa_backend",
+        parser_type=str,
+        choices=PYTORCH_SDPA_BACKEND_CHOICES,
+        default=PyTorchSdpaBackendName.DEFAULT.value,
+        metavar="BACKEND",
+        group="Reference Validation",
+        help=(
+            "PyTorch scaled-dot-product-attention category (default: default). "
+            f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default categories are "
+            "strict: the graph must execute native forward SDPA through the "
+            "selected category or it errors; no default or CPU fallback is tried."
+        ),
+        config_key="pytorch_sdpa_backend",
+        config_kind=ConfigKind.CHOICE,
+        config_type=str,
+    ),
+    CliOption(
+        flags=("--pytorch-rocm-fa-library",),
+        dest="pytorch_rocm_fa_library",
+        parser_type=str,
+        default=None,
+        metavar="LIBRARY",
+        group="Reference Validation",
+        help=(
+            "ROCm Flash Attention implementation preference forwarded unchanged "
+            "to PyTorch (for example: aotriton). Requires "
+            "--pytorch-sdpa-backend flash; ROCm-only. PyTorch rejects unknown "
+            "preferences."
+        ),
+        config_key="pytorch_rocm_fa_library",
+        config_kind=ConfigKind.SCALAR,
         config_type=str,
     ),
     CliOption(
@@ -475,6 +513,10 @@ Examples:
 PyTorch Backend (GPU via PyTorch):
   dnn-benchmark -g ./graph.json --backend pytorch
   dnn-benchmark -g ./graph.json --backend pytorch -o pytorch_results.json
+  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend flash --pytorch-rocm-fa-library aotriton -o pytorch_flash_aotriton.json
+  default preserves normal dispatch. Non-default categories are strict.
+  On ROCm, --pytorch-rocm-fa-library forwards a Flash implementation preference
+  (for example, aotriton); PyTorch may use another implementation.
 
 Reference Validation:
   dnn-benchmark -g ./graph.json --validate pytorch

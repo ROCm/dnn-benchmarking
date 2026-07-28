@@ -20,6 +20,12 @@ from ._registry import (
     supports_graph,
 )
 from ._common import ReplayTensors
+from ._sdpa_backend import (
+    PyTorchSdpaBackendState,
+    PyTorchSdpaBackendUnavailableError,
+    execute_selected_sdpa,
+    use_pytorch_sdpa_backend,
+)
 from ._warnings import get_reference_warnings
 
 # Import handler submodules so their @register_handler decorators run.
@@ -39,6 +45,10 @@ __all__ = [
     "CompiledOp",
     "CompiledGraph",
     "ReplayTensors",
+    "PyTorchSdpaBackendUnavailableError",
+    "PyTorchSdpaBackendState",
+    "use_pytorch_sdpa_backend",
+    "execute_selected_sdpa",
     "register_handler",
     "get_handler",
     "get_supported_operations",

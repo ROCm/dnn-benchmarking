@@ -285,6 +285,45 @@ class TestPyTorchCudaExecutor:
 
         assert len(result.host_timings) == 1
 
+    def test_flash_rocm_preference_reports_requested_metadata(self):
+        """Flash selection forwards and records an AOTriton preference."""
+        from dnn_benchmarking.common import torch_support
+
+        skip_if_no_gpu_torch()
+        if not torch_support.is_rocm_build():
+            pytest.skip("AOTriton SDPA selection is ROCm-only")
+
+        graph_path = Path(__file__).parent.parent.parent / "graphs" / "sample_sdpa.json"
+        loader = GraphLoader()
+        graph_json = loader.load_json(graph_path)
+        tensor_infos = loader.extract_tensor_info(graph_json)
+        config = BenchmarkConfig(
+            graph_path=graph_path,
+            warmup_iters=1,
+            benchmark_iters=1,
+            pytorch_sdpa_backend="flash",
+            pytorch_rocm_fa_library="aotriton",
+        )
+
+        executor = PyTorchCudaExecutor(graph_json, config)
+        executor.prepare()
+        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
+            buffer_manager.allocate_all()
+            buffer_manager.fill_inputs_random(seed=42)
+            buffer_manager.zero_outputs()
+            tensors = buffer_manager.get_tensors()
+            executor.warmup(tensors)
+            result = executor.benchmark(
+                tensors,
+                graph_name="flash_aotriton_sdpa_backend",
+            )
+
+        assert result.host_timings and result.host_timings[0] > 0
+        assert result.kernel_timings and result.kernel_timings[0] > 0
+        assert result.metadata is not None
+        assert result.metadata.pytorch_sdpa_backend_requested == "flash"
+        assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
+
     def test_json_export(self, sample_conv_graph, tmp_path):
         """Test that benchmark results can be exported to JSON."""
         skip_if_no_gpu_torch()

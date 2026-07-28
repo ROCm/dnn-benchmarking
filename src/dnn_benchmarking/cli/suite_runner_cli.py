@@ -13,6 +13,7 @@ from ..common.exceptions import ExecutionError, GraphLoadError
 from ..config.benchmark_config import (
     ExecutionBackendName,
     MetricsConfig,
+    PyTorchSdpaBackendName,
     ReferenceProviderName,
     SuiteConfig,
     ValidationConfig,
@@ -99,7 +100,21 @@ def _run_suite_graphs_after_startup(
             reporter.print_graph_result_table(gr)
         graph_results.append(gr)
 
-    suite_result = SuiteResult.from_graph_results(graph_results, total_graphs=total)
+    pytorch_selected = (
+        config.backend is ExecutionBackendName.PYTORCH
+        or config.validation.provider is ReferenceProviderName.PYTORCH
+    )
+
+    suite_result = SuiteResult.from_graph_results(
+        graph_results,
+        total_graphs=total,
+        pytorch_sdpa_backend_requested=(
+            config.pytorch_sdpa_backend.value if pytorch_selected else None
+        ),
+        pytorch_rocm_fa_library_requested=(
+            config.pytorch_rocm_fa_library if pytorch_selected else None
+        ),
+    )
 
     reporter.print_suite_summary(suite_result.metadata)
     reporter.print_suite_footer()
@@ -223,6 +238,18 @@ def run_suite_cli(
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
             )
+        if (
+            (
+                args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value
+                or args.pytorch_rocm_fa_library is not None
+            )
+            and backend is not ExecutionBackendName.PYTORCH
+            and validation.provider is not ReferenceProviderName.PYTORCH
+        ):
+            reporter.print_warning(
+                "PyTorch SDPA options are ignored unless --backend pytorch or "
+                "--validate pytorch is selected"
+            )
         plugin_paths = None
         if backend is not ExecutionBackendName.PYTORCH:
             plugin_paths = args.plugin_path or _plugin_paths_from_environment()
@@ -236,6 +263,8 @@ def run_suite_cli(
             validation=validation,
             plugin_paths=plugin_paths,
             backend=backend,
+            pytorch_sdpa_backend=args.pytorch_sdpa_backend,
+            pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
         )
     except ValueError as e:
         reporter.print_error(f"Suite configuration error: {e}")

@@ -348,6 +348,7 @@ class TestSuiteCLIIntegration:
 
         assert "metadata" in data
         assert "graphs" in data
+        assert data["metadata"]["pytorch_sdpa_backend_requested"] is None
         assert data["metadata"]["total_graphs"] > 0
         assert len(data["graphs"]) == data["metadata"]["total_graphs"]
 
@@ -355,6 +356,8 @@ class TestSuiteCLIIntegration:
         for g in data["graphs"]:
             assert "graph_name" in g
             assert "results" in g
+            for row in g["results"]:
+                assert "pytorch_sdpa_backend_requested" not in row
             assert len(g["results"]) > 0
 
     def test_suite_mode_single_graph_failure_continues(
@@ -561,7 +564,7 @@ class TestPyTorchBackendCLIIntegration:
     def test_pytorch_backend_multi_graph_suite_json(
         self, project_root: Path, tmp_path: Path
     ) -> None:
-        """--backend pytorch with multiple graphs emits one SuiteResult JSON."""
+        """Default PyTorch dispatch succeeds for multiple non-SDPA graphs."""
         output_file = tmp_path / "pytorch_results.json"
         result = subprocess.run(
             [
@@ -591,6 +594,7 @@ class TestPyTorchBackendCLIIntegration:
         )
         assert output_file.exists(), result.stdout
         data = json.loads(output_file.read_text())
+        assert data["metadata"]["pytorch_sdpa_backend_requested"] == "default"
         assert len(data["graphs"]) == 2
         for graph in data["graphs"]:
             providers = {r["provider"] for r in graph["results"]}
@@ -601,3 +605,89 @@ class TestPyTorchBackendCLIIntegration:
                 # "auto" timing yields HIP events on ROCm and torch.cuda
                 # events on CUDA, so kernel stats exist on both.
                 assert row["gpu_kernel_stats"], row
+                assert "pytorch_sdpa_backend_requested" not in row
+
+    def test_flash_rocm_preference_serializes_suite_metadata(
+        self, project_root: Path, tmp_path: Path
+    ) -> None:
+        """Suite JSON owns the requested ROCm Flash library preference."""
+        output_file = tmp_path / "pytorch_flash_aotriton.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "dnn_benchmarking",
+                "--graph",
+                str(_graphs_dir() / "sample_sdpa.json"),
+                "--backend",
+                "pytorch",
+                "--pytorch-sdpa-backend",
+                "flash",
+                "--pytorch-rocm-fa-library",
+                "aotriton",
+                "--warmup",
+                "1",
+                "--iters",
+                "1",
+                "-o",
+                str(output_file),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0, (
+            f"Unexpected exit code {result.returncode}. "
+            f"stdout: {result.stdout} stderr: {result.stderr}"
+        )
+        data = json.loads(output_file.read_text())
+        metadata = data["metadata"]
+        assert metadata["pytorch_sdpa_backend_requested"] == "flash"
+        assert metadata["pytorch_rocm_fa_library_requested"] == "aotriton"
+        assert (
+            "pytorch_rocm_fa_library_requested" not in data["graphs"][0]["results"][0]
+        )
+
+    def test_nondefault_pytorch_selection_errors_without_native_sdpa(
+        self, project_root: Path, tmp_path: Path
+    ) -> None:
+        """A selected backend rejects graphs that never reach native SDPA."""
+        output_file = tmp_path / "strict_pytorch_results.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "dnn_benchmarking",
+                "--graph",
+                str(_graphs_dir() / "sample_conv_fwd.json"),
+                str(_graphs_dir() / "sample_relu.json"),
+                "--backend",
+                "pytorch",
+                "--pytorch-sdpa-backend",
+                "math",
+                "--warmup",
+                "1",
+                "--iters",
+                "2",
+                "-o",
+                str(output_file),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 1, (
+            f"Unexpected exit code {result.returncode}. "
+            f"stdout: {result.stdout} stderr: {result.stderr}"
+        )
+        data = json.loads(output_file.read_text())
+        assert data["metadata"]["pytorch_sdpa_backend_requested"] == "math"
+        for graph in data["graphs"]:
+            row = graph["results"][0]
+            assert row["status"] == "error"
+            assert "native forward SDPA call" in row["error_message"]
+            assert "pytorch_sdpa_backend_requested" not in row
+            assert "host_stats" not in row
+            assert "gpu_kernel_stats" not in row

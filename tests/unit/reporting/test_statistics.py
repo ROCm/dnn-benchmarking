@@ -88,6 +88,8 @@ class TestBenchmarkMetadata:
         assert metadata.engine_id == 0
         assert metadata.timing_backend == ""
         # hostname and timestamp are auto-generated
+        assert metadata.pytorch_sdpa_backend_requested is None
+        assert metadata.pytorch_rocm_fa_library_requested is None
         assert metadata.hostname != ""
         assert metadata.timestamp != ""
 
@@ -163,6 +165,25 @@ class TestBenchmarkResult:
         assert data["metadata"]["graph_name"] == "test"
         assert data["metadata"]["timing_backend"] == "hip"
         assert data["metadata"]["benchmark_iters"] == 100
+
+    def test_sdpa_requests_round_trip_through_result_json(self) -> None:
+        result = BenchmarkResult(
+            host_timings=[1.0],
+            metadata=BenchmarkMetadata(
+                pytorch_sdpa_backend_requested="flash",
+                pytorch_rocm_fa_library_requested="aotriton",
+            ),
+        )
+
+        serialized = result.to_dict()
+        loaded = BenchmarkResult.from_dict(serialized)
+
+        assert serialized["metadata"]["pytorch_sdpa_backend_requested"] == "flash"
+        assert serialized["metadata"]["pytorch_rocm_fa_library_requested"] == "aotriton"
+        assert "pytorch_sdpa_category_executed" not in serialized["metadata"]
+        assert loaded.metadata is not None
+        assert loaded.metadata.pytorch_sdpa_backend_requested == "flash"
+        assert loaded.metadata.pytorch_rocm_fa_library_requested == "aotriton"
 
     def test_to_json(self) -> None:
         """Test to_json produces valid JSON."""

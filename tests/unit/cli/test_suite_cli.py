@@ -119,6 +119,39 @@ class TestParserGlobAndFilters:
         args = parser.parse_args(["--graph", "g.json", "--verbose"])
         assert args.verbose is True
 
+    def test_pytorch_sdpa_backend_defaults_to_default(self) -> None:
+        args = create_parser().parse_args(["--graph", "g.json"])
+        assert args.pytorch_sdpa_backend == "default"
+
+    def test_pytorch_rocm_fa_library_defaults_to_none(self) -> None:
+        args = create_parser().parse_args(["--graph", "g.json"])
+        assert args.pytorch_rocm_fa_library is None
+
+    def test_pytorch_rocm_fa_library_accepts_arbitrary_string(self) -> None:
+        args = create_parser().parse_args(
+            [
+                "--graph",
+                "g.json",
+                "--pytorch-rocm-fa-library",
+                "aotriton",
+            ]
+        )
+        assert args.pytorch_rocm_fa_library == "aotriton"
+
+    @pytest.mark.parametrize("shorthand", ["aotriton", "aotriton_preferred"])
+    def test_pytorch_sdpa_backend_rejects_removed_aotriton_shorthand(
+        self, shorthand: str
+    ) -> None:
+        with pytest.raises(SystemExit):
+            create_parser().parse_args(
+                ["--graph", "g.json", "--pytorch-sdpa-backend", shorthand]
+            )
+
+    def test_pytorch_sdpa_backend_help_describes_rocm_preference_option(self) -> None:
+        help_text = create_parser().format_help()
+        assert "--pytorch-rocm-fa-library" in help_text
+        assert "forwarded unchanged to PyTorch" in help_text
+
 
 class TestMainRouting:
     """Tests for main() routing — single and multi files both go through the orchestrator."""
@@ -777,6 +810,100 @@ class TestRunSuiteWorkflow:
         assert result == 1
 
 
+class TestPyTorchSdpaBackendCli:
+    """PyTorch SDPA selector compatibility and SuiteConfig forwarding."""
+
+    @pytest.mark.parametrize(
+        "flow",
+        [
+            ["--backend", "pytorch"],
+            ["--validate", "pytorch"],
+        ],
+    )
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_selector_is_allowed_for_each_pytorch_flow(
+        self, mock_benchmark: MagicMock, flow: list[str]
+    ) -> None:
+        from dnn_benchmarking.cli.suite_runner_cli import run_suite_cli
+
+        mock_benchmark.return_value = 0
+        args = create_parser().parse_args(
+            [
+                "--graph",
+                "g.json",
+                *flow,
+                "--pytorch-sdpa-backend",
+                "flash",
+                "--pytorch-rocm-fa-library",
+                "aotriton",
+            ]
+        )
+
+        assert (
+            run_suite_cli(
+                args,
+                graph_paths=[Path("g.json")],
+                reporter=MagicMock(spec=Reporter),
+            )
+            == 0
+        )
+        config = mock_benchmark.call_args.kwargs["config"]
+        assert config.pytorch_sdpa_backend.value == "flash"
+        assert config.pytorch_rocm_fa_library == "aotriton"
+
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_non_default_selector_warns_without_a_pytorch_path(
+        self, mock_benchmark: MagicMock
+    ) -> None:
+        from dnn_benchmarking.cli.suite_runner_cli import run_suite_cli
+
+        mock_benchmark.return_value = 0
+        reporter = MagicMock(spec=Reporter)
+        args = create_parser().parse_args(
+            [
+                "--graph",
+                "g.json",
+                "--pytorch-sdpa-backend",
+                "flash",
+                "--pytorch-rocm-fa-library",
+                "aotriton",
+            ]
+        )
+
+        assert run_suite_cli(args, graph_paths=[Path("g.json")], reporter=reporter) == 0
+        reporter.print_warning.assert_called_once_with(
+            "PyTorch SDPA options are ignored unless --backend pytorch or "
+            "--validate pytorch is selected"
+        )
+
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_rocm_preference_requires_flash_selector(
+        self, mock_benchmark: MagicMock
+    ) -> None:
+        from dnn_benchmarking.cli.suite_runner_cli import run_suite_cli
+
+        reporter = MagicMock(spec=Reporter)
+        args = create_parser().parse_args(
+            [
+                "--graph",
+                "g.json",
+                "--backend",
+                "pytorch",
+                "--pytorch-sdpa-backend",
+                "math",
+                "--pytorch-rocm-fa-library",
+                "aotriton",
+            ]
+        )
+
+        assert run_suite_cli(args, graph_paths=[Path("g.json")], reporter=reporter) == 1
+        reporter.print_error.assert_called_once_with(
+            "Suite configuration error: "
+            "pytorch_rocm_fa_library requires pytorch_sdpa_backend='flash'"
+        )
+        mock_benchmark.assert_not_called()
+
+
 class TestBackendEngineRouting:
     """Tests for engine selection rules across execution backends."""
 
@@ -843,7 +970,20 @@ class TestBackendEngineRouting:
     def test_validate_pytorch_with_pytorch_backend_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             graph = self._create_graph(Path(tmpdir))
-            assert self._run_main_with_args(graph, ["--validate", "pytorch"]) == 1
+            assert (
+                self._run_main_with_args(
+                    graph,
+                    [
+                        "--validate",
+                        "pytorch",
+                        "--pytorch-sdpa-backend",
+                        "flash",
+                        "--pytorch-rocm-fa-library",
+                        "aotriton",
+                    ],
+                )
+                == 1
+            )
 
     def test_profiling_flags_with_pytorch_backend_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

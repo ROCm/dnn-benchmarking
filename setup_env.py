@@ -66,6 +66,30 @@ def run(cmd, *, env=None, check=True, **kwargs):
     return subprocess.run(list(cmd), env=env, check=check, **kwargs)
 
 
+def require_working_cmake() -> str:
+    """Return the PATH-selected CMake executable after a startup check."""
+    cmake = shutil.which("cmake")
+    if not cmake:
+        fail("cmake not found on PATH.")
+    try:
+        result = subprocess.run(
+            [cmake, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        fail(f"cmake at {cmake} cannot run: {error}")
+    if result.returncode:
+        fail(
+            f"cmake at {cmake} failed its startup check (exit {result.returncode}).",
+            result.stderr.strip()
+            or "Fix the selected cmake executable or PATH before retrying.",
+        )
+    return cmake
+
+
 def run_git(args, **kwargs):
     """Run git with the given args; raise on nonzero exit."""
     return run(["git", *args], **kwargs)
@@ -881,8 +905,7 @@ class Setup:
         return prefix_path, program_path
 
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
-        if not shutil.which("cmake"):
-            fail("cmake not found on PATH.")
+        cmake = require_working_cmake()
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
@@ -893,7 +916,7 @@ class Setup:
         print(f"Building hipDNN and providers to {install_prefix}...")
         run(
             [
-                "cmake",
+                cmake,
                 "--preset",
                 "hipdnn-providers-all",
                 "-GNinja",
@@ -916,17 +939,18 @@ class Setup:
             env=self._build_env(),
         )
         run(
-            ["cmake", "--build", str(build_dir)],
+            [cmake, "--build", str(build_dir)],
             env=self._build_env(),
         )
         run(
-            ["cmake", "--install", str(build_dir)],
+            [cmake, "--install", str(build_dir)],
             env=self._build_env(),
         )
 
     def build_and_install_bindings(
         self, install_prefix: str, toolchain_prefix: str
     ) -> None:
+        cmake = require_working_cmake()
         python_dir = HIPDNN_ROOT / "python"
         bindings_source = python_dir / "frontend_bindings"
         if not bindings_source.is_dir():
@@ -941,7 +965,7 @@ class Setup:
         self.pip("install", "build")
         run(
             [
-                "cmake",
+                cmake,
                 "-S",
                 str(bindings_source),
                 "-B",
@@ -956,7 +980,7 @@ class Setup:
             ],
             env=self._build_env(),
         )
-        run(["cmake", "--build", str(bindings_build)], env=self._build_env())
+        run([cmake, "--build", str(bindings_build)], env=self._build_env())
         run(
             [
                 self.py,

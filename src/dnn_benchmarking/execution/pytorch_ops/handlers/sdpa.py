@@ -7,10 +7,10 @@ from math import sqrt
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
+from .._sdpa_backend import execute_selected_sdpa
 
 
 def _sdpa_bool(node: Dict[str, Any], key: str, default: bool = False) -> bool:
@@ -143,9 +143,6 @@ def _call_sdpa(
     rep_k: int,
     rep_v: int,
 ) -> torch.Tensor:
-    kwargs: Dict[str, Any] = {}
-    if scale is not None:
-        kwargs["scale"] = scale
     # Expand K and V independently to the query head count. PyTorch's
     # enable_gqa only models equal K/V head counts, so explicit repeat is the
     # only correct path when Hk != Hv.
@@ -153,14 +150,14 @@ def _call_sdpa(
         k = k.repeat_interleave(rep_k, dim=-3)
     if rep_v > 1:
         v = v.repeat_interleave(rep_v, dim=-3)
-    return F.scaled_dot_product_attention(
+    return execute_selected_sdpa(
         q,
         k,
         v,
         attn_mask=attn_mask,
         dropout_p=dropout_p,
         is_causal=is_causal,
-        **kwargs,
+        scale=scale,
     )
 
 
