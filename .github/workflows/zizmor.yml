@@ -18,7 +18,7 @@ permissions: {}
 
 jobs:
   zizmor:
-    runs-on: ubuntu-24.04
+    runs-on: aws-linux-scale-rocm-small
     timeout-minutes: 15
     permissions:
       actions: read
