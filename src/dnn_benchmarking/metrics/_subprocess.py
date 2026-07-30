@@ -28,16 +28,41 @@ _REAP_TIMEOUT_S = 5
 
 
 def _kill_tree(proc: "subprocess.Popen[str]") -> None:
-    """Kill the tool and everything it spawned.
+    """Kill the tool and every process it spawned.
 
-    ponytail: POSIX process-group kill. On Windows only the direct child
-    dies, so a tool that orphans the workload can still hold the pipes;
-    switch to a job object if Windows profiling ever wedges in practice.
+    Killing only the direct child is not enough: its descendants keep the
+    captured pipes open, and closing a pipe whose read is still in flight
+    blocks until the last writer exits — which is exactly the hang this
+    module exists to prevent (Windows CI measured 30s against a 2s cap).
+    POSIX kills the session's process group; Windows has no process
+    groups worth the name, so walk the tree with ``taskkill /T``.
     """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=_REAP_TIMEOUT_S,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            # taskkill missing or wedged; the direct child is still worth
+            # killing even though its descendants will survive.
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (AttributeError, OSError):
-        proc.kill()
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def run_capped(
@@ -48,6 +73,8 @@ def run_capped(
     Drop-in for ``subprocess.run(argv, capture_output=True, text=True,
     check=False, timeout=timeout_s)`` — same return value, same
     exceptions — except that the timeout also applies to grandchildren.
+    Any abnormal exit tears the process tree down, so cancelling the
+    caller cannot leave a profiler and its GPU workload running.
 
     Args:
         argv: Command to run.
@@ -57,7 +84,8 @@ def run_capped(
         The completed process with ``stdout``/``stderr`` as text.
 
     Raises:
-        subprocess.TimeoutExpired: after the process group is killed.
+        subprocess.TimeoutExpired: after the process tree is killed.
+        KeyboardInterrupt, SystemExit: likewise, after the kill.
         OSError: if the tool can't be spawned.
     """
     with subprocess.Popen(
@@ -69,13 +97,16 @@ def run_capped(
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
+        except BaseException:
+            # Every abnormal exit, not just TimeoutExpired: the tool runs
+            # in its own session, so a Ctrl-C or SystemExit in this
+            # process never reaches it and would leave rocprofv3 (and the
+            # GPU workload under it) running after we're gone.
             _kill_tree(proc)
             try:
-                # Reap the killed group. Bounded: a grandchild that called
-                # setsid() escaped the group and can still hold the pipes,
-                # and an unbounded reap there would reintroduce the very
-                # hang this function exists to prevent.
+                # Bounded reap: a grandchild that called setsid() escaped
+                # the group and can still hold the pipes, and an unbounded
+                # wait here would reintroduce the very hang we prevent.
                 proc.communicate(timeout=_REAP_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 pass

@@ -166,11 +166,20 @@ def unify_rocprofiler_libs(core_lib: Path, devel_lib: Path) -> int:
         target = core_by_id.get((info.st_dev, info.st_ino))
         if target is None:
             continue
+        # Build the replacement first and swap it in atomically: unlinking
+        # the hardlink up front would destroy the only remaining name for
+        # the library if symlink creation then failed (Windows without
+        # developer mode, restricted permissions), leaving the devel
+        # prefix short a library it can never get back.
+        staged = dup.with_name(dup.name + ".unify-tmp")
         try:
-            dup.unlink()
-            dup.symlink_to(target)
+            if staged.is_symlink() or staged.exists():
+                staged.unlink()
+            staged.symlink_to(target)
+            os.replace(staged, dup)
         except OSError as e:
-            # Windows needs developer mode or admin rights for symlinks.
+            if staged.is_symlink() or staged.exists():
+                staged.unlink()
             print(f"WARNING: could not relink {dup} -> {target}: {e}")
             return relinked
         relinked += 1

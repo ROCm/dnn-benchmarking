@@ -10,13 +10,26 @@ front-end and then waits on those pipes forever, so a wedged rocprofv3
 hangs the whole benchmark instead of skipping one pass.
 """
 
+import os
 import subprocess
 import sys
 import time
 
 import pytest
 
+from dnn_benchmarking.metrics import _subprocess as _subprocess_mod
 from dnn_benchmarking.metrics._subprocess import run_capped
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
 
 # Spawns a grandchild that outlives it and holds the inherited pipes,
 # exactly like rocprofv3/perf/rocprof-compute do with the workload.
@@ -71,3 +84,49 @@ class TestRunCapped:
     def test_missing_binary_raises_oserror(self, tmp_path):
         with pytest.raises(OSError):
             run_capped([str(tmp_path / "definitely-not-a-binary")], 10)
+
+    def test_cancellation_kills_the_tool(self, monkeypatch):
+        """KeyboardInterrupt/SystemExit must tear the tool down too. The
+        tool runs in its own session, so a Ctrl-C in this process never
+        reaches it — without explicit cleanup rocprofv3 and the GPU
+        workload under it would outlive the cancelled run."""
+        real_communicate = subprocess.Popen.communicate
+        interrupted = []
+
+        def interrupt_once(self, input=None, timeout=None):
+            if not interrupted:
+                interrupted.append(self.pid)
+                raise KeyboardInterrupt
+            return real_communicate(self, input=input, timeout=timeout)
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", interrupt_once)
+        with pytest.raises(KeyboardInterrupt):
+            run_capped([sys.executable, "-c", _SPAWNS_ORPHAN], 60)
+
+        pid = interrupted[0]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _alive(pid):
+            time.sleep(0.05)
+        assert not _alive(pid), f"tool pid {pid} survived cancellation"
+
+
+class TestKillTree:
+    def test_windows_kills_the_whole_tree(self, monkeypatch):
+        """taskkill /T, not Popen.kill(): on Windows the descendants keep
+        the captured pipes open, and closing a pipe mid-read blocks until
+        the last writer exits (CI measured 30s against a 2s cap)."""
+        calls = []
+        monkeypatch.setattr(_subprocess_mod.os, "name", "nt")
+        monkeypatch.setattr(
+            _subprocess_mod.subprocess, "run", lambda argv, **kw: calls.append(argv)
+        )
+
+        class FakeProc:
+            pid = 4321
+
+            def kill(self):
+                calls.append("kill")
+
+        _subprocess_mod._kill_tree(FakeProc())
+
+        assert calls == [["taskkill", "/F", "/T", "/PID", "4321"]]

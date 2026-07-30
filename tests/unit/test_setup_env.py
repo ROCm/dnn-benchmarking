@@ -93,3 +93,22 @@ class TestUnifyRocprofilerLibs:
 
     def test_missing_prefix_is_a_no_op(self, tmp_path):
         assert setup_env.unify_rocprofiler_libs(tmp_path / "nope", tmp_path) == 0
+
+    def test_failed_symlink_leaves_the_original_library_intact(
+        self, wheel_libs, monkeypatch
+    ):
+        """Symlink creation can fail (Windows without developer mode,
+        restricted permissions). It must not take the library with it — the
+        hardlink being replaced may be the last name for those bytes."""
+        core, devel = wheel_libs
+        victim = devel / "librocprofiler-sdk.so"
+
+        def refuse(self, target, target_is_directory=False):
+            raise OSError("symlink privilege not held")
+
+        monkeypatch.setattr(Path, "symlink_to", refuse)
+        assert setup_env.unify_rocprofiler_libs(core, devel) == 0
+
+        assert victim.exists() and not victim.is_symlink()
+        assert victim.read_bytes() == b"elf"
+        assert not any(devel.glob("*.unify-tmp"))
