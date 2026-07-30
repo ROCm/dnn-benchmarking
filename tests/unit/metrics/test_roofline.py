@@ -53,7 +53,7 @@ class TestRunHappyPath:
             lambda name: "/opt/rocm/bin/rocprof-compute",
         )
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # rocprof-compute nests its output one level deeper than
             # workload_dir (under <wl_dir>/<gpu>/). The _find_named
             # walker is recursive so the test mirrors that depth.
@@ -64,7 +64,7 @@ class TestRunHappyPath:
             (inner / "results_pmc_perf_0.csv").write_text("k,v\n")
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(roofline_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(roofline_mod, "run_capped", side_effect=fake_run):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         rl = extra["roofline"]
         assert rl["roofline_csv"].endswith("roofline.csv")
@@ -93,7 +93,7 @@ class TestFailureModes:
         proc = MagicMock(
             returncode=1, stdout="", stderr="rocprof-compute: workload failed\n"
         )
-        with patch.object(roofline_mod.subprocess, "run", return_value=proc):
+        with patch.object(roofline_mod, "run_capped", return_value=proc):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         assert extra["roofline"]["returncode"] == 1
         assert "failed" in extra["roofline"]["error_tail"]
@@ -119,7 +119,7 @@ class TestFailureModes:
         )
         # Critically: no side effect that creates any CSV.
         proc = MagicMock(returncode=0, stdout="", stderr="")
-        with patch.object(roofline_mod.subprocess, "run", return_value=proc):
+        with patch.object(roofline_mod, "run_capped", return_value=proc):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         rl = extra["roofline"]
         assert len(rl["warnings"]) == 1
@@ -138,13 +138,13 @@ class TestFailureModes:
             lambda name: "/opt/rocm/bin/rocprof-compute",
         )
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # Drop an unrelated CSV so the rglob *.csv match succeeds
             # but neither named file is present.
             (tmp_path / "results_pmc_perf_0.csv").write_text("counter,value\n")
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(roofline_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(roofline_mod, "run_capped", side_effect=fake_run):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         rl = extra["roofline"]
         assert rl["warnings"] == ["no roofline.csv or sysinfo.csv produced"]

@@ -121,6 +121,62 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def unify_rocprofiler_libs(core_lib: Path, devel_lib: Path) -> int:
+    """Point the devel prefix's rocprofiler libraries at the core copies.
+
+    The ROCm wheels hardlink one set of rocprofiler libraries into both
+    ``_rocm_sdk_core/lib`` (what torch loads) and ``_rocm_sdk_devel/lib``
+    (the RUNPATH the hipDNN plugins are built against).
+    rocprofiler-register identifies the registered library by path
+    string, so a profiled run registers the core path for torch and then
+    aborts when the plugins bring in the devel path — even though both
+    names are the same file::
+
+        ROCPROFILER_REGISTER_LIBRARY is already set to
+        '.../_rocm_sdk_core/lib/librocprofiler-sdk.so.1', not overriding
+        with '.../_rocm_sdk_devel/lib/librocprofiler-sdk.so'
+
+    Replacing the devel duplicates with symlinks leaves exactly one path
+    in play, which is what makes rocprofv3 trace capture work at all.
+    Only exact same-file duplicates (same device + inode) are relinked,
+    so a genuinely different build is never swapped underneath the user.
+
+    Args:
+        core_lib: ``_rocm_sdk_core/lib``.
+        devel_lib: ``_rocm_sdk_devel/lib``.
+
+    Returns:
+        Number of duplicates relinked.
+    """
+    if not core_lib.is_dir() or not devel_lib.is_dir():
+        return 0
+
+    core_by_id = {}
+    for path in core_lib.glob("librocprofiler-*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        info = path.stat()
+        core_by_id[(info.st_dev, info.st_ino)] = path
+
+    relinked = 0
+    for dup in sorted(devel_lib.glob("librocprofiler-*")):
+        if dup.is_symlink() or not dup.is_file():
+            continue
+        info = dup.stat()
+        target = core_by_id.get((info.st_dev, info.st_ino))
+        if target is None:
+            continue
+        try:
+            dup.unlink()
+            dup.symlink_to(target)
+        except OSError as e:
+            # Windows needs developer mode or admin rights for symlinks.
+            print(f"WARNING: could not relink {dup} -> {target}: {e}")
+            return relinked
+        relinked += 1
+    return relinked
+
+
 # --- Probes ----------------------------------------------------------------
 # These inspect the interpreter's own sys.prefix/sysconfig, so they must run in
 # the VENV interpreter, never the system one.
@@ -1115,6 +1171,28 @@ class Setup:
 
     # -- top-level flow -----------------------------------------------------
 
+    def unify_wheel_rocprofiler_libs(self) -> None:
+        """Deduplicate the wheels' rocprofiler libraries (no-op elsewhere).
+
+        Only meaningful for a wheel ROCm install; a system ``--rocm-prefix``
+        has one copy of each library to begin with.
+        """
+        core_prefix, status = self.find_rocm_wheel_prefix("core")
+        if status != 0:
+            return
+        devel_root = self._rocm_sdk_devel_root()
+        if not devel_root:
+            return
+        relinked = unify_rocprofiler_libs(
+            Path(core_prefix) / "lib", Path(devel_root) / "lib"
+        )
+        if relinked:
+            print(
+                f"Relinked {relinked} rocprofiler libraries in the devel "
+                "prefix onto the core prefix copies (rocprofv3 aborts when "
+                "one process registers both paths)."
+            )
+
     def run(self) -> int:
         self.require_python_version()
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -1153,6 +1231,7 @@ class Setup:
         binding_prefix = self.select_binding_prefix()
         print(f"Using hipDNN/ROCm prefix: {binding_prefix}")
         self.build_and_install(binding_prefix)
+        self.unify_wheel_rocprofiler_libs()
 
         self.verify()
         self._print_complete()

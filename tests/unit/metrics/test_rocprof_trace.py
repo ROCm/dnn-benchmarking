@@ -55,13 +55,13 @@ class TestPftracePath:
     def test_happy_path_records_path(self, tmp_path, _force_rocprofv3_present):
         out_dir = tmp_path / "trace_out"
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             host_dir = Path(argv[argv.index("-d") + 1])
             host_dir.mkdir(parents=True, exist_ok=True)
             (host_dir / "results.pftrace").write_bytes(b"fake-pftrace")
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_trace.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_trace, "run_capped", side_effect=fake_run):
             extra = rocprof_trace.run(
                 inner_argv=["python"], out_dir=out_dir, fmt="pftrace"
             )
@@ -75,7 +75,7 @@ class TestPftracePath:
         proc = MagicMock(
             returncode=2, stdout="", stderr="rocprofv3: failed for reasons\n"
         )
-        with patch.object(rocprof_trace.subprocess, "run", return_value=proc):
+        with patch.object(rocprof_trace, "run_capped", return_value=proc):
             extra = rocprof_trace.run(
                 inner_argv=["python"], out_dir=out_dir, fmt="pftrace"
             )
@@ -107,7 +107,7 @@ class TestKineto:
         call_count = {"n": 0}
         recorded_fmts: list[str] = []
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             host_dir = Path(argv[argv.index("-d") + 1])
             host_dir.mkdir(parents=True, exist_ok=True)
             call_count["n"] += 1
@@ -115,7 +115,7 @@ class TestKineto:
             (host_dir / "results.pftrace").write_bytes(b"fake-pftrace")
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_trace.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_trace, "run_capped", side_effect=fake_run):
             extra = rocprof_trace.run(
                 inner_argv=["python"], out_dir=out_dir, fmt="kineto"
             )

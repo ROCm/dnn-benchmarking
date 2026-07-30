@@ -13,12 +13,12 @@ that can launch but cannot produce full artifacts.
 
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
 
 
@@ -40,14 +40,15 @@ def _require_rocm_tool(name: str) -> str:
     """ROCm tool gate — mirrors production resolution.
 
     Production paths (``rocprof_pmc``, ``rocprof_trace``, ``roofline``)
-    resolve ROCm tools via ``resolve_rocm_tool``, which prefers
-    ``$ROCM_PATH/bin``. A bare ``shutil.which`` skip-gate would silently
-    skip on hosts where ``/opt/rocm/bin`` isn't on PATH (remote login
-    nodes, sandboxed containers) even though production would run.
+    resolve ROCm tools via ``resolve_rocm_tool``, which prefers the
+    rocm-sdk wheel's shim and falls back to ``$ROCM_PATH/bin`` then PATH.
+    A bare ``shutil.which`` skip-gate would both miss the wheel shim and
+    silently skip on hosts where ``/opt/rocm/bin`` isn't on PATH (remote
+    login nodes, sandboxed containers) even though production would run.
     """
     binary = resolve_rocm_tool(name)
     if binary is None:
-        pytest.skip(f"{name} not found at $ROCM_PATH/bin or on PATH")
+        pytest.skip(f"{name} not found in the ROCm wheel, $ROCM_PATH/bin, or PATH")
     return binary
 
 
@@ -76,9 +77,20 @@ def _conv_graph() -> Path:
     return p
 
 
+# Below the helper's own cap, so a wedged profiler pass surfaces as the
+# documented ``skipped: ... timed out`` slice instead of killing the test
+# with TimeoutExpired.
+_PROFILING_TIMEOUT_S = 90
+_HELPER_TIMEOUT_S = 300
+
+
 def _run_dnn_bench(extra_args, tmp_path) -> dict:
     out_path = tmp_path / "results.json"
-    proc = subprocess.run(
+    # run_capped, not subprocess.run: the profiler front-ends exec the
+    # workload as a grandchild that survives a plain timeout kill and
+    # holds the pipes open (it also keeps a GPU busy long after pytest
+    # exits). This is the module under test doing its own job.
+    proc = run_capped(
         [
             sys.executable,
             "-m",
@@ -89,15 +101,15 @@ def _run_dnn_bench(extra_args, tmp_path) -> dict:
             "2",
             "--iters",
             "5",
+            "--profiling-timeout",
+            str(_PROFILING_TIMEOUT_S),
             "--profiling-output-dir",
             str(tmp_path / "prof"),
             "-o",
             str(out_path),
             *extra_args,
         ],
-        capture_output=True,
-        text=True,
-        timeout=300,
+        _HELPER_TIMEOUT_S,
     )
     if proc.returncode not in (0, 2):
         pytest.fail(

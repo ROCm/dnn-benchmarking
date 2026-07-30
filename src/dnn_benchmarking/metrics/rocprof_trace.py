@@ -27,6 +27,7 @@ from ._artifact_paths import (
     flatten_hostname_dir,
 )
 from ._diagnostic import warn_once
+from ._subprocess import run_capped
 from ._tool_resolver import resolve_rocm_tool
 
 
@@ -80,7 +81,7 @@ def _convert_to_kineto(db_path: Path, timeout_s: int) -> Optional[Path]:
     out_path = db_path.with_suffix(".chrome.json")
     subprocess_timeout = timeout_s or None
     try:
-        proc = subprocess.run(
+        proc = run_capped(
             [
                 sys.executable,
                 "-m",
@@ -93,10 +94,7 @@ def _convert_to_kineto(db_path: Path, timeout_s: int) -> Optional[Path]:
                 "-o",
                 str(out_path),
             ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=subprocess_timeout,
+            subprocess_timeout,
         )
     except subprocess.TimeoutExpired:
         warn_once(
@@ -171,13 +169,7 @@ def run(
 
     subprocess_timeout = timeout_s or None
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=subprocess_timeout,
-        )
+        proc = run_capped(argv, subprocess_timeout)
     except subprocess.TimeoutExpired:
         warn_once(
             "rocprof_trace",

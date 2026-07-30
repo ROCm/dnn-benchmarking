@@ -52,7 +52,7 @@ class TestKernelEventGate:
 
         captured = {"argv": None}
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             captured["argv"] = argv
             # Write the CSV at the exact `-o` value rather than
             # reconstructing the path from out_dir. If a future
@@ -65,7 +65,7 @@ class TestKernelEventGate:
             csv_path.write_text(SAMPLE_CSV)
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(perf_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
             extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
 
         # Argv must omit cycles:k / instructions:k.
@@ -80,7 +80,7 @@ class TestKernelEventGate:
 
         captured = {"argv": None}
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             captured["argv"] = argv
             # Write the CSV at the exact `-o` value rather than
             # reconstructing the path from out_dir. If a future
@@ -93,7 +93,7 @@ class TestKernelEventGate:
             csv_path.write_text(SAMPLE_CSV)
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(perf_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
             perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
 
         events_arg = captured["argv"][captured["argv"].index("-e") + 1]
@@ -116,9 +116,7 @@ class TestSubprocessFailureModes:
     def test_oserror_returns_skipped(self, monkeypatch, tmp_path):
         monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
         monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
-        with patch.object(
-            perf_mod.subprocess, "run", side_effect=OSError("perf killed")
-        ):
+        with patch.object(perf_mod, "run_capped", side_effect=OSError("perf killed")):
             extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
         assert "skipped" in extra["perf"]
         assert "perf killed" in extra["perf"]["skipped"]
@@ -127,7 +125,7 @@ class TestSubprocessFailureModes:
         monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
         monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # Drop a CSV so partial parsing succeeds — perf.py records
             # error_tail in addition to whatever events it could parse.
             # Write the CSV at the exact `-o` value rather than
@@ -141,10 +139,25 @@ class TestSubprocessFailureModes:
             csv_path.write_text(SAMPLE_CSV)
             return MagicMock(returncode=2, stdout="", stderr="perf: bad event\n")
 
-        with patch.object(perf_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
             extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
         assert extra["perf"]["returncode"] == 2
         assert "perf: bad event" in extra["perf"]["error_tail"]
+
+    def test_launch_failure_omits_csv_path(self, monkeypatch, tmp_path):
+        """perf.py creates the output directory before launching, so a perf
+        that never starts leaves the directory but no CSV. Advertising the
+        path anyway hands consumers a guaranteed ENOENT."""
+        monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
+        monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
+
+        def fake_run(argv, timeout_s=None, **kwargs):
+            return MagicMock(returncode=2, stdout="", stderr="perf: not found\n")
+
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
+            extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
+        assert "csv_path" not in extra["perf"]
+        assert extra["perf"]["returncode"] == 2
 
     def test_timeout_returns_skipped(self, monkeypatch, tmp_path):
         """A wedged perf child must surface as a `skipped: timed out
@@ -156,8 +169,8 @@ class TestSubprocessFailureModes:
         monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
         monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
         with patch.object(
-            perf_mod.subprocess,
-            "run",
+            perf_mod,
+            "run_capped",
             side_effect=subprocess.TimeoutExpired(cmd="perf", timeout=600),
         ):
             extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
@@ -170,7 +183,7 @@ class TestIpcDerivation:
         monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
         monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # Write the CSV at the exact `-o` value rather than
             # reconstructing the path from out_dir. If a future
             # _build_argv change moves -o, this assertion fails loudly
@@ -182,7 +195,7 @@ class TestIpcDerivation:
             csv_path.write_text(SAMPLE_CSV)
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(perf_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
             extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
         ipc = extra["perf"]["ipc_user"]
         assert ipc is not None

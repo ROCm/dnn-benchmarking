@@ -35,6 +35,7 @@ from typing import Any, Dict, List
 
 from ._artifact_paths import DEFAULT_PROFILING_TIMEOUT_S, find_first
 from ._diagnostic import warn_once
+from ._subprocess import run_capped
 from ._tool_resolver import resolve_rocm_tool
 
 
@@ -84,13 +85,7 @@ def run(
 
     subprocess_timeout = timeout_s or None
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=subprocess_timeout,
-        )
+        proc = run_capped(argv, subprocess_timeout)
     except subprocess.TimeoutExpired:
         warn_once(
             "roofline",

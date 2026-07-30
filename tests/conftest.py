@@ -315,7 +315,16 @@ def _venv_rocm_sdk_plugin_dirs() -> list[Path]:
         dirs.extend(
             child / "lib" / "hipdnn_plugins" / "engines"
             for child in site_dir.iterdir()
-            if child.is_dir() and child.name.startswith("_rocm_sdk_libraries_")
+            # whl-multi-arch ships a single arch-agnostic
+            # "_rocm_sdk_libraries"; older per-arch indexes name it
+            # "_rocm_sdk_libraries_<arch>". Match both, as setup_env does —
+            # the suffixed-only check silently skipped every plugin-gated
+            # integration test on a current wheel install.
+            if child.is_dir()
+            and (
+                child.name == "_rocm_sdk_libraries"
+                or child.name.startswith("_rocm_sdk_libraries_")
+            )
         )
     return dirs
 

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from ._artifact_paths import DEFAULT_PROFILING_TIMEOUT_S
 from ._diagnostic import warn_once
+from ._subprocess import run_capped
 
 PERF_EVENTS_USER = [
     "cycles:u",
@@ -136,13 +137,7 @@ def run(
 
     subprocess_timeout = timeout_s or None
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=subprocess_timeout,
-        )
+        proc = run_capped(argv, subprocess_timeout)
     except subprocess.TimeoutExpired:
         warn_once("perf", f"perf invocation timed out after {subprocess_timeout}s")
         return {
@@ -176,8 +171,12 @@ def run(
         "context_switches": _get("context-switches"),
         "page_faults": _get("page-faults"),
         "kernel_perf_paranoid": paranoid,
-        "csv_path": str(csv_path),
     }
+    if csv_path.exists():
+        # Only advertise the artifact when perf actually wrote it: on a
+        # launch failure the directory exists but the CSV does not, and a
+        # consumer opening the advertised path would just get ENOENT.
+        result["csv_path"] = str(csv_path)
     if not kernel_ok:
         result["kernel_events_skipped_reason"] = (
             f"perf_event_paranoid={paranoid} (kernel events require <= 1)"

@@ -70,3 +70,6 @@ tmp/
 *.sarif
 *.spdx
 *.spdx.json
+
+# rocprofv3 drops per-pass counter scratch in the working directory
+.rocprofv3/

@@ -377,3 +377,49 @@ def test_cpu_only_torch_does_not_affect_hip_synchronization(monkeypatch) -> None
 
     assert result.host_timings
     assert sync_calls == ["sync"]
+
+
+def test_staged_path_primes_plan_before_measuring(monkeypatch) -> None:
+    """The staged timer arms a stream gate around the measured enqueue, so a
+    first-call plan compile inside it can never drain (``--warmup 0`` hung
+    forever). benchmark() must execute one untimed priming pass first, then
+    exactly one execute per measured iteration."""
+    calls: list[str] = []
+
+    class TrackingGraph:
+        def execute(
+            self, handle: Any, variant_pack: Dict[int, int], workspace_ptr: int
+        ) -> DummyResult:
+            calls.append("execute")
+            return DummyResult()
+
+    class FakeStagedTimer:
+        def __init__(self, stream: int) -> None:
+            self.stream = stream
+
+        def barrier(self) -> None:
+            calls.append("barrier")
+
+        def measure(self, enqueue):
+            enqueue()
+            return (0.5, 0.25)
+
+    monkeypatch.setattr(executor_module, "_is_staged_hip_available", lambda: True)
+    monkeypatch.setattr(executor_module, "StalledRegionTimer", FakeStagedTimer)
+    monkeypatch.setattr(
+        executor_module,
+        "create_gpu_timer",
+        lambda *a, **k: pytest.fail("staged path must not build a GPU-event timer"),
+    )
+
+    config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=0, benchmark_iters=2)
+    executor = executor_module.Executor("{}", config, collect_kernel_timing=True)
+    executor._graph = TrackingGraph()
+    executor._workspace_ptr = 0
+
+    result = executor.benchmark(handle=FakeHandle(0), variant_pack={})
+
+    # Priming execute, then the barrier, then one execute per iteration.
+    assert calls == ["execute", "barrier", "execute", "execute"]
+    assert len(result.host_timings) == 2
+    assert result.kernel_timings is not None and len(result.kernel_timings) == 2
