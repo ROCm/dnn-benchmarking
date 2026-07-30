@@ -112,3 +112,30 @@ class TestUnifyRocprofilerLibs:
         assert victim.exists() and not victim.is_symlink()
         assert victim.read_bytes() == b"elf"
         assert not any(devel.glob("*.unify-tmp"))
+
+
+class TestWheelRocpdDir:
+    """The kineto converter lives in the ROCm wheel, one copy per
+    interpreter minor version. Picking the wrong one imports compiled
+    bits built for another Python."""
+
+    def test_returns_the_matching_interpreter_payload(self, tmp_path):
+        core = tmp_path / "_rocm_sdk_core"
+        for tag in ("python3.11", "python3.12"):
+            (core / "lib" / tag / "site-packages" / "rocpd").mkdir(parents=True)
+
+        found = setup_env.wheel_rocpd_dir(core, "python3.12")
+
+        assert found == core / "lib" / "python3.12" / "site-packages"
+
+    def test_returns_none_when_that_version_is_absent(self, tmp_path):
+        core = tmp_path / "_rocm_sdk_core"
+        (core / "lib" / "python3.11" / "site-packages" / "rocpd").mkdir(parents=True)
+
+        assert setup_env.wheel_rocpd_dir(core, "python3.13") is None
+
+    def test_returns_none_when_the_payload_has_no_rocpd(self, tmp_path):
+        core = tmp_path / "_rocm_sdk_core"
+        (core / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+
+        assert setup_env.wheel_rocpd_dir(core, "python3.12") is None

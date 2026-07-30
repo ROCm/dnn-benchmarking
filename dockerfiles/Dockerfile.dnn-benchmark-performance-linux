@@ -103,6 +103,21 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -rf /var/lib/apt/lists/*
 
 
+# Profiling sources in this image (setup_env.py prints the same summary):
+#
+#  * --pmc / --emit-trace: rocprofv3 comes from the ROCm wheels, and this
+#    image deliberately installs no system ROCm, so the profiler and the
+#    workload always share one ROCm build. Mixing two is what makes
+#    rocprofv3 abort on a duplicate librocprofiler-sdk registration.
+#  * --emit-trace kineto: setup_env puts the wheel's rocpd module on the
+#    venv path and installs otf2 (rocpd's CLI imports it unconditionally).
+#    A rocpd whose convert offers only csv/pftrace/otf2 records pftrace
+#    and says so in the result rather than failing.
+#  * --roofline: rocprof-compute is NOT installed. It ships in the
+#    rocprofiler-compute system package, which would pull a second ROCm
+#    into the image and reintroduce the mismatch above. Run roofline on a
+#    host with a full ROCm install instead.
+#
 # linux-tools-{common,generic} provide the `perf` binary required by
 # dnn-benchmarking's `--perf` source (CPU cycles/IPC). Two runtime
 # gotchas the apt install can't fix:

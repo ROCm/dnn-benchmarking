@@ -25,6 +25,21 @@ $VENV_SITE/triton/backends/amd/lib:\
 $LD_LIBRARY_PATH
 ```
 
+## What each profiling source needs
+
+`setup_env.py` prints this as a `Profiling sources:` block at the end of
+a run; the table is what it is checking and how to close each gap.
+
+| Source | Needs | Provided by |
+| --- | --- | --- |
+| `--pmc`, `--emit-trace pftrace` | `rocprofv3` from the **same** ROCm as torch | The rocm-sdk wheels. Never mix a system `/opt/rocm` profiler with wheel-ROCm torch: the profiler injects the system LLVM runtime and the workload dies loading `libamd_comgr.so.3` |
+| `--emit-trace kineto` | `rocpd` + `otf2`, and a `rocpd convert` that still offers `chrome` | setup adds the wheel's `rocpd` to the path and installs `otf2`. ROCm 7.15's rocpd offers only csv/pftrace/otf2, so kineto records pftrace there and says so in `kineto_unavailable` |
+| `--perf` | `perf` matching the **running kernel**, and `/proc/sys/kernel/perf_event_paranoid <= 1` for kernel events | Host, not the venv: `apt install linux-tools-$(uname -r)`. Containers inherit the host's paranoid value, so user-space counters (`cycles:u`) may be all you get |
+| `--roofline` | `rocprof-compute` | The `rocprofiler-compute` system package. Deliberately absent from the wheel-only Docker image: pulling it in means adding a second ROCm install, which is the mismatch above |
+
+A source that can't run is never fatal — it records a `skipped` entry
+with the reason in `extra_metrics` and the benchmark continues.
+
 ## Profiling integration tests
 
 The profiling smoke tests in `tests/integration/test_profiling.py`

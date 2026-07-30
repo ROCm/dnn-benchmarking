@@ -16,6 +16,9 @@ from dnn_benchmarking.metrics._diagnostic import reset as reset_warn_once
 @pytest.fixture(autouse=True)
 def _reset():
     reset_warn_once()
+    # The chrome-capability probe is cached for the process; a stale
+    # entry would make these tests depend on execution order.
+    rocprof_trace._rocpd_can_emit_chrome.cache_clear()
 
 
 @pytest.fixture
@@ -129,3 +132,38 @@ class TestKineto:
         assert trace["recorded_format"] == "pftrace"
         assert "kineto_unavailable" in trace
         assert trace["path"].endswith(".pftrace")
+
+    def test_kineto_downgrades_when_rocpd_cannot_emit_chrome(
+        self, tmp_path, monkeypatch, _force_rocprofv3_present
+    ):
+        """ROCm 7.15's rocpd narrowed convert to csv/pftrace/otf2. An
+        importable rocpd is therefore not enough — asking it for chrome is
+        a hard argparse error, so the probe must read the offered formats
+        and downgrade before the workload runs, not after."""
+        out_dir = tmp_path / "trace_out"
+        monkeypatch.setitem(sys.modules, "rocpd", MagicMock())
+        monkeypatch.setitem(sys.modules, "otf2", MagicMock())
+
+        recorded_fmts: list[str] = []
+
+        def fake_run(argv, timeout_s=None, **kwargs):
+            if "--help" in argv:
+                return MagicMock(
+                    returncode=0,
+                    stdout="-f {csv,pftrace,otf2} [{csv,pftrace,otf2} ...]",
+                    stderr="",
+                )
+            host_dir = Path(argv[argv.index("-d") + 1])
+            host_dir.mkdir(parents=True, exist_ok=True)
+            recorded_fmts.append(argv[argv.index("--output-format") + 1])
+            (host_dir / "results.pftrace").write_bytes(b"fake-pftrace")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(rocprof_trace, "run_capped", side_effect=fake_run):
+            extra = rocprof_trace.run(
+                inner_argv=["python"], out_dir=out_dir, fmt="kineto"
+            )
+
+        assert recorded_fmts == ["pftrace"], "the workload must run exactly once"
+        assert extra["trace"]["recorded_format"] == "pftrace"
+        assert "chrome" in extra["trace"]["kineto_unavailable"]

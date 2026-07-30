@@ -16,8 +16,10 @@ Supports two formats:
   the rocpd Python module is not importable.
 """
 
+import importlib
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -55,27 +57,45 @@ def _build_argv(
     ]
 
 
-def _rocpd_importable() -> bool:
-    """True iff `import rocpd` succeeds in the current interpreter.
+_CHROME_FORMAT = "chrome"
 
-    The kineto branch needs the rocpd module both at run-time (for
-    ``python -m rocpd convert``) and as a pre-condition for asking
-    rocprofv3 to emit the rocpd db form. Probing upfront lets us pick
-    pftrace before the first rocprofv3 invocation when rocpd is absent,
-    avoiding a wasteful re-run of the entire workload.
+
+@lru_cache(maxsize=1)
+def _rocpd_can_emit_chrome() -> bool:
+    """True iff this rocpd can convert a db to the Chrome-trace form.
+
+    Three things have to hold, and each fails differently:
+
+    * ``rocpd`` importable — the ROCm wheels ship it under
+      ``_rocm_sdk_core/lib/python<X.Y>/site-packages``, which setup_env
+      puts on the path.
+    * ``otf2`` importable — ``rocpd.__main__`` imports it at startup for
+      every subcommand, so without it the package imports and the CLI
+      does not.
+    * ``convert`` still offering ``chrome`` — ROCm 7.15's rocpd narrowed
+      ``--output-format`` to csv/pftrace/otf2, so asking for chrome is a
+      hard argparse error on that build.
+
+    Probing upfront picks pftrace before the first rocprofv3 invocation
+    rather than paying for the whole workload and failing at conversion.
     """
+    for module in ("rocpd", "otf2"):
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            return False
     try:
-        import rocpd  # noqa: F401
-    except ImportError:
+        proc = run_capped([sys.executable, "-m", "rocpd", "convert", "--help"], 60)
+    except (OSError, subprocess.SubprocessError):
         return False
-    return True
+    return proc.returncode == 0 and _CHROME_FORMAT in proc.stdout
 
 
 def _convert_to_kineto(db_path: Path, timeout_s: int) -> Optional[Path]:
     """Convert a rocpd db to Chrome-trace format. Returns the .json path or None.
 
-    Caller has already verified rocpd is importable via
-    ``_rocpd_importable()``; this function only needs to handle the
+    Caller has already verified the converter can emit chrome via
+    ``_rocpd_can_emit_chrome()``; this function only needs to handle the
     converter exiting non-zero (missing transitive deps, schema drift).
     """
     out_path = db_path.with_suffix(".chrome.json")
@@ -150,17 +170,17 @@ def run(
     # cross-version invocation is to ask for pftrace directly when the
     # user wants pftrace, and ask for the db form when they want kineto.
     #
-    # If the user asked for kineto but rocpd isn't importable, the
-    # conversion step would fail anyway. Decide upfront and run pftrace
-    # directly instead of paying for the full workload re-run on the
-    # fallback path.
-    rocpd_present = _rocpd_importable()
-    kineto_downgraded = fmt == "kineto" and not rocpd_present
+    # If the user asked for kineto but this rocpd can't produce chrome
+    # output, the conversion step would fail anyway. Decide upfront and
+    # run pftrace directly instead of paying for the full workload re-run
+    # on the fallback path.
+    kineto_downgraded = fmt == "kineto" and not _rocpd_can_emit_chrome()
     if kineto_downgraded:
         warn_once(
             "rocprof_trace",
-            "rocpd Python module not importable; recording pftrace "
-            "instead of kineto (one workload run, not two)",
+            "rocpd cannot emit chrome output here (module missing, or a "
+            "build whose convert offers only csv/pftrace/otf2); recording "
+            "pftrace instead of kineto (one workload run, not two)",
         )
         rocprof_fmt = "pftrace"
     else:
@@ -199,7 +219,7 @@ def run(
     if kineto_downgraded:
         # The user asked for kineto; we recorded pftrace. Tell them why
         # in the result so the format mismatch isn't silent.
-        result["kineto_unavailable"] = "rocpd Python module not importable"
+        result["kineto_unavailable"] = "rocpd cannot emit chrome output here"
         result["recorded_format"] = "pftrace"
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-40:])

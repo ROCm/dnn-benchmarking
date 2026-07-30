@@ -121,6 +121,22 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def wheel_rocpd_dir(core_prefix: Path, pytag: str):
+    """The wheel's ``rocpd`` site-packages dir for ``pytag``, or None.
+
+    The core wheel ships one payload per interpreter minor version
+    (``lib/python3.10/site-packages`` … ``lib/python3.13/site-packages``),
+    so the venv's own tag is the only correct choice — importing another
+    version's copy would fail on the compiled bits.
+
+    Args:
+        core_prefix: ``_rocm_sdk_core``.
+        pytag: ``python3.12``-style tag from the venv interpreter.
+    """
+    candidate = core_prefix / "lib" / pytag / "site-packages"
+    return candidate if (candidate / "rocpd").is_dir() else None
+
+
 def unify_rocprofiler_libs(core_lib: Path, devel_lib: Path) -> int:
     """Point the devel prefix's rocprofiler libraries at the core copies.
 
@@ -256,6 +272,62 @@ if len(matches) > 1:
     print("Use a clean workspace/venv so setup cannot mix ROCm SDK packages.", file=sys.stderr)
     sys.exit(2)
 sys.exit(1)
+"""
+
+
+_PURELIB_AND_PYTAG = r"""
+import sys
+import sysconfig
+
+print(sysconfig.get_path("purelib"))
+print(f"python{sys.version_info.major}.{sys.version_info.minor}")
+"""
+
+
+# Reports what each opt-in profiling flag can do in this venv. Runs in the
+# venv interpreter so it sees the same resolution the benchmark will.
+_PROFILING_SOURCES = r"""
+import shutil
+
+from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
+from dnn_benchmarking.metrics.rocprof_trace import _rocpd_can_emit_chrome
+
+
+def state(ok, detail):
+    return ("  [ok]   " if ok else "  [skip] ") + detail
+
+
+rocprofv3 = resolve_rocm_tool("rocprofv3")
+print(state(rocprofv3 is not None, f"--emit-trace pftrace / --pmc: rocprofv3 {rocprofv3 or 'not found'}"))
+
+# Same predicate the trace pass uses, so setup can't promise a converter
+# the benchmark will then refuse to use.
+kineto = _rocpd_can_emit_chrome()
+print(state(kineto, "--emit-trace kineto: " + (
+    "rocpd converter ready"
+    if kineto
+    else "no chrome-capable rocpd (missing rocpd/otf2, or a build offering "
+         "only csv/pftrace/otf2); records pftrace instead"
+)))
+
+rocprof_compute = resolve_rocm_tool("rocprof-compute")
+print(state(rocprof_compute is not None, "--roofline: " + (
+    str(rocprof_compute)
+    if rocprof_compute
+    else "rocprof-compute not found; install the rocprofiler-compute system package"
+)))
+
+perf = shutil.which("perf")
+try:
+    paranoid = int(open("/proc/sys/kernel/perf_event_paranoid").read().strip())
+except OSError:
+    paranoid = None
+if perf is None:
+    print(state(False, "--perf: perf not found; install linux-tools matching $(uname -r)"))
+elif paranoid is not None and paranoid > 1:
+    print(state(False, f"--perf: user-space counters only (perf_event_paranoid={paranoid}, kernel events need <= 1)"))
+else:
+    print(state(True, f"--perf: {perf}"))
 """
 
 _AMDSMI_IMPORTABLE = r"""
@@ -1202,6 +1274,65 @@ class Setup:
                 "one process registers both paths)."
             )
 
+    def enable_rocpd_module(self) -> None:
+        """Put the ROCm wheel's ``rocpd`` package on the venv's import path.
+
+        The wheel already ships the rocpd Python package, but under
+        ``_rocm_sdk_core/lib/python<X.Y>/site-packages``, which is not on
+        ``sys.path``. Without it ``--emit-trace kineto`` silently records
+        pftrace instead of converting. A .pth is the standard way to bolt
+        an out-of-tree directory onto a venv, and it costs nothing when
+        the directory is absent.
+        """
+        core_prefix, status = self.find_rocm_wheel_prefix("core")
+        if status != 0:
+            return
+        result = self.probe(_PURELIB_AND_PYTAG)
+        if result.returncode != 0:
+            return
+        purelib, pytag = result.stdout.split()
+        rocpd_dir = wheel_rocpd_dir(Path(core_prefix), pytag)
+        if rocpd_dir is None:
+            return
+        pth = Path(purelib) / "_rocm_sdk_rocpd.pth"
+        pth.write_text(f"{rocpd_dir}\n", encoding="utf-8")
+        print(f"Enabled the wheel's rocpd module via {pth.name}.")
+
+    def install_kineto_converter_deps(self) -> None:
+        """Install ``otf2``, which ``rocpd``'s CLI imports unconditionally.
+
+        ``rocpd/__main__.py`` imports otf2 at startup for every subcommand,
+        so ``python -m rocpd convert`` fails without it even when the user
+        only wants Chrome/pftrace output. It is a source distribution, so
+        treat a build failure as non-fatal: trace capture still works, it
+        just records pftrace instead of converting.
+        """
+        if self.probe("import otf2").returncode == 0:
+            return
+        try:
+            self.pip("install", "otf2")
+        except subprocess.CalledProcessError:
+            print(
+                "WARNING: could not install otf2; --emit-trace kineto will "
+                "record pftrace instead of converting.",
+                file=sys.stderr,
+            )
+
+    def report_profiling_sources(self) -> None:
+        """Print which opt-in profiling sources this install can actually run.
+
+        Every source degrades to a ``skipped`` slice at run time, which is
+        correct but only visible after paying for a benchmark. Setup knows
+        the answer now, and the two host-level gaps (perf, rocprof-compute)
+        need a root install this script must not attempt.
+        """
+        report = self.probe(_PROFILING_SOURCES)
+        if report.returncode != 0:
+            return
+        print("Profiling sources:")
+        sys.stdout.write(report.stdout)
+        print("")
+
     def run(self) -> int:
         self.require_python_version()
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -1241,9 +1372,12 @@ class Setup:
         print(f"Using hipDNN/ROCm prefix: {binding_prefix}")
         self.build_and_install(binding_prefix)
         self.unify_wheel_rocprofiler_libs()
+        self.enable_rocpd_module()
+        self.install_kineto_converter_deps()
 
         self.verify()
         self._print_complete()
+        self.report_profiling_sources()
         return 0
 
     def _print_complete(self, cuda: bool = False) -> None:
