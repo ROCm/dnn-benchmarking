@@ -334,7 +334,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         help=(
             "Re-run benchmark under rocprofv3 and export a kernel + "
             "memory-copy trace in the given format. 'kineto' falls back "
-            "to pftrace when the rocpd Python module is not importable. "
+            "to pftrace when the installed rocpd can't emit chrome. "
             "Adds ~1 extra workload run (~5%% kernel-time overhead)."
         ),
         config_key="emit_trace",

@@ -13,7 +13,8 @@ Supports two formats:
 * ``kineto`` — emits the rocpd db, then converts via
   ``python3 -m rocpd convert -i <db> --output-format chrome`` for
   PyTorch Kineto / Chrome-trace consumers. Falls back to pftrace when
-  the rocpd Python module is not importable.
+  the installed rocpd can't emit chrome (missing rocpd/otf2, or a
+  build whose convert offers only csv/pftrace/otf2).
 """
 
 import importlib

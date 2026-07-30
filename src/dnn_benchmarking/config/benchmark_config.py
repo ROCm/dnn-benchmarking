@@ -190,8 +190,8 @@ class MetricsConfig:
             metric collection — useful for clean engine-comparison timing.
         emit_trace: ``pftrace`` or ``kineto`` — re-run benchmark under
             ``rocprofv3 --kernel-trace --memory-copy-trace`` and write a
-            trace file. ``kineto`` falls back to pftrace if the rocpd
-            Python module is not importable.
+            trace file. ``kineto`` falls back to pftrace when the
+            installed rocpd can't emit chrome output.
         pmc_set: ``basic`` | ``memory`` | ``flops`` | ``all`` — re-run
             under ``rocprofv3 --pmc <set>`` and fold per-kernel counter
             aggregates into ``extra_metrics["pmc"]``. ``all`` requires
