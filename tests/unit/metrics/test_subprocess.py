@@ -10,11 +10,11 @@ front-end and then waits on those pipes forever, so a wedged rocprofv3
 hangs the whole benchmark instead of skipping one pass.
 """
 
-import os
 import subprocess
 import sys
 import time
 
+import psutil
 import pytest
 
 from dnn_benchmarking.metrics import _subprocess as _subprocess_mod
@@ -22,13 +22,9 @@ from dnn_benchmarking.metrics._subprocess import run_capped
 
 
 def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # psutil, not os.kill(pid, 0): signal 0 is not a thing on Windows
+    # (WinError 87). psutil is already a runtime dependency.
+    return psutil.pid_exists(pid)
 
 
 # Spawns a grandchild that outlives it and holds the inherited pipes,
