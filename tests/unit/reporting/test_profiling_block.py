@@ -105,29 +105,6 @@ class TestTraceRendering:
         assert "/tmp/out/results.pftrace" in text
         assert "ui.perfetto.dev" in text
 
-    def test_kineto_db_only_path_renders_convert_hint(self):
-        """When rocpd convert failed (no `path`, only `db_path`), the
-        user has the source db but no viewable trace. Surface the
-        manual convert command so they don't have to dig it out of
-        the source."""
-        extra = {
-            "trace": {
-                "format": "kineto",
-                "db_path": "/tmp/out/results.db",
-                "kineto_unavailable": "rocpd convert failed",
-            }
-        }
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        text = out.getvalue()
-        assert "Trace DB:" in text
-        assert "/tmp/out/results.db" in text
-        assert "python -m rocpd convert" in text
-        # The Perfetto hint must NOT fire here — the db is not directly
-        # openable in Perfetto, and surfacing the pftrace hint next to
-        # a sqlite path would mislead.
-        assert "ui.perfetto.dev" not in text
-
 
 class TestPerfRendering:
     def test_ipc_and_cycles_render(self):

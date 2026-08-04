@@ -188,10 +188,9 @@ class MetricsConfig:
     Attributes:
         tier: ``basic`` enables always-on probes. ``off`` disables all
             metric collection — useful for clean engine-comparison timing.
-        emit_trace: ``pftrace`` or ``kineto`` — re-run benchmark under
+        emit_trace: ``pftrace`` — re-run benchmark under
             ``rocprofv3 --kernel-trace --memory-copy-trace`` and write a
-            trace file. ``kineto`` falls back to pftrace when the
-            installed rocpd can't emit chrome output.
+            trace file.
         pmc_set: ``basic`` | ``memory`` | ``flops`` | ``all`` — re-run
             under ``rocprofv3 --pmc <set>`` and fold per-kernel counter
             aggregates into ``extra_metrics["pmc"]``. ``all`` requires
@@ -227,7 +226,7 @@ class MetricsConfig:
     """
 
     tier: Literal["basic", "off"] = "basic"
-    emit_trace: Optional[Literal["pftrace", "kineto"]] = None
+    emit_trace: Optional[Literal["pftrace"]] = None
     pmc_set: Optional[Literal["basic", "memory", "flops", "all"]] = None
     perf: bool = False
     roofline: bool = False
@@ -253,13 +252,9 @@ class MetricsConfig:
             raise ValueError(
                 f"Invalid metrics tier: '{self.tier}'. " f"Valid options: {valid_tiers}"
             )
-        if self.emit_trace is not None and self.emit_trace not in {
-            "pftrace",
-            "kineto",
-        }:
+        if self.emit_trace is not None and self.emit_trace != "pftrace":
             raise ValueError(
-                f"Invalid emit_trace: '{self.emit_trace}'. "
-                "Valid options: pftrace, kineto"
+                f"Invalid emit_trace: '{self.emit_trace}'. Valid option: pftrace"
             )
         if self.pmc_set is not None and self.pmc_set not in {
             "basic",

@@ -107,7 +107,7 @@ _BACKEND_CHOICES = EXECUTION_BACKEND_CHOICES
 _REFERENCE_PROVIDER_HELP = ", ".join(sorted(REFERENCE_PROVIDER_CHOICES))
 _PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
 _METRICS_TIER_CHOICES = frozenset({"basic", "off"})
-_EMIT_TRACE_CHOICES = frozenset({"pftrace", "kineto"})
+_EMIT_TRACE_CHOICES = frozenset({"pftrace"})
 _PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
 
 CLI_OPTIONS: tuple[CliOption, ...] = (
@@ -333,8 +333,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Metrics",
         help=(
             "Re-run benchmark under rocprofv3 and export a kernel + "
-            "memory-copy trace in the given format. 'kineto' falls back "
-            "to pftrace when the installed rocpd can't emit chrome. "
+            "memory-copy trace in Perfetto format. "
             "Adds ~1 extra workload run (~5%% kernel-time overhead)."
         ),
         config_key="emit_trace",
@@ -433,7 +432,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Metrics",
         help=(
             "Wall-clock budget for each external profiler subprocess "
-            "(rocprofv3, perf, rocprof-compute, rocpd convert). Default "
+            "(rocprofv3, perf, rocprof-compute). Default "
             "600 s. A wedged child surfaces as 'timed out after Ns' in "
             "extra_metrics['<source>']['skipped'] instead of hanging the "
             "suite. Bump for known-long workloads (heavy graph under "

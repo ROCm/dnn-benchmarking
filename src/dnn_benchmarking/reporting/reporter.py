@@ -628,29 +628,12 @@ class Reporter:
 
         trace = extra.get("trace")
         if isinstance(trace, dict):
-            # Trace and rocpd db are distinct artefacts — kineto in
-            # particular emits both: `path` is the chrome JSON the user
-            # opens in Perfetto/Chrome, `db_path` is the rocpd source.
-            # Folding them onto one line with a `fmt` suffix would
-            # mislabel a database as a trace whenever convert failed and
-            # only `db_path` was present.
             fmt = trace.get("format", "?")
             trace_path = trace.get("path")
-            db_path = trace.get("db_path")
             if trace_path:
                 self._print(f"  Trace ({fmt}):         {trace_path}")
-                # Both .pftrace and chrome JSON open in Perfetto.
                 self._print("    → drag onto https://ui.perfetto.dev/")
-            if db_path:
-                self._print(f"  Trace DB:              {db_path}")
-                # When the kineto convert failed, the db is all we have;
-                # surface the convert command so the user can rerun.
-                if not trace_path:
-                    self._print(
-                        "    → python -m rocpd convert -i <db> "
-                        "--output-format chrome -o trace.json"
-                    )
-            if not trace_path and not db_path and "skipped" in trace:
+            elif "skipped" in trace:
                 self._print(f"  Trace ({fmt}):         skipped — {trace['skipped']}")
             if "error_tail" in trace:
                 self._print(
