@@ -8,6 +8,7 @@ FROM ${BASE_IMAGE} AS builder
 
 ARG DEVICE_TARGET=gfx942
 ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
+ARG ROCM_TORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
@@ -18,7 +19,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -40,9 +40,9 @@ RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
 set -eu
 
 case "${DEVICE_TARGET}" in
-    gfx90a | gfx942 | gfx950 | gfx1152) ;;
+    gfx90a | gfx942 | gfx950 | gfx1151 | gfx1152) ;;
     *)
-        echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, or gfx1152." >&2
+        echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, gfx1151, or gfx1152." >&2
         exit 1
         ;;
 esac
@@ -53,12 +53,18 @@ if [ "${FETCHCONTENT_GIT_SSL_NO_VERIFY}" = "true" ]; then
     export PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
 fi
 
-python3.12 setup_env.py \
+
+set -- \
     --workspace "${BENCHMARK_WORKSPACE}" \
     --torch-mode rocm \
     --gpu-arch "${DEVICE_TARGET}" \
     --no-editable \
     -y
+if [ -n "${ROCM_TORCH_INDEX_URL}" ]; then
+    set -- "$@" --torch-index-url "${ROCM_TORCH_INDEX_URL}"
+fi
+
+python3.12 setup_env.py "$@"
 
 
 # rocm-sdk-devel is build-only. Runtime keeps the ROCm torch/core/libraries
@@ -121,15 +127,29 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #    None kernel fields). See docs/troubleshooting.md.
 
 COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
+ENV ROCM_PATH=/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries \
+    LD_LIBRARY_PATH=/usr/local/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/host-math/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/rocm_sysdeps/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/llvm/lib
 
-# MIOpen's HIPRTC activation path includes libc++ <cstdint> before MIOpen's own
-# miopen_cstdint.hpp. Runtime must not install glibc development headers (their
-# LP64 fixed-width typedefs conflict with MIOpen's HIPRTC LL64 shim), but libc++
-# still needs global intmax_t/uintmax_t for std::intmax_t. Provide only those
-# max-width typedefs and let miopen_cstdint.hpp define int8_t/int64_t/etc.
+# WSL's HSA runtime loads librocdxg.so by its unversioned name, while wheels
+# cannot preserve symlinks and ship only librocdxg.so.1.
+RUN ln -sf \
+    /opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/librocdxg.so.1 \
+    /usr/local/lib/librocdxg.so
+
+# HIPRTC cannot use glibc development headers here: their LP64 int64_t conflicts
+# with MIOpen's LL64 device shim. Provide LL64 fixed-width types directly for
+# libc++ <cstdint> and generated hip-kernel-provider sources.
 RUN cat > /usr/local/include/stdint.h <<'EOF'
-#ifndef DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
-#define DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
+#ifndef DNN_BENCHMARKING_HIPRTC_STDINT_H
+#define DNN_BENCHMARKING_HIPRTC_STDINT_H
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef signed short int16_t;
+typedef unsigned short uint16_t;
+typedef signed int int32_t;
+typedef unsigned int uint32_t;
+typedef signed long long int64_t;
+typedef unsigned long long uint64_t;
 typedef long long intmax_t;
 typedef unsigned long long uintmax_t;
 #define INTMAX_MAX 9223372036854775807LL

@@ -206,9 +206,16 @@ except Exception:
 # warnings to stdout, which is captured here; emit the mode on its own final
 # line (the leading newline guards a warning lacking one) and read only that.
 _GET_TORCH_MODE = r"""
+import os
+import sys
 try:
     import torch
-except Exception:
+except Exception as exc:
+    print(
+        f"torch import failed with LD_LIBRARY_PATH="
+        f"{os.environ.get('LD_LIBRARY_PATH', '')}: {exc}",
+        file=sys.stderr,
+    )
     mode = "missing"
 else:
     if getattr(torch.version, "hip", None):
@@ -332,6 +339,7 @@ class Setup:
         self.resolved_torch_index_url = ""
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
+        self.rocm_runtime_lib_dirs: tuple[str, ...] = ()
 
         self.do_build = not self.reuse_artifacts and self.torch_mode != "cuda"
 
@@ -506,6 +514,8 @@ class Setup:
 
     def get_torch_mode(self) -> str:
         result = self.probe(_GET_TORCH_MODE)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
         if result.returncode != 0:
             return "missing"
         lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
@@ -827,6 +837,33 @@ class Setup:
                 "--index-url",
                 index_url,
             )
+            if not IS_WINDOWS:
+                libraries_prefix = self.require_rocm_wheel_libraries_prefix()
+                core_prefix, core_status = self.find_rocm_wheel_prefix("core")
+                if core_status != 0 or core_prefix is None:
+                    fail("ERROR: no usable ROCm SDK core package found in this venv.")
+                candidates = (
+                    Path(libraries_prefix) / "lib",
+                    Path(core_prefix) / "lib",
+                    Path(core_prefix) / "lib/host-math/lib",
+                    Path(core_prefix) / "lib/rocm_sysdeps/lib",
+                    Path(core_prefix) / "lib/llvm/lib",
+                )
+                self.rocm_runtime_lib_dirs = tuple(
+                    str(path) for path in candidates if path.is_dir()
+                )
+                print(
+                    "ROCm runtime libraries: "
+                    + ":".join(self.rocm_runtime_lib_dirs)
+                )
+                current = self.env.get("LD_LIBRARY_PATH", "")
+                existing = current.split(":") if current else []
+                ordered = [
+                    path
+                    for path in self.rocm_runtime_lib_dirs
+                    if path not in existing
+                ] + existing
+                self.env["LD_LIBRARY_PATH"] = ":".join(ordered)
 
         self.installed_torch_mode = self.get_torch_mode()
         self.require_torch_mode(mode)
@@ -1041,11 +1078,14 @@ class Setup:
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
-            lib_dirs = tuple(
+            runtime_prefixes = tuple(
                 str(Path(prefix) / "lib")
                 for prefix in (toolchain_prefix, install_prefix)
                 if prefix and (Path(prefix) / "lib").is_dir()
             )
+            lib_dirs = tuple(dict.fromkeys(
+                [*self.rocm_runtime_lib_dirs, *runtime_prefixes]
+            ))
             current = self.env.get("LD_LIBRARY_PATH", "")
             existing = current.split(":") if current else []
             ordered = [path for path in lib_dirs if path not in existing] + existing
