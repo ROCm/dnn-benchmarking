@@ -127,29 +127,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #    None kernel fields). See docs/troubleshooting.md.
 
 COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
-ENV ROCM_PATH=/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries \
-    LD_LIBRARY_PATH=/usr/local/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/host-math/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/rocm_sysdeps/lib:/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/llvm/lib
 
-# WSL's HSA runtime loads librocdxg.so by its unversioned name, while wheels
-# cannot preserve symlinks and ship only librocdxg.so.1.
-RUN ln -sf \
-    /opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/librocdxg.so.1 \
-    /usr/local/lib/librocdxg.so
-
-# HIPRTC cannot use glibc development headers here: their LP64 int64_t conflicts
-# with MIOpen's LL64 device shim. Provide LL64 fixed-width types directly for
-# libc++ <cstdint> and generated hip-kernel-provider sources.
+# MIOpen's HIPRTC activation path includes libc++ <cstdint> before MIOpen's own
+# miopen_cstdint.hpp. Runtime must not install glibc development headers (their
+# LP64 fixed-width typedefs conflict with MIOpen's HIPRTC LL64 shim), but libc++
+# still needs global intmax_t/uintmax_t for std::intmax_t. Provide only those
+# max-width typedefs and let miopen_cstdint.hpp define int8_t/int64_t/etc.
 RUN cat > /usr/local/include/stdint.h <<'EOF'
-#ifndef DNN_BENCHMARKING_HIPRTC_STDINT_H
-#define DNN_BENCHMARKING_HIPRTC_STDINT_H
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef signed short int16_t;
-typedef unsigned short uint16_t;
-typedef signed int int32_t;
-typedef unsigned int uint32_t;
-typedef signed long long int64_t;
-typedef unsigned long long uint64_t;
+#ifndef DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
+#define DNN_BENCHMARKING_HIPRTC_STDINT_MAX_ONLY_H
 typedef long long intmax_t;
 typedef unsigned long long uintmax_t;
 #define INTMAX_MAX 9223372036854775807LL
