@@ -504,9 +504,8 @@ class TestSuiteCLIIntegration:
         data = json.loads(output_file.read_text())
         assert len(data["graphs"]) == 1
         engine_ids = [r["engine_id"] for r in data["graphs"][0]["results"]]
-        # IDs are provider-namespaced stable 64-bit hex strings.
         assert any(
-            eid.endswith(("0000000000000000", "0000000000000001")) for eid in engine_ids
+            eid in (0, 1) for eid in engine_ids
         ), f"Expected engines 0 or 1, got {engine_ids}"
 
 

@@ -149,7 +149,7 @@ class TestProviderEngineResult:
         assert "host_stats" in d
         assert "correctness" in d
         assert d["gpu_kernel_stats"]["mean_ms"] == 1.0
-        assert d["engine_id"] == "miopen:0000000000000001"
+        assert d["engine_id"] == 1
         assert d["engine_name"] == "miopen"
         assert d["engine_version"] == "unavailable"
         assert d["started_at"].endswith("+00:00")

@@ -210,10 +210,9 @@ class ProviderEngineResult:
         and only when non-None, so the JSON shape stays compact for
         runs where probes were unavailable.
         """
-        stable_engine_id = f"{self.provider}:{self.engine_id & ((1 << 64) - 1):016x}"
         d: Dict[str, Any] = {
             "provider": self.provider,
-            "engine_id": stable_engine_id,
+            "engine_id": self.engine_id,
             "engine_name": self.provider,
             "engine_version": self.engine_version,
             "started_at": self.started_at,
