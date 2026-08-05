@@ -852,16 +852,11 @@ class Setup:
                 self.rocm_runtime_lib_dirs = tuple(
                     str(path) for path in candidates if path.is_dir()
                 )
-                print(
-                    "ROCm runtime libraries: "
-                    + ":".join(self.rocm_runtime_lib_dirs)
-                )
+                print("ROCm runtime libraries: " + ":".join(self.rocm_runtime_lib_dirs))
                 current = self.env.get("LD_LIBRARY_PATH", "")
                 existing = current.split(":") if current else []
                 ordered = [
-                    path
-                    for path in self.rocm_runtime_lib_dirs
-                    if path not in existing
+                    path for path in self.rocm_runtime_lib_dirs if path not in existing
                 ] + existing
                 self.env["LD_LIBRARY_PATH"] = ":".join(ordered)
 
@@ -1083,9 +1078,9 @@ class Setup:
                 for prefix in (toolchain_prefix, install_prefix)
                 if prefix and (Path(prefix) / "lib").is_dir()
             )
-            lib_dirs = tuple(dict.fromkeys(
-                [*self.rocm_runtime_lib_dirs, *runtime_prefixes]
-            ))
+            lib_dirs = tuple(
+                dict.fromkeys([*self.rocm_runtime_lib_dirs, *runtime_prefixes])
+            )
             current = self.env.get("LD_LIBRARY_PATH", "")
             existing = current.split(":") if current else []
             ordered = [path for path in lib_dirs if path not in existing] + existing
