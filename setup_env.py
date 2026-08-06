@@ -879,7 +879,7 @@ class Setup:
             fail("Visual Studio 2022 C++ Build Tools and the Windows SDK are required.")
 
         result = subprocess.run(
-            ["cmd", "/d", "/s", "/c", f'call "{vcvars}" >nul && set'],
+            f'cmd /d /s /c "call "{vcvars}" >nul && set"',
             capture_output=True,
             text=True,
             check=True,
