@@ -13,6 +13,7 @@ from dnn_benchmarking.execution.suite_runner import (
     run_graph_all_providers,
     run_graph_pytorch_backend,
     _resolve_engine_name,
+    _resolve_engine_version,
     _get_reference_provider,
     _check_correctness,
     _BFLOAT16_RTOL,
@@ -89,6 +90,14 @@ def _make_bm_mock():
     mock_bm.__exit__ = MagicMock(return_value=False)
     mock_bm.create_variant_pack.return_value = {1: 100}
     return mock_bm
+
+
+def test_resolve_engine_version_uses_loaded_plugin_metadata():
+    handle = MagicMock()
+    handle.get_engine_info.return_value.version = "2.3.4"
+
+    assert _resolve_engine_version(handle, 7) == "2.3.4"
+    handle.get_engine_info.assert_called_once_with(7)
 
 
 def _make_exec_factory(

@@ -144,6 +144,20 @@ def _resolve_engine_name(engine_id: int) -> str:
     return f"engine_{engine_id:#x}"
 
 
+def _resolve_engine_version(handle: Any, engine_id: int) -> str:
+    """Return the loaded provider plugin version for an engine ID."""
+    try:
+        info = handle.get_engine_info(engine_id)
+        if info.version:
+            return str(info.version)
+    except Exception as e:
+        warn_once(
+            "suite_runner",
+            f"engine version lookup failed for {engine_id:#x}: {e}",
+        )
+    return "unavailable"
+
+
 def set_plugin_path(
     hipdnn: Any, plugin_path: Optional[Path], loading_mode: Optional[Any] = None
 ) -> None:
@@ -434,10 +448,17 @@ def _run_timed_pytorch_row(
     """
     from . import pytorch_ops
 
+    try:
+        from importlib.metadata import version
+
+        engine_version = version("torch")
+    except Exception:
+        engine_version = "unavailable"
     result = ProviderEngineResult(
         provider=ReferenceProviderName.PYTORCH.value,
         engine_id=0,
         status="skipped",
+        engine_version=engine_version,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
@@ -1001,6 +1022,7 @@ def run_single_provider_engine(
         provider=provider,
         engine_id=engine_id,
         status="error",
+        engine_version=_resolve_engine_version(handle, engine_id),
     )
 
     metrics_basic = config.metrics.basic_enabled

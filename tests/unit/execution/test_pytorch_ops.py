@@ -1865,31 +1865,28 @@ class TestPyTorchSdpaBackendSelection:
         from torch.nn import attention
 
         from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
 
         selected_entered = Event()
         release_selected = Event()
         patch_removed = Event()
         calls = []
-
-        def selected_sdpa(*args, **kwargs):
-            calls.append("selected")
-            selected_entered.set()
-            assert release_selected.wait(timeout=5)
-            calls.append("default")
-            return torch.empty(0)
-
         selected_state = pytorch_ops.PyTorchSdpaBackendState(
             PyTorchSdpaBackendName.MATH
         )
 
+        def tracked_sdpa(*args, **kwargs):
+            if _sdpa_backend._ACTIVE_SDPA_BACKEND.get() is selected_state:
+                calls.append("selected")
+                selected_entered.set()
+                assert release_selected.wait(timeout=5)
+            else:
+                calls.append("default")
+            return torch.empty(0)
+
         def run_selected() -> None:
             with (
                 patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
-                patch.object(
-                    torch.nn.functional,
-                    "scaled_dot_product_attention",
-                    side_effect=selected_sdpa,
-                ),
                 pytorch_ops.use_pytorch_sdpa_backend(selected_state),
             ):
                 self._execute()
@@ -1904,14 +1901,19 @@ class TestPyTorchSdpaBackendSelection:
 
         selected_thread = Thread(target=run_selected)
         default_thread = Thread(target=run_default)
-        selected_thread.start()
-        assert selected_entered.wait(timeout=5)
-        default_thread.start()
-        default_thread.join(timeout=0.1)
-        assert default_thread.is_alive()
-        release_selected.set()
-        selected_thread.join(timeout=5)
-        default_thread.join(timeout=5)
+        with patch.object(
+            torch.nn.functional,
+            "scaled_dot_product_attention",
+            side_effect=tracked_sdpa,
+        ):
+            selected_thread.start()
+            assert selected_entered.wait(timeout=5)
+            default_thread.start()
+            default_thread.join(timeout=0.1)
+            assert default_thread.is_alive()
+            release_selected.set()
+            selected_thread.join(timeout=5)
+            default_thread.join(timeout=5)
 
         assert not selected_thread.is_alive()
         assert not default_thread.is_alive()
