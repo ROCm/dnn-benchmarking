@@ -1868,6 +1868,7 @@ class TestPyTorchSdpaBackendSelection:
 
         selected_entered = Event()
         release_selected = Event()
+        patch_removed = Event()
         calls = []
 
         def selected_sdpa(*args, **kwargs):
@@ -1892,8 +1893,13 @@ class TestPyTorchSdpaBackendSelection:
                 pytorch_ops.use_pytorch_sdpa_backend(selected_state),
             ):
                 self._execute()
+            # Signal that the global patch has been fully removed before
+            # default_thread proceeds — prevents a race where default_thread
+            # unblocks from the backend lock but still sees the active patch.
+            patch_removed.set()
 
         def run_default() -> None:
+            assert patch_removed.wait(timeout=5)
             self._execute()
 
         selected_thread = Thread(target=run_selected)

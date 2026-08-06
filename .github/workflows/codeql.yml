@@ -26,7 +26,7 @@ concurrency:
 jobs:
   analyze:
     name: Analyze ${{ matrix.language }}
-    runs-on: ubuntu-24.04
+    runs-on: aws-linux-scale-rocm-small
     timeout-minutes: 30
     permissions:
       actions: read

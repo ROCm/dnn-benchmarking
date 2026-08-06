@@ -42,7 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        include:
+          - os: aws-linux-scale-rocm-small
+            platform: linux
+          - os: windows-2022
+            platform: windows
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
