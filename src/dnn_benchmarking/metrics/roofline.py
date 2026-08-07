@@ -44,6 +44,15 @@ def _build_argv(
     inner_argv: List[str],
     rocprof_compute_binary: str,
 ) -> List[str]:
+    """Build the ``profile --roof-only`` command line.
+
+    ``-p`` must stay a directory we own outright. rocprof-compute 3.3.0
+    clears the whole ``-p`` root, not just ``-p/-n``: measured with a
+    canary file and a nested directory beside the workload name, both
+    were gone after the run. ``run`` passes the per-(graph, engine)
+    ``roofline`` leaf, so it only ever eats its own output — pointing
+    ``-p`` at a shared parent would take the pmc db and traces with it.
+    """
     return [
         rocprof_compute_binary,
         "profile",

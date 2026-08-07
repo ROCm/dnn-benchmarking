@@ -40,6 +40,35 @@ class TestArgvBuild:
         sep = argv.index("--")
         assert argv[sep + 1 :] == ["python", "-m", "dnn_benchmarking"]
 
+    def test_workload_root_is_the_private_source_dir(self, tmp_path, monkeypatch):
+        """rocprof-compute clears the whole ``-p`` root (verified on 3.3.0:
+        a canary file and a sibling directory under ``-p`` were both gone
+        after a run). ``-p`` must therefore be the per-source roofline
+        leaf we create, never a directory shared with the pmc db or the
+        trace."""
+        out_dir = tmp_path / "graph" / "MIOPEN_ENGINE" / "roofline"
+        sibling = tmp_path / "graph" / "MIOPEN_ENGINE" / "pmc_basic"
+        sibling.mkdir(parents=True)
+
+        captured = {"argv": None}
+
+        def fake_run(argv, timeout_s=None, **kwargs):
+            captured["argv"] = argv
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            roofline_mod,
+            "resolve_rocm_tool",
+            lambda name: "/opt/rocm/bin/rocprof-compute",
+        )
+        with patch.object(roofline_mod, "run_capped", side_effect=fake_run):
+            roofline_mod.run(inner_argv=["python"], out_dir=out_dir)
+
+        argv = captured["argv"]
+        assert Path(argv[argv.index("-p") + 1]) == out_dir
+        # ...and never the engine dir that also holds the pmc db / trace.
+        assert Path(argv[argv.index("-p") + 1]) != sibling.parent
+
 
 class TestRunHappyPath:
     def test_records_csv_and_workload_paths(self, tmp_path, monkeypatch):
