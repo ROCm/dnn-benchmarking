@@ -23,16 +23,16 @@ on:
 permissions:
   contents: read
 
-# rocm-build and gpu-test each pull ~13 GB of ROCm SDK wheels, so never let
-# rapid pushes queue duplicate runs of either.
+# gpu-test pulls ~13 GB of ROCm SDK wheels, so never let rapid pushes queue
+# duplicate runs of it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# setup validates the cross-platform CUDA install path. rocm-build validates
-# the Linux source build against the ROCm SDK wheels without requiring a GPU.
-# gpu-test builds the same way on a real gfx942 machine and runs the full
-# suite there, including the gpu-marked tests the other two jobs skip.
+# setup validates the cross-platform CUDA install path without a GPU.
+# gpu-test builds hipDNN + providers from source for gfx942 on a real GPU
+# machine and runs the full suite there -- one build, then every test in the
+# repo, including the gpu-marked tests setup deselects.
 defaults:
   run:
     # Windows runners ship Git Bash, so a single bash step keeps
@@ -102,52 +102,6 @@ jobs:
           "$VENV/dnn-benchmark" --help
           "$VENV/python" -m pytest -m "not gpu" -q
 
-  rocm-build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
-      # with only ~16 GB free, which isn't enough headroom alongside the sparse
-      # rocm-libraries checkout. Reclaim preinstalled toolchains this job doesn't
-      # use and skip pip's cache to keep the build's footprint self-contained.
-      # $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) is deliberately left alone:
-      # setup-python below reads it, and wiping it forces a redownload.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup || true
-          docker system prune -af || true
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - name: Full rocm-mode build (no GPU)
-        env:
-          PIP_NO_CACHE_DIR: "1"
-        run: |
-          python setup_env.py \
-            --gpu-arch gfx90a \
-            --workspace .ci-rocm-workspace \
-            -y
-
-      # The build installs the whole tool on top of the compiled bindings. Assert
-      # the full no-GPU surface: the hipdnn_frontend extension loads and its ROCm
-      # deps resolve, and the tool imports and its CLI runs. A real benchmark
-      # needs a GPU (hipDNN Handle + kernel dispatch), so that stays on the
-      # on-hardware gfx942 run (the gpu-test job below).
-      - name: Assert install
-        env:
-          DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-rocm-workspace
-        run: |
-          VENV=.ci-rocm-workspace/.venv/bin
-          "$VENV/python" -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
-          "$VENV/python" -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
-          "$VENV/dnn-benchmark" --help
-
   gpu-test:
     runs-on: linux-gfx942-1gpu-ccs-csp-ossci-rocm
     timeout-minutes: 180
@@ -169,12 +123,12 @@ jobs:
             -y
 
       # Activating the venv (rather than invoking $VENV/python directly, as
-      # the other jobs do) picks up the ROCM_PATH/LD_LIBRARY_PATH that
+      # the setup job does) picks up the ROCM_PATH/LD_LIBRARY_PATH that
       # setup_env.py writes to activate.local -- the plugin-discovery
       # fixtures in tests/conftest.py need those to find the built engine
       # plugins. No -m filter: this is the only job with real hardware, so it
-      # runs every test in the repo, including gpu-marked ones the other two
-      # jobs deselect. Tests needing rocprofv3/perf/rocprof-compute binaries
+      # runs every test in the repo, including gpu-marked ones setup
+      # deselects. Tests needing rocprofv3/perf/rocprof-compute binaries
       # self-skip via shutil.which when a tool isn't installed on the runner.
       - name: Install test extras and run full suite on hardware
         env:
