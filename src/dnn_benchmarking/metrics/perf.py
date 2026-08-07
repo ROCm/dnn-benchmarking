@@ -11,10 +11,10 @@ Two tiers of events:
 * User-space (``cycles:u``, ``instructions:u``) — always available to
   the running user.
 * Kernel-space (``cycles:k``, ``instructions:k``) — require
-  ``/proc/sys/kernel/perf_event_paranoid <= 1`` (or ``CAP_PERFMON`` on
-  the perf binary). Dropped silently when the kernel doesn't permit
-  them; the recorded paranoid value tells the user why the kernel
-  fields are None.
+  ``/proc/sys/kernel/perf_event_paranoid <= 1``, unless this process
+  holds ``CAP_PERFMON``/``CAP_SYS_ADMIN``, which bypass the sysctl
+  entirely. Dropped when neither holds; the recorded paranoid value
+  tells the user why the kernel fields are None.
 
 Missing perf binary is a single warn_once + skipped metrics dict;
 nothing about ``--perf`` is fatal.
@@ -52,10 +52,37 @@ def _read_perf_paranoid() -> Optional[int]:
         return None
 
 
+# CAP_SYS_ADMIN and CAP_PERFMON bypass perf_event_paranoid outright.
+_CAP_SYS_ADMIN = 21
+_CAP_PERFMON = 38
+
+
+def _has_perfmon_capability() -> bool:
+    """True iff this process may open kernel events whatever the sysctl says.
+
+    Benchmarking hosts routinely run the workload as root in a
+    privileged container, where perf_event_paranoid is inherited from
+    the (unprivileged-facing) host and says nothing about what we are
+    allowed to do. Reading the sysctl alone drops half the counters on
+    exactly the machines that can collect them.
+    """
+    try:
+        with open("/proc/self/status", "r") as fh:
+            for line in fh:
+                if line.startswith("CapEff:"):
+                    caps = int(line.split()[1], 16)
+                    return bool(caps & ((1 << _CAP_SYS_ADMIN) | (1 << _CAP_PERFMON)))
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 def _kernel_events_allowed(paranoid: Optional[int]) -> bool:
     # Documented kernel rule: cycles:k / instructions:k require
     # paranoid <= 1. paranoid 2 blocks kernel events; 3 blocks all
     # unprivileged tracing; 4 blocks even cycles:u on some kernels.
+    if _has_perfmon_capability():
+        return True
     return paranoid is not None and paranoid <= 1
 
 
@@ -179,7 +206,8 @@ def run(
         result["csv_path"] = str(csv_path)
     if not kernel_ok:
         result["kernel_events_skipped_reason"] = (
-            f"perf_event_paranoid={paranoid} (kernel events require <= 1)"
+            f"perf_event_paranoid={paranoid} (kernel events need <= 1, "
+            "or CAP_PERFMON)"
         )
     if proc.returncode != 0:
         result["returncode"] = proc.returncode

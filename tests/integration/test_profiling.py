@@ -20,6 +20,7 @@ import pytest
 
 from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
+from dnn_benchmarking.metrics.perf import _kernel_events_allowed, _read_perf_paranoid
 
 
 def _graphs_dir() -> Path:
@@ -60,14 +61,14 @@ def _require_binary(name: str) -> str:
     return binary
 
 
-def _require_perf_paranoid_low():
-    try:
-        with open("/proc/sys/kernel/perf_event_paranoid") as fh:
-            paranoid = int(fh.read().strip())
-    except (OSError, ValueError):
-        pytest.skip("could not read perf_event_paranoid")
-    if paranoid > 1:
-        pytest.skip(f"perf_event_paranoid={paranoid} > 1 (kernel events blocked)")
+def _require_perf_kernel_events():
+    """Mirrors production: the sysctl is only half the rule — CAP_PERFMON
+    (root in a privileged container) bypasses it."""
+    paranoid = _read_perf_paranoid()
+    if not _kernel_events_allowed(paranoid):
+        pytest.skip(
+            f"perf_event_paranoid={paranoid} and no CAP_PERFMON (kernel events blocked)"
+        )
 
 
 def _conv_graph() -> Path:
@@ -160,7 +161,7 @@ def test_emit_trace_pftrace_records_artifact(tmp_path):
 def test_perf_records_user_cycles(tmp_path):
     _require_gpu()
     _require_binary("perf")
-    _require_perf_paranoid_low()
+    _require_perf_kernel_events()
     data = _run_dnn_bench(["--perf"], tmp_path)
     extra = _first_pe_extra(data)
     assert "perf" in extra
@@ -202,7 +203,7 @@ def test_combined_pmc_perf_roofline_merge_into_one_extra_metrics(tmp_path):
     _require_rocm_tool("rocprofv3")
     _require_binary("perf")
     _require_rocm_tool("rocprof-compute")
-    _require_perf_paranoid_low()
+    _require_perf_kernel_events()
 
     data = _run_dnn_bench(["--pmc", "basic", "--perf", "--roofline"], tmp_path)
     extra = _first_pe_extra(data)
@@ -293,7 +294,7 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     _require_rocm_tool("rocprofv3")
     _require_binary("perf")
     _require_rocm_tool("rocprof-compute")
-    _require_perf_paranoid_low()
+    _require_perf_kernel_events()
 
     data = _run_dnn_bench(
         ["--pmc", "basic", "--emit-trace", "pftrace", "--perf", "--roofline"], tmp_path

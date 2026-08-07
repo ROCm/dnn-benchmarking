@@ -263,8 +263,10 @@ sys.exit(1)
 # venv interpreter so it sees the same resolution the benchmark will.
 _PROFILING_SOURCES = r"""
 import shutil
+import subprocess
 
 from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
+from dnn_benchmarking.metrics.perf import _kernel_events_allowed, _read_perf_paranoid
 
 
 def state(ok, detail):
@@ -283,16 +285,22 @@ print(state(rocprof_compute is not None, "--roofline: " + (
 )))
 
 perf = shutil.which("perf")
-try:
-    paranoid = int(open("/proc/sys/kernel/perf_event_paranoid").read().strip())
-except OSError:
-    paranoid = None
 if perf is None:
     print(state(False, "--perf: perf not found; install linux-tools matching $(uname -r)"))
-elif paranoid is not None and paranoid > 1:
-    print(state(False, f"--perf: user-space counters only (perf_event_paranoid={paranoid}, kernel events need <= 1)"))
 else:
-    print(state(True, f"--perf: {perf}"))
+    # Distro `perf` is often a wrapper that refuses to run when no
+    # linux-tools package matches the running kernel, so resolving the
+    # name proves nothing. --version is the cheap end-to-end check.
+    probe = subprocess.run([perf, "--version"], capture_output=True, text=True, timeout=30)
+    paranoid = _read_perf_paranoid()
+    if probe.returncode != 0:
+        why = (probe.stderr or probe.stdout).strip().splitlines()
+        print(state(False, f"--perf: {perf} is not runnable: {why[0] if why else 'exit ' + str(probe.returncode)}"))
+        print("         point PATH at a working perf, e.g. /usr/lib/linux-tools-<ver>/perf")
+    elif not _kernel_events_allowed(paranoid):
+        print(state(False, f"--perf: user-space counters only (perf_event_paranoid={paranoid}, kernel events need <= 1 or CAP_PERFMON)"))
+    else:
+        print(state(True, f"--perf: {perf} ({probe.stdout.strip()})"))
 """
 
 _AMDSMI_IMPORTABLE = r"""
