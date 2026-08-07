@@ -23,20 +23,15 @@ on:
 permissions:
   contents: read
 
-# gpu-test pulls ~13 GB of ROCm SDK wheels, so never let rapid pushes queue
-# duplicate runs of it.
+# gpu-test pulls ~13 GB of ROCm SDK wheels; don't queue duplicate runs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# setup validates the cross-platform CUDA install path without a GPU.
-# gpu-test builds hipDNN + providers from source for gfx942 on a real GPU
-# machine and runs the full suite there -- one build, then every test in the
-# repo, including the gpu-marked tests setup deselects.
+# setup: no-GPU install paths, cross-platform. gpu-test: real hardware, full suite.
 defaults:
   run:
-    # Windows runners ship Git Bash, so a single bash step keeps
-    # the assertions identical across OSes.
+    # Windows runners ship Git Bash, so one bash step works on both OSes.
     shell: bash
 
 jobs:
@@ -52,8 +47,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      # No submodules: the rocm-libraries submodule stays empty; the tested
-      # paths (validation + CUDA early-exit) never need it.
+      # No submodules: neither tested path needs rocm-libraries.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -61,11 +55,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Linux-only: with no rocm_agent_enumerator/rocminfo on the runner and no
-      # --gpu-arch override, detection returns "" and install_torch fails fast
-      # before touching the network. Windows always has a default arch, so
-      # this path never fires there -- an arch the index doesn't recognize is
-      # a pip resolver problem, not one setup_env.py can catch itself.
+      # Linux-only: asserts arch detection fails fast on a GPU-less runner.
+      # Windows can't fail this way -- it falls back to a default arch.
       - name: Validation smoke (missing GPU arch)
         if: runner.os == 'Linux'
         run: |
@@ -76,11 +67,8 @@ jobs:
           test "$rc" -eq 1
           grep -q "could not detect a GPU architecture" arch.err
 
-      # cu124 torch yields a CUDA-enabled wheel on both linux-64 and win-64 (bare
-      # PyPI torch is CPU-only on Windows, which would report mode 'cpu' and fail
-      # require_torch_mode cuda). cu124 torch reports torch.version.cuda set even
-      # with no GPU, so get_torch_mode -> cuda and the early-exit path completes
-      # without hardware.
+      # cu124 (not bare PyPI torch, which is CPU-only on Windows) reports
+      # torch.version.cuda even with no GPU, so the cuda path completes here.
       - name: Install smoke (no-GPU CUDA path)
         run: |
           python setup_env.py \
@@ -113,23 +101,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Full rocm-mode build (real GPU)
+      # No --gpu-arch: detected from the runner's own GPU, so this job works
+      # on any GPU runner label.
+      - name: Full rocm-mode build
         env:
           PIP_NO_CACHE_DIR: "1"
         run: |
           python setup_env.py \
-            --gpu-arch gfx942 \
             --workspace .ci-gpu-workspace \
             -y
 
-      # Activating the venv (rather than invoking $VENV/python directly, as
-      # the setup job does) picks up the ROCM_PATH/LD_LIBRARY_PATH that
-      # setup_env.py writes to activate.local -- the plugin-discovery
-      # fixtures in tests/conftest.py need those to find the built engine
-      # plugins. No -m filter: this is the only job with real hardware, so it
-      # runs every test in the repo, including gpu-marked ones setup
-      # deselects. Tests needing rocprofv3/perf/rocprof-compute binaries
-      # self-skip via shutil.which when a tool isn't installed on the runner.
+      # activate (not $VENV/python) for the ROCM_PATH/LD_LIBRARY_PATH that
+      # conftest.py's plugin discovery needs. No -m filter: gpu tests run here.
       - name: Install test extras and run full suite on hardware
         env:
           DNN_BENCH_WORKSPACE: ${{ github.workspace }}/.ci-gpu-workspace
