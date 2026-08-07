@@ -3,6 +3,7 @@
 
 """Tests for the rocprof-compute roofline wrapper."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +98,23 @@ class TestFailureModes:
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         assert extra["roofline"]["returncode"] == 1
         assert "failed" in extra["roofline"]["error_tail"]
+
+    def test_timeout_returns_skipped(self, monkeypatch, tmp_path):
+        """rocprof-compute replays the workload several times, so it is the
+        longest profiling pass and the most likely to wedge. It must still
+        come back as a `skipped` slice rather than hanging the suite."""
+        monkeypatch.setattr(
+            roofline_mod,
+            "resolve_rocm_tool",
+            lambda name: "/opt/rocm/bin/rocprof-compute",
+        )
+        with patch.object(
+            roofline_mod,
+            "run_capped",
+            side_effect=subprocess.TimeoutExpired(cmd="rocprof-compute", timeout=600),
+        ):
+            extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
+        assert "timed out" in extra["roofline"]["skipped"]
 
     def test_success_with_no_csv_at_all_records_tool_diagnostic(
         self, monkeypatch, tmp_path

@@ -3,6 +3,7 @@
 
 """Tests for rocprofv3 trace export."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -80,3 +81,15 @@ class TestPftracePath:
         monkeypatch.setattr(rocprof_trace, "resolve_rocm_tool", lambda name: None)
         extra = rocprof_trace.run(inner_argv=["python"], out_dir=tmp_path)
         assert extra["trace"]["skipped"] == "rocprofv3 binary not found"
+
+    def test_timeout_returns_skipped(self, tmp_path, _force_rocprofv3_present):
+        """A wedged rocprofv3 must surface as a `skipped` slice. rocprofv3
+        execs the workload as a grandchild, so the timeout only fires
+        because run_capped kills the group — see metrics/_subprocess.py."""
+        with patch.object(
+            rocprof_trace,
+            "run_capped",
+            side_effect=subprocess.TimeoutExpired(cmd="rocprofv3", timeout=600),
+        ):
+            extra = rocprof_trace.run(inner_argv=["python"], out_dir=tmp_path)
+        assert "timed out" in extra["trace"]["skipped"]
