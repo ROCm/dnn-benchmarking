@@ -1,29 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+container_command="docker"
 device_target="gfx942"
 tag=""
-docker_args=()
+build_args=()
 
 usage() {
     cat <<'EOF'
-Usage: ./build-dnn-benchmark-performance-image.sh [options] [-- docker-build-args...]
+Usage: ./build-dnn-benchmark-performance-image.sh [options] [-- build-args...]
 
-Build the dnn-benchmark-performance Docker image from the local workspace.
+Build the dnn-benchmark-performance image from the local workspace.
 
 Options:
-  --device-target TARGET  ROCm PyTorch GPU architecture. Default: gfx942
-  --tag TAG               Docker image tag. Default: dnn-benchmark-performance:<device-target>
-  -h, --help              Show this help.
+  --container-command CMD  Container command. Default: docker
+  --device-target TARGET   ROCm PyTorch GPU architecture. Default: gfx942
+  --tag TAG                Image tag. Default: dnn-benchmark-performance:<device-target>
+  -h, --help               Show this help.
 
 Examples:
   ./build-dnn-benchmark-performance-image.sh
+  ./build-dnn-benchmark-performance-image.sh --container-command podman
   ./build-dnn-benchmark-performance-image.sh --device-target gfx950
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --container-command)
+            [[ $# -ge 2 ]] || { echo "--container-command requires a value" >&2; exit 2; }
+            container_command="$2"
+            shift 2
+            ;;
         --device-target)
             [[ $# -ge 2 ]] || { echo "--device-target requires a value" >&2; exit 2; }
             device_target="$2"
@@ -40,7 +48,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --)
             shift
-            docker_args+=("$@")
+            build_args+=("$@")
             break
             ;;
         *)
@@ -51,8 +59,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! command -v docker >/dev/null 2>&1; then
-    echo "docker is required but was not found on PATH" >&2
+if ! command -v "${container_command}" >/dev/null 2>&1; then
+    echo "${container_command} is required but was not found on PATH" >&2
     exit 1
 fi
 
@@ -63,10 +71,9 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-
-DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build \
+DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" "${container_command}" build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance-linux" \
     --build-arg "DEVICE_TARGET=${device_target}" \
     -t "${tag}" \
-    "${docker_args[@]}" \
+    "${build_args[@]}" \
     "${repo_root}"

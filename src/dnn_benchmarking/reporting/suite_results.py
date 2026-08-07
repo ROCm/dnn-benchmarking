@@ -101,6 +101,8 @@ class ProviderEngineResult:
         provider: Provider name.
         engine_id: Engine ID used.
         status: One of 'success', 'error', 'skipped'.
+        engine_version: Loaded provider plugin version.
+        started_at: UTC timestamp immediately before this engine run.
         role: ``engine`` for hipDNN engine rows, ``reference`` for timed
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
@@ -158,6 +160,10 @@ class ProviderEngineResult:
     provider: str
     engine_id: int
     status: Literal["success", "error", "skipped"]
+    engine_version: str = "unavailable"
+    started_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     role: Literal["engine", "reference"] = "engine"
     plugin_path: Optional[str] = None
     cpu_build_time_ms: Optional[float] = None
@@ -207,6 +213,9 @@ class ProviderEngineResult:
         d: Dict[str, Any] = {
             "provider": self.provider,
             "engine_id": self.engine_id,
+            "engine_name": self.provider,
+            "engine_version": self.engine_version,
+            "started_at": self.started_at,
             "status": self.status,
         }
         if self.role != "engine":

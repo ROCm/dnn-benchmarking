@@ -8,6 +8,7 @@ FROM ${BASE_IMAGE} AS builder
 
 ARG DEVICE_TARGET=gfx942
 ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
+ARG ROCM_TORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
@@ -18,7 +19,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -40,9 +40,9 @@ RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
 set -eu
 
 case "${DEVICE_TARGET}" in
-    gfx90a | gfx942 | gfx950 | gfx1152) ;;
+    gfx90a | gfx942 | gfx950 | gfx1151 | gfx1152) ;;
     *)
-        echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, or gfx1152." >&2
+        echo "Unsupported DEVICE_TARGET='${DEVICE_TARGET}'. Expected gfx90a, gfx942, gfx950, gfx1151, or gfx1152." >&2
         exit 1
         ;;
 esac
@@ -53,12 +53,18 @@ if [ "${FETCHCONTENT_GIT_SSL_NO_VERIFY}" = "true" ]; then
     export PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
 fi
 
-python3.12 setup_env.py \
+
+set -- \
     --workspace "${BENCHMARK_WORKSPACE}" \
     --torch-mode rocm \
     --gpu-arch "${DEVICE_TARGET}" \
     --no-editable \
     -y
+if [ -n "${ROCM_TORCH_INDEX_URL}" ]; then
+    set -- "$@" --torch-index-url "${ROCM_TORCH_INDEX_URL}"
+fi
+
+python3.12 setup_env.py "$@"
 
 
 # rocm-sdk-devel is build-only. Runtime keeps the ROCm torch/core/libraries

@@ -503,9 +503,7 @@ class TestSuiteCLIIntegration:
 
         data = json.loads(output_file.read_text())
         assert len(data["graphs"]) == 1
-        engine_ids = sorted(r["engine_id"] for r in data["graphs"][0]["results"])
-        # The discovery on this system may produce just [1] or [0,1] depending on plugin.
-        # We require at least one of the requested IDs landed.
+        engine_ids = [r["engine_id"] for r in data["graphs"][0]["results"]]
         assert any(
             eid in (0, 1) for eid in engine_ids
         ), f"Expected engines 0 or 1, got {engine_ids}"
