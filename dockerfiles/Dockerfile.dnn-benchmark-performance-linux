@@ -120,10 +120,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #
 #  * Container kernel mismatch — the perf wrapper dispatches to
 #    `perf_<kernel-version>` and exits 2 when that build is absent,
-#    which is fatal for the whole pass, not a fallback. Fix with
-#    `apt install linux-tools-$(uname -r)` for the *host* kernel, or
-#    put an already-installed real binary first on PATH
-#    (`/usr/lib/linux-tools-<ver>/perf`).
+#    which is the normal case here: the image ships tools for its own
+#    kernel, the container runs the host's. dnn-benchmarking then uses
+#    the image's build from /usr/lib/linux-tools* and labels the slice
+#    `binary_substituted`. For counters from a matched perf, install
+#    `linux-tools-$(uname -r)` for the *host* kernel.
 #  * Kernel-event collection (`cycles:k`) needs
 #    `/proc/sys/kernel/perf_event_paranoid <= 1` OR `CAP_PERFMON` /
 #    `CAP_SYS_ADMIN`. The sysctl is not namespaced, so the container

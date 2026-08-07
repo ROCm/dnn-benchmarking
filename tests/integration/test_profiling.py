@@ -12,7 +12,6 @@ that can launch but cannot produce full artifacts.
 """
 
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -20,7 +19,11 @@ import pytest
 
 from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
-from dnn_benchmarking.metrics.perf import _kernel_events_allowed, _read_perf_paranoid
+from dnn_benchmarking.metrics.perf import (
+    _kernel_events_allowed,
+    _read_perf_paranoid,
+    _resolve_perf,
+)
 
 
 def _graphs_dir() -> Path:
@@ -53,12 +56,14 @@ def _require_rocm_tool(name: str) -> str:
     return binary
 
 
-def _require_binary(name: str) -> str:
-    """Non-ROCm binary gate (perf, etc.) — PATH-only."""
-    binary = shutil.which(name)
-    if binary is None:
-        pytest.skip(f"{name} not found on PATH")
-    return binary
+def _require_perf() -> str:
+    """perf gate — mirrors production resolution, which falls back to an
+    installed build when the distro wrapper can't run on this kernel. A
+    bare ``shutil.which`` gate skips on hosts where production works."""
+    resolved = _resolve_perf()
+    if resolved is None:
+        pytest.skip("no runnable perf binary")
+    return resolved[0]
 
 
 def _require_perf_kernel_events():
@@ -160,7 +165,7 @@ def test_emit_trace_pftrace_records_artifact(tmp_path):
 @pytest.mark.perf
 def test_perf_records_user_cycles(tmp_path):
     _require_gpu()
-    _require_binary("perf")
+    _require_perf()
     _require_perf_kernel_events()
     data = _run_dnn_bench(["--perf"], tmp_path)
     extra = _first_pe_extra(data)
@@ -201,7 +206,7 @@ def test_combined_pmc_perf_roofline_merge_into_one_extra_metrics(tmp_path):
     """
     _require_gpu()
     _require_rocm_tool("rocprofv3")
-    _require_binary("perf")
+    _require_perf()
     _require_rocm_tool("rocprof-compute")
     _require_perf_kernel_events()
 
@@ -292,7 +297,7 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     """
     _require_gpu()
     _require_rocm_tool("rocprofv3")
-    _require_binary("perf")
+    _require_perf()
     _require_rocm_tool("rocprof-compute")
     _require_perf_kernel_events()
 

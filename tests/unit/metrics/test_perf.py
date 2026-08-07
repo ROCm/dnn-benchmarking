@@ -33,6 +33,12 @@ def _reset(monkeypatch):
     # Pin it off so the paranoid-value tests below assert the sysctl
     # rule and not the host's capabilities.
     monkeypatch.setattr(perf_mod, "_has_perfmon_capability", lambda: False)
+    # Same idea for binary resolution: `which("perf")` is monkeypatched
+    # per test, so pin the runnability probe and the host's installed
+    # linux-tools builds instead of shelling out to whatever this
+    # machine happens to ship.
+    monkeypatch.setattr(perf_mod, "_perf_is_runnable", lambda _: True)
+    monkeypatch.setattr(perf_mod, "_installed_perf_binaries", lambda: [])
 
 
 class TestParseCsv:
@@ -160,11 +166,67 @@ class TestPerfmonCapabilityProbe:
             assert _REAL_CAP_PROBE() is False
 
 
-class TestMissingBinary:
-    def test_missing_perf_returns_skipped(self, monkeypatch, tmp_path):
+class TestBinaryResolution:
+    def test_no_runnable_perf_returns_skipped(self, monkeypatch, tmp_path):
         monkeypatch.setattr(perf_mod.shutil, "which", lambda _: None)
         extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
-        assert extra["perf"]["skipped"].startswith("perf binary not found")
+        assert extra["perf"]["skipped"].startswith("no runnable perf binary")
+
+    def test_unrunnable_wrapper_falls_back_to_an_installed_build(
+        self, monkeypatch, tmp_path
+    ):
+        """Ubuntu's /usr/bin/perf exits 2 when no linux-tools matches the
+        running kernel — routine in a container, where the host kernel
+        differs from the image. The image's own build still counts these
+        events, so use it and say so rather than reporting all-None."""
+        monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
+        monkeypatch.setattr(
+            perf_mod,
+            "_installed_perf_binaries",
+            lambda: ["/usr/lib/linux-tools-6.8.0-136/perf"],
+        )
+        monkeypatch.setattr(
+            perf_mod, "_perf_is_runnable", lambda b: b != "/usr/bin/perf"
+        )
+        monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
+
+        captured = {"argv": None}
+
+        def fake_run(argv, timeout_s=None, **kwargs):
+            captured["argv"] = argv
+            csv_path = Path(argv[argv.index("-o") + 1])
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_path.write_text(SAMPLE_CSV)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
+            extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
+
+        assert captured["argv"][0] == "/usr/lib/linux-tools-6.8.0-136/perf"
+        assert extra["perf"]["binary"] == "/usr/lib/linux-tools-6.8.0-136/perf"
+        assert "/usr/bin/perf" in extra["perf"]["binary_substituted"]
+
+    def test_runnable_perf_is_never_substituted(self, monkeypatch, tmp_path):
+        """The fallback exists for a broken wrapper only. Silently
+        swapping in a build for another kernel when the real one works
+        would change what the numbers mean."""
+        monkeypatch.setattr(perf_mod.shutil, "which", lambda _: "/usr/bin/perf")
+        monkeypatch.setattr(
+            perf_mod, "_installed_perf_binaries", lambda: ["/usr/lib/other/perf"]
+        )
+        monkeypatch.setattr(perf_mod, "_read_perf_paranoid", lambda: 1)
+
+        def fake_run(argv, timeout_s=None, **kwargs):
+            csv_path = Path(argv[argv.index("-o") + 1])
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_path.write_text(SAMPLE_CSV)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(perf_mod, "run_capped", side_effect=fake_run):
+            extra = perf_mod.run(inner_argv=["python"], out_dir=tmp_path)
+
+        assert extra["perf"]["binary"] == "/usr/bin/perf"
+        assert "binary_substituted" not in extra["perf"]
 
 
 class TestSubprocessFailureModes:

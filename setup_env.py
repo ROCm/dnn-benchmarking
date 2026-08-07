@@ -262,11 +262,12 @@ sys.exit(1)
 # Reports what each opt-in profiling flag can do in this venv. Runs in the
 # venv interpreter so it sees the same resolution the benchmark will.
 _PROFILING_SOURCES = r"""
-import shutil
-import subprocess
-
 from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
-from dnn_benchmarking.metrics.perf import _kernel_events_allowed, _read_perf_paranoid
+from dnn_benchmarking.metrics.perf import (
+    _kernel_events_allowed,
+    _read_perf_paranoid,
+    _resolve_perf,
+)
 
 
 def state(ok, detail):
@@ -284,23 +285,21 @@ print(state(rocprof_compute is not None, "--roofline: " + (
     else "rocprof-compute not found; install the rocprofiler-compute system package"
 )))
 
-perf = shutil.which("perf")
-if perf is None:
-    print(state(False, "--perf: perf not found; install linux-tools matching $(uname -r)"))
+# Same resolution the benchmark performs: distro `perf` is a wrapper
+# that refuses to run when no linux-tools matches the running kernel,
+# so resolving the name proves nothing.
+resolved_perf = _resolve_perf()
+if resolved_perf is None:
+    print(state(False, "--perf: no runnable perf; install linux-tools matching $(uname -r)"))
 else:
-    # Distro `perf` is often a wrapper that refuses to run when no
-    # linux-tools package matches the running kernel, so resolving the
-    # name proves nothing. --version is the cheap end-to-end check.
-    probe = subprocess.run([perf, "--version"], capture_output=True, text=True, timeout=30)
+    perf, substitution = resolved_perf
     paranoid = _read_perf_paranoid()
-    if probe.returncode != 0:
-        why = (probe.stderr or probe.stdout).strip().splitlines()
-        print(state(False, f"--perf: {perf} is not runnable: {why[0] if why else 'exit ' + str(probe.returncode)}"))
-        print("         point PATH at a working perf, e.g. /usr/lib/linux-tools-<ver>/perf")
-    elif not _kernel_events_allowed(paranoid):
-        print(state(False, f"--perf: user-space counters only (perf_event_paranoid={paranoid}, kernel events need <= 1 or CAP_PERFMON)"))
+    if not _kernel_events_allowed(paranoid):
+        print(state(False, f"--perf: {perf} records user-space counters only (perf_event_paranoid={paranoid}, kernel events need <= 1 or CAP_PERFMON)"))
     else:
-        print(state(True, f"--perf: {perf} ({probe.stdout.strip()})"))
+        print(state(True, f"--perf: {perf}"))
+    if substitution:
+        print(f"         {substitution}")
 """
 
 _AMDSMI_IMPORTABLE = r"""
