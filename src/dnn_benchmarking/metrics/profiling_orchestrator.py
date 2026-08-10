@@ -257,7 +257,6 @@ def run_profiling_passes(
                         engine_name,
                         f"trace_{metrics_config.emit_trace}",
                     ),
-                    fmt=metrics_config.emit_trace,
                     timeout_s=timeout_s,
                 )
             )

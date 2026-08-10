@@ -205,7 +205,7 @@ class TestRunHappyPath:
         out_dir = tmp_path / "pmc_out"
         out_dir.mkdir()
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # Drop the synthetic db where _find_rocpd_db will pick it up.
             host_dir = Path(argv[argv.index("-d") + 1])
             host_dir.mkdir(parents=True, exist_ok=True)
@@ -213,7 +213,7 @@ class TestRunHappyPath:
             self._make_synthetic_rocpd_db(db)
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_pmc.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_pmc, "run_capped", side_effect=fake_run):
             extra = rocprof_pmc.run(
                 inner_argv=["python", "-m", "dnn_benchmarking"],
                 out_dir=out_dir,
@@ -240,7 +240,7 @@ class TestRunHappyPath:
         out_dir = tmp_path / "pmc_out"
         out_dir.mkdir()
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             host_dir = Path(argv[argv.index("-d") + 1])
             host_dir.mkdir(parents=True, exist_ok=True)
             db = host_dir / "results.db"
@@ -257,7 +257,7 @@ class TestRunHappyPath:
                 conn.close()
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_pmc.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_pmc, "run_capped", side_effect=fake_run):
             extra = rocprof_pmc.run(
                 inner_argv=["python"], out_dir=out_dir, pmc_set="basic"
             )
@@ -279,7 +279,7 @@ class TestRunFailureModes:
             stdout="",
             stderr="rocprofv3: counter 'BOGUS' unsupported on this device\n",
         )
-        with patch.object(rocprof_pmc.subprocess, "run", return_value=proc):
+        with patch.object(rocprof_pmc, "run_capped", return_value=proc):
             extra = rocprof_pmc.run(
                 inner_argv=["python"],
                 out_dir=tmp_path,
@@ -295,7 +295,7 @@ class TestRunFailureModes:
         monkeypatch.setattr(
             rocprof_pmc, "resolve_rocm_tool", lambda name: "/opt/rocm/bin/rocprofv3"
         )
-        with patch.object(rocprof_pmc.subprocess, "run", side_effect=OSError("boom")):
+        with patch.object(rocprof_pmc, "run_capped", side_effect=OSError("boom")):
             extra = rocprof_pmc.run(
                 inner_argv=["python"],
                 out_dir=tmp_path,
@@ -334,8 +334,8 @@ class TestRunFailureModes:
             rocprof_pmc, "resolve_rocm_tool", lambda name: "/opt/rocm/bin/rocprofv3"
         )
         with patch.object(
-            rocprof_pmc.subprocess,
-            "run",
+            rocprof_pmc,
+            "run_capped",
             side_effect=subprocess.TimeoutExpired(cmd="rocprofv3", timeout=600),
         ):
             extra = rocprof_pmc.run(
@@ -357,10 +357,10 @@ class TestArchNarrowing:
             rocprof_pmc, "resolve_rocm_tool", lambda name: "/opt/rocm/bin/rocprofv3"
         )
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_pmc.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_pmc, "run_capped", side_effect=fake_run):
             extra = rocprof_pmc.run(
                 inner_argv=["python"], out_dir=tmp_path, pmc_set="all"
             )
@@ -376,10 +376,10 @@ class TestArchNarrowing:
             rocprof_pmc, "resolve_rocm_tool", lambda name: "/opt/rocm/bin/rocprofv3"
         )
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_pmc.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_pmc, "run_capped", side_effect=fake_run):
             extra = rocprof_pmc.run(
                 inner_argv=["python"], out_dir=tmp_path, pmc_set="all"
             )
@@ -423,11 +423,11 @@ class TestSqlitePathEscaping:
         finally:
             conn.close()
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # rocprofv3 already "wrote" the db above; just succeed.
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(rocprof_pmc.subprocess, "run", side_effect=fake_run):
+        with patch.object(rocprof_pmc, "run_capped", side_effect=fake_run):
             extra = rocprof_pmc.run(
                 inner_argv=["python"], out_dir=out_dir, pmc_set="basic"
             )

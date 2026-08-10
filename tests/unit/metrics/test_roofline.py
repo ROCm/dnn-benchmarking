@@ -3,6 +3,7 @@
 
 """Tests for the rocprof-compute roofline wrapper."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +40,35 @@ class TestArgvBuild:
         sep = argv.index("--")
         assert argv[sep + 1 :] == ["python", "-m", "dnn_benchmarking"]
 
+    def test_workload_root_is_the_private_source_dir(self, tmp_path, monkeypatch):
+        """rocprof-compute clears the whole ``-p`` root (verified on 3.3.0:
+        a canary file and a sibling directory under ``-p`` were both gone
+        after a run). ``-p`` must therefore be the per-source roofline
+        leaf we create, never a directory shared with the pmc db or the
+        trace."""
+        out_dir = tmp_path / "graph" / "MIOPEN_ENGINE" / "roofline"
+        sibling = tmp_path / "graph" / "MIOPEN_ENGINE" / "pmc_basic"
+        sibling.mkdir(parents=True)
+
+        captured = {"argv": None}
+
+        def fake_run(argv, timeout_s=None, **kwargs):
+            captured["argv"] = argv
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            roofline_mod,
+            "resolve_rocm_tool",
+            lambda name: "/opt/rocm/bin/rocprof-compute",
+        )
+        with patch.object(roofline_mod, "run_capped", side_effect=fake_run):
+            roofline_mod.run(inner_argv=["python"], out_dir=out_dir)
+
+        argv = captured["argv"]
+        assert Path(argv[argv.index("-p") + 1]) == out_dir
+        # ...and never the engine dir that also holds the pmc db / trace.
+        assert Path(argv[argv.index("-p") + 1]) != sibling.parent
+
 
 class TestRunHappyPath:
     def test_records_csv_and_workload_paths(self, tmp_path, monkeypatch):
@@ -53,7 +83,7 @@ class TestRunHappyPath:
             lambda name: "/opt/rocm/bin/rocprof-compute",
         )
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # rocprof-compute nests its output one level deeper than
             # workload_dir (under <wl_dir>/<gpu>/). The _find_named
             # walker is recursive so the test mirrors that depth.
@@ -64,7 +94,7 @@ class TestRunHappyPath:
             (inner / "results_pmc_perf_0.csv").write_text("k,v\n")
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(roofline_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(roofline_mod, "run_capped", side_effect=fake_run):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         rl = extra["roofline"]
         assert rl["roofline_csv"].endswith("roofline.csv")
@@ -93,10 +123,27 @@ class TestFailureModes:
         proc = MagicMock(
             returncode=1, stdout="", stderr="rocprof-compute: workload failed\n"
         )
-        with patch.object(roofline_mod.subprocess, "run", return_value=proc):
+        with patch.object(roofline_mod, "run_capped", return_value=proc):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         assert extra["roofline"]["returncode"] == 1
         assert "failed" in extra["roofline"]["error_tail"]
+
+    def test_timeout_returns_skipped(self, monkeypatch, tmp_path):
+        """rocprof-compute replays the workload several times, so it is the
+        longest profiling pass and the most likely to wedge. It must still
+        come back as a `skipped` slice rather than hanging the suite."""
+        monkeypatch.setattr(
+            roofline_mod,
+            "resolve_rocm_tool",
+            lambda name: "/opt/rocm/bin/rocprof-compute",
+        )
+        with patch.object(
+            roofline_mod,
+            "run_capped",
+            side_effect=subprocess.TimeoutExpired(cmd="rocprof-compute", timeout=600),
+        ):
+            extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
+        assert "timed out" in extra["roofline"]["skipped"]
 
     def test_success_with_no_csv_at_all_records_tool_diagnostic(
         self, monkeypatch, tmp_path
@@ -119,7 +166,7 @@ class TestFailureModes:
         )
         # Critically: no side effect that creates any CSV.
         proc = MagicMock(returncode=0, stdout="", stderr="")
-        with patch.object(roofline_mod.subprocess, "run", return_value=proc):
+        with patch.object(roofline_mod, "run_capped", return_value=proc):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         rl = extra["roofline"]
         assert len(rl["warnings"]) == 1
@@ -138,13 +185,13 @@ class TestFailureModes:
             lambda name: "/opt/rocm/bin/rocprof-compute",
         )
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, timeout_s=None, **kwargs):
             # Drop an unrelated CSV so the rglob *.csv match succeeds
             # but neither named file is present.
             (tmp_path / "results_pmc_perf_0.csv").write_text("counter,value\n")
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch.object(roofline_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(roofline_mod, "run_capped", side_effect=fake_run):
             extra = roofline_mod.run(inner_argv=["python"], out_dir=tmp_path)
         rl = extra["roofline"]
         assert rl["warnings"] == ["no roofline.csv or sysinfo.csv produced"]
