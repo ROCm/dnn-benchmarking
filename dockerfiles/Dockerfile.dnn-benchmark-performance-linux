@@ -109,22 +109,35 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -rf /var/lib/apt/lists/*
 
 
+# Profiling sources in this image (setup_env.py prints the same summary):
+#
+#  * --pmc / --emit-trace: rocprofv3 comes from the ROCm wheels, and this
+#    image deliberately installs no system ROCm, so the profiler and the
+#    workload always share one ROCm build. Mixing two is what makes
+#    rocprofv3 abort on a duplicate librocprofiler-sdk registration.
+#  * --roofline: rocprof-compute is NOT installed. It ships in the
+#    rocprofiler-compute system package, which would pull a second ROCm
+#    into the image and reintroduce the mismatch above. Run roofline on a
+#    host with a full ROCm install instead.
+#
 # linux-tools-{common,generic} provide the `perf` binary required by
 # dnn-benchmarking's `--perf` source (CPU cycles/IPC). Two runtime
 # gotchas the apt install can't fix:
 #
 #  * Container kernel mismatch — the perf wrapper dispatches to
-#    `perf_<kernel-version>`. If that build isn't present, perf
-#    complains and falls back; sometimes the user needs
-#    `apt install linux-tools-$(uname -r)` matching the host kernel.
-#  * Kernel-event collection (`cycles:k`) requires
-#    `/proc/sys/kernel/perf_event_paranoid <= 1`. Containers inherit
-#    the host value, so either run the container with
-#    `--cap-add=SYS_ADMIN` and `sysctl kernel.perf_event_paranoid=1`
-#    on the host first, or accept user-space-only counters
-#    (cycles:u / instructions:u — dnn-benchmarking records these
-#    unconditionally and surfaces the paranoid value next to the
-#    None kernel fields). See docs/troubleshooting.md.
+#    `perf_<kernel-version>` and exits 2 when that build is absent,
+#    which is the normal case here: the image ships tools for its own
+#    kernel, the container runs the host's. dnn-benchmarking then uses
+#    the image's build from /usr/lib/linux-tools* and labels the slice
+#    `binary_substituted`. For counters from a matched perf, install
+#    `linux-tools-$(uname -r)` for the *host* kernel.
+#  * Kernel-event collection (`cycles:k`) needs
+#    `/proc/sys/kernel/perf_event_paranoid <= 1` OR `CAP_PERFMON` /
+#    `CAP_SYS_ADMIN`. The sysctl is not namespaced, so the container
+#    reads the host's value — but `--cap-add=PERFMON` (or a privileged
+#    container) bypasses it without touching the host. Failing both,
+#    the run records user-space counters only and reports the paranoid
+#    value next to the None kernel fields. See docs/troubleshooting.md.
 
 COPY --from=builder /opt/dnn-benchmark /opt/dnn-benchmark
 

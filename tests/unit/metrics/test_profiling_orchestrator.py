@@ -339,7 +339,7 @@ class TestDispatch:
             captured["pmc_dir"] = out_dir
             return {"pmc": {}}
 
-        def fake_trace(inner_argv, out_dir, fmt, timeout_s):
+        def fake_trace(inner_argv, out_dir, timeout_s):
             captured["trace_dir"] = out_dir
             return {"trace": {}}
 

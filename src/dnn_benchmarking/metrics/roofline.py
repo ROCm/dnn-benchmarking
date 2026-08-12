@@ -35,6 +35,7 @@ from typing import Any, Dict, List
 
 from ._artifact_paths import DEFAULT_PROFILING_TIMEOUT_S, find_first
 from ._diagnostic import warn_once
+from ._subprocess import run_capped
 from ._tool_resolver import resolve_rocm_tool
 
 
@@ -43,6 +44,15 @@ def _build_argv(
     inner_argv: List[str],
     rocprof_compute_binary: str,
 ) -> List[str]:
+    """Build the ``profile --roof-only`` command line.
+
+    ``-p`` must stay a directory we own outright. rocprof-compute 3.3.0
+    clears the whole ``-p`` root, not just ``-p/-n``: measured with a
+    canary file and a nested directory beside the workload name, both
+    were gone after the run. ``run`` passes the per-(graph, engine)
+    ``roofline`` leaf, so it only ever eats its own output — pointing
+    ``-p`` at a shared parent would take the pmc db and traces with it.
+    """
     return [
         rocprof_compute_binary,
         "profile",
@@ -84,13 +94,7 @@ def run(
 
     subprocess_timeout = timeout_s or None
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=subprocess_timeout,
-        )
+        proc = run_capped(argv, subprocess_timeout)
     except subprocess.TimeoutExpired:
         warn_once(
             "roofline",

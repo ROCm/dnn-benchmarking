@@ -394,6 +394,15 @@ class Executor:
                         f"Benchmark execution failed: {result.get_message()}"
                     )
 
+            # Untimed priming pass, mirroring the PyTorch executor: the
+            # staged timer arms a stream gate before the measured enqueue,
+            # so a provider's first-call plan compile inside the gated
+            # region never drains — with --warmup 0 the run hung
+            # indefinitely (reproduced on MI210 for any --iters).
+            # run_staged_iterations drains the device (barrier) before the
+            # first measurement.
+            enqueue()
+
             host_timings, kernel_timings = run_staged_iterations(
                 staged_timer, self._config.benchmark_iters, enqueue
             )

@@ -121,6 +121,71 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def unify_rocprofiler_libs(core_lib: Path, devel_lib: Path) -> int:
+    """Point the devel prefix's rocprofiler libraries at the core copies.
+
+    The ROCm wheels hardlink one set of rocprofiler libraries into both
+    ``_rocm_sdk_core/lib`` (what torch loads) and ``_rocm_sdk_devel/lib``
+    (the RUNPATH the hipDNN plugins are built against).
+    rocprofiler-register identifies the registered library by path
+    string, so a profiled run registers the core path for torch and then
+    aborts when the plugins bring in the devel path — even though both
+    names are the same file::
+
+        ROCPROFILER_REGISTER_LIBRARY is already set to
+        '.../_rocm_sdk_core/lib/librocprofiler-sdk.so.1', not overriding
+        with '.../_rocm_sdk_devel/lib/librocprofiler-sdk.so'
+
+    Replacing the devel duplicates with symlinks leaves exactly one path
+    in play, which is what makes rocprofv3 trace capture work at all.
+    Only exact same-file duplicates (same device + inode) are relinked,
+    so a genuinely different build is never swapped underneath the user.
+
+    Args:
+        core_lib: ``_rocm_sdk_core/lib``.
+        devel_lib: ``_rocm_sdk_devel/lib``.
+
+    Returns:
+        Number of duplicates relinked.
+    """
+    if not core_lib.is_dir() or not devel_lib.is_dir():
+        return 0
+
+    core_by_id = {}
+    for path in core_lib.glob("librocprofiler-*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        info = path.stat()
+        core_by_id[(info.st_dev, info.st_ino)] = path
+
+    relinked = 0
+    for dup in sorted(devel_lib.glob("librocprofiler-*")):
+        if dup.is_symlink() or not dup.is_file():
+            continue
+        info = dup.stat()
+        target = core_by_id.get((info.st_dev, info.st_ino))
+        if target is None:
+            continue
+        # Build the replacement first and swap it in atomically: unlinking
+        # the hardlink up front would destroy the only remaining name for
+        # the library if symlink creation then failed (Windows without
+        # developer mode, restricted permissions), leaving the devel
+        # prefix short a library it can never get back.
+        staged = dup.with_name(dup.name + ".unify-tmp")
+        try:
+            if staged.is_symlink() or staged.exists():
+                staged.unlink()
+            staged.symlink_to(target)
+            os.replace(staged, dup)
+        except OSError as e:
+            if staged.is_symlink() or staged.exists():
+                staged.unlink()
+            print(f"WARNING: could not relink {dup} -> {target}: {e}")
+            return relinked
+        relinked += 1
+    return relinked
+
+
 # --- Probes ----------------------------------------------------------------
 # These inspect the interpreter's own sys.prefix/sysconfig, so they must run in
 # the VENV interpreter, never the system one.
@@ -191,6 +256,50 @@ if len(matches) > 1:
     print("Use a clean workspace/venv so setup cannot mix ROCm SDK packages.", file=sys.stderr)
     sys.exit(2)
 sys.exit(1)
+"""
+
+
+# Reports what each opt-in profiling flag can do in this venv. Runs in the
+# venv interpreter so it sees the same resolution the benchmark will.
+_PROFILING_SOURCES = r"""
+from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
+from dnn_benchmarking.metrics.perf import (
+    _kernel_events_allowed,
+    _read_perf_paranoid,
+    _resolve_perf,
+)
+
+
+def state(ok, detail):
+    return ("  [ok]   " if ok else "  [skip] ") + detail
+
+
+rocprofv3 = resolve_rocm_tool("rocprofv3")
+print(state(rocprofv3 is not None, f"--emit-trace pftrace / --pmc: rocprofv3 {rocprofv3 or 'not found'}"))
+
+
+rocprof_compute = resolve_rocm_tool("rocprof-compute")
+print(state(rocprof_compute is not None, "--roofline: " + (
+    str(rocprof_compute)
+    if rocprof_compute
+    else "rocprof-compute not found; install the rocprofiler-compute system package"
+)))
+
+# Same resolution the benchmark performs: distro `perf` is a wrapper
+# that refuses to run when no linux-tools matches the running kernel,
+# so resolving the name proves nothing.
+resolved_perf = _resolve_perf()
+if resolved_perf is None:
+    print(state(False, "--perf: no runnable perf; install linux-tools matching $(uname -r)"))
+else:
+    perf, substitution = resolved_perf
+    paranoid = _read_perf_paranoid()
+    if not _kernel_events_allowed(paranoid):
+        print(state(False, f"--perf: {perf} records user-space counters only (perf_event_paranoid={paranoid}, kernel events need <= 1 or CAP_PERFMON)"))
+    else:
+        print(state(True, f"--perf: {perf}"))
+    if substitution:
+        print(f"         {substitution}")
 """
 
 _AMDSMI_IMPORTABLE = r"""
@@ -1115,6 +1224,43 @@ class Setup:
 
     # -- top-level flow -----------------------------------------------------
 
+    def unify_wheel_rocprofiler_libs(self) -> None:
+        """Deduplicate the wheels' rocprofiler libraries (no-op elsewhere).
+
+        Only meaningful for a wheel ROCm install; a system ``--rocm-prefix``
+        has one copy of each library to begin with.
+        """
+        core_prefix, status = self.find_rocm_wheel_prefix("core")
+        if status != 0:
+            return
+        devel_root = self._rocm_sdk_devel_root()
+        if not devel_root:
+            return
+        relinked = unify_rocprofiler_libs(
+            Path(core_prefix) / "lib", Path(devel_root) / "lib"
+        )
+        if relinked:
+            print(
+                f"Relinked {relinked} rocprofiler libraries in the devel "
+                "prefix onto the core prefix copies (rocprofv3 aborts when "
+                "one process registers both paths)."
+            )
+
+    def report_profiling_sources(self) -> None:
+        """Print which opt-in profiling sources this install can actually run.
+
+        Every source degrades to a ``skipped`` slice at run time, which is
+        correct but only visible after paying for a benchmark. Setup knows
+        the answer now, and the two host-level gaps (perf, rocprof-compute)
+        need a root install this script must not attempt.
+        """
+        report = self.probe(_PROFILING_SOURCES)
+        if report.returncode != 0:
+            return
+        print("Profiling sources:")
+        sys.stdout.write(report.stdout)
+        print("")
+
     def run(self) -> int:
         self.require_python_version()
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -1153,9 +1299,11 @@ class Setup:
         binding_prefix = self.select_binding_prefix()
         print(f"Using hipDNN/ROCm prefix: {binding_prefix}")
         self.build_and_install(binding_prefix)
+        self.unify_wheel_rocprofiler_libs()
 
         self.verify()
         self._print_complete()
+        self.report_profiling_sources()
         return 0
 
     def _print_complete(self, cuda: bool = False) -> None:

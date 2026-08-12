@@ -12,14 +12,18 @@ that can launch but cannot produce full artifacts.
 """
 
 import json
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.metrics._tool_resolver import resolve_rocm_tool
+from dnn_benchmarking.metrics.perf import (
+    _kernel_events_allowed,
+    _read_perf_paranoid,
+    _resolve_perf,
+)
 
 
 def _graphs_dir() -> Path:
@@ -40,33 +44,36 @@ def _require_rocm_tool(name: str) -> str:
     """ROCm tool gate — mirrors production resolution.
 
     Production paths (``rocprof_pmc``, ``rocprof_trace``, ``roofline``)
-    resolve ROCm tools via ``resolve_rocm_tool``, which prefers
-    ``$ROCM_PATH/bin``. A bare ``shutil.which`` skip-gate would silently
-    skip on hosts where ``/opt/rocm/bin`` isn't on PATH (remote login
-    nodes, sandboxed containers) even though production would run.
+    resolve ROCm tools via ``resolve_rocm_tool``, which prefers the
+    rocm-sdk wheel's shim and falls back to ``$ROCM_PATH/bin`` then PATH.
+    A bare ``shutil.which`` skip-gate would both miss the wheel shim and
+    silently skip on hosts where ``/opt/rocm/bin`` isn't on PATH (remote
+    login nodes, sandboxed containers) even though production would run.
     """
     binary = resolve_rocm_tool(name)
     if binary is None:
-        pytest.skip(f"{name} not found at $ROCM_PATH/bin or on PATH")
+        pytest.skip(f"{name} not found in the ROCm wheel, $ROCM_PATH/bin, or PATH")
     return binary
 
 
-def _require_binary(name: str) -> str:
-    """Non-ROCm binary gate (perf, etc.) — PATH-only."""
-    binary = shutil.which(name)
-    if binary is None:
-        pytest.skip(f"{name} not found on PATH")
-    return binary
+def _require_perf() -> str:
+    """perf gate — mirrors production resolution, which falls back to an
+    installed build when the distro wrapper can't run on this kernel. A
+    bare ``shutil.which`` gate skips on hosts where production works."""
+    resolved = _resolve_perf()
+    if resolved is None:
+        pytest.skip("no runnable perf binary")
+    return resolved[0]
 
 
-def _require_perf_paranoid_low():
-    try:
-        with open("/proc/sys/kernel/perf_event_paranoid") as fh:
-            paranoid = int(fh.read().strip())
-    except (OSError, ValueError):
-        pytest.skip("could not read perf_event_paranoid")
-    if paranoid > 1:
-        pytest.skip(f"perf_event_paranoid={paranoid} > 1 (kernel events blocked)")
+def _require_perf_kernel_events():
+    """Mirrors production: the sysctl is only half the rule — CAP_PERFMON
+    (root in a privileged container) bypasses it."""
+    paranoid = _read_perf_paranoid()
+    if not _kernel_events_allowed(paranoid):
+        pytest.skip(
+            f"perf_event_paranoid={paranoid} and no CAP_PERFMON (kernel events blocked)"
+        )
 
 
 def _conv_graph() -> Path:
@@ -76,9 +83,20 @@ def _conv_graph() -> Path:
     return p
 
 
+# Below the helper's own cap, so a wedged profiler pass surfaces as the
+# documented ``skipped: ... timed out`` slice instead of killing the test
+# with TimeoutExpired.
+_PROFILING_TIMEOUT_S = 90
+_HELPER_TIMEOUT_S = 300
+
+
 def _run_dnn_bench(extra_args, tmp_path) -> dict:
     out_path = tmp_path / "results.json"
-    proc = subprocess.run(
+    # run_capped, not subprocess.run: the profiler front-ends exec the
+    # workload as a grandchild that survives a plain timeout kill and
+    # holds the pipes open (it also keeps a GPU busy long after pytest
+    # exits). This is the module under test doing its own job.
+    proc = run_capped(
         [
             sys.executable,
             "-m",
@@ -89,15 +107,15 @@ def _run_dnn_bench(extra_args, tmp_path) -> dict:
             "2",
             "--iters",
             "5",
+            "--profiling-timeout",
+            str(_PROFILING_TIMEOUT_S),
             "--profiling-output-dir",
             str(tmp_path / "prof"),
             "-o",
             str(out_path),
             *extra_args,
         ],
-        capture_output=True,
-        text=True,
-        timeout=300,
+        _HELPER_TIMEOUT_S,
     )
     if proc.returncode not in (0, 2):
         pytest.fail(
@@ -147,8 +165,8 @@ def test_emit_trace_pftrace_records_artifact(tmp_path):
 @pytest.mark.perf
 def test_perf_records_user_cycles(tmp_path):
     _require_gpu()
-    _require_binary("perf")
-    _require_perf_paranoid_low()
+    _require_perf()
+    _require_perf_kernel_events()
     data = _run_dnn_bench(["--perf"], tmp_path)
     extra = _first_pe_extra(data)
     assert "perf" in extra
@@ -188,9 +206,9 @@ def test_combined_pmc_perf_roofline_merge_into_one_extra_metrics(tmp_path):
     """
     _require_gpu()
     _require_rocm_tool("rocprofv3")
-    _require_binary("perf")
+    _require_perf()
     _require_rocm_tool("rocprof-compute")
-    _require_perf_paranoid_low()
+    _require_perf_kernel_events()
 
     data = _run_dnn_bench(["--pmc", "basic", "--perf", "--roofline"], tmp_path)
     extra = _first_pe_extra(data)
@@ -279,9 +297,9 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     """
     _require_gpu()
     _require_rocm_tool("rocprofv3")
-    _require_binary("perf")
+    _require_perf()
     _require_rocm_tool("rocprof-compute")
-    _require_perf_paranoid_low()
+    _require_perf_kernel_events()
 
     data = _run_dnn_bench(
         ["--pmc", "basic", "--emit-trace", "pftrace", "--perf", "--roofline"], tmp_path

@@ -1171,11 +1171,10 @@ class TestProfilingFlagParsing:
         args = parser.parse_args(["--graph", "g.json", "--pmc-allow-multipass"])
         assert args.pmc_allow_multipass is True
 
-    def test_emit_trace_accepts_pftrace_and_kineto(self):
+    def test_emit_trace_accepts_pftrace(self):
         parser = create_parser()
-        for fmt in ("pftrace", "kineto"):
-            args = parser.parse_args(["--graph", "g.json", "--emit-trace", fmt])
-            assert args.emit_trace == fmt
+        args = parser.parse_args(["--graph", "g.json", "--emit-trace", "pftrace"])
+        assert args.emit_trace == "pftrace"
 
     def test_emit_trace_rejects_unknown_format(self):
         parser = create_parser()

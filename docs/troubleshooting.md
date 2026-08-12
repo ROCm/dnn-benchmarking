@@ -25,6 +25,20 @@ $VENV_SITE/triton/backends/amd/lib:\
 $LD_LIBRARY_PATH
 ```
 
+## What each profiling source needs
+
+`setup_env.py` prints this as a `Profiling sources:` block at the end of
+a run; the table is what it is checking and how to close each gap.
+
+| Source | Needs | Provided by |
+| --- | --- | --- |
+| `--pmc`, `--emit-trace pftrace` | `rocprofv3` from the **same** ROCm as torch | The rocm-sdk wheels. Never mix a system `/opt/rocm` profiler with wheel-ROCm torch: the profiler injects the system LLVM runtime and the workload dies loading `libamd_comgr.so.3` |
+| `--perf` | a **runnable** `perf`, and either `/proc/sys/kernel/perf_event_paranoid <= 1` or `CAP_PERFMON`/`CAP_SYS_ADMIN` for kernel events | Host, not the venv: `apt install linux-tools-$(uname -r)`. Distro `perf` is a wrapper that exits 2 when no linux-tools matches the running kernel — routine in a container. When that happens the run falls back to an installed build from `/usr/lib/linux-tools*` and records `binary` + `binary_substituted` in the slice, so counters from a foreign-kernel perf are always labelled as such. The paranoid sysctl is not namespaced, so a container reads the host's value; a root/privileged container bypasses it by capability and still records `cycles:k` |
+| `--roofline` | `rocprof-compute` **paired with the ROCm whose `rocprofv3` it drives** | The `rocprofiler-compute` system package. Deliberately absent from the wheel-only Docker image: pulling it in means adding a second ROCm install, which is the mismatch above. A hand-installed copy is not a shortcut — rocprofiler-compute 3.3.0 against ROCm 7.15 dies on `$ROCM_PATH/share/rocprofiler-sdk/counter_defs.yaml`, which that ROCm does not ship. Note it also clears the whole `-p` directory it is given, so never point it at a directory holding other artefacts |
+
+A source that can't run is never fatal — it records a `skipped` entry
+with the reason in `extra_metrics` and the benchmark continues.
+
 ## Profiling integration tests
 
 The profiling smoke tests in `tests/integration/test_profiling.py`
@@ -76,7 +90,7 @@ follow-up work, not a blocker.
 ### Tuning the profiling subprocess timeout
 
 Every external profiler invocation (rocprofv3 PMC, rocprofv3 trace,
-rocpd convert, perf stat, rocprof-compute) is capped at a per-process
+perf stat, rocprof-compute) is capped at a per-process
 wall-clock budget. A wedged child surfaces as
 `extra_metrics["<source>"]["skipped"] == "timed out after Ns"`
 instead of blocking the entire suite.
@@ -194,51 +208,19 @@ the post-hoc render can switch:
 rocprof-compute analyze --path <workload_path> --roofline-data-type FP16
 ```
 
-### Kernel + memcpy trace (`--emit-trace pftrace` / `kineto`)
+### Kernel + memcpy trace (`--emit-trace pftrace`)
 
-The recorded artefacts:
-
-| Key | What |
-|---|---|
-| `path` | The viewable trace file |
-| `db_path` | (kineto only) The rocpd source sqlite db |
-| `format` | What you asked for |
-| `recorded_format` | What was actually recorded (differs only on the kineto-downgraded-to-pftrace path) |
-| `kineto_unavailable` | Set when rocpd isn't importable and we recorded pftrace instead |
-
-#### Open in Perfetto
-
-Both `.pftrace` and the chrome JSON drop into the Perfetto UI:
+The `path` field under `extra_metrics["trace"]` points to the generated
+`.pftrace` file. Open it at:
 
 ```text
 https://ui.perfetto.dev/
 ```
 
-Drag the file onto the page (or `Open Trace File`). Tracks: GPU
-kernels grouped by stream, memcpy operations, host-side HIP API
-calls. Zoom with `W`/`S`, pan with `A`/`D`. Click a kernel slice for
-launch params, duration, queue depth.
-
-#### Open the kineto chrome JSON in Chrome
-
-```text
-chrome://tracing/
-```
-
-Click `Load`, pick the `.chrome.json` file. Perfetto is the better
-viewer; this is the legacy path if you need Chrome's older trace
-processor.
-
-#### If conversion failed (rocpd db only)
-
-`kineto_unavailable` means we have the rocpd `.db` but no chrome
-JSON. Convert manually:
-
-```bash
-python -m rocpd convert -i <db_path> --output-format chrome -o trace.chrome.json
-```
-
-Then open `trace.chrome.json` in Perfetto.
+Drag the file onto the page (or `Open Trace File`). Tracks include GPU
+kernels grouped by stream, memcpy operations, and host-side HIP API calls.
+Zoom with `W`/`S`, pan with `A`/`D`, and click a kernel slice for launch
+parameters, duration, and queue depth.
 
 ### PMC counters (`--pmc basic|memory|flops|all`)
 

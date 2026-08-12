@@ -45,7 +45,7 @@ validate = "none"  # "none" or "pytorch"
 metrics_tier = "basic"
 
 # Optional profiling passes. Omit these keys to disable each optional pass.
-# emit_trace = "pftrace"  # "pftrace" or "kineto"
+# emit_trace = "pftrace"
 # pmc = "basic"           # "basic", "memory", "flops", or "all"
 pmc_allow_multipass = false
 perf = false
