@@ -91,7 +91,7 @@ jobs:
           "$VENV/python" -m pytest -m "not gpu" -q
 
   gpu-test:
-    runs-on: linux-gfx942-1gpu-ccs-csp-ossci-rocm
+    runs-on: linux-gfx90a-gpu-rocm
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
