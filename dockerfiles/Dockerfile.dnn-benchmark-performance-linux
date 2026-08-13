@@ -14,6 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
     BENCHMARK_WORKSPACE=/opt/dnn-benchmark \
     BENCHMARK_VENV=/opt/dnn-benchmark/.venv \
+    LD_LIBRARY_PATH=/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib \
     WORKSPACE_DIR=/workspace \
     GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
@@ -83,6 +84,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
     BENCHMARK_WORKSPACE=/opt/dnn-benchmark \
     BENCHMARK_VENV=/opt/dnn-benchmark/.venv \
+    LD_LIBRARY_PATH=/opt/dnn-benchmark/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib \
     WORKSPACE_DIR=/workspace \
     PATH=/opt/dnn-benchmark/.venv/bin:${PATH}
 
