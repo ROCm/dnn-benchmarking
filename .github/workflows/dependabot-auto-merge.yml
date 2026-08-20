@@ -6,6 +6,12 @@
 # required status checks pass. GitHub's native auto-merge waits for
 # checks required by main's branch protection before merging, so it
 # will not merge on red CI as long as "pre-commit" is a required check.
+#
+# Gated on github.event.pull_request.user.login rather than
+# github.actor: actor reflects the last account to touch the PR ref
+# (spoofable by pushing attacker commits after a bot-authored HEAD),
+# while user.login is the actual PR author and cannot be forged by
+# PR content.
 name: dependabot-auto-merge
 
 on:
@@ -18,7 +24,7 @@ permissions:
 
 jobs:
   auto-merge:
-    if: github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-24.04
     steps:
       - name: Enable auto-merge for the submodule bump PR
