@@ -1,0 +1,28 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Auto-merges the daily rocm-libraries submodule bump PR opened by
+# Dependabot (.github/dependabot.yml, gitsubmodule ecosystem) once
+# required status checks pass. GitHub's native auto-merge waits for
+# checks required by main's branch protection before merging, so it
+# will not merge on red CI as long as "pre-commit" is a required check.
+name: dependabot-auto-merge
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enable auto-merge for the submodule bump PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
