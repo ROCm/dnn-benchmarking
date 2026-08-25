@@ -26,6 +26,8 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+      time: "12:00"
+      timezone: "America/New_York"
     commit-message:
       prefix: "chore(rocm-libraries)"
     labels:
