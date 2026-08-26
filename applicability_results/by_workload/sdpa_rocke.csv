@@ -1,0 +1,158 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,sdpa_rocke,d64-serving-gqa8__bf16_prefill_d64_bf16_idx78_b1_hq64_kv8_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,d64-serving-gqa8__bf16_prefill_d64_bf16_idx79_b1_hq64_kv8_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,d64-serving-gqa8__bf16_prefill_d64_bf16_idx80_b1_hq64_kv8_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,d64-serving-gqa8__bf16_prefill_d64_bf16_idx81_b2_hq64_kv8_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__bf16_prefill_bf16_idx73_b1_hq40_kv40_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__bf16_prefill_bf16_idx74_b1_hq40_kv40_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__bf16_prefill_bf16_idx75_b1_hq40_kv40_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__bf16_prefill_bf16_idx76_b1_hq40_kv40_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__bf16_prefill_bf16_idx77_b1_hq40_kv40_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__fp16_prefill_fp16_idx68_b1_hq40_kv40_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__fp16_prefill_fp16_idx69_b1_hq40_kv40_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__fp16_prefill_fp16_idx70_b1_hq40_kv40_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__fp16_prefill_fp16_idx71_b1_hq40_kv40_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,gpt-3-13b-class__fp16_prefill_fp16_idx72_b1_hq40_kv40_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__bf16_prefill_bf16_idx63_b1_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__bf16_prefill_bf16_idx64_b1_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__bf16_prefill_bf16_idx65_b1_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__bf16_prefill_bf16_idx66_b1_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__bf16_prefill_bf16_idx67_b1_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__fp16_prefill_fp16_idx58_b1_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__fp16_prefill_fp16_idx59_b1_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__fp16_prefill_fp16_idx60_b1_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__fp16_prefill_fp16_idx61_b1_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-2-7b__fp16_prefill_fp16_idx62_b1_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_decode_bf16_idx129_b1_hq128_kv8_sq1_skv16384_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_decode_bf16_idx134_b1_hq128_kv8_sq1_skv32768_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_decode_bf16_idx139_b1_hq128_kv8_sq1_skv512_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_decode_regular_bf16_idx116_b128_hq128_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_prefill_bf16_idx45_b1_hq128_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_prefill_bf16_idx46_b1_hq128_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_prefill_bf16_idx47_b1_hq128_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_prefill_bf16_idx48_b1_hq128_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__bf16_prefill_bf16_idx49_b1_hq128_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_decode_fp16_idx93_b16_hq128_kv8_sq1_skv4096_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_decode_fp16_idx94_b16_hq128_kv8_sq1_skv8192_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_prefill_fp16_idx40_b1_hq128_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_prefill_fp16_idx41_b1_hq128_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_prefill_fp16_idx42_b1_hq128_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_prefill_fp16_idx43_b1_hq128_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-1-405b__fp16_prefill_fp16_idx44_b1_hq128_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__bf16_chunked_prefill_bf16_idx105_b1_hq64_kv8_sq2048_skv16384_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_batchsweep_bf16_idx119_b32_hq64_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_batchsweep_bf16_idx120_b256_hq64_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_bf16_idx125_b1_hq64_kv8_sq1_skv16384_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_bf16_idx135_b1_hq64_kv8_sq1_skv32768_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_bf16_idx138_b1_hq64_kv8_sq1_skv512_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_regular_bf16_idx114_b1_hq64_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_decode_regular_bf16_idx115_b128_hq64_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-70b__bf16_prefill_bf16_idx35_b1_hq64_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__bf16_prefill_bf16_idx36_b1_hq64_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__bf16_prefill_bf16_idx37_b1_hq64_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__bf16_prefill_bf16_idx38_b1_hq64_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__bf16_prefill_bf16_idx39_b1_hq64_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_decode_fp16_idx90_b16_hq64_kv8_sq1_skv4096_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_decode_fp16_idx91_b16_hq64_kv8_sq1_skv8192_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_decode_fp16_idx92_b16_hq64_kv8_sq1_skv16384_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_prefill_fp16_idx30_b1_hq64_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_prefill_fp16_idx31_b1_hq64_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_prefill_fp16_idx32_b1_hq64_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_prefill_fp16_idx33_b1_hq64_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-70b__fp16_prefill_fp16_idx34_b1_hq64_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_chunked_prefill_bf16_idx102_b1_hq32_kv8_sq512_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_chunked_prefill_bf16_idx103_b1_hq32_kv8_sq2048_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_chunked_prefill_bf16_idx104_b1_hq32_kv8_sq2048_skv32768_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_chunked_prefill_regular_bf16_idx110_b1_hq32_kv8_sq256_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_batchsweep_bf16_idx106_b1_hq32_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_batchsweep_bf16_idx107_b32_hq32_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_batchsweep_bf16_idx108_b128_hq32_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_batchsweep_bf16_idx109_b256_hq32_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_bf16_idx124_b1_hq32_kv8_sq1_skv512_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_bf16_idx136_b1_hq32_kv8_sq1_skv16384_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_bf16_idx137_b1_hq32_kv8_sq1_skv32768_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_bf16_idx88_b16_hq32_kv8_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_decode_bf16_idx89_b16_hq32_kv8_sq1_skv16384_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,llama-3-8b__bf16_prefill_bf16_idx5_b1_hq32_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_prefill_bf16_idx6_b1_hq32_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_prefill_bf16_idx7_b1_hq32_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_prefill_bf16_idx8_b1_hq32_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__bf16_prefill_bf16_idx9_b1_hq32_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_decode_fp16_idx82_b16_hq32_kv8_sq1_skv1024_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_decode_fp16_idx83_b16_hq32_kv8_sq1_skv2048_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_decode_fp16_idx84_b16_hq32_kv8_sq1_skv4096_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_decode_fp16_idx85_b16_hq32_kv8_sq1_skv8192_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_decode_fp16_idx86_b16_hq32_kv8_sq1_skv16384_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_decode_fp16_idx87_b16_hq32_kv8_sq1_skv32768_d128_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_prefill_fp16_idx0_b1_hq32_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_prefill_fp16_idx1_b1_hq32_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_prefill_fp16_idx2_b1_hq32_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_prefill_fp16_idx3_b1_hq32_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,llama-3-8b__fp16_prefill_fp16_idx4_b1_hq32_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mimo-v2__bf16_full_prefill_bf16_idx100_b1_hq32_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mimo-v2__bf16_swa_prefill_bf16_idx101_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__bf16_swin_bf16_bs16_idx148_b1_hq32_kv8_sq2048_skv2048_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__bf16_swin_bf16_bs16_idx149_b1_hq32_kv8_sq4096_skv4096_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__bf16_swin_bf16_bs16_idx150_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__bf16_swin_bf16_bs16_idx151_b1_hq32_kv8_sq16384_skv16384_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__bf16_swin_bf16_bs32_idx153_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__bf16_swin_bf16_idx99_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_bs16_idx144_b1_hq32_kv8_sq2048_skv2048_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_bs16_idx145_b1_hq32_kv8_sq4096_skv4096_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_bs16_idx146_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_bs16_idx147_b1_hq32_kv8_sq16384_skv16384_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_bs32_idx152_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_idx97_b1_hq32_kv8_sq8192_skv8192_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,mistral-7b__fp16_swin_fp16_idx98_b1_hq32_kv8_sq16384_skv16384_d128_swin4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__bf16_chunked_prefill_regular_bf16_idx112_b1_hq28_kv4_sq512_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__bf16_prefill_bf16_idx25_b1_hq28_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__bf16_prefill_bf16_idx26_b1_hq28_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__bf16_prefill_bf16_idx27_b1_hq28_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__bf16_prefill_bf16_idx28_b1_hq28_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__bf16_prefill_bf16_idx29_b1_hq28_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__fp16_prefill_fp16_idx20_b1_hq28_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__fp16_prefill_fp16_idx21_b1_hq28_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__fp16_prefill_fp16_idx22_b1_hq28_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__fp16_prefill_fp16_idx23_b1_hq28_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen2-5-7b__fp16_prefill_fp16_idx24_b1_hq28_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_chunked_prefill_regular_bf16_idx111_b1_hq40_kv8_sq512_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_chunked_prefill_sweep_bf16_idx123_b1_hq40_kv8_sq2048_skv32768_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_prefill_bf16_idx15_b1_hq40_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_prefill_bf16_idx16_b1_hq40_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_prefill_bf16_idx17_b1_hq40_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_prefill_bf16_idx18_b1_hq40_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__bf16_prefill_bf16_idx19_b1_hq40_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__fp16_prefill_fp16_idx10_b1_hq40_kv8_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__fp16_prefill_fp16_idx11_b1_hq40_kv8_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__fp16_prefill_fp16_idx12_b1_hq40_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__fp16_prefill_fp16_idx13_b1_hq40_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-14b__fp16_prefill_fp16_idx14_b1_hq40_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_chunked_prefill_regular_bf16_idx113_b1_hq64_kv4_sq2048_skv16384_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_batchsweep_bf16_idx121_b32_hq64_kv4_sq1_skv8192_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_batchsweep_bf16_idx122_b256_hq64_kv4_sq1_skv8192_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_bf16_idx131_b1_hq64_kv4_sq1_skv16384_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_bf16_idx132_b1_hq64_kv4_sq1_skv32768_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_bf16_idx141_b1_hq64_kv4_sq1_skv512_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_bf16_idx142_b1_hq64_kv4_sq1_skv1024_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_bf16_idx96_b64_hq64_kv4_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_decode_regular_bf16_idx117_b128_hq64_kv4_sq1_skv8192_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_prefill_bf16_idx53_b1_hq64_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_prefill_bf16_idx54_b1_hq64_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_prefill_bf16_idx55_b1_hq64_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_prefill_bf16_idx56_b1_hq64_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__bf16_prefill_bf16_idx57_b1_hq64_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__fp16_prefill_fp16_idx50_b1_hq64_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__fp16_prefill_fp16_idx51_b1_hq64_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-235b-a22b__fp16_prefill_fp16_idx52_b1_hq64_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-30b-a3b__bf16_decode_bf16_idx130_b1_hq32_kv4_sq1_skv16384_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-30b-a3b__bf16_decode_bf16_idx133_b1_hq32_kv4_sq1_skv32768_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-30b-a3b__bf16_decode_bf16_idx140_b1_hq32_kv4_sq1_skv512_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-30b-a3b__bf16_decode_bf16_idx143_b1_hq32_kv4_sq1_skv1024_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-30b-a3b__bf16_decode_bf16_idx95_b64_hq32_kv4_sq1_skv4096_d128_full,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,sdpa_rocke,qwen3-next-80b-a3b__bf16_decode_bf16_idx126_b1_hq16_kv2_sq1_skv512_d256_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-next-80b-a3b__bf16_decode_bf16_idx127_b1_hq16_kv2_sq1_skv2048_d256_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-next-80b-a3b__bf16_decode_bf16_idx128_b1_hq16_kv2_sq1_skv16384_d256_full,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-next__bf16_prefill_bf16_idx154_b1_hq16_kv2_sq2048_skv2048_d256_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-next__bf16_prefill_bf16_idx155_b1_hq16_kv2_sq4096_skv4096_d256_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-next__bf16_prefill_bf16_idx156_b1_hq16_kv2_sq8192_skv8192_d256_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,sdpa_rocke,qwen3-next__bf16_prefill_bf16_idx157_b1_hq16_kv2_sq16384_skv16384_d256_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.

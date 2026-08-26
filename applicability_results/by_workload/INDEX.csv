@@ -1,0 +1,10 @@
+workload,asic,graph_count,engine_attempt_rows,applicable_rows,not_applicable_rows,applicable_engines
+bench_cases,gfx942,179,314,270,44,MIOPEN_ENGINE;MIOPEN_ENGINE_DETERMINISTIC
+bench_cases_moe,gfx942,121,121,56,65,HIPBLASLT_ENGINE
+cudnn_frontend_attention_inference,gfx942,428,428,2,426,ASM_SDPA_ENGINE
+cudnn_frontend_attention_training_v2,gfx942,141,141,0,141,none
+cudnn_frontend_bench_moe,gfx942,12,12,12,0,HIPBLASLT_ENGINE
+cudnn_frontend_full_norm,gfx942,30,30,0,30,none
+cudnn_frontend_full_sdpa,gfx942,105,105,0,105,none
+hipblaslt,gfx942,578,578,578,0,HIPBLASLT_ENGINE
+sdpa_rocke,gfx942,157,157,33,124,ASM_SDPA_ENGINE
