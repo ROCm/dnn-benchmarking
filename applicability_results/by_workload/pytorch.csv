@@ -1,0 +1,1381 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,pytorch,backward_fp32_n128_c2048_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n128_c2048_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n128_c8192_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n128_c8192_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n1_c256_h3136_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n1_c256_h3136_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n2_c2048_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n2_c2048_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n2_c8192_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n2_c8192_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n3136_c256_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n3136_c256_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c128_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c256_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n32_c64_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c128_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c256_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,backward_fp32_n8_c64_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n128_c2048_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n128_c2048_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n128_c8192_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n128_c8192_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n1_c256_h3136_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n1_c256_h3136_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n2_c2048_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n2_c2048_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n2_c8192_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n2_c8192_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n3136_c256_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n3136_c256_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c128_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c256_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n32_c64_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c128_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c256_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,inference_fp32_n8_c64_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n128_c2048_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n128_c2048_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n128_c8192_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n128_c8192_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n1_c256_h3136_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n1_c256_h3136_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n2_c2048_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n2_c2048_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n2_c8192_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n2_c8192_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n3136_c256_h1_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n3136_c256_h1_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c128_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c256_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n32_c64_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c128_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c256_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h1024_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h1024_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h256_w1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h256_w1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h28_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h28_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h28_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h28_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h56_w28,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h56_w28,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h56_w56,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,training_fp32_n8_c64_h56_w56,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n1c256h16w16_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n1c256h16w16_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n1c256h16w16_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n1c256h16w16_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k128r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c128h32w32_k256r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k128r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_dgrad_n4c256h32w32_k256r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n1c256h16w16_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n1c256h16w16_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n1c256h16w16_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n1c256h16w16_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k128r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c128h32w32_k256r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k128r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_fprop_n4c256h32w32_k256r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n1c256h16w16_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n1c256h16w16_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n1c256h16w16_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n1c256h16w16_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k128r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c128h32w32_k256r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k128r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r1s1_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r1s1_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r1s1_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r1s1_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r3s3_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r3s3_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r3s3_st2_pad0,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_wgrad_n4c256h32w32_k256r3s3_st2_pad0,-6748551569128940061,MIOPEN_ENGINE_DETERMINISTIC,engine,success,,True,,
+gfx942,pytorch,bf16_b128_m64_n64_k32,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m128_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m128_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m128_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m128_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m8_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m8_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m8_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_m8_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_m1_n2_k8,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m1024_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b32_m256_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m1024_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m128_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m128_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m128_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m128_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m256_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m8_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m8_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m8_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_m8_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m1024_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m1024_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m1024_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m1024_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m256_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m256_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m256_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m256_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m3000_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m3000_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m3000_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_m3000_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m128_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m128_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m128_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m128_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m8_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m8_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m8_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b1_m8_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m1024_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b32_m256_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m1024_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m128_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m128_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m128_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m128_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m256_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m8_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m8_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m8_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_b8_m8_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m1024_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m1024_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m1024_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m1024_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m256_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m256_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m256_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m256_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m3000_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m3000_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m3000_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp16_m3000_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b128_m64_n64_k32,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m128_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m128_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m128_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m128_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m8_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m8_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m8_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b1_m8_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b2_m1_n2_k8,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m1024_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b32_m256_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m1024_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m128_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m128_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m128_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m128_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n1024_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n1024_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n128_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n256_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n256_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n64_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m256_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m8_n32_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m8_n32_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m8_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_b8_m8_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m1024_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m1024_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m1024_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m1024_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m128_n128_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m16_n256_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m1_n1_k1,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m256_n256_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m256_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m256_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m256_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m256_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m3000_n4096_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m3000_n4096_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m3000_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m3000_n512_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m32_n128_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m32_n128_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m32_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m32_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m4_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m64_n128_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m64_n128_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m64_n128_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m64_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m64_n64_k512,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_m64_n64_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_layernorm_1x8x16_nd2,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x1024x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x1024x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x1024x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x256x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x256x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x256x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_32x8x16_nd2,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_64x128x56x56_nd3,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x1024x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x1024x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x1024x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x256x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x256x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x256x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_layernorm_8x8x16_nd2,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_32x1024x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_32x1024x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_32x1024x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_32x256x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_32x256x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_32x256x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_8x1024x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_8x1024x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_8x1024x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_8x256x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_8x256x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_8x256x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_32x1024x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_32x1024x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_32x1024x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_32x256x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_32x256x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_32x256x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_8x1024x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_8x1024x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_8x1024x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_8x256x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_8x256x512_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rmsnorm_backward_8x256x64_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_abs_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_abs_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_abs_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_abs_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_abs_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_128x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_128x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_128x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_128x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_1x1x1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_64x64x128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_64x64x64,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_8x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_8x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_8x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_8x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_ceil_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_ceil_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_ceil_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_ceil_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_ceil_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_128x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_128x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_128x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_128x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_1x1x1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_64x64x128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_64x64x64,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_8x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_8x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_8x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_div_8x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_erf_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_erf_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_erf_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_erf_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_erf_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_exp_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_exp_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_exp_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_exp_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_exp_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_floor_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_floor_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_floor_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_floor_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_floor_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1048576,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_131072,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1x3x16x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1x3x16x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1x3x256x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_1x3x256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_262144,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_4x3x16x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_4x3x16x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_4x3x256x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_4x3x256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_524288,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_64,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_gelu_fwd_8192,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_log_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_log_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_log_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_log_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_log_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_128x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_128x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_128x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_128x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_1x1x1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_64x64x128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_64x64x64,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_8x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_8x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_8x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_mul_8x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_neg_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_neg_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_neg_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_neg_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_neg_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_reciprocal_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_reciprocal_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_reciprocal_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_reciprocal_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_reciprocal_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_relu_fwd_1,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_1024x1024,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_1024x256,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_1048576,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_131072,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_256x1024,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_256x256,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_262144,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_4096,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_512x512,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_524288,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_64,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_relu_fwd_8192,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_rsqrt_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rsqrt_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rsqrt_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rsqrt_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_rsqrt_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sigmoid_fwd_1024x1024,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_sigmoid_fwd_1024x256,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_sigmoid_fwd_256x1024,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_sigmoid_fwd_256x256,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_sigmoid_fwd_512x512,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_sin_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sin_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sin_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sin_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sin_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sqrt_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sqrt_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sqrt_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sqrt_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sqrt_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_128x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_128x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_128x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_128x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_1x1x1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_64x64x128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_64x64x64,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_8x32x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_8x32x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_8x64x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_sub_8x64x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_1048576,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_131072,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_262144,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_4096,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_524288,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_64,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_swish_fwd_8192,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_tan_1024x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_tan_1024x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_tan_256x1024,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_tan_256x256,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_tan_512x512,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_tanh_fwd_1024x1024,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_tanh_fwd_1024x256,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_tanh_fwd_256x1024,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_tanh_fwd_256x256,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_tanh_fwd_512x512,1563989756945604898,MIOPEN_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_add_1024x1024_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_1024x1024_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_1024x512_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_1024x8192_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_256x32_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_256x512_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_32x256_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_32x64_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_512x1024_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_512x256_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_512x64_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_512x8192_ax1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_64x32_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_64x512_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_8192x1024_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_add_8192x512_ax0,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x32x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x32x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x32x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x32x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x64x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x64x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x64x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_16x32x64x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_1x16x32x32_w3x1_s2x1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x32x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x32x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x32x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x32x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x64x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x64x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x64x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_avgpool_exclude_padding_8x32x64x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x32x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x32x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x32x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x32x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x64x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x64x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x64x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_16x32x64x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_1x16x32x32_w3x1_s2x1,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x32x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x32x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x32x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x32x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x64x32_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x64x32_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x64x64_w3x2_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,fp32_maxpool_8x32x64x64_w3x3_s2x2,-2478880896520848391,HIP_MLOPS_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq16_kv16_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq16_kv16_sq1024_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq16_kv16_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq16_kv16_sq128_skv256_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq16_kv16_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq16_kv16_sq1_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq16_kv16_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq16_kv16_sq256_skv416_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq16_kv16_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq16_kv16_sq512_skv4097_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq32_kv32_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq32_kv32_sq1024_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq32_kv32_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq32_kv32_sq128_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq32_kv32_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq32_kv32_sq1_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq32_kv32_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq32_kv32_sq256_skv416_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b128_hq32_kv32_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b128_hq32_kv32_sq512_skv4097_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1024_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq128_skv128_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq128_skv128_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq128_skv256_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq1_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq256_skv256_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq256_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq256_skv416_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq512_skv4097_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv16_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv16_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv2_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv2_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv2_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv2_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq16_kv2_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq16_kv2_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1024_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq128_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq1_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq256_skv416_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq512_skv4097_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv32_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv32_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv4_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv4_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv4_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv4_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b16_hq32_kv4_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b16_hq32_kv4_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1024_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq128_skv128_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq128_skv128_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq128_skv256_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq1_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq256_skv256_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq256_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq256_skv416_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq512_skv4097_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv16_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv16_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv2_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv2_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv2_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv2_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq16_kv2_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq16_kv2_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1024_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq128_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq1_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq256_skv416_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq512_skv4097_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv32_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv32_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv4_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv4_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv4_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv4_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b1_hq32_kv4_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b1_hq32_kv4_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b256_hq32_kv32_sq256_skv256_d16_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv16_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv16_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv16_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv16_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv16_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv16_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv2_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv2_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv2_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv2_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq16_kv2_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq16_kv2_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv32_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv32_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv32_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv32_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv32_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv32_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv4_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv4_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv4_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv4_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b2_hq32_kv4_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b2_hq32_kv4_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv16_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv16_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv16_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv16_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv16_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv16_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv2_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv2_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv2_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv2_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq16_kv2_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq16_kv2_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv32_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv32_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv32_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv32_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv32_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv32_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv4_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv4_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv4_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv4_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b4_hq32_kv4_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b4_hq32_kv4_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1024_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq128_skv128_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq128_skv128_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq128_skv256_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq1_skv2048_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq256_skv256_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq256_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq256_skv416_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq512_skv4097_d256_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv16_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv16_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv2_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv2_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv2_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv2_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq16_kv2_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq16_kv2_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1024_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1024_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq128_skv256_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq128_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq1_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq256_skv416_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq256_skv416_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq512_skv4097_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq512_skv4097_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv32_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv32_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq1024_skv1024_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq1024_skv1024_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv4_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq1024_skv1024_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv4_sq2048_skv2048_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq2048_skv2048_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv4_sq4096_skv4096_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq4096_skv4096_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq512_skv512_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq512_skv512_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv4_sq512_skv512_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,pytorch,bf16_b8_hq32_kv4_sq8192_skv8192_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,bf16_b8_hq32_kv4_sq8192_skv8192_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp16_b256_hq32_kv32_sq256_skv256_d16_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq128_skv128_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq256_skv256_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq512_skv512_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq64_skv64_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq16_kv16_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq128_skv128_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq256_skv256_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq512_skv512_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq64_skv64_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b128_hq8_kv8_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq128_skv128_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq256_skv256_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq512_skv512_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq64_skv64_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq16_kv16_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq128_skv128_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq256_skv256_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq512_skv512_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq64_skv64_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b16_hq8_kv8_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq128_skv128_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq256_skv256_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq512_skv512_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq64_skv64_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq16_kv16_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq32_kv32_sq256_skv256_d16_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq128_skv128_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq256_skv256_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq512_skv512_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq64_skv64_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b256_hq8_kv8_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq128_skv128_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq256_skv256_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq512_skv512_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq64_skv64_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq16_kv16_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq128_skv128_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq256_skv256_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq512_skv512_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq64_skv64_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b32_hq8_kv8_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq128_skv128_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq256_skv256_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq512_skv512_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq64_skv64_d32_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq16_kv16_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq128_skv128_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq128_skv128_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq256_skv256_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq256_skv256_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq512_skv512_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq512_skv512_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq64_skv64_d128_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,pytorch,fp32_b64_hq8_kv8_sq64_skv64_d64_noncausal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
