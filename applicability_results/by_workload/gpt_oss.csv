@@ -1,0 +1,6 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,gpt_oss,gpt_oss__bf16_b2_hq128_kv128_sq16384_skv16384_d64_causal_swa128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,gpt_oss,gpt_oss__bf16_b2_hq128_kv128_sq2048_skv2048_d64_causal_swa128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,gpt_oss,gpt_oss__bf16_b2_hq128_kv128_sq32768_skv32768_d64_causal_swa128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,gpt_oss,gpt_oss__bf16_b2_hq128_kv128_sq4096_skv4096_d64_causal_swa128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,gpt_oss,gpt_oss__bf16_b2_hq128_kv128_sq8192_skv8192_d64_causal_swa128,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.

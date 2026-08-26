@@ -1,0 +1,15 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,qwen3_32b,bf16_m4096_n1024_k5120,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,qwen3_32b,bf16_m4096_n151936_k5120,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,qwen3_32b,bf16_m4096_n25600_k5120,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,qwen3_32b,bf16_m4096_n5120_k25600,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,qwen3_32b,bf16_m4096_n5120_k8192,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,qwen3_32b,bf16_m4096_n8192_k5120,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,qwen3_32b,bf16_rmsnorm_262144x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_rmsnorm_32768x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_rmsnorm_4096x5120_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_swish_fwd_4096x25600,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_b1_hq64_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_b1_hq64_kv8_sq32768_skv32768_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_b1_hq64_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,qwen3_32b,bf16_b1_hq64_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
