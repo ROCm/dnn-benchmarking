@@ -1,4 +1,5 @@
 workload,asic,graph_count,engine_attempt_rows,applicable_rows,not_applicable_rows,applicable_engines
+aiter,gfx942,4988,4988,1102,3886,ASM_SDPA_ENGINE;HIPBLASLT_ENGINE
 aotriton,gfx942,48,48,0,48,none
 auto_regressive_dit,gfx942,5,5,5,0,ASM_SDPA_ENGINE
 bench_cases,gfx942,179,314,270,44,MIOPEN_ENGINE;MIOPEN_ENGINE_DETERMINISTIC

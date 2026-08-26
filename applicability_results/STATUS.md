@@ -23,9 +23,9 @@ correctness-checked pass is a separate, heavier follow-up (needs a PyTorch refer
 - `by_workload/INDEX.csv` — per (workload, asic) summary: graph count, applicable/not-applicable row counts, which
   engines are applicable.
 
-## Status: gfx942 (MI300X) — 33 of 34 workloads complete, 1 in progress
-All workloads except `aiter.tar.gz` (4988 graphs, the largest tarball — timed out at 3600s in the first attempt,
-re-running now with a longer budget) are done and in this ledger.
+## Status: gfx942 (MI300X) — COMPLETE, all 34 workloads
+All 34 workload tarballs are benchmarked and in this ledger, including `aiter.tar.gz` (4988 graphs, the largest
+tarball — timed out at 3600s on the first attempt, completed in 1912s / ~32 min on a retry with a longer budget).
 
 Setup: container `hipdnn_latest_gfx942.sqsh`; `--reuse-artifacts --rocm-prefix /opt/rocm` failed (no hipDNN CMake
 configs baked into the container's `/opt/rocm`); built hipDNN + hipblaslt-provider + hip-kernel-provider + MIOpen
@@ -45,7 +45,7 @@ Per-workload results (gfx942):
 | cudnn_frontend_bench_moe | 12 | HIPBLASLT_ENGINE | 12 | 0 |
 | bench_cases | 179 | MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 270 | 44 |
 | hipblaslt | 578 | HIPBLASLT_ENGINE | 578 | 0 |
-| aiter | 4988 | *(re-running — timed out first attempt)* | — | — |
+| aiter | 4988 | HIPBLASLT_ENGINE / ASM_SDPA_ENGINE | 1102 | 3886 |
 | aotriton | 48 | none | 0 | 48 |
 | bnorm_backward | 8 | HIP_MLOPS_ENGINE / MIOPEN_ENGINE | 16 | 0 |
 | bnorm_fwd | 8 | HIP_MLOPS_ENGINE / MIOPEN_ENGINE | 16 | 0 |
