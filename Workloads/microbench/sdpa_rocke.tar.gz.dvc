@@ -1,0 +1,5 @@
+outs:
+- md5: fc55670aed0df61a5ddd1b898636c4b6
+  size: 18569
+  hash: md5
+  path: sdpa_rocke.tar.gz
