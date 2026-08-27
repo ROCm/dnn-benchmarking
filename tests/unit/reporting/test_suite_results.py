@@ -622,8 +622,6 @@ def _stats(mean_ms: float) -> BenchmarkStats:
 
 def _oracle(**overrides) -> OracleResult:
     kwargs = dict(
-        engine_id=7,
-        engine_name="ENGINE_A",
         plan_name="plan_x",
         compiled_plan_index=3,
         rank=0,
@@ -655,7 +653,9 @@ class TestOracleSerialization:
         pe.oracle_delta = build_oracle_delta(pe, oracle)
         d = pe.to_dict()
         assert d["oracle"]["plan_name"] == "plan_x"
-        assert d["oracle"]["engine_id"] == 7
+        # The engine is the row's own; it is deliberately not duplicated here.
+        assert "engine_id" not in d["oracle"]
+        assert "engine_name" not in d["oracle"]
         assert d["oracle"]["knob_settings"] == []
         assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
         assert d["oracle"]["host_stats"] is None

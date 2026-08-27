@@ -1060,8 +1060,6 @@ def _run_oracle_pass(
         bench_result = executor.benchmark(handle, variant_pack, graph_name=graph_name)
 
         oracle = OracleResult(
-            engine_id=int(winner.engine_id),
-            engine_name=str(winner.engine_name),
             plan_name=executor.plan_name or "",
             compiled_plan_index=int(winner.compiled_plan_index),
             rank=int(winner.rank),

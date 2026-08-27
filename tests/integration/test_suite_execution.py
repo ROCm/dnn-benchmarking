@@ -762,8 +762,14 @@ class TestOracleCLIIntegration:
         assert tuned, f"no row carried an oracle payload. stdout: {result.stdout}"
 
         oracle = tuned[0]["oracle"]
-        assert oracle["plan_name"]
-        assert isinstance(oracle["engine_id"], int)
+        # Not just truthy: the active plan must resolve to the row's own
+        # registered engine name, never the "0x..." hex fallback that an
+        # unregistered engine ID produces.
+        assert oracle["plan_name"] == tuned[0]["engine_name"]
+        assert not oracle["plan_name"].startswith("0x")
+        assert oracle["rank"] == 0
+        assert oracle["compiled_plan_index"] >= 0
+        assert oracle["candidates_benchmarked"] >= 1
         delta = tuned[0]["oracle_delta"]
         assert set(delta) == {
             "basis",

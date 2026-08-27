@@ -102,9 +102,12 @@ class OracleResult:
     autotuning sweep selected and activated a winner. Sweep-time
     measurements are diagnostics only and appear as ``sweep_min_time_ms``.
 
+    The winning engine is not repeated here: candidates are filtered to the
+    row's own engine, so it is always the enclosing
+    :class:`ProviderEngineResult`'s ``engine_id`` / ``provider``.
+    :meth:`Executor.autotune` rejects a winner that says otherwise.
+
     Attributes:
-        engine_id: Engine the winning plan belongs to.
-        engine_name: Engine name reported by the sweep.
         plan_name: Name of the plan hipDNN activated after tuning.
         compiled_plan_index: Index of the winning plan in the compiled set.
         rank: Sweep rank of the winner (0 is fastest).
@@ -122,8 +125,6 @@ class OracleResult:
         host_stats: Host-side timing of the post-tuning run.
     """
 
-    engine_id: int
-    engine_name: str
     plan_name: str
     compiled_plan_index: int
     rank: int
@@ -137,8 +138,6 @@ class OracleResult:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
-            "engine_id": self.engine_id,
-            "engine_name": self.engine_name,
             "plan_name": self.plan_name,
             "compiled_plan_index": self.compiled_plan_index,
             "rank": self.rank,

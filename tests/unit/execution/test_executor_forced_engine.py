@@ -60,6 +60,8 @@ class _StubGraph:
         build_fails=False,
         autotune_results=(),
         autotune_error=None,
+        plan_engines=None,
+        plan_workspaces=None,
     ):
         self._autotune_results = autotune_results
         self._autotune_error = autotune_error
@@ -75,6 +77,20 @@ class _StubGraph:
         self.build_policy = "unset"
         self.autotune_workspace_queried = False
         self.autotune_kwargs = None
+        # One entry per candidate plan, giving the engine that backs it.
+        # Defaults to one plan per ranked engine.
+        self._plan_engines = (
+            [int(e) for e in plan_engines]
+            if plan_engines is not None
+            else [int(e) for e in ranked]
+        )
+        self._plan_workspaces = (
+            list(plan_workspaces)
+            if plan_workspaces is not None
+            else [0] * len(self._plan_engines)
+        )
+        self.barred_engines = set()
+        self.compiled_plan_engines = []
 
     def from_json(self, _s):
         return _StubResult()
@@ -106,16 +122,36 @@ class _StubGraph:
     def check_support(self):
         return _StubResult(bad=self._support_fails, message="not supported")
 
+    def deselect_engines(self, engine_ids):
+        self.barred_engines.update(int(e) for e in engine_ids)
+        return self
+
     def build_plans(self, policy=None):
         self.build_policy = policy
-        return _StubResult(bad=self._build_fails, message="build failed")
+        if self._build_fails:
+            return _StubResult(bad=True, message="build failed")
+        # BuildPlanPolicy.ALL compiles every plan whose engine is not barred;
+        # the heuristic policy compiles only the active plan.
+        if policy == "ALL":
+            self.compiled_plan_engines = [
+                e for e in self._plan_engines if e not in self.barred_engines
+            ]
+        else:
+            self.compiled_plan_engines = self._plan_engines[:1]
+        return _StubResult()
 
     def get_workspace_size(self):
         return 0
 
     def get_autotune_workspace_size(self):
         self.autotune_workspace_queried = True
-        return 0
+        # Mirrors hipDNN: barred plans are skipped from the maximum.
+        sizes = [
+            ws
+            for engine, ws in zip(self._plan_engines, self._plan_workspaces)
+            if engine not in self.barred_engines
+        ]
+        return max(sizes) if sizes else 0
 
     def get_plan_name(self):
         return "winning_plan"
@@ -137,10 +173,24 @@ class _StubAutotuneConfig:
 class _StubCandidate:
     """Stands in for one hipdnn_frontend.AutotuneResult entry."""
 
-    def __init__(self, succeeded=True, rank=0, error_message=""):
+    def __init__(self, succeeded=True, rank=0, error_message="", engine_id=999):
         self.succeeded = succeeded
         self.rank = rank
         self.error_message = error_message
+        self.engine_id = engine_id
+
+
+class _StubDeviceBuffer:
+    """Stands in for hipdnn_frontend.DeviceBuffer."""
+
+    def __init__(self, size):
+        self.size = size
+
+    def ptr(self):
+        return 0xDEADBEEF
+
+    def zeros(self):
+        return None
 
 
 def _executor():
@@ -154,6 +204,7 @@ def _fake_module(graph):
     fake.Graph = lambda: graph
     fake.BuildPlanPolicy = types.SimpleNamespace(ALL="ALL")
     fake.AutotuneConfig = _StubAutotuneConfig
+    fake.DeviceBuffer = _StubDeviceBuffer
     return fake
 
 
@@ -286,7 +337,9 @@ def test_autotune_filters_to_engine_and_omits_workspace_size():
     graph = _StubGraph(
         ranked=[999],
         selected=999,
-        autotune_results=[_StubCandidate(rank=1), _StubCandidate(rank=0)],
+        # hipDNN's rankAndSelectWinner returns succeeded candidates first, in
+        # ascending rank order; the stub reproduces that contract.
+        autotune_results=[_StubCandidate(rank=0), _StubCandidate(rank=1)],
     )
     executor = _prepared_autotune_executor(graph)
     with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
@@ -295,7 +348,7 @@ def test_autotune_filters_to_engine_and_omits_workspace_size():
     assert graph.autotune_kwargs is not None
     assert "workspace_size" not in graph.autotune_kwargs
     assert graph.autotune_kwargs["config"].engine_id_filter == [999]
-    # Rank 0 first, so callers can take winners[0].
+    # Rank order is preserved, so callers can take winners[0].
     assert [w.rank for w in winners] == [0, 1]
     assert executor.selected_engine_id == 999
     assert executor.plan_name == "winning_plan"
@@ -345,3 +398,117 @@ def test_autotune_without_prepare_raises():
     with pytest.raises(ExecutionError) as exc:
         _executor().autotune(object(), {}, 1)
     assert "not prepared" in str(exc.value)
+
+
+def test_prepare_for_autotune_bars_other_engines():
+    """Only the target engine's plans are compiled, and the workspace is sized
+    for those plans alone.
+
+    build_plans(ALL) skips a barred plan before finalizing it, so barring the
+    other engines removes their compiles; get_autotune_workspace_size() also
+    skips barred plans, which keeps the oracle workspace off the peak while the
+    OOTB workspace is still allocated.
+    """
+    graph = _StubGraph(
+        ranked=[999, 111, 222],
+        selected=999,
+        plan_engines=[999, 999, 111, 222],
+        plan_workspaces=[16, 32, 4096, 8192],
+    )
+    _prepared_autotune_executor(graph)
+
+    assert graph.barred_engines == {111, 222}
+    # Same count as engine 999's own plans, i.e. two fewer compiles here.
+    assert graph.compiled_plan_engines == [999, 999]
+
+
+def test_prepare_for_autotune_without_deselect_compiles_every_engine():
+    """Control for the previous test: without barring, every engine's plans are
+    compiled and the workspace is sized for the largest of them."""
+    graph = _StubGraph(
+        ranked=[999, 111, 222],
+        selected=999,
+        plan_engines=[999, 999, 111, 222],
+        plan_workspaces=[16, 32, 4096, 8192],
+    )
+    executor = _executor()
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        # engine_id=None is the only way to reach the ALL build without the
+        # barring step, which is exactly the "before" case.
+        executor.prepare(handle=object(), engine_id=None, for_autotune=True)
+
+    assert graph.barred_engines == set()
+    assert graph.compiled_plan_engines == [999, 999, 111, 222]
+    assert executor.workspace_size == 8192
+
+
+def test_prepare_for_autotune_workspace_covers_target_engine_only():
+    """The allocated workspace is the target engine's maximum, not the graph's."""
+    graph = _StubGraph(
+        ranked=[999, 111],
+        selected=999,
+        plan_engines=[999, 999, 111],
+        plan_workspaces=[16, 32, 8192],
+    )
+    executor = _prepared_autotune_executor(graph)
+    assert executor.workspace_size == 32
+
+
+def test_autotune_passes_run_warmup_iterations_to_the_sweep():
+    """The sweep's warmup comes from the run's --warmup, not the binding
+    default of 1, so first-execute kernel sampling stays out of the window
+    that ranks the candidates."""
+    config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=7, benchmark_iters=1)
+    executor = executor_module.Executor("{}", config)
+    graph = _StubGraph(
+        ranked=[999], selected=999, autotune_results=[_StubCandidate(rank=0)]
+    )
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        executor.prepare(handle=object(), engine_id=999, for_autotune=True)
+        executor.autotune(object(), {}, 999)
+
+    assert graph.autotune_kwargs["config"].warmup_iterations == 7
+
+
+def test_autotune_error_reports_target_engine_failure_not_the_filter():
+    """Other engines' candidates come back as non-benchmarked filter/bar
+    rejections; the reported error must be the target engine's real failure."""
+    graph = _StubGraph(
+        ranked=[999],
+        selected=999,
+        autotune_results=[
+            _StubCandidate(
+                succeeded=False,
+                rank=-1,
+                error_message="Plan excluded by engineIdFilter.",
+                engine_id=111,
+            ),
+            _StubCandidate(
+                succeeded=False,
+                rank=-1,
+                error_message="workspace exceeds limit",
+                engine_id=999,
+            ),
+        ],
+    )
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        with pytest.raises(ExecutionError) as exc:
+            executor.autotune(object(), {}, 999)
+    assert "workspace exceeds limit" in str(exc.value)
+    assert "engineIdFilter" not in str(exc.value)
+
+
+def test_autotune_winner_from_another_engine_raises():
+    """engine_id_filter makes this impossible; if it ever happens the oracle
+    timing would carry the wrong engine label, so fail loudly."""
+    graph = _StubGraph(
+        ranked=[999],
+        selected=999,
+        autotune_results=[_StubCandidate(rank=0, engine_id=111)],
+    )
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        with pytest.raises(ExecutionError) as exc:
+            executor.autotune(object(), {}, 999)
+    assert "111" in str(exc.value) and "999" in str(exc.value)

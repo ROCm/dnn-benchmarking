@@ -656,8 +656,6 @@ class TestMachineSummaryPlatformLabel:
 
 def _make_oracle(**overrides) -> OracleResult:
     kwargs = dict(
-        engine_id=1,
-        engine_name="MIOPEN_ENGINE",
         plan_name="tuned_plan_7",
         compiled_plan_index=2,
         rank=0,
@@ -723,7 +721,8 @@ class TestOracleReporting:
         )
         out = output.getvalue()
         assert "Oracle (auto-tuned):" in out
-        assert "1 (MIOPEN_ENGINE)" in out
+        # The engine is already in the row header; the block does not repeat it.
+        assert "Engine:" not in out
         assert "tuned_plan_7" in out
         assert "compiled plan index 2, rank 0" in out
         assert "engine defaults" in out

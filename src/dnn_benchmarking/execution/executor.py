@@ -254,6 +254,24 @@ class Executor:
                     f"Backend support check failed: {result.get_message()}"
                 )
 
+            if for_autotune and engine_id is not None:
+                # Bar every other engine before compiling. build_plans(ALL)
+                # marks a barred plan and skips it *before*
+                # finalizePlanDescriptor, so this drops E-1 engine compiles per
+                # row, and get_autotune_workspace_size() ignores barred plans,
+                # so the workspace shrinks to this engine's plans. That matters
+                # because it is allocated while the OOTB workspace is still
+                # live. The tuning candidate set is unchanged: engine_id_filter
+                # already restricted benchmarking to engine_id, so barring the
+                # rest only changes which non-benchmarked reason they report.
+                others = [
+                    int(eid)
+                    for eid in self._graph.get_ranked_engine_ids()
+                    if int(eid) != engine_id
+                ]
+                if others:
+                    self._graph.deselect_engines(others)
+
             if for_autotune:
                 result = self._graph.build_plans(hipdnn.BuildPlanPolicy.ALL)
             else:
@@ -297,8 +315,8 @@ class Executor:
             engine_id: Engine the candidate plans are restricted to.
 
         Returns:
-            The list of successful AutotuneResult entries, sorted by rank
-            (rank 0 first). Failed candidates are dropped.
+            The successful AutotuneResult entries in rank order (rank 0 first),
+            as hipDNN already returns them. Failed candidates are dropped.
 
         Raises:
             ExecutionError: If the graph is not prepared, autotuning fails, or
@@ -316,6 +334,11 @@ class Executor:
 
         cfg = hipdnn.AutotuneConfig()
         cfg.engine_id_filter = [engine_id]
+        # The binding default is 1 warmup iteration, which leaves a provider's
+        # first-execute kernel sampling inside the window that ranks the
+        # candidates. Use the run's own warmup count so the winner is picked on
+        # steady-state timings. strategy stays RUN_UNTIL_STABLE.
+        cfg.warmup_iterations = self._config.warmup_iters
 
         try:
             # Omit workspace_size: passing it selects the plan-spec overload
@@ -326,18 +349,35 @@ class Executor:
         except RuntimeError as e:
             raise ExecutionError(f"Autotuning failed: {e}") from e
 
+        # hipDNN returns succeeded candidates first, in ascending rank order,
+        # then the failed ones with rank -1, so no re-sort is needed.
         winners = [r for r in results if r.succeeded]
         if not winners:
-            message = ""
-            for r in results:
-                message = getattr(r, "error_message", "") or ""
-                if message:
-                    break
+            # Candidates for other engines come back as non-benchmarked
+            # failures ("Plan excluded by engineIdFilter." / "Plan barred ..."),
+            # so report this engine's real failure rather than the filter's own
+            # message.
+            message = next(
+                (
+                    r.error_message
+                    for r in results
+                    if int(r.engine_id) == engine_id and r.error_message
+                ),
+                "",
+            )
             raise ExecutionError(
                 message or "no autotune candidate benchmarked successfully"
             )
 
-        winners.sort(key=lambda r: r.rank)
+        winner = winners[0]
+        if int(winner.engine_id) != engine_id:
+            # engine_id_filter makes this impossible; a mismatch would mean the
+            # oracle timing is labelled with the wrong engine.
+            raise ExecutionError(
+                f"Autotune winner is engine {int(winner.engine_id)}, but "
+                f"candidates were filtered to engine {engine_id}"
+            )
+
         # Refresh the recorded engine from the plan autotune just activated.
         self._record_selected_engine(None)
         return winners

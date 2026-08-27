@@ -555,7 +555,6 @@ class Reporter:
 
         o = pe.oracle
         self._print("Oracle (auto-tuned):")
-        self._print(f"  Engine:        {o.engine_id} ({o.engine_name})")
         self._print(
             f"  Plan:          {o.plan_name}  "
             f"(compiled plan index {o.compiled_plan_index}, rank {o.rank})"
