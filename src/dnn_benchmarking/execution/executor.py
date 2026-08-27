@@ -353,15 +353,14 @@ class Executor:
         # then the failed ones with rank -1, so no re-sort is needed.
         winners = [r for r in results if r.succeeded]
         if not winners:
-            # Candidates for other engines come back as non-benchmarked
-            # failures ("Plan excluded by engineIdFilter." / "Plan barred ..."),
-            # so report this engine's real failure rather than the filter's own
-            # message.
+            # Candidates the caller's own filters rejected are not
+            # benchmarked and carry the filter's message, not a real
+            # failure, so skip them and report this engine's actual reason.
             message = next(
                 (
                     r.error_message
                     for r in results
-                    if int(r.engine_id) == engine_id and r.error_message
+                    if not r.excluded_by_caller and r.error_message
                 ),
                 "",
             )
@@ -382,31 +381,21 @@ class Executor:
         self._record_selected_engine(None)
         return winners
 
-    def plan_name(self, handle: Any = None) -> Optional[str]:
+    def plan_name(self, handle: Any) -> Optional[str]:
         """Name of the currently active execution plan, or None if unprepared.
 
-        Pass the handle the graph was built with. Newer hipDNN bindings need it
-        to name plugin-supplied engines and fall back to a hex engine ID
-        without it, which is exactly the engine class this tool benchmarks.
-        Bindings that predate the handle parameter resolve plugin engines from
-        a process-wide registry instead, so call the no-handle form when the
-        handle is rejected rather than reporting a hex ID on either revision.
-
         Args:
-            handle: hipdnn.Handle instance the graph was built with.
+            handle: hipdnn.Handle instance the graph was built with. Required:
+                without it hipDNN consults only the built-in registry and
+                reports a hex engine ID for plugin-supplied engines, which is
+                the engine class this tool benchmarks.
 
         Returns:
             The active plan's engine name, or None when no graph is prepared.
         """
         if self._graph is None:
             return None
-        if handle is not None:
-            try:
-                return str(self._graph.get_plan_name(handle))
-            except TypeError:
-                # Binding predates the handle parameter.
-                pass
-        return str(self._graph.get_plan_name())
+        return str(self._graph.get_plan_name(handle))
 
     @property
     def selected_engine_id(self) -> Optional[int]:

@@ -154,9 +154,9 @@ class _StubGraph:
         ]
         return max(sizes) if sizes else 0
 
-    def get_plan_name(self, handle=None):
-        # Newer bindings take the handle and need it to name plugin-supplied
-        # engines; without it they fall back to a hex engine ID.
+    def get_plan_name(self, handle):
+        # hipDNN needs the handle to name plugin-supplied engines; without it
+        # it consults only the built-in registry and reports a hex engine ID.
         self.plan_name_handle = handle
         return "winning_plan" if handle is not None else "0xdeadbeef"
 
@@ -165,13 +165,6 @@ class _StubGraph:
             raise RuntimeError(self._autotune_error)
         self.autotune_kwargs = kwargs
         return list(self._autotune_results)
-
-
-class _LegacyPlanNameGraph(_StubGraph):
-    """Stub for bindings that predate the get_plan_name handle parameter."""
-
-    def get_plan_name(self):
-        return "winning_plan"
 
 
 class _StubAutotuneConfig:
@@ -184,11 +177,21 @@ class _StubAutotuneConfig:
 class _StubCandidate:
     """Stands in for one hipdnn_frontend.AutotuneResult entry."""
 
-    def __init__(self, succeeded=True, rank=0, error_message="", engine_id=999):
+    def __init__(
+        self,
+        succeeded=True,
+        rank=0,
+        error_message="",
+        engine_id=999,
+        excluded_by_caller=False,
+    ):
         self.succeeded = succeeded
         self.rank = rank
         self.error_message = error_message
         self.engine_id = engine_id
+        # hipDNN sets this on candidates its own filters rejected without
+        # benchmarking (engine_id_filter, deselect_engines, workspace ceiling).
+        self.excluded_by_caller = excluded_by_caller
 
 
 class _StubDeviceBuffer:
@@ -481,9 +484,9 @@ def test_autotune_passes_run_warmup_iterations_to_the_sweep():
     assert graph.autotune_kwargs["config"].warmup_iterations == 7
 
 
-def test_autotune_error_reports_target_engine_failure_not_the_filter():
-    """Other engines' candidates come back as non-benchmarked filter/bar
-    rejections; the reported error must be the target engine's real failure."""
+def test_autotune_error_reports_a_benchmarked_failure_not_a_filter_rejection():
+    """Candidates the caller's own filters rejected are not benchmarked and
+    carry the filter's message; the reported error must be the real failure."""
     graph = _StubGraph(
         ranked=[999],
         selected=999,
@@ -493,6 +496,7 @@ def test_autotune_error_reports_target_engine_failure_not_the_filter():
                 rank=-1,
                 error_message="Plan excluded by engineIdFilter.",
                 engine_id=111,
+                excluded_by_caller=True,
             ),
             _StubCandidate(
                 succeeded=False,
@@ -507,6 +511,30 @@ def test_autotune_error_reports_target_engine_failure_not_the_filter():
         with pytest.raises(ExecutionError) as exc:
             executor.autotune(object(), {}, 999)
     assert "workspace exceeds limit" in str(exc.value)
+    assert "engineIdFilter" not in str(exc.value)
+
+
+def test_autotune_error_when_every_candidate_was_filtered_out():
+    """With nothing benchmarked there is no real failure to report, so fall
+    back to a generic message rather than parroting the filter's."""
+    graph = _StubGraph(
+        ranked=[999],
+        selected=999,
+        autotune_results=[
+            _StubCandidate(
+                succeeded=False,
+                rank=-1,
+                error_message="Plan excluded by engineIdFilter.",
+                engine_id=111,
+                excluded_by_caller=True,
+            )
+        ],
+    )
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        with pytest.raises(ExecutionError) as exc:
+            executor.autotune(object(), {}, 999)
+    assert "no autotune candidate benchmarked successfully" in str(exc.value)
     assert "engineIdFilter" not in str(exc.value)
 
 
@@ -541,15 +569,7 @@ def test_plan_name_without_a_handle_gets_the_hex_fallback():
     it silently degrades to a hex engine ID."""
     graph = _StubGraph(ranked=[999], selected=999)
     executor = _prepared_autotune_executor(graph)
-    assert executor.plan_name() == "0xdeadbeef"
-
-
-def test_plan_name_falls_back_when_the_binding_rejects_the_handle():
-    """Bindings that predate the handle parameter must still resolve a name
-    rather than raising or reporting hex."""
-    graph = _LegacyPlanNameGraph(ranked=[999], selected=999)
-    executor = _prepared_autotune_executor(graph)
-    assert executor.plan_name(object()) == "winning_plan"
+    assert executor.plan_name(None) == "0xdeadbeef"
 
 
 def test_plan_name_without_prepare_is_none():

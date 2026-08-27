@@ -1150,9 +1150,15 @@ class Setup:
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
+            # install_prefix first: it is what ROCM_PATH points at (above) and
+            # where a from-source hipDNN build is installed, so it must win
+            # over the toolchain wheel's prebuilt copy. With the wheel first,
+            # its older libhipdnn_backend.so shadows the freshly built one and
+            # the frontend bindings fail to load with an undefined symbol as
+            # soon as the submodule adds a backend export the wheel lacks.
             lib_dirs = tuple(
                 str(Path(prefix) / "lib")
-                for prefix in (toolchain_prefix, install_prefix)
+                for prefix in (install_prefix, toolchain_prefix)
                 if prefix and (Path(prefix) / "lib").is_dir()
             )
             current = self.env.get("LD_LIBRARY_PATH", "")
