@@ -27,8 +27,8 @@ updates:
     cooldown:
       default-days: 0
     schedule:
-      interval: "weekly"
-      time: "12:00"
+      interval: "cron"
+      cronjob: "0 12 * * 1,3"
       timezone: "America/New_York"
     commit-message:
       prefix: "chore(rocm-libraries)"
