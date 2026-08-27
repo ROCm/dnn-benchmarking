@@ -1,0 +1,5 @@
+outs:
+- md5: e2ae0750705953ed5108df3e55b822d3
+  size: 26885
+  hash: md5
+  path: cudnn_attention_training.tar.gz

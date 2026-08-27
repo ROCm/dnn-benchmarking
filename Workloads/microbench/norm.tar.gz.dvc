@@ -1,0 +1,5 @@
+outs:
+- md5: 498d5ee6ce0f7d8ab3847d313abe3d92
+  size: 6374
+  hash: md5
+  path: norm.tar.gz

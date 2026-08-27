@@ -1,5 +1,0 @@
-outs:
-- md5: 4bc56fa174cea8a3e585a912f3876011
-  size: 6382
-  hash: md5
-  path: cudnn_frontend_full_norm.tar.gz
