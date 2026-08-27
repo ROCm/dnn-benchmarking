@@ -1,0 +1,5 @@
+outs:
+- md5: fb456b2f8c7a77a78f9f33ceabb38440
+  size: 4084
+  hash: md5
+  path: bnorm.tar.gz
