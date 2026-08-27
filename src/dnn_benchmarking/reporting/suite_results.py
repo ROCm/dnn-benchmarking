@@ -120,7 +120,10 @@ class OracleResult:
             for knobs the sweep set explicitly. Normally empty: the
             compiled-plan candidate path records only explicitly-set knobs
             and this flow sets none, so ``[]`` means "engine defaults".
-        cpu_build_time_ms: Graph build time of the autotune-capable build.
+        cpu_build_time_ms: Build time of the autotune-capable graph. Not
+            comparable to the row's own ``cpu_build_time_ms``: this build
+            enumerates every engine's plans before barring all but one, so it
+            measures a different amount of work than the OOTB build.
         gpu_kernel_stats: GPU kernel timing of the post-tuning run.
         host_stats: Host-side timing of the post-tuning run.
     """

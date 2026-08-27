@@ -77,6 +77,7 @@ class _StubGraph:
         self.build_policy = "unset"
         self.autotune_workspace_queried = False
         self.autotune_kwargs = None
+        self.plan_name_handle = "unset"
         # One entry per candidate plan, giving the engine that backs it.
         # Defaults to one plan per ranked engine.
         self._plan_engines = (
@@ -153,14 +154,24 @@ class _StubGraph:
         ]
         return max(sizes) if sizes else 0
 
-    def get_plan_name(self):
-        return "winning_plan"
+    def get_plan_name(self, handle=None):
+        # Newer bindings take the handle and need it to name plugin-supplied
+        # engines; without it they fall back to a hex engine ID.
+        self.plan_name_handle = handle
+        return "winning_plan" if handle is not None else "0xdeadbeef"
 
     def autotune(self, handle, variant_pack, workspace_ptr, **kwargs):
         if self._autotune_error is not None:
             raise RuntimeError(self._autotune_error)
         self.autotune_kwargs = kwargs
         return list(self._autotune_results)
+
+
+class _LegacyPlanNameGraph(_StubGraph):
+    """Stub for bindings that predate the get_plan_name handle parameter."""
+
+    def get_plan_name(self):
+        return "winning_plan"
 
 
 class _StubAutotuneConfig:
@@ -351,7 +362,7 @@ def test_autotune_filters_to_engine_and_omits_workspace_size():
     # Rank order is preserved, so callers can take winners[0].
     assert [w.rank for w in winners] == [0, 1]
     assert executor.selected_engine_id == 999
-    assert executor.plan_name == "winning_plan"
+    assert executor.plan_name(object()) == "winning_plan"
 
 
 def test_autotune_drops_failed_candidates():
@@ -512,3 +523,34 @@ def test_autotune_winner_from_another_engine_raises():
         with pytest.raises(ExecutionError) as exc:
             executor.autotune(object(), {}, 999)
     assert "111" in str(exc.value) and "999" in str(exc.value)
+
+
+def test_plan_name_passes_the_handle_to_the_binding():
+    """Newer bindings need the handle to name plugin-supplied engines, which is
+    the engine class this tool benchmarks; without it they report a hex ID."""
+    handle = object()
+    graph = _StubGraph(ranked=[999], selected=999)
+    executor = _prepared_autotune_executor(graph)
+
+    assert executor.plan_name(handle) == "winning_plan"
+    assert graph.plan_name_handle is handle
+
+
+def test_plan_name_without_a_handle_gets_the_hex_fallback():
+    """Control: the handle is what makes the difference, so a caller that drops
+    it silently degrades to a hex engine ID."""
+    graph = _StubGraph(ranked=[999], selected=999)
+    executor = _prepared_autotune_executor(graph)
+    assert executor.plan_name() == "0xdeadbeef"
+
+
+def test_plan_name_falls_back_when_the_binding_rejects_the_handle():
+    """Bindings that predate the handle parameter must still resolve a name
+    rather than raising or reporting hex."""
+    graph = _LegacyPlanNameGraph(ranked=[999], selected=999)
+    executor = _prepared_autotune_executor(graph)
+    assert executor.plan_name(object()) == "winning_plan"
+
+
+def test_plan_name_without_prepare_is_none():
+    assert _executor().plan_name(object()) is None

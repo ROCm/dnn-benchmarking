@@ -1008,7 +1008,6 @@ def _run_oracle_pass(
     handle: Any,
     engine_id: int,
     bm: Any,
-    input_data: Dict[int, Any],
 ) -> None:
     """Tune ``engine_id`` on the same graph and record the post-tuning timing.
 
@@ -1030,7 +1029,6 @@ def _run_oracle_pass(
         engine_id: Engine the sweep is restricted to.
         bm: The OOTB pass's BufferManager, reused so both passes read
             identical input data.
-        input_data: Host input tensors reloaded before tuning.
     """
     try:
         bench_config = BenchmarkConfig(
@@ -1045,10 +1043,11 @@ def _run_oracle_pass(
         )
         executor.prepare(handle, engine_id=engine_id, for_autotune=True)
 
-        # The OOTB correctness re-execution leaves outputs populated;
-        # restore the exact OOTB starting state so both passes are
-        # comparable.
-        bm.load_input_data(input_data)
+        # The OOTB correctness re-execution leaves outputs populated; zeroing
+        # them restores the OOTB starting state. The inputs need no reload:
+        # they are disjoint from the output set, and the OOTB pass already
+        # relies on them surviving its own warmup, timed loop, and correctness
+        # re-execution without one.
         bm.zero_outputs()
         variant_pack = bm.create_variant_pack()
 
@@ -1060,7 +1059,7 @@ def _run_oracle_pass(
         bench_result = executor.benchmark(handle, variant_pack, graph_name=graph_name)
 
         oracle = OracleResult(
-            plan_name=executor.plan_name or "",
+            plan_name=executor.plan_name(handle) or "",
             compiled_plan_index=int(winner.compiled_plan_index),
             rank=int(winner.rank),
             sweep_min_time_ms=float(winner.min_time_ms),
@@ -1216,7 +1215,6 @@ def run_single_provider_engine(
                     handle=handle,
                     engine_id=engine_id,
                     bm=bm,
-                    input_data=input_data,
                 )
 
         # BufferManager context has exited — I/O buffers are freed.

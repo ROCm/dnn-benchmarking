@@ -382,11 +382,30 @@ class Executor:
         self._record_selected_engine(None)
         return winners
 
-    @property
-    def plan_name(self) -> Optional[str]:
-        """Name of the currently active execution plan, or None if unprepared."""
+    def plan_name(self, handle: Any = None) -> Optional[str]:
+        """Name of the currently active execution plan, or None if unprepared.
+
+        Pass the handle the graph was built with. Newer hipDNN bindings need it
+        to name plugin-supplied engines and fall back to a hex engine ID
+        without it, which is exactly the engine class this tool benchmarks.
+        Bindings that predate the handle parameter resolve plugin engines from
+        a process-wide registry instead, so call the no-handle form when the
+        handle is rejected rather than reporting a hex ID on either revision.
+
+        Args:
+            handle: hipdnn.Handle instance the graph was built with.
+
+        Returns:
+            The active plan's engine name, or None when no graph is prepared.
+        """
         if self._graph is None:
             return None
+        if handle is not None:
+            try:
+                return str(self._graph.get_plan_name(handle))
+            except TypeError:
+                # Binding predates the handle parameter.
+                pass
         return str(self._graph.get_plan_name())
 
     @property
