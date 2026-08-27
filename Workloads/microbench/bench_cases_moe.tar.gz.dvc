@@ -1,5 +1,5 @@
 outs:
-- md5: b2e208bddad2907e2c727c53853a80b4
-  size: 16867
+- md5: 4f74c9ee3eeb8f210e931163ba76ba7c
+  size: 28521
   hash: md5
   path: bench_cases_moe.tar.gz

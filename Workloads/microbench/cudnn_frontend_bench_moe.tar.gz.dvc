@@ -1,5 +1,5 @@
 outs:
-- md5: c3fcfeb212ea9d182b7f2bba933d4fe0
-  size: 3524
+- md5: c52965fb177af12cebe4adad781d76df
+  size: 4709
   hash: md5
   path: cudnn_frontend_bench_moe.tar.gz
