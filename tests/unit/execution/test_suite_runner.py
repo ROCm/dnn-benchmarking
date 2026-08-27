@@ -4,6 +4,7 @@
 """Unit tests for suite_runner module."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
@@ -1782,3 +1783,131 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "error"
         assert row.result.error_message == reason
+
+
+def _make_candidate(**overrides):
+    """Build a stand-in hipdnn_frontend.AutotuneResult."""
+    values = {
+        "engine_id": 0,
+        "engine_name": "engine_0",
+        "compiled_plan_index": 2,
+        "rank": 0,
+        "min_time_ms": 0.2,
+        "succeeded": True,
+        "knob_settings": [],
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _make_oracle_exec_factory(autotune_side_effect=None):
+    """Executor factory whose third instance is the oracle pass.
+
+    Instance order inside run_graph_all_providers is discovery, OOTB, then
+    oracle. The oracle instance reports half the OOTB kernel time so the
+    delta is unambiguous.
+    """
+    instances = []
+
+    def make_instance(*args, **kwargs):
+        m = MagicMock()
+        m.init_time_ms = 5.0
+        m.discover_engines.return_value = [0]
+        m.plan_name = "tuned_plan"
+        kernel_ms = 0.5 if len(instances) < 2 else 0.25
+        bench_result = MagicMock()
+        bench_result.host_timings = [1.0]
+        bench_result.kernel_timings = [kernel_ms]
+        bench_result.has_kernel_timings = True
+        m.benchmark.return_value = bench_result
+        if autotune_side_effect is not None:
+            m.autotune.side_effect = autotune_side_effect
+        else:
+            m.autotune.return_value = [_make_candidate()]
+        instances.append(m)
+        return m
+
+    return make_instance, instances
+
+
+class TestOraclePass:
+    """--oracle adds a second tuned pass per engine row without changing OOTB."""
+
+    def _run(self, factory, oracle=True):
+        with (
+            patch(
+                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
+                side_effect=lambda eid: f"engine_{eid}",
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
+                return_value=None,
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.BufferManager",
+                return_value=_make_bm_mock(),
+            ),
+        ):
+            return run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(oracle=oracle),
+                handle=MagicMock(),
+            )
+
+    def test_oracle_payload_recorded(self):
+        factory, instances = _make_oracle_exec_factory()
+        result = self._run(factory)
+
+        r = result.results[0]
+        assert r.status == "success"
+        assert r.oracle is not None
+        assert r.oracle.plan_name == "tuned_plan"
+        assert r.oracle.compiled_plan_index == 2
+        assert r.oracle.sweep_min_time_ms == 0.2
+        assert r.oracle.candidates_benchmarked == 1
+        assert r.oracle.knob_settings == []
+        assert r.oracle_error is None
+        assert r.oracle_delta is not None
+        assert r.oracle_delta.basis == "gpu_kernel"
+        assert r.oracle_delta.speedup == 2.0
+
+    def test_oracle_uses_second_executor_with_autotune_prepare(self):
+        factory, instances = _make_oracle_exec_factory()
+        self._run(factory)
+
+        # discovery, OOTB, oracle
+        assert len(instances) == 3
+        ootb, oracle = instances[1], instances[2]
+        assert ootb.prepare.call_args.kwargs.get("for_autotune") is None
+        assert oracle.prepare.call_args.kwargs["for_autotune"] is True
+        assert oracle.autotune.call_count == 1
+        assert oracle.benchmark.call_count == 1
+
+    def test_oracle_failure_leaves_ootb_row_intact(self):
+        factory, _ = _make_oracle_exec_factory(
+            autotune_side_effect=ExecutionError("no candidate succeeded")
+        )
+        result = self._run(factory)
+
+        r = result.results[0]
+        assert r.status == "success"
+        assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
+        assert r.oracle is None
+        assert r.oracle_delta is None
+        assert r.oracle_error == "no candidate succeeded"
+
+    def test_no_oracle_pass_when_flag_is_off(self):
+        factory, instances = _make_oracle_exec_factory()
+        result = self._run(factory, oracle=False)
+
+        r = result.results[0]
+        assert r.oracle is None
+        assert r.oracle_delta is None
+        assert r.oracle_error is None
+        # discovery + OOTB only.
+        assert len(instances) == 2

@@ -249,6 +249,31 @@ the following are rejected with `--backend pytorch`:
 - `--engine` / `--plugin-path` (no hipDNN engine plugins are loaded)
 - `--validate pytorch` (the backend would validate against itself)
 - `--pmc` / `--emit-trace` / `--perf` / `--roofline` (rocprofv3-based passes)
+- `--oracle` (auto-tuning is a hipDNN engine feature)
+
+### Oracle (Auto-Tuned) Comparison
+
+`--oracle` measures every hipDNN engine row twice: the normal
+heuristic-selected run (OOTB) and a run of the plan that hipDNN auto-tuning
+picks for that same engine. Each successful row then carries `oracle`,
+`oracle_delta`, or `oracle_error` in the JSON, and the summary table gains
+`oracle_kernel_mean_ms` and `oracle_speedup` columns. Runs without the flag
+emit the same output as before.
+
+The flag runs one tuning sweep per engine row, so it is significantly slower.
+Narrow the run with `--engine` when the extra cost matters.
+
+hipDNN consults an on-disk engine-ranking cache before heuristic selection, so
+a persisted ranking can make the OOTB row reuse a previously benchmarked engine
+order and shrink the reported gap. Export
+`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold OOTB baseline. The tool warns
+once when that variable is not set, and records the relevant environment
+variables under `metadata.hipdnn_selection_env`.
+
+```bash
+HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 python -m dnn_benchmarking \
+  --graph ./graphs/sample_conv_fwd.json --oracle -v -o oracle.json
+```
 
 ### Cross-Machine Comparison (ROCm vs CUDA)
 

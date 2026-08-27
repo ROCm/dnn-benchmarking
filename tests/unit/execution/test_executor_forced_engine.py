@@ -58,7 +58,11 @@ class _StubGraph:
         plans_fail=False,
         support_fails=False,
         build_fails=False,
+        autotune_results=(),
+        autotune_error=None,
     ):
+        self._autotune_results = autotune_results
+        self._autotune_error = autotune_error
         self._ranked = ranked
         self._selected = selected
         self._hard_fails = hard_fails
@@ -68,6 +72,9 @@ class _StubGraph:
         self._build_fails = build_fails
         self.plans_created = False
         self.hard_engine_id = None
+        self.build_policy = "unset"
+        self.autotune_workspace_queried = False
+        self.autotune_kwargs = None
 
     def from_json(self, _s):
         return _StubResult()
@@ -99,11 +106,41 @@ class _StubGraph:
     def check_support(self):
         return _StubResult(bad=self._support_fails, message="not supported")
 
-    def build_plans(self):
+    def build_plans(self, policy=None):
+        self.build_policy = policy
         return _StubResult(bad=self._build_fails, message="build failed")
 
     def get_workspace_size(self):
         return 0
+
+    def get_autotune_workspace_size(self):
+        self.autotune_workspace_queried = True
+        return 0
+
+    def get_plan_name(self):
+        return "winning_plan"
+
+    def autotune(self, handle, variant_pack, workspace_ptr, **kwargs):
+        if self._autotune_error is not None:
+            raise RuntimeError(self._autotune_error)
+        self.autotune_kwargs = kwargs
+        return list(self._autotune_results)
+
+
+class _StubAutotuneConfig:
+    """Stands in for hipdnn_frontend.AutotuneConfig."""
+
+    def __init__(self):
+        self.engine_id_filter = []
+
+
+class _StubCandidate:
+    """Stands in for one hipdnn_frontend.AutotuneResult entry."""
+
+    def __init__(self, succeeded=True, rank=0, error_message=""):
+        self.succeeded = succeeded
+        self.rank = rank
+        self.error_message = error_message
 
 
 def _executor():
@@ -115,6 +152,8 @@ def _executor():
 def _fake_module(graph):
     fake = types.ModuleType("hipdnn_frontend")
     fake.Graph = lambda: graph
+    fake.BuildPlanPolicy = types.SimpleNamespace(ALL="ALL")
+    fake.AutotuneConfig = _StubAutotuneConfig
     return fake
 
 
@@ -214,3 +253,95 @@ def test_prepare_build_plans_failure_is_execution_error():
         with pytest.raises(ExecutionError) as exc:
             executor.prepare(handle=object(), engine_id=None)
     assert "build failed" in str(exc.value)
+
+
+def _prepared_autotune_executor(graph):
+    executor = _executor()
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        executor.prepare(handle=object(), engine_id=999, for_autotune=True)
+    return executor
+
+
+def test_prepare_for_autotune_builds_all_plans():
+    """The autotune build compiles every candidate and never hard-selects."""
+    graph = _StubGraph(ranked=[999], selected=999)
+    executor = _prepared_autotune_executor(graph)
+    assert graph.plans_created is True
+    assert graph.hard_engine_id is None
+    assert graph.build_policy == "ALL"
+    assert graph.autotune_workspace_queried is True
+    # No plan is pinned yet, so no engine is recorded by prepare().
+    assert executor.selected_engine_id is None
+
+
+def test_prepare_for_autotune_skips_forced_engine_mismatch_check():
+    """A requested engine that differs from the reported one must not raise on
+    the autotune path: no plan is pinned until autotune() picks a winner."""
+    graph = _StubGraph(ranked=[111], selected=111)
+    executor = _prepared_autotune_executor(graph)
+    assert executor.selected_engine_id is None
+
+
+def test_autotune_filters_to_engine_and_omits_workspace_size():
+    graph = _StubGraph(
+        ranked=[999],
+        selected=999,
+        autotune_results=[_StubCandidate(rank=1), _StubCandidate(rank=0)],
+    )
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        winners = executor.autotune(object(), {}, 999)
+
+    assert graph.autotune_kwargs is not None
+    assert "workspace_size" not in graph.autotune_kwargs
+    assert graph.autotune_kwargs["config"].engine_id_filter == [999]
+    # Rank 0 first, so callers can take winners[0].
+    assert [w.rank for w in winners] == [0, 1]
+    assert executor.selected_engine_id == 999
+    assert executor.plan_name == "winning_plan"
+
+
+def test_autotune_drops_failed_candidates():
+    graph = _StubGraph(
+        ranked=[999],
+        selected=999,
+        autotune_results=[
+            _StubCandidate(succeeded=False, rank=-1, error_message="bad plan"),
+            _StubCandidate(rank=0),
+        ],
+    )
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        winners = executor.autotune(object(), {}, 999)
+    assert len(winners) == 1
+    assert winners[0].rank == 0
+
+
+def test_autotune_all_candidates_failed_raises():
+    graph = _StubGraph(
+        ranked=[999],
+        selected=999,
+        autotune_results=[
+            _StubCandidate(succeeded=False, rank=-1, error_message="bad plan")
+        ],
+    )
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        with pytest.raises(ExecutionError) as exc:
+            executor.autotune(object(), {}, 999)
+    assert "bad plan" in str(exc.value)
+
+
+def test_autotune_runtime_error_becomes_execution_error():
+    graph = _StubGraph(ranked=[999], selected=999, autotune_error="sweep exploded")
+    executor = _prepared_autotune_executor(graph)
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        with pytest.raises(ExecutionError) as exc:
+            executor.autotune(object(), {}, 999)
+    assert "sweep exploded" in str(exc.value)
+
+
+def test_autotune_without_prepare_raises():
+    with pytest.raises(ExecutionError) as exc:
+        _executor().autotune(object(), {}, 1)
+    assert "not prepared" in str(exc.value)

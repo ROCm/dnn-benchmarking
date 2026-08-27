@@ -689,3 +689,103 @@ class TestPyTorchBackendCLIIntegration:
             assert "pytorch_sdpa_backend_requested" not in row
             assert "host_stats" not in row
             assert "gpu_kernel_stats" not in row
+
+
+@pytest.mark.gpu
+class TestOracleCLIIntegration:
+    """--oracle adds the tuned payload; its absence leaves the JSON unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def check_deps(self, plugin_paths: List[str]):
+        """Skip all tests if GPU or hipdnn not available."""
+        _require_gpu()
+        _require_hipdnn(plugin_paths)
+
+    @pytest.fixture
+    def project_root(self) -> Path:
+        return Path(__file__).parent.parent.parent
+
+    @pytest.fixture
+    def cli_plugin_args(self, plugin_paths: List[str]) -> List[str]:
+        return ["--plugin-path", plugin_paths[0]]
+
+    def _run(
+        self,
+        project_root: Path,
+        output_file: Path,
+        cli_plugin_args: List[str],
+        extra: List[str],
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "dnn_benchmarking",
+                "--graph",
+                str(_graphs_dir() / "sample_conv_fwd.json"),
+                "--warmup",
+                "2",
+                "--iters",
+                "5",
+                "--output",
+                str(output_file),
+            ]
+            + extra
+            + cli_plugin_args,
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+
+    def test_oracle_run_records_tuned_payload(
+        self, project_root: Path, tmp_path: Path, cli_plugin_args: List[str]
+    ) -> None:
+        output_file = tmp_path / "oracle.json"
+        result = self._run(project_root, output_file, cli_plugin_args, ["--oracle"])
+
+        assert result.returncode in (
+            0,
+            1,
+            2,
+        ), f"Unexpected exit code {result.returncode}. stderr: {result.stderr}"
+        data = json.loads(output_file.read_text())
+        assert "hipdnn_selection_env" in data["metadata"]
+
+        rows = [
+            row
+            for graph in data["graphs"]
+            for row in graph["results"]
+            if row["status"] == "success"
+        ]
+        assert rows, "no successful engine row to compare"
+        tuned = [row for row in rows if "oracle" in row]
+        assert tuned, f"no row carried an oracle payload. stdout: {result.stdout}"
+
+        oracle = tuned[0]["oracle"]
+        assert oracle["plan_name"]
+        assert isinstance(oracle["engine_id"], int)
+        delta = tuned[0]["oracle_delta"]
+        assert set(delta) == {
+            "basis",
+            "ootb_mean_ms",
+            "oracle_mean_ms",
+            "delta_ms",
+            "speedup",
+        }
+
+    def test_plain_run_has_no_oracle_keys(
+        self, project_root: Path, tmp_path: Path, cli_plugin_args: List[str]
+    ) -> None:
+        output_file = tmp_path / "plain.json"
+        result = self._run(project_root, output_file, cli_plugin_args, [])
+
+        assert result.returncode in (
+            0,
+            1,
+            2,
+        ), f"Unexpected exit code {result.returncode}. stderr: {result.stderr}"
+        data = json.loads(output_file.read_text())
+        assert "hipdnn_selection_env" not in data["metadata"]
+        for graph in data["graphs"]:
+            for row in graph["results"]:
+                assert not {"oracle", "oracle_delta", "oracle_error"} & set(row)

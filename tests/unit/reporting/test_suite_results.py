@@ -15,11 +15,13 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleResult,
     ProviderEngineResult,
     StatusCounts,
     SuiteMetadata,
     SuiteResult,
     _format_cudnn_version,
+    build_oracle_delta,
     collect_environment_info,
 )
 
@@ -605,3 +607,154 @@ class TestFormatCudnnVersion:
     @pytest.mark.parametrize("raw", [None, 0])
     def test_missing_version_returns_none(self, raw):
         assert _format_cudnn_version(raw) is None
+
+
+def _stats(mean_ms: float) -> BenchmarkStats:
+    return BenchmarkStats(
+        mean_ms=mean_ms,
+        std_ms=0.0,
+        min_ms=mean_ms,
+        max_ms=mean_ms,
+        p95_ms=mean_ms,
+        p99_ms=mean_ms,
+    )
+
+
+def _oracle(**overrides) -> OracleResult:
+    kwargs = dict(
+        engine_id=7,
+        engine_name="ENGINE_A",
+        plan_name="plan_x",
+        compiled_plan_index=3,
+        rank=0,
+        sweep_min_time_ms=0.8,
+        candidates_benchmarked=4,
+        knob_settings=[],
+    )
+    kwargs.update(overrides)
+    return OracleResult(**kwargs)
+
+
+class TestOracleSerialization:
+    """Oracle payload emission on ProviderEngineResult."""
+
+    def test_oracle_keys_absent_when_unset(self):
+        pe = ProviderEngineResult(provider="p", engine_id=1, status="success")
+        d = pe.to_dict()
+        assert not {"oracle", "oracle_delta", "oracle_error"} & set(d)
+
+    def test_oracle_and_delta_serialize_under_success(self):
+        oracle = _oracle(gpu_kernel_stats=_stats(1.0))
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="success",
+            gpu_kernel_stats=_stats(2.0),
+            oracle=oracle,
+        )
+        pe.oracle_delta = build_oracle_delta(pe, oracle)
+        d = pe.to_dict()
+        assert d["oracle"]["plan_name"] == "plan_x"
+        assert d["oracle"]["engine_id"] == 7
+        assert d["oracle"]["knob_settings"] == []
+        assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
+        assert d["oracle"]["host_stats"] is None
+        assert d["oracle_delta"]["basis"] == "gpu_kernel"
+        assert d["oracle_delta"]["speedup"] == 2.0
+
+    def test_oracle_error_serializes_under_success(self):
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="success",
+            oracle_error="tuning failed",
+        )
+        assert pe.to_dict()["oracle_error"] == "tuning failed"
+
+    def test_oracle_keys_absent_on_error_status(self):
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="error",
+            error_message="boom",
+            oracle_error="tuning failed",
+        )
+        assert "oracle_error" not in pe.to_dict()
+
+
+class TestBuildOracleDelta:
+    """Basis selection and guard rails for the OOTB-vs-oracle comparison."""
+
+    def test_prefers_gpu_kernel_basis(self):
+        oracle = _oracle(gpu_kernel_stats=_stats(1.0), host_stats=_stats(5.0))
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="success",
+            gpu_kernel_stats=_stats(2.0),
+            host_stats=_stats(9.0),
+        )
+        delta = build_oracle_delta(pe, oracle)
+        assert delta is not None
+        assert delta.basis == "gpu_kernel"
+        assert delta.ootb_mean_ms == 2.0
+        assert delta.oracle_mean_ms == 1.0
+        assert delta.delta_ms == 1.0
+        assert delta.speedup == 2.0
+
+    def test_falls_back_to_host_basis(self):
+        oracle = _oracle(host_stats=_stats(4.0))
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="success",
+            gpu_kernel_stats=_stats(2.0),
+            host_stats=_stats(8.0),
+        )
+        delta = build_oracle_delta(pe, oracle)
+        assert delta is not None
+        assert delta.basis == "host"
+        assert delta.speedup == 2.0
+
+    def test_returns_none_without_comparable_stats(self):
+        pe = ProviderEngineResult(provider="p", engine_id=1, status="success")
+        assert build_oracle_delta(pe, _oracle()) is None
+
+    def test_returns_none_when_oracle_mean_is_zero(self):
+        oracle = _oracle(gpu_kernel_stats=_stats(0.0))
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="success",
+            gpu_kernel_stats=_stats(2.0),
+        )
+        assert build_oracle_delta(pe, oracle) is None
+
+
+class TestSuiteMetadataSelectionEnv:
+    """hipdnn_selection_env is recorded only for oracle runs."""
+
+    _NAMES = (
+        "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
+        "HIPDNN_CACHE_DIR",
+        "HIPDNN_DISABLE_CACHE",
+        "HIPDNN_FORCE_BENCHMARKING",
+    )
+
+    def test_absent_without_oracle(self):
+        sr = SuiteResult.from_graph_results([], total_graphs=0)
+        assert sr.metadata.hipdnn_selection_env is None
+        assert "hipdnn_selection_env" not in sr.to_dict()["metadata"]
+
+    def test_records_all_names_with_oracle(self, monkeypatch):
+        for name in self._NAMES:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HIPDNN_CACHE_DIR", "/tmp/cache")
+
+        sr = SuiteResult.from_graph_results([], total_graphs=0, oracle=True)
+        env = sr.to_dict()["metadata"]["hipdnn_selection_env"]
+        assert set(env) == set(self._NAMES)
+        assert env["HIPDNN_CACHE_DIR"] == "/tmp/cache"
+        assert env["HIPDNN_DISABLE_EXACT_ENGINE_CACHE"] is None
+        assert env["HIPDNN_DISABLE_CACHE"] is None
+        assert env["HIPDNN_FORCE_BENCHMARKING"] is None

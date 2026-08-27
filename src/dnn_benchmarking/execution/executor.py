@@ -205,13 +205,23 @@ class Executor:
         except RuntimeError as e:
             raise UnsupportedGraphError(str(e)) from e
 
-    def prepare(self, handle: Any, engine_id: Optional[int] = None) -> None:
+    def prepare(
+        self,
+        handle: Any,
+        engine_id: Optional[int] = None,
+        for_autotune: bool = False,
+    ) -> None:
         """Build the operation graph and prepare for execution.
 
         Args:
             handle: hipdnn.Handle instance.
             engine_id: Optional engine ID to use. If specified, overrides
                        any engine ID in the graph JSON.
+            for_autotune: When True, build every candidate plan
+                (``BuildPlanPolicy.ALL``) instead of hard-selecting one
+                engine, and size the workspace for the largest candidate.
+                No engine is pinned; :meth:`autotune` picks the winner and
+                restricts candidates with ``engine_id_filter``.
 
         Raises:
             ExecutionError: If graph building fails.
@@ -220,7 +230,7 @@ class Executor:
             self._execution_stream = _get_handle_stream(handle)
             hipdnn = self._build_through_operation_graph(handle)
 
-            if engine_id is not None:
+            if engine_id is not None and not for_autotune:
                 # Hard engine selection: build the plan for exactly this engine.
                 # create_execution_plan_ext reports a bad result if the engine is
                 # not valid/applicable, so it can never silently fall back to a
@@ -244,19 +254,100 @@ class Executor:
                     f"Backend support check failed: {result.get_message()}"
                 )
 
-            result = self._graph.build_plans()
+            if for_autotune:
+                result = self._graph.build_plans(hipdnn.BuildPlanPolicy.ALL)
+            else:
+                result = self._graph.build_plans()
             if result.is_bad():
                 raise ExecutionError(f"Failed to build plans: {result.get_message()}")
 
-            self._record_selected_engine(engine_id)
+            if not for_autotune:
+                # No plan is pinned yet on the autotune path, so the
+                # forced-engine mismatch check would fire spuriously.
+                self._record_selected_engine(engine_id)
 
-            workspace_size = self._graph.get_workspace_size()
+            if for_autotune:
+                # Largest workspace across all compiled candidates: every
+                # candidate the sweep benchmarks must fit in it.
+                workspace_size = self._graph.get_autotune_workspace_size()
+            else:
+                workspace_size = self._graph.get_workspace_size()
             self._workspace_size = int(workspace_size)
             if workspace_size > 0:
                 self._workspace = hipdnn.DeviceBuffer(workspace_size)
                 self._workspace_ptr = self._workspace.ptr()
 
         self._init_time_ms = t.elapsed_ms
+
+    def autotune(
+        self,
+        handle: Any,
+        variant_pack: Dict[int, int],
+        engine_id: int,
+    ) -> List[Any]:
+        """Benchmark every compiled plan for ``engine_id`` and activate the winner.
+
+        Requires a graph prepared with ``prepare(..., for_autotune=True)``.
+        The winning plan is left active by hipDNN, so a following
+        warmup/benchmark runs it with no further setup.
+
+        Args:
+            handle: hipdnn.Handle instance.
+            variant_pack: Mapping of tensor UIDs to device pointers.
+            engine_id: Engine the candidate plans are restricted to.
+
+        Returns:
+            The list of successful AutotuneResult entries, sorted by rank
+            (rank 0 first). Failed candidates are dropped.
+
+        Raises:
+            ExecutionError: If the graph is not prepared, autotuning fails, or
+                no candidate plan benchmarked successfully.
+        """
+        if self._graph is None:
+            raise ExecutionError("Graph not prepared. Call prepare() first.")
+
+        try:
+            import hipdnn_frontend as hipdnn
+        except ImportError as e:
+            raise ExecutionError(
+                "hipdnn_frontend not available. Install hipDNN Python bindings."
+            ) from e
+
+        cfg = hipdnn.AutotuneConfig()
+        cfg.engine_id_filter = [engine_id]
+
+        try:
+            # Omit workspace_size: passing it selects the plan-spec overload
+            # used with add_engine_*, which is not the compiled-plan path.
+            results = self._graph.autotune(
+                handle, variant_pack, self._workspace_ptr, config=cfg
+            )
+        except RuntimeError as e:
+            raise ExecutionError(f"Autotuning failed: {e}") from e
+
+        winners = [r for r in results if r.succeeded]
+        if not winners:
+            message = ""
+            for r in results:
+                message = getattr(r, "error_message", "") or ""
+                if message:
+                    break
+            raise ExecutionError(
+                message or "no autotune candidate benchmarked successfully"
+            )
+
+        winners.sort(key=lambda r: r.rank)
+        # Refresh the recorded engine from the plan autotune just activated.
+        self._record_selected_engine(None)
+        return winners
+
+    @property
+    def plan_name(self) -> Optional[str]:
+        """Name of the currently active execution plan, or None if unprepared."""
+        if self._graph is None:
+            return None
+        return str(self._graph.get_plan_name())
 
     @property
     def selected_engine_id(self) -> Optional[int]:

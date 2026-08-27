@@ -339,6 +339,8 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
+        oracle: If True, also tune each engine row with hipDNN auto-tuning
+            and report the tuned (oracle) timing beside the OOTB timing.
         metrics: Metric collection configuration. Defaults to ``basic`` tier
             (always-on probes, no extra runs).
         backend: Execution backend (``hipdnn`` runs discovered engine plugins,
@@ -355,6 +357,7 @@ class SuiteConfig:
     seed: Optional[int] = None
     engine_filter: Optional[List[int]] = None
     verbose: bool = False
+    oracle: bool = False
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None

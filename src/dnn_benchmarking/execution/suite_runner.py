@@ -39,7 +39,9 @@ from ..reporting.statistics import BenchmarkStats
 from ..reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleResult,
     ProviderEngineResult,
+    build_oracle_delta,
 )
 from ..validation.reference_provider import (
     ReferenceOutput,
@@ -996,6 +998,93 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
+def _run_oracle_pass(
+    *,
+    result: ProviderEngineResult,
+    graph_path: Path,
+    graph_json_str: str,
+    graph_name: str,
+    config: SuiteConfig,
+    handle: Any,
+    engine_id: int,
+    bm: Any,
+    input_data: Dict[int, Any],
+) -> None:
+    """Tune ``engine_id`` on the same graph and record the post-tuning timing.
+
+    Builds a second graph with every candidate plan compiled, runs one
+    hipDNN auto-tuning sweep restricted to ``engine_id``, then times the
+    winning plan with the user's warmup/iteration counts.
+
+    Mutates ``result.oracle``/``result.oracle_delta`` on success and
+    ``result.oracle_error`` on any failure. Never raises: a tuning failure
+    must not fail the OOTB row.
+
+    Args:
+        result: The completed OOTB row to attach the oracle payload to.
+        graph_path: Path of the graph under test.
+        graph_json_str: Serialized graph, rebuilt for the autotune executor.
+        graph_name: Graph name recorded in the benchmark metadata.
+        config: Suite configuration (warmup/iteration counts).
+        handle: hipdnn.Handle instance.
+        engine_id: Engine the sweep is restricted to.
+        bm: The OOTB pass's BufferManager, reused so both passes read
+            identical input data.
+        input_data: Host input tensors reloaded before tuning.
+    """
+    try:
+        bench_config = BenchmarkConfig(
+            graph_path=graph_path,
+            warmup_iters=config.warmup_iters,
+            benchmark_iters=config.benchmark_iters,
+            engine_id=engine_id,
+        )
+        executor = Executor(
+            graph_json_str=graph_json_str,
+            config=bench_config,
+        )
+        executor.prepare(handle, engine_id=engine_id, for_autotune=True)
+
+        # The OOTB correctness re-execution leaves outputs populated;
+        # restore the exact OOTB starting state so both passes are
+        # comparable.
+        bm.load_input_data(input_data)
+        bm.zero_outputs()
+        variant_pack = bm.create_variant_pack()
+
+        candidates = executor.autotune(handle, variant_pack, engine_id)
+        winner = candidates[0]
+
+        bm.zero_outputs()
+        executor.warmup(handle, variant_pack)
+        bench_result = executor.benchmark(handle, variant_pack, graph_name=graph_name)
+
+        oracle = OracleResult(
+            engine_id=int(winner.engine_id),
+            engine_name=str(winner.engine_name),
+            plan_name=executor.plan_name or "",
+            compiled_plan_index=int(winner.compiled_plan_index),
+            rank=int(winner.rank),
+            sweep_min_time_ms=float(winner.min_time_ms),
+            candidates_benchmarked=len(candidates),
+            knob_settings=[
+                {"knob_id": str(k.knob_id), "value": k.value}
+                for k in winner.knob_settings
+            ],
+            cpu_build_time_ms=executor.init_time_ms,
+            host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
+            gpu_kernel_stats=(
+                BenchmarkStats.from_timings(bench_result.kernel_timings)
+                if bench_result.has_kernel_timings
+                else None
+            ),
+        )
+        result.oracle = oracle
+        result.oracle_delta = build_oracle_delta(result, oracle)
+    except Exception as e:
+        result.oracle_error = str(e)
+
+
 def run_single_provider_engine(
     graph_path: Path,
     graph_json_str: str,
@@ -1114,6 +1203,22 @@ def run_single_provider_engine(
                     rtol=rtol,
                     atol=atol,
                     error_message="No reference provider requested",
+                )
+
+            # Reaching here means the OOTB timed pass succeeded (any
+            # failure raised out of this try block already), so the row
+            # is eligible for an oracle comparison.
+            if config.oracle:
+                _run_oracle_pass(
+                    result=result,
+                    graph_path=graph_path,
+                    graph_json_str=graph_json_str,
+                    graph_name=graph_name,
+                    config=config,
+                    handle=handle,
+                    engine_id=engine_id,
+                    bm=bm,
+                    input_data=input_data,
                 )
 
         # BufferManager context has exited — I/O buffers are freed.

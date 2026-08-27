@@ -9,6 +9,7 @@ statistics and correctness data. Error entries carry status + message only.
 """
 
 import json
+import os
 import socket
 import sys
 from dataclasses import dataclass, field
@@ -94,6 +95,95 @@ class CorrectnessResult:
 
 
 @dataclass
+class OracleResult:
+    """Post-tuning timed run for one engine row.
+
+    Timing fields come from a clean benchmark pass executed after the
+    autotuning sweep selected and activated a winner. Sweep-time
+    measurements are diagnostics only and appear as ``sweep_min_time_ms``.
+
+    Attributes:
+        engine_id: Engine the winning plan belongs to.
+        engine_name: Engine name reported by the sweep.
+        plan_name: Name of the plan hipDNN activated after tuning.
+        compiled_plan_index: Index of the winning plan in the compiled set.
+        rank: Sweep rank of the winner (0 is fastest).
+        sweep_min_time_ms: Winner's fastest sweep iteration. hipDNN ranks
+            candidates on this value. Diagnostic only: the reported oracle
+            timing is the post-tuning benchmark pass, not the sweep.
+        candidates_benchmarked: Number of candidates that benchmarked
+            successfully.
+        knob_settings: ``{"knob_id": str, "value": int|float|str}`` entries
+            for knobs the sweep set explicitly. Normally empty: the
+            compiled-plan candidate path records only explicitly-set knobs
+            and this flow sets none, so ``[]`` means "engine defaults".
+        cpu_build_time_ms: Graph build time of the autotune-capable build.
+        gpu_kernel_stats: GPU kernel timing of the post-tuning run.
+        host_stats: Host-side timing of the post-tuning run.
+    """
+
+    engine_id: int
+    engine_name: str
+    plan_name: str
+    compiled_plan_index: int
+    rank: int
+    sweep_min_time_ms: float
+    candidates_benchmarked: int
+    knob_settings: List[Dict[str, Any]]
+    cpu_build_time_ms: Optional[float] = None
+    gpu_kernel_stats: Optional[BenchmarkStats] = None
+    host_stats: Optional[BenchmarkStats] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "engine_id": self.engine_id,
+            "engine_name": self.engine_name,
+            "plan_name": self.plan_name,
+            "compiled_plan_index": self.compiled_plan_index,
+            "rank": self.rank,
+            "sweep_min_time_ms": self.sweep_min_time_ms,
+            "candidates_benchmarked": self.candidates_benchmarked,
+            "knob_settings": list(self.knob_settings),
+            "cpu_build_time_ms": self.cpu_build_time_ms,
+            "gpu_kernel_stats": (
+                self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
+            ),
+            "host_stats": self.host_stats.to_dict() if self.host_stats else None,
+        }
+
+
+@dataclass
+class OracleDelta:
+    """OOTB-vs-oracle comparison for one engine row.
+
+    Attributes:
+        basis: Which timing pair the comparison used.
+        ootb_mean_ms: Mean of the heuristic-selected run.
+        oracle_mean_ms: Mean of the post-tuning run.
+        delta_ms: ``ootb_mean_ms - oracle_mean_ms``; positive means the
+            oracle is faster.
+        speedup: ``ootb_mean_ms / oracle_mean_ms``.
+    """
+
+    basis: Literal["gpu_kernel", "host"]
+    ootb_mean_ms: float
+    oracle_mean_ms: float
+    delta_ms: float
+    speedup: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "basis": self.basis,
+            "ootb_mean_ms": self.ootb_mean_ms,
+            "oracle_mean_ms": self.oracle_mean_ms,
+            "delta_ms": self.delta_ms,
+            "speedup": self.speedup,
+        }
+
+
+@dataclass
 class ProviderEngineResult:
     """Result for one provider/engine combination on one graph.
 
@@ -143,6 +233,12 @@ class ProviderEngineResult:
         extra_metrics: Opt-in profiling payload from rocprofv3 PMC /
             traces, perf, and rocprof-compute roofline. None when no
             opt-in profiling flag was supplied.
+        oracle: Post-tuning result for this engine row. Set only when
+            ``--oracle`` was requested and tuning succeeded.
+        oracle_delta: OOTB-vs-oracle comparison. None when either side
+            lacks comparable statistics.
+        oracle_error: Why tuning produced no result for this row.
+            Mutually exclusive with ``oracle``.
 
     Note:
         Process RSS, host RAM availability, and the volatile parts of
@@ -186,6 +282,10 @@ class ProviderEngineResult:
     vram_used_mb: Optional[float] = None
     # Opt-in profiling payload (rocprofv3 PMC / trace, perf, roofline).
     extra_metrics: Optional[Dict[str, Any]] = None
+    # Opt-in oracle (auto-tuned) comparison payload.
+    oracle: Optional[OracleResult] = None
+    oracle_delta: Optional[OracleDelta] = None
+    oracle_error: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate status field."""
@@ -267,6 +367,12 @@ class ProviderEngineResult:
                 d["vram_used_mb"] = self.vram_used_mb
             if self.extra_metrics is not None:
                 d["extra_metrics"] = self.extra_metrics
+            if self.oracle is not None:
+                d["oracle"] = self.oracle.to_dict()
+            if self.oracle_delta is not None:
+                d["oracle_delta"] = self.oracle_delta.to_dict()
+            if self.oracle_error is not None:
+                d["oracle_error"] = self.oracle_error
         elif self.status == "error":
             d["error_message"] = self.error_message
         elif self.status == "skipped":
@@ -275,6 +381,46 @@ class ProviderEngineResult:
         if self.correctness is not None:
             d["correctness"] = self.correctness.to_dict()
         return d
+
+
+def build_oracle_delta(
+    ootb: ProviderEngineResult, oracle: OracleResult
+) -> Optional[OracleDelta]:
+    """Compare an OOTB engine row against its post-tuning oracle run.
+
+    Prefers GPU kernel time; falls back to host time when either side has
+    no kernel statistics.
+
+    Args:
+        ootb: The heuristic-selected row.
+        oracle: The post-tuning result for the same engine row.
+
+    Returns:
+        An OracleDelta, or None when no comparable statistics pair exists
+        or the oracle mean is zero.
+    """
+    basis: Literal["gpu_kernel", "host"]
+    if ootb.gpu_kernel_stats is not None and oracle.gpu_kernel_stats is not None:
+        basis = "gpu_kernel"
+        ootb_mean = ootb.gpu_kernel_stats.mean_ms
+        oracle_mean = oracle.gpu_kernel_stats.mean_ms
+    elif ootb.host_stats is not None and oracle.host_stats is not None:
+        basis = "host"
+        ootb_mean = ootb.host_stats.mean_ms
+        oracle_mean = oracle.host_stats.mean_ms
+    else:
+        return None
+
+    if oracle_mean == 0.0:
+        return None
+
+    return OracleDelta(
+        basis=basis,
+        ootb_mean_ms=ootb_mean,
+        oracle_mean_ms=oracle_mean,
+        delta_ms=ootb_mean - oracle_mean,
+        speedup=ootb_mean / oracle_mean,
+    )
 
 
 class StatusCounts(NamedTuple):
@@ -404,6 +550,10 @@ class SuiteMetadata:
             suite end, via amdsmi. Reflects steady-state allocation, not
             per-kernel peak.
         vram_total_mb: Total VRAM on the GPU at suite end, via amdsmi.
+        hipdnn_selection_env: hipDNN cache/benchmarking environment
+            variables sampled at suite end, recorded only for ``--oracle``
+            runs. A ``None`` value means the variable was not set, which
+            is the load-bearing signal for cache-affected OOTB timings.
     """
 
     timestamp: str
@@ -436,10 +586,11 @@ class SuiteMetadata:
     host_ram_available_mb: Optional[float] = None
     vram_used_mb: Optional[float] = None
     vram_total_mb: Optional[float] = None
+    hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return {
+        d: Dict[str, Any] = {
             "timestamp": self.timestamp,
             "hostname": self.hostname,
             "total_graphs": self.total_graphs,
@@ -473,6 +624,9 @@ class SuiteMetadata:
             "vram_used_mb": self.vram_used_mb,
             "vram_total_mb": self.vram_total_mb,
         }
+        if self.hipdnn_selection_env is not None:
+            d["hipdnn_selection_env"] = dict(self.hipdnn_selection_env)
+        return d
 
 
 @dataclass
@@ -495,6 +649,7 @@ class SuiteResult:
         *,
         pytorch_sdpa_backend_requested: Optional[str] = None,
         pytorch_rocm_fa_library_requested: Optional[str] = None,
+        oracle: bool = False,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
         env_info = collect_environment_info()
@@ -531,6 +686,21 @@ class SuiteResult:
         except Exception:
             pass
 
+        # Oracle runs record the hipDNN switches that change what either
+        # pass measures, so an implausible OOTB-vs-oracle gap is
+        # diagnosable from the JSON alone.
+        hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
+        if oracle:
+            hipdnn_selection_env = {
+                name: os.environ.get(name)
+                for name in (
+                    "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
+                    "HIPDNN_CACHE_DIR",
+                    "HIPDNN_DISABLE_CACHE",
+                    "HIPDNN_FORCE_BENCHMARKING",
+                )
+            }
+
         metadata = SuiteMetadata(
             timestamp=datetime.now(timezone.utc).isoformat(),
             hostname=socket.gethostname(),
@@ -562,6 +732,7 @@ class SuiteResult:
             host_ram_available_mb=host_ram_available_mb,
             vram_used_mb=vram_used_mb,
             vram_total_mb=vram_total_mb,
+            hipdnn_selection_env=hipdnn_selection_env,
         )
         return cls(metadata=metadata, graphs=graph_results)
 

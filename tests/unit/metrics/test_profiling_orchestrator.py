@@ -53,6 +53,18 @@ class TestBuildInnerArgv:
         assert "--seed" not in argv
         assert "--plugin-path" not in argv
 
+    def test_oracle_never_leaks_into_inner_argv(self):
+        """The inner argv is an allowlist; --oracle must never be forwarded."""
+        argv = orch.build_inner_argv(
+            graph_path=Path("/g/x.json"),
+            engine_id=1,
+            seed=None,
+            warmup_iters=1,
+            benchmark_iters=1,
+            plugin_path=None,
+        )
+        assert "--oracle" not in argv
+
 
 class TestResolveOutputDir:
     def test_default_creates_timestamped_dir(self, tmp_path, monkeypatch):

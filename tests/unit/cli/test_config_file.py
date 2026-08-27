@@ -106,6 +106,37 @@ iters = 7
     assert args.iters == 11
 
 
+def test_oracle_config_key_populates_args(tmp_path: Path) -> None:
+    config = _write_config(
+        tmp_path / "bench.toml",
+        """
+version = 1
+graphs = ["from_config.json"]
+oracle = true
+""",
+    )
+
+    args = _parse_with_config(["--config", str(config)])
+
+    assert args.oracle is True
+
+
+def test_oracle_cli_flag_overrides_config(tmp_path: Path) -> None:
+    """An explicit --oracle wins over `oracle = false` in the config."""
+    config = _write_config(
+        tmp_path / "bench.toml",
+        """
+version = 1
+graphs = ["from_config.json"]
+oracle = false
+""",
+    )
+
+    args = _parse_with_config(["--config", str(config), "--oracle"])
+
+    assert args.oracle is True
+
+
 def test_pytorch_rocm_fa_library_config_and_cli_precedence(tmp_path: Path) -> None:
     config = _write_config(
         tmp_path / "bench.toml",

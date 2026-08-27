@@ -57,6 +57,10 @@ roofline = false
 # Timeout in seconds for each external profiler subprocess. Use 0 to disable the timeout.
 profiling_timeout = 600
 
+# Run an extra hipDNN auto-tuning sweep per engine row and report the tuned
+# (oracle) timing beside the out-of-the-box timing. Significantly slower.
+# oracle = false
+
 # Optional explicit engine matrix. Uncomment to run only specific engine IDs.
 # If any engine entry sets plugin_path, every engine entry must set plugin_path.
 # When either --engine or --plugin-path is supplied on the CLI, this matrix is

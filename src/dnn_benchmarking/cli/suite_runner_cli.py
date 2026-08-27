@@ -76,6 +76,50 @@ def _run_one_graph(
         return _error_graph_result(graph_path, str(e))
 
 
+# hipDNN's own truthy set for environment switches.
+_TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
+
+
+def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
+    """Warn once about conditions that make the OOTB baseline non-cold."""
+    cache_flag = os.environ.get("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "")
+    if cache_flag.strip().lower() not in _TRUTHY_ENV:
+        reporter.print_warning(
+            "--oracle: hipDNN's exact-match engine-ranking cache is enabled, "
+            "so the out-of-the-box timing may reflect a previously persisted "
+            "ranking rather than cold heuristic selection. Set "
+            "HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for a cold OOTB baseline."
+        )
+    if config.warmup_iters == 0:
+        reporter.print_warning(
+            "--oracle with --warmup 0: a plan's first execute() may sample "
+            "candidate kernels, so that cost lands inside both timed loops"
+        )
+
+
+def _print_oracle_comparison(
+    config: SuiteConfig,
+    graph_results: List[GraphResult],
+    reporter: Reporter,
+) -> None:
+    """Print the suite-wide mean oracle speedup across compared engine rows."""
+    if not config.oracle:
+        return
+    speedups = [
+        pe.oracle_delta.speedup
+        for gr in graph_results
+        for pe in gr.results
+        if pe.oracle_delta is not None
+    ]
+    if not speedups:
+        return
+    mean_speedup = sum(speedups) / len(speedups)
+    reporter.print_info(
+        f"Oracle comparison: {len(speedups)} engine rows tuned, "
+        f"mean speedup {mean_speedup:.2f}x"
+    )
+
+
 def _run_suite_graphs_after_startup(
     graph_paths: List[Path],
     config: SuiteConfig,
@@ -85,6 +129,8 @@ def _run_suite_graphs_after_startup(
 ) -> int:
     """Run loaded-graph callback for each graph and emit suite output."""
     total = len(graph_paths)
+    if config.oracle:
+        _print_oracle_warnings(config, reporter)
     reporter.print_running_benchmark(total)
 
     graph_results: List[GraphResult] = []
@@ -114,10 +160,12 @@ def _run_suite_graphs_after_startup(
         pytorch_rocm_fa_library_requested=(
             config.pytorch_rocm_fa_library if pytorch_selected else None
         ),
+        oracle=config.oracle,
     )
 
     reporter.print_suite_summary(suite_result.metadata)
     reporter.print_suite_footer()
+    _print_oracle_comparison(config, graph_results, reporter)
 
     if output_path is not None:
         suite_result.save_json(str(output_path))
@@ -225,6 +273,12 @@ def run_suite_cli(
                     "--roofline) are not supported with --backend pytorch"
                 )
                 return 1
+            if args.oracle:
+                reporter.print_error(
+                    "--oracle is not supported with --backend pytorch "
+                    "(auto-tuning is a hipDNN engine feature)"
+                )
+                return 1
         # --profiling-output-dir is only meaningful when at least one
         # opt-in profiling source fires. Passing it solo is a silent
         # no-op today; surface that as a soft warning so the user
@@ -259,6 +313,7 @@ def run_suite_cli(
             seed=args.seed,
             engine_filter=args.engine,
             verbose=args.verbose,
+            oracle=args.oracle,
             metrics=metrics_config,
             validation=validation,
             plugin_paths=plugin_paths,
