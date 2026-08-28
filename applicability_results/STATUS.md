@@ -104,6 +104,13 @@ covers on gfx950 but not gfx942, or vice versa.
   prebuilt-kernel catalog gated on (dtype, head_dim, mask_type) — causal/prefill and head_dim=256 configs commonly
   miss the catalog.
 
+## Note: two upstream commits landed after this sweep ran
+`9546535` and `dd623be` (`fix(workloads): normalize model spelling...`, `fix(cudnn_bench_moe): normalize model
+spelling...`) bumped the DVC hashes for `attn`, `conv`, `cudnn_attention_training`, `cudnn_bench_moe`, `moe`, and
+`norm` after our sweep completed — cosmetic model-name-spelling / metadata-only fixes, not tensor/shape/dtype
+changes. Applicability conclusions in this ledger should be unaffected, but `graph_name` strings for those 6
+workloads may now differ slightly from what's in the repo. Re-pull + re-run if exact graph-name matching matters.
+
 ## Combined CSV
 `workspaces/applicability_combined.csv` — gfx942 + gfx950, all 34 workloads (25 unchanged from the prior sweep + 9
 revised/new), 18,950 data rows total.
