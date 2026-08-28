@@ -4,7 +4,7 @@ Branch: `users/sareeder/benchmark-workload-curation` (dnn-benchmarking repo, ROC
 This branch supersedes `users/sareeder/collect-brad-david-benchmark-graphs` (same root work, rebased/renamed,
 plus real fixes and workload restructuring — see "What changed" below).
 
-There are 34 workload tarballs total under `Workloads/` (`Workloads/microbench/*.tar.gz` and
+There are 34 workload tarballs total under `Workloads/` (`Workloads/headline/*.tar.gz`, `Workloads/microbench/*.tar.gz`, and
 `Workloads/models/*.tar.gz`), all DVC-tracked. This ledger records, for every workload, every graph inside it, and
 every engine hipDNN discovers as a candidate: did the engine get discovered, and did the run succeed?
 
@@ -110,6 +110,12 @@ spelling...`) bumped the DVC hashes for `attn`, `conv`, `cudnn_attention_trainin
 `norm` after our sweep completed — cosmetic model-name-spelling / metadata-only fixes, not tensor/shape/dtype
 changes. Applicability conclusions in this ledger should be unaffected, but `graph_name` strings for those 6
 workloads may now differ slightly from what's in the repo. Re-pull + re-run if exact graph-name matching matters.
+
+A third commit (`86d9795`, `refactor(workloads): consolidate conv_fwd/conv_dgrad/conv_wgrad into conv_sweep`) also
+landed after this sweep: pure repackaging/rename, no shape/dtype change (see the rename table above). A fourth
+commit moved the 5 headline tarballs (`conv.tar.gz`, `bnorm.tar.gz`, `attn.tar.gz`, `hipblaslt.tar.gz`,
+`moe.tar.gz`) from `Workloads/microbench/` to `Workloads/headline/` -- path only, DVC hashes unchanged, no content
+change. `dvc pull` paths for those 5 in any future run should use the new `Workloads/headline/` location.
 
 ## Regenerating a combined view
 There is no checked-in combined CSV (removed as pure duplication of `by_workload/*.csv` -- same 18,950 rows,
