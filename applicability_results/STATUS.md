@@ -7,12 +7,6 @@ and did the run succeed?
 
 Tested at dnn-benchmarking commit `5c8e838`, `rocm-libraries` submodule pinned at `dcb84f88`.
 
-Commits landed on top since this sweep ran (`9546535`, `dd623be`, `86d9795`, `83978ed`, plus the `norm.tar.gz`
-headline move): metadata-normalization and tarball path/consolidation changes only, no shape/dtype changes.
-Applicability conclusions below are unaffected, but `graph_name` strings and tarball paths for `attn`, `conv`,
-`conv_sweep` (was `conv_fwd`/`conv_dgrad`/`conv_wgrad`), `cudnn_attention_training`, `cudnn_bench_moe`, `moe`, and
-`norm` may differ slightly from what's in the repo now. Re-pull + re-run if exact graph-name matching matters.
-
 ## CSV schema
 `asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason`
 
@@ -93,11 +87,3 @@ and `by_workload/INDEX.csv` for full per-workload/per-ASIC numbers.
 - **No RMSNorm/LayerNorm engine**: see fix #2 above — `norm.tar.gz` is 0/30 applicable on both ASICs.
 - **No MoeGroupedMatmulAttributes engine**: see fix #3 above — `moe.tar.gz`/`cudnn_bench_moe.tar.gz` mostly fail
   to build a backend graph.
-
-## Regenerating a combined view
-There is no checked-in combined CSV (removed as pure duplication of `by_workload/*.csv` -- same rows, just
-concatenated). To reproduce one on demand:
-```bash
-awk 'FNR==1 && NR!=1{next}{print}' $(ls applicability_results/by_workload/*.csv | grep -v INDEX.csv) \
-  > /tmp/applicability_combined.csv
-```
