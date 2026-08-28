@@ -39,8 +39,9 @@ correct?". Runs used the default (no `--validate pytorch`), so `correctness_matc
 | `bench_cases.tar.gz` | `conv.tar.gz` | rename (this is where the 1D-conv fix was verified) |
 | — | `cudnn_gemm.tar.gz` | **brand new** workload |
 | `hipblaslt.tar.gz` | `hipblaslt.tar.gz` | same name, re-tested against the rebuilt engine |
+| `conv_fwd.tar.gz` + `conv_dgrad.tar.gz` + `conv_wgrad.tar.gz` | `conv_sweep.tar.gz` | consolidated 3 tarballs into 1 (`fwd`/`dgrad`/`wgrad` subdirs), no content change — removes the naming collision with `conv.tar.gz`'s own internal `fprop`/`dgrad`/`wgrad` subfolders |
 
-The other 25 workloads (`aiter`, `aotriton`, `bnorm_backward`, `bnorm_fwd`, `conv_dgrad`, `conv_fwd`, `conv_wgrad`,
+The other 23 workloads (`aiter`, `aotriton`, `bnorm_backward`, `bnorm_fwd`,
 `cudnn_frontend`, `hipkittens`, `pytorch`, `rocke`, and all 14 `Workloads/models/*.tar.gz`) are untouched by this
 branch and unchanged from the prior sweep.
 

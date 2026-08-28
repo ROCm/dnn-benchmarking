@@ -350,7 +350,7 @@ To fetch one workload instead:
 This downloads the tar files tracked by `.dvc` pointer files in `Workloads/`. If the file is already cached locally, DVC restores it without re-downloading.
 
 ```bash
-dvc pull Workloads/conv_fwd.tar.gz.dvc
+dvc pull Workloads/microbench/conv_sweep.tar.gz.dvc
 ```
 
 Keep credentials in DVC's ignored local configuration (`.dvc/config.local`);
