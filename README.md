@@ -338,7 +338,10 @@ for anonymous reads; archive contents are not stored directly in Git.
 
 - `Workloads/headline/` — the small, curated set currently tracked for
   regression monitoring: `conv.tar.gz`, `bnorm.tar.gz`, `attn.tar.gz`,
-  `hipblaslt.tar.gz`, `moe.tar.gz`. Expected to grow over time.
+  `hipblaslt.tar.gz`, `moe.tar.gz`, `norm.tar.gz`. Expected to grow over
+  time. Note: `norm.tar.gz` currently has 0% applicability (no ROCm engine
+  implements RMSNorm/LayerNorm yet) -- tracked here ahead of engine support
+  landing, not because it has a signal today.
 - `Workloads/microbench/` — broader backing/brute-force sets (raw shape
   sweeps, per-source SDPA/norm/GEMM/MoE collections) not part of the
   frequent-cadence headline signal.

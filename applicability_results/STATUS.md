@@ -1,15 +1,17 @@
-# Applicability sweep — graph workloads on users/sareeder/benchmark-workload-curation
+# Applicability sweep — graph workloads
 
-Branch: `users/sareeder/benchmark-workload-curation` (dnn-benchmarking repo, ROCm/dnn-benchmarking on GitHub).
-This branch supersedes `users/sareeder/collect-brad-david-benchmark-graphs` (same root work, rebased/renamed,
-plus real fixes and workload restructuring — see "What changed" below).
+There are 34 workload tarballs total under `Workloads/` (`Workloads/headline/*.tar.gz`,
+`Workloads/microbench/*.tar.gz`, and `Workloads/models/*.tar.gz`), all DVC-tracked. This ledger records, for every
+workload, every graph inside it, and every engine hipDNN discovers as a candidate: did the engine get discovered,
+and did the run succeed?
 
-There are 34 workload tarballs total under `Workloads/` (`Workloads/headline/*.tar.gz`, `Workloads/microbench/*.tar.gz`, and
-`Workloads/models/*.tar.gz`), all DVC-tracked. This ledger records, for every workload, every graph inside it, and
-every engine hipDNN discovers as a candidate: did the engine get discovered, and did the run succeed?
+Tested at dnn-benchmarking commit `5c8e838`, `rocm-libraries` submodule pinned at `dcb84f88`.
 
-`rocm-libraries` submodule pinned at `dcb84f88` (refreshed from `develop` tip on 2026-08-28; the prior sweep used
-`c6f7c9f2db`).
+Commits landed on top since this sweep ran (`9546535`, `dd623be`, `86d9795`, `83978ed`, plus the `norm.tar.gz`
+headline move): metadata-normalization and tarball path/consolidation changes only, no shape/dtype changes.
+Applicability conclusions below are unaffected, but `graph_name` strings and tarball paths for `attn`, `conv`,
+`conv_sweep` (was `conv_fwd`/`conv_dgrad`/`conv_wgrad`), `cudnn_attention_training`, `cudnn_bench_moe`, `moe`, and
+`norm` may differ slightly from what's in the repo now. Re-pull + re-run if exact graph-name matching matters.
 
 ## CSV schema
 `asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason`
@@ -26,33 +28,14 @@ correct?". Runs used the default (no `--validate pytorch`), so `correctness_matc
 - `by_workload/INDEX.csv` — per (workload, asic) summary: graph count, applicable/not-applicable row counts, which
   engines are applicable.
 
-## What changed vs the old branch (workload rename/restructure map)
-| old name (collect-brad-david-benchmark-graphs) | new name (benchmark-workload-curation) | what changed |
-|---|---|---|
-| `bench_cases_moe.tar.gz` | `moe.tar.gz` | now uses hipDNN's native `MoeGroupedMatmulAttributes` node instead of a disconnected router-gate+FFN GEMM approximation |
-| `sdpa_rocke.tar.gz` | folded into `attn.tar.gz` | merged with new real-model SDPA fwd+bwd content (MLA/DSA/attention-sink coverage) |
-| `cudnn_frontend_full_sdpa.tar.gz` | **removed**, no replacement | superseded |
-| `cudnn_frontend_full_norm.tar.gz` | `norm.tar.gz` | stat/parameter tensors now fp32, matching bnorm's working convention |
-| `cudnn_frontend_attention_inference.tar.gz` | `cudnn_attention_inference.tar.gz` | rename only |
-| `cudnn_frontend_attention_training_v2.tar.gz` | `cudnn_attention_training.tar.gz` | rename, dropped `_v2` suffix |
-| `cudnn_frontend_bench_moe.tar.gz` | `cudnn_bench_moe.tar.gz` | rename + extended with a new "frost" MoE catalog + native-MoE-node fix |
-| `bench_cases.tar.gz` | `conv.tar.gz` | rename (this is where the 1D-conv fix was verified) |
-| — | `cudnn_gemm.tar.gz` | **brand new** workload |
-| `hipblaslt.tar.gz` | `hipblaslt.tar.gz` | same name, re-tested against the rebuilt engine |
-| `conv_fwd.tar.gz` + `conv_dgrad.tar.gz` + `conv_wgrad.tar.gz` | `conv_sweep.tar.gz` | consolidated 3 tarballs into 1 (`fwd`/`dgrad`/`wgrad` subdirs), no content change — removes the naming collision with `conv.tar.gz`'s own internal `fprop`/`dgrad`/`wgrad` subfolders |
-
-The other 23 workloads (`aiter`, `aotriton`, `bnorm_backward`, `bnorm_fwd`,
-`cudnn_frontend`, `hipkittens`, `pytorch`, `rocke`, and all 14 `Workloads/models/*.tar.gz`) are untouched by this
-branch and unchanged from the prior sweep.
-
 ## Three fixes verified on both gfx942 and gfx950
 
 **1. 1D depthwise-conv fix — CONFIRMED FIXED.** The `rocm-libraries` upstream fix landed and works. All three
 `Conformer-L__bf16_ncl_dw_conv1d_k31_bf16` graphs (fwd, backward-dgrad, backward-wgrad) now pass via
-`MIOPEN_ENGINE`/`MIOPEN_ENGINE_DETERMINISTIC` on both ASICs, in the renamed `conv.tar.gz` workload. The remaining
-33/179 not-applicable `conv.tar.gz` graphs are unrelated: 3D video-VAE convolutions (HunyuanVideo-VAE,
-Cosmos-Tokenizer, WAN-VAE, Mochi-1 — the asymmetric-padding issue documented below) and SSM/Hyena causal
-conv1d/FFT ops (Mamba, Mamba2, Jamba, Hyena) that no engine implements.
+`MIOPEN_ENGINE`/`MIOPEN_ENGINE_DETERMINISTIC` on both ASICs, in `conv.tar.gz`. The remaining 33/179 not-applicable
+`conv.tar.gz` graphs are unrelated: 3D video-VAE convolutions (HunyuanVideo-VAE, Cosmos-Tokenizer, WAN-VAE,
+Mochi-1 — the asymmetric-padding issue documented below) and SSM/Hyena causal conv1d/FFT ops (Mamba, Mamba2,
+Jamba, Hyena) that no engine implements.
 
 **2. Norm fp32-stat-tensor fix — landed, but NOT sufficient for applicability.** `norm.tar.gz` still shows
 0/30 applicable on both ASICs. The fix removed the old dtype-mismatch rejection, but that just exposed the real,
@@ -60,7 +43,8 @@ deeper gap: no engine on either gfx942 or gfx950 actually implements RMSNorm/Lay
 29/30 graphs now fail with `"No engine configurations available"` (previously they failed with a dtype-mismatch
 message instead — same practical outcome, cleaner error). The 30th (GPT3 LayerNorm-backward) still fails a
 separate graph-validation constraint (`"mean and scale must both be one-padded or both not"`). The fp32 fix was
-necessary but not sufficient — an actual GPU engine implementation is still needed.
+necessary but not sufficient — an actual GPU engine implementation is still needed. `norm.tar.gz` is tracked in
+`Workloads/headline/` ahead of that engine support landing, not because it has applicability signal today.
 
 **3. Native MoE node fix — landed, failure mode changed, NOT fixed.** `moe.tar.gz`/`cudnn_bench_moe.tar.gz` now
 correctly use `MoeGroupedMatmulAttributes` instead of the disconnected two-GEMM approximation — the old
@@ -73,7 +57,7 @@ mixtral-8x7b, kimi-k2) that happen to still route through plain `HIPBLASLT_ENGIN
 This is the same conclusion as before: the representation is now architecturally correct, but the GPU engine work
 is still outstanding.
 
-## Per-workload results — the 9 revised/new workloads (identical applicability on gfx942 and gfx950)
+## Per-workload results
 
 | workload | graphs | applicable engine(s) | gfx942 applicable/not | gfx950 applicable/not |
 |---|---|---|---|---|
@@ -91,7 +75,10 @@ Note: `attn` and `cudnn_attention_training` show a real gfx942-vs-gfx950 diverge
 applicable respectively) — worth a follow-up look at which specific shapes ASM_SDPA_ENGINE's kernel catalog
 covers on gfx950 but not gfx942, or vice versa.
 
-## Known issues (still present, not fixed by this branch)
+Bnorm and every other workload not listed above are unchanged from the prior sweep; see `by_workload/*.csv`
+and `by_workload/INDEX.csv` for full per-workload/per-ASIC numbers.
+
+## Known issues (current, at the tested commit)
 - **Asymmetric-padding 3D convs**: `HunyuanVideo-VAE`/`WAN-VAE` decoder-upsample 3D convs use `pre_padding !=
   post_padding`; MIOpen's C API only accepts symmetric padding (`MiopenConvDescriptor.cpp` hard-rejects the
   mismatch). Real API-level gap, not addressed by the 1D-conv fix.
@@ -103,23 +90,13 @@ covers on gfx950 but not gfx942, or vice versa.
   (rejects most training-paired forward graphs), no explicit attn_mask/alibi/padding-mask/paged-KV, and a fixed
   prebuilt-kernel catalog gated on (dtype, head_dim, mask_type) — causal/prefill and head_dim=256 configs commonly
   miss the catalog.
-
-## Note: two upstream commits landed after this sweep ran
-`9546535` and `dd623be` (`fix(workloads): normalize model spelling...`, `fix(cudnn_bench_moe): normalize model
-spelling...`) bumped the DVC hashes for `attn`, `conv`, `cudnn_attention_training`, `cudnn_bench_moe`, `moe`, and
-`norm` after our sweep completed — cosmetic model-name-spelling / metadata-only fixes, not tensor/shape/dtype
-changes. Applicability conclusions in this ledger should be unaffected, but `graph_name` strings for those 6
-workloads may now differ slightly from what's in the repo. Re-pull + re-run if exact graph-name matching matters.
-
-A third commit (`86d9795`, `refactor(workloads): consolidate conv_fwd/conv_dgrad/conv_wgrad into conv_sweep`) also
-landed after this sweep: pure repackaging/rename, no shape/dtype change (see the rename table above). A fourth
-commit moved the 5 headline tarballs (`conv.tar.gz`, `bnorm.tar.gz`, `attn.tar.gz`, `hipblaslt.tar.gz`,
-`moe.tar.gz`) from `Workloads/microbench/` to `Workloads/headline/` -- path only, DVC hashes unchanged, no content
-change. `dvc pull` paths for those 5 in any future run should use the new `Workloads/headline/` location.
+- **No RMSNorm/LayerNorm engine**: see fix #2 above — `norm.tar.gz` is 0/30 applicable on both ASICs.
+- **No MoeGroupedMatmulAttributes engine**: see fix #3 above — `moe.tar.gz`/`cudnn_bench_moe.tar.gz` mostly fail
+  to build a backend graph.
 
 ## Regenerating a combined view
-There is no checked-in combined CSV (removed as pure duplication of `by_workload/*.csv` -- same 18,950 rows,
-just concatenated). To reproduce one on demand:
+There is no checked-in combined CSV (removed as pure duplication of `by_workload/*.csv` -- same rows, just
+concatenated). To reproduce one on demand:
 ```bash
 awk 'FNR==1 && NR!=1{next}{print}' $(ls applicability_results/by_workload/*.csv | grep -v INDEX.csv) \
   > /tmp/applicability_combined.csv
