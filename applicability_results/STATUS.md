@@ -1,10 +1,15 @@
-# Applicability sweep — graph workloads on users/sareeder/collect-brad-david-benchmark-graphs
+# Applicability sweep — graph workloads on users/sareeder/benchmark-workload-curation
 
-Branch: `users/sareeder/collect-brad-david-benchmark-graphs` (dnn-benchmarking repo, ROCm/dnn-benchmarking on GitHub).
+Branch: `users/sareeder/benchmark-workload-curation` (dnn-benchmarking repo, ROCm/dnn-benchmarking on GitHub).
+This branch supersedes `users/sareeder/collect-brad-david-benchmark-graphs` (same root work, rebased/renamed,
+plus real fixes and workload restructuring — see "What changed" below).
 
 There are 34 workload tarballs total under `Workloads/` (`Workloads/microbench/*.tar.gz` and
 `Workloads/models/*.tar.gz`), all DVC-tracked. This ledger records, for every workload, every graph inside it, and
 every engine hipDNN discovers as a candidate: did the engine get discovered, and did the run succeed?
+
+`rocm-libraries` submodule pinned at `dcb84f88` (refreshed from `develop` tip on 2026-08-28; the prior sweep used
+`c6f7c9f2db`).
 
 ## CSV schema
 `asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason`
@@ -14,88 +19,91 @@ run succeeded (status=="success") AND correctness (when checked) didn't fail. A 
 gets one row with `engine_name=NONE`, `status=no_engine_discovered`, `applicable=False`.
 
 **Important caveat**: this ledger answers "does the engine run without error?", not "is its output numerically
-correct?". Runs used the default (no `--validate pytorch`), so `correctness_match` is blank on every row. A
-correctness-checked pass is a separate, heavier follow-up (needs a PyTorch reference build) — not done here.
+correct?". Runs used the default (no `--validate pytorch`), so `correctness_match` is blank on every row.
 
 ## Layout
-- `applicability_combined.csv` — every row, every workload, every ASIC tested so far.
-- `by_workload/<workload>.csv` — one CSV per workload (same schema), easier to diff/track per workload.
+- `applicability_combined.csv` — every row, every workload, both ASICs.
+- `by_workload/<workload>.csv` — one CSV per workload (same schema).
 - `by_workload/INDEX.csv` — per (workload, asic) summary: graph count, applicable/not-applicable row counts, which
   engines are applicable.
 
-## Status: gfx942 (MI300X) — COMPLETE, all 34 workloads
-All 34 workload tarballs are benchmarked and in this ledger, including `aiter.tar.gz` (4988 graphs, the largest
-tarball — timed out at 3600s on the first attempt, completed in 1912s / ~32 min on a retry with a longer budget).
+## What changed vs the old branch (workload rename/restructure map)
+| old name (collect-brad-david-benchmark-graphs) | new name (benchmark-workload-curation) | what changed |
+|---|---|---|
+| `bench_cases_moe.tar.gz` | `moe.tar.gz` | now uses hipDNN's native `MoeGroupedMatmulAttributes` node instead of a disconnected router-gate+FFN GEMM approximation |
+| `sdpa_rocke.tar.gz` | folded into `attn.tar.gz` | merged with new real-model SDPA fwd+bwd content (MLA/DSA/attention-sink coverage) |
+| `cudnn_frontend_full_sdpa.tar.gz` | **removed**, no replacement | superseded |
+| `cudnn_frontend_full_norm.tar.gz` | `norm.tar.gz` | stat/parameter tensors now fp32, matching bnorm's working convention |
+| `cudnn_frontend_attention_inference.tar.gz` | `cudnn_attention_inference.tar.gz` | rename only |
+| `cudnn_frontend_attention_training_v2.tar.gz` | `cudnn_attention_training.tar.gz` | rename, dropped `_v2` suffix |
+| `cudnn_frontend_bench_moe.tar.gz` | `cudnn_bench_moe.tar.gz` | rename + extended with a new "frost" MoE catalog + native-MoE-node fix |
+| `bench_cases.tar.gz` | `conv.tar.gz` | rename (this is where the 1D-conv fix was verified) |
+| — | `cudnn_gemm.tar.gz` | **brand new** workload |
+| `hipblaslt.tar.gz` | `hipblaslt.tar.gz` | same name, re-tested against the rebuilt engine |
 
-Setup: container `hipdnn_latest_gfx942.sqsh`; `--reuse-artifacts --rocm-prefix /opt/rocm` failed (no hipDNN CMake
-configs baked into the container's `/opt/rocm`); built hipDNN + hipblaslt-provider + hip-kernel-provider + MIOpen
-provider from source via `setup_env.py` once, then reused that venv (`.workspace/.venv`) for every subsequent job —
-no rebuild needed per workload.
+The other 25 workloads (`aiter`, `aotriton`, `bnorm_backward`, `bnorm_fwd`, `conv_dgrad`, `conv_fwd`, `conv_wgrad`,
+`cudnn_frontend`, `hipkittens`, `pytorch`, `rocke`, and all 14 `Workloads/models/*.tar.gz`) are untouched by this
+branch and unchanged from the prior sweep.
 
-Per-workload results (gfx942):
+## Three fixes verified on both gfx942 and gfx950
 
-| workload | graphs | applicable engine(s) | applicable rows | not-applicable rows |
+**1. 1D depthwise-conv fix — CONFIRMED FIXED.** The `rocm-libraries` upstream fix landed and works. All three
+`Conformer-L__bf16_ncl_dw_conv1d_k31_bf16` graphs (fwd, backward-dgrad, backward-wgrad) now pass via
+`MIOPEN_ENGINE`/`MIOPEN_ENGINE_DETERMINISTIC` on both ASICs, in the renamed `conv.tar.gz` workload. The remaining
+33/179 not-applicable `conv.tar.gz` graphs are unrelated: 3D video-VAE convolutions (HunyuanVideo-VAE,
+Cosmos-Tokenizer, WAN-VAE, Mochi-1 — the asymmetric-padding issue documented below) and SSM/Hyena causal
+conv1d/FFT ops (Mamba, Mamba2, Jamba, Hyena) that no engine implements.
+
+**2. Norm fp32-stat-tensor fix — landed, but NOT sufficient for applicability.** `norm.tar.gz` still shows
+0/30 applicable on both ASICs. The fix removed the old dtype-mismatch rejection, but that just exposed the real,
+deeper gap: no engine on either gfx942 or gfx950 actually implements RMSNorm/LayerNorm forward or backward today.
+29/30 graphs now fail with `"No engine configurations available"` (previously they failed with a dtype-mismatch
+message instead — same practical outcome, cleaner error). The 30th (GPT3 LayerNorm-backward) still fails a
+separate graph-validation constraint (`"mean and scale must both be one-padded or both not"`). The fp32 fix was
+necessary but not sufficient — an actual GPU engine implementation is still needed.
+
+**3. Native MoE node fix — landed, failure mode changed, NOT fixed.** `moe.tar.gz`/`cudnn_bench_moe.tar.gz` now
+correctly use `MoeGroupedMatmulAttributes` instead of the disconnected two-GEMM approximation — the old
+"disconnected components" error (65 graphs) is gone entirely. But no GPU engine (`hipblaslt-provider`,
+`hip-kernel-provider`, `miopen-provider`) implements this node yet, so most graphs now fail differently: 89/121
+`moe.tar.gz` graphs (and all 26 `cudnn_bench_moe.tar.gz` graphs) fail with `"Failed to create backend graph
+descriptor from JSON data"`, and 24/121 fail graph validation (`"grad_out must have at least 3 dimensions"`). Only
+8/121 `moe.tar.gz` graphs pass — all router-gate backward GEMMs (dgrad/wgrad for deepseek-r1, qwen3-235b-a22b,
+mixtral-8x7b, kimi-k2) that happen to still route through plain `HIPBLASLT_ENGINE` GEMM, unrelated to the new node.
+This is the same conclusion as before: the representation is now architecturally correct, but the GPU engine work
+is still outstanding.
+
+## Per-workload results — the 9 revised/new workloads (identical applicability on gfx942 and gfx950)
+
+| workload | graphs | applicable engine(s) | gfx942 applicable/not | gfx950 applicable/not |
 |---|---|---|---|---|
-| bench_cases_moe | 121 | HIPBLASLT_ENGINE | 56 | 65 |
-| sdpa_rocke | 157 | ASM_SDPA_ENGINE | 33 | 124 |
-| cudnn_frontend_full_sdpa | 105 | none | 0 | 105 |
-| cudnn_frontend_full_norm | 30 | none | 0 | 30 |
-| cudnn_frontend_attention_inference | 428 | ASM_SDPA_ENGINE | 2 | 426 |
-| cudnn_frontend_attention_training_v2 | 141 | none | 0 | 141 |
-| cudnn_frontend_bench_moe | 12 | HIPBLASLT_ENGINE | 12 | 0 |
-| bench_cases | 179 | MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 270 | 44 |
-| hipblaslt | 578 | HIPBLASLT_ENGINE | 578 | 0 |
-| aiter | 4988 | HIPBLASLT_ENGINE / ASM_SDPA_ENGINE | 1102 | 3886 |
-| aotriton | 48 | none | 0 | 48 |
-| bnorm_backward | 8 | HIP_MLOPS_ENGINE / MIOPEN_ENGINE | 16 | 0 |
-| bnorm_fwd | 8 | HIP_MLOPS_ENGINE / MIOPEN_ENGINE | 16 | 0 |
-| conv_dgrad | 133 | MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 266 | 0 |
-| conv_fwd | 150 | MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 300 | 0 |
-| conv_wgrad | 146 | MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 292 | 0 |
-| cudnn_frontend | 53 | HIPBLASLT_ENGINE | 18 | 35 |
-| hipkittens | 73 | ASM_SDPA_ENGINE / HIPBLASLT_ENGINE | 37 | 36 |
-| pytorch | 1200 | ASM_SDPA_ENGINE / HIP_MLOPS_ENGINE / HIPBLASLT_ENGINE / MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 762 | 618 |
-| rocke | 32 | none | 0 | 32 |
-| auto_regressive_dit | 5 | ASM_SDPA_ENGINE | 5 | 0 |
-| dsv3 | 10 | ASM_SDPA_ENGINE | 5 | 5 |
-| glm_5_2_moe | 20 | HIPBLASLT_ENGINE | 11 | 9 |
-| gpt_oss | 5 | none | 0 | 5 |
-| kimiK26 | 10 | ASM_SDPA_ENGINE | 5 | 5 |
-| llama3.1 | 10 | ASM_SDPA_ENGINE | 5 | 5 |
-| ltx2 | 5 | ASM_SDPA_ENGINE | 5 | 0 |
-| mad_llama3_1_8b_train | 8 | HIPBLASLT_ENGINE | 5 | 3 |
-| qwen35 | 5 | none | 0 | 5 |
-| qwen3_235b_a22b_moe | 15 | HIPBLASLT_ENGINE | 7 | 8 |
-| qwen3_30b_a3b_moe | 15 | HIPBLASLT_ENGINE | 7 | 8 |
-| qwen3_32b | 14 | HIPBLASLT_ENGINE | 6 | 8 |
-| qwen3_8b | 13 | HIPBLASLT_ENGINE | 5 | 8 |
-| wan22_a14b | 5 | ASM_SDPA_ENGINE | 5 | 0 |
+| moe | 121 | HIPBLASLT_ENGINE | 8 / 113 | 8 / 113 |
+| attn | 217 | ASM_SDPA_ENGINE | 5 / 212 | 34 / 183 |
+| norm | 30 | none | 0 / 30 | 0 / 30 |
+| cudnn_attention_inference | 428 | ASM_SDPA_ENGINE | 2 / 426 | 2 / 426 |
+| cudnn_attention_training | 141 | none (gfx942) / ASM_SDPA_ENGINE (gfx950) | 0 / 141 | 20 / 121 |
+| cudnn_bench_moe | 26 | none | 0 / 26 | 0 / 26 |
+| cudnn_gemm | 5 | HIPBLASLT_ENGINE | 2 / 3 | 2 / 3 |
+| conv | 179 | MIOPEN_ENGINE / MIOPEN_ENGINE_DETERMINISTIC | 292 rows applicable / 33 rows not (325 total rows; 146 unique graphs pass x2 engine rows) | same, 146/179 unique graphs pass |
+| hipblaslt | 578 | HIPBLASLT_ENGINE | 578 / 0 | 578 / 0 |
 
-**Known issue found during the sweep**: running `cudnn_frontend_full_*`/`cudnn_frontend_attention_*` workloads
-back-to-back in the same process can trigger a HIP error 700 (illegal memory access) inside hipblaslt's
-cleanup/destructor path (`hipblaslt.cpp:187`) at the end of a suite, after its JSON is already written, wedging
-the GPU for the next invocation in the same process. Worked around by isolating each workload in its own SLURM
-job / subprocess. Standalone `hipblaslt.tar.gz` (578 graphs) did NOT reproduce this crash. Worth a real bug
-report against hipDNN/hipblaslt-provider — not fixed here, out of scope for this sweep.
+Note: `attn` and `cudnn_attention_training` show a real gfx942-vs-gfx950 divergence (34 vs 5, and 20 vs 0
+applicable respectively) — worth a follow-up look at which specific shapes ASM_SDPA_ENGINE's kernel catalog
+covers on gfx950 but not gfx942, or vice versa.
 
-## Status: gfx950 (MI350X/MI355X) — BLOCKED on cluster capacity, all 34 workloads queued in one job
-Every gfx950 node cluster-wide (MI350X 1-GPU nodes and MI355X 8-GPU nodes, both `gpu` and `shard` GRES) is 100%
-allocated by long-running jobs (7-day/28-day/30-day/365-day reservations). The federation sibling cluster
-`alola-blr` has no gfx950 nodes at all.
+## Known issues (still present, not fixed by this branch)
+- **Asymmetric-padding 3D convs**: `HunyuanVideo-VAE`/`WAN-VAE` decoder-upsample 3D convs use `pre_padding !=
+  post_padding`; MIOpen's C API only accepts symmetric padding (`MiopenConvDescriptor.cpp` hard-rejects the
+  mismatch). Real API-level gap, not addressed by the 1D-conv fix.
+- **HIP-700 hipblaslt cleanup crash**: running certain workloads back-to-back in the same process can trigger a
+  HIP error 700 (illegal memory access) inside hipblaslt's cleanup path at process exit, after the JSON is
+  already written. Worked around by isolating each workload in its own subprocess/SLURM job. Standalone
+  `hipblaslt.tar.gz` runs cleanly. Not fixed, out of scope for this sweep.
+- **ASM_SDPA_ENGINE coverage gaps** (unchanged from before): no fp16 (only bf16/fp8), no `generate_stats` output
+  (rejects most training-paired forward graphs), no explicit attn_mask/alibi/padding-mask/paged-KV, and a fixed
+  prebuilt-kernel catalog gated on (dtype, head_dim, mask_type) — causal/prefill and head_dim=256 configs commonly
+  miss the catalog.
 
-SLURM job `67845858` (`workspaces/gfx950/run_sweep_gfx950.sh`) is queued on partition `defq`, requesting
-`gres/gpu:gfx950-mi350x=1`, reason `Priority`, time limit 10:00:00, submitted 2026-08-26T16:56:48. All 34
-workload tarballs are already DVC-pulled into `workspaces/gfx950/Workloads/`. The script runs every `dnn-benchmark`
-invocation in its own subprocess (works around the HIP-700 issue) and parses everything directly into
-`applicability_gfx950_all34.csv` when it finishes.
-
-**No action needed** — it's a standard `sbatch` submission that runs unattended once SLURM schedules it. When it
-completes:
-```bash
-cd /home/AMD/sareeder/ROCm-workspace/workspaces
-{ head -1 applicability_gfx942.csv; tail -n +2 applicability_combined.csv; tail -n +2 applicability_gfx950_all34.csv; } > applicability_combined.csv.new
-mv applicability_combined.csv.new applicability_combined.csv
-```
-(then re-split `by_workload/*.csv` and `INDEX.csv` from the refreshed combined CSV)
-- Check status: `squeue -j 67845858` or `sacct -j 67845858`.
-- Check output: `workspaces/gfx950/results/*.json` and `workspaces/applicability_gfx950_all34.csv`.
+## Combined CSV
+`workspaces/applicability_combined.csv` — gfx942 + gfx950, all 34 workloads (25 unchanged from the prior sweep + 9
+revised/new), 18,950 data rows total.
