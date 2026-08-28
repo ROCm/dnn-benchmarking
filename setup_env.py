@@ -1015,6 +1015,15 @@ class Setup:
 
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
         cmake = require_working_cmake()
+        # The ingestor's descriptor-packaging step (HkpPackaging.cmake) does
+        # find_package(Python3 COMPONENTS Interpreter REQUIRED) and imports
+        # rocm_kpack under whatever it resolves. Left to its own search it
+        # can land on the ambient system interpreter (the GitHub Actions
+        # runner's hosted-tool-cache Python, which has neither dependency),
+        # not the venv this script manages. Pin it explicitly and install
+        # into that same venv so resolution is deterministic instead of
+        # depending on what the host happens to have.
+        self.pip("install", "zstandard>=0.20.0", "msgpack")
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
@@ -1039,6 +1048,7 @@ class Setup:
                 "-DHIPDNN_SKIP_TESTS=ON",
                 "-DHIPDNN_ENABLE_SDPA=ON",
                 "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
+                f"-DPython3_EXECUTABLE={self.py}",
                 # The ingestor engine's descriptor packaging step needs
                 # rocm_kpack, which is not part of this superbuild's own
                 # sources. Fetch the pinned commit rather than requiring a
