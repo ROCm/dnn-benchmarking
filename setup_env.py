@@ -1038,10 +1038,26 @@ class Setup:
                 *self.hip_arch_args,
                 "-DHIPDNN_SKIP_TESTS=ON",
                 "-DHIPDNN_ENABLE_SDPA=ON",
+                "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
+                # The ingestor engine's descriptor packaging step needs
+                # rocm_kpack, which is not part of this superbuild's own
+                # sources. Fetch the pinned commit rather than requiring a
+                # host-local rocm-systems checkout; re-entrant, so a warm
+                # build directory touches the network only once.
+                "-DHIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON",
                 "-DMIOPENPROVIDER_SKIP_TESTS=ON",
                 "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
                 "-DENABLE_ASM_SDPA_ENGINE=ON",
                 "-DENABLE_CLANG_FORMAT=OFF",
+                # The kernel ingestor's std::stable_sort usage (plugin_sdk
+                # IKernelHeuristic.hpp) trips libstdc++'s own now-deprecated
+                # get_temporary_buffer internals under -Werror. Confirmed
+                # this is a local-toolchain-only skew, not a code defect:
+                # rocm-libraries' own Linux superbuild CI builds this exact
+                # flag combination green. Downgrade to a warning for this
+                # bootstrap script's own build only; hipDNN's CMakeLists and
+                # CI's warning policy are untouched.
+                "-DCMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations",
                 "-DENABLE_CLANG_TIDY=OFF",
             ],
             cwd=ROCM_LIBRARIES_DIR,
