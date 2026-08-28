@@ -22,7 +22,6 @@ gets one row with `engine_name=NONE`, `status=no_engine_discovered`, `applicable
 correct?". Runs used the default (no `--validate pytorch`), so `correctness_match` is blank on every row.
 
 ## Layout
-- `applicability_combined.csv` — every row, every workload, both ASICs.
 - `by_workload/<workload>.csv` — one CSV per workload (same schema).
 - `by_workload/INDEX.csv` — per (workload, asic) summary: graph count, applicable/not-applicable row counts, which
   engines are applicable.
@@ -111,6 +110,10 @@ spelling...`) bumped the DVC hashes for `attn`, `conv`, `cudnn_attention_trainin
 changes. Applicability conclusions in this ledger should be unaffected, but `graph_name` strings for those 6
 workloads may now differ slightly from what's in the repo. Re-pull + re-run if exact graph-name matching matters.
 
-## Combined CSV
-`workspaces/applicability_combined.csv` — gfx942 + gfx950, all 34 workloads (25 unchanged from the prior sweep + 9
-revised/new), 18,950 data rows total.
+## Regenerating a combined view
+There is no checked-in combined CSV (removed as pure duplication of `by_workload/*.csv` -- same 18,950 rows,
+just concatenated). To reproduce one on demand:
+```bash
+awk 'FNR==1 && NR!=1{next}{print}' $(ls applicability_results/by_workload/*.csv | grep -v INDEX.csv) \
+  > /tmp/applicability_combined.csv
+```
