@@ -1,0 +1,5 @@
+outs:
+- md5: 59c000e95380ce937ac5c921879d7a69
+  size: 28183
+  hash: md5
+  path: moe.tar.gz

@@ -1,0 +1,11 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,cudnn_gemm,bf16_b1_m4096_n4096_k4096_matmul,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_gemm,bf16_b1_m4096_n4096_k4096_matmul_swiglu,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_gemm,int8_bf16_b1_m4096_n4096_k4096_matmul_mixedinput,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_gemm,nvfp4_b1_m4096_n4096_k4096_matmul_blockscale,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_gemm,nvfp4_b1_m4096_n4096_k4096_matmul_blockscale_swiglu,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_gemm,bf16_b1_m4096_n4096_k4096_matmul,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_gemm,bf16_b1_m4096_n4096_k4096_matmul_swiglu,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_gemm,int8_bf16_b1_m4096_n4096_k4096_matmul_mixedinput,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_gemm,nvfp4_b1_m4096_n4096_k4096_matmul_blockscale,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_gemm,nvfp4_b1_m4096_n4096_k4096_matmul_blockscale_swiglu,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.

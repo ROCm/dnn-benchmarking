@@ -336,6 +336,17 @@ The `Workloads/` directory contains benchmark workload tarballs tracked with
 [DVC](https://dvc.org/). The public DVC remote is configured in `.dvc/config`
 for anonymous reads; archive contents are not stored directly in Git.
 
+- `Workloads/headline/` — the small, curated set currently tracked for
+  regression monitoring: `conv.tar.gz`, `bnorm.tar.gz`, `attn.tar.gz`,
+  `hipblaslt.tar.gz`, `moe.tar.gz`, `norm.tar.gz`. Expected to grow over
+  time. Note: `norm.tar.gz` currently has 0% applicability (no ROCm engine
+  implements RMSNorm/LayerNorm yet) -- tracked here ahead of engine support
+  landing, not because it has a signal today.
+- `Workloads/microbench/` — broader backing/brute-force sets (raw shape
+  sweeps, per-source SDPA/norm/GEMM/MoE collections) not part of the
+  frequent-cadence headline signal.
+- `Workloads/models/` — per-model workload collections.
+
 ### Download workload archives
 
 Install DVC with S3 support, then pull every tracked workload:
@@ -350,7 +361,7 @@ To fetch one workload instead:
 This downloads the tar files tracked by `.dvc` pointer files in `Workloads/`. If the file is already cached locally, DVC restores it without re-downloading.
 
 ```bash
-dvc pull Workloads/conv_fwd.tar.gz.dvc
+dvc pull Workloads/headline/conv.tar.gz.dvc
 ```
 
 Keep credentials in DVC's ignored local configuration (`.dvc/config.local`);
