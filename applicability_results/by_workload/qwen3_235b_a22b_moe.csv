@@ -14,3 +14,18 @@ gfx942,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq2048_skv2048_d128_causal,0,unknown
 gfx942,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq32768_skv32768_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
 gfx942,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
 gfx942,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n128_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n151936_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n1536_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n4096_k1536,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n4096_k8192,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n512_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_m4096_n8192_k4096,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,qwen3_235b_a22b_moe,bf16_rmsnorm_16384x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_rmsnorm_262144x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_rmsnorm_4096x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_swish_fwd_4096x1536,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq32768_skv32768_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,qwen3_235b_a22b_moe,bf16_b1_hq64_kv4_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.

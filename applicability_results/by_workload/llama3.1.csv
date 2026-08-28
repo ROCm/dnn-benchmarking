@@ -9,3 +9,13 @@ gfx942,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq4096_skv4096_d128_causal,0,unknown,
 gfx942,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
 gfx942,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
 gfx942,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq16384_skv16384_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq16384_skv16384_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq2048_skv2048_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq2048_skv2048_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq32768_skv32768_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq32768_skv32768_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq4096_skv4096_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq4096_skv4096_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq8192_skv8192_d128_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,llama3.1,llama3.1__bf16_b2_hq64_kv8_sq8192_skv8192_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,

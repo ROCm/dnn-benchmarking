@@ -78,24 +78,13 @@ the GPU for the next invocation in the same process. Worked around by isolating 
 job / subprocess. Standalone `hipblaslt.tar.gz` (578 graphs) did NOT reproduce this crash. Worth a real bug
 report against hipDNN/hipblaslt-provider — not fixed here, out of scope for this sweep.
 
-## Status: gfx950 (MI350X/MI355X) — BLOCKED on cluster capacity, all 34 workloads queued in one job
-Every gfx950 node cluster-wide (MI350X 1-GPU nodes and MI355X 8-GPU nodes, both `gpu` and `shard` GRES) is 100%
-allocated by long-running jobs (7-day/28-day/30-day/365-day reservations). The federation sibling cluster
-`alola-blr` has no gfx950 nodes at all.
+## Status: gfx950 (MI350X/MI355X) — COMPLETE, all 34 workloads
+SLURM job `67845858` ran 2026-08-28T10:16:55 -> 12:18:50 (2h02m) on node `bg-1w300-g1-3` and completed
+successfully. All 34 workloads are now merged into `applicability_combined.csv` and `by_workload/*.csv`
+for both gfx942 and gfx950 (18,990 total data rows).
 
-SLURM job `67845858` (`workspaces/gfx950/run_sweep_gfx950.sh`) is queued on partition `defq`, requesting
-`gres/gpu:gfx950-mi350x=1`, reason `Priority`, time limit 10:00:00, submitted 2026-08-26T16:56:48. All 34
-workload tarballs are already DVC-pulled into `workspaces/gfx950/Workloads/`. The script runs every `dnn-benchmark`
-invocation in its own subprocess (works around the HIP-700 issue) and parses everything directly into
-`applicability_gfx950_all34.csv` when it finishes.
-
-**No action needed** — it's a standard `sbatch` submission that runs unattended once SLURM schedules it. When it
-completes:
-```bash
-cd /home/AMD/sareeder/ROCm-workspace/workspaces
-{ head -1 applicability_gfx942.csv; tail -n +2 applicability_combined.csv; tail -n +2 applicability_gfx950_all34.csv; } > applicability_combined.csv.new
-mv applicability_combined.csv.new applicability_combined.csv
-```
-(then re-split `by_workload/*.csv` and `INDEX.csv` from the refreshed combined CSV)
-- Check status: `squeue -j 67845858` or `sacct -j 67845858`.
-- Check output: `workspaces/gfx950/results/*.json` and `workspaces/applicability_gfx950_all34.csv`.
+**NOTE (superseding update in progress)**: the source branch was renamed/superseded by
+`users/sareeder/benchmark-workload-curation`, which restructured several workload tarballs (renames,
+merges, and real fixes -- native MoE node, fp32 norm stats, 1D-conv fix) and pinned a newer
+`rocm-libraries` checkout. A follow-up sweep re-testing the affected workloads on both ASICs against
+that branch is in progress; this STATUS.md will be rewritten once it lands.
