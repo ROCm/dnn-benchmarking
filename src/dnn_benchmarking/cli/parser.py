@@ -207,6 +207,19 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_type=bool,
     ),
     CliOption(
+        flags=("--oracle",),
+        dest="oracle",
+        action="store_true",
+        default=False,
+        group="Output",
+        help="Also run each engine through hipDNN auto-tuning and report the "
+        "tuned (oracle) timing alongside the out-of-the-box timing "
+        "(one tuning sweep per engine; significantly slower)",
+        config_key="oracle",
+        config_kind=ConfigKind.SCALAR,
+        config_type=bool,
+    ),
+    CliOption(
         flags=("--rtol",),
         dest="rtol",
         parser_type=float,

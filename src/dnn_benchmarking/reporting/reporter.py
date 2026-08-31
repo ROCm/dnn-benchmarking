@@ -144,6 +144,14 @@ class Reporter:
         """
         self._print(f"WARNING: {message}")
 
+    def print_info(self, message: str) -> None:
+        """Print an informational line verbatim.
+
+        Args:
+            message: Message text.
+        """
+        self._print(message)
+
     def _print(self, text: str) -> None:
         """Print a line of text.
 
@@ -386,6 +394,11 @@ class Reporter:
             ]
         )
         include_warnings = any(pe.warnings for pe in graph_result.results)
+        include_oracle = any(
+            pe.oracle or pe.oracle_error for pe in graph_result.results
+        )
+        if include_oracle:
+            headers.extend(["oracle_kernel_mean_ms", "oracle_speedup"])
         if include_warnings:
             headers.append("warnings")
         rows: List[List[str]] = []
@@ -401,6 +414,18 @@ class Reporter:
                     self._fmt_stat(pe.host_stats, "median_ms"),
                 ]
             )
+            if include_oracle:
+                row.append(
+                    self._fmt_stat(pe.oracle.gpu_kernel_stats, "mean_ms")
+                    if pe.oracle is not None
+                    else "n/a"
+                )
+                if pe.oracle_delta is not None:
+                    row.append(f"{pe.oracle_delta.speedup:.2f}x")
+                elif pe.oracle_error is not None:
+                    row.append("failed")
+                else:
+                    row.append("n/a")
             if include_warnings:
                 row.append(self._fmt_warnings(pe.warnings))
             rows.append(row)
@@ -474,6 +499,7 @@ class Reporter:
             if pe.status == "success":
                 self._print_pe_stats(pe)
                 self._print_pe_metrics(pe)
+                self._print_oracle_block(pe)
                 # Profiling artefacts render independently of the always-on
                 # metrics block — opt-in profiling is valid under
                 # --metrics-tier off, and the user should still see where
@@ -517,6 +543,49 @@ class Reporter:
         self._print("Warnings:")
         for warning in pe.warnings:
             self._print(f"  WARNING: {warning}")
+        self._print("")
+
+    def _print_oracle_block(self, pe: ProviderEngineResult) -> None:
+        """Render the auto-tuned (oracle) comparison block in verbose mode."""
+        if pe.oracle is None:
+            if pe.oracle_error is not None:
+                self._print(f"Oracle (auto-tuned): unavailable — {pe.oracle_error}")
+                self._print("")
+            return
+
+        o = pe.oracle
+        self._print("Oracle (auto-tuned):")
+        self._print(
+            f"  Plan:          {o.plan_name}  "
+            f"(compiled plan index {o.compiled_plan_index}, rank {o.rank})"
+        )
+        if o.knob_settings:
+            self._print("  Knobs:")
+            for knob in o.knob_settings:
+                self._print(f"    {knob['knob_id']}={knob['value']}")
+        else:
+            self._print("  Knobs:         engine defaults")
+        self._print(
+            f"  Candidates:    {o.candidates_benchmarked} benchmarked successfully"
+        )
+        self._print(
+            f"  Sweep best:    {o.sweep_min_time_ms:.3f} ms   "
+            "(diagnostic; not the reported oracle timing)"
+        )
+        if o.gpu_kernel_stats is not None:
+            self._print(f"  Kernel mean:   {o.gpu_kernel_stats.mean_ms:.3f} ms")
+        if o.host_stats is not None:
+            self._print(f"  Host mean:     {o.host_stats.mean_ms:.3f} ms")
+        if pe.oracle_delta is not None:
+            d = pe.oracle_delta
+            self._print(
+                f"  Warm baseline: {d.baseline_mean_ms:.3f} ms   "
+                "(heuristic plan, re-timed after the sweep)"
+            )
+            self._print(
+                f"  Tuned vs baseline: {d.delta_ms:.3f} ms faster, "
+                f"{d.speedup:.2f}x  (basis: {d.basis})"
+            )
         self._print("")
 
     @staticmethod

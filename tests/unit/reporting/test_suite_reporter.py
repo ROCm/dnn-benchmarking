@@ -12,8 +12,10 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
+    build_oracle_delta,
 )
 
 
@@ -650,3 +652,112 @@ class TestMachineSummaryPlatformLabel:
         assert "ROCm:    6.2.0" in out
         assert "CUDA:" not in out
         assert "cuDNN:" not in out
+
+
+def _make_oracle(**overrides) -> OracleResult:
+    kwargs = dict(
+        plan_name="tuned_plan_7",
+        compiled_plan_index=2,
+        rank=0,
+        sweep_min_time_ms=0.210,
+        candidates_benchmarked=5,
+        knob_settings=[],
+        gpu_kernel_stats=BenchmarkStats(
+            mean_ms=0.250,
+            std_ms=0.01,
+            min_ms=0.24,
+            max_ms=0.26,
+            p95_ms=0.255,
+            p99_ms=0.258,
+        ),
+        # The heuristic plan re-timed after the sweep; twice the tuned run,
+        # so the rendered speedup is 2.00x.
+        warm_baseline_gpu_kernel_stats=BenchmarkStats(
+            mean_ms=0.500,
+            std_ms=0.02,
+            min_ms=0.48,
+            max_ms=0.52,
+            p95_ms=0.510,
+            p99_ms=0.516,
+        ),
+    )
+    kwargs.update(overrides)
+    return OracleResult(**kwargs)
+
+
+class TestOracleReporting:
+    """Oracle columns and the verbose oracle block."""
+
+    def _graph_with(self, pe: ProviderEngineResult) -> GraphResult:
+        return GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
+
+    def test_table_omits_oracle_columns_without_oracle_data(self) -> None:
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(
+            self._graph_with(_make_pe_success())
+        )
+        out = output.getvalue()
+        assert "oracle_kernel_mean_ms" not in out
+        assert "oracle_speedup" not in out
+
+    def test_table_renders_oracle_columns(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "oracle_kernel_mean_ms" in out
+        assert "oracle_speedup" in out
+        assert "0.250" in out
+        assert "2.00x" in out
+
+    def test_table_marks_failed_oracle_row(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle_error = "sweep exploded"
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "oracle_speedup" in out
+        assert "failed" in out
+
+    def test_verbose_renders_oracle_block(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Oracle (auto-tuned):" in out
+        # The engine is already in the row header; the block does not repeat it.
+        assert "Engine:" not in out
+        assert "tuned_plan_7" in out
+        assert "compiled plan index 2, rank 0" in out
+        assert "engine defaults" in out
+        assert "5 benchmarked successfully" in out
+        assert "basis: gpu_kernel" in out
+        assert "Warm baseline: 0.500 ms" in out
+        assert "Tuned vs baseline:" in out
+
+    def test_verbose_renders_knob_lines(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(knob_settings=[{"knob_id": "SPLIT_K", "value": 4}])
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "SPLIT_K=4" in out
+        assert "engine defaults" not in out
+
+    def test_verbose_renders_oracle_failure(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle_error = "no autotune candidate benchmarked successfully"
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Oracle (auto-tuned): unavailable — no autotune candidate" in out

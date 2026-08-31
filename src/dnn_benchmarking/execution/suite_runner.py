@@ -39,7 +39,9 @@ from ..reporting.statistics import BenchmarkStats
 from ..reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleResult,
     ProviderEngineResult,
+    build_oracle_delta,
 )
 from ..validation.reference_provider import (
     ReferenceOutput,
@@ -996,6 +998,114 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
+def _run_oracle_pass(
+    *,
+    result: ProviderEngineResult,
+    graph_path: Path,
+    graph_json_str: str,
+    graph_name: str,
+    config: SuiteConfig,
+    handle: Any,
+    engine_id: int,
+    bm: Any,
+    ootb_executor: Any,
+) -> None:
+    """Tune ``engine_id`` on the same graph and record the post-tuning timing.
+
+    Builds a second graph with every candidate plan compiled, runs one
+    hipDNN auto-tuning sweep restricted to ``engine_id``, then times the
+    winning plan with the user's warmup/iteration counts.
+
+    Mutates ``result.oracle``/``result.oracle_delta`` on success and
+    ``result.oracle_error`` on any failure. Never raises: a tuning failure
+    must not fail the OOTB row.
+
+    Args:
+        result: The completed OOTB row to attach the oracle payload to.
+        graph_path: Path of the graph under test.
+        graph_json_str: Serialized graph, rebuilt for the autotune executor.
+        graph_name: Graph name recorded in the benchmark metadata.
+        config: Suite configuration (warmup/iteration counts).
+        handle: hipdnn.Handle instance.
+        engine_id: Engine the sweep is restricted to.
+        bm: The OOTB pass's BufferManager, reused so both passes read
+            identical input data.
+        ootb_executor: The prepared OOTB executor, re-timed after the sweep
+            so the comparison operands share one warm state.
+    """
+    try:
+        bench_config = BenchmarkConfig(
+            graph_path=graph_path,
+            warmup_iters=config.warmup_iters,
+            benchmark_iters=config.benchmark_iters,
+            engine_id=engine_id,
+        )
+        executor = Executor(
+            graph_json_str=graph_json_str,
+            config=bench_config,
+        )
+        executor.prepare(handle, engine_id=engine_id, for_autotune=True)
+
+        # The OOTB correctness re-execution leaves outputs populated; zeroing
+        # them restores the OOTB starting state. The inputs need no reload:
+        # they are disjoint from the output set, and the OOTB pass already
+        # relies on them surviving its own warmup, timed loop, and correctness
+        # re-execution without one.
+        bm.zero_outputs()
+        variant_pack = bm.create_variant_pack()
+
+        candidates = executor.autotune(handle, variant_pack, engine_id)
+        winner = candidates[0]
+
+        # Warmth parity. The sweep just executed this engine's plans up to
+        # a hundred times, so timing the tuned plan now measures a hotter
+        # device than the OOTB pass ever saw. Re-time the heuristic plan
+        # here, between the sweep and the tuned run, so both operands carry
+        # the same warmup history and the ratio isolates the plan change.
+        # Without this the tool reports large speedups on graphs where the
+        # sweep had exactly one candidate and changed nothing at all.
+        bm.zero_outputs()
+        ootb_executor.warmup(handle, variant_pack)
+        baseline_result = ootb_executor.benchmark(
+            handle, variant_pack, graph_name=graph_name
+        )
+
+        bm.zero_outputs()
+        executor.warmup(handle, variant_pack)
+        bench_result = executor.benchmark(handle, variant_pack, graph_name=graph_name)
+
+        oracle = OracleResult(
+            plan_name=executor.plan_name(handle) or "",
+            compiled_plan_index=int(winner.compiled_plan_index),
+            rank=int(winner.rank),
+            sweep_min_time_ms=float(winner.min_time_ms),
+            candidates_benchmarked=len(candidates),
+            knob_settings=[
+                {"knob_id": str(k.knob_id), "value": k.value}
+                for k in winner.knob_settings
+            ],
+            cpu_build_time_ms=executor.init_time_ms,
+            host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
+            gpu_kernel_stats=(
+                BenchmarkStats.from_timings(bench_result.kernel_timings)
+                if bench_result.has_kernel_timings
+                else None
+            ),
+            warm_baseline_host_stats=BenchmarkStats.from_timings(
+                baseline_result.host_timings
+            ),
+            warm_baseline_gpu_kernel_stats=(
+                BenchmarkStats.from_timings(baseline_result.kernel_timings)
+                if baseline_result.has_kernel_timings
+                else None
+            ),
+        )
+        result.oracle = oracle
+        result.oracle_delta = build_oracle_delta(oracle)
+    except Exception as e:
+        result.oracle_error = str(e)
+
+
 def run_single_provider_engine(
     graph_path: Path,
     graph_json_str: str,
@@ -1114,6 +1224,22 @@ def run_single_provider_engine(
                     rtol=rtol,
                     atol=atol,
                     error_message="No reference provider requested",
+                )
+
+            # Reaching here means the OOTB timed pass succeeded (any
+            # failure raised out of this try block already), so the row
+            # is eligible for an oracle comparison.
+            if config.oracle:
+                _run_oracle_pass(
+                    result=result,
+                    graph_path=graph_path,
+                    graph_json_str=graph_json_str,
+                    graph_name=graph_name,
+                    config=config,
+                    handle=handle,
+                    engine_id=engine_id,
+                    bm=bm,
+                    ootb_executor=executor,
                 )
 
         # BufferManager context has exited — I/O buffers are freed.

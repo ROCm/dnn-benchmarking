@@ -1331,3 +1331,117 @@ class TestProfilingFlagPropagation:
         ):
             rc = run_suite_cli(args, graph_paths=[Path("g.json")], reporter=Reporter())
         assert rc == 0
+
+
+class TestOracleFlag:
+    """--oracle parsing, SuiteConfig propagation, and startup warnings."""
+
+    def _create_graph(self, tmpdir: Path) -> Path:
+        p = tmpdir / "g.json"
+        p.write_text(json.dumps({"name": "g", "nodes": [], "tensors": []}))
+        return p
+
+    def test_oracle_defaults_to_false(self) -> None:
+        parser = create_parser()
+        args = parser.parse_args(["--graph", "g.json"])
+        assert args.oracle is False
+
+    def test_oracle_flag_parses_true(self) -> None:
+        parser = create_parser()
+        args = parser.parse_args(["--graph", "g.json", "--oracle"])
+        assert args.oracle is True
+
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_oracle_flag_propagates_to_suite_config(
+        self, mock_benchmark: MagicMock
+    ) -> None:
+        mock_benchmark.return_value = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = self._create_graph(Path(tmpdir))
+            from dnn_benchmarking.cli.main import main
+
+            with patch(
+                "sys.argv", ["dnn-benchmark", "--graph", str(graph), "--oracle"]
+            ):
+                main()
+
+        assert mock_benchmark.call_args.kwargs["config"].oracle is True
+
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_oracle_absent_leaves_suite_config_false(
+        self, mock_benchmark: MagicMock
+    ) -> None:
+        mock_benchmark.return_value = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = self._create_graph(Path(tmpdir))
+            from dnn_benchmarking.cli.main import main
+
+            with patch("sys.argv", ["dnn-benchmark", "--graph", str(graph)]):
+                main()
+
+        assert mock_benchmark.call_args.kwargs["config"].oracle is False
+
+    def test_oracle_with_pytorch_backend_rejected(self) -> None:
+        from dnn_benchmarking.cli.main import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = self._create_graph(Path(tmpdir))
+            with patch(
+                "sys.argv",
+                [
+                    "dnn-benchmark",
+                    "--graph",
+                    str(graph),
+                    "--oracle",
+                    "--backend",
+                    "pytorch",
+                ],
+            ):
+                assert main() == 1
+
+
+class TestOracleStartupWarnings:
+    """The cache warning is driven by hipDNN's truthy set, not by bool()."""
+
+    def _warn(self, warmup_iters: int = 10) -> str:
+        import io
+
+        from dnn_benchmarking.cli.suite_runner_cli import _print_oracle_warnings
+
+        buf = io.StringIO()
+        _print_oracle_warnings(
+            SuiteConfig(oracle=True, warmup_iters=warmup_iters),
+            Reporter(output=buf),
+        )
+        return buf.getvalue()
+
+    def test_cache_warning_when_variable_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", raising=False)
+        assert "engine-ranking cache is enabled" in self._warn()
+
+    def test_no_cache_warning_when_variable_truthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        assert "engine-ranking cache is enabled" not in self._warn()
+
+    def test_cache_warning_when_variable_is_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """hipDNN treats '0' as still-enabled, so the warning must fire."""
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "0")
+        assert "engine-ranking cache is enabled" in self._warn()
+
+    def test_zero_warmup_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        assert "--warmup 0" in self._warn(warmup_iters=0)
+
+    def test_no_zero_warmup_warning_with_warmup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        assert self._warn(warmup_iters=1) == ""

@@ -1015,6 +1015,15 @@ class Setup:
 
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
         cmake = require_working_cmake()
+        # The ingestor's descriptor-packaging step (HkpPackaging.cmake) does
+        # find_package(Python3 COMPONENTS Interpreter REQUIRED) and imports
+        # rocm_kpack under whatever it resolves. Left to its own search it
+        # can land on the ambient system interpreter (the GitHub Actions
+        # runner's hosted-tool-cache Python, which has neither dependency),
+        # not the venv this script manages. Pin it explicitly and install
+        # into that same venv so resolution is deterministic instead of
+        # depending on what the host happens to have.
+        self.pip("install", "zstandard>=0.20.0", "msgpack")
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
@@ -1038,10 +1047,27 @@ class Setup:
                 *self.hip_arch_args,
                 "-DHIPDNN_SKIP_TESTS=ON",
                 "-DHIPDNN_ENABLE_SDPA=ON",
+                "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
+                f"-DPython3_EXECUTABLE={self.py}",
+                # The ingestor engine's descriptor packaging step needs
+                # rocm_kpack, which is not part of this superbuild's own
+                # sources. Fetch the pinned commit rather than requiring a
+                # host-local rocm-systems checkout; re-entrant, so a warm
+                # build directory touches the network only once.
+                "-DHIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON",
                 "-DMIOPENPROVIDER_SKIP_TESTS=ON",
                 "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
                 "-DENABLE_ASM_SDPA_ENGINE=ON",
                 "-DENABLE_CLANG_FORMAT=OFF",
+                # The kernel ingestor's std::stable_sort usage (plugin_sdk
+                # IKernelHeuristic.hpp) trips libstdc++'s own now-deprecated
+                # get_temporary_buffer internals under -Werror. Confirmed
+                # this is a local-toolchain-only skew, not a code defect:
+                # rocm-libraries' own Linux superbuild CI builds this exact
+                # flag combination green. Downgrade to a warning for this
+                # bootstrap script's own build only; hipDNN's CMakeLists and
+                # CI's warning policy are untouched.
+                "-DCMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations",
                 "-DENABLE_CLANG_TIDY=OFF",
             ],
             cwd=ROCM_LIBRARIES_DIR,
@@ -1150,9 +1176,15 @@ class Setup:
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
+            # install_prefix first: it is what ROCM_PATH points at (above) and
+            # where a from-source hipDNN build is installed, so it must win
+            # over the toolchain wheel's prebuilt copy. With the wheel first,
+            # its older libhipdnn_backend.so shadows the freshly built one and
+            # the frontend bindings fail to load with an undefined symbol as
+            # soon as the submodule adds a backend export the wheel lacks.
             lib_dirs = tuple(
                 str(Path(prefix) / "lib")
-                for prefix in (toolchain_prefix, install_prefix)
+                for prefix in (install_prefix, toolchain_prefix)
                 if prefix and (Path(prefix) / "lib").is_dir()
             )
             current = self.env.get("LD_LIBRARY_PATH", "")
