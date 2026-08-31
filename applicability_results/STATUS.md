@@ -31,14 +31,16 @@ correct?". Runs used the default (no `--validate pytorch`), so `correctness_matc
 Mochi-1 — the asymmetric-padding issue documented below) and SSM/Hyena causal conv1d/FFT ops (Mamba, Mamba2,
 Jamba, Hyena) that no engine implements.
 
-**2. Norm fp32-stat-tensor fix — landed, but NOT sufficient for applicability.** `norm.tar.gz` still shows
-0/30 applicable on both ASICs. The fix removed the old dtype-mismatch rejection, but that just exposed the real,
-deeper gap: no engine on either gfx942 or gfx950 actually implements RMSNorm/LayerNorm forward or backward today.
-29/30 graphs now fail with `"No engine configurations available"` (previously they failed with a dtype-mismatch
-message instead — same practical outcome, cleaner error). The 30th (GPT3 LayerNorm-backward) still fails a
-separate graph-validation constraint (`"mean and scale must both be one-padded or both not"`). The fp32 fix was
-necessary but not sufficient — an actual GPU engine implementation is still needed. `norm.tar.gz` is tracked in
-`Workloads/headline/` ahead of that engine support landing, not because it has applicability signal today.
+**2. Norm fp32-stat-tensor fix — landed; the applicability result needs a HIP_MLOPS_ENGINE rerun.** `norm.tar.gz`
+still shows 0/30 applicable on both ASICs in this ledger, but that result must not be read as proof that norm
+support does not exist. The current `hip-kernel-provider` source registers `RMSnormPlanBuilder`,
+`RMSnormBwdPlanBuilder`, and `LayernormPlanBuilder` under `HIP_MLOPS_ENGINE`, with RMSNorm and LayerNorm
+kernels and applicability validators. The norm CSV contains no `HIP_MLOPS_ENGINE` result; every RMSNorm row says
+`No engine configurations available`. The sweep therefore did not exercise a matching HIP_MLOPS engine
+configuration, or used a build that did not include it. Re-run norm with the current provider enabled before
+using 0/30 as a current applicability conclusion. The dtype fix remains correct: activations are bf16,
+statistics/affine tensors are fp32, and compute type is fp32. The GPT3 LayerNorm case also has a separate
+mean/scale one-padding validation failure.
 
 **3. Native MoE node fix — landed, failure mode changed, NOT fixed.** `moe.tar.gz`/`cudnn_bench_moe.tar.gz` now
 correctly use `MoeGroupedMatmulAttributes` instead of the disconnected two-GEMM approximation — the old
@@ -84,6 +86,8 @@ and `by_workload/INDEX.csv` for full per-workload/per-ASIC numbers.
   (rejects most training-paired forward graphs), no explicit attn_mask/alibi/padding-mask/paged-KV, and a fixed
   prebuilt-kernel catalog gated on (dtype, head_dim, mask_type) — causal/prefill and head_dim=256 configs commonly
   miss the catalog.
-- **No RMSNorm/LayerNorm engine**: see fix #2 above — `norm.tar.gz` is 0/30 applicable on both ASICs.
+- **Norm applicability needs a current HIP_MLOPS_ENGINE run**: the current source contains RMSNorm forward/backward
+  and LayerNorm plan builders, but this ledger discovered no matching HIP_MLOPS engine configuration. Re-run
+  `norm.tar.gz` with that engine enabled; do not describe the source as lacking norm implementation.
 - **No MoeGroupedMatmulAttributes engine**: see fix #3 above — `moe.tar.gz`/`cudnn_bench_moe.tar.gz` mostly fail
   to build a backend graph.
