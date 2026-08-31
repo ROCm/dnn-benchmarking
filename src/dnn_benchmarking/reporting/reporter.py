@@ -579,7 +579,11 @@ class Reporter:
         if pe.oracle_delta is not None:
             d = pe.oracle_delta
             self._print(
-                f"  OOTB vs oracle: {d.delta_ms:.3f} ms faster, "
+                f"  Warm baseline: {d.baseline_mean_ms:.3f} ms   "
+                "(heuristic plan, re-timed after the sweep)"
+            )
+            self._print(
+                f"  Tuned vs baseline: {d.delta_ms:.3f} ms faster, "
                 f"{d.speedup:.2f}x  (basis: {d.basis})"
             )
         self._print("")

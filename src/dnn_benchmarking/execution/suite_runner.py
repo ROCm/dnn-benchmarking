@@ -1008,6 +1008,7 @@ def _run_oracle_pass(
     handle: Any,
     engine_id: int,
     bm: Any,
+    ootb_executor: Any,
 ) -> None:
     """Tune ``engine_id`` on the same graph and record the post-tuning timing.
 
@@ -1029,6 +1030,8 @@ def _run_oracle_pass(
         engine_id: Engine the sweep is restricted to.
         bm: The OOTB pass's BufferManager, reused so both passes read
             identical input data.
+        ootb_executor: The prepared OOTB executor, re-timed after the sweep
+            so the comparison operands share one warm state.
     """
     try:
         bench_config = BenchmarkConfig(
@@ -1054,6 +1057,19 @@ def _run_oracle_pass(
         candidates = executor.autotune(handle, variant_pack, engine_id)
         winner = candidates[0]
 
+        # Warmth parity. The sweep just executed this engine's plans up to
+        # a hundred times, so timing the tuned plan now measures a hotter
+        # device than the OOTB pass ever saw. Re-time the heuristic plan
+        # here, between the sweep and the tuned run, so both operands carry
+        # the same warmup history and the ratio isolates the plan change.
+        # Without this the tool reports large speedups on graphs where the
+        # sweep had exactly one candidate and changed nothing at all.
+        bm.zero_outputs()
+        ootb_executor.warmup(handle, variant_pack)
+        baseline_result = ootb_executor.benchmark(
+            handle, variant_pack, graph_name=graph_name
+        )
+
         bm.zero_outputs()
         executor.warmup(handle, variant_pack)
         bench_result = executor.benchmark(handle, variant_pack, graph_name=graph_name)
@@ -1075,9 +1091,17 @@ def _run_oracle_pass(
                 if bench_result.has_kernel_timings
                 else None
             ),
+            warm_baseline_host_stats=BenchmarkStats.from_timings(
+                baseline_result.host_timings
+            ),
+            warm_baseline_gpu_kernel_stats=(
+                BenchmarkStats.from_timings(baseline_result.kernel_timings)
+                if baseline_result.has_kernel_timings
+                else None
+            ),
         )
         result.oracle = oracle
-        result.oracle_delta = build_oracle_delta(result, oracle)
+        result.oracle_delta = build_oracle_delta(oracle)
     except Exception as e:
         result.oracle_error = str(e)
 
@@ -1215,6 +1239,7 @@ def run_single_provider_engine(
                     handle=handle,
                     engine_id=engine_id,
                     bm=bm,
+                    ootb_executor=executor,
                 )
 
         # BufferManager context has exited — I/O buffers are freed.

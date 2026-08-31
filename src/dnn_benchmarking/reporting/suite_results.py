@@ -126,6 +126,14 @@ class OracleResult:
             measures a different amount of work than the OOTB build.
         gpu_kernel_stats: GPU kernel timing of the post-tuning run.
         host_stats: Host-side timing of the post-tuning run.
+        warm_baseline_gpu_kernel_stats: GPU kernel timing of the *heuristic*
+            plan, re-measured after the sweep. The row's own timing cannot
+            serve as the comparand: the sweep executes the engine's plans
+            many times, so the tuned run is measured on a hotter device than
+            the OOTB pass ever saw. Re-timing the heuristic plan here puts
+            both sides in one warm state, so the delta reflects the plan
+            change instead of accumulated warmup.
+        warm_baseline_host_stats: Host-side counterpart of the above.
     """
 
     plan_name: str
@@ -137,6 +145,8 @@ class OracleResult:
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
+    warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
+    warm_baseline_host_stats: Optional[BenchmarkStats] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -152,24 +162,41 @@ class OracleResult:
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
             ),
             "host_stats": self.host_stats.to_dict() if self.host_stats else None,
+            "warm_baseline_gpu_kernel_stats": (
+                self.warm_baseline_gpu_kernel_stats.to_dict()
+                if self.warm_baseline_gpu_kernel_stats
+                else None
+            ),
+            "warm_baseline_host_stats": (
+                self.warm_baseline_host_stats.to_dict()
+                if self.warm_baseline_host_stats
+                else None
+            ),
         }
 
 
 @dataclass
 class OracleDelta:
-    """OOTB-vs-oracle comparison for one engine row.
+    """Warm heuristic baseline vs tuned run for one engine row.
+
+    Both sides are measured after the autotuning sweep, back to back on the
+    same buffers, so device warmth is common to them and the ratio isolates
+    the plan change. This is deliberately not the row's headline OOTB
+    timing: that one is measured before the sweep exists and is the
+    "what you get out of the box" number, which at low ``--warmup`` can sit
+    well above steady state and would inflate the speedup.
 
     Attributes:
         basis: Which timing pair the comparison used.
-        ootb_mean_ms: Mean of the heuristic-selected run.
+        baseline_mean_ms: Mean of the heuristic plan, re-timed post-sweep.
         oracle_mean_ms: Mean of the post-tuning run.
-        delta_ms: ``ootb_mean_ms - oracle_mean_ms``; positive means the
+        delta_ms: ``baseline_mean_ms - oracle_mean_ms``; positive means the
             oracle is faster.
-        speedup: ``ootb_mean_ms / oracle_mean_ms``.
+        speedup: ``baseline_mean_ms / oracle_mean_ms``.
     """
 
     basis: Literal["gpu_kernel", "host"]
-    ootb_mean_ms: float
+    baseline_mean_ms: float
     oracle_mean_ms: float
     delta_ms: float
     speedup: float
@@ -178,7 +205,7 @@ class OracleDelta:
         """Convert to dictionary for JSON serialization."""
         return {
             "basis": self.basis,
-            "ootb_mean_ms": self.ootb_mean_ms,
+            "baseline_mean_ms": self.baseline_mean_ms,
             "oracle_mean_ms": self.oracle_mean_ms,
             "delta_ms": self.delta_ms,
             "speedup": self.speedup,
@@ -385,30 +412,36 @@ class ProviderEngineResult:
         return d
 
 
-def build_oracle_delta(
-    ootb: ProviderEngineResult, oracle: OracleResult
-) -> Optional[OracleDelta]:
-    """Compare an OOTB engine row against its post-tuning oracle run.
+def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
+    """Compare the warm heuristic baseline against the tuned run.
+
+    Both operands come from ``oracle``: the sweep-adjacent re-timing of the
+    heuristic plan and the post-tuning run. The row's own OOTB timing is
+    deliberately not used — it is measured before the sweep, so at low
+    ``--warmup`` it can sit above steady state and report a speedup that is
+    accumulated warmup rather than a better plan.
 
     Prefers GPU kernel time; falls back to host time when either side has
     no kernel statistics.
 
     Args:
-        ootb: The heuristic-selected row.
-        oracle: The post-tuning result for the same engine row.
+        oracle: The post-tuning result, carrying its own warm baseline.
 
     Returns:
         An OracleDelta, or None when no comparable statistics pair exists
         or the oracle mean is zero.
     """
     basis: Literal["gpu_kernel", "host"]
-    if ootb.gpu_kernel_stats is not None and oracle.gpu_kernel_stats is not None:
+    if (
+        oracle.warm_baseline_gpu_kernel_stats is not None
+        and oracle.gpu_kernel_stats is not None
+    ):
         basis = "gpu_kernel"
-        ootb_mean = ootb.gpu_kernel_stats.mean_ms
+        baseline_mean = oracle.warm_baseline_gpu_kernel_stats.mean_ms
         oracle_mean = oracle.gpu_kernel_stats.mean_ms
-    elif ootb.host_stats is not None and oracle.host_stats is not None:
+    elif oracle.warm_baseline_host_stats is not None and oracle.host_stats is not None:
         basis = "host"
-        ootb_mean = ootb.host_stats.mean_ms
+        baseline_mean = oracle.warm_baseline_host_stats.mean_ms
         oracle_mean = oracle.host_stats.mean_ms
     else:
         return None
@@ -418,10 +451,10 @@ def build_oracle_delta(
 
     return OracleDelta(
         basis=basis,
-        ootb_mean_ms=ootb_mean,
+        baseline_mean_ms=baseline_mean,
         oracle_mean_ms=oracle_mean,
-        delta_ms=ootb_mean - oracle_mean,
-        speedup=ootb_mean / oracle_mean,
+        delta_ms=baseline_mean - oracle_mean,
+        speedup=baseline_mean / oracle_mean,
     )
 
 

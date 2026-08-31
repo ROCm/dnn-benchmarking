@@ -263,6 +263,16 @@ emit the same output as before.
 The flag runs one tuning sweep per engine row, so it is significantly slower.
 Narrow the run with `--engine` when the extra cost matters.
 
+`oracle_speedup` compares the tuned plan against a **warm baseline**: the
+heuristic plan re-timed immediately after the sweep, reported as
+`oracle.warm_baseline_gpu_kernel_stats` and `oracle_delta.baseline_mean_ms`.
+The row's own OOTB timing is not the comparand. A tuning sweep executes the
+engine's plans many times, so the tuned run is measured on a hotter device
+than the OOTB pass ever saw; comparing the two directly reports a speedup
+even when the sweep had a single candidate and changed nothing. Both
+operands of `oracle_speedup` therefore share the sweep's warmup history,
+and the row's OOTB columns stay the untouched out-of-the-box number.
+
 hipDNN consults an on-disk engine-ranking cache before heuristic selection, so
 a persisted ranking can make the OOTB row reuse a previously benchmarked engine
 order and shrink the reported gap. Export

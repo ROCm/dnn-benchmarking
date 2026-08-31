@@ -773,11 +773,18 @@ class TestOracleCLIIntegration:
         delta = tuned[0]["oracle_delta"]
         assert set(delta) == {
             "basis",
-            "ootb_mean_ms",
+            "baseline_mean_ms",
             "oracle_mean_ms",
             "delta_ms",
             "speedup",
         }
+        # The baseline is the post-sweep re-timing carried on the oracle
+        # payload, never the row's own pre-sweep OOTB number.
+        assert oracle["warm_baseline_gpu_kernel_stats"] is not None
+        assert (
+            delta["baseline_mean_ms"]
+            == oracle["warm_baseline_gpu_kernel_stats"]["mean_ms"]
+        )
 
     def test_plain_run_has_no_oracle_keys(
         self, project_root: Path, tmp_path: Path, cli_plugin_args: List[str]

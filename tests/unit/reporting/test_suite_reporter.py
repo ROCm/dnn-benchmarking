@@ -670,6 +670,16 @@ def _make_oracle(**overrides) -> OracleResult:
             p95_ms=0.255,
             p99_ms=0.258,
         ),
+        # The heuristic plan re-timed after the sweep; twice the tuned run,
+        # so the rendered speedup is 2.00x.
+        warm_baseline_gpu_kernel_stats=BenchmarkStats(
+            mean_ms=0.500,
+            std_ms=0.02,
+            min_ms=0.48,
+            max_ms=0.52,
+            p95_ms=0.510,
+            p99_ms=0.516,
+        ),
     )
     kwargs.update(overrides)
     return OracleResult(**kwargs)
@@ -693,7 +703,7 @@ class TestOracleReporting:
     def test_table_renders_oracle_columns(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe, pe.oracle)
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -714,7 +724,7 @@ class TestOracleReporting:
     def test_verbose_renders_oracle_block(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe, pe.oracle)
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()
@@ -728,6 +738,8 @@ class TestOracleReporting:
         assert "engine defaults" in out
         assert "5 benchmarked successfully" in out
         assert "basis: gpu_kernel" in out
+        assert "Warm baseline: 0.500 ms" in out
+        assert "Tuned vs baseline:" in out
 
     def test_verbose_renders_knob_lines(self) -> None:
         pe = _make_pe_success()

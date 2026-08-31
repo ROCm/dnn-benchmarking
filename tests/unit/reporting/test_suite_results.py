@@ -642,7 +642,9 @@ class TestOracleSerialization:
         assert not {"oracle", "oracle_delta", "oracle_error"} & set(d)
 
     def test_oracle_and_delta_serialize_under_success(self):
-        oracle = _oracle(gpu_kernel_stats=_stats(1.0))
+        oracle = _oracle(
+            gpu_kernel_stats=_stats(1.0), warm_baseline_gpu_kernel_stats=_stats(2.0)
+        )
         pe = ProviderEngineResult(
             provider="p",
             engine_id=1,
@@ -650,7 +652,7 @@ class TestOracleSerialization:
             gpu_kernel_stats=_stats(2.0),
             oracle=oracle,
         )
-        pe.oracle_delta = build_oracle_delta(pe, oracle)
+        pe.oracle_delta = build_oracle_delta(oracle)
         d = pe.to_dict()
         assert d["oracle"]["plan_name"] == "plan_x"
         # The engine is the row's own; it is deliberately not duplicated here.
@@ -661,6 +663,11 @@ class TestOracleSerialization:
         assert d["oracle"]["host_stats"] is None
         assert d["oracle_delta"]["basis"] == "gpu_kernel"
         assert d["oracle_delta"]["speedup"] == 2.0
+        assert d["oracle"]["warm_baseline_gpu_kernel_stats"]["mean_ms"] == 2.0
+        assert d["oracle"]["warm_baseline_host_stats"] is None
+        # The comparand is the warm re-timing, not the row's own OOTB number.
+        assert d["oracle_delta"]["baseline_mean_ms"] == 2.0
+        assert "ootb_mean_ms" not in d["oracle_delta"]
 
     def test_oracle_error_serializes_under_success(self):
         pe = ProviderEngineResult(
@@ -683,52 +690,51 @@ class TestOracleSerialization:
 
 
 class TestBuildOracleDelta:
-    """Basis selection and guard rails for the OOTB-vs-oracle comparison."""
+    """Basis selection and guard rails for the warm-baseline comparison."""
 
     def test_prefers_gpu_kernel_basis(self):
-        oracle = _oracle(gpu_kernel_stats=_stats(1.0), host_stats=_stats(5.0))
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="success",
-            gpu_kernel_stats=_stats(2.0),
-            host_stats=_stats(9.0),
+        oracle = _oracle(
+            gpu_kernel_stats=_stats(1.0),
+            host_stats=_stats(5.0),
+            warm_baseline_gpu_kernel_stats=_stats(2.0),
+            warm_baseline_host_stats=_stats(9.0),
         )
-        delta = build_oracle_delta(pe, oracle)
+        delta = build_oracle_delta(oracle)
         assert delta is not None
         assert delta.basis == "gpu_kernel"
-        assert delta.ootb_mean_ms == 2.0
+        assert delta.baseline_mean_ms == 2.0
         assert delta.oracle_mean_ms == 1.0
         assert delta.delta_ms == 1.0
         assert delta.speedup == 2.0
 
     def test_falls_back_to_host_basis(self):
-        oracle = _oracle(host_stats=_stats(4.0))
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="success",
-            gpu_kernel_stats=_stats(2.0),
-            host_stats=_stats(8.0),
+        # No kernel stats on the tuned side, so the pair cannot be gpu_kernel
+        # even though a warm kernel baseline exists.
+        oracle = _oracle(
+            host_stats=_stats(4.0),
+            warm_baseline_gpu_kernel_stats=_stats(2.0),
+            warm_baseline_host_stats=_stats(8.0),
         )
-        delta = build_oracle_delta(pe, oracle)
+        delta = build_oracle_delta(oracle)
         assert delta is not None
         assert delta.basis == "host"
         assert delta.speedup == 2.0
 
     def test_returns_none_without_comparable_stats(self):
-        pe = ProviderEngineResult(provider="p", engine_id=1, status="success")
-        assert build_oracle_delta(pe, _oracle()) is None
+        assert build_oracle_delta(_oracle()) is None
+
+    def test_returns_none_without_a_warm_baseline(self):
+        # The row's own OOTB timing must never stand in for the baseline:
+        # it is measured before the sweep and would inflate the speedup.
+        oracle = _oracle(gpu_kernel_stats=_stats(1.0), host_stats=_stats(5.0))
+        assert build_oracle_delta(oracle) is None
 
     def test_returns_none_when_oracle_mean_is_zero(self):
-        oracle = _oracle(gpu_kernel_stats=_stats(0.0))
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="success",
-            gpu_kernel_stats=_stats(2.0),
+        oracle = _oracle(
+            gpu_kernel_stats=_stats(0.0),
+            warm_baseline_gpu_kernel_stats=_stats(2.0),
         )
-        assert build_oracle_delta(pe, oracle) is None
+        assert build_oracle_delta(oracle) is None
 
 
 class TestSuiteMetadataSelectionEnv:
