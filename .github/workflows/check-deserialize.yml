@@ -1,0 +1,84 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: check-deserialize
+
+on:
+  pull_request:
+    paths:
+      - 'Workloads/**'
+      - 'src/dnn_benchmarking/graph/**'
+      - 'tools/check_deserialize.py'
+      - '.github/workflows/check-deserialize.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Workloads/**'
+      - 'src/dnn_benchmarking/graph/**'
+      - 'tools/check_deserialize.py'
+      - '.github/workflows/check-deserialize.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check-deserialize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      # rocm-sdk-devel unpacks to ~13 GB, same as the `rocm-build` job in
+      # setup.yml. No submodules: setup_env.py fetches prebuilt ROCm SDK
+      # wheels, it never builds against the rocm-libraries submodule source.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup || true
+          docker system prune -af || true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install DVC
+        run: pip install "dvc[s3]"
+
+      # .dvc/config sets allow_anonymous_login for the S3 remote, so this
+      # needs no credentials. Total tracked workload size is ~1 MB.
+      - name: Pull DVC-tracked workloads
+        run: dvc pull
+
+      - name: Extract workload tarballs
+        run: |
+          mkdir -p /tmp/workloads-extracted
+          find Workloads -iname '*.tar.gz' -print0 \
+            | xargs -0 -n1 -I{} tar xzf {} -C /tmp/workloads-extracted
+
+      # --level json only exercises dnn_benchmarking's pure-Python
+      # GraphLoader, which doesn't know hipDNN's real node contract (tensor
+      # rank, dtype, connected-components, per-node field constraints). It's
+      # a fast fail-fast gate for gross JSON/schema errors, not the safety
+      # net -- that's the opgraph-level check below, which calls real
+      # hipdnn_frontend and is the only level that has ever caught a graph
+      # bug in this repo (see the moe.tar.gz fix history).
+      - name: Fast pre-check (JSON schema only)
+        run: |
+          pip install -e .
+          python tools/check_deserialize.py --level json --src src \
+            /tmp/workloads-extracted
+
+      # No GPU required: from_json + validate + build_operation_graph only
+      # assemble and finalize the backend operation-graph descriptor, no
+      # plan build or kernel execution.
+      - name: Build hipDNN (no GPU)
+        env:
+          PIP_NO_CACHE_DIR: "1"
+        run: |
+          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y
+
+      - name: Check opgraph-level graph deserialization
+        run: |
+          .ci-workspace/.venv/bin/python tools/check_deserialize.py \
+            --level opgraph /tmp/workloads-extracted

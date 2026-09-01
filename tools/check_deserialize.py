@@ -54,6 +54,14 @@ def main():
                 file=sys.stderr,
             )
             return 3
+        # This check only exercises from_json/validate/build_operation_graph,
+        # which assemble the backend graph descriptor from JSON and never
+        # touch an engine. Engine plugins (HIPBLASLT_ENGINE, MIOPEN_ENGINE,
+        # ASM_SDPA_ENGINE, ...) are otherwise loaded eagerly on Handle()
+        # construction and some initialize a real GPU context on load,
+        # which aborts hard on GPU-less machines/CI runners. Must be called
+        # before any Handle exists.
+        hipdnn.set_engine_plugin_paths([], mode=hipdnn.PluginLoadingMode.ABSOLUTE)
         handle = hipdnn.Handle()
 
     ok = fail = 0
