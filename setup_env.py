@@ -333,6 +333,26 @@ print("\n" + mode)
 # --- CLI -------------------------------------------------------------------
 
 
+def _cmake_define(value: str) -> str:
+    """Normalise a --cmake-arg value to a `-DNAME=VALUE` CMake define.
+
+    Accepts both spellings. The bare `-D` form only survives argparse when
+    written `--cmake-arg=-DFOO=ON`; with a space, argparse sees a token starting
+    with `-` and reports "expected one argument". Accepting `NAME=VALUE` makes
+    the space form work too, which is the form everyone reaches for first.
+    """
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError("--cmake-arg needs a NAME=VALUE define")
+    if text.startswith("-D"):
+        text = text[2:]
+    if "=" not in text:
+        raise argparse.ArgumentTypeError(
+            f"--cmake-arg expects NAME=VALUE, got {value!r} (no '=' found)"
+        )
+    return f"-D{text}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="setup_env.py",
@@ -416,6 +436,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cmake-arg",
+        dest="cmake_args",
+        action="append",
+        default=[],
+        type=_cmake_define,
+        metavar="NAME=VALUE",
+        help=(
+            "Extra CMake define appended to the hipDNN/provider configure. "
+            "Repeatable. Appended after the defaults, so it can override one. "
+            "Accepts NAME=VALUE or -DNAME=VALUE; the leading -D is added when "
+            "absent, because argparse reads a bare '-DFOO=ON' as an option "
+            "rather than a value unless it is written '--cmake-arg=-DFOO=ON'. "
+            "Needed for any engine gated behind a non-default option -- e.g. "
+            "HIPDNN_ENABLE_KERNEL_INGESTOR=ON, which defaults OFF and without "
+            "which a descriptor-backed engine is compiled into no plugin at all: "
+            "the plugin .so is still present, so --plugin-path looks satisfied, "
+            "and every graph reports 'no engines applicable'."
+        ),
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",
@@ -438,6 +478,7 @@ class Setup:
         self.gpu_arch_override = args.gpu_arch
         self.torch_index_url = args.torch_index_url
         self.editable_install = args.editable_install
+        self.extra_cmake_args = list(getattr(args, "cmake_args", []) or [])
         self.resolved_torch_index_url = ""
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
@@ -1043,6 +1084,9 @@ class Setup:
                 "-DENABLE_ASM_SDPA_ENGINE=ON",
                 "-DENABLE_CLANG_FORMAT=OFF",
                 "-DENABLE_CLANG_TIDY=OFF",
+                # LAST, so a caller's -D overrides a default above rather than
+                # being silently overridden by it.
+                *self.extra_cmake_args,
             ],
             cwd=ROCM_LIBRARIES_DIR,
             env=self._build_env(),
