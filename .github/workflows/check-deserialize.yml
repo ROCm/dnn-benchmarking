@@ -23,10 +23,6 @@ permissions:
 
 jobs:
   check-deserialize:
-    # rocm-sdk-devel unpacks to ~13 GB; aws-linux-scale-rocm-small (used by
-    # every other GPU-adjacent job in this repo) has enough disk space for
-    # that, unlike the default ubuntu-24.04 runners -- no disk cleanup or
-    # docker prune needed here.
     runs-on: aws-linux-scale-rocm-small
     timeout-minutes: 180
     steps:
