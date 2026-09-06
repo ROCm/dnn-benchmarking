@@ -265,10 +265,14 @@ def run_suite_cli(
             backend=backend,
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
+            autotune=getattr(args, "autotune", False),
+            cache_dir=str(args.cache_dir) if getattr(args, "cache_dir", None) else None,
         )
     except ValueError as e:
         reporter.print_error(f"Suite configuration error: {e}")
         return 1
+
+    _apply_tuning_environment(config, reporter)
 
     return run_suite_benchmark(
         graph_paths=graph_paths,
@@ -277,3 +281,51 @@ def run_suite_cli(
         reporter=reporter,
         tarball_source=tarball_source,
     )
+
+
+def _apply_tuning_environment(config: SuiteConfig, reporter) -> None:
+    """Set the kernel-selection environment, and SAY which path will run.
+
+    An engine has two selection paths and they answer different questions:
+    the cold heuristic (default) measures how good the heuristic is, while
+    benchmarking measures what the shipped kernel set can actually deliver.
+    A perf table whose selection path is unstated is not interpretable, and the
+    default silently picks the first -- so the path is always announced, not
+    only when it is requested.
+    """
+    import os
+
+    if config.cache_dir:
+        os.environ["HIPDNN_CACHE_DIR"] = config.cache_dir
+        reporter.print_warning(f"HIPDNN_CACHE_DIR={config.cache_dir}")
+
+    if config.autotune:
+        os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
+        reporter.print_warning(
+            "kernel selection: BENCHMARKED -- every knob-filtered candidate is "
+            "sampled on each plan's first execute and the winner cached "
+            "(HIPDNN_FORCE_BENCHMARKING=1)"
+        )
+        if not config.cache_dir:
+            reporter.print_warning(
+                "--autotune without --cache-dir: the winner cache is on disk and "
+                "outlives this run, so results may be inherited from a previous "
+                "kernel set rather than measured for this one"
+            )
+        return
+
+    # Not requested. A leaked value from another shell or test would silently
+    # change the path, so report what is actually in effect rather than what
+    # was asked for.
+    leaked = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
+    if leaked:
+        reporter.print_warning(
+            f"HIPDNN_FORCE_BENCHMARKING={leaked} is set in the environment but "
+            "--autotune was not passed; kernel selection is NOT the default "
+            "heuristic path"
+        )
+    else:
+        reporter.print_warning(
+            "kernel selection: COLD HEURISTIC (rank-0). Pass --autotune to "
+            "measure what the shipped kernel set can deliver."
+        )

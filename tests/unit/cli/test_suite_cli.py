@@ -871,7 +871,11 @@ class TestPyTorchSdpaBackendCli:
         )
 
         assert run_suite_cli(args, graph_paths=[Path("g.json")], reporter=reporter) == 0
-        reporter.print_warning.assert_called_once_with(
+        # assert_any_call, not assert_called_once_with: print_warning is also the
+        # channel the run announces its kernel-selection path on, which every run
+        # now does. This test owns the SDPA-selector warning, not the whole
+        # channel.
+        reporter.print_warning.assert_any_call(
             "PyTorch SDPA options are ignored unless --backend pytorch or "
             "--validate pytorch is selected"
         )
