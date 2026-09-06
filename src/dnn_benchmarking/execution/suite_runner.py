@@ -679,7 +679,7 @@ def run_graph_all_providers(
     engine_selections = config.engine_selections_for(engine_ids)
     ref_provider = _get_reference_provider(config, graph_json)
     try:
-        graph_input_data = generate_input_data(tensor_infos, config.seed)
+        graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
     except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
         msg = f"Input data generation failed: {e}"
         rtol, atol = _fallback_tolerance_for_config(config)
@@ -885,7 +885,7 @@ def run_graph_pytorch_backend(
         )
 
     try:
-        graph_input_data = generate_input_data(tensor_infos, config.seed)
+        graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
     except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
         msg = f"Input data generation failed: {e}"
         return GraphResult(

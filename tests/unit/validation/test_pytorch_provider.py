@@ -1245,14 +1245,10 @@ class TestPyTorchProviderNewOps:
     @pytest.mark.parametrize(
         "optional_input",
         [
-            "seq_len_q_tensor_uid",
-            "seq_len_kv_tensor_uid",
             "seed_tensor_uid",
             "offset_tensor_uid",
             "dropout_mask_tensor_uid",
             "dropout_scale_tensor_uid",
-            "page_table_k_tensor_uid",
-            "page_table_v_tensor_uid",
             "block_mask_tensor_uid",
             "sink_token_tensor_uid",
             "descale_q_tensor_uid",
@@ -1291,14 +1287,79 @@ class TestPyTorchProviderNewOps:
             )
 
     @pytest.mark.parametrize(
+        "optional_input",
+        ["page_table_k_tensor_uid", "page_table_v_tensor_uid"],
+    )
+    def test_sdpa_forward_paged_needs_both_tables_and_lengths(
+        self, optional_input: str
+    ) -> None:
+        """Paged forward is served, but a half-specified paged graph is not: one
+        page table without the other, or without seq_len_kv, cannot be gathered."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        optional_input: 5,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"dropout_probability": 0.0},
+                }
+            ],
+        }
+
+        with pytest.raises(UnsupportedGraphError, match="page table|seq_len_kv"):
+            provider.compute_reference(
+                graph_json,
+                {1: q, 2: q, 3: q, 5: np.array([1], dtype=np.int32)},
+            )
+
+    @pytest.mark.parametrize(
+        "optional_input", ["seq_len_q_tensor_uid", "seq_len_kv_tensor_uid"]
+    )
+    def test_sdpa_forward_varlen_without_a_page_table_is_dense(
+        self, optional_input: str
+    ) -> None:
+        """Sequence lengths alone do not make a graph paged. Without a page table
+        there is nothing to gather, so the graph runs as the dense one it is."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        optional_input: 5,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"dropout_probability": 0.0},
+                }
+            ],
+        }
+
+        result = provider.compute_reference(
+            graph_json,
+            {1: q, 2: q, 3: q, 5: np.array([2], dtype=np.int32)},
+        )
+        assert 4 in result
+
+    @pytest.mark.parametrize(
         "attributes,match",
         [
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
             ({"causal_mask_bottom_right": True}, "bottom-right causal"),
             ({"diagonal_alignment": "BOTTOM_RIGHT"}, "TOP_LEFT"),
-            ({"left_bound": 1}, "sliding-window"),
-            ({"right_bound": 1}, "sliding-window"),
+            ({"right_bound": 1}, "forward-looking band"),
+            ({"left_bound": -5}, "neither unbounded nor a width"),
         ],
     )
     def test_sdpa_forward_rejects_unsupported_attributes(
