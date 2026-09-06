@@ -53,16 +53,13 @@ def _sdpa_head_repeat(q_heads: int, kv_heads: int, label: str) -> int:
 
 def _plan_sdpa_common(
     node: Dict[str, Any],
-) -> Tuple[Optional[int], float, bool, Optional[int], Any]:
+    allow_paged: bool = False,
+) -> Tuple[Optional[int], float, bool, Optional[int], Any, Optional[int]]:
     unsupported = [
-        "seq_len_q_tensor_uid",
-        "seq_len_kv_tensor_uid",
         "seed_tensor_uid",
         "offset_tensor_uid",
         "dropout_mask_tensor_uid",
         "dropout_scale_tensor_uid",
-        "page_table_k_tensor_uid",
-        "page_table_v_tensor_uid",
         "block_mask_tensor_uid",
         "sink_token_tensor_uid",
         "descale_q_tensor_uid",
@@ -72,6 +69,17 @@ def _plan_sdpa_common(
         "scale_s_tensor_uid",
         "scale_o_tensor_uid",
     ]
+    if not allow_paged:
+        # The paged/varlen inputs are served by the forward handler only: it
+        # gathers the page table into dense per-sequence K/V before calling
+        # PyTorch, which has no paged API. Backward has no such path, so for it
+        # these remain hard rejections rather than a silently dense gradient.
+        unsupported += [
+            "seq_len_q_tensor_uid",
+            "seq_len_kv_tensor_uid",
+            "page_table_k_tensor_uid",
+            "page_table_v_tensor_uid",
+        ]
     _sdpa_unsupported_if_present(node, unsupported)
 
     if _sdpa_bool(node, "alibi_mask") or _sdpa_bool(node, "padding_mask"):
@@ -85,13 +93,6 @@ def _plan_sdpa_common(
     diagonal_alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
     if diagonal_alignment not in ("TOP_LEFT", 0, None):
         raise ValueError("Only TOP_LEFT SDPA diagonal alignment is supported")
-    if (
-        _node_param(node, "left_bound", None) is not None
-        or _node_param(node, "right_bound", None) is not None
-    ):
-        raise ValueError(
-            "SDPA sliding-window bounds are not supported by the PyTorch reference"
-        )
 
     dropout_probability = _node_param(node, "dropout_probability", 0.0)
     dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
@@ -101,15 +102,57 @@ def _plan_sdpa_common(
         )
 
     mask_uid = _optional_uid(node, "attn_mask_tensor_uid")
-    is_causal = _sdpa_bool(node, "causal_mask")
-    if mask_uid is not None and is_causal:
+    is_causal, window = _sdpa_derive_mask(node)
+    if mask_uid is not None and (is_causal or window is not None):
         raise ValueError(
             "PyTorch SDPA reference does not support both attn_mask and causal_mask"
         )
 
     scale_uid = _optional_uid(node, "scale_tensor_uid")
     attn_scale_value = _node_param(node, "attn_scale_value", None)
-    return mask_uid, dropout_p, is_causal, scale_uid, attn_scale_value
+    return mask_uid, dropout_p, is_causal, scale_uid, attn_scale_value, window
+
+
+def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
+    """Resolve (is_causal, sliding_window_width) the way the engine does.
+
+    Mirrors ``Gfx950AttentionTiledNative.cpp::maskTypeFor``. Two things there are
+    easy to get wrong and both produce a wrong answer rather than an error:
+
+      * **A real bound wins over the deprecated booleans.** They can only say
+        top-left vs bottom-right, so a graph that sets ``causal_mask`` *and*
+        carries ``left_bound`` is asking for a window; reading the boolean first
+        silently discards it.
+      * **Both spellings occur in this repo.** The shipped ``quick/SdpaFwd``
+        bundles leave the booleans false and express causality as
+        ``left_bound=-1, right_bound=0``, while the model traces set
+        ``causal_mask: true``. Reading only one convention passes one population
+        and mis-serves the other.
+
+    The window WIDTH is ``left_bound + 1``: hipDNN's left bound counts tokens
+    strictly before the current one, the band includes it.
+    """
+    unbounded = -1
+    left = _node_param(node, "left_bound", unbounded)
+    right = _node_param(node, "right_bound", unbounded)
+    left = unbounded if left is None else int(left)
+    right = unbounded if right is None else int(right)
+
+    if left != unbounded:
+        if left < 0:
+            raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+        return False, left + 1
+
+    if _sdpa_bool(node, "causal_mask"):
+        return True, None
+    if right == unbounded:
+        return False, None
+    if right == 0:
+        return True, None
+    raise ValueError(
+        f"SDPA right_bound {right} is a forward-looking band the reference "
+        "cannot express"
+    )
 
 
 def _sdpa_resolve(
@@ -132,6 +175,23 @@ def _sdpa_resolve(
     return attn_mask, scale, rep_k, rep_v
 
 
+def _sliding_window_mask(
+    q_len: int,
+    kv_len: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Additive mask for a causal band of ``width`` tokens INCLUDING the current
+    one, i.e. the kernel's ``q - W + 1 <= k <= q``. Rows are aligned top-left,
+    matching the only diagonal alignment this reference accepts."""
+    q_idx = torch.arange(q_len, device=device).unsqueeze(-1)
+    k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    keep = (k_idx <= q_idx) & (k_idx > q_idx - width)
+    mask = torch.zeros((q_len, kv_len), device=device, dtype=dtype)
+    return mask.masked_fill(~keep, float("-inf"))
+
+
 def _call_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -142,6 +202,7 @@ def _call_sdpa(
     scale: Optional[float],
     rep_k: int,
     rep_v: int,
+    window: Optional[int] = None,
 ) -> torch.Tensor:
     # Expand K and V independently to the query head count. PyTorch's
     # enable_gqa only models equal K/V head counts, so explicit repeat is the
@@ -150,6 +211,13 @@ def _call_sdpa(
         k = k.repeat_interleave(rep_k, dim=-3)
     if rep_v > 1:
         v = v.repeat_interleave(rep_v, dim=-3)
+    if window is not None:
+        # A sliding window has no boolean spelling in torch's SDPA, so it is
+        # expressed as the additive mask it actually is. is_causal is already
+        # False here: a bounded left edge wins over the deprecated booleans.
+        attn_mask = _sliding_window_mask(
+            int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
+        )
     return execute_selected_sdpa(
         q,
         k,
@@ -159,6 +227,130 @@ def _call_sdpa(
         is_causal=is_causal,
         scale=scale,
     )
+
+
+def _run_paged_sdpa(
+    node: Dict[str, Any],
+    tensors: Dict[int, torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    page_table_k_uid: int,
+    page_table_v_uid: int,
+    seq_len_q_uid: Optional[int],
+    seq_len_kv_uid: int,
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float,
+    is_causal: bool,
+    scale: Optional[float],
+    rep_k: int,
+    rep_v: int,
+    window: Optional[int],
+) -> torch.Tensor:
+    """Gather a paged KV cache to dense and run attention per sequence.
+
+    Layouts, taken from the committed paged bundles rather than assumed:
+
+      * paged K/V are ``[num_blocks, num_kv_heads, page_size, head_size]``
+      * the page table is ``[num_seqs, max_blocks_per_seq]`` of int32 block ids
+      * ``seq_len_kv`` is ``[num_seqs]`` LENGTHS (not offsets -- the page table
+        is itself the per-sequence indirection, so paged K/V carry no ragged
+        offsets)
+      * Q is ``[1, num_query_heads, total_q, head_size]``, with the sequences
+        packed along ``total_q``
+
+    Each sequence's live KV is ``ceil(len / page_size)`` blocks gathered in page
+    order and then trimmed to the exact length, so trailing slots in the last
+    page never contribute.
+    """
+    if attn_mask is not None:
+        raise ValueError("Paged SDPA with an explicit attn_mask is not supported")
+
+    page_table_k = _tensor(tensors, page_table_k_uid, node)
+    page_table_v = _tensor(tensors, page_table_v_uid, node)
+    seq_len_kv = _tensor(tensors, seq_len_kv_uid, node)
+    seq_len_q = (
+        _tensor(tensors, seq_len_q_uid, node) if seq_len_q_uid is not None else None
+    )
+
+    if k.ndim != 4 or v.ndim != 4:
+        raise ValueError("Paged SDPA expects rank-4 paged K/V containers")
+    page_size = int(k.shape[-2])
+    num_seqs = int(seq_len_kv.numel())
+    if int(page_table_k.shape[0]) != num_seqs:
+        raise ValueError(
+            f"Paged SDPA page table has {int(page_table_k.shape[0])} rows for "
+            f"{num_seqs} sequences"
+        )
+
+    kv_lengths = [int(x) for x in seq_len_kv.flatten().tolist()]
+    if seq_len_q is not None:
+        q_lengths = [int(x) for x in seq_len_q.flatten().tolist()]
+        if len(q_lengths) != num_seqs:
+            raise ValueError("Paged SDPA seq_len_q/seq_len_kv disagree on num_seqs")
+    else:
+        # No per-sequence Q lengths: the packed Q must divide evenly.
+        total_q = int(q.shape[-2])
+        if total_q % num_seqs != 0:
+            raise ValueError(
+                f"Paged SDPA cannot split {total_q} queries across {num_seqs} "
+                "sequences without seq_len_q"
+            )
+        q_lengths = [total_q // num_seqs] * num_seqs
+
+    outputs = []
+    q_start = 0
+    for seq, (q_len, kv_len) in enumerate(zip(q_lengths, kv_lengths)):
+        if kv_len <= 0:
+            raise ValueError(f"Paged SDPA sequence {seq} has non-positive KV length")
+        blocks_needed = (kv_len + page_size - 1) // page_size
+        if blocks_needed > int(page_table_k.shape[1]):
+            raise ValueError(
+                f"Paged SDPA sequence {seq} needs {blocks_needed} blocks but the "
+                f"page table holds {int(page_table_k.shape[1])}"
+            )
+        ids_k = page_table_k[seq, :blocks_needed].to(torch.long)
+        ids_v = page_table_v[seq, :blocks_needed].to(torch.long)
+
+        # [blocks, H, page, D] -> [H, blocks*page, D] -> trimmed to kv_len.
+        k_seq = (
+            k[ids_k]
+            .permute(1, 0, 2, 3)
+            .reshape(int(k.shape[1]), blocks_needed * page_size, int(k.shape[-1]))[
+                :, :kv_len, :
+            ]
+        )
+        v_seq = (
+            v[ids_v]
+            .permute(1, 0, 2, 3)
+            .reshape(int(v.shape[1]), blocks_needed * page_size, int(v.shape[-1]))[
+                :, :kv_len, :
+            ]
+        )
+
+        q_seq = q[..., q_start : q_start + q_len, :]
+        if q_seq.ndim == 4:
+            k_seq = k_seq.unsqueeze(0)
+            v_seq = v_seq.unsqueeze(0)
+        q_start += q_len
+
+        outputs.append(
+            _call_sdpa(
+                q_seq,
+                k_seq,
+                v_seq,
+                None,
+                dropout_p,
+                is_causal,
+                scale,
+                rep_k,
+                rep_v,
+                window,
+            )
+        )
+
+    # Re-pack along the query axis in the order the sequences were laid out.
+    return torch.cat(outputs, dim=-2)
 
 
 def _sdpa_stats(
@@ -200,7 +392,15 @@ def compile_sdpa(
     node: Dict[str, Any],
     graph_json: Dict[str, Any],
 ) -> CompiledOp:
-    """Plan scaled dot-product attention forward."""
+    """Plan scaled dot-product attention forward.
+
+    Serves paged (KV-cache) graphs as well as dense ones. PyTorch has no paged
+    SDPA API -- ``F.scaled_dot_product_attention`` takes no page table -- so a
+    paged graph is gathered through its page table into dense per-sequence K/V
+    and then run one sequence at a time. That gather is unavoidable and it is the
+    same on both paths: ``--validate pytorch`` walks these very handlers with CPU
+    tensors, so there is no reference-side shortcut.
+    """
     _sdpa_unsupported_if_present(
         node,
         [
@@ -215,10 +415,28 @@ def compile_sdpa(
     k_uid = _required_input_uid(node, "k_tensor_uid")
     v_uid = _required_input_uid(node, "v_tensor_uid")
     o_uid = _required_output_uid(node, "o_tensor_uid")
-    mask_uid, dropout_p, is_causal, scale_uid, attn_scale_value = _plan_sdpa_common(
-        node
-    )
+    (
+        mask_uid,
+        dropout_p,
+        is_causal,
+        scale_uid,
+        attn_scale_value,
+        window,
+    ) = _plan_sdpa_common(node, allow_paged=True)
     stats_uid = _optional_uid(node, "stats_tensor_uid")
+
+    page_table_k_uid = _optional_uid(node, "page_table_k_tensor_uid")
+    page_table_v_uid = _optional_uid(node, "page_table_v_tensor_uid")
+    seq_len_q_uid = _optional_uid(node, "seq_len_q_tensor_uid")
+    seq_len_kv_uid = _optional_uid(node, "seq_len_kv_tensor_uid")
+    is_paged = page_table_k_uid is not None or page_table_v_uid is not None
+    if is_paged:
+        if page_table_k_uid is None or page_table_v_uid is None:
+            raise ValueError("Paged SDPA needs both K and V page tables")
+        if seq_len_kv_uid is None:
+            raise ValueError("Paged SDPA needs seq_len_kv to bound each sequence")
+        if stats_uid is not None:
+            raise ValueError("Paged SDPA stats output is not supported")
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         q = _tensor(tensors, q_uid, node)
@@ -227,7 +445,31 @@ def compile_sdpa(
         attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
             node, tensors, q, k, v, mask_uid, scale_uid, attn_scale_value
         )
-        o = _call_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v)
+        if is_paged:
+            o = _run_paged_sdpa(
+                node,
+                tensors,
+                q,
+                k,
+                v,
+                page_table_k_uid,
+                page_table_v_uid,
+                seq_len_q_uid,
+                seq_len_kv_uid,
+                attn_mask,
+                dropout_p,
+                is_causal,
+                scale,
+                rep_k,
+                rep_v,
+                window,
+            )
+            _store_tensor(tensors, o_uid, o)
+            return
+
+        o = _call_sdpa(
+            q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v, window
+        )
         _store_tensor(tensors, o_uid, o)
 
         if stats_uid is not None:
@@ -270,9 +512,19 @@ def compile_sdpa_backward(
     dq_uid = _required_output_uid(node, "dq_tensor_uid")
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
-    mask_uid, _dropout_p, is_causal, scale_uid, attn_scale_value = _plan_sdpa_common(
-        node
-    )
+    (
+        mask_uid,
+        _dropout_p,
+        is_causal,
+        scale_uid,
+        attn_scale_value,
+        window,
+    ) = _plan_sdpa_common(node)
+    if window is not None:
+        raise ValueError(
+            "SDPA sliding-window bounds are not supported by the PyTorch reference "
+            "backward"
+        )
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         q = _tensor(tensors, q_uid, node)
