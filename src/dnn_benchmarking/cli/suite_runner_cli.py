@@ -298,6 +298,19 @@ def _apply_tuning_environment(config: SuiteConfig, reporter) -> None:
     if config.cache_dir:
         os.environ["HIPDNN_CACHE_DIR"] = config.cache_dir
         reporter.print_warning(f"HIPDNN_CACHE_DIR={config.cache_dir}")
+    elif not os.environ.get("HIPDNN_CACHE_DIR"):
+        # Unset means the shared per-user default (~/.cache/hipdnn). The winner
+        # cache is keyed by graph content and device -- NOT by checkout, engine
+        # or session -- so two concurrent runs over the same graphs read and
+        # write each other's measurements. Reads are ungated while writes are
+        # gated on benchmarking, so even an untuned run can serve a ranking some
+        # other session tuned, and report it as its own.
+        reporter.print_warning(
+            "no --cache-dir: using the shared per-user cache (~/.cache/hipdnn). "
+            "The winner cache is keyed by graph and device, not by checkout or "
+            "session, so a concurrent run over the same graphs can supply the "
+            "rankings this one reports. Pass --cache-dir for an isolated root."
+        )
 
     if config.autotune:
         os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
@@ -308,9 +321,9 @@ def _apply_tuning_environment(config: SuiteConfig, reporter) -> None:
         )
         if not config.cache_dir:
             reporter.print_warning(
-                "--autotune without --cache-dir: the winner cache is on disk and "
-                "outlives this run, so results may be inherited from a previous "
-                "kernel set rather than measured for this one"
+                "--autotune without --cache-dir: the winner cache outlives this "
+                "run, so results may be inherited from a previous kernel set "
+                "rather than measured for this one"
             )
         return
 

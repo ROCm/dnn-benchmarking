@@ -106,3 +106,18 @@ class TestKernelSelectionEnvironment:
         _apply_tuning_environment(self._config(), reporter)
         assert any("is set in the environment" in m for m in reporter.messages)
         assert not any("COLD HEURISTIC" in m for m in reporter.messages)
+
+    def test_missing_cache_dir_warns_about_the_shared_cache(self, monkeypatch) -> None:
+        """The winner cache is keyed by graph content and device -- not by
+        checkout, engine or session. Two agents benchmarking the same graphs on
+        one box read and write each other's rankings through the per-user
+        default, and reads are ungated while writes are gated on benchmarking,
+        so an untuned run can report another session's tuned result as its own."""
+        reporter = self._apply(monkeypatch)
+        assert any("shared per-user cache" in m for m in reporter.messages)
+
+    def test_explicit_cache_dir_suppresses_the_shared_warning(
+        self, monkeypatch
+    ) -> None:
+        reporter = self._apply(monkeypatch, cache_dir="/tmp/phase-x")
+        assert not any("shared per-user cache" in m for m in reporter.messages)
