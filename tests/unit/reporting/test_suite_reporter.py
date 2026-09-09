@@ -743,7 +743,9 @@ class TestOracleReporting:
 
     def test_verbose_reports_an_exhaustive_pass_that_ran(self) -> None:
         pe = _make_pe_success()
-        pe.oracle = _make_oracle(exhaustive_requested=True, exhaustive_supported=True, exhaustive_ran=True)
+        pe.oracle = _make_oracle(
+            exhaustive_requested=True, exhaustive_supported=True, exhaustive_ran=True
+        )
         pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
@@ -800,7 +802,7 @@ class TestOracleReporting:
         assert "2.00x" not in out
 
     def test_table_speedup_survives_an_unchecked_verdict(self) -> None:
-        """"Not checked" is not "failed" and must not blank the ratio."""
+        """ "Not checked" is not "failed" and must not blank the ratio."""
         pe = _make_pe_success()
         pe.correctness = CorrectnessResult(
             execution_success=True,
@@ -912,7 +914,9 @@ class TestOracleReporting:
         pe.oracle = _make_oracle(
             compiled_plans_benchmarked=1,
             compiled_plans_total=1,
-            exhaustive_requested=True, exhaustive_supported=True, exhaustive_ran=True,
+            exhaustive_requested=True,
+            exhaustive_supported=True,
+            exhaustive_ran=True,
         )
         pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
@@ -939,7 +943,12 @@ class TestOracleReporting:
     def test_verbose_empty_knobs_do_not_claim_no_variants_explored(self) -> None:
         """``knob_settings: []`` means no explicit plan knobs, nothing more."""
         pe = _make_pe_success()
-        pe.oracle = _make_oracle(knob_settings=[], exhaustive_requested=True, exhaustive_supported=True, exhaustive_ran=True)
+        pe.oracle = _make_oracle(
+            knob_settings=[],
+            exhaustive_requested=True,
+            exhaustive_supported=True,
+            exhaustive_ran=True,
+        )
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()

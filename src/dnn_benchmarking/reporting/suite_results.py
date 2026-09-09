@@ -237,9 +237,7 @@ class OracleResult:
                 if self.warm_baseline_host_stats
                 else None
             ),
-            "correctness": (
-                self.correctness.to_dict() if self.correctness else None
-            ),
+            "correctness": (self.correctness.to_dict() if self.correctness else None),
         }
 
 

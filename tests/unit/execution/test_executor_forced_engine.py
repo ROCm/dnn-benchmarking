@@ -384,6 +384,7 @@ def test_autotune_retains_failed_candidates_for_reporting():
     assert candidates[0].rank == -1
     assert candidates[1].rank == 0
 
+
 def test_autotune_all_candidates_failed_raises():
     graph = _StubGraph(
         ranked=[999],
@@ -482,6 +483,7 @@ def test_autotune_passes_run_warmup_iterations_to_the_sweep():
         executor.autotune(object(), {}, 999)
 
     assert graph.autotune_kwargs["config"].warmup_iterations == 7
+
 
 def test_autotune_uses_one_warmup_when_run_warmup_is_zero():
     config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=0, benchmark_iters=1)

@@ -2024,9 +2024,7 @@ class TestOraclePass:
         distinct, and neither requires a measured speedup above 1.0x.
         """
         factory, _ = _make_oracle_exec_factory(
-            candidates=[
-                _make_candidate(supports_exhaustive=True, ran_exhaustive=True)
-            ]
+            candidates=[_make_candidate(supports_exhaustive=True, ran_exhaustive=True)]
         )
         oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
 
@@ -2171,7 +2169,7 @@ class TestOracleTunedPlanValidation:
         assert r.oracle_delta is None
 
     def test_unchecked_correctness_does_not_suppress_the_comparison(self):
-        """"Not checked" is not "failed".
+        """ "Not checked" is not "failed".
 
         A plain run records tolerance_match=None on the row. Treating that as
         a failure would suppress every speedup when --validate is absent.
@@ -2206,9 +2204,7 @@ class TestOracleTunedPlanValidation:
         """
         factory, _ = _make_oracle_exec_factory()
         # First call is the OOTB check, second is the tuned check.
-        r = self._run(
-            factory, [self._verdict(True), self._verdict(False)]
-        ).results[0]
+        r = self._run(factory, [self._verdict(True), self._verdict(False)]).results[0]
 
         assert r.correctness.passed is True
         assert r.oracle.correctness.passed is False
@@ -2360,6 +2356,8 @@ class TestOracleExhaustiveEnvGuard:
             autotune_side_effect=ExecutionError("no candidate succeeded")
         )
         result = self._run(factory, "exhaustive", monkeypatch)
-        assert result.results[0].oracle_error == "ExecutionError: no candidate succeeded"
+        assert (
+            result.results[0].oracle_error == "ExecutionError: no candidate succeeded"
+        )
         assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
         assert "HIPDNN_DISABLE_CACHE" not in os.environ

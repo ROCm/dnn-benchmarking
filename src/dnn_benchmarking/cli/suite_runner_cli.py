@@ -90,8 +90,7 @@ def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
         not in _TRUTHY_ENV
     )
     all_cache_enabled = (
-        os.environ.get("HIPDNN_DISABLE_CACHE", "").strip().lower()
-        not in _TRUTHY_ENV
+        os.environ.get("HIPDNN_DISABLE_CACHE", "").strip().lower() not in _TRUTHY_ENV
     )
     if exact_cache_enabled or all_cache_enabled:
         cache_root = os.environ.get("HIPDNN_CACHE_DIR") or "<default>"

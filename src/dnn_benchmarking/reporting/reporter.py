@@ -145,9 +145,7 @@ class Reporter:
         """
         self._print(f"WARNING: {message}")
 
-    def print_oracle_summary(
-        self, speedups: List[float], no_search_rows: int
-    ) -> None:
+    def print_oracle_summary(self, speedups: List[float], no_search_rows: int) -> None:
         """Print the suite-wide oracle comparison line.
 
         Args:
