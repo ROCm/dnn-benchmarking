@@ -661,7 +661,8 @@ class TestOracleSerialization:
         assert "engine_id" not in d["oracle"]
         assert "engine_name" not in d["oracle"]
         assert d["oracle"]["knob_settings"] == []
-        assert d["oracle"]["benchmarking_forced"] is False
+        assert d["oracle"]["exhaustive_requested"] is False
+        assert d["oracle"]["exhaustive_ran"] is False
         assert d["oracle"]["compiled_plans_benchmarked"] == 4
         assert d["oracle"]["compiled_plans_total"] == 4
         assert d["oracle"]["compiled_plans_failed"] == 0

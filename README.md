@@ -279,26 +279,47 @@ even when the sweep had a single candidate and changed nothing. Both
 operands of `oracle_speedup` therefore share the sweep's warmup history,
 and the row's OOTB columns stay the untouched out-of-the-box number.
 
-The two modes search at different levels, and the JSON names that difference
-rather than blurring it. `oracle.compiled_plans_benchmarked` counts *compiled
-plans*, never provider-internal kernel variants; a provider that samples
-variants inside a single plan still reports `1`. `oracle.benchmarking_forced`
-records whether `exhaustive` requested provider-level sampling. hipDNN exposes
-no count of those internal variants, so none is reported.
-`oracle.knob_settings: []` means "no explicit plan knob settings", i.e. engine
-defaults; it does not mean no variants were explored.
+`exhaustive` uses hipDNN's `TuneMode.EXHAUSTIVE`, which primes only engines
+advertising the `global.benchmarking` knob -- today the generic kernel ingestor
+and the MIOpen provider. Other engines, hipBLASLt among them, ignore the
+request and are tuned at plan level only. hipDNN discards the primed plan
+before timing the plan it keeps, so the reported timing measures the kernel and
+not the sampling sweep.
+
+Because a request is not a search, the JSON separates the three states:
+
+| Field | Meaning |
+|---|---|
+| `exhaustive_requested` | the run asked for it |
+| `exhaustive_supported` | the engine advertises the knob |
+| `exhaustive_ran` | hipDNN confirms the provider sampled its variants |
+| `exhaustive_not_run_reason` | why a requested pass did not run |
+
+`oracle.compiled_plans_benchmarked` counts *compiled plans*, never
+provider-internal kernel variants; a provider that samples variants inside a
+single plan still reports `1`. hipDNN exposes no count of those internal
+variants, so none is reported. `oracle.knob_settings: []` means "no explicit
+plan knob settings", i.e. engine defaults; it does not mean no variants were
+explored.
 
 `oracle.tuning_explored` is the derived summary: false when exactly one plan
-was compiled and provider benchmarking was not forced. Such a pass re-measured
-the heuristic configuration, so any ratio is run-to-run noise. The table then
+was compiled and no provider-level search actually ran. Only `exhaustive_ran`
+counts -- a request the provider ignored does not. Such a pass re-measured the
+heuristic configuration, so any ratio is run-to-run noise. The table then
 prints `no-search` in place of `oracle_speedup`, and the suite footer excludes
 the row from its geometric mean instead of averaging noise into a result.
 
 When `--validate` is set the tuned plan is validated too, after its timed loop,
 and the verdict is recorded at `oracle.correctness`. The row's own
-`correctness` remains the OOTB verdict; the two are independent. A tuned plan
-that fails validation publishes **no** `oracle_delta`, and the table prints
-`invalid` in place of `oracle_speedup`. A wrong answer never carries a speedup.
+`correctness` remains the OOTB verdict; the two are independent.
+
+A comparison needs two trustworthy operands, so `oracle_delta` is withheld when
+**either** side explicitly fails validation: a wrong tuned plan must not
+advertise a gain, and a wrong baseline cannot measure one. The table prints
+`invalid` in place of `oracle_speedup`. Both verdicts and both timings are
+still recorded; only the ratio is refused. A verdict of "not checked", which is
+what a run without `--validate` records, is not a failure and suppresses
+nothing.
 
 The table also prints `warm_baseline_kernel_mean_ms`, the figure
 `oracle_speedup` is actually computed from, so the ratio can be checked against

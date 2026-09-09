@@ -455,10 +455,16 @@ class Reporter:
                     if pe.oracle is not None
                     else "n/a"
                 )
-                oracle_correctness = pe.oracle.correctness if pe.oracle else None
-                if oracle_correctness is not None and not oracle_correctness.passed:
-                    # The tuned plan produced a wrong answer; a speedup here
-                    # would advertise a gain the result does not earn.
+                # Either operand failing makes the ratio meaningless: a wrong
+                # tuned plan has not earned a gain, and a wrong baseline cannot
+                # measure one.
+                if any(
+                    verdict is not None and verdict.explicitly_failed
+                    for verdict in (
+                        pe.correctness,
+                        pe.oracle.correctness if pe.oracle else None,
+                    )
+                ):
                     row.append("invalid")
                 elif pe.oracle is not None and not pe.oracle.tuning_explored:
                     # One fixed configuration was re-measured. Printing a ratio
@@ -614,16 +620,27 @@ class Reporter:
             f"successfully ({o.compiled_plans_total} total, "
             f"{o.compiled_plans_failed} failed)"
         )
-        if o.benchmarking_forced:
-            self._print(
-                "  Benchmarking:  forced (providers sampled kernel variants; "
-                "hipDNN exposes no count of them)"
-            )
+        if o.exhaustive_requested:
+            if o.exhaustive_ran:
+                self._print(
+                    "  Exhaustive:    ran (provider sampled its kernel variants; "
+                    "hipDNN exposes no count of them)"
+                )
+            else:
+                reason = o.exhaustive_not_run_reason or (
+                    "engine does not advertise the global.benchmarking knob"
+                    if not o.exhaustive_supported
+                    else "hipDNN reported no priming"
+                )
+                self._print(
+                    f"  Exhaustive:    requested but NOT run - {reason}; "
+                    "this engine was tuned at plan level only"
+                )
         if not o.tuning_explored:
             self._print(
-                "  Tuning:        unavailable - one compiled plan and no forced "
-                "provider benchmarking, so this pass re-measured the heuristic "
-                "configuration; any delta below is run-to-run noise"
+                "  Tuning:        unavailable - one compiled plan and no "
+                "provider-level search actually ran, so this pass re-measured "
+                "the heuristic configuration; any delta below is run-to-run noise"
             )
         if o.correctness is not None:
             if o.correctness.passed:

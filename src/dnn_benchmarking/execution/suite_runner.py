@@ -1000,22 +1000,21 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
-# Provider-side kernel benchmarking is a process-global environment switch,
-# not a per-graph API argument, so the oracle pass sets it around the work it
-# owns and restores it afterwards. HIPDNN_DISABLE_CACHE rides along: a
-# forced-benchmarking run otherwise persists its winner to hipDNN's on-disk
-# caches and silently changes the OOTB baseline of later runs.
+# hipDNN's TuneMode.EXHAUSTIVE activates provider benchmarking itself, and only
+# for engines advertising the knob, so this guard no longer forces
+# HIPDNN_FORCE_BENCHMARKING. What remains is cache hygiene: an exhaustive pass
+# otherwise persists its winner to hipDNN's on-disk caches and silently changes
+# the OOTB baseline of later runs. MIOpen's perf-db is outside this switch.
 # ponytail: process-global guard, safe only while the suite loop is
 # single-threaded; concurrent graph execution would need a subprocess boundary.
-_FORCED_BENCHMARKING_ENV = {
-    "HIPDNN_FORCE_BENCHMARKING": "1",
+_EXHAUSTIVE_CACHE_ENV = {
     "HIPDNN_DISABLE_CACHE": "1",
 }
 
 
 @contextmanager
-def _forced_benchmarking_env(enabled: bool):
-    """Set the provider benchmarking overrides for the enclosed block.
+def _exhaustive_cache_env(enabled: bool):
+    """Keep an exhaustive pass from persisting its winner to disk.
 
     A no-op when ``enabled`` is False. Restores every touched variable to
     its prior state on exit, including deleting one that was unset.
@@ -1023,8 +1022,8 @@ def _forced_benchmarking_env(enabled: bool):
     if not enabled:
         yield
         return
-    previous = {name: os.environ.get(name) for name in _FORCED_BENCHMARKING_ENV}
-    os.environ.update(_FORCED_BENCHMARKING_ENV)
+    previous = {name: os.environ.get(name) for name in _EXHAUSTIVE_CACHE_ENV}
+    os.environ.update(_EXHAUSTIVE_CACHE_ENV)
     try:
         yield
     finally:
@@ -1084,7 +1083,7 @@ def _run_oracle_pass(
             asked for no validation. None skips the tuned-plan check.
     """
     try:
-        with _forced_benchmarking_env(config.oracle_exhaustive):
+        with _exhaustive_cache_env(config.oracle_exhaustive):
             bench_config = BenchmarkConfig(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
@@ -1105,7 +1104,9 @@ def _run_oracle_pass(
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
-            candidates = executor.autotune(handle, variant_pack, engine_id)
+            candidates = executor.autotune(
+                handle, variant_pack, engine_id, exhaustive=config.oracle_exhaustive
+            )
             eligible_candidates = [
                 candidate
                 for candidate in candidates
@@ -1164,7 +1165,14 @@ def _run_oracle_pass(
                     if baseline_result.has_kernel_timings
                     else None
                 ),
-                benchmarking_forced=config.oracle_exhaustive,
+                exhaustive_requested=config.oracle_exhaustive,
+                exhaustive_supported=bool(
+                    getattr(winner, "supports_exhaustive", False)
+                ),
+                exhaustive_ran=bool(getattr(winner, "ran_exhaustive", False)),
+                exhaustive_not_run_reason=(
+                    getattr(winner, "exhaustive_not_run_reason", None) or None
+                ),
             )
 
             # Validate the tuned plan the same way the OOTB pass is validated,
@@ -1184,14 +1192,25 @@ def _run_oracle_pass(
                 )
 
             result.oracle = oracle
-            if oracle.correctness is not None and not oracle.correctness.passed:
-                # A wrong answer must not publish a speedup. Keep the timings,
-                # which are still evidence, but refuse the comparison.
+            # Both operands must be trustworthy. A wrong tuned plan must not
+            # advertise a gain, and a wrong baseline cannot measure one: a
+            # broken OOTB run is not a legitimate comparand either.
+            invalid = [
+                side
+                for side, verdict in (
+                    ("baseline", result.correctness),
+                    ("tuned plan", oracle.correctness),
+                )
+                if verdict is not None and verdict.explicitly_failed
+            ]
+            if invalid:
+                # Keep the timings, which are still evidence, and both
+                # verdicts, which stay separate. Refuse only the comparison.
                 result.oracle_delta = None
                 warn_once(
                     "oracle_correctness",
-                    f"oracle plan for {graph_name} engine {engine_id} failed "
-                    f"validation; speedup suppressed",
+                    f"oracle comparison for {graph_name} engine {engine_id} "
+                    f"suppressed: {' and '.join(invalid)} failed validation",
                 )
             else:
                 result.oracle_delta = build_oracle_delta(oracle)

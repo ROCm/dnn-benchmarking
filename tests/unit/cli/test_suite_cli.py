@@ -1592,13 +1592,14 @@ class TestOracleStartupWarnings:
         monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         assert self._warn(warmup_iters=1) == ""
 
-    def test_exhaustive_warning_mentions_force_benchmarking(
+    def test_exhaustive_warning_mentions_partial_provider_support(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
         monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         warning = self._warn(oracle_mode="exhaustive")
-        assert "HIPDNN_FORCE_BENCHMARKING=1" in warning
+        assert "EXHAUSTIVE tune mode" in warning
+        assert "global.benchmarking knob" in warning
 
     def test_plan_warning_omits_force_benchmarking(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1606,4 +1607,4 @@ class TestOracleStartupWarnings:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
         monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         warning = self._warn(oracle_mode="plan")
-        assert "HIPDNN_FORCE_BENCHMARKING=1" not in warning
+        assert "EXHAUSTIVE tune mode" not in warning

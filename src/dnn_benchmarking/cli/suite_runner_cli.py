@@ -121,9 +121,11 @@ def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
         )
     if config.oracle_exhaustive:
         reporter.print_warning(
-            "--oracle-mode exhaustive: the tuned pass runs with "
-            "HIPDNN_FORCE_BENCHMARKING=1, so each candidate samples its "
-            "kernel variants. Expect the sweep to take candidates x variants "
+            "--oracle-mode exhaustive: the tuned pass uses hipDNN's "
+            "EXHAUSTIVE tune mode, which primes only engines advertising the "
+            "global.benchmarking knob (today the kernel ingestor and MIOpen). "
+            "Other engines silently fall back to plan-level tuning and are "
+            "reported as such. Expect the sweep to take candidates x variants "
             "times longer. hipDNN's own on-disk caches are disabled for that "
             "pass so it cannot persist a winner, but MIOpen's perf-db is "
             "outside that switch and persists under DNN_BENCH_WORKSPACE; run "

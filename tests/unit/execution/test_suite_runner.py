@@ -1796,6 +1796,12 @@ def _make_candidate(**overrides):
         "min_time_ms": 0.2,
         "succeeded": True,
         "knob_settings": [],
+        # hipDNN reports capability and whether priming actually ran. The
+        # default models an engine that does not implement the knob, which is
+        # every provider except the ingestor and MIOpen.
+        "supports_exhaustive": False,
+        "ran_exhaustive": False,
+        "exhaustive_not_run_reason": "",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -1959,10 +1965,11 @@ class TestOraclePass:
         # discovery + OOTB only.
         assert len(instances) == 2
 
-    def test_plan_mode_leaves_benchmarking_forced_false(self):
+    def test_plan_mode_records_no_exhaustive_request(self):
         factory, _ = _make_oracle_exec_factory()
-        result = self._run(factory, oracle_mode="plan")
-        assert result.results[0].oracle.benchmarking_forced is False
+        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
+        assert oracle.exhaustive_requested is False
+        assert oracle.exhaustive_ran is False
 
     def test_winner_is_the_rank_zero_plan_when_several_plans_compete(self):
         """A real multi-plan sweep records the rank-0 winner and true counts.
@@ -2002,26 +2009,75 @@ class TestOraclePass:
         assert oracle.tuning_explored is True
 
     def test_single_plan_plan_mode_reports_no_tuning_search(self):
-        """One plan and no forced benchmarking searched nothing."""
+        """One plan and no provider-level search searched nothing."""
         factory, _ = _make_oracle_exec_factory(candidates=[_make_candidate()])
         oracle = self._run(factory, oracle_mode="plan").results[0].oracle
 
         assert oracle.compiled_plans_total == 1
-        assert oracle.benchmarking_forced is False
+        assert oracle.exhaustive_requested is False
         assert oracle.tuning_explored is False
 
-    def test_single_plan_exhaustive_mode_counts_as_a_search(self):
-        """Provider-level variant sampling is a search the plan count cannot see.
+    def test_exhaustive_that_the_provider_ran_counts_as_a_search(self):
+        """Provider-level sampling is a search the plan count cannot see.
 
-        Tested separately from the multi-plan case: the two levels are distinct,
-        and neither requires a measured speedup above 1.0x.
+        Tested separately from the multi-plan case: the two levels are
+        distinct, and neither requires a measured speedup above 1.0x.
         """
-        factory, _ = _make_oracle_exec_factory(candidates=[_make_candidate()])
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[
+                _make_candidate(supports_exhaustive=True, ran_exhaustive=True)
+            ]
+        )
         oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
 
         assert oracle.compiled_plans_total == 1
-        assert oracle.benchmarking_forced is True
+        assert oracle.exhaustive_requested is True
+        assert oracle.exhaustive_supported is True
+        assert oracle.exhaustive_ran is True
         assert oracle.tuning_explored is True
+
+    def test_exhaustive_the_provider_ignored_is_not_a_search(self):
+        """A request is not a search.
+
+        hipBLASLt does not implement ``global.benchmarking``: it requests one
+        heuristic solution and ignores the override. Such a row re-measured a
+        single fixed configuration and must stay no-search, outside the
+        aggregate, even though exhaustive mode was asked for.
+        """
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[
+                _make_candidate(
+                    supports_exhaustive=False,
+                    ran_exhaustive=False,
+                    exhaustive_not_run_reason="engine does not support priming",
+                )
+            ]
+        )
+        oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
+
+        assert oracle.compiled_plans_total == 1
+        assert oracle.exhaustive_requested is True
+        assert oracle.exhaustive_supported is False
+        assert oracle.exhaustive_ran is False
+        assert oracle.exhaustive_not_run_reason == "engine does not support priming"
+        assert oracle.tuning_explored is False
+
+    def test_exhaustive_supported_but_not_run_is_not_a_search(self):
+        """Capability alone is not evidence either; only ``ran`` counts."""
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[
+                _make_candidate(
+                    supports_exhaustive=True,
+                    ran_exhaustive=False,
+                    exhaustive_not_run_reason="priming failed",
+                )
+            ]
+        )
+        oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
+
+        assert oracle.exhaustive_supported is True
+        assert oracle.exhaustive_ran is False
+        assert oracle.tuning_explored is False
 
 
 class TestOracleTunedPlanValidation:
@@ -2097,6 +2153,42 @@ class TestOracleTunedPlanValidation:
         assert r.oracle.gpu_kernel_stats is not None
         assert r.oracle_delta is None
 
+    def test_failing_baseline_publishes_no_speedup(self):
+        """Inverse fault injection: a wrong baseline cannot measure a gain.
+
+        The tuned plan is correct here and the baseline is not. Comparing
+        against a broken comparand produced a clean 2.00x even though one
+        operand was garbage, so eligibility must consider both sides.
+        """
+        factory, _ = _make_oracle_exec_factory()
+        # OOTB check first, tuned check second.
+        r = self._run(factory, [self._verdict(False), self._verdict(True)]).results[0]
+
+        assert r.correctness.passed is False
+        assert r.oracle.correctness.passed is True
+        # Both verdicts survive separately; only the comparison is refused.
+        assert r.oracle.gpu_kernel_stats is not None
+        assert r.oracle_delta is None
+
+    def test_unchecked_correctness_does_not_suppress_the_comparison(self):
+        """"Not checked" is not "failed".
+
+        A plain run records tolerance_match=None on the row. Treating that as
+        a failure would suppress every speedup when --validate is absent.
+        """
+        factory, _ = _make_oracle_exec_factory()
+        unchecked = CorrectnessResult(
+            execution_success=True,
+            tolerance_match=None,
+            rtol=1e-5,
+            atol=1e-5,
+            error_message="No reference provider requested",
+        )
+        r = self._run(factory, [unchecked, self._verdict(True)]).results[0]
+
+        assert r.oracle_delta is not None
+        assert r.oracle_delta.speedup == 2.0
+
     def test_passing_tuned_plan_still_reports_a_speedup(self):
         factory, _ = _make_oracle_exec_factory()
         r = self._run(factory, self._verdict(True)).results[0]
@@ -2143,7 +2235,11 @@ class TestOracleTunedPlanValidation:
 
 
 class TestOracleExhaustiveEnvGuard:
-    """--oracle-mode exhaustive scopes HIPDNN_FORCE_BENCHMARKING/DISABLE_CACHE."""
+    """--oracle-mode exhaustive scopes HIPDNN_DISABLE_CACHE and asks hipDNN.
+
+    Benchmarking activation belongs to hipDNN's EXHAUSTIVE tune mode, not to a
+    process-global env override, so the guard now covers cache hygiene only.
+    """
 
     @pytest.fixture(autouse=True)
     def _clean_env(self, monkeypatch: pytest.MonkeyPatch):
@@ -2176,23 +2272,40 @@ class TestOracleExhaustiveEnvGuard:
                 handle=MagicMock(),
             )
 
-    def test_exhaustive_sets_env_before_plan_build(
+    def test_exhaustive_requests_exhaustive_tuning_from_hipdnn(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """The mode reaches Executor.autotune rather than an env variable."""
+        factory, instances = _make_oracle_exec_factory()
+        self._run(factory, "exhaustive", monkeypatch)
+
+        _, kwargs = instances[2].autotune.call_args
+        assert kwargs["exhaustive"] is True
+
+    def test_plan_mode_does_not_request_exhaustive_tuning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        factory, instances = _make_oracle_exec_factory()
+        self._run(factory, "plan", monkeypatch)
+
+        _, kwargs = instances[2].autotune.call_args
+        assert kwargs["exhaustive"] is False
+
+    def test_exhaustive_disables_the_cache_before_plan_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exhaustive winner must not persist into a later OOTB baseline."""
         seen = {}
         factory, instances = _make_oracle_exec_factory()
-        original_side_effect = None
 
         def make_instance_with_capture(*args, **kwargs):
             m = factory(*args, **kwargs)
             if len(instances) == 3:
-                seen["force"] = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
                 seen["disable_cache"] = os.environ.get("HIPDNN_DISABLE_CACHE")
             return m
 
         self._run(make_instance_with_capture, "exhaustive", monkeypatch)
 
-        assert seen["force"] == "1"
         assert seen["disable_cache"] == "1"
 
     def test_exhaustive_restores_env_after_run(
@@ -2206,17 +2319,24 @@ class TestOracleExhaustiveEnvGuard:
     def test_exhaustive_restores_preexisting_value_not_delete(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "0")
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
         factory, _ = _make_oracle_exec_factory()
         self._run(factory, "exhaustive", monkeypatch)
-        assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "0"
+        assert os.environ["HIPDNN_DISABLE_CACHE"] == "0"
 
-    def test_exhaustive_marks_benchmarking_forced(
+    def test_exhaustive_marks_the_request(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        factory, _ = _make_oracle_exec_factory()
+        # One compiled plan, so only a provider-level search could make this
+        # row a real comparison.
+        factory, _ = _make_oracle_exec_factory(candidates=[_make_candidate()])
         result = self._run(factory, "exhaustive", monkeypatch)
-        assert result.results[0].oracle.benchmarking_forced is True
+        oracle = result.results[0].oracle
+        assert oracle.exhaustive_requested is True
+        # The stub engine does not advertise the knob, so the request alone
+        # must not be mistaken for a search.
+        assert oracle.exhaustive_ran is False
+        assert oracle.tuning_explored is False
 
     def test_plan_mode_never_sets_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen = {}
@@ -2225,15 +2345,13 @@ class TestOracleExhaustiveEnvGuard:
         def make_instance_with_capture(*args, **kwargs):
             m = factory(*args, **kwargs)
             if len(instances) == 3:
-                seen["force"] = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
                 seen["disable_cache"] = os.environ.get("HIPDNN_DISABLE_CACHE")
             return m
 
         result = self._run(make_instance_with_capture, "plan", monkeypatch)
 
-        assert seen["force"] is None
         assert seen["disable_cache"] is None
-        assert result.results[0].oracle.benchmarking_forced is False
+        assert result.results[0].oracle.exhaustive_requested is False
 
     def test_exception_inside_guard_still_restores_env(
         self, monkeypatch: pytest.MonkeyPatch
