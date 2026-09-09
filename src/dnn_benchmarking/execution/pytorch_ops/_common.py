@@ -70,11 +70,15 @@ def _node_section(node: Dict[str, Any], section: str) -> Dict[str, Any]:
 
 
 def _node_param(node: Dict[str, Any], key: str, default: Any = None) -> Any:
+    # A key present with a null value means "not specified": some graph
+    # producers emit every optional attribute as an explicit null. Treat it as
+    # absent so the default applies, but keep falsy-yet-valid values (0, False).
     for section_name in ("parameters", "attributes", "inputs", "outputs"):
-        section = _node_section(node, section_name)
-        if key in section:
-            return section[key]
-    return node.get(key, default)
+        value = _node_section(node, section_name).get(key)
+        if value is not None:
+            return value
+    value = node.get(key)
+    return default if value is None else value
 
 
 def _node_uid(
