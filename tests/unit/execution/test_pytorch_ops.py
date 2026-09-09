@@ -1944,3 +1944,86 @@ class TestStorePlanned:
         _store_planned(tensors, 1, value, None)
         assert tensors[1] is value
         assert tuple(tensors[1].shape) == (6,)
+
+
+class TestNodeParamNullAttributes:
+    """Producers that emit optional attributes as explicit nulls."""
+
+    def test_null_attribute_takes_the_default(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops._common import _node_param
+
+        node = {"inputs": {"relu_upper_clip": None}}
+        assert _node_param(node, "relu_upper_clip", float("inf")) == float("inf")
+
+    def test_falsy_but_valid_values_are_preserved(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops._common import _node_param
+
+        node = {"inputs": {"relu_upper_clip": 0.0, "use_padding_mask": False}}
+        assert _node_param(node, "relu_upper_clip", float("inf")) == 0.0
+        assert _node_param(node, "use_padding_mask", True) is False
+
+    def test_top_level_null_takes_the_default(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops._common import _node_param
+
+        assert _node_param({"mode": None}, "mode", "NOT_SET") == "NOT_SET"
+
+    def test_pointwise_add_with_null_clips_runs(self) -> None:
+        """A null clip triple must not kill a node that does no clipping."""
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "PointwiseAttributes",
+                    "inputs": {
+                        "operation": "add",
+                        "in_0_tensor_uid": 1,
+                        "in_1_tensor_uid": 2,
+                        "relu_lower_clip": None,
+                        "relu_upper_clip": None,
+                        "relu_lower_clip_slope": None,
+                    },
+                    "outputs": {"out_0_tensor_uid": 3},
+                }
+            ]
+        }
+        tensors = {1: torch.ones(4), 2: torch.full((4,), 2.0)}
+        pytorch_ops.execute_graph(graph_json, tensors)
+        torch.testing.assert_close(tensors[3], torch.full((4,), 3.0))
+
+    def test_pointwise_relu_with_null_clips_is_plain_relu(self) -> None:
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "PointwiseAttributes",
+                    "inputs": {
+                        "operation": "relu_fwd",
+                        "in_0_tensor_uid": 1,
+                        "relu_lower_clip": None,
+                        "relu_upper_clip": None,
+                    },
+                    "outputs": {"out_0_tensor_uid": 2},
+                }
+            ]
+        }
+        tensors = {1: torch.tensor([-1.0, 0.5, 7.0])}
+        pytorch_ops.execute_graph(graph_json, tensors)
+        torch.testing.assert_close(tensors[2], torch.tensor([0.0, 0.5, 7.0]))
+
+    def test_pointwise_relu_zero_upper_clip_still_clamps(self) -> None:
+        """0.0 is a legitimate bound, not a stand-in for "unset"."""
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "PointwiseAttributes",
+                    "inputs": {
+                        "operation": "relu_fwd",
+                        "in_0_tensor_uid": 1,
+                        "relu_lower_clip": 0.0,
+                        "relu_upper_clip": 0.0,
+                    },
+                    "outputs": {"out_0_tensor_uid": 2},
+                }
+            ]
+        }
+        tensors = {1: torch.tensor([-1.0, 0.5, 7.0])}
+        pytorch_ops.execute_graph(graph_json, tensors)
+        torch.testing.assert_close(tensors[2], torch.zeros(3))
