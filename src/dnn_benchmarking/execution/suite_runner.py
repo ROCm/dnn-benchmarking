@@ -10,8 +10,10 @@ and E2E wall-clock time. Performs correctness validation by comparing GPU
 output against a reference provider via ArrayComparator.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -998,6 +1000,41 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
+# Provider-side kernel benchmarking is a process-global environment switch,
+# not a per-graph API argument, so the oracle pass sets it around the work it
+# owns and restores it afterwards. HIPDNN_DISABLE_CACHE rides along: a
+# forced-benchmarking run otherwise persists its winner to hipDNN's on-disk
+# caches and silently changes the OOTB baseline of later runs.
+# ponytail: process-global guard, safe only while the suite loop is
+# single-threaded; concurrent graph execution would need a subprocess boundary.
+_FORCED_BENCHMARKING_ENV = {
+    "HIPDNN_FORCE_BENCHMARKING": "1",
+    "HIPDNN_DISABLE_CACHE": "1",
+}
+
+
+@contextmanager
+def _forced_benchmarking_env(enabled: bool):
+    """Set the provider benchmarking overrides for the enclosed block.
+
+    A no-op when ``enabled`` is False. Restores every touched variable to
+    its prior state on exit, including deleting one that was unset.
+    """
+    if not enabled:
+        yield
+        return
+    previous = {name: os.environ.get(name) for name in _FORCED_BENCHMARKING_ENV}
+    os.environ.update(_FORCED_BENCHMARKING_ENV)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _run_oracle_pass(
     *,
     result: ProviderEngineResult,
@@ -1009,6 +1046,9 @@ def _run_oracle_pass(
     engine_id: int,
     bm: Any,
     ootb_executor: Any,
+    tensor_infos: list,
+    graph_json: Dict[str, Any],
+    reference_outputs: Optional[Dict[int, Any]],
 ) -> None:
     """Tune ``engine_id`` on the same graph and record the post-tuning timing.
 
@@ -1019,6 +1059,12 @@ def _run_oracle_pass(
     Mutates ``result.oracle``/``result.oracle_delta`` on success and
     ``result.oracle_error`` on any failure. Never raises: a tuning failure
     must not fail the OOTB row.
+
+    When a reference is available the tuned plan is validated the same way
+    the OOTB pass is, after its timed loop. A tuned plan that fails
+    validation publishes no ``oracle_delta``: a wrong result must not carry
+    an apparently valid speedup. The row's own OOTB correctness is separate
+    and is never overwritten here.
 
     Args:
         result: The completed OOTB row to attach the oracle payload to.
@@ -1032,78 +1078,130 @@ def _run_oracle_pass(
             identical input data.
         ootb_executor: The prepared OOTB executor, re-timed after the sweep
             so the comparison operands share one warm state.
+        tensor_infos: Tensor metadata used to read back tuned outputs.
+        graph_json: Parsed graph, for per-output tolerance selection.
+        reference_outputs: Cached reference outputs, or None when the user
+            asked for no validation. None skips the tuned-plan check.
     """
     try:
-        bench_config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=config.warmup_iters,
-            benchmark_iters=config.benchmark_iters,
-            engine_id=engine_id,
-        )
-        executor = Executor(
-            graph_json_str=graph_json_str,
-            config=bench_config,
-        )
-        executor.prepare(handle, engine_id=engine_id, for_autotune=True)
+        with _forced_benchmarking_env(config.oracle_exhaustive):
+            bench_config = BenchmarkConfig(
+                graph_path=graph_path,
+                warmup_iters=config.warmup_iters,
+                benchmark_iters=config.benchmark_iters,
+                engine_id=engine_id,
+            )
+            executor = Executor(
+                graph_json_str=graph_json_str,
+                config=bench_config,
+            )
+            executor.prepare(handle, engine_id=engine_id, for_autotune=True)
 
-        # The OOTB correctness re-execution leaves outputs populated; zeroing
-        # them restores the OOTB starting state. The inputs need no reload:
-        # they are disjoint from the output set, and the OOTB pass already
-        # relies on them surviving its own warmup, timed loop, and correctness
-        # re-execution without one.
-        bm.zero_outputs()
-        variant_pack = bm.create_variant_pack()
+            # The OOTB correctness re-execution leaves outputs populated; zeroing
+            # them restores the OOTB starting state. The inputs need no reload:
+            # they are disjoint from the output set, and the OOTB pass already
+            # relies on them surviving its own warmup, timed loop, and correctness
+            # re-execution without one.
+            bm.zero_outputs()
+            variant_pack = bm.create_variant_pack()
 
-        candidates = executor.autotune(handle, variant_pack, engine_id)
-        winner = candidates[0]
+            candidates = executor.autotune(handle, variant_pack, engine_id)
+            eligible_candidates = [
+                candidate
+                for candidate in candidates
+                if not getattr(candidate, "excluded_by_caller", False)
+            ]
+            successful_candidates = [
+                candidate for candidate in eligible_candidates if candidate.succeeded
+            ]
+            winner = successful_candidates[0]
 
-        # Warmth parity. The sweep just executed this engine's plans up to
-        # a hundred times, so timing the tuned plan now measures a hotter
-        # device than the OOTB pass ever saw. Re-time the heuristic plan
-        # here, between the sweep and the tuned run, so both operands carry
-        # the same warmup history and the ratio isolates the plan change.
-        # Without this the tool reports large speedups on graphs where the
-        # sweep had exactly one candidate and changed nothing at all.
-        bm.zero_outputs()
-        ootb_executor.warmup(handle, variant_pack)
-        baseline_result = ootb_executor.benchmark(
-            handle, variant_pack, graph_name=graph_name
-        )
+            # Warmth parity. The sweep just executed this engine's plans up to
+            # a hundred times, so timing the tuned plan now measures a hotter
+            # device than the OOTB pass ever saw. Re-time the heuristic plan
+            # here, between the sweep and the tuned run, so both operands carry
+            # the same warmup history and the ratio isolates the plan change.
+            # Without this the tool reports large speedups on graphs where the
+            # sweep had exactly one candidate and changed nothing at all.
+            bm.zero_outputs()
+            ootb_executor.warmup(handle, variant_pack)
+            baseline_result = ootb_executor.benchmark(
+                handle, variant_pack, graph_name=graph_name
+            )
 
-        bm.zero_outputs()
-        executor.warmup(handle, variant_pack)
-        bench_result = executor.benchmark(handle, variant_pack, graph_name=graph_name)
+            bm.zero_outputs()
+            executor.warmup(handle, variant_pack)
+            bench_result = executor.benchmark(
+                handle, variant_pack, graph_name=graph_name
+            )
 
-        oracle = OracleResult(
-            plan_name=executor.plan_name(handle) or "",
-            compiled_plan_index=int(winner.compiled_plan_index),
-            rank=int(winner.rank),
-            sweep_min_time_ms=float(winner.min_time_ms),
-            candidates_benchmarked=len(candidates),
-            knob_settings=[
-                {"knob_id": str(k.knob_id), "value": k.value}
-                for k in winner.knob_settings
-            ],
-            cpu_build_time_ms=executor.init_time_ms,
-            host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
-            gpu_kernel_stats=(
-                BenchmarkStats.from_timings(bench_result.kernel_timings)
-                if bench_result.has_kernel_timings
-                else None
-            ),
-            warm_baseline_host_stats=BenchmarkStats.from_timings(
-                baseline_result.host_timings
-            ),
-            warm_baseline_gpu_kernel_stats=(
-                BenchmarkStats.from_timings(baseline_result.kernel_timings)
-                if baseline_result.has_kernel_timings
-                else None
-            ),
-        )
-        result.oracle = oracle
-        result.oracle_delta = build_oracle_delta(oracle)
+            oracle = OracleResult(
+                plan_name=executor.plan_name(handle) or "",
+                compiled_plan_index=int(winner.compiled_plan_index),
+                rank=int(winner.rank),
+                sweep_min_time_ms=float(winner.min_time_ms),
+                compiled_plans_benchmarked=len(successful_candidates),
+                compiled_plans_total=len(eligible_candidates),
+                compiled_plans_failed=(
+                    len(eligible_candidates) - len(successful_candidates)
+                ),
+                knob_settings=[
+                    {"knob_id": str(k.knob_id), "value": k.value}
+                    for k in winner.knob_settings
+                ],
+                cpu_build_time_ms=executor.init_time_ms,
+                host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
+                gpu_kernel_stats=(
+                    BenchmarkStats.from_timings(bench_result.kernel_timings)
+                    if bench_result.has_kernel_timings
+                    else None
+                ),
+                warm_baseline_host_stats=BenchmarkStats.from_timings(
+                    baseline_result.host_timings
+                ),
+                warm_baseline_gpu_kernel_stats=(
+                    BenchmarkStats.from_timings(baseline_result.kernel_timings)
+                    if baseline_result.has_kernel_timings
+                    else None
+                ),
+                benchmarking_forced=config.oracle_exhaustive,
+            )
+
+            # Validate the tuned plan the same way the OOTB pass is validated,
+            # after its timed loop so the check never lands inside a
+            # measurement. The row's own `result.correctness` stays the OOTB
+            # verdict; this one belongs to the tuned plan.
+            if reference_outputs is not None:
+                bm.zero_outputs()
+                executor.execute_once(handle, variant_pack)
+                oracle.correctness = _check_correctness(
+                    bm,
+                    tensor_infos,
+                    graph_json,
+                    reference_outputs,
+                    config.validation.provider.value,
+                    config,
+                )
+
+            result.oracle = oracle
+            if oracle.correctness is not None and not oracle.correctness.passed:
+                # A wrong answer must not publish a speedup. Keep the timings,
+                # which are still evidence, but refuse the comparison.
+                result.oracle_delta = None
+                warn_once(
+                    "oracle_correctness",
+                    f"oracle plan for {graph_name} engine {engine_id} failed "
+                    f"validation; speedup suppressed",
+                )
+            else:
+                result.oracle_delta = build_oracle_delta(oracle)
     except Exception as e:
-        result.oracle_error = str(e)
+        error = f"{type(e).__name__}: {e}"
+        result.oracle_error = error
+        warn_once(
+            "oracle",
+            f"oracle tuning failed for {graph_name} engine {engine_id}: {error}",
+        )
 
 
 def run_single_provider_engine(
@@ -1229,7 +1327,7 @@ def run_single_provider_engine(
             # Reaching here means the OOTB timed pass succeeded (any
             # failure raised out of this try block already), so the row
             # is eligible for an oracle comparison.
-            if config.oracle:
+            if config.oracle_enabled:
                 _run_oracle_pass(
                     result=result,
                     graph_path=graph_path,
@@ -1240,6 +1338,9 @@ def run_single_provider_engine(
                     engine_id=engine_id,
                     bm=bm,
                     ootb_executor=executor,
+                    tensor_infos=tensor_infos,
+                    graph_json=graph_json,
+                    reference_outputs=reference_outputs,
                 )
 
         # BufferManager context has exited — I/O buffers are freed.

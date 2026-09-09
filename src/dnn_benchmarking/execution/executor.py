@@ -315,8 +315,10 @@ class Executor:
             engine_id: Engine the candidate plans are restricted to.
 
         Returns:
-            The successful AutotuneResult entries in rank order (rank 0 first),
-            as hipDNN already returns them. Failed candidates are dropped.
+            All AutotuneResult entries, with successful candidates first in
+            rank order and failed candidates after them. The winning plan is
+            the first successful entry. Failed candidates remain available so
+            callers can report partial sweep failures.
 
         Raises:
             ExecutionError: If the graph is not prepared, autotuning fails, or
@@ -334,11 +336,10 @@ class Executor:
 
         cfg = hipdnn.AutotuneConfig()
         cfg.engine_id_filter = [engine_id]
-        # The binding default is 1 warmup iteration, which leaves a provider's
-        # first-execute kernel sampling inside the window that ranks the
-        # candidates. Use the run's own warmup count so the winner is picked on
-        # steady-state timings. strategy stays RUN_UNTIL_STABLE.
-        cfg.warmup_iterations = self._config.warmup_iters
+        # A zero warmup would rank candidates on first-execute sampling.
+        # Keep at least one warmup iteration in the sweep; the caller's
+        # separate benchmark still honors ``--warmup 0``.
+        cfg.warmup_iterations = max(1, self._config.warmup_iters)
 
         try:
             # Omit workspace_size: passing it selects the plan-spec overload
@@ -350,7 +351,7 @@ class Executor:
             raise ExecutionError(f"Autotuning failed: {e}") from e
 
         # hipDNN returns succeeded candidates first, in ascending rank order,
-        # then the failed ones with rank -1, so no re-sort is needed.
+        # then failed candidates with rank -1, so no re-sort is needed.
         winners = [r for r in results if r.succeeded]
         if not winners:
             # Candidates the caller's own filters rejected are not
@@ -379,7 +380,7 @@ class Executor:
 
         # Refresh the recorded engine from the plan autotune just activated.
         self._record_selected_engine(None)
-        return winners
+        return results
 
     def plan_name(self, handle: Any) -> Optional[str]:
         """Name of the currently active execution plan, or None if unprepared.

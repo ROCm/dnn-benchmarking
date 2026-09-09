@@ -626,7 +626,9 @@ def _oracle(**overrides) -> OracleResult:
         compiled_plan_index=3,
         rank=0,
         sweep_min_time_ms=0.8,
-        candidates_benchmarked=4,
+        compiled_plans_benchmarked=4,
+        compiled_plans_total=4,
+        compiled_plans_failed=0,
         knob_settings=[],
     )
     kwargs.update(overrides)
@@ -659,8 +661,11 @@ class TestOracleSerialization:
         assert "engine_id" not in d["oracle"]
         assert "engine_name" not in d["oracle"]
         assert d["oracle"]["knob_settings"] == []
+        assert d["oracle"]["benchmarking_forced"] is False
+        assert d["oracle"]["compiled_plans_benchmarked"] == 4
+        assert d["oracle"]["compiled_plans_total"] == 4
+        assert d["oracle"]["compiled_plans_failed"] == 0
         assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
-        assert d["oracle"]["host_stats"] is None
         assert d["oracle_delta"]["basis"] == "gpu_kernel"
         assert d["oracle_delta"]["speedup"] == 2.0
         assert d["oracle"]["warm_baseline_gpu_kernel_stats"]["mean_ms"] == 2.0
@@ -745,6 +750,8 @@ class TestSuiteMetadataSelectionEnv:
         "HIPDNN_CACHE_DIR",
         "HIPDNN_DISABLE_CACHE",
         "HIPDNN_FORCE_BENCHMARKING",
+        "MIOPEN_USER_DB_PATH",
+        "MIOPEN_CUSTOM_CACHE_DIR",
     )
 
     def test_absent_without_oracle(self):

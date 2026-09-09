@@ -114,12 +114,24 @@ class OracleResult:
         sweep_min_time_ms: Winner's fastest sweep iteration. hipDNN ranks
             candidates on this value. Diagnostic only: the reported oracle
             timing is the post-tuning benchmark pass, not the sweep.
-        candidates_benchmarked: Number of candidates that benchmarked
-            successfully.
-        knob_settings: ``{"knob_id": str, "value": int|float|str}`` entries
-            for knobs the sweep set explicitly. Normally empty: the
-            compiled-plan candidate path records only explicitly-set knobs
-            and this flow sets none, so ``[]`` means "engine defaults".
+        compiled_plans_benchmarked: Number of compiled plan candidates that
+            benchmarked successfully. This counts *plans*, not provider-internal
+            kernel variants: a provider that samples variants inside a single
+            plan still reports 1 here. See ``benchmarking_forced``.
+        compiled_plans_total: Number of eligible compiled plan candidates
+            returned by the sweep, including candidates that failed.
+        compiled_plans_failed: Number of eligible compiled plan candidates that
+            failed to benchmark successfully.
+        knob_settings: ``{"knob_id": str, "value": int|float|str}`` entries for
+            plan knobs the sweep set explicitly. ``[]`` means "no explicit plan
+            knob settings", i.e. engine defaults. It does *not* mean the
+            provider explored no internal kernel variants; ``benchmarking_forced``
+            records that. hipDNN exposes no count of provider-internal
+            variants, so none is reported.
+        benchmarking_forced: True when the tuned pass ran with
+            ``HIPDNN_FORCE_BENCHMARKING=1``, so providers sampled their
+            kernel variants instead of using the heuristic pick. False for
+            an ``--oracle-mode plan`` run.
         cpu_build_time_ms: Build time of the autotune-capable graph. Not
             comparable to the row's own ``cpu_build_time_ms``: this build
             enumerates every engine's plans before barring all but one, so it
@@ -134,19 +146,43 @@ class OracleResult:
             both sides in one warm state, so the delta reflects the plan
             change instead of accumulated warmup.
         warm_baseline_host_stats: Host-side counterpart of the above.
+        tuning_explored: Derived. True when the pass actually had an
+            alternative configuration to choose from, i.e. more than one
+            compiled plan candidate, or provider-side variant sampling was
+            forced. When False the sweep re-measured a single fixed
+            configuration, so any reported delta is run-to-run noise, not a
+            tuning gain.
+        correctness: Validation verdict for the *tuned* plan, when a reference
+            was available. The row's own ``correctness`` is the OOTB verdict
+            and is separate. A tuned plan that fails validation publishes no
+            ``oracle_delta``.
     """
 
     plan_name: str
     compiled_plan_index: int
     rank: int
     sweep_min_time_ms: float
-    candidates_benchmarked: int
+    compiled_plans_benchmarked: int
+    compiled_plans_total: int
+    compiled_plans_failed: int
     knob_settings: List[Dict[str, Any]]
+    benchmarking_forced: bool = False
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
     warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
     warm_baseline_host_stats: Optional[BenchmarkStats] = None
+    correctness: Optional[CorrectnessResult] = None
+
+    @property
+    def tuning_explored(self) -> bool:
+        """True when tuning had an alternative configuration to evaluate.
+
+        False means one compiled plan and no forced provider benchmarking, so
+        the sweep re-measured the heuristic configuration and the delta must
+        not be presented as a tuning gain.
+        """
+        return self.compiled_plans_total > 1 or self.benchmarking_forced
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -155,8 +191,12 @@ class OracleResult:
             "compiled_plan_index": self.compiled_plan_index,
             "rank": self.rank,
             "sweep_min_time_ms": self.sweep_min_time_ms,
-            "candidates_benchmarked": self.candidates_benchmarked,
+            "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
+            "compiled_plans_total": self.compiled_plans_total,
+            "compiled_plans_failed": self.compiled_plans_failed,
+            "tuning_explored": self.tuning_explored,
             "knob_settings": list(self.knob_settings),
+            "benchmarking_forced": self.benchmarking_forced,
             "cpu_build_time_ms": self.cpu_build_time_ms,
             "gpu_kernel_stats": (
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
@@ -171,6 +211,9 @@ class OracleResult:
                 self.warm_baseline_host_stats.to_dict()
                 if self.warm_baseline_host_stats
                 else None
+            ),
+            "correctness": (
+                self.correctness.to_dict() if self.correctness else None
             ),
         }
 
@@ -263,7 +306,7 @@ class ProviderEngineResult:
             traces, perf, and rocprof-compute roofline. None when no
             opt-in profiling flag was supplied.
         oracle: Post-tuning result for this engine row. Set only when
-            ``--oracle`` was requested and tuning succeeded.
+            ``--oracle-mode`` was requested and tuning succeeded.
         oracle_delta: OOTB-vs-oracle comparison. None when either side
             lacks comparable statistics.
         oracle_error: Why tuning produced no result for this row.
@@ -585,10 +628,12 @@ class SuiteMetadata:
             suite end, via amdsmi. Reflects steady-state allocation, not
             per-kernel peak.
         vram_total_mb: Total VRAM on the GPU at suite end, via amdsmi.
-        hipdnn_selection_env: hipDNN cache/benchmarking environment
-            variables sampled at suite end, recorded only for ``--oracle``
-            runs. A ``None`` value means the variable was not set, which
-            is the load-bearing signal for cache-affected OOTB timings.
+        hipdnn_selection_env: hipDNN cache/benchmarking and MIOpen
+            perf-db path environment variables sampled at suite end,
+            recorded only for oracle runs (``--oracle-mode plan`` or
+            ``exhaustive``). A ``None`` value means the variable was not
+            set, which is the load-bearing signal for cache-affected OOTB
+            timings.
     """
 
     timestamp: str
@@ -733,6 +778,8 @@ class SuiteResult:
                     "HIPDNN_CACHE_DIR",
                     "HIPDNN_DISABLE_CACHE",
                     "HIPDNN_FORCE_BENCHMARKING",
+                    "MIOPEN_USER_DB_PATH",
+                    "MIOPEN_CUSTOM_CACHE_DIR",
                 )
             }
 

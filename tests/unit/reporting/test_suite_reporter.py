@@ -660,7 +660,9 @@ def _make_oracle(**overrides) -> OracleResult:
         compiled_plan_index=2,
         rank=0,
         sweep_min_time_ms=0.210,
-        candidates_benchmarked=5,
+        compiled_plans_benchmarked=5,
+        compiled_plans_total=5,
+        compiled_plans_failed=0,
         knob_settings=[],
         gpu_kernel_stats=BenchmarkStats(
             mean_ms=0.250,
@@ -733,13 +735,166 @@ class TestOracleReporting:
         assert "Oracle (auto-tuned):" in out
         # The engine is already in the row header; the block does not repeat it.
         assert "Engine:" not in out
-        assert "tuned_plan_7" in out
-        assert "compiled plan index 2, rank 0" in out
-        assert "engine defaults" in out
-        assert "5 benchmarked successfully" in out
+        assert "Compiled plans: 5 benchmarked successfully" in out
+        assert "5 total, 0 failed" in out
         assert "basis: gpu_kernel" in out
         assert "Warm baseline: 0.500 ms" in out
         assert "Tuned vs baseline:" in out
+
+    def test_verbose_renders_benchmarking_forced_line(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(benchmarking_forced=True)
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Benchmarking:  forced (providers sampled kernel variants" in out
+        # The provider does not expose a variant count, so none is invented.
+        assert "hipDNN exposes no count of them" in out
+
+    def test_verbose_omits_benchmarking_forced_line_by_default(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Benchmarking:" not in out
+
+    @staticmethod
+    def _verdict(passed: bool) -> CorrectnessResult:
+        return CorrectnessResult(
+            execution_success=True,
+            tolerance_match=passed,
+            rtol=1e-5,
+            atol=1e-5,
+            error_message=None if passed else "output mismatch",
+        )
+
+    def test_table_shows_the_baseline_the_speedup_is_computed_from(self) -> None:
+        """The ratio must be checkable against numbers on the same line.
+
+        OOTB kernel_mean_ms is not the comparand; without the warm baseline
+        column the printed 2.00x looks wrong against the visible figures.
+        """
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "warm_baseline_kernel_mean_ms" in out
+        # 0.500 baseline / 0.250 tuned = the printed 2.00x.
+        assert "0.500" in out
+        assert "0.250" in out
+        assert "2.00x" in out
+
+    def test_table_marks_a_tuned_plan_that_failed_validation(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(correctness=self._verdict(False))
+        pe.oracle_delta = None
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "invalid" in out
+        assert "2.00x" not in out
+
+    def test_table_keeps_the_speedup_when_the_tuned_plan_validates(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(correctness=self._verdict(True))
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "invalid" not in out
+
+    def test_verbose_explains_a_failed_tuned_validation(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(correctness=self._verdict(False))
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "tuned plan FAILED" in out
+        assert "output mismatch" in out
+        assert "no speedup is reported" in out
+
+    def test_table_marks_row_without_a_tuning_search(self) -> None:
+        """One compiled plan and no forced benchmarking is a remeasurement.
+
+        The ratio is real arithmetic but means nothing, so the table must not
+        print it as a speedup.
+        """
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+        )
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        assert pe.oracle_delta is not None
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "no-search" in out
+        assert "2.00x" not in out
+
+    def test_table_reports_speedup_when_plans_competed(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "no-search" not in out
+
+    def test_table_reports_speedup_when_only_provider_variants_competed(self) -> None:
+        """Provider-level search counts even though one plan was compiled."""
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+            benchmarking_forced=True,
+        )
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "no-search" not in out
+
+    def test_verbose_explains_a_missing_tuning_search(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+        )
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Tuning:        unavailable" in out
+        assert "run-to-run noise" in out
+
+    def test_verbose_empty_knobs_do_not_claim_no_variants_explored(self) -> None:
+        """``knob_settings: []`` means no explicit plan knobs, nothing more."""
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(knob_settings=[], benchmarking_forced=True)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "none set explicitly (engine defaults)" in out
+        assert "Benchmarking:  forced" in out
 
     def test_verbose_renders_knob_lines(self) -> None:
         pe = _make_pe_success()

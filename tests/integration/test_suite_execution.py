@@ -693,7 +693,7 @@ class TestPyTorchBackendCLIIntegration:
 
 @pytest.mark.gpu
 class TestOracleCLIIntegration:
-    """--oracle adds the tuned payload; its absence leaves the JSON unchanged."""
+    """--oracle-mode adds the tuned payload; its absence leaves the JSON unchanged."""
 
     @pytest.fixture(autouse=True)
     def check_deps(self, plugin_paths: List[str]):
@@ -741,7 +741,9 @@ class TestOracleCLIIntegration:
         self, project_root: Path, tmp_path: Path, cli_plugin_args: List[str]
     ) -> None:
         output_file = tmp_path / "oracle.json"
-        result = self._run(project_root, output_file, cli_plugin_args, ["--oracle"])
+        result = self._run(
+            project_root, output_file, cli_plugin_args, ["--oracle-mode", "plan"]
+        )
 
         assert result.returncode in (
             0,
@@ -769,7 +771,7 @@ class TestOracleCLIIntegration:
         assert not oracle["plan_name"].startswith("0x")
         assert oracle["rank"] == 0
         assert oracle["compiled_plan_index"] >= 0
-        assert oracle["candidates_benchmarked"] >= 1
+        assert oracle["compiled_plans_benchmarked"] >= 1
         delta = tuned[0]["oracle_delta"]
         assert set(delta) == {
             "basis",

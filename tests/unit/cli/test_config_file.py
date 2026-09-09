@@ -106,35 +106,35 @@ iters = 7
     assert args.iters == 11
 
 
-def test_oracle_config_key_populates_args(tmp_path: Path) -> None:
+def test_oracle_mode_config_key_populates_args(tmp_path: Path) -> None:
     config = _write_config(
         tmp_path / "bench.toml",
         """
 version = 1
 graphs = ["from_config.json"]
-oracle = true
+oracle_mode = "exhaustive"
 """,
     )
 
     args = _parse_with_config(["--config", str(config)])
 
-    assert args.oracle is True
+    assert args.oracle_mode == "exhaustive"
 
 
-def test_oracle_cli_flag_overrides_config(tmp_path: Path) -> None:
-    """An explicit --oracle wins over `oracle = false` in the config."""
+def test_oracle_mode_cli_flag_overrides_config(tmp_path: Path) -> None:
+    """An explicit --oracle-mode wins over `oracle_mode` in the config."""
     config = _write_config(
         tmp_path / "bench.toml",
         """
 version = 1
 graphs = ["from_config.json"]
-oracle = false
+oracle_mode = "exhaustive"
 """,
     )
 
-    args = _parse_with_config(["--config", str(config), "--oracle"])
+    args = _parse_with_config(["--config", str(config), "--oracle-mode", "plan"])
 
-    assert args.oracle is True
+    assert args.oracle_mode == "plan"
 
 
 def test_pytorch_rocm_fa_library_config_and_cli_precedence(tmp_path: Path) -> None:
@@ -325,6 +325,7 @@ id = 1
     ("field", "value"),
     [
         ("backend", '"pytoch"'),
+        ("oracle_mode", '"full"'),
         ("validate", '"torch"'),
         ("metrics_tier", '"full"'),
         ("emit_trace", '"json"'),

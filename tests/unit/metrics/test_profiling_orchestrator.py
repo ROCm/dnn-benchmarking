@@ -54,7 +54,7 @@ class TestBuildInnerArgv:
         assert "--plugin-path" not in argv
 
     def test_oracle_never_leaks_into_inner_argv(self):
-        """The inner argv is an allowlist; --oracle must never be forwarded."""
+        """The inner argv is an allowlist; --oracle-mode must never be forwarded."""
         argv = orch.build_inner_argv(
             graph_path=Path("/g/x.json"),
             engine_id=1,
@@ -63,7 +63,7 @@ class TestBuildInnerArgv:
             benchmark_iters=1,
             plugin_path=None,
         )
-        assert "--oracle" not in argv
+        assert "--oracle-mode" not in argv
 
 
 class TestResolveOutputDir:

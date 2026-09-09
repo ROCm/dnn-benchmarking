@@ -5,6 +5,7 @@
 
 import sys
 from pathlib import Path
+from statistics import geometric_mean
 from typing import List, Optional, TextIO
 
 from ..config.benchmark_config import BenchmarkConfig, SuiteConfig
@@ -144,13 +145,33 @@ class Reporter:
         """
         self._print(f"WARNING: {message}")
 
-    def print_info(self, message: str) -> None:
-        """Print an informational line verbatim.
+    def print_oracle_summary(
+        self, speedups: List[float], no_search_rows: int
+    ) -> None:
+        """Print the suite-wide oracle comparison line.
 
         Args:
-            message: Message text.
+            speedups: Per-row speedups from rows where tuning had an
+                alternative configuration to choose from.
+            no_search_rows: Rows excluded because nothing was searched.
         """
-        self._print(message)
+        if not speedups:
+            if no_search_rows:
+                self._print(
+                    f"Oracle comparison: no tuning search available on any of "
+                    f"{no_search_rows} engine rows (one compiled plan each, "
+                    f"provider benchmarking not forced); no speedup reported"
+                )
+            return
+        suffix = (
+            f"; {no_search_rows} row(s) excluded with no tuning search"
+            if no_search_rows
+            else ""
+        )
+        self._print(
+            f"Oracle comparison: {len(speedups)} engine rows tuned, "
+            f"geomean speedup {geometric_mean(speedups):.2f}x{suffix}"
+        )
 
     def _print(self, text: str) -> None:
         """Print a line of text.
@@ -398,7 +419,13 @@ class Reporter:
             pe.oracle or pe.oracle_error for pe in graph_result.results
         )
         if include_oracle:
-            headers.extend(["oracle_kernel_mean_ms", "oracle_speedup"])
+            headers.extend(
+                [
+                    "warm_baseline_kernel_mean_ms",
+                    "oracle_kernel_mean_ms",
+                    "oracle_speedup",
+                ]
+            )
         if include_warnings:
             headers.append("warnings")
         rows: List[List[str]] = []
@@ -415,12 +442,29 @@ class Reporter:
                 ]
             )
             if include_oracle:
+                # oracle_speedup is tuned vs this warm baseline, never vs the
+                # row's own OOTB kernel_mean_ms. Show it so the printed ratio
+                # can be checked against the numbers on the same line.
+                row.append(
+                    self._fmt_stat(pe.oracle.warm_baseline_gpu_kernel_stats, "mean_ms")
+                    if pe.oracle is not None
+                    else "n/a"
+                )
                 row.append(
                     self._fmt_stat(pe.oracle.gpu_kernel_stats, "mean_ms")
                     if pe.oracle is not None
                     else "n/a"
                 )
-                if pe.oracle_delta is not None:
+                oracle_correctness = pe.oracle.correctness if pe.oracle else None
+                if oracle_correctness is not None and not oracle_correctness.passed:
+                    # The tuned plan produced a wrong answer; a speedup here
+                    # would advertise a gain the result does not earn.
+                    row.append("invalid")
+                elif pe.oracle is not None and not pe.oracle.tuning_explored:
+                    # One fixed configuration was re-measured. Printing a ratio
+                    # here would read as a tuning gain; it is noise.
+                    row.append("no-search")
+                elif pe.oracle_delta is not None:
                     row.append(f"{pe.oracle_delta.speedup:.2f}x")
                 elif pe.oracle_error is not None:
                     row.append("failed")
@@ -564,10 +608,32 @@ class Reporter:
             for knob in o.knob_settings:
                 self._print(f"    {knob['knob_id']}={knob['value']}")
         else:
-            self._print("  Knobs:         engine defaults")
+            self._print("  Knobs:         none set explicitly (engine defaults)")
         self._print(
-            f"  Candidates:    {o.candidates_benchmarked} benchmarked successfully"
+            f"  Compiled plans: {o.compiled_plans_benchmarked} benchmarked "
+            f"successfully ({o.compiled_plans_total} total, "
+            f"{o.compiled_plans_failed} failed)"
         )
+        if o.benchmarking_forced:
+            self._print(
+                "  Benchmarking:  forced (providers sampled kernel variants; "
+                "hipDNN exposes no count of them)"
+            )
+        if not o.tuning_explored:
+            self._print(
+                "  Tuning:        unavailable - one compiled plan and no forced "
+                "provider benchmarking, so this pass re-measured the heuristic "
+                "configuration; any delta below is run-to-run noise"
+            )
+        if o.correctness is not None:
+            if o.correctness.passed:
+                self._print("  Validation:    tuned plan passed")
+            else:
+                detail = o.correctness.error_message or "output mismatch"
+                self._print(
+                    f"  Validation:    tuned plan FAILED - {detail}; "
+                    "no speedup is reported for this row"
+                )
         self._print(
             f"  Sweep best:    {o.sweep_min_time_ms:.3f} ms   "
             "(diagnostic; not the reported oracle timing)"

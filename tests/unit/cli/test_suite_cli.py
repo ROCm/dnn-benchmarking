@@ -5,6 +5,7 @@
 
 import json
 import importlib
+import io
 import os
 import sys
 import tempfile
@@ -15,12 +16,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from dnn_benchmarking.cli.parser import create_parser
-from dnn_benchmarking.cli.suite_runner_cli import run_suite_benchmark
+from dnn_benchmarking.cli.suite_runner_cli import (
+    _print_oracle_comparison,
+    run_suite_benchmark,
+)
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleDelta,
+    OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
     SuiteResult,
@@ -1334,25 +1340,41 @@ class TestProfilingFlagPropagation:
 
 
 class TestOracleFlag:
-    """--oracle parsing, SuiteConfig propagation, and startup warnings."""
+    """--oracle-mode parsing, SuiteConfig propagation, and startup warnings."""
 
     def _create_graph(self, tmpdir: Path) -> Path:
         p = tmpdir / "g.json"
         p.write_text(json.dumps({"name": "g", "nodes": [], "tensors": []}))
         return p
 
-    def test_oracle_defaults_to_false(self) -> None:
+    def test_oracle_mode_defaults_to_off(self) -> None:
         parser = create_parser()
         args = parser.parse_args(["--graph", "g.json"])
-        assert args.oracle is False
+        assert args.oracle_mode == "off"
 
-    def test_oracle_flag_parses_true(self) -> None:
+    @pytest.mark.parametrize("mode", ["plan", "exhaustive"])
+    def test_oracle_mode_parses_and_propagates(self, mode: str) -> None:
         parser = create_parser()
-        args = parser.parse_args(["--graph", "g.json", "--oracle"])
-        assert args.oracle is True
+        args = parser.parse_args(["--graph", "g.json", "--oracle-mode", mode])
+        assert args.oracle_mode == mode
+
+    def test_oracle_mode_rejects_unknown_value(self) -> None:
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--graph", "g.json", "--oracle-mode", "full"])
+
+    def test_oracle_exhaustive_derived_properties(self) -> None:
+        config = SuiteConfig(oracle_mode="exhaustive")
+        assert config.oracle_enabled is True
+        assert config.oracle_exhaustive is True
+
+    def test_oracle_plan_derived_properties(self) -> None:
+        config = SuiteConfig(oracle_mode="plan")
+        assert config.oracle_enabled is True
+        assert config.oracle_exhaustive is False
 
     @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
-    def test_oracle_flag_propagates_to_suite_config(
+    def test_oracle_mode_flag_propagates_to_suite_config(
         self, mock_benchmark: MagicMock
     ) -> None:
         mock_benchmark.return_value = 0
@@ -1362,14 +1384,15 @@ class TestOracleFlag:
             from dnn_benchmarking.cli.main import main
 
             with patch(
-                "sys.argv", ["dnn-benchmark", "--graph", str(graph), "--oracle"]
+                "sys.argv",
+                ["dnn-benchmark", "--graph", str(graph), "--oracle-mode", "plan"],
             ):
                 main()
 
-        assert mock_benchmark.call_args.kwargs["config"].oracle is True
+        assert mock_benchmark.call_args.kwargs["config"].oracle_mode == "plan"
 
     @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
-    def test_oracle_absent_leaves_suite_config_false(
+    def test_oracle_mode_absent_leaves_suite_config_off(
         self, mock_benchmark: MagicMock
     ) -> None:
         mock_benchmark.return_value = 0
@@ -1381,9 +1404,9 @@ class TestOracleFlag:
             with patch("sys.argv", ["dnn-benchmark", "--graph", str(graph)]):
                 main()
 
-        assert mock_benchmark.call_args.kwargs["config"].oracle is False
+        assert mock_benchmark.call_args.kwargs["config"].oracle_mode == "off"
 
-    def test_oracle_with_pytorch_backend_rejected(self) -> None:
+    def test_oracle_mode_with_pytorch_backend_rejected(self) -> None:
         from dnn_benchmarking.cli.main import main
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1394,25 +1417,133 @@ class TestOracleFlag:
                     "dnn-benchmark",
                     "--graph",
                     str(graph),
-                    "--oracle",
+                    "--oracle-mode",
+                    "plan",
                     "--backend",
                     "pytorch",
                 ],
             ):
                 assert main() == 1
 
+    def test_oracle_mode_exhaustive_with_zero_warmup_rejected(self) -> None:
+        from dnn_benchmarking.cli.main import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = self._create_graph(Path(tmpdir))
+            with patch(
+                "sys.argv",
+                [
+                    "dnn-benchmark",
+                    "--graph",
+                    str(graph),
+                    "--oracle-mode",
+                    "exhaustive",
+                    "--warmup",
+                    "0",
+                ],
+            ):
+                assert main() == 1
+
+    def test_oracle_mode_plan_with_zero_warmup_not_rejected(self) -> None:
+        """Only exhaustive mode hard-errors on --warmup 0."""
+        from dnn_benchmarking.cli.main import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = self._create_graph(Path(tmpdir))
+            with (
+                patch(
+                    "dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark",
+                    return_value=0,
+                ),
+                patch(
+                    "sys.argv",
+                    [
+                        "dnn-benchmark",
+                        "--graph",
+                        str(graph),
+                        "--oracle-mode",
+                        "plan",
+                        "--warmup",
+                        "0",
+                    ],
+                ),
+            ):
+                assert main() != 1
+
+    @staticmethod
+    def _row(engine_id: int, speedup: float, *, searched: bool) -> ProviderEngineResult:
+        """A tuned row whose sweep did or did not have an alternative to pick."""
+        return ProviderEngineResult(
+            provider="p",
+            engine_id=engine_id,
+            status="success",
+            oracle=OracleResult(
+                plan_name="pl",
+                compiled_plan_index=0,
+                rank=0,
+                sweep_min_time_ms=1.0,
+                compiled_plans_benchmarked=2 if searched else 1,
+                compiled_plans_total=2 if searched else 1,
+                compiled_plans_failed=0,
+                knob_settings=[],
+            ),
+            oracle_delta=OracleDelta(
+                basis="gpu_kernel",
+                baseline_mean_ms=1.0,
+                oracle_mean_ms=1.0 / speedup,
+                delta_ms=1.0 - 1.0 / speedup,
+                speedup=speedup,
+            ),
+        )
+
+    def _footer(self, rows) -> str:
+        output = io.StringIO()
+        _print_oracle_comparison(
+            SuiteConfig(oracle_mode="plan"),
+            [GraphResult(graph_name="g", graph_path="/tmp/g.json", results=rows)],
+            Reporter(output=output),
+        )
+        return output.getvalue()
+
+    def test_oracle_footer_uses_geometric_mean(self) -> None:
+        # Arithmetic mean of 2.0 and 0.5 is 1.25x, which would claim a suite
+        # gain even though the combined runtime is unchanged.
+        out = self._footer(
+            [
+                self._row(1, 2.0, searched=True),
+                self._row(2, 0.5, searched=True),
+            ]
+        )
+        assert "geomean speedup 1.00x" in out
+
+    def test_footer_excludes_rows_without_a_tuning_search(self) -> None:
+        out = self._footer(
+            [
+                self._row(1, 2.0, searched=True),
+                self._row(2, 0.5, searched=False),
+            ]
+        )
+        assert "1 engine rows tuned" in out
+        assert "geomean speedup 2.00x" in out
+        assert "1 row(s) excluded with no tuning search" in out
+
+    def test_footer_reports_no_speedup_when_nothing_was_searched(self) -> None:
+        out = self._footer([self._row(1, 1.004, searched=False)])
+        assert "no tuning search available" in out
+        assert "speedup" not in out.replace("no speedup reported", "")
+
 
 class TestOracleStartupWarnings:
     """The cache warning is driven by hipDNN's truthy set, not by bool()."""
 
-    def _warn(self, warmup_iters: int = 10) -> str:
+    def _warn(self, warmup_iters: int = 10, oracle_mode: str = "plan") -> str:
         import io
 
         from dnn_benchmarking.cli.suite_runner_cli import _print_oracle_warnings
 
         buf = io.StringIO()
         _print_oracle_warnings(
-            SuiteConfig(oracle=True, warmup_iters=warmup_iters),
+            SuiteConfig(oracle_mode=oracle_mode, warmup_iters=warmup_iters),
             Reporter(output=buf),
         )
         return buf.getvalue()
@@ -1421,27 +1552,58 @@ class TestOracleStartupWarnings:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", raising=False)
+        monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
         assert "engine-ranking cache is enabled" in self._warn()
 
-    def test_no_cache_warning_when_variable_truthy(
+    def test_no_cache_warning_when_all_cache_controls_disable_caches(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
-        assert "engine-ranking cache is enabled" not in self._warn()
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
+        assert self._warn() == ""
+
+    def test_provider_cache_warning_when_exact_cache_is_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
+        monkeypatch.setenv("HIPDNN_CACHE_DIR", "/tmp/oracle-cache")
+        warning = self._warn()
+        assert "provider kernel caches remain active" in warning
+        assert "HIPDNN_CACHE_DIR=/tmp/oracle-cache" in warning
 
     def test_cache_warning_when_variable_is_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """hipDNN treats '0' as still-enabled, so the warning must fire."""
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "0")
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         assert "engine-ranking cache is enabled" in self._warn()
 
     def test_zero_warmup_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         assert "--warmup 0" in self._warn(warmup_iters=0)
 
     def test_no_zero_warmup_warning_with_warmup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         assert self._warn(warmup_iters=1) == ""
+
+    def test_exhaustive_warning_mentions_force_benchmarking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
+        warning = self._warn(oracle_mode="exhaustive")
+        assert "HIPDNN_FORCE_BENCHMARKING=1" in warning
+
+    def test_plan_warning_omits_force_benchmarking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
+        warning = self._warn(oracle_mode="plan")
+        assert "HIPDNN_FORCE_BENCHMARKING=1" not in warning

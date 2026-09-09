@@ -368,7 +368,7 @@ def test_autotune_filters_to_engine_and_omits_workspace_size():
     assert executor.plan_name(object()) == "winning_plan"
 
 
-def test_autotune_drops_failed_candidates():
+def test_autotune_retains_failed_candidates_for_reporting():
     graph = _StubGraph(
         ranked=[999],
         selected=999,
@@ -379,10 +379,10 @@ def test_autotune_drops_failed_candidates():
     )
     executor = _prepared_autotune_executor(graph)
     with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
-        winners = executor.autotune(object(), {}, 999)
-    assert len(winners) == 1
-    assert winners[0].rank == 0
-
+        candidates = executor.autotune(object(), {}, 999)
+    assert len(candidates) == 2
+    assert candidates[0].rank == -1
+    assert candidates[1].rank == 0
 
 def test_autotune_all_candidates_failed_raises():
     graph = _StubGraph(
@@ -482,6 +482,18 @@ def test_autotune_passes_run_warmup_iterations_to_the_sweep():
         executor.autotune(object(), {}, 999)
 
     assert graph.autotune_kwargs["config"].warmup_iterations == 7
+
+def test_autotune_uses_one_warmup_when_run_warmup_is_zero():
+    config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=0, benchmark_iters=1)
+    executor = executor_module.Executor("{}", config)
+    graph = _StubGraph(
+        ranked=[999], selected=999, autotune_results=[_StubCandidate(rank=0)]
+    )
+    with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
+        executor.prepare(handle=object(), engine_id=999, for_autotune=True)
+        executor.autotune(object(), {}, 999)
+
+    assert graph.autotune_kwargs["config"].warmup_iterations == 1
 
 
 def test_autotune_error_reports_a_benchmarked_failure_not_a_filter_rejection():

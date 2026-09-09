@@ -249,19 +249,25 @@ the following are rejected with `--backend pytorch`:
 - `--engine` / `--plugin-path` (no hipDNN engine plugins are loaded)
 - `--validate pytorch` (the backend would validate against itself)
 - `--pmc` / `--emit-trace` / `--perf` / `--roofline` (rocprofv3-based passes)
-- `--oracle` (auto-tuning is a hipDNN engine feature)
+- `--oracle-mode` (auto-tuning is a hipDNN engine feature)
 
 ### Oracle (Auto-Tuned) Comparison
 
-`--oracle` measures every hipDNN engine row twice: the normal
-heuristic-selected run (OOTB) and a run of the plan that hipDNN auto-tuning
-picks for that same engine. Each successful row then carries `oracle`,
+`--oracle-mode {plan,exhaustive}` measures every hipDNN engine row twice: the
+normal heuristic-selected run (OOTB) and a run of the plan that hipDNN
+auto-tuning picks for that same engine. `plan` selects among the plans the
+engine exposes; it does not sample kernel variants hidden inside one plan.
+`exhaustive` additionally forces provider kernel benchmarking
+(`HIPDNN_FORCE_BENCHMARKING=1`) for the oracle pass, so providers sample
+those hidden variants too. Each successful row then carries `oracle`,
 `oracle_delta`, or `oracle_error` in the JSON, and the summary table gains
-`oracle_kernel_mean_ms` and `oracle_speedup` columns. Runs without the flag
-emit the same output as before.
+`oracle_kernel_mean_ms` and `oracle_speedup` columns. The default, `off`,
+emits the same output as before.
 
-The flag runs one tuning sweep per engine row, so it is significantly slower.
-Narrow the run with `--engine` when the extra cost matters.
+Both modes run one tuning sweep per engine row, so both are significantly
+slower; `exhaustive` much more so (each candidate also samples its kernel
+variants). Narrow the run with `--engine` when the extra cost matters.
+`exhaustive` requires `--warmup >= 1`.
 
 `oracle_speedup` compares the tuned plan against a **warm baseline**: the
 heuristic plan re-timed immediately after the sweep, reported as
@@ -273,16 +279,45 @@ even when the sweep had a single candidate and changed nothing. Both
 operands of `oracle_speedup` therefore share the sweep's warmup history,
 and the row's OOTB columns stay the untouched out-of-the-box number.
 
-hipDNN consults an on-disk engine-ranking cache before heuristic selection, so
-a persisted ranking can make the OOTB row reuse a previously benchmarked engine
-order and shrink the reported gap. Export
-`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold OOTB baseline. The tool warns
-once when that variable is not set, and records the relevant environment
-variables under `metadata.hipdnn_selection_env`.
+The two modes search at different levels, and the JSON names that difference
+rather than blurring it. `oracle.compiled_plans_benchmarked` counts *compiled
+plans*, never provider-internal kernel variants; a provider that samples
+variants inside a single plan still reports `1`. `oracle.benchmarking_forced`
+records whether `exhaustive` requested provider-level sampling. hipDNN exposes
+no count of those internal variants, so none is reported.
+`oracle.knob_settings: []` means "no explicit plan knob settings", i.e. engine
+defaults; it does not mean no variants were explored.
+
+`oracle.tuning_explored` is the derived summary: false when exactly one plan
+was compiled and provider benchmarking was not forced. Such a pass re-measured
+the heuristic configuration, so any ratio is run-to-run noise. The table then
+prints `no-search` in place of `oracle_speedup`, and the suite footer excludes
+the row from its geometric mean instead of averaging noise into a result.
+
+When `--validate` is set the tuned plan is validated too, after its timed loop,
+and the verdict is recorded at `oracle.correctness`. The row's own
+`correctness` remains the OOTB verdict; the two are independent. A tuned plan
+that fails validation publishes **no** `oracle_delta`, and the table prints
+`invalid` in place of `oracle_speedup`. A wrong answer never carries a speedup.
+
+The table also prints `warm_baseline_kernel_mean_ms`, the figure
+`oracle_speedup` is actually computed from, so the ratio can be checked against
+numbers on the same line rather than against the row's OOTB timing.
+
+hipDNN consults on-disk engine-ranking and provider kernel caches during
+selection and execution. Existing cache entries can shrink the reported gap.
+Set `HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold heuristic baseline and
+`HIPDNN_DISABLE_CACHE=1` to disable provider caches. Set `HIPDNN_CACHE_DIR` to
+an isolated directory when you need a separate cache root. `exhaustive`
+applies `HIPDNN_DISABLE_CACHE=1` itself, scoped to the oracle pass, so its
+forced-benchmarking winner never persists to hipDNN's on-disk caches. The
+tool warns once when any relevant cache remains enabled and records these
+environment variables, plus `MIOPEN_USER_DB_PATH` /
+`MIOPEN_CUSTOM_CACHE_DIR`, under `metadata.hipdnn_selection_env`.
 
 ```bash
 HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 python -m dnn_benchmarking \
-  --graph ./graphs/sample_conv_fwd.json --oracle -v -o oracle.json
+  --graph ./graphs/sample_conv_fwd.json --oracle-mode plan -v -o oracle.json
 ```
 
 ### Cross-Machine Comparison (ROCm vs CUDA)
