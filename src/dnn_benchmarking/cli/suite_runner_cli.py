@@ -76,6 +76,77 @@ def _run_one_graph(
         return _error_graph_result(graph_path, str(e))
 
 
+# Match hipDNN's documented truthy values. Notably, "0" leaves a switch off.
+_TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
+
+
+def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
+    """Warn once about conditions that make the OOTB baseline non-cold."""
+    exact_cache_enabled = (
+        os.environ.get("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "").strip().lower()
+        not in _TRUTHY_ENV
+    )
+    all_cache_enabled = (
+        os.environ.get("HIPDNN_DISABLE_CACHE", "").strip().lower() not in _TRUTHY_ENV
+    )
+    if exact_cache_enabled or all_cache_enabled:
+        cache_root = os.environ.get("HIPDNN_CACHE_DIR") or "<default>"
+        if exact_cache_enabled:
+            message = (
+                "--oracle-mode: hipDNN's exact-match engine-ranking cache is "
+                "enabled, so the out-of-the-box timing may reflect a "
+                "previously persisted ranking rather than cold heuristic "
+                "selection. Set HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for a "
+                "cold OOTB baseline."
+            )
+        else:
+            message = (
+                "--oracle-mode: HIPDNN_DISABLE_CACHE is not enabled, so "
+                "provider kernel caches remain active and may affect the "
+                "comparison."
+            )
+        reporter.print_warning(
+            f"{message} Cache root: HIPDNN_CACHE_DIR={cache_root}. "
+            "Set HIPDNN_DISABLE_CACHE=1 to disable provider caches."
+        )
+    if config.warmup_iters == 0:
+        reporter.print_warning(
+            "--oracle-mode with --warmup 0: a plan's first execute() may "
+            "sample candidate kernels, so that cost lands inside both timed "
+            "loops"
+        )
+    if config.oracle_exhaustive:
+        reporter.print_warning(
+            "--oracle-mode exhaustive: the tuned pass enables each provider's "
+            "global.benchmarking capability (today the kernel ingestor and "
+            "MIOpen). Other engines stay at plan-level tuning. Providers can "
+            "reuse existing tuned selections, including MIOpen FindDb and "
+            "performance-database entries; this mode does not prove that the "
+            "current invocation performed a fresh search. On a cache miss, "
+            "expect the sweep to take candidates x variants longer."
+        )
+
+
+def _print_oracle_comparison(
+    config: SuiteConfig,
+    graph_results: List[GraphResult],
+    reporter: Reporter,
+) -> None:
+    """Print the suite-wide oracle comparison via the reporter."""
+    if not config.oracle_enabled:
+        return
+    # Rows where tuning had no alternative configuration re-measured the
+    # heuristic pick. Averaging them in would dilute a real result with noise.
+    tuned = [
+        pe
+        for gr in graph_results
+        for pe in gr.results
+        if pe.oracle_delta is not None and pe.oracle is not None
+    ]
+    speedups = [pe.oracle_delta.speedup for pe in tuned if pe.oracle.tuning_available]
+    reporter.print_oracle_summary(speedups, len(tuned) - len(speedups))
+
+
 def _run_suite_graphs_after_startup(
     graph_paths: List[Path],
     config: SuiteConfig,
@@ -85,6 +156,8 @@ def _run_suite_graphs_after_startup(
 ) -> int:
     """Run loaded-graph callback for each graph and emit suite output."""
     total = len(graph_paths)
+    if config.oracle_enabled:
+        _print_oracle_warnings(config, reporter)
     reporter.print_running_benchmark(total)
 
     graph_results: List[GraphResult] = []
@@ -114,10 +187,12 @@ def _run_suite_graphs_after_startup(
         pytorch_rocm_fa_library_requested=(
             config.pytorch_rocm_fa_library if pytorch_selected else None
         ),
+        oracle=config.oracle_enabled,
     )
 
     reporter.print_suite_summary(suite_result.metadata)
     reporter.print_suite_footer()
+    _print_oracle_comparison(config, graph_results, reporter)
 
     if output_path is not None:
         suite_result.save_json(str(output_path))
@@ -225,6 +300,12 @@ def run_suite_cli(
                     "--roofline) are not supported with --backend pytorch"
                 )
                 return 1
+            if args.oracle_mode != "off":
+                reporter.print_error(
+                    "--oracle-mode is not supported with --backend pytorch "
+                    "(auto-tuning is a hipDNN engine feature)"
+                )
+                return 1
         # --profiling-output-dir is only meaningful when at least one
         # opt-in profiling source fires. Passing it solo is a silent
         # no-op today; surface that as a soft warning so the user
@@ -238,6 +319,14 @@ def run_suite_cli(
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
             )
+        if args.oracle_mode == "exhaustive" and args.warmup == 0:
+            reporter.print_error(
+                "--oracle-mode exhaustive requires --warmup >= 1: with "
+                "benchmarking forced, a plan's first execute() samples kernel "
+                "variants, and at zero warmup that sampling lands inside the "
+                "timed loop"
+            )
+            return 1
         if (
             (
                 args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value
@@ -259,6 +348,7 @@ def run_suite_cli(
             seed=args.seed,
             engine_filter=args.engine,
             verbose=args.verbose,
+            oracle_mode=args.oracle_mode,
             metrics=metrics_config,
             validation=validation,
             plugin_paths=plugin_paths,

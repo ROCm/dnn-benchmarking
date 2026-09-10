@@ -109,6 +109,7 @@ _PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
 _METRICS_TIER_CHOICES = frozenset({"basic", "off"})
 _EMIT_TRACE_CHOICES = frozenset({"pftrace"})
 _PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
+_ORACLE_MODE_CHOICES = frozenset({"off", "plan", "exhaustive"})
 
 CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
@@ -205,6 +206,26 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_key="verbose",
         config_kind=ConfigKind.SCALAR,
         config_type=bool,
+    ),
+    CliOption(
+        flags=("--oracle-mode",),
+        dest="oracle_mode",
+        parser_type=str,
+        choices=_ORACLE_MODE_CHOICES,
+        default="off",
+        metavar="MODE",
+        group="Output",
+        help=(
+            "Oracle comparison depth (default: off). 'plan' also times the "
+            "plan hipDNN auto-tuning picks for each engine and reports the "
+            "delta against the heuristic plan. 'exhaustive' additionally "
+            "forces provider kernel benchmarking so providers sample kernel "
+            "variants; both run one tuning sweep per engine and are "
+            "significantly slower, 'exhaustive' much more so."
+        ),
+        config_key="oracle_mode",
+        config_kind=ConfigKind.CHOICE,
+        config_type=str,
     ),
     CliOption(
         flags=("--rtol",),

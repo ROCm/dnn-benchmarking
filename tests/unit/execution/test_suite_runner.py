@@ -3,7 +3,9 @@
 
 """Unit tests for suite_runner module."""
 
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
@@ -1782,3 +1784,583 @@ class TestTimedPytorchRowEngineRole:
 
         assert row.result.status == "error"
         assert row.result.error_message == reason
+
+
+def _make_candidate(**overrides):
+    """Build a stand-in hipdnn_frontend.AutotuneResult."""
+    values = {
+        "engine_id": 0,
+        "engine_name": "engine_0",
+        "compiled_plan_index": 2,
+        "rank": 0,
+        "min_time_ms": 0.2,
+        "succeeded": True,
+        "knob_settings": [],
+        # hipDNN reports capability on the compiled-plan path. It cannot
+        # report whether an environment-enabled provider reused a cached tuned
+        # selection or performed a fresh search.
+        "supports_exhaustive": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _make_oracle_exec_factory(autotune_side_effect=None, order=None, candidates=None):
+    """Executor factory whose third instance is the oracle pass.
+
+    Instance order inside run_graph_all_providers is discovery, OOTB, then
+    oracle. The oracle instance reports half the OOTB kernel time so the
+    delta is unambiguous.
+
+    Args:
+        autotune_side_effect: Exception the sweep raises, if any.
+        order: When given, receives ``"<role>.<method>"`` labels in call
+            order so a test can pin when each pass runs relative to the
+            sweep.
+        candidates: Sweep result list. Defaults to one success and one
+            failure. Pass an explicit list to model a real multi-plan sweep.
+    """
+    instances = []
+
+    def _candidates():
+        if candidates is not None:
+            return candidates
+        return [
+            _make_candidate(),
+            _make_candidate(succeeded=False, rank=-1, error_message="candidate failed"),
+        ]
+
+    def make_instance(*args, **kwargs):
+        m = MagicMock()
+        role = {0: "discovery", 1: "ootb", 2: "oracle"}.get(
+            len(instances), f"extra{len(instances)}"
+        )
+        m.init_time_ms = 5.0
+        m.discover_engines.return_value = [0]
+        m.plan_name.return_value = "tuned_plan"
+        kernel_ms = 0.5 if len(instances) < 2 else 0.25
+        bench_result = MagicMock()
+        bench_result.host_timings = [1.0]
+        bench_result.kernel_timings = [kernel_ms]
+        bench_result.has_kernel_timings = True
+        m.benchmark.return_value = bench_result
+        if autotune_side_effect is not None:
+            m.autotune.side_effect = autotune_side_effect
+        else:
+            m.autotune.return_value = list(_candidates())
+
+        if order is not None:
+
+            def _benchmark(*a, _role=role, **k):
+                order.append(f"{_role}.benchmark")
+                return bench_result
+
+            def _autotune(*a, _role=role, **k):
+                order.append(f"{_role}.autotune")
+                if autotune_side_effect is not None:
+                    raise autotune_side_effect
+                return list(_candidates())
+
+            m.benchmark.side_effect = _benchmark
+            m.autotune.side_effect = _autotune
+
+        instances.append(m)
+        return m
+
+    return make_instance, instances
+
+
+class TestOraclePass:
+    """--oracle-mode adds a second tuned pass per engine row without changing OOTB."""
+
+    def _run(self, factory, oracle_mode="plan"):
+        with (
+            patch(
+                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
+                side_effect=lambda eid: f"engine_{eid}",
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
+                return_value=None,
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.BufferManager",
+                return_value=_make_bm_mock(),
+            ),
+        ):
+            return run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(oracle_mode=oracle_mode),
+                handle=MagicMock(),
+            )
+
+    def test_oracle_uses_second_executor_with_autotune_prepare(self):
+        factory, instances = _make_oracle_exec_factory()
+        self._run(factory)
+
+        # discovery, OOTB, oracle
+        assert len(instances) == 3
+        ootb, oracle = instances[1], instances[2]
+        assert ootb.prepare.call_args.kwargs.get("for_autotune") is None
+        assert oracle.prepare.call_args.kwargs["for_autotune"] is True
+        assert oracle.autotune.call_count == 1
+        assert oracle.benchmark.call_count == 1
+
+    def test_oracle_uses_an_isolated_handle_on_the_same_stream(self):
+        class Handle:
+            instances = []
+
+            def __init__(self):
+                self.stream = -1
+                self.__class__.instances.append(self)
+
+            def get_stream(self):
+                return self.stream
+
+            def set_stream(self, stream):
+                self.stream = stream
+
+        factory, instances = _make_oracle_exec_factory()
+        ootb_handle = Handle()
+        ootb_handle.stream = 17
+        with (
+            patch(
+                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
+                side_effect=lambda eid: f"engine_{eid}",
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
+                return_value=None,
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.BufferManager",
+                return_value=_make_bm_mock(),
+            ),
+        ):
+            run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(oracle_mode="exhaustive"),
+                handle=ootb_handle,
+            )
+
+        oracle_handle = instances[2].prepare.call_args.args[0]
+        assert oracle_handle is not ootb_handle
+        assert oracle_handle.stream == 17
+        assert instances[1].benchmark.call_args_list[-1].args[0] is ootb_handle
+        assert instances[2].benchmark.call_args.args[0] is oracle_handle
+
+    def test_delta_baseline_is_retimed_after_the_sweep(self):
+        """The comparison operands must share the sweep's warmup history.
+
+        The sweep executes the engine's plans many times, so timing the
+        tuned plan straight afterwards measures a hotter device than the
+        OOTB pass ever saw. The heuristic plan is therefore re-timed
+        between the sweep and the tuned run. Comparing against the row's
+        pre-sweep OOTB timing instead reports a speedup on graphs where
+        the sweep had one candidate and changed nothing.
+        """
+        order = []
+        factory, instances = _make_oracle_exec_factory(order=order)
+        result = self._run(factory)
+
+        assert order == [
+            "ootb.benchmark",
+            "oracle.autotune",
+            "ootb.benchmark",
+            "oracle.benchmark",
+        ]
+        # Re-timed, not reused: the OOTB executor runs a second warmup too.
+        assert instances[1].warmup.call_count == 2
+
+        oracle = result.results[0].oracle
+        assert oracle.warm_baseline_gpu_kernel_stats is not None
+        assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
+        assert result.results[0].oracle_delta.baseline_mean_ms == 0.5
+
+    def test_oracle_failure_leaves_ootb_row_intact(self):
+        factory, _ = _make_oracle_exec_factory(
+            autotune_side_effect=ExecutionError("no candidate succeeded")
+        )
+        result = self._run(factory)
+
+        r = result.results[0]
+        assert r.status == "success"
+        assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
+        assert r.oracle is None
+        assert r.oracle_delta is None
+        assert r.oracle_error == "ExecutionError: no candidate succeeded"
+
+    def test_no_oracle_pass_when_mode_is_off(self):
+        factory, instances = _make_oracle_exec_factory()
+        result = self._run(factory, oracle_mode="off")
+
+        r = result.results[0]
+        assert r.oracle is None
+        assert r.oracle_delta is None
+        assert r.oracle_error is None
+        # discovery + OOTB only.
+        assert len(instances) == 2
+
+    def test_plan_mode_records_no_exhaustive_request(self):
+        factory, _ = _make_oracle_exec_factory()
+        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
+        assert oracle.exhaustive_requested is False
+
+    def test_winner_is_the_rank_zero_plan_when_several_plans_compete(self):
+        """A real multi-plan sweep records the rank-0 winner and true counts.
+
+        Deterministic: hipDNN returns successes first in ascending rank, so the
+        winner is fixed by the input, not by measured time. No speedup is
+        asserted; a sweep that finds nothing faster is still a valid sweep.
+        """
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[
+                _make_candidate(
+                    compiled_plan_index=7,
+                    rank=0,
+                    min_time_ms=0.10,
+                    knob_settings=[SimpleNamespace(knob_id="SPLIT_K", value=4)],
+                ),
+                _make_candidate(compiled_plan_index=3, rank=1, min_time_ms=0.30),
+                _make_candidate(
+                    compiled_plan_index=9,
+                    succeeded=False,
+                    rank=-1,
+                    error_message="candidate failed",
+                ),
+            ]
+        )
+        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
+
+        assert oracle.compiled_plan_index == 7
+        assert oracle.rank == 0
+        assert oracle.sweep_min_time_ms == 0.10
+        assert oracle.compiled_plans_benchmarked == 2
+        assert oracle.compiled_plans_total == 3
+        assert oracle.compiled_plans_failed == 1
+        assert oracle.knob_settings == [{"knob_id": "SPLIT_K", "value": 4}]
+        # Several plans competed, so the comparison is meaningful whatever the
+        # measured ratio turned out to be.
+        assert oracle.tuning_available is True
+
+    def test_single_plan_plan_mode_reports_no_tuning_search(self):
+        """One plan and no provider-level search searched nothing."""
+        factory, _ = _make_oracle_exec_factory(candidates=[_make_candidate()])
+        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
+
+        assert oracle.compiled_plans_total == 1
+        assert oracle.exhaustive_requested is False
+        assert oracle.tuning_available is False
+
+    def test_exhaustive_capability_counts_as_provider_level_tuning(self):
+        """A capable provider can select variants hidden inside one plan."""
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[_make_candidate(supports_exhaustive=True)]
+        )
+        oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
+
+        assert oracle.compiled_plans_total == 1
+        assert oracle.exhaustive_requested is True
+        assert oracle.exhaustive_supported is True
+        assert oracle.tuning_available is True
+
+    def test_exhaustive_unsupported_provider_is_not_a_search(self):
+        """A request cannot add alternatives to an incapable engine."""
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[_make_candidate(supports_exhaustive=False)]
+        )
+        oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
+
+        assert oracle.compiled_plans_total == 1
+        assert oracle.exhaustive_requested is True
+        assert oracle.exhaustive_supported is False
+        assert oracle.tuning_available is False
+
+
+class TestOracleTunedPlanValidation:
+    """--validate gates the tuned plan, not only the OOTB run."""
+
+    def _run(self, factory, correctness):
+        """Run with a reference available and a pinned correctness verdict.
+
+        ``correctness`` is one verdict for every check, or a list consumed in
+        call order (OOTB first, tuned second).
+        """
+        check_kwargs = (
+            {"side_effect": list(correctness)}
+            if isinstance(correctness, list)
+            else {"return_value": correctness}
+        )
+        with (
+            patch(
+                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
+                side_effect=lambda eid: f"engine_{eid}",
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner."
+                "_compute_reference_outputs_once",
+                return_value=({1: MagicMock()}, None),
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._check_correctness",
+                **check_kwargs,
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.BufferManager",
+                return_value=_make_bm_mock(),
+            ),
+        ):
+            return run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(oracle_mode="plan"),
+                handle=MagicMock(),
+            )
+
+    @staticmethod
+    def _verdict(passed: bool) -> CorrectnessResult:
+        return CorrectnessResult(
+            execution_success=True,
+            tolerance_match=passed,
+            rtol=1e-5,
+            atol=1e-5,
+            error_message=None if passed else "output mismatch",
+        )
+
+    def test_failing_tuned_plan_publishes_no_speedup(self):
+        """Fault injection: a wrong tuned result must not carry a speedup.
+
+        This is the regression guard for a tuned plan that computes garbage
+        twice as fast and previously reported a clean 2.00x.
+        """
+        factory, _ = _make_oracle_exec_factory()
+        r = self._run(factory, self._verdict(False)).results[0]
+
+        assert r.oracle is not None
+        assert r.oracle.correctness.passed is False
+        # Timings survive as evidence; the comparison does not.
+        assert r.oracle.gpu_kernel_stats is not None
+        assert r.oracle_delta is None
+
+    def test_failing_baseline_publishes_no_speedup(self):
+        """Inverse fault injection: a wrong baseline cannot measure a gain.
+
+        The tuned plan is correct here and the baseline is not. Comparing
+        against a broken comparand produced a clean 2.00x even though one
+        operand was garbage, so eligibility must consider both sides.
+        """
+        factory, _ = _make_oracle_exec_factory()
+        # OOTB check first, tuned check second.
+        r = self._run(factory, [self._verdict(False), self._verdict(True)]).results[0]
+
+        assert r.correctness.passed is False
+        assert r.oracle.correctness.passed is True
+        # Both verdicts survive separately; only the comparison is refused.
+        assert r.oracle.gpu_kernel_stats is not None
+        assert r.oracle_delta is None
+
+    def test_unchecked_correctness_does_not_suppress_the_comparison(self):
+        """ "Not checked" is not "failed".
+
+        A plain run records tolerance_match=None on the row. Treating that as
+        a failure would suppress every speedup when --validate is absent.
+        """
+        factory, _ = _make_oracle_exec_factory()
+        unchecked = CorrectnessResult(
+            execution_success=True,
+            tolerance_match=None,
+            rtol=1e-5,
+            atol=1e-5,
+            error_message="No reference provider requested",
+        )
+        r = self._run(factory, [unchecked, self._verdict(True)]).results[0]
+
+        assert r.oracle_delta is not None
+        assert r.oracle_delta.speedup == 2.0
+
+    def test_passing_tuned_plan_still_reports_a_speedup(self):
+        factory, _ = _make_oracle_exec_factory()
+        r = self._run(factory, self._verdict(True)).results[0]
+
+        assert r.oracle.correctness.passed is True
+        assert r.oracle_delta is not None
+        assert r.oracle_delta.speedup == 2.0
+
+    def test_a_failing_tuned_plan_leaves_the_ootb_verdict_passing(self):
+        """OOTB correctness is the row's; the tuned verdict is the oracle's.
+
+        The OOTB plan is correct and the tuned plan is not, so the two must
+        disagree. A row that reports the tuned failure as its own would fail
+        a passing engine.
+        """
+        factory, _ = _make_oracle_exec_factory()
+        # First call is the OOTB check, second is the tuned check.
+        r = self._run(factory, [self._verdict(True), self._verdict(False)]).results[0]
+
+        assert r.correctness.passed is True
+        assert r.oracle.correctness.passed is False
+        assert r.status == "success"
+        assert r.oracle_delta is None
+
+    def test_tuned_plan_is_validated_after_its_timed_loop(self):
+        """Validation must never land inside a measurement."""
+        factory, instances = _make_oracle_exec_factory()
+        self._run(factory, self._verdict(True))
+
+        oracle_exec = instances[2]
+        # benchmark() then execute_once() on the tuned executor.
+        assert oracle_exec.benchmark.call_count == 1
+        assert oracle_exec.execute_once.call_count == 1
+
+    def test_without_a_reference_no_tuned_verdict_is_recorded(self):
+        """--validate off leaves the tuned check off too, and the delta stands."""
+        factory, _ = _make_oracle_exec_factory()
+        r = TestOraclePass()._run(factory, oracle_mode="plan").results[0]
+
+        assert r.oracle.correctness is None
+        assert r.oracle_delta is not None
+
+
+class TestOracleExhaustiveEnvGuard:
+    """Exhaustive mode scopes provider controls to an isolated oracle handle."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("HIPDNN_FORCE_BENCHMARKING", raising=False)
+        monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
+
+    def _run(self, factory, oracle_mode, monkeypatch):
+        with (
+            patch(
+                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
+                side_effect=lambda eid: f"engine_{eid}",
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
+                return_value=None,
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.BufferManager",
+                return_value=_make_bm_mock(),
+            ),
+        ):
+            return run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(oracle_mode=oracle_mode),
+                handle=MagicMock(),
+            )
+
+    def test_exhaustive_forces_benchmarking_before_plan_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = {}
+        factory, instances = _make_oracle_exec_factory()
+
+        def make_instance_with_capture(*args, **kwargs):
+            m = factory(*args, **kwargs)
+            if len(instances) == 3:
+                seen["force"] = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
+            return m
+
+        self._run(make_instance_with_capture, "exhaustive", monkeypatch)
+
+        assert seen["force"] == "1"
+        # Compiled plans must use STANDARD autotune mode. Provider
+        # benchmarking was latched while the plans were built.
+        assert instances[2].autotune.call_args.kwargs == {}
+
+    def test_exhaustive_disables_the_cache_before_plan_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exhaustive winner must not persist into a later OOTB baseline."""
+        seen = {}
+        factory, instances = _make_oracle_exec_factory()
+
+        def make_instance_with_capture(*args, **kwargs):
+            m = factory(*args, **kwargs)
+            if len(instances) == 3:
+                seen["disable_cache"] = os.environ.get("HIPDNN_DISABLE_CACHE")
+            return m
+
+        self._run(make_instance_with_capture, "exhaustive", monkeypatch)
+
+        assert seen["disable_cache"] == "1"
+
+    def test_exhaustive_restores_env_after_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        factory, _ = _make_oracle_exec_factory()
+        self._run(factory, "exhaustive", monkeypatch)
+        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
+        assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+    def test_exhaustive_restores_preexisting_value_not_delete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
+        factory, _ = _make_oracle_exec_factory()
+        self._run(factory, "exhaustive", monkeypatch)
+        assert os.environ["HIPDNN_DISABLE_CACHE"] == "0"
+
+    def test_exhaustive_marks_supported_provider_tuning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        factory, _ = _make_oracle_exec_factory(
+            candidates=[_make_candidate(supports_exhaustive=True)]
+        )
+        oracle = self._run(factory, "exhaustive", monkeypatch).results[0].oracle
+        assert oracle.exhaustive_requested is True
+        assert oracle.exhaustive_supported is True
+        assert oracle.tuning_available is True
+
+    def test_plan_mode_never_sets_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = {}
+        factory, instances = _make_oracle_exec_factory()
+
+        def make_instance_with_capture(*args, **kwargs):
+            m = factory(*args, **kwargs)
+            if len(instances) == 3:
+                seen["force"] = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
+                seen["disable_cache"] = os.environ.get("HIPDNN_DISABLE_CACHE")
+            return m
+
+        result = self._run(make_instance_with_capture, "plan", monkeypatch)
+
+        assert seen == {"force": None, "disable_cache": None}
+        assert result.results[0].oracle.exhaustive_requested is False
+
+    def test_exception_inside_guard_still_restores_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        factory, _ = _make_oracle_exec_factory(
+            autotune_side_effect=ExecutionError("no candidate succeeded")
+        )
+        result = self._run(factory, "exhaustive", monkeypatch)
+        assert (
+            result.results[0].oracle_error == "ExecutionError: no candidate succeeded"
+        )
+        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
+        assert "HIPDNN_DISABLE_CACHE" not in os.environ

@@ -249,6 +249,71 @@ the following are rejected with `--backend pytorch`:
 - `--engine` / `--plugin-path` (no hipDNN engine plugins are loaded)
 - `--validate pytorch` (the backend would validate against itself)
 - `--pmc` / `--emit-trace` / `--perf` / `--roofline` (rocprofv3-based passes)
+- `--oracle-mode` (auto-tuning is a hipDNN engine feature)
+
+### Oracle (Auto-Tuned) Comparison
+
+Use `--oracle-mode` to compare the normal out-of-the-box (OOTB) plan with
+hipDNN's tuned plan for each engine:
+
+| Mode | Behavior |
+|---|---|
+| `off` | Run only the OOTB plan. This is the default. |
+| `plan` | Benchmark every backend-generated plan for the engine. |
+| `exhaustive` | Run `plan` mode and enable provider-managed kernel selection where supported. |
+
+The exhaustive path keeps every plan returned by the backend. It does not
+generate a Cartesian product of public knob values. The kernel ingestor and
+MIOpen currently support provider-level selection; other engines, including
+hipBLASLt, remain at plan-level tuning. Providers can reuse cached selections,
+so exhaustive mode does not prove that every variant was measured during the
+current invocation.
+
+Both modes are slower than a normal run. Use `--engine` to limit the work.
+`exhaustive` requires `--warmup >= 1`.
+
+The summary table shows:
+
+- `ootb_kernel_mean_ms`: the original OOTB measurement.
+- `warm_ootb_kernel_mean_ms`: the same OOTB plan re-measured after tuning.
+- `oracle_kernel_mean_ms`: the selected plan measured after tuning.
+- `oracle_speedup`: `warm_ootb_kernel_mean_ms / oracle_kernel_mean_ms`.
+
+The warm OOTB measurement is the comparison baseline because it has comparable
+device warmup. The oracle can be slower; `0.99x` is a valid measured result.
+An unsupported single-plan row prints `no-search` and stays outside the suite
+geometric mean.
+
+JSON records the candidate counts and the provider-level state:
+
+| Field | Meaning |
+|---|---|
+| `compiled_plans_benchmarked` | Compiled plans measured successfully. |
+| `compiled_plans_total` | Eligible compiled plans, including failures. |
+| `exhaustive_requested` | The run requested provider-level tuning. |
+| `exhaustive_supported` | The engine advertises `global.benchmarking`. |
+| `exhaustive_enabled` | Provider-level tuning was requested and supported. |
+| `tuning_available` | Multiple plans competed or provider-level tuning was enabled. |
+
+These counts do not include provider-internal kernel variants; hipDNN exposes
+no count for them. An empty `knob_settings` list means that no public plan knob
+was set explicitly.
+
+With `--validate`, the tool validates the OOTB and tuned plans independently.
+It reports no speedup if either plan fails.
+
+Cache state can affect selection. Set
+`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold heuristic baseline.
+Exhaustive mode disables hipDNN's provider caches during its oracle pass, but
+MIOpen FindDb and performance-database entries can still supply existing tuned
+selections. The output records the relevant cache and MIOpen database paths in
+`metadata.hipdnn_selection_env`.
+
+```bash
+HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 python -m dnn_benchmarking \
+  --graph ./graphs/sample_conv_fwd.json \
+  --oracle-mode exhaustive -v -o oracle.json
+```
 
 ### Cross-Machine Comparison (ROCm vs CUDA)
 

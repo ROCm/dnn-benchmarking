@@ -9,6 +9,7 @@ statistics and correctness data. Error entries carry status + message only.
 """
 
 import json
+import os
 import socket
 import sys
 from dataclasses import dataclass, field
@@ -48,6 +49,17 @@ class CorrectnessResult:
     def passed(self) -> bool:
         """Overall pass = executed successfully AND tolerance matched."""
         return self.execution_success and (self.tolerance_match is True)
+
+    @property
+    def explicitly_failed(self) -> bool:
+        """True only when validation ran and returned a negative verdict.
+
+        ``passed`` is also False for ``tolerance_match=None``, which means
+        "not checked" -- the default when no reference was requested. Callers
+        that gate on a real failure must use this instead, or a plain run
+        looks like a suite of failures.
+        """
+        return not self.execution_success or self.tolerance_match is False
 
     @classmethod
     def failed(
@@ -91,6 +103,123 @@ class CorrectnessResult:
         if self.error_message is not None:
             d["error_message"] = self.error_message
         return d
+
+
+@dataclass
+class OracleResult:
+    """Post-tuning result for one engine row.
+
+    ``sweep_min_time_ms`` is the fastest single selection-sweep iteration.
+    Reported timing comes from the later ``gpu_kernel_stats`` or ``host_stats``
+    benchmark.
+
+    Candidate counts describe compiled plans, not provider-internal kernels.
+    ``exhaustive_enabled`` means the selected engine advertises
+    ``global.benchmarking`` and the run requested it. Providers can reuse
+    cached selections, so it does not prove a fresh search occurred.
+
+    ``warm_baseline_*`` contains the OOTB plan re-timed after selection. The
+    delta uses this warm measurement, not the row's earlier OOTB timing.
+    ``correctness`` is the tuned plan's verdict; the row retains the OOTB
+    verdict.
+    """
+
+    plan_name: str
+    compiled_plan_index: int
+    rank: int
+    sweep_min_time_ms: float
+    compiled_plans_benchmarked: int
+    compiled_plans_total: int
+    compiled_plans_failed: int
+    knob_settings: List[Dict[str, Any]]
+    exhaustive_requested: bool = False
+    exhaustive_supported: bool = False
+    cpu_build_time_ms: Optional[float] = None
+    gpu_kernel_stats: Optional[BenchmarkStats] = None
+    host_stats: Optional[BenchmarkStats] = None
+    warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
+    warm_baseline_host_stats: Optional[BenchmarkStats] = None
+    correctness: Optional[CorrectnessResult] = None
+
+    @property
+    def exhaustive_enabled(self) -> bool:
+        """True when a capable provider was built for exhaustive selection."""
+        return self.exhaustive_requested and self.exhaustive_supported
+
+    @property
+    def tuning_available(self) -> bool:
+        """Return whether this pass had a tuning alternative."""
+        return self.compiled_plans_total > 1 or self.exhaustive_enabled
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "plan_name": self.plan_name,
+            "compiled_plan_index": self.compiled_plan_index,
+            "rank": self.rank,
+            "sweep_min_time_ms": self.sweep_min_time_ms,
+            "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
+            "compiled_plans_total": self.compiled_plans_total,
+            "compiled_plans_failed": self.compiled_plans_failed,
+            "tuning_available": self.tuning_available,
+            "knob_settings": list(self.knob_settings),
+            "exhaustive_requested": self.exhaustive_requested,
+            "exhaustive_enabled": self.exhaustive_enabled,
+            "exhaustive_supported": self.exhaustive_supported,
+            "cpu_build_time_ms": self.cpu_build_time_ms,
+            "gpu_kernel_stats": (
+                self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
+            ),
+            "host_stats": self.host_stats.to_dict() if self.host_stats else None,
+            "warm_baseline_gpu_kernel_stats": (
+                self.warm_baseline_gpu_kernel_stats.to_dict()
+                if self.warm_baseline_gpu_kernel_stats
+                else None
+            ),
+            "warm_baseline_host_stats": (
+                self.warm_baseline_host_stats.to_dict()
+                if self.warm_baseline_host_stats
+                else None
+            ),
+            "correctness": (self.correctness.to_dict() if self.correctness else None),
+        }
+
+
+@dataclass
+class OracleDelta:
+    """Warm heuristic baseline vs tuned run for one engine row.
+
+    Both sides are measured after the autotuning sweep, back to back on the
+    same buffers, so device warmth is common to them and the ratio isolates
+    the plan change. This is deliberately not the row's headline OOTB
+    timing: that one is measured before the sweep exists and is the
+    "what you get out of the box" number, which at low ``--warmup`` can sit
+    well above steady state and would inflate the speedup.
+
+    Attributes:
+        basis: Which timing pair the comparison used.
+        baseline_mean_ms: Mean of the heuristic plan, re-timed post-sweep.
+        oracle_mean_ms: Mean of the post-tuning run.
+        delta_ms: ``baseline_mean_ms - oracle_mean_ms``; positive means the
+            oracle is faster.
+        speedup: ``baseline_mean_ms / oracle_mean_ms``.
+    """
+
+    basis: Literal["gpu_kernel", "host"]
+    baseline_mean_ms: float
+    oracle_mean_ms: float
+    delta_ms: float
+    speedup: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "basis": self.basis,
+            "baseline_mean_ms": self.baseline_mean_ms,
+            "oracle_mean_ms": self.oracle_mean_ms,
+            "delta_ms": self.delta_ms,
+            "speedup": self.speedup,
+        }
 
 
 @dataclass
@@ -143,6 +272,12 @@ class ProviderEngineResult:
         extra_metrics: Opt-in profiling payload from rocprofv3 PMC /
             traces, perf, and rocprof-compute roofline. None when no
             opt-in profiling flag was supplied.
+        oracle: Post-tuning result for this engine row. Set only when
+            ``--oracle-mode`` was requested and tuning succeeded.
+        oracle_delta: OOTB-vs-oracle comparison. None when either side
+            lacks comparable statistics.
+        oracle_error: Why tuning produced no result for this row.
+            Mutually exclusive with ``oracle``.
 
     Note:
         Process RSS, host RAM availability, and the volatile parts of
@@ -186,6 +321,10 @@ class ProviderEngineResult:
     vram_used_mb: Optional[float] = None
     # Opt-in profiling payload (rocprofv3 PMC / trace, perf, roofline).
     extra_metrics: Optional[Dict[str, Any]] = None
+    # Opt-in oracle (auto-tuned) comparison payload.
+    oracle: Optional[OracleResult] = None
+    oracle_delta: Optional[OracleDelta] = None
+    oracle_error: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate status field."""
@@ -267,6 +406,12 @@ class ProviderEngineResult:
                 d["vram_used_mb"] = self.vram_used_mb
             if self.extra_metrics is not None:
                 d["extra_metrics"] = self.extra_metrics
+            if self.oracle is not None:
+                d["oracle"] = self.oracle.to_dict()
+            if self.oracle_delta is not None:
+                d["oracle_delta"] = self.oracle_delta.to_dict()
+            if self.oracle_error is not None:
+                d["oracle_error"] = self.oracle_error
         elif self.status == "error":
             d["error_message"] = self.error_message
         elif self.status == "skipped":
@@ -275,6 +420,52 @@ class ProviderEngineResult:
         if self.correctness is not None:
             d["correctness"] = self.correctness.to_dict()
         return d
+
+
+def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
+    """Compare the warm heuristic baseline against the tuned run.
+
+    Both operands come from ``oracle``: the sweep-adjacent re-timing of the
+    heuristic plan and the post-tuning run. The row's own OOTB timing is
+    deliberately not used — it is measured before the sweep, so at low
+    ``--warmup`` it can sit above steady state and report a speedup that is
+    accumulated warmup rather than a better plan.
+
+    Prefers GPU kernel time; falls back to host time when either side has
+    no kernel statistics.
+
+    Args:
+        oracle: The post-tuning result, carrying its own warm baseline.
+
+    Returns:
+        An OracleDelta, or None when no comparable statistics pair exists
+        or the oracle mean is zero.
+    """
+    basis: Literal["gpu_kernel", "host"]
+    if (
+        oracle.warm_baseline_gpu_kernel_stats is not None
+        and oracle.gpu_kernel_stats is not None
+    ):
+        basis = "gpu_kernel"
+        baseline_mean = oracle.warm_baseline_gpu_kernel_stats.mean_ms
+        oracle_mean = oracle.gpu_kernel_stats.mean_ms
+    elif oracle.warm_baseline_host_stats is not None and oracle.host_stats is not None:
+        basis = "host"
+        baseline_mean = oracle.warm_baseline_host_stats.mean_ms
+        oracle_mean = oracle.host_stats.mean_ms
+    else:
+        return None
+
+    if oracle_mean == 0.0:
+        return None
+
+    return OracleDelta(
+        basis=basis,
+        baseline_mean_ms=baseline_mean,
+        oracle_mean_ms=oracle_mean,
+        delta_ms=baseline_mean - oracle_mean,
+        speedup=baseline_mean / oracle_mean,
+    )
 
 
 class StatusCounts(NamedTuple):
@@ -404,6 +595,12 @@ class SuiteMetadata:
             suite end, via amdsmi. Reflects steady-state allocation, not
             per-kernel peak.
         vram_total_mb: Total VRAM on the GPU at suite end, via amdsmi.
+        hipdnn_selection_env: hipDNN cache/benchmarking and MIOpen
+            perf-db path environment variables sampled at suite end,
+            recorded only for oracle runs (``--oracle-mode plan`` or
+            ``exhaustive``). A ``None`` value means the variable was not
+            set, which is the load-bearing signal for cache-affected OOTB
+            timings.
     """
 
     timestamp: str
@@ -436,10 +633,11 @@ class SuiteMetadata:
     host_ram_available_mb: Optional[float] = None
     vram_used_mb: Optional[float] = None
     vram_total_mb: Optional[float] = None
+    hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return {
+        d: Dict[str, Any] = {
             "timestamp": self.timestamp,
             "hostname": self.hostname,
             "total_graphs": self.total_graphs,
@@ -473,6 +671,9 @@ class SuiteMetadata:
             "vram_used_mb": self.vram_used_mb,
             "vram_total_mb": self.vram_total_mb,
         }
+        if self.hipdnn_selection_env is not None:
+            d["hipdnn_selection_env"] = dict(self.hipdnn_selection_env)
+        return d
 
 
 @dataclass
@@ -495,6 +696,7 @@ class SuiteResult:
         *,
         pytorch_sdpa_backend_requested: Optional[str] = None,
         pytorch_rocm_fa_library_requested: Optional[str] = None,
+        oracle: bool = False,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
         env_info = collect_environment_info()
@@ -531,6 +733,21 @@ class SuiteResult:
         except Exception:
             pass
 
+        # Record selection controls only for oracle runs.
+        hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
+        if oracle:
+            hipdnn_selection_env = {
+                name: os.environ.get(name)
+                for name in (
+                    "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
+                    "HIPDNN_CACHE_DIR",
+                    "HIPDNN_DISABLE_CACHE",
+                    "HIPDNN_FORCE_BENCHMARKING",
+                    "MIOPEN_USER_DB_PATH",
+                    "MIOPEN_CUSTOM_CACHE_DIR",
+                )
+            }
+
         metadata = SuiteMetadata(
             timestamp=datetime.now(timezone.utc).isoformat(),
             hostname=socket.gethostname(),
@@ -562,6 +779,7 @@ class SuiteResult:
             host_ram_available_mb=host_ram_available_mb,
             vram_used_mb=vram_used_mb,
             vram_total_mb=vram_total_mb,
+            hipdnn_selection_env=hipdnn_selection_env,
         )
         return cls(metadata=metadata, graphs=graph_results)
 
