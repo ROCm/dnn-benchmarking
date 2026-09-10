@@ -107,67 +107,21 @@ class CorrectnessResult:
 
 @dataclass
 class OracleResult:
-    """Post-tuning timed run for one engine row.
+    """Post-tuning result for one engine row.
 
-    Timing fields come from a clean benchmark pass executed after the
-    autotuning sweep selected and activated a winner. Sweep-time
-    measurements are diagnostics only and appear as ``sweep_min_time_ms``.
+    ``sweep_min_time_ms`` is the fastest single selection-sweep iteration.
+    Reported timing comes from the later ``gpu_kernel_stats`` or ``host_stats``
+    benchmark.
 
-    The winning engine is not repeated here: candidates are filtered to the
-    row's own engine, so it is always the enclosing
-    :class:`ProviderEngineResult`'s ``engine_id`` / ``provider``.
-    :meth:`Executor.autotune` rejects a winner that says otherwise.
+    Candidate counts describe compiled plans, not provider-internal kernels.
+    ``exhaustive_enabled`` means the selected engine advertises
+    ``global.benchmarking`` and the run requested it. Providers can reuse
+    cached selections, so it does not prove a fresh search occurred.
 
-    Attributes:
-        plan_name: Name of the plan hipDNN activated after tuning.
-        compiled_plan_index: Index of the winning plan in the compiled set.
-        rank: Sweep rank of the winner (0 is fastest).
-        sweep_min_time_ms: Winner's fastest sweep iteration. hipDNN ranks
-            candidates on this value. Diagnostic only: the reported oracle
-            timing is the post-tuning benchmark pass, not the sweep.
-        compiled_plans_benchmarked: Number of compiled plan candidates that
-            benchmarked successfully. This counts *plans*, not provider-internal
-            kernel variants: a provider that samples variants inside a single
-            plan still reports 1 here.
-        compiled_plans_total: Number of eligible compiled plan candidates
-            returned by the sweep, including candidates that failed.
-        compiled_plans_failed: Number of eligible compiled plan candidates that
-            failed to benchmark successfully.
-        knob_settings: ``{"knob_id": str, "value": int|float|str}`` entries for
-            plan knobs the sweep set explicitly. ``[]`` means "no explicit plan
-            knob settings", i.e. engine defaults. It does *not* mean the
-            provider explored no internal kernel variants. hipDNN exposes no
-            count of provider-internal variants, so none is reported.
-        exhaustive_requested: True when the run asked for
-            ``--oracle-mode exhaustive``.
-        exhaustive_supported: True when the winning engine advertises the
-            ``global.benchmarking`` knob. When both exhaustive fields are True,
-            the provider plan was built with benchmarking enabled. The provider
-            can reuse an existing tuned selection, so this does not prove that
-            this invocation performed a fresh search.
-        cpu_build_time_ms: Build time of the autotune-capable graph. Not
-            comparable to the row's own ``cpu_build_time_ms``: this build
-            enumerates every engine's plans before barring all but one, so it
-            measures a different amount of work than the OOTB build.
-        gpu_kernel_stats: GPU kernel timing of the post-tuning run.
-        host_stats: Host-side timing of the post-tuning run.
-        warm_baseline_gpu_kernel_stats: GPU kernel timing of the *heuristic*
-            plan, re-measured after the sweep. The row's own timing cannot
-            serve as the comparand: the sweep executes the engine's plans
-            many times, so the tuned run is measured on a hotter device than
-            the OOTB pass ever saw. Re-timing the heuristic plan here puts
-            both sides in one warm state, so the delta reflects the plan
-            change instead of accumulated warmup.
-        warm_baseline_host_stats: Host-side counterpart of the above.
-        tuning_available: Derived. True when the pass had an alternative
-            configuration to select: more than one compiled plan candidate, or
-            provider benchmarking was enabled on an engine that advertises it.
-            This does not imply that the provider performed a fresh search;
-            provider caches can supply an existing tuned selection.
-        correctness: Validation verdict for the *tuned* plan, when a reference
-            was available. The row's own ``correctness`` is the OOTB verdict
-            and is separate. A tuned plan that fails validation publishes no
-            ``oracle_delta``.
+    ``warm_baseline_*`` contains the OOTB plan re-timed after selection. The
+    delta uses this warm measurement, not the row's earlier OOTB timing.
+    ``correctness`` is the tuned plan's verdict; the row retains the OOTB
+    verdict.
     """
 
     plan_name: str
@@ -194,13 +148,7 @@ class OracleResult:
 
     @property
     def tuning_available(self) -> bool:
-        """True when tuning had an alternative configuration to select.
-
-        Provider benchmarking can reuse a cached tuned selection. The API does
-        not expose whether this invocation performed a fresh search, so this
-        property records capability plus activation rather than making that
-        stronger claim.
-        """
+        """Return whether this pass had a tuning alternative."""
         return self.compiled_plans_total > 1 or self.exhaustive_enabled
 
     def to_dict(self) -> Dict[str, Any]:
@@ -785,9 +733,7 @@ class SuiteResult:
         except Exception:
             pass
 
-        # Oracle runs record the hipDNN switches that change what either
-        # pass measures, so an implausible OOTB-vs-oracle gap is
-        # diagnosable from the JSON alone.
+        # Record selection controls only for oracle runs.
         hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
         if oracle:
             hipdnn_selection_env = {

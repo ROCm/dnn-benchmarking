@@ -1000,12 +1000,9 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
-# Provider benchmarking is selected when the oracle plan is built. Keep the
-# switch scoped to that plan and disable hipDNN's disk caches so it cannot
-# change later OOTB runs. MIOpen's database remains independent and can supply
-# an existing tuned selection.
-# ponytail: process-global guard, safe only while the suite loop is
-# single-threaded; concurrent graph execution would need a subprocess boundary.
+# Benchmarking is latched when oracle plans are built. Disable hipDNN disk
+# caches so the selected provider variant cannot affect later runs.
+# ponytail: process-global guard; concurrent execution needs process isolation.
 _EXHAUSTIVE_ENV = {
     "HIPDNN_FORCE_BENCHMARKING": "1",
     "HIPDNN_DISABLE_CACHE": "1",
@@ -1014,11 +1011,7 @@ _EXHAUSTIVE_ENV = {
 
 @contextmanager
 def _exhaustive_env(enabled: bool):
-    """Set exhaustive provider controls for the enclosed oracle pass.
-
-    A no-op when ``enabled`` is False. Restores every touched variable to
-    its prior state on exit, including deleting one that was unset.
-    """
+    """Set provider benchmarking controls and restore the prior environment."""
     if not enabled:
         yield
         return
@@ -1049,45 +1042,10 @@ def _run_oracle_pass(
     graph_json: Dict[str, Any],
     reference_outputs: Optional[Dict[int, Any]],
 ) -> None:
-    """Tune ``engine_id`` on the same graph and record the post-tuning timing.
-
-    Builds a second graph with every candidate plan compiled, runs one
-    hipDNN auto-tuning sweep restricted to ``engine_id``, then times the
-    winning plan with the user's warmup/iteration counts.
-
-    Mutates ``result.oracle``/``result.oracle_delta`` on success and
-    ``result.oracle_error`` on any failure. Never raises: a tuning failure
-    must not fail the OOTB row.
-
-    When a reference is available the tuned plan is validated the same way
-    the OOTB pass is, after its timed loop. A tuned plan that fails
-    validation publishes no ``oracle_delta``: a wrong result must not carry
-    an apparently valid speedup. The row's own OOTB correctness is separate
-    and is never overwritten here.
-
-    Args:
-        result: The completed OOTB row to attach the oracle payload to.
-        graph_path: Path of the graph under test.
-        graph_json_str: Serialized graph, rebuilt for the autotune executor.
-        graph_name: Graph name recorded in the benchmark metadata.
-        config: Suite configuration (warmup/iteration counts).
-        handle: hipdnn.Handle instance.
-        engine_id: Engine the sweep is restricted to.
-        bm: The OOTB pass's BufferManager, reused so both passes read
-            identical input data.
-        ootb_executor: The prepared OOTB executor, re-timed after the sweep
-            so the comparison operands share one warm state.
-        tensor_infos: Tensor metadata used to read back tuned outputs.
-        graph_json: Parsed graph, for per-output tolerance selection.
-        reference_outputs: Cached reference outputs, or None when the user
-            asked for no validation. None skips the tuned-plan check.
-    """
+    """Tune one engine and attach its result without failing the OOTB row."""
     try:
         with _exhaustive_env(config.oracle_exhaustive):
-            # A separate handle isolates provider-local state. MIOpen resolves
-            # an algorithm's solver through a mutable per-handle map on every
-            # execute, so sharing the OOTB handle would let oracle tuning alter
-            # the baseline plan when it is re-timed below.
+            # Isolate MIOpen's mutable per-handle solver map from the baseline.
             oracle_handle = type(handle)()
             get_stream = getattr(handle, "get_stream", None)
             set_stream = getattr(oracle_handle, "set_stream", None)
@@ -1105,11 +1063,7 @@ def _run_oracle_pass(
             )
             executor.prepare(oracle_handle, engine_id=engine_id, for_autotune=True)
 
-            # The OOTB correctness re-execution leaves outputs populated; zeroing
-            # them restores the OOTB starting state. The inputs need no reload:
-            # they are disjoint from the output set, and the OOTB pass already
-            # relies on them surviving its own warmup, timed loop, and correctness
-            # re-execution without one.
+            # Restore outputs; inputs remain valid across executions.
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
@@ -1124,13 +1078,7 @@ def _run_oracle_pass(
             ]
             winner = successful_candidates[0]
 
-            # Warmth parity. The sweep just executed this engine's plans up to
-            # a hundred times, so timing the tuned plan now measures a hotter
-            # device than the OOTB pass ever saw. Re-time the heuristic plan
-            # here, between the sweep and the tuned run, so both operands carry
-            # the same warmup history and the ratio isolates the plan change.
-            # Without this the tool reports large speedups on graphs where the
-            # sweep had exactly one candidate and changed nothing at all.
+            # Re-time OOTB after the sweep so both operands share device warmth.
             bm.zero_outputs()
             ootb_executor.warmup(handle, variant_pack)
             baseline_result = ootb_executor.benchmark(
@@ -1176,15 +1124,9 @@ def _run_oracle_pass(
                 exhaustive_supported=bool(
                     getattr(winner, "supports_exhaustive", False)
                 ),
-                # The compiled-plan API reports capability in STANDARD mode.
-                # It cannot report whether a provider performed a fresh search:
-                # providers can reuse an existing tuned selection.
             )
 
-            # Validate the tuned plan the same way the OOTB pass is validated,
-            # after its timed loop so the check never lands inside a
-            # measurement. The row's own `result.correctness` stays the OOTB
-            # verdict; this one belongs to the tuned plan.
+            # Validate after timing; keep OOTB and tuned verdicts separate.
             if reference_outputs is not None:
                 bm.zero_outputs()
                 executor.execute_once(oracle_handle, variant_pack)
@@ -1198,9 +1140,7 @@ def _run_oracle_pass(
                 )
 
             result.oracle = oracle
-            # Both operands must be trustworthy. A wrong tuned plan must not
-            # advertise a gain, and a wrong baseline cannot measure one: a
-            # broken OOTB run is not a legitimate comparand either.
+            # A speedup requires two valid operands.
             invalid = [
                 side
                 for side, verdict in (
@@ -1210,8 +1150,7 @@ def _run_oracle_pass(
                 if verdict is not None and verdict.explicitly_failed
             ]
             if invalid:
-                # Keep the timings, which are still evidence, and both
-                # verdicts, which stay separate. Refuse only the comparison.
+                # Preserve timing and verdict evidence, but refuse the ratio.
                 result.oracle_delta = None
                 warn_once(
                     "oracle_correctness",

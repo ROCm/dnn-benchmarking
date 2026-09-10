@@ -255,15 +255,8 @@ class Executor:
                 )
 
             if for_autotune and engine_id is not None:
-                # Bar every other engine before compiling. build_plans(ALL)
-                # marks a barred plan and skips it *before*
-                # finalizePlanDescriptor, so this drops E-1 engine compiles per
-                # row, and get_autotune_workspace_size() ignores barred plans,
-                # so the workspace shrinks to this engine's plans. That matters
-                # because it is allocated while the OOTB workspace is still
-                # live. The tuning candidate set is unchanged: engine_id_filter
-                # already restricted benchmarking to engine_id, so barring the
-                # rest only changes which non-benchmarked reason they report.
+                # Compile only this engine's plans. The engine filter controls
+                # measurement; barring also avoids unrelated compile/workspace cost.
                 others = [
                     int(eid)
                     for eid in self._graph.get_ranked_engine_ids()
@@ -280,13 +273,9 @@ class Executor:
                 raise ExecutionError(f"Failed to build plans: {result.get_message()}")
 
             if not for_autotune:
-                # No plan is pinned yet on the autotune path, so the
-                # forced-engine mismatch check would fire spuriously.
                 self._record_selected_engine(engine_id)
 
             if for_autotune:
-                # Largest workspace across all compiled candidates: every
-                # candidate the sweep benchmarks must fit in it.
                 workspace_size = self._graph.get_autotune_workspace_size()
             else:
                 workspace_size = self._graph.get_workspace_size()
@@ -303,29 +292,11 @@ class Executor:
         variant_pack: Dict[int, int],
         engine_id: int,
     ) -> List[Any]:
-        """Benchmark every compiled plan for ``engine_id`` and activate the winner.
+        """Benchmark this engine's compiled plans and activate the winner.
 
-        Requires a graph prepared with ``prepare(..., for_autotune=True)``.
-        The winning plan is left active by hipDNN, so a following
-        warmup/benchmark runs it with no further setup.
-
-        Args:
-            handle: hipdnn.Handle instance.
-            variant_pack: Mapping of tensor UIDs to device pointers.
-            engine_id: Engine the candidate plans are restricted to.
-            The provider plan can already have kernel benchmarking enabled at
-            build time. This method keeps the compiled-plan autotune mode at
-            STANDARD because hipDNN rejects EXHAUSTIVE mode on that path.
-
-        Returns:
-            All AutotuneResult entries, with successful candidates first in
-            rank order and failed candidates after them. The winning plan is
-            the first successful entry. Failed candidates remain available so
-            callers can report partial sweep failures.
-
-        Raises:
-            ExecutionError: If the graph is not prepared, autotuning fails, or
-                no candidate plan benchmarked successfully.
+        Provider benchmarking can be enabled while the plans are built. Keep
+        this compiled-plan sweep in STANDARD mode because hipDNN rejects
+        ``TuneMode.EXHAUSTIVE`` here.
         """
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
@@ -339,30 +310,25 @@ class Executor:
 
         cfg = hipdnn.AutotuneConfig()
         cfg.engine_id_filter = [engine_id]
-        # A zero warmup would rank candidates on first-execute sampling.
-        # Keep at least one warmup iteration in the sweep; the caller's
-        # separate benchmark still honors ``--warmup 0``.
+        # At least one warmup keeps first-execute provider setup out of the
+        # candidate timing. The later reported benchmark keeps the user's
+        # configured warmup count.
         cfg.warmup_iterations = max(1, self._config.warmup_iters)
-        # Keep STANDARD mode. The graph contains pre-compiled plans, which
-        # hipDNN rejects with TuneMode.EXHAUSTIVE. Provider-side benchmarking,
-        # when requested, was latched while those plans were built.
-
+        # Precompiled plans preserve the backend's candidate set. A default
+        # plan spec narrows it; add_engine_sweep() invents knob combinations.
         try:
-            # Omit workspace_size: passing it selects the plan-spec overload
-            # used with add_engine_*, which is not the compiled-plan path.
+            # Omitting workspace_size selects the compiled-plan overload.
             results = self._graph.autotune(
                 handle, variant_pack, self._workspace_ptr, config=cfg
             )
         except RuntimeError as e:
             raise ExecutionError(f"Autotuning failed: {e}") from e
 
-        # hipDNN returns succeeded candidates first, in ascending rank order,
-        # then failed candidates with rank -1, so no re-sort is needed.
+        # hipDNN returns successes first in rank order.
         winners = [r for r in results if r.succeeded]
         if not winners:
-            # Candidates the caller's own filters rejected are not
-            # benchmarked and carry the filter's message, not a real
-            # failure, so skip them and report this engine's actual reason.
+            # Ignore candidates excluded by caller filters when choosing the
+            # actionable failure message.
             message = next(
                 (
                     r.error_message
@@ -377,14 +343,12 @@ class Executor:
 
         winner = winners[0]
         if int(winner.engine_id) != engine_id:
-            # engine_id_filter makes this impossible; a mismatch would mean the
-            # oracle timing is labelled with the wrong engine.
+            # A mismatch would attach timing to the wrong engine row.
             raise ExecutionError(
                 f"Autotune winner is engine {int(winner.engine_id)}, but "
                 f"candidates were filtered to engine {engine_id}"
             )
 
-        # Refresh the recorded engine from the plan autotune just activated.
         self._record_selected_engine(None)
         return results
 

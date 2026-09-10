@@ -401,25 +401,25 @@ class Reporter:
             return
 
         include_plugin = any(pe.plugin_path for pe in graph_result.results)
+        include_oracle = any(
+            pe.oracle or pe.oracle_error for pe in graph_result.results
+        )
         headers = ["engine", "status"]
         if include_plugin:
             headers.append("plugin_path")
         headers.extend(
             [
-                "kernel_mean_ms",
+                "ootb_kernel_mean_ms" if include_oracle else "kernel_mean_ms",
                 "kernel_median_ms",
                 "host_mean_ms",
                 "host_median_ms",
             ]
         )
         include_warnings = any(pe.warnings for pe in graph_result.results)
-        include_oracle = any(
-            pe.oracle or pe.oracle_error for pe in graph_result.results
-        )
         if include_oracle:
             headers.extend(
                 [
-                    "warm_baseline_kernel_mean_ms",
+                    "warm_ootb_kernel_mean_ms",
                     "oracle_kernel_mean_ms",
                     "oracle_speedup",
                 ]
@@ -440,9 +440,7 @@ class Reporter:
                 ]
             )
             if include_oracle:
-                # oracle_speedup is tuned vs this warm baseline, never vs the
-                # row's own OOTB kernel_mean_ms. Show it so the printed ratio
-                # can be checked against the numbers on the same line.
+                # Show the warm OOTB operand used by oracle_speedup.
                 row.append(
                     self._fmt_stat(pe.oracle.warm_baseline_gpu_kernel_stats, "mean_ms")
                     if pe.oracle is not None
@@ -453,9 +451,7 @@ class Reporter:
                     if pe.oracle is not None
                     else "n/a"
                 )
-                # Either operand failing makes the ratio meaningless: a wrong
-                # tuned plan has not earned a gain, and a wrong baseline cannot
-                # measure one.
+                # A speedup requires two valid operands.
                 if any(
                     verdict is not None and verdict.explicitly_failed
                     for verdict in (
@@ -465,8 +461,7 @@ class Reporter:
                 ):
                     row.append("invalid")
                 elif pe.oracle is not None and not pe.oracle.tuning_available:
-                    # One fixed configuration was re-measured. Printing a ratio
-                    # here would read as a tuning gain; it is noise.
+                    # A single fixed configuration produced only timing noise.
                     row.append("no-search")
                 elif pe.oracle_delta is not None:
                     row.append(f"{pe.oracle_delta.speedup:.2f}x")
@@ -645,8 +640,8 @@ class Reporter:
                     "no speedup is reported for this row"
                 )
         self._print(
-            f"  Sweep best:    {o.sweep_min_time_ms:.3f} ms   "
-            "(diagnostic; not the reported oracle timing)"
+            f"  Sweep minimum: {o.sweep_min_time_ms:.3f} ms   "
+            "(fastest single iteration from the selection sweep)"
         )
         if o.gpu_kernel_stats is not None:
             self._print(f"  Kernel mean:   {o.gpu_kernel_stats.mean_ms:.3f} ms")
@@ -655,11 +650,11 @@ class Reporter:
         if pe.oracle_delta is not None:
             d = pe.oracle_delta
             self._print(
-                f"  Warm baseline: {d.baseline_mean_ms:.3f} ms   "
+                f"  Warm OOTB:     {d.baseline_mean_ms:.3f} ms   "
                 "(heuristic plan, re-timed after the sweep)"
             )
             self._print(
-                f"  Tuned vs baseline: {d.delta_ms:.3f} ms faster, "
+                f"  Tuned vs warm OOTB: {d.delta_ms:+.3f} ms faster, "
                 f"{d.speedup:.2f}x  (basis: {d.basis})"
             )
         self._print("")

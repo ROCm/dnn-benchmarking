@@ -76,10 +76,7 @@ def _run_one_graph(
         return _error_graph_result(graph_path, str(e))
 
 
-# hipDNN's own truthy set for environment switches, mirrored from the tables in
-# rocm-libraries projects/hipdnn/docs/Environment.md. Anything else, including
-# "0", leaves the switch disabled. Re-check against that doc if hipDNN changes
-# its parsing: this copy cannot follow it automatically.
+# Match hipDNN's documented truthy values. Notably, "0" leaves a switch off.
 _TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
 
 

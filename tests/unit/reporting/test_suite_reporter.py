@@ -701,6 +701,8 @@ class TestOracleReporting:
         out = output.getvalue()
         assert "oracle_kernel_mean_ms" not in out
         assert "oracle_speedup" not in out
+        assert "ootb_kernel_mean_ms" not in out
+        assert "kernel_mean_ms" in out
 
     def test_table_renders_oracle_columns(self) -> None:
         pe = _make_pe_success()
@@ -713,6 +715,7 @@ class TestOracleReporting:
         assert "oracle_speedup" in out
         assert "0.250" in out
         assert "2.00x" in out
+        assert "ootb_kernel_mean_ms" in out
 
     def test_table_marks_failed_oracle_row(self) -> None:
         pe = _make_pe_success()
@@ -738,8 +741,8 @@ class TestOracleReporting:
         assert "Compiled plans: 5 benchmarked successfully" in out
         assert "5 total, 0 failed" in out
         assert "basis: gpu_kernel" in out
-        assert "Warm baseline: 0.500 ms" in out
-        assert "Tuned vs baseline:" in out
+        assert "Warm OOTB:     0.500 ms" in out
+        assert "Tuned vs warm OOTB:" in out
 
     def test_verbose_reports_exhaustive_provider_selection(self) -> None:
         pe = _make_pe_success()
@@ -834,7 +837,7 @@ class TestOracleReporting:
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
-        assert "warm_baseline_kernel_mean_ms" in out
+        assert "warm_ootb_kernel_mean_ms" in out
         # 0.500 baseline / 0.250 tuned = the printed 2.00x.
         assert "0.500" in out
         assert "0.250" in out
