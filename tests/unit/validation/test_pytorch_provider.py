@@ -593,7 +593,10 @@ class TestPyTorchProviderNewOps:
             1: x,
             2: np.array([[[[1.0]]]], dtype=np.float32),
             3: np.array([[[[0.0]]]], dtype=np.float32),
-            4: np.array([0.0], dtype=np.float32),
+            # Epsilon guards the division; zero is not a value the op ever
+            # sees. A real 1e-5 moves y and inv_variance off their exact
+            # values -- the three stats below do not depend on it.
+            4: np.array([1e-5], dtype=np.float32),
             5: np.array([[[[10.0]]]], dtype=np.float32),
             6: np.array([[[[20.0]]]], dtype=np.float32),
             7: np.array([0.5], dtype=np.float32),
@@ -601,9 +604,9 @@ class TestPyTorchProviderNewOps:
 
         outputs = provider.compute_reference(graph_json, input_data)
 
-        np.testing.assert_allclose(outputs[8].data, [[[[-1.0, 1.0]]]], rtol=1e-6)
+        np.testing.assert_allclose(outputs[8].data, [[[[-1.0, 1.0]]]], rtol=1e-5)
         np.testing.assert_allclose(outputs[9].data, [[[[2.0]]]], rtol=1e-6)
-        np.testing.assert_allclose(outputs[10].data, [[[[1.0]]]], rtol=1e-6)
+        np.testing.assert_allclose(outputs[10].data, [[[[1.0]]]], rtol=1e-5)
         np.testing.assert_allclose(outputs[11].data, [[[[6.0]]]], rtol=1e-6)
         np.testing.assert_allclose(outputs[12].data, [[[[11.0]]]], rtol=1e-6)
 
@@ -633,11 +636,14 @@ class TestPyTorchProviderNewOps:
                 3: np.array([[[[4.0]]]], dtype=np.float32),
                 4: np.array([[[[2.0]]]], dtype=np.float32),
                 5: np.array([[[[1.0]]]], dtype=np.float32),
-                6: np.array([0.0], dtype=np.float32),
+                # Epsilon guards the division, so zero is not a configuration
+                # the op ever sees; torch rejects it outright. A real 1e-5
+                # moves y off an exact 3.0, hence the matching tolerance.
+                6: np.array([1e-5], dtype=np.float32),
             },
         )
 
-        np.testing.assert_allclose(outputs[7].data, [[[[3.0]]]], rtol=1e-6)
+        np.testing.assert_allclose(outputs[7].data, [[[[3.0]]]], rtol=1e-5)
 
     def test_batchnorm_inference_mean_inv_variance(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
@@ -927,7 +933,7 @@ class TestPyTorchProviderNewOps:
             1: np.array([[[[1.0, 3.0]]]], dtype=np.float32),
             2: np.array([[[[1.0]]]], dtype=np.float32),
             3: np.array([[[[0.0]]]], dtype=np.float32),
-            4: np.array([0.0], dtype=np.float32),
+            4: np.array([1e-5], dtype=np.float32),
         }
 
         with pytest.raises(UnsupportedGraphError, match="peer statistics"):
