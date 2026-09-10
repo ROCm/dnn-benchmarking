@@ -156,9 +156,9 @@ class Reporter:
         if not speedups:
             if no_search_rows:
                 self._print(
-                    f"Oracle comparison: no tuning search available on any of "
-                    f"{no_search_rows} engine rows (one compiled plan each, "
-                    f"provider benchmarking not forced); no speedup reported"
+                    f"Oracle comparison: no tuning alternatives available on "
+                    f"any of {no_search_rows} engine rows (one compiled plan "
+                    f"each, provider tuning unavailable); no speedup reported"
                 )
             return
         suffix = (
@@ -464,7 +464,7 @@ class Reporter:
                     )
                 ):
                     row.append("invalid")
-                elif pe.oracle is not None and not pe.oracle.tuning_explored:
+                elif pe.oracle is not None and not pe.oracle.tuning_available:
                     # One fixed configuration was re-measured. Printing a ratio
                     # here would read as a tuning gain; it is noise.
                     row.append("no-search")
@@ -619,25 +619,20 @@ class Reporter:
             f"{o.compiled_plans_failed} failed)"
         )
         if o.exhaustive_requested:
-            if o.exhaustive_ran:
+            if o.exhaustive_supported:
                 self._print(
-                    "  Exhaustive:    ran (provider sampled its kernel variants; "
-                    "hipDNN exposes no count of them)"
+                    "  Exhaustive:    enabled for this provider "
+                    "(an existing tuned selection may be reused)"
                 )
             else:
-                reason = o.exhaustive_not_run_reason or (
-                    "engine does not advertise the global.benchmarking knob"
-                    if not o.exhaustive_supported
-                    else "hipDNN reported no priming"
-                )
                 self._print(
-                    f"  Exhaustive:    requested but NOT run - {reason}; "
-                    "this engine was tuned at plan level only"
+                    "  Exhaustive:    unsupported by this engine; "
+                    "this row was tuned at plan level only"
                 )
-        if not o.tuning_explored:
+        if not o.tuning_available:
             self._print(
                 "  Tuning:        unavailable - one compiled plan and no "
-                "provider-level search actually ran, so this pass re-measured "
+                "provider-level tuning capability, so this pass re-measured "
                 "the heuristic configuration; any delta below is run-to-run noise"
             )
         if o.correctness is not None:

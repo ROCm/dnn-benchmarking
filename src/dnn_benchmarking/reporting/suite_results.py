@@ -128,7 +128,7 @@ class OracleResult:
         compiled_plans_benchmarked: Number of compiled plan candidates that
             benchmarked successfully. This counts *plans*, not provider-internal
             kernel variants: a provider that samples variants inside a single
-            plan still reports 1 here. See ``exhaustive_ran``.
+            plan still reports 1 here.
         compiled_plans_total: Number of eligible compiled plan candidates
             returned by the sweep, including candidates that failed.
         compiled_plans_failed: Number of eligible compiled plan candidates that
@@ -136,20 +136,15 @@ class OracleResult:
         knob_settings: ``{"knob_id": str, "value": int|float|str}`` entries for
             plan knobs the sweep set explicitly. ``[]`` means "no explicit plan
             knob settings", i.e. engine defaults. It does *not* mean the
-            provider explored no internal kernel variants; ``exhaustive_ran``
-            records that. hipDNN exposes no count of provider-internal
-            variants, so none is reported.
+            provider explored no internal kernel variants. hipDNN exposes no
+            count of provider-internal variants, so none is reported.
         exhaustive_requested: True when the run asked for
-            ``--oracle-mode exhaustive``. A request is not a search: an engine
-            that does not implement ``global.benchmarking`` ignores it.
-        exhaustive_supported: True when hipDNN reports the winning engine
-            advertises the ``global.benchmarking`` knob. Today only the
-            generic kernel ingestor and the MIOpen provider do.
-        exhaustive_ran: True when hipDNN reports it actually primed this
-            engine, i.e. the provider did sample its kernel variants. This is
-            the only field that evidences a provider-level search.
-        exhaustive_not_run_reason: hipDNN's reason when a requested
-            exhaustive pass did not run.
+            ``--oracle-mode exhaustive``.
+        exhaustive_supported: True when the winning engine advertises the
+            ``global.benchmarking`` knob. When both exhaustive fields are True,
+            the provider plan was built with benchmarking enabled. The provider
+            can reuse an existing tuned selection, so this does not prove that
+            this invocation performed a fresh search.
         cpu_build_time_ms: Build time of the autotune-capable graph. Not
             comparable to the row's own ``cpu_build_time_ms``: this build
             enumerates every engine's plans before barring all but one, so it
@@ -164,12 +159,11 @@ class OracleResult:
             both sides in one warm state, so the delta reflects the plan
             change instead of accumulated warmup.
         warm_baseline_host_stats: Host-side counterpart of the above.
-        tuning_explored: Derived. True when the pass actually had an
-            alternative configuration to choose from: more than one compiled
-            plan candidate, or a provider-level search hipDNN confirms it
-            ran. A request that the provider ignored does not count. When
-            False the sweep re-measured a single fixed configuration, so any
-            reported delta is run-to-run noise, not a tuning gain.
+        tuning_available: Derived. True when the pass had an alternative
+            configuration to select: more than one compiled plan candidate, or
+            provider benchmarking was enabled on an engine that advertises it.
+            This does not imply that the provider performed a fresh search;
+            provider caches can supply an existing tuned selection.
         correctness: Validation verdict for the *tuned* plan, when a reference
             was available. The row's own ``correctness`` is the OOTB verdict
             and is separate. A tuned plan that fails validation publishes no
@@ -186,8 +180,6 @@ class OracleResult:
     knob_settings: List[Dict[str, Any]]
     exhaustive_requested: bool = False
     exhaustive_supported: bool = False
-    exhaustive_ran: bool = False
-    exhaustive_not_run_reason: Optional[str] = None
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
@@ -196,15 +188,20 @@ class OracleResult:
     correctness: Optional[CorrectnessResult] = None
 
     @property
-    def tuning_explored(self) -> bool:
-        """True when tuning had an alternative configuration to evaluate.
+    def exhaustive_enabled(self) -> bool:
+        """True when a capable provider was built for exhaustive selection."""
+        return self.exhaustive_requested and self.exhaustive_supported
 
-        A single compiled plan whose provider ignored the benchmarking
-        request searched nothing, so the delta must not be presented as a
-        tuning gain. ``exhaustive_ran`` is hipDNN's own confirmation that the
-        provider sampled variants; the request alone is not evidence.
+    @property
+    def tuning_available(self) -> bool:
+        """True when tuning had an alternative configuration to select.
+
+        Provider benchmarking can reuse a cached tuned selection. The API does
+        not expose whether this invocation performed a fresh search, so this
+        property records capability plus activation rather than making that
+        stronger claim.
         """
-        return self.compiled_plans_total > 1 or self.exhaustive_ran
+        return self.compiled_plans_total > 1 or self.exhaustive_enabled
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -216,12 +213,11 @@ class OracleResult:
             "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
             "compiled_plans_total": self.compiled_plans_total,
             "compiled_plans_failed": self.compiled_plans_failed,
-            "tuning_explored": self.tuning_explored,
+            "tuning_available": self.tuning_available,
             "knob_settings": list(self.knob_settings),
             "exhaustive_requested": self.exhaustive_requested,
+            "exhaustive_enabled": self.exhaustive_enabled,
             "exhaustive_supported": self.exhaustive_supported,
-            "exhaustive_ran": self.exhaustive_ran,
-            "exhaustive_not_run_reason": self.exhaustive_not_run_reason,
             "cpu_build_time_ms": self.cpu_build_time_ms,
             "gpu_kernel_stats": (
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None

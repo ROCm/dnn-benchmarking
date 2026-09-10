@@ -1000,21 +1000,21 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
-# hipDNN's TuneMode.EXHAUSTIVE activates provider benchmarking itself, and only
-# for engines advertising the knob, so this guard no longer forces
-# HIPDNN_FORCE_BENCHMARKING. What remains is cache hygiene: an exhaustive pass
-# otherwise persists its winner to hipDNN's on-disk caches and silently changes
-# the OOTB baseline of later runs. MIOpen's perf-db is outside this switch.
+# Provider benchmarking is selected when the oracle plan is built. Keep the
+# switch scoped to that plan and disable hipDNN's disk caches so it cannot
+# change later OOTB runs. MIOpen's database remains independent and can supply
+# an existing tuned selection.
 # ponytail: process-global guard, safe only while the suite loop is
 # single-threaded; concurrent graph execution would need a subprocess boundary.
-_EXHAUSTIVE_CACHE_ENV = {
+_EXHAUSTIVE_ENV = {
+    "HIPDNN_FORCE_BENCHMARKING": "1",
     "HIPDNN_DISABLE_CACHE": "1",
 }
 
 
 @contextmanager
-def _exhaustive_cache_env(enabled: bool):
-    """Keep an exhaustive pass from persisting its winner to disk.
+def _exhaustive_env(enabled: bool):
+    """Set exhaustive provider controls for the enclosed oracle pass.
 
     A no-op when ``enabled`` is False. Restores every touched variable to
     its prior state on exit, including deleting one that was unset.
@@ -1022,8 +1022,8 @@ def _exhaustive_cache_env(enabled: bool):
     if not enabled:
         yield
         return
-    previous = {name: os.environ.get(name) for name in _EXHAUSTIVE_CACHE_ENV}
-    os.environ.update(_EXHAUSTIVE_CACHE_ENV)
+    previous = {name: os.environ.get(name) for name in _EXHAUSTIVE_ENV}
+    os.environ.update(_EXHAUSTIVE_ENV)
     try:
         yield
     finally:
@@ -1083,7 +1083,16 @@ def _run_oracle_pass(
             asked for no validation. None skips the tuned-plan check.
     """
     try:
-        with _exhaustive_cache_env(config.oracle_exhaustive):
+        with _exhaustive_env(config.oracle_exhaustive):
+            # A separate handle isolates provider-local state. MIOpen resolves
+            # an algorithm's solver through a mutable per-handle map on every
+            # execute, so sharing the OOTB handle would let oracle tuning alter
+            # the baseline plan when it is re-timed below.
+            oracle_handle = type(handle)()
+            get_stream = getattr(handle, "get_stream", None)
+            set_stream = getattr(oracle_handle, "set_stream", None)
+            if callable(get_stream) and callable(set_stream):
+                set_stream(get_stream())
             bench_config = BenchmarkConfig(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
@@ -1094,7 +1103,7 @@ def _run_oracle_pass(
                 graph_json_str=graph_json_str,
                 config=bench_config,
             )
-            executor.prepare(handle, engine_id=engine_id, for_autotune=True)
+            executor.prepare(oracle_handle, engine_id=engine_id, for_autotune=True)
 
             # The OOTB correctness re-execution leaves outputs populated; zeroing
             # them restores the OOTB starting state. The inputs need no reload:
@@ -1104,9 +1113,7 @@ def _run_oracle_pass(
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
-            candidates = executor.autotune(
-                handle, variant_pack, engine_id, exhaustive=config.oracle_exhaustive
-            )
+            candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
             eligible_candidates = [
                 candidate
                 for candidate in candidates
@@ -1131,13 +1138,13 @@ def _run_oracle_pass(
             )
 
             bm.zero_outputs()
-            executor.warmup(handle, variant_pack)
+            executor.warmup(oracle_handle, variant_pack)
             bench_result = executor.benchmark(
-                handle, variant_pack, graph_name=graph_name
+                oracle_handle, variant_pack, graph_name=graph_name
             )
 
             oracle = OracleResult(
-                plan_name=executor.plan_name(handle) or "",
+                plan_name=executor.plan_name(oracle_handle) or "",
                 compiled_plan_index=int(winner.compiled_plan_index),
                 rank=int(winner.rank),
                 sweep_min_time_ms=float(winner.min_time_ms),
@@ -1169,10 +1176,9 @@ def _run_oracle_pass(
                 exhaustive_supported=bool(
                     getattr(winner, "supports_exhaustive", False)
                 ),
-                exhaustive_ran=bool(getattr(winner, "ran_exhaustive", False)),
-                exhaustive_not_run_reason=(
-                    getattr(winner, "exhaustive_not_run_reason", None) or None
-                ),
+                # The compiled-plan API reports capability in STANDARD mode.
+                # It cannot report whether a provider performed a fresh search:
+                # providers can reuse an existing tuned selection.
             )
 
             # Validate the tuned plan the same way the OOTB pass is validated,
@@ -1181,7 +1187,7 @@ def _run_oracle_pass(
             # verdict; this one belongs to the tuned plan.
             if reference_outputs is not None:
                 bm.zero_outputs()
-                executor.execute_once(handle, variant_pack)
+                executor.execute_once(oracle_handle, variant_pack)
                 oracle.correctness = _check_correctness(
                     bm,
                     tensor_infos,

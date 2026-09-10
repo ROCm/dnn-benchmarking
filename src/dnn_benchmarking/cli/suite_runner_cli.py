@@ -120,16 +120,13 @@ def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
         )
     if config.oracle_exhaustive:
         reporter.print_warning(
-            "--oracle-mode exhaustive: the tuned pass uses hipDNN's "
-            "EXHAUSTIVE tune mode, which primes only engines advertising the "
-            "global.benchmarking knob (today the kernel ingestor and MIOpen). "
-            "Other engines silently fall back to plan-level tuning and are "
-            "reported as such. Expect the sweep to take candidates x variants "
-            "times longer. hipDNN's own on-disk caches are disabled for that "
-            "pass so it cannot persist a winner, but MIOpen's perf-db is "
-            "outside that switch and persists under DNN_BENCH_WORKSPACE; run "
-            "with DNN_BENCH_WORKSPACE unset if a later run needs a strictly "
-            "cold OOTB baseline."
+            "--oracle-mode exhaustive: the tuned pass enables each provider's "
+            "global.benchmarking capability (today the kernel ingestor and "
+            "MIOpen). Other engines stay at plan-level tuning. Providers can "
+            "reuse existing tuned selections, including MIOpen FindDb and "
+            "performance-database entries; this mode does not prove that the "
+            "current invocation performed a fresh search. On a cache miss, "
+            "expect the sweep to take candidates x variants longer."
         )
 
 
@@ -149,7 +146,7 @@ def _print_oracle_comparison(
         for pe in gr.results
         if pe.oracle_delta is not None and pe.oracle is not None
     ]
-    speedups = [pe.oracle_delta.speedup for pe in tuned if pe.oracle.tuning_explored]
+    speedups = [pe.oracle_delta.speedup for pe in tuned if pe.oracle.tuning_available]
     reporter.print_oracle_summary(speedups, len(tuned) - len(speedups))
 
 

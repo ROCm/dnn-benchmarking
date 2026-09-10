@@ -302,7 +302,6 @@ class Executor:
         handle: Any,
         variant_pack: Dict[int, int],
         engine_id: int,
-        exhaustive: bool = False,
     ) -> List[Any]:
         """Benchmark every compiled plan for ``engine_id`` and activate the winner.
 
@@ -314,13 +313,9 @@ class Executor:
             handle: hipdnn.Handle instance.
             variant_pack: Mapping of tensor UIDs to device pointers.
             engine_id: Engine the candidate plans are restricted to.
-            exhaustive: Request hipDNN's EXHAUSTIVE tuning mode, which primes
-                every engine advertising the ``global.benchmarking`` knob so
-                the provider samples its kernel variants. hipDNN discards the
-                primed plan before timing the plan it keeps, so the reported
-                timing measures the kernel and not the sampling sweep. An
-                engine that does not advertise the knob is left alone and
-                reports ``supports_exhaustive=False``.
+            The provider plan can already have kernel benchmarking enabled at
+            build time. This method keeps the compiled-plan autotune mode at
+            STANDARD because hipDNN rejects EXHAUSTIVE mode on that path.
 
         Returns:
             All AutotuneResult entries, with successful candidates first in
@@ -348,13 +343,9 @@ class Executor:
         # Keep at least one warmup iteration in the sweep; the caller's
         # separate benchmark still honors ``--warmup 0``.
         cfg.warmup_iterations = max(1, self._config.warmup_iters)
-        if exhaustive:
-            # hipDNN primes only engines that advertise the knob and reports
-            # per-candidate whether priming actually ran, so the caller can
-            # tell a supported search from an ignored request. Setting
-            # HIPDNN_FORCE_BENCHMARKING by hand cannot make that distinction
-            # and would leave benchmarking active during the timed run.
-            cfg.mode = hipdnn.TuneMode.EXHAUSTIVE
+        # Keep STANDARD mode. The graph contains pre-compiled plans, which
+        # hipDNN rejects with TuneMode.EXHAUSTIVE. Provider-side benchmarking,
+        # when requested, was latched while those plans were built.
 
         try:
             # Omit workspace_size: passing it selects the plan-spec overload

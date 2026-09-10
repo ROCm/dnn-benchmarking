@@ -1529,7 +1529,7 @@ class TestOracleFlag:
 
     def test_footer_reports_no_speedup_when_nothing_was_searched(self) -> None:
         out = self._footer([self._row(1, 1.004, searched=False)])
-        assert "no tuning search available" in out
+        assert "no tuning alternatives available" in out
         assert "speedup" not in out.replace("no speedup reported", "")
 
 
@@ -1598,8 +1598,9 @@ class TestOracleStartupWarnings:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
         monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         warning = self._warn(oracle_mode="exhaustive")
-        assert "EXHAUSTIVE tune mode" in warning
-        assert "global.benchmarking knob" in warning
+        assert "global.benchmarking capability" in warning
+        assert "does not prove" in warning
+        assert "MIOpen FindDb" in warning
 
     def test_plan_warning_omits_force_benchmarking(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1607,4 +1608,4 @@ class TestOracleStartupWarnings:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
         monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         warning = self._warn(oracle_mode="plan")
-        assert "EXHAUSTIVE tune mode" not in warning
+        assert "global.benchmarking capability" not in warning

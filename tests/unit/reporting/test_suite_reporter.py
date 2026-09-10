@@ -741,20 +741,18 @@ class TestOracleReporting:
         assert "Warm baseline: 0.500 ms" in out
         assert "Tuned vs baseline:" in out
 
-    def test_verbose_reports_an_exhaustive_pass_that_ran(self) -> None:
+    def test_verbose_reports_exhaustive_provider_selection(self) -> None:
         pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            exhaustive_requested=True, exhaustive_supported=True, exhaustive_ran=True
-        )
+        pe.oracle = _make_oracle(exhaustive_requested=True, exhaustive_supported=True)
         pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()
         )
         out = output.getvalue()
-        assert "Exhaustive:    ran (provider sampled its kernel variants" in out
-        # The provider does not expose a variant count, so none is invented.
-        assert "hipDNN exposes no count of them" in out
+        assert "Exhaustive:    enabled for this provider" in out
+        assert "existing tuned selection may be reused" in out
+        assert "fresh search" not in out
 
     def test_verbose_omits_the_exhaustive_line_by_default(self) -> None:
         pe = _make_pe_success()
@@ -767,26 +765,21 @@ class TestOracleReporting:
         out = output.getvalue()
         assert "Exhaustive:" not in out
 
-    def test_verbose_reports_an_exhaustive_pass_the_provider_ignored(self) -> None:
-        """A request the engine ignored must read as not run, not as a search."""
+    def test_verbose_reports_an_unsupported_exhaustive_provider(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle(
             compiled_plans_benchmarked=1,
             compiled_plans_total=1,
             exhaustive_requested=True,
             exhaustive_supported=False,
-            exhaustive_ran=False,
-            exhaustive_not_run_reason="engine does not support priming",
         )
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()
         )
         out = output.getvalue()
-        assert "Exhaustive:    requested but NOT run" in out
-        assert "engine does not support priming" in out
+        assert "Exhaustive:    unsupported by this engine" in out
         assert "tuned at plan level only" in out
-        # And it stays a no-search row.
         assert "Tuning:        unavailable" in out
 
     def test_table_marks_a_failed_baseline_invalid_too(self) -> None:
@@ -916,7 +909,6 @@ class TestOracleReporting:
             compiled_plans_total=1,
             exhaustive_requested=True,
             exhaustive_supported=True,
-            exhaustive_ran=True,
         )
         pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
@@ -947,7 +939,6 @@ class TestOracleReporting:
             knob_settings=[],
             exhaustive_requested=True,
             exhaustive_supported=True,
-            exhaustive_ran=True,
         )
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
@@ -955,7 +946,7 @@ class TestOracleReporting:
         )
         out = output.getvalue()
         assert "none set explicitly (engine defaults)" in out
-        assert "Exhaustive:    ran" in out
+        assert "Exhaustive:    enabled for this provider" in out
 
     def test_verbose_renders_knob_lines(self) -> None:
         pe = _make_pe_success()
