@@ -452,7 +452,9 @@ def build_parser() -> argparse.ArgumentParser:
             "HIPDNN_ENABLE_KERNEL_INGESTOR=ON, which defaults OFF and without "
             "which a descriptor-backed engine is compiled into no plugin at all: "
             "the plugin .so is still present, so --plugin-path looks satisfied, "
-            "and every graph reports 'no engines applicable'."
+            "and every graph reports 'no engines applicable'. That option also "
+            "needs rocm-kpack, which the torch wheel's bundled ROCm SDK does "
+            "not ship a CMake config for -- see the README."
         ),
     )
     parser.add_argument(
