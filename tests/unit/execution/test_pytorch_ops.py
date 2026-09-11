@@ -2027,3 +2027,327 @@ class TestNodeParamNullAttributes:
         tensors = {1: torch.tensor([-1.0, 0.5, 7.0])}
         pytorch_ops.execute_graph(graph_json, tensors)
         torch.testing.assert_close(tensors[2], torch.zeros(3))
+
+
+class TestPyTorchSdpaPaged:
+    """Paged (KV-cache) SDPA support.
+
+    PyTorch has no paged SDPA API, so the handler gathers K/V through the page
+    table into dense per-sequence tensors before calling it. That gather runs on
+    the benchmark path and the ``--validate pytorch`` reference path alike -- both
+    walk these handlers -- so it is worth pinning against an independent dense
+    computation rather than against itself.
+    """
+
+    PAGE = 16
+    HQ, HKV, D = 8, 2, 64
+    KV_LENS = [40, 27]  # deliberately not page-aligned
+    Q_LENS = [5, 3]
+    BLOCKS_PER_SEQ = 4
+    NUM_BLOCKS = 16
+
+    def _build(self, seed: int = 0):
+        """A paged cache that is a known permutation of a dense one.
+
+        Blocks are assigned out of order and unused slots are filled with a
+        sentinel, so a gather that assumes contiguous blocks -- or that reads past
+        a sequence's true length -- produces a visibly wrong answer instead of a
+        subtly wrong one.
+        """
+        torch.manual_seed(seed)
+        num_seqs = len(self.KV_LENS)
+        dense_k = [
+            torch.randn(self.HKV, n, self.D, dtype=torch.float32) for n in self.KV_LENS
+        ]
+        dense_v = [
+            torch.randn(self.HKV, n, self.D, dtype=torch.float32) for n in self.KV_LENS
+        ]
+
+        k_pages = torch.full(
+            (self.NUM_BLOCKS, self.HKV, self.PAGE, self.D), 999.0, dtype=torch.float32
+        )
+        v_pages = torch.full(
+            (self.NUM_BLOCKS, self.HKV, self.PAGE, self.D), -999.0, dtype=torch.float32
+        )
+        page_table = torch.zeros(num_seqs, self.BLOCKS_PER_SEQ, dtype=torch.int32)
+
+        scrambled = [13, 2, 7, 11, 0, 5, 9, 3]
+        nxt = 0
+        for s in range(num_seqs):
+            needed = (self.KV_LENS[s] + self.PAGE - 1) // self.PAGE
+            for b in range(needed):
+                blk = scrambled[nxt]
+                nxt += 1
+                page_table[s, b] = blk
+                lo = b * self.PAGE
+                hi = min(lo + self.PAGE, self.KV_LENS[s])
+                k_pages[blk, :, : hi - lo, :] = dense_k[s][:, lo:hi, :]
+                v_pages[blk, :, : hi - lo, :] = dense_v[s][:, lo:hi, :]
+
+        q = torch.randn(1, self.HQ, sum(self.Q_LENS), self.D, dtype=torch.float32)
+        return q, k_pages, v_pages, page_table, dense_k, dense_v
+
+    def _graph(self, **attr_overrides):
+        attributes = {
+            "causal_mask": False,
+            "causal_mask_bottom_right": False,
+            "padding_mask": False,
+            "alibi_mask": False,
+            "attn_scale_value": 1.0 / (self.D**0.5),
+            "left_bound": -1,
+            "right_bound": -1,
+            "diagonal_alignment": "TOP_LEFT",
+        }
+        attributes.update(attr_overrides)
+        return {
+            "name": "paged",
+            "compute_data_type": "float",
+            "io_data_type": "float",
+            "tensors": [],
+            "nodes": [
+                {
+                    "name": "",
+                    "type": "SdpaAttributes",
+                    "compute_data_type": "float",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "seq_len_q_tensor_uid": 7,
+                        "seq_len_kv_tensor_uid": 8,
+                        "page_table_k_tensor_uid": 5,
+                        "page_table_v_tensor_uid": 6,
+                    },
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": None},
+                    "attributes": attributes,
+                }
+            ],
+        }
+
+    def _tensors(self, q, k_pages, v_pages, page_table):
+        return {
+            1: q,
+            2: k_pages,
+            3: v_pages,
+            5: page_table,
+            6: page_table,
+            7: torch.tensor(self.Q_LENS, dtype=torch.int32),
+            8: torch.tensor(self.KV_LENS, dtype=torch.int32),
+        }
+
+    def _dense_reference(self, q, dense_k, dense_v, is_causal=False):
+        import torch.nn.functional as F
+
+        rep = self.HQ // self.HKV
+        out, start = [], 0
+        for s, q_len in enumerate(self.Q_LENS):
+            q_s = q[:, :, start : start + q_len, :]
+            start += q_len
+            out.append(
+                F.scaled_dot_product_attention(
+                    q_s,
+                    dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    scale=1.0 / (self.D**0.5),
+                    is_causal=is_causal,
+                )
+            )
+        return torch.cat(out, dim=-2)
+
+    def test_paged_gather_matches_dense_attention(self) -> None:
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(), tensors)
+
+        expected = self._dense_reference(q, dense_k, dense_v)
+        assert tensors[4].shape == expected.shape
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    def test_page_table_is_actually_followed(self) -> None:
+        """Negative control. If corrupting a page id does not change the answer,
+        the gather is not reading the table and the test above proves nothing."""
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        expected = self._dense_reference(q, dense_k, dense_v)
+
+        corrupted = page_table.clone()
+        corrupted[0, 0] = 12  # a block holding only the sentinel fill
+        tensors = self._tensors(q, k_pages, v_pages, corrupted)
+        pytorch_ops.execute_graph(self._graph(), tensors)
+
+        assert not torch.allclose(tensors[4], expected, atol=1e-3)
+
+    def test_trailing_page_slots_do_not_leak(self) -> None:
+        """The last page of a sequence is partly unused. Those slots hold a
+        sentinel; if the trim to seq_len_kv is missing they dominate the softmax
+        and the output diverges wildly rather than slightly."""
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(), tensors)
+        assert torch.isfinite(tensors[4]).all()
+        assert tensors[4].abs().max().item() < 100.0
+
+    def test_paged_causal_matches_dense_causal(self) -> None:
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(causal_mask=True), tensors)
+
+        expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    def test_bundle_causal_spelling_matches_boolean_spelling(self) -> None:
+        """The shipped paged bundles express causality as (-1, 0) while the model
+        traces set causal_mask. Both must resolve to the same mask."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+
+        via_bool = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(causal_mask=True), via_bool)
+
+        via_bounds = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(left_bound=-1, right_bound=0), via_bounds)
+
+        assert torch.allclose(via_bool[4], via_bounds[4], atol=1e-6)
+
+    def test_paged_requires_both_page_tables(self) -> None:
+        graph = self._graph()
+        graph["nodes"][0]["inputs"]["page_table_v_tensor_uid"] = None
+        with pytest.raises(UnsupportedGraphError, match="both K and V page tables"):
+            pytorch_ops.compile_graph(graph)
+
+    def test_paged_requires_seq_len_kv(self) -> None:
+        graph = self._graph()
+        graph["nodes"][0]["inputs"]["seq_len_kv_tensor_uid"] = None
+        with pytest.raises(UnsupportedGraphError, match="seq_len_kv"):
+            pytorch_ops.compile_graph(graph)
+
+    def test_page_table_too_small_is_reported(self) -> None:
+        """A sequence needing more blocks than the table holds is a graph error,
+        not something to silently truncate."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table[:, :1])
+        # The registry normalizes a handler ValueError into UnsupportedGraphError.
+        with pytest.raises(UnsupportedGraphError, match="page table holds"):
+            pytorch_ops.execute_graph(self._graph(), tensors)
+
+    def test_backward_still_refuses_paged(self) -> None:
+        """Only the forward handler gathers. A paged backward would otherwise
+        compute a dense gradient and call it correct."""
+        graph = {
+            "name": "paged_bwd",
+            "compute_data_type": "float",
+            "io_data_type": "float",
+            "tensors": [],
+            "nodes": [
+                {
+                    "name": "",
+                    "type": "SdpaBackwardAttributes",
+                    "compute_data_type": "float",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                        "page_table_k_tensor_uid": 7,
+                        "page_table_v_tensor_uid": 8,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 9,
+                        "dk_tensor_uid": 10,
+                        "dv_tensor_uid": 11,
+                    },
+                    "attributes": {"causal_mask": False},
+                }
+            ],
+        }
+        with pytest.raises(UnsupportedGraphError, match="page_table"):
+            pytorch_ops.compile_graph(graph)
+
+
+class TestPyTorchSdpaMaskDerivation:
+    """The mask a graph is asking for, derived the way the engine derives it
+    (Gfx950AttentionTiledNative.cpp::maskTypeFor)."""
+
+    @staticmethod
+    def _node(**attributes):
+        return {
+            "type": "SdpaAttributes",
+            "inputs": {},
+            "outputs": {},
+            "attributes": attributes,
+        }
+
+    def test_bounds_spelling_is_causal(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(self._node(left_bound=-1, right_bound=0)) == (
+            True,
+            None,
+        )
+
+    def test_boolean_spelling_is_causal(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(self._node(causal_mask=True)) == (True, None)
+
+    def test_absent_bounds_are_unmasked(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(self._node()) == (False, None)
+
+    def test_a_real_bound_wins_over_the_boolean(self) -> None:
+        """causal_mask + a left bound is a WINDOW. Reading the boolean first
+        discards the window and serves the wrong triangle."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(self._node(causal_mask=True, left_bound=127)) == (
+            False,
+            128,
+        )
+
+    def test_window_width_includes_the_current_token(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sliding_window_mask,
+        )
+
+        keep = _sliding_window_mask(4, 4, 2, torch.device("cpu"), torch.float32) == 0
+        expected = torch.tensor(
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, True, True, False],
+                [False, False, True, True],
+            ]
+        )
+        assert torch.equal(keep, expected)
+
+    def test_width_one_is_the_diagonal(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sliding_window_mask,
+        )
+
+        keep = _sliding_window_mask(3, 3, 1, torch.device("cpu"), torch.float32) == 0
+        assert torch.equal(keep, torch.eye(3, dtype=torch.bool))
+
+    @pytest.mark.parametrize(
+        "attributes, match",
+        [
+            ({"left_bound": -5}, "neither unbounded nor a width"),
+            ({"right_bound": 3}, "forward-looking band"),
+        ],
+    )
+    def test_illegal_bounds_are_declined(self, attributes, match) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        with pytest.raises(ValueError, match=match):
+            _sdpa_derive_mask(self._node(**attributes))

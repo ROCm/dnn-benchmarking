@@ -153,6 +153,39 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_type=int,
     ),
     CliOption(
+        flags=("--autotune",),
+        dest="autotune",
+        action="store_true",
+        default=False,
+        help=(
+            "Sample every knob-filtered candidate kernel on each plan's first "
+            "execute and cache the winner, via HIPDNN_FORCE_BENCHMARKING=1. "
+            "Without it an engine serves its cold heuristic's rank-0 pick, so a "
+            "table measures the heuristic rather than what the shipped kernel "
+            "set can deliver -- and an engine that gains good variants can "
+            "measure SLOWER when the tie-break is a coin flip. Required for any "
+            "best-vs-best comparison. Pair with a per-run --cache-dir."
+        ),
+        config_key="autotune",
+        config_kind=ConfigKind.SCALAR,
+        config_type=bool,
+    ),
+    CliOption(
+        flags=("--cache-dir",),
+        dest="cache_dir",
+        parser_type=Path,
+        metavar="PATH",
+        help=(
+            "Set HIPDNN_CACHE_DIR for the run. The ingestor's winner cache is on "
+            "disk and outlives the job, and reads are NOT gated on benchmarking "
+            "while writes are -- so an untuned phase can silently replay a "
+            "previous tuned ranking. Give each phase its own empty root."
+        ),
+        config_key="cache_dir",
+        config_kind=ConfigKind.SCALAR,
+        config_type=str,
+    ),
+    CliOption(
         flags=("--engine", "-e"),
         dest="engine",
         parser_type=_parse_engine_list,

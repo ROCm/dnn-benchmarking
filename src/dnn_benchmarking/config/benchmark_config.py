@@ -361,6 +361,15 @@ class SuiteConfig:
     backend: ExecutionBackendName = ExecutionBackendName.HIPDNN
     pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
     pytorch_rocm_fa_library: Optional[str] = None
+    #: Sample every knob-filtered candidate on first execute and cache the
+    #: winner (HIPDNN_FORCE_BENCHMARKING=1). Off, an engine serves its cold
+    #: heuristic's rank-0 pick, so the table measures the heuristic rather than
+    #: what the shipped kernel set can deliver.
+    autotune: bool = False
+    #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
+    #: job; reads are not gated on benchmarking while writes are, so without an
+    #: explicit empty root an untuned phase can replay a previous tuned ranking.
+    cache_dir: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
