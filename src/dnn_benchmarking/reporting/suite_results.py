@@ -437,9 +437,8 @@ def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
     Args:
         oracle: The post-tuning result, carrying its own warm baseline.
 
-    Returns:
-        An OracleDelta, or None when no comparable statistics pair exists
-        or the oracle mean is zero.
+        An OracleDelta, or None when no comparable statistics pair exists or
+        either mean is non-positive.
     """
     basis: Literal["gpu_kernel", "host"]
     if (
@@ -456,7 +455,7 @@ def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
     else:
         return None
 
-    if oracle_mean == 0.0:
+    if baseline_mean <= 0.0 or oracle_mean <= 0.0:
         return None
 
     return OracleDelta(

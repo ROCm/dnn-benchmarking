@@ -743,6 +743,13 @@ class TestBuildOracleDelta:
         )
         assert build_oracle_delta(oracle) is None
 
+    def test_returns_none_when_baseline_mean_is_zero(self):
+        oracle = _oracle(
+            gpu_kernel_stats=_stats(1.0),
+            warm_baseline_gpu_kernel_stats=_stats(0.0),
+        )
+        assert build_oracle_delta(oracle) is None
+
 
 class TestSuiteMetadataSelectionEnv:
     """hipdnn_selection_env is recorded only for oracle runs."""
