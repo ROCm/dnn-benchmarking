@@ -3,7 +3,7 @@
 
 """Device buffer management for graph execution."""
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -151,8 +151,98 @@ def _encode_bfloat16_dense_to_storage_bytes(
     return storage.tobytes()
 
 
+def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
+    """Map tensor UID -> paged role for every SDPA node in the graph.
+
+    Roles are read from the node's ``inputs`` map rather than guessed from a
+    tensor name, because names are free-form and a graph is under no obligation
+    to call its page table PAGE_TABLE_K.
+    """
+    roles: Dict[int, str] = {}
+    if not graph_json:
+        return roles
+    for node in graph_json.get("nodes", []) or []:
+        if not str(node.get("type", "")).startswith("Sdpa"):
+            continue
+        inputs = node.get("inputs") or {}
+        for key, role in (
+            ("page_table_k_tensor_uid", "page_table"),
+            ("page_table_v_tensor_uid", "page_table"),
+            ("seq_len_q_tensor_uid", "seq_len_q"),
+            ("seq_len_kv_tensor_uid", "seq_len_kv"),
+        ):
+            uid = inputs.get(key)
+            if uid is not None:
+                roles[int(uid)] = role
+    return roles
+
+
+def _paged_metadata(
+    graph_json: Optional[Dict[str, Any]],
+) -> Tuple[int, int]:
+    """(page_size, num_pages) taken from the paged K container's own dims.
+
+    hipDNN has no page-size scalar: the paged K/V container is
+    ``[num_blocks, num_kv_heads, page_size, head_size]``, so both facts are read
+    off that tensor instead of being assumed.
+    """
+    if not graph_json:
+        return 0, 0
+    tensors = {int(t["uid"]): t for t in graph_json.get("tensors", []) or []}
+    for node in graph_json.get("nodes", []) or []:
+        inputs = node.get("inputs") or {}
+        if inputs.get("page_table_k_tensor_uid") is None:
+            continue
+        k = (
+            tensors.get(int(inputs["k_tensor_uid"]))
+            if inputs.get("k_tensor_uid")
+            else None
+        )
+        if k and len(k.get("dims", [])) == 4:
+            return int(k["dims"][2]), int(k["dims"][0])
+    return 0, 0
+
+
+def _generate_paged_input(
+    tensor_info: TensorInfo,
+    role: str,
+    page_size: int,
+    num_pages: int,
+    rng: "np.random.RandomState",
+) -> np.ndarray:
+    """Structured data for a paged input.
+
+    ``rng.uniform(0, 1).astype(int32)`` is **all zeros**, which for a page table
+    means every sequence reads page 0 and for a sequence length means an empty
+    sequence. Both are degenerate rather than merely random, so these inputs are
+    generated to satisfy their own invariants instead.
+    """
+    dims = list(tensor_info.dims)
+    dtype = DTYPE_MAP.get(tensor_info.data_type.lower(), np.int32)
+
+    if role == "page_table":
+        # Distinct pages per sequence, so a gather that ignores the table or
+        # collapses sequences produces a visibly different answer.
+        num_seqs = int(dims[0])
+        blocks_per_seq = int(dims[1]) if len(dims) > 1 else 1
+        needed = num_seqs * blocks_per_seq
+        pool = num_pages if num_pages > 0 else needed
+        ids = (np.arange(needed) % max(pool, 1)).astype(dtype)
+        return ids.reshape(dims)
+
+    if role in ("seq_len_q", "seq_len_kv"):
+        # Fill the cache: every sequence uses its whole page allocation, which
+        # is the largest length the page table can legally address.
+        length = page_size if page_size > 0 else 1
+        return np.full(dims, length, dtype=dtype)
+
+    return rng.uniform(0.0, 1.0, dims).astype(dtype)
+
+
 def generate_input_data(
-    tensor_infos: List[TensorInfo], seed: Optional[int] = None
+    tensor_infos: List[TensorInfo],
+    seed: Optional[int] = None,
+    graph_json: Optional[Dict[str, Any]] = None,
 ) -> Dict[int, np.ndarray]:
     """Generate one graph-scoped logical input map.
 
@@ -160,9 +250,16 @@ def generate_input_data(
     and reference providers: dense logical ndarrays keyed by tensor UID. BF16
     values are generated as FP32, rounded through BF16 storage, then decoded
     back to numeric FP32 because NumPy has no native bfloat16 dtype.
+
+    ``graph_json`` is optional and only affects **paged** SDPA graphs: page
+    tables and sequence lengths are integer inputs with invariants that uniform
+    noise cannot satisfy (see :func:`_generate_paged_input`). Without it the
+    behaviour is exactly as before.
     """
     rng = np.random.RandomState(seed)
     input_data: Dict[int, np.ndarray] = {}
+    paged_roles = _paged_input_roles(graph_json)
+    page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -172,6 +269,13 @@ def generate_input_data(
         if tensor_info.is_pass_by_value:
             dtype = DTYPE_MAP.get(dtype_key, np.float32)
             input_data[tensor_info.uid] = np.asarray([tensor_info.value], dtype=dtype)
+            continue
+
+        role = paged_roles.get(tensor_info.uid)
+        if role is not None:
+            input_data[tensor_info.uid] = _generate_paged_input(
+                tensor_info, role, page_size, num_pages, rng
+            )
             continue
 
         if dtype_key == "bfloat16":
