@@ -32,6 +32,15 @@ test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
+# One extra per released GPU architecture. Each pulls the prebuilt hipDNN
+# backend and engine plugins for that target, plus the architecture-independent
+# bindings. torch is deliberately absent for the reason above: it has to come
+# from the ROCm nightly index, and pip cannot pin one requirement to one index.
+gfx90a = ["hipdnn-runtime-gfx90a", "hipdnn-frontend"]
+gfx942 = ["hipdnn-runtime-gfx942", "hipdnn-frontend"]
+gfx950 = ["hipdnn-runtime-gfx950", "hipdnn-frontend"]
+gfx1100 = ["hipdnn-runtime-gfx1100", "hipdnn-frontend"]
+gfx1151 = ["hipdnn-runtime-gfx1151", "hipdnn-frontend"]
 
 [project.scripts]
 dnn-benchmark = "dnn_benchmarking.cli.main:main"
