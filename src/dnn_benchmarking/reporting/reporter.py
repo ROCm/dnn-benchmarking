@@ -5,6 +5,7 @@
 
 import sys
 from pathlib import Path
+from statistics import geometric_mean
 from typing import List, Optional, TextIO
 
 from ..config.benchmark_config import BenchmarkConfig, SuiteConfig
@@ -143,6 +144,32 @@ class Reporter:
             message: Warning message.
         """
         self._print(f"WARNING: {message}")
+
+    def print_oracle_summary(self, speedups: List[float], no_search_rows: int) -> None:
+        """Print the suite-wide oracle comparison line.
+
+        Args:
+            speedups: Per-row speedups from rows where tuning had an
+                alternative configuration to choose from.
+            no_search_rows: Rows excluded because nothing was searched.
+        """
+        if not speedups:
+            if no_search_rows:
+                self._print(
+                    f"Oracle comparison: no tuning alternatives available on "
+                    f"any of {no_search_rows} engine rows (one compiled plan "
+                    f"each, provider tuning unavailable); no speedup reported"
+                )
+            return
+        suffix = (
+            f"; {no_search_rows} row(s) excluded with no tuning search"
+            if no_search_rows
+            else ""
+        )
+        self._print(
+            f"Oracle comparison: {len(speedups)} engine rows tuned, "
+            f"geomean speedup {geometric_mean(speedups):.2f}x{suffix}"
+        )
 
     def _print(self, text: str) -> None:
         """Print a line of text.
@@ -374,18 +401,29 @@ class Reporter:
             return
 
         include_plugin = any(pe.plugin_path for pe in graph_result.results)
+        include_oracle = any(
+            pe.oracle or pe.oracle_error for pe in graph_result.results
+        )
         headers = ["engine", "status"]
         if include_plugin:
             headers.append("plugin_path")
         headers.extend(
             [
-                "kernel_mean_ms",
+                "ootb_kernel_mean_ms" if include_oracle else "kernel_mean_ms",
                 "kernel_median_ms",
                 "host_mean_ms",
                 "host_median_ms",
             ]
         )
         include_warnings = any(pe.warnings for pe in graph_result.results)
+        if include_oracle:
+            headers.extend(
+                [
+                    "warm_ootb_kernel_mean_ms",
+                    "oracle_kernel_mean_ms",
+                    "oracle_speedup",
+                ]
+            )
         if include_warnings:
             headers.append("warnings")
         rows: List[List[str]] = []
@@ -401,6 +439,36 @@ class Reporter:
                     self._fmt_stat(pe.host_stats, "median_ms"),
                 ]
             )
+            if include_oracle:
+                # Show the warm OOTB operand used by oracle_speedup.
+                row.append(
+                    self._fmt_stat(pe.oracle.warm_baseline_gpu_kernel_stats, "mean_ms")
+                    if pe.oracle is not None
+                    else "n/a"
+                )
+                row.append(
+                    self._fmt_stat(pe.oracle.gpu_kernel_stats, "mean_ms")
+                    if pe.oracle is not None
+                    else "n/a"
+                )
+                # A speedup requires two valid operands.
+                if any(
+                    verdict is not None and verdict.explicitly_failed
+                    for verdict in (
+                        pe.correctness,
+                        pe.oracle.correctness if pe.oracle else None,
+                    )
+                ):
+                    row.append("invalid")
+                elif pe.oracle is not None and not pe.oracle.tuning_available:
+                    # A single fixed configuration produced only timing noise.
+                    row.append("no-search")
+                elif pe.oracle_delta is not None:
+                    row.append(f"{pe.oracle_delta.speedup:.2f}x")
+                elif pe.oracle_error is not None:
+                    row.append("failed")
+                else:
+                    row.append("n/a")
             if include_warnings:
                 row.append(self._fmt_warnings(pe.warnings))
             rows.append(row)
@@ -474,6 +542,7 @@ class Reporter:
             if pe.status == "success":
                 self._print_pe_stats(pe)
                 self._print_pe_metrics(pe)
+                self._print_oracle_block(pe)
                 # Profiling artefacts render independently of the always-on
                 # metrics block — opt-in profiling is valid under
                 # --metrics-tier off, and the user should still see where
@@ -517,6 +586,77 @@ class Reporter:
         self._print("Warnings:")
         for warning in pe.warnings:
             self._print(f"  WARNING: {warning}")
+        self._print("")
+
+    def _print_oracle_block(self, pe: ProviderEngineResult) -> None:
+        """Render the auto-tuned (oracle) comparison block in verbose mode."""
+        if pe.oracle is None:
+            if pe.oracle_error is not None:
+                self._print(f"Oracle (auto-tuned): unavailable — {pe.oracle_error}")
+                self._print("")
+            return
+
+        o = pe.oracle
+        self._print("Oracle (auto-tuned):")
+        self._print(
+            f"  Plan:          {o.plan_name}  "
+            f"(compiled plan index {o.compiled_plan_index}, rank {o.rank})"
+        )
+        if o.knob_settings:
+            self._print("  Knobs:")
+            for knob in o.knob_settings:
+                self._print(f"    {knob['knob_id']}={knob['value']}")
+        else:
+            self._print("  Knobs:         none set explicitly (engine defaults)")
+        self._print(
+            f"  Compiled plans: {o.compiled_plans_benchmarked} benchmarked "
+            f"successfully ({o.compiled_plans_total} total, "
+            f"{o.compiled_plans_failed} failed)"
+        )
+        if o.exhaustive_requested:
+            if o.exhaustive_supported:
+                self._print(
+                    "  Exhaustive:    enabled for this provider "
+                    "(an existing tuned selection may be reused)"
+                )
+            else:
+                self._print(
+                    "  Exhaustive:    unsupported by this engine; "
+                    "this row was tuned at plan level only"
+                )
+        if not o.tuning_available:
+            self._print(
+                "  Tuning:        unavailable - one compiled plan and no "
+                "provider-level tuning capability, so this pass re-measured "
+                "the heuristic configuration; any delta below is run-to-run noise"
+            )
+        if o.correctness is not None:
+            if o.correctness.passed:
+                self._print("  Validation:    tuned plan passed")
+            else:
+                detail = o.correctness.error_message or "output mismatch"
+                self._print(
+                    f"  Validation:    tuned plan FAILED - {detail}; "
+                    "no speedup is reported for this row"
+                )
+        self._print(
+            f"  Sweep minimum: {o.sweep_min_time_ms:.3f} ms   "
+            "(fastest single iteration from the selection sweep)"
+        )
+        if o.gpu_kernel_stats is not None:
+            self._print(f"  Kernel mean:   {o.gpu_kernel_stats.mean_ms:.3f} ms")
+        if o.host_stats is not None:
+            self._print(f"  Host mean:     {o.host_stats.mean_ms:.3f} ms")
+        if pe.oracle_delta is not None:
+            d = pe.oracle_delta
+            self._print(
+                f"  Warm OOTB:     {d.baseline_mean_ms:.3f} ms   "
+                "(heuristic plan, re-timed after the sweep)"
+            )
+            self._print(
+                f"  Tuned vs warm OOTB: {d.delta_ms:+.3f} ms faster, "
+                f"{d.speedup:.2f}x  (basis: {d.basis})"
+            )
         self._print("")
 
     @staticmethod

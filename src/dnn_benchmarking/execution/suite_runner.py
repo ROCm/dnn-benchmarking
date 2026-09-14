@@ -10,8 +10,10 @@ and E2E wall-clock time. Performs correctness validation by comparing GPU
 output against a reference provider via ArrayComparator.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -39,7 +41,9 @@ from ..reporting.statistics import BenchmarkStats
 from ..reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleResult,
     ProviderEngineResult,
+    build_oracle_delta,
 )
 from ..validation.reference_provider import (
     ReferenceOutput,
@@ -996,6 +1000,174 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
+# Benchmarking is latched when oracle plans are built. Disable hipDNN disk
+# caches so the selected provider variant cannot affect later runs.
+# ponytail: process-global guard; concurrent execution needs process isolation.
+_EXHAUSTIVE_ENV = {
+    "HIPDNN_FORCE_BENCHMARKING": "1",
+    "HIPDNN_DISABLE_CACHE": "1",
+}
+
+
+@contextmanager
+def _exhaustive_env(enabled: bool):
+    """Set provider benchmarking controls and restore the prior environment."""
+    if not enabled:
+        yield
+        return
+    previous = {name: os.environ.get(name) for name in _EXHAUSTIVE_ENV}
+    os.environ.update(_EXHAUSTIVE_ENV)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _run_oracle_pass(
+    *,
+    result: ProviderEngineResult,
+    graph_path: Path,
+    graph_json_str: str,
+    graph_name: str,
+    config: SuiteConfig,
+    handle: Any,
+    engine_id: int,
+    bm: Any,
+    ootb_executor: Any,
+    tensor_infos: list,
+    graph_json: Dict[str, Any],
+    reference_outputs: Optional[Dict[int, Any]],
+) -> None:
+    """Tune one engine and attach its result without failing the OOTB row."""
+    try:
+        with _exhaustive_env(config.oracle_exhaustive):
+            # Isolate MIOpen's mutable per-handle solver map from the baseline.
+            oracle_handle = type(handle)()
+            get_stream = getattr(handle, "get_stream", None)
+            set_stream = getattr(oracle_handle, "set_stream", None)
+            if callable(get_stream) and callable(set_stream):
+                set_stream(get_stream())
+            bench_config = BenchmarkConfig(
+                graph_path=graph_path,
+                warmup_iters=config.warmup_iters,
+                benchmark_iters=config.benchmark_iters,
+                engine_id=engine_id,
+            )
+            executor = Executor(
+                graph_json_str=graph_json_str,
+                config=bench_config,
+            )
+            executor.prepare(oracle_handle, engine_id=engine_id, for_autotune=True)
+
+            # Restore outputs; inputs remain valid across executions.
+            bm.zero_outputs()
+            variant_pack = bm.create_variant_pack()
+
+            candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
+            eligible_candidates = [
+                candidate
+                for candidate in candidates
+                if not getattr(candidate, "excluded_by_caller", False)
+            ]
+            successful_candidates = [
+                candidate for candidate in eligible_candidates if candidate.succeeded
+            ]
+            winner = successful_candidates[0]
+
+            # Re-time OOTB after the sweep so both operands share device warmth.
+            bm.zero_outputs()
+            ootb_executor.warmup(handle, variant_pack)
+            baseline_result = ootb_executor.benchmark(
+                handle, variant_pack, graph_name=graph_name
+            )
+
+            bm.zero_outputs()
+            executor.warmup(oracle_handle, variant_pack)
+            bench_result = executor.benchmark(
+                oracle_handle, variant_pack, graph_name=graph_name
+            )
+
+            oracle = OracleResult(
+                plan_name=executor.plan_name(oracle_handle) or "",
+                compiled_plan_index=int(winner.compiled_plan_index),
+                rank=int(winner.rank),
+                sweep_min_time_ms=float(winner.min_time_ms),
+                compiled_plans_benchmarked=len(successful_candidates),
+                compiled_plans_total=len(eligible_candidates),
+                compiled_plans_failed=(
+                    len(eligible_candidates) - len(successful_candidates)
+                ),
+                knob_settings=[
+                    {"knob_id": str(k.knob_id), "value": k.value}
+                    for k in winner.knob_settings
+                ],
+                cpu_build_time_ms=executor.init_time_ms,
+                host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
+                gpu_kernel_stats=(
+                    BenchmarkStats.from_timings(bench_result.kernel_timings)
+                    if bench_result.has_kernel_timings
+                    else None
+                ),
+                warm_baseline_host_stats=BenchmarkStats.from_timings(
+                    baseline_result.host_timings
+                ),
+                warm_baseline_gpu_kernel_stats=(
+                    BenchmarkStats.from_timings(baseline_result.kernel_timings)
+                    if baseline_result.has_kernel_timings
+                    else None
+                ),
+                exhaustive_requested=config.oracle_exhaustive,
+                exhaustive_supported=bool(
+                    getattr(winner, "supports_exhaustive", False)
+                ),
+            )
+
+            # Validate after timing; keep OOTB and tuned verdicts separate.
+            if reference_outputs is not None:
+                bm.zero_outputs()
+                executor.execute_once(oracle_handle, variant_pack)
+                oracle.correctness = _check_correctness(
+                    bm,
+                    tensor_infos,
+                    graph_json,
+                    reference_outputs,
+                    config.validation.provider.value,
+                    config,
+                )
+
+            result.oracle = oracle
+            # A speedup requires two valid operands.
+            invalid = [
+                side
+                for side, verdict in (
+                    ("baseline", result.correctness),
+                    ("tuned plan", oracle.correctness),
+                )
+                if verdict is not None and verdict.explicitly_failed
+            ]
+            if invalid:
+                # Preserve timing and verdict evidence, but refuse the ratio.
+                result.oracle_delta = None
+                warn_once(
+                    "oracle_correctness",
+                    f"oracle comparison for {graph_name} engine {engine_id} "
+                    f"suppressed: {' and '.join(invalid)} failed validation",
+                )
+            else:
+                result.oracle_delta = build_oracle_delta(oracle)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        result.oracle_error = error
+        warn_once(
+            "oracle",
+            f"oracle tuning failed for {graph_name} engine {engine_id}: {error}",
+        )
+
+
 def run_single_provider_engine(
     graph_path: Path,
     graph_json_str: str,
@@ -1114,6 +1286,25 @@ def run_single_provider_engine(
                     rtol=rtol,
                     atol=atol,
                     error_message="No reference provider requested",
+                )
+
+            # Reaching here means the OOTB timed pass succeeded (any
+            # failure raised out of this try block already), so the row
+            # is eligible for an oracle comparison.
+            if config.oracle_enabled:
+                _run_oracle_pass(
+                    result=result,
+                    graph_path=graph_path,
+                    graph_json_str=graph_json_str,
+                    graph_name=graph_name,
+                    config=config,
+                    handle=handle,
+                    engine_id=engine_id,
+                    bm=bm,
+                    ootb_executor=executor,
+                    tensor_infos=tensor_infos,
+                    graph_json=graph_json,
+                    reference_outputs=reference_outputs,
                 )
 
         # BufferManager context has exited — I/O buffers are freed.

@@ -339,6 +339,10 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
+        oracle_mode: Oracle comparison depth. "off" runs no comparison;
+            "plan" times the auto-tuner's chosen plan against the heuristic
+            plan; "exhaustive" additionally forces provider kernel
+            benchmarking so providers sample kernel variants.
         metrics: Metric collection configuration. Defaults to ``basic`` tier
             (always-on probes, no extra runs).
         backend: Execution backend (``hipdnn`` runs discovered engine plugins,
@@ -355,6 +359,7 @@ class SuiteConfig:
     seed: Optional[int] = None
     engine_filter: Optional[List[int]] = None
     verbose: bool = False
+    oracle_mode: str = "off"
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None
@@ -370,6 +375,16 @@ class SuiteConfig:
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
     cache_dir: Optional[str] = None
+
+    @property
+    def oracle_enabled(self) -> bool:
+        """True when any oracle comparison should run."""
+        return self.oracle_mode != "off"
+
+    @property
+    def oracle_exhaustive(self) -> bool:
+        """True when the oracle pass must force provider kernel benchmarking."""
+        return self.oracle_mode == "exhaustive"
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
