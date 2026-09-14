@@ -44,28 +44,46 @@ shell activation step: hipDNN and the engine plugins arrive prebuilt for your
 GPU architecture. Released architectures are `gfx90a`, `gfx942`, `gfx950`,
 `gfx1100`, and `gfx1151`.
 
+Each release publishes a requirements file per architecture, so the whole
+install is one command:
+
 ```bash
-# 1. ROCm PyTorch and the ROCm SDK runtime, from the ROCm nightly index.
-pip install --pre "torch[device-gfx942]" "rocm[libraries,device-gfx942]" \
-    --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+python3 -m venv .venv && source .venv/bin/activate
 
-# 2. The benchmark tool plus the hipDNN build for that architecture.
-pip install "dnn-benchmarking[gfx942]" --find-links <release-url>
-
-dnn-benchmark --graph graphs/sample_conv_fwd.json
+pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/v0.1.0-hipdnn-studio-integration.1/requirements-gfx942.txt
 ```
 
-Two commands, because pip cannot pin one requirement to one index: torch has to
-resolve against the ROCm nightly index while `numpy`/`psutil` resolve against
-PyPI. Installing torch first, on its own, keeps that selection unambiguous. For
-the same reason the `[gfx*]` extras deliberately do **not** depend on torch.
+Take the tag from the [releases page](https://github.com/ROCm/dnn-benchmarking/releases).
+`releases/latest/download/...` resolves only once a non-prerelease exists.
 
-Substitute the extra that matches the local GPU; `rocm_agent_enumerator` or
-`rocminfo` reports it. The installed wheel records what it was built for:
+Substitute the architecture that matches the local GPU; `rocm_agent_enumerator`
+or `rocminfo` reports it. The installed wheel records what it was built for:
 
 ```bash
 python -c "import hipdnn_runtime; print(hipdnn_runtime.__gpu_arch__)"
 ```
+
+The requirements file carries the index wiring the install needs: torch resolves
+against the ROCm nightly index while `numpy`/`psutil` resolve against PyPI, and
+pip cannot pin one requirement to one index from the command line. It also pins
+the ROCm SDK version, which transitively pins torch to the same nightly these
+wheels were compiled and verified against -- hipDNN and the ROCm SDK ship
+libraries with matching SONAMEs, so a skewed pair fails at load time rather than
+at install time. For the same reason the `[gfx*]` extras deliberately do **not**
+depend on torch.
+
+To pick the pieces yourself instead, the equivalent is two commands:
+
+```bash
+pip install --pre "torch[device-gfx942]" "rocm[libraries,device-gfx942]" \
+    --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+pip install "dnn-benchmarking[gfx942]" --find-links <release-assets-url>
+```
+
+Any Python the ROCm nightly index builds torch for works; that is currently
+3.10 through 3.14, and this package requires 3.12 or newer. The `hipdnn_frontend`
+and `hipdnn_runtime` wheels are tagged `cp312-abi3`, so one build of each covers
+every supported interpreter. Verified on 3.12 and 3.14.
 
 The plugins resolve from the installed `hipdnn_runtime` package, so
 `ROCM_PATH` is not needed. Setting it still wins, and still points the tool at
@@ -234,7 +252,8 @@ python3 tools/build_release_wheels.py                 # every released arch
 python3 tools/build_release_wheels.py --arch gfx942   # just one
 ```
 
-It writes three kinds of wheel into `dist/`:
+It writes three kinds of wheel into `dist/`, plus one requirements file per
+architecture:
 
 | Wheel | Varies by | Contents |
 | --- | --- | --- |
@@ -253,8 +272,18 @@ path reaching the sibling `_rocm_sdk_*` wheels, which is what removes the
 assembly SDPA kernels built for other architectures, which the superbuild
 installs regardless of `GPU_TARGETS`.
 
-Publish by attaching `dist/*.whl` to a GitHub Release on this repository, or by
-serving them from a PEP 503 index you own. Do **not** push them to
+Publishing is two steps. Build with `--find-links` naming the URL the assets
+will live at, so the generated requirements files point at the right place, then
+attach everything to a GitHub Release on this repository:
+
+```bash
+TAG=v0.1.0
+python3 tools/build_release_wheels.py \
+    --find-links https://github.com/ROCm/dnn-benchmarking/releases/expanded_assets/$TAG
+gh release create $TAG dist/*.whl dist/requirements-*.txt
+```
+
+A PEP 503 index you own works equally well. Do **not** push to
 `rocm.nightlies.amd.com`: that bucket belongs to TheRock, and write access is
 gated to IAM roles assumed by TheRock's own workflows.
 

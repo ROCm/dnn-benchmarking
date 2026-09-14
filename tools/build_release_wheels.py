@@ -180,6 +180,20 @@ class BuildEnv:
         )
         return Path(result.stdout.strip())
 
+    def distribution_version(self, name: str) -> str:
+        """Version of a distribution installed in the build venv."""
+        result = subprocess.run(
+            [
+                str(self.python),
+                "-c",
+                f"from importlib.metadata import version; print(version({name!r}))",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
     def pip(self, *args) -> None:
         run([self.python, "-m", "pip", "install", *args])
 
@@ -424,6 +438,41 @@ def collect_one(wheelhouse: Path, pattern: str, output_dir: Path) -> Path:
     return destination
 
 
+def write_requirements(
+    env: BuildEnv, arch: str, version: str, find_links: str, output_dir: Path
+) -> Path:
+    """Emit a requirements file that installs everything in one pip command.
+
+    pip cannot pin one requirement to one index, but it honours index options
+    inside a requirements file -- and accepts that file over https. So the index
+    wiring ships with the release instead of landing in the user's shell.
+
+    Only the ROCm SDK version is pinned. torch's device package depends on
+    ``rocm-sdk-device-<arch>`` at an exact version, so that single pin drags
+    torch to the same nightly these wheels were compiled and verified against --
+    which matters, because hipDNN and the SDK share library names and a skewed
+    pair fails at load time, not at install time.
+    """
+    rocm_version = env.distribution_version("rocm")
+    path = output_dir / f"requirements-{arch}.txt"
+    path.write_text(
+        textwrap.dedent(f"""\
+            # dnn-benchmarking {version} for {arch}, against ROCm {rocm_version}.
+            # Install with:
+            #   pip install -r {path.name}
+            --index-url {ROCM_TORCH_INDEX_URL}
+            --extra-index-url https://pypi.org/simple
+            --find-links {find_links}
+            --pre
+            torch[device-{arch}]
+            rocm[libraries,device-{arch}]=={rocm_version}
+            dnn-benchmarking[{arch}]=={version}
+            """),
+        encoding="utf-8",
+    )
+    return path
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -447,6 +496,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=REPO_ROOT / "dist",
         help="Directory to write the wheels to. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--find-links",
+        default="",
+        help=(
+            "Where the generated requirements files should look for these "
+            "wheels, e.g. a GitHub Release assets URL. Defaults to --output, "
+            "which works for a local install."
+        ),
     )
     parser.add_argument(
         "--build-venv",
@@ -524,17 +582,22 @@ def main(argv=None) -> int:
     built.append(build_frontend_wheel(env, work_dir / "stage" / archs[0], output_dir))
     built.append(build_benchmark_wheel(env, output_dir))
 
+    find_links = args.find_links or str(output_dir)
+    requirements = [
+        write_requirements(env, arch, version, find_links, output_dir) for arch in archs
+    ]
+
     print()
     print(f"Wheels written to {output_dir}:")
     for wheel in built:
         print(f"  {wheel.name}  ({wheel.stat().st_size / 1e6:.1f} MB)")
+    for path in requirements:
+        print(f"  {path.name}")
     print()
     print(textwrap.dedent(f"""\
             Install on a {archs[0]} host with:
 
-              pip install --pre "torch[device-{archs[0]}]" "rocm[libraries,device-{archs[0]}]" \\
-                  --index-url {ROCM_TORCH_INDEX_URL}
-              pip install "dnn-benchmarking[{archs[0]}]" --find-links {output_dir}
+              pip install -r {requirements[0]}
             """))
     return 0
 
