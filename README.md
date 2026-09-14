@@ -45,10 +45,12 @@ GPU architecture. Released architectures are `gfx90a`, `gfx942`, `gfx950`,
 `gfx1100`, and `gfx1151`.
 
 Each release publishes a requirements file per architecture, so the whole
-install is one command:
+install is one command. Create the venv with a Python 3.12 or newer
+interpreter; on distributions whose `python3` is older, name the version
+explicitly:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 
 pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/v0.1.0-hipdnn-studio-integration.1/requirements-gfx942.txt
 ```

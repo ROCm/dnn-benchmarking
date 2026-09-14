@@ -47,6 +47,12 @@ DEFAULT_ARCHS = ("gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1151")
 # still relies on.
 CMAKE_PIN = "cmake==3.31.6"
 
+# The interpreter floor, mirroring requires-python in pyproject.toml. The
+# sentinel is a distribution that exists on no index: pulled in only below the
+# floor, it makes pip's failure name the real cause.
+PYTHON_FLOOR = "3.12"
+PYTHON_FLOOR_SENTINEL = "dnn-benchmarking-requires-python-3-12-or-newer"
+
 # Loader search paths baked into the packaged payload, relative to each file.
 # They reach the sibling ROCm SDK wheels in the same site-packages, which is
 # what lets a pip install work with no LD_LIBRARY_PATH and no activation script.
@@ -452,18 +458,27 @@ def write_requirements(
     torch to the same nightly these wheels were compiled and verified against --
     which matters, because hipDNN and the SDK share library names and a skewed
     pair fails at load time, not at install time.
+
+    The leading sentinel enforces the Python floor. A GitHub Release page is not
+    a PEP 503 index and carries no ``data-requires-python``, so pip cannot see
+    the floor before downloading, and a too-old interpreter instead reports
+    "no matching distribution" for whichever abi3 dependency it reached first.
+    A requirement that exists only below the floor turns that into a message
+    that names the real problem.
     """
     rocm_version = env.distribution_version("rocm")
     path = output_dir / f"requirements-{arch}.txt"
     path.write_text(
         textwrap.dedent(f"""\
             # dnn-benchmarking {version} for {arch}, against ROCm {rocm_version}.
+            # Needs Python >= {PYTHON_FLOOR}.
             # Install with:
             #   pip install -r {path.name}
             --index-url {ROCM_TORCH_INDEX_URL}
             --extra-index-url https://pypi.org/simple
             --find-links {find_links}
             --pre
+            {PYTHON_FLOOR_SENTINEL}; python_version < "{PYTHON_FLOOR}"
             torch[device-{arch}]
             rocm[libraries,device-{arch}]=={rocm_version}
             dnn-benchmarking[{arch}]=={version}
