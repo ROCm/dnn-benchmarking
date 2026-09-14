@@ -274,7 +274,15 @@ path reaching the sibling `_rocm_sdk_*` wheels, which is what removes the
 assembly SDPA kernels built for other architectures, which the superbuild
 installs regardless of `GPU_TARGETS`.
 
-Publishing is two steps. Build with `--find-links` naming the URL the assets
+The `release-wheels` workflow does this on CI. Dispatch it manually from the
+Actions tab against the branch you want released, giving it the tag to create
+and, optionally, a narrower architecture list. It builds on a GPU-less runner,
+smoke-tests that the packaged payload imports and exposes its engine plugins,
+and publishes the release. It stays manual on purpose: the wheels are
+cross-compiled, so nothing in CI can confirm they run on the hardware they
+target.
+
+To publish by hand instead, build with `--find-links` naming the URL the assets
 will live at, so the generated requirements files point at the right place, then
 attach everything to a GitHub Release on this repository:
 

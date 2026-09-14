@@ -38,6 +38,11 @@ ROCM_LIBRARIES_DIR = REPO_ROOT / "rocm-libraries"
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
 RUNTIME_TEMPLATE_DIR = Path(__file__).resolve().parent / "release" / "hipdnn_runtime"
 
+# setup_env.py already owns the sparse, blobless rocm-libraries checkout this
+# build needs; importing it keeps one implementation of that fetch.
+sys.path.insert(0, str(REPO_ROOT))
+from setup_env import Setup  # noqa: E402
+
 ROCM_TORCH_INDEX_URL = "https://rocm.nightlies.amd.com/whl-multi-arch/"
 
 DEFAULT_ARCHS = ("gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1151")
@@ -571,10 +576,11 @@ def main(argv=None) -> int:
         fail("ERROR: release wheels are built on Linux only.")
     if not shutil.which("patchelf"):
         fail("ERROR: patchelf not found on PATH; it rewrites the packaged RPATHs.")
+    Setup.ensure_rocm_libraries_checkout()
     if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
         fail(
-            f"ERROR: {ROCM_LIBRARIES_DIR} is not populated.",
-            "Run `git submodule update --init rocm-libraries` first.",
+            f"ERROR: {ROCM_LIBRARIES_DIR} is populated but has no CMakePresets.json.",
+            "Check out a rocm-libraries ref that contains the superbuild presets.",
         )
 
     env = BuildEnv(args.build_venv.resolve(), args.index_url)

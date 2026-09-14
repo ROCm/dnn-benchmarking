@@ -30,7 +30,6 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-
 IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -528,7 +527,8 @@ class Setup:
 
     # -- rocm-libraries checkout --------------------------------------------
 
-    def ensure_rocm_libraries_checkout(self) -> None:
+    @staticmethod
+    def ensure_rocm_libraries_checkout() -> None:
         """Fetch rocm-libraries if absent.
 
         It is a git submodule (see .gitmodules) tracking develop by default, so

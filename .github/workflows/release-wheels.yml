@@ -1,0 +1,151 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Builds the release wheels from the HEAD of whichever ref is dispatched and
+# publishes them as a GitHub Release. Manual only for now: the wheels are
+# cross-compiled here and no GPU on this runner can verify them, so a human
+# decides when a build is worth publishing.
+name: release-wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create, e.g. v0.1.0-hipdnn-studio-integration.2'
+        required: true
+        type: string
+      archs:
+        description: 'Space-separated GPU architectures'
+        required: false
+        default: 'gfx90a gfx942 gfx950 gfx1100 gfx1151'
+        type: string
+      prerelease:
+        description: 'Mark the release as a prerelease'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+# The build pulls ~13 GB of ROCm SDK wheels. Never let two dispatches of it
+# overlap on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      # Required to create the release and upload its assets.
+      contents: write
+    steps:
+      # rocm-sdk-devel unpacks to ~13 GB; standard ubuntu-24.04 runners start
+      # with only ~16 GB free, which isn't enough headroom alongside the sparse
+      # rocm-libraries checkout and five install trees. Reclaim preinstalled
+      # toolchains this job does not use. $AGENT_TOOLSDIRECTORY is left alone:
+      # setup-python reads it, and wiping it forces a redownload.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup || true
+          docker system prune -af || true
+
+      # No submodules: build_release_wheels.py fetches rocm-libraries itself as
+      # a sparse, blobless clone rather than the full ~9 GB monorepo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends patchelf
+
+      # --find-links is baked into the generated requirements files, so it has
+      # to name the assets URL of the tag this run is about to create.
+      - name: Build wheels
+        env:
+          PIP_NO_CACHE_DIR: "1"
+          ARCHS: ${{ inputs.archs }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          arch_args=""
+          for arch in $ARCHS; do
+            arch_args="$arch_args --arch $arch"
+          done
+          python tools/build_release_wheels.py $arch_args \
+            --find-links "${{ github.server_url }}/${{ github.repository }}/releases/expanded_assets/$TAG"
+
+      # Wheels are only as good as the interpreter that can load them. This
+      # runner has no GPU, so prove the packaging instead: the payload imports,
+      # reports the architecture it was built for, and the plugin directory it
+      # exposes exists. A real benchmark stays a manual on-hardware step.
+      - name: Smoke test the packaged wheels
+        env:
+          ARCHS: ${{ inputs.archs }}
+        run: |
+          first_arch="${ARCHS%% *}"
+          python -m venv .smoke
+          .smoke/bin/python -m pip install --quiet --upgrade pip
+          .smoke/bin/python -m pip install --quiet \
+            --find-links dist "dnn-benchmarking[$first_arch]"
+          .smoke/bin/python - <<'PY'
+          import hipdnn_runtime
+          from dnn_benchmarking.common.rocm_runtime import wheel_hipdnn_plugin_path
+
+          print("packaged arch:", hipdnn_runtime.__gpu_arch__)
+          plugins = wheel_hipdnn_plugin_path()
+          assert plugins is not None, "runtime wheel exposes no plugin directory"
+          engines = sorted(p.name for p in plugins.glob("*.so"))
+          print("engine plugins:", engines)
+          assert engines, f"no engine plugins packaged under {plugins}"
+          PY
+          .smoke/bin/dnn-benchmark --help > /dev/null
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ARCHS: ${{ inputs.archs }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          # A branch name is attacker-controllable on a fork, so keep every ref
+          # value out of the run block's expansion and read it as data.
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          ASSETS_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download
+        run: |
+          prerelease_flag=""
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flag="--prerelease"
+          fi
+          {
+            echo "Wheels built from \`$REF_NAME\` at \`$SHA\`."
+            echo
+            echo "Architectures: $ARCHS"
+            echo
+            echo '## Install'
+            echo
+            echo 'One command, on Python 3.12 or newer. Substitute your GPU architecture:'
+            echo
+            echo '```bash'
+            echo 'python3.12 -m venv .venv && source .venv/bin/activate'
+            echo "pip install -r $ASSETS_URL/$TAG/requirements-${ARCHS%% *}.txt"
+            echo '```'
+            echo
+            echo 'No compiler, CMake, rocm-libraries checkout, `rocm-sdk-devel`, `ROCM_PATH`, or `LD_LIBRARY_PATH` required.'
+            echo
+            echo '## Verification'
+            echo
+            echo 'Built and packaging-smoked in CI on a runner with no GPU. Benchmark runs on real hardware are a separate manual step.'
+          } > release-notes.md
+
+          gh release create "$TAG" dist/*.whl dist/requirements-*.txt \
+            --target "$SHA" \
+            --title "dnn-benchmarking wheels ($TAG)" \
+            --notes-file release-notes.md \
+            $prerelease_flag
