@@ -10,17 +10,14 @@ A `--backend pytorch` executor runs the same graphs through PyTorch (ROCm or CUD
 
 ## Build and Development Commands
 
+Use `setup_env.py` for all development setup. Use manual package installation only when explicitly requested.
+
 ```bash
-# Full setup (venv, requirements, hipDNN bindings) — skips hipDNN/provider build if already installed
-python3 setup_env.py
+# Standard ROCm setup
+python3 setup_env.py --workspace .workspace
 
-# Manual package setup
-pip install -e ".[test]"
-
-# setup_env.py builds the hipDNN frontend extension and installs its wheel
-
-# Append extra CMake defines to the hipDNN/provider configure (repeatable)
-python3 setup_env.py --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=ON
+# Enable the kernel-ingestor engine
+python3 setup_env.py --workspace .workspace --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=ON
 
 # CUDA host (NVIDIA): PyTorch backend only, skips all ROCm/hipDNN setup
 python3 setup_env.py --torch-mode cuda --workspace .workspace
