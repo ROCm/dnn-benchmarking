@@ -78,6 +78,9 @@ REFERENCE_PROVIDER_CHOICES = frozenset(
 )
 
 
+INPUT_INIT_CHOICES = frozenset({"random", "zeros", "ones"})
+
+
 @dataclass
 class BenchmarkConfig:
     """Configuration for benchmark execution.
@@ -352,6 +355,12 @@ class SuiteConfig:
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
             preference forwarded to PyTorch with the Flash category.
+        input_manifest: Optional path to a dense tensor input manifest (file
+            or directory) to replay recorded inputs instead of generating them.
+        input_init: Fallback input generation mode when no manifest supplies a
+            tensor: "random", "zeros", or "ones".
+        tensor_output_dir: Optional root directory to dump generated/replayed
+            dense input and output tensor manifests for offline inspection.
     """
 
     warmup_iters: int = 10
@@ -375,6 +384,9 @@ class SuiteConfig:
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
     cache_dir: Optional[str] = None
+    input_manifest: Optional[Path] = None
+    input_init: Literal["random", "zeros", "ones"] = "random"
+    tensor_output_dir: Optional[Path] = None
 
     @property
     def oracle_enabled(self) -> bool:
@@ -410,6 +422,15 @@ class SuiteConfig:
                     raise ValueError(
                         "--plugin-path entry count must be 1 or match --engine count"
                     )
+        if self.input_manifest is not None:
+            self.input_manifest = Path(self.input_manifest)
+        if self.input_init not in INPUT_INIT_CHOICES:
+            raise ValueError(
+                f"Invalid input_init: '{self.input_init}'. "
+                f"Valid options: {sorted(INPUT_INIT_CHOICES)}"
+            )
+        if self.tensor_output_dir is not None:
+            self.tensor_output_dir = Path(self.tensor_output_dir)
         try:
             self.backend = ExecutionBackendName(self.backend)
         except ValueError as e:

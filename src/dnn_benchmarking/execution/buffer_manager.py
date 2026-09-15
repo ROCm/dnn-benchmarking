@@ -243,19 +243,17 @@ def generate_input_data(
     tensor_infos: List[TensorInfo],
     seed: Optional[int] = None,
     graph_json: Optional[Dict[str, Any]] = None,
+    init: str = "random",
 ) -> Dict[int, np.ndarray]:
-    """Generate one graph-scoped logical input map.
+    """Create one graph-scoped logical input map.
 
-    Returned arrays use the validation representation consumed by both hipDNN
-    and reference providers: dense logical ndarrays keyed by tensor UID. BF16
-    values are generated as FP32, rounded through BF16 storage, then decoded
-    back to numeric FP32 because NumPy has no native bfloat16 dtype.
-
-    ``graph_json`` is optional and only affects **paged** SDPA graphs: page
-    tables and sequence lengths are integer inputs with invariants that uniform
-    noise cannot satisfy (see :func:`_generate_paged_input`). Without it the
-    behaviour is exactly as before.
+    ``random``, ``zeros``, and ``ones`` apply to ordinary data tensors.
+    Pass-by-value tensors always use the value embedded in the graph. Paged
+    attention index tensors always use their valid structured values.
     """
+    if init not in {"random", "zeros", "ones"}:
+        raise ValueError(f"Unsupported input initialization mode: {init!r}")
+
     rng = np.random.RandomState(seed)
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
@@ -268,7 +266,9 @@ def generate_input_data(
         dtype_key = tensor_info.data_type.lower()
         if tensor_info.is_pass_by_value:
             dtype = DTYPE_MAP.get(dtype_key, np.float32)
-            input_data[tensor_info.uid] = np.asarray([tensor_info.value], dtype=dtype)
+            input_data[tensor_info.uid] = np.full(
+                tensor_info.dims, tensor_info.value, dtype=dtype
+            )
             continue
 
         role = paged_roles.get(tensor_info.uid)
@@ -278,18 +278,22 @@ def generate_input_data(
             )
             continue
 
-        if dtype_key == "bfloat16":
-            data_f32 = rng.uniform(0.0, 1.0, tensor_info.dims).astype(np.float32)
-            raw_bytes = _encode_bfloat16_dense_to_storage_bytes(data_f32, tensor_info)
-            input_data[tensor_info.uid] = _bfloat16_storage_bytes_to_ndarray(
-                raw_bytes, tensor_info
-            )
-            continue
-
-        dtype = DTYPE_MAP.get(dtype_key, np.float32)
-        input_data[tensor_info.uid] = rng.uniform(0.0, 1.0, tensor_info.dims).astype(
-            dtype
+        dtype = (
+            np.float32
+            if dtype_key == "bfloat16"
+            else DTYPE_MAP.get(dtype_key, np.float32)
         )
+        if init == "random":
+            data = rng.uniform(0.0, 1.0, tensor_info.dims).astype(dtype)
+        elif init == "zeros":
+            data = np.zeros(tensor_info.dims, dtype=dtype)
+        else:
+            data = np.ones(tensor_info.dims, dtype=dtype)
+
+        if dtype_key == "bfloat16":
+            raw_bytes = _encode_bfloat16_dense_to_storage_bytes(data, tensor_info)
+            data = _bfloat16_storage_bytes_to_ndarray(raw_bytes, tensor_info)
+        input_data[tensor_info.uid] = data
 
     return input_data
 

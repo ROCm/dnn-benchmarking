@@ -357,6 +357,9 @@ def run_suite_cli(
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
             autotune=getattr(args, "autotune", False),
             cache_dir=str(args.cache_dir) if getattr(args, "cache_dir", None) else None,
+            input_manifest=args.input_manifest,
+            input_init=args.input_init,
+            tensor_output_dir=args.tensor_output_dir,
         )
     except ValueError as e:
         reporter.print_error(f"Suite configuration error: {e}")

@@ -361,7 +361,33 @@ dnn-benchmark --graph 'graphs/*.json' --warmup 10 --iters 100
 
 # With reproducible random seed
 dnn-benchmark --graph ./graphs/sample_conv_fwd.json --seed 42
+
+### Tensor inputs and outputs
+
+Use `--input-init zeros` or `--input-init ones` for deterministic generated
+inputs. The default remains seeded random data. `--tensor-output-dir DIR`
+writes dense, C-order input and output values as `.bin` files with versioned
+JSON manifests:
+
+```bash
+dnn-benchmark -g graph.json --seed 42 --tensor-output-dir ./tensor-artifacts
+dnn-benchmark -g graph.json --input-manifest ./tensor-artifacts \
+  --tensor-output-dir ./replayed-artifacts
 ```
+
+An input manifest must match the graph content and include every non-virtual
+input tensor. The loader verifies tensor UIDs, shapes, data types, graph
+strides, exact byte lengths, SHA-256 checksums, and embedded scalar values.
+The wire encodings are little-endian `f32`, `f16`, `bf16`, `f64`, `int8`,
+`int32`, and `uint8`. Files contain logical values without graph padding;
+the runner packs them into each graph tensor's declared strides.
+
+Output capture runs once after benchmark timing. With validation enabled, the
+same execution used for correctness supplies the captured outputs; otherwise
+the runner performs one untimed execution for capture. Report JSON
+links each graph to its input manifest and each successful row to its output or
+reference manifest. Profiling replays the captured input manifest so its
+workload uses the same input bytes as the timed pass.
 
 ### Running from a Tarball
 

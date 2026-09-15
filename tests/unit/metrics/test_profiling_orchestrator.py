@@ -65,6 +65,35 @@ class TestBuildInnerArgv:
         )
         assert "--oracle-mode" not in argv
 
+    def test_input_manifest_replaces_seed_regeneration(self):
+        argv = orch.build_inner_argv(
+            graph_path=Path("/g/x.json"),
+            engine_id=1,
+            seed=7,
+            warmup_iters=1,
+            benchmark_iters=1,
+            plugin_path=None,
+            input_manifest=Path("/artifacts/input/manifest.json"),
+        )
+
+        assert (
+            argv[argv.index("--input-manifest") + 1] == "/artifacts/input/manifest.json"
+        )
+        assert "--seed" not in argv
+
+    def test_nonrandom_input_mode_replays_without_manifest(self):
+        argv = orch.build_inner_argv(
+            graph_path=Path("/g/x.json"),
+            engine_id=1,
+            seed=None,
+            warmup_iters=1,
+            benchmark_iters=1,
+            plugin_path=None,
+            input_init="ones",
+        )
+
+        assert argv[argv.index("--input-init") + 1] == "ones"
+
 
 class TestResolveOutputDir:
     def test_default_creates_timestamped_dir(self, tmp_path, monkeypatch):

@@ -12,6 +12,7 @@ from typing import Any, FrozenSet, List, Optional
 from ..config.benchmark_config import (
     EXECUTION_BACKEND_CHOICES,
     ExecutionBackendName,
+    INPUT_INIT_CHOICES,
     PYTORCH_SDPA_BACKEND_CHOICES,
     PyTorchSdpaBackendName,
     REFERENCE_PROVIDER_CHOICES,
@@ -229,6 +230,19 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_kind=ConfigKind.PATH,
     ),
     CliOption(
+        flags=("--tensor-output-dir",),
+        dest="tensor_output_dir",
+        parser_type=Path,
+        metavar="DIR",
+        group="Output",
+        help=(
+            "Root directory to dump dense input/output tensor manifests "
+            "(JSON manifest + .bin values) for offline replay or inspection."
+        ),
+        config_key="tensor_output_dir",
+        config_kind=ConfigKind.PATH,
+    ),
+    CliOption(
         flags=("-v", "--verbose"),
         dest="verbose",
         action="store_true",
@@ -257,6 +271,36 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "significantly slower, 'exhaustive' much more so."
         ),
         config_key="oracle_mode",
+        config_kind=ConfigKind.CHOICE,
+        config_type=str,
+    ),
+    CliOption(
+        flags=("--input-manifest",),
+        dest="input_manifest",
+        parser_type=Path,
+        metavar="PATH",
+        group="Tensor Data",
+        help=(
+            "Dense tensor input manifest file or directory to replay "
+            "recorded inputs instead of generating them. Must supply every "
+            "required input tensor for the graph."
+        ),
+        config_key="input_manifest",
+        config_kind=ConfigKind.PATH,
+    ),
+    CliOption(
+        flags=("--input-init",),
+        dest="input_init",
+        parser_type=str,
+        choices=INPUT_INIT_CHOICES,
+        default="random",
+        metavar="MODE",
+        group="Tensor Data",
+        help=(
+            "Input generation mode when no --input-manifest is supplied "
+            "(default: random). Options: random, zeros, ones."
+        ),
+        config_key="input_init",
         config_kind=ConfigKind.CHOICE,
         config_type=str,
     ),
@@ -593,11 +637,16 @@ Suite Mode (multiple graphs):
 Tarball Input:
   dnn-benchmark --graph graphs.tar.gz
   dnn-benchmark --graph graphs.tgz -o results.json
+
+Tensor Data (dense input/output manifests):
+  dnn-benchmark -g ./graph.json --tensor-output-dir ./tensors
+  dnn-benchmark -g ./graph.json --input-manifest ./tensors
         """,
     )
 
     groups = {
         "Output": parser.add_argument_group("Output"),
+        "Tensor Data": parser.add_argument_group("Tensor Data"),
         "Reference Comparison": parser.add_argument_group("Reference Comparison"),
         "Reference Validation": parser.add_argument_group("Reference Validation"),
         "Suite Options": parser.add_argument_group("Suite Options"),

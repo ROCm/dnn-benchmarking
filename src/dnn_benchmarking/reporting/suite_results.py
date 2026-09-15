@@ -278,6 +278,9 @@ class ProviderEngineResult:
             lacks comparable statistics.
         oracle_error: Why tuning produced no result for this row.
             Mutually exclusive with ``oracle``.
+        tensor_manifest: Path to the dense logical tensor manifest captured
+            after benchmark timing. A validation execution supplies validated
+            outputs; otherwise capture uses a separate untimed execution.
 
     Note:
         Process RSS, host RAM availability, and the volatile parts of
@@ -325,6 +328,7 @@ class ProviderEngineResult:
     oracle: Optional[OracleResult] = None
     oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
+    tensor_manifest: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate status field."""
@@ -363,6 +367,8 @@ class ProviderEngineResult:
             d["plugin_path"] = self.plugin_path
         if self.warnings:
             d["warnings"] = list(self.warnings)
+        if self.tensor_manifest is not None:
+            d["tensor_manifest"] = self.tensor_manifest
         # extra_metrics is exclusively populated by the opt-in
         # profiling orchestrator, which the suite runner only fires on
         # the success path. Asserting the invariant here makes it
@@ -493,12 +499,15 @@ class GraphResult:
         graph_name: Name of the graph.
         graph_path: File path to the graph JSON.
         results: List of ProviderEngineResult for each combination.
+        input_tensor_manifest: Path to the graph input manifest used for all
+            provider and reference executions.
     """
 
     graph_name: str
     graph_path: str
     results: List[ProviderEngineResult]
     engine_ids: List[int] = field(default_factory=list)
+    input_tensor_manifest: Optional[str] = None
 
     def is_no_engine_graph(self) -> bool:
         """True when this graph result represents a no-engine outcome."""
@@ -540,11 +549,14 @@ class GraphResult:
 
         Graph entry with 'results' array of provider/engine entries.
         """
-        return {
+        result: Dict[str, Any] = {
             "graph_name": self.graph_name,
             "graph_path": self.graph_path,
             "results": [r.to_dict() for r in self.results],
         }
+        if self.input_tensor_manifest is not None:
+            result["input_tensor_manifest"] = self.input_tensor_manifest
+        return result
 
 
 @dataclass

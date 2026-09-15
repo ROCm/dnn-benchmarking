@@ -113,12 +113,10 @@ def build_inner_argv(
     warmup_iters: int,
     benchmark_iters: int,
     plugin_path: Optional[Path],
+    input_manifest: Optional[Path] = None,
+    input_init: str = "random",
 ) -> List[str]:
-    """Construct the argv for the ``--internal-profiling-run`` sub-mode.
-
-    Always omits any opt-in profiling flag so the child process can't
-    recurse back into the orchestrator.
-    """
+    """Construct the argv for the ``--internal-profiling-run`` sub-mode."""
     argv = [
         sys.executable,
         "-m",
@@ -139,8 +137,13 @@ def build_inner_argv(
         "--metrics-tier",
         "off",
     ]
-    if seed is not None:
-        argv += ["--seed", str(seed)]
+    if input_manifest is not None:
+        argv += ["--input-manifest", str(input_manifest)]
+    else:
+        if seed is not None:
+            argv += ["--seed", str(seed)]
+        if input_init != "random":
+            argv += ["--input-init", input_init]
     if plugin_path is not None:
         argv += ["--plugin-path", str(plugin_path)]
     return argv
@@ -182,30 +185,13 @@ def run_profiling_passes(
     metrics_config: MetricsConfig,
     plugin_path: Optional[Path],
     out_dir: Optional[Path] = None,
+    input_manifest: Optional[Path] = None,
+    input_init: str = "random",
 ) -> Dict[str, Any]:
     """Run every requested profiling source. Returns a merged dict.
 
-    Source slices are merged at the top level so consumers can address
-    them via ``extra_metrics["pmc"]``, ``extra_metrics["trace"]`` etc.
-
-    Args:
-        graph_path: Graph file passed to the inner process.
-        engine_id: Single engine ID for the inner process.
-        engine_name: Human-readable engine name (e.g.
-            ``"MIOPEN_ENGINE"``) used as the per-engine output
-            subdirectory; resolved by the caller via
-            ``suite_runner._resolve_engine_name``.
-        seed: Reproducibility seed for fill_inputs_random; passed
-            through to the inner process so PMC counts are over the
-            same input distribution as the timed pass.
-        warmup_iters: Inner warmup iteration count.
-        benchmark_iters: Inner benchmark iteration count.
-        metrics_config: Decides which sources fire.
-        plugin_path: Optional plugin path forwarded to the inner CLI.
-        out_dir: Override the resolved profiling-output root (test hook).
-
-    Never raises. Source-specific failures end up in their slice's
-    ``skipped`` / ``error_tail`` / ``warnings`` keys.
+    A captured input manifest takes precedence over seed regeneration so the
+    profiling subprocess executes the same values as the timed pass.
     """
     if not metrics_config.opt_in_pass_requested:
         return {}
@@ -217,14 +203,13 @@ def run_profiling_passes(
         engine_id=engine_id,
         seed=seed,
         warmup_iters=warmup_iters,
-        # Single iter — warmups should be enough to stabilise; re-evaluate
-        # if any source shows noisy counters in practice.
         benchmark_iters=1,
         plugin_path=plugin_path,
+        input_manifest=input_manifest,
+        input_init=input_init,
     )
 
     aggregated: Dict[str, Any] = {}
-
     timeout_s = metrics_config.profiling_timeout_s
 
     if metrics_config.pmc_set is not None:

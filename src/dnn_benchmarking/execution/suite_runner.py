@@ -12,13 +12,13 @@ output against a reference provider via ArrayComparator.
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
-
-from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..common.exceptions import ExecutionError, UnsupportedGraphError, ValidationError
 from ..config.benchmark_config import (
     BenchmarkConfig,
     PyTorchSdpaBackendName,
@@ -27,6 +27,7 @@ from ..config.benchmark_config import (
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
+from ..execution.tensor_artifacts import load_input_tensors, write_tensor_manifest
 from ..execution.timing import Timer
 from ..metrics import (
     CpuTimeProbe,
@@ -52,7 +53,6 @@ from ..validation.reference_provider import (
 )
 from ..validation.validator import Validator
 
-
 # bf16 has a 7-bit mantissa: 1 ULP ~= 2^-7 = 0.78% relative. Backward
 # convolutions (wgrad/dgrad) accumulate over large reductions, and the MIOpen
 # kernels hipDNN and PyTorch select round 2-3 ULP apart even when they pick the
@@ -72,6 +72,141 @@ class _TimedPytorchRow:
 
     result: ProviderEngineResult
     outputs: Optional[Dict[int, ReferenceOutput]]
+
+
+def _graph_source_key(graph_path: Path) -> str:
+    try:
+        source = str(graph_path.resolve())
+    except OSError:
+        source = str(graph_path)
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+
+
+def _prepare_graph_inputs(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+) -> tuple[Dict[int, Any], Optional[str], Optional[Path]]:
+    if config.input_manifest is not None:
+        input_data = load_input_tensors(config.input_manifest, graph_json, tensor_infos)
+        replay_source = config.input_manifest
+    else:
+        input_data = generate_input_data(
+            tensor_infos, config.seed, graph_json, init=config.input_init
+        )
+        replay_source = None
+
+    manifest_path = replay_source if config.input_manifest is not None else None
+    if config.tensor_output_dir is not None:
+        manifest_path = write_tensor_manifest(
+            config.tensor_output_dir,
+            graph_path,
+            graph_json,
+            tensor_infos,
+            input_data,
+            phase="input",
+            artifact_key=_graph_source_key(graph_path),
+        )
+        replay_source = manifest_path
+    elif config.metrics.opt_in_pass_requested and replay_source is None:
+        from ..metrics.profiling_orchestrator import resolve_output_dir
+
+        manifest_path = write_tensor_manifest(
+            resolve_output_dir(config.metrics) / "tensor-inputs",
+            graph_path,
+            graph_json,
+            tensor_infos,
+            input_data,
+            phase="input",
+            artifact_key=_graph_source_key(graph_path),
+        )
+        replay_source = manifest_path
+    return (
+        input_data,
+        (
+            str(manifest_path)
+            if config.tensor_output_dir is not None or config.input_manifest is not None
+            else None
+        ),
+        replay_source,
+    )
+
+
+def _collect_output_tensors(buffer_manager: Any, tensor_infos: list) -> Dict[int, Any]:
+    outputs: Dict[int, Any] = {}
+    for tensor_info in tensor_infos:
+        if not tensor_info.is_output or tensor_info.is_virtual:
+            continue
+        data = buffer_manager.get_output_data(tensor_info.uid)
+        if data is None:
+            raise ExecutionError(
+                f"Missing output data for tensor UID {tensor_info.uid}"
+            )
+        outputs[tensor_info.uid] = data
+    if not outputs:
+        raise ExecutionError("Graph produced no non-virtual output tensors")
+    return outputs
+
+
+def _write_row_outputs(
+    config: SuiteConfig,
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    outputs: Dict[int, Any],
+    *,
+    phase: Literal["output", "reference"],
+    provider: str,
+    engine_id: int,
+    artifact_key: str,
+) -> Optional[str]:
+    if config.tensor_output_dir is None:
+        return None
+    return str(
+        write_tensor_manifest(
+            config.tensor_output_dir,
+            graph_path,
+            graph_json,
+            tensor_infos,
+            outputs,
+            phase=phase,
+            provider=provider,
+            engine_id=engine_id,
+            artifact_key=artifact_key,
+        )
+    )
+
+
+def _capture_row_outputs(
+    result: ProviderEngineResult,
+    config: SuiteConfig,
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    buffer_manager: Any,
+    *,
+    phase: Literal["output", "reference"],
+    provider: str,
+    engine_id: int,
+    artifact_key: str,
+) -> None:
+    try:
+        result.tensor_manifest = _write_row_outputs(
+            config,
+            graph_path,
+            graph_json,
+            tensor_infos,
+            _collect_output_tensors(buffer_manager, tensor_infos),
+            phase=phase,
+            provider=provider,
+            engine_id=engine_id,
+            artifact_key=artifact_key,
+        )
+    except (OSError, ValueError, RuntimeError, ValidationError, ExecutionError) as e:
+        warning = f"Tensor output capture failed: {type(e).__name__}: {e}"
+        result.warnings = [*(result.warnings or []), warning]
+        warn_once("tensor_artifacts", warning)
 
 
 def _output_node_types(graph_json: Dict[str, Any]) -> Dict[int, str]:
@@ -463,6 +598,7 @@ def _run_timed_pytorch_row(
         engine_id=0,
         status="skipped",
         engine_version=engine_version,
+        role=role,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
@@ -526,6 +662,42 @@ def _run_timed_pytorch_row(
                     buffer_manager.zero_outputs()
                     executor.execute_once(tensors)
                     outputs = _pytorch_reference_outputs_from_buffer(buffer_manager)
+                    if config.tensor_output_dir is not None:
+                        _capture_row_outputs(
+                            result,
+                            config,
+                            graph_path,
+                            graph_json,
+                            tensor_infos,
+                            buffer_manager,
+                            phase="reference",
+                            provider=result.provider,
+                            engine_id=result.engine_id,
+                            artifact_key=_graph_source_key(graph_path),
+                        )
+                elif config.tensor_output_dir is not None:
+                    try:
+                        buffer_manager.zero_outputs()
+                        executor.execute_once(tensors)
+                    except Exception as e:
+                        warning = (
+                            f"Tensor output capture failed: {type(e).__name__}: {e}"
+                        )
+                        result.warnings = [*(result.warnings or []), warning]
+                        warn_once("tensor_artifacts", warning)
+                    else:
+                        _capture_row_outputs(
+                            result,
+                            config,
+                            graph_path,
+                            graph_json,
+                            tensor_infos,
+                            buffer_manager,
+                            phase="output",
+                            provider=result.provider,
+                            engine_id=result.engine_id,
+                            artifact_key=_graph_source_key(graph_path),
+                        )
 
             if role == "reference":
                 result.correctness = _reference_row_correctness(config)
@@ -683,8 +855,17 @@ def run_graph_all_providers(
     engine_selections = config.engine_selections_for(engine_ids)
     ref_provider = _get_reference_provider(config, graph_json)
     try:
-        graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
-    except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
+        graph_input_data, input_manifest, profiling_input_manifest = (
+            _prepare_graph_inputs(graph_path, graph_json, tensor_infos, config)
+        )
+    except (
+        ValueError,
+        RuntimeError,
+        OSError,
+        TypeError,
+        OverflowError,
+        ValidationError,
+    ) as e:
         msg = f"Input data generation failed: {e}"
         rtol, atol = _fallback_tolerance_for_config(config)
         return GraphResult(
@@ -762,7 +943,7 @@ def run_graph_all_providers(
                 config,
             )
 
-    for selection in engine_selections:
+    for selection_index, selection in enumerate(engine_selections):
         engine_id = selection.engine_id
         engine_plugin_path = selection.plugin_path
         engine_name = _resolve_engine_name(engine_id)
@@ -814,6 +995,10 @@ def run_graph_all_providers(
                 analytical_flops=analytical_flops,
                 analytical_flops_partial=analytical_flops_partial,
                 analytical_io_bytes=analytical_io_bytes,
+                profiling_input_manifest=profiling_input_manifest,
+                output_artifact_key=(
+                    f"{_graph_source_key(graph_path)}-{selection_index}"
+                ),
             )
         pe_result.elapsed_time_ms = t.elapsed_ms
         if engine_plugin_path is not None:
@@ -827,6 +1012,7 @@ def run_graph_all_providers(
         graph_path=str(graph_path),
         results=pe_results,
         engine_ids=engine_ids,
+        input_tensor_manifest=input_manifest,
     )
 
 
@@ -889,8 +1075,17 @@ def run_graph_pytorch_backend(
         )
 
     try:
-        graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
-    except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
+        graph_input_data, input_manifest, _profiling_input_manifest = (
+            _prepare_graph_inputs(graph_path, graph_json, tensor_infos, config)
+        )
+    except (
+        ValueError,
+        RuntimeError,
+        OSError,
+        TypeError,
+        OverflowError,
+        ValidationError,
+    ) as e:
         msg = f"Input data generation failed: {e}"
         return GraphResult(
             graph_name=graph_name,
@@ -937,6 +1132,7 @@ def run_graph_pytorch_backend(
         graph_path=str(graph_path),
         results=[row],
         engine_ids=[0],
+        input_tensor_manifest=input_manifest,
     )
 
 
@@ -1186,6 +1382,8 @@ def run_single_provider_engine(
     analytical_flops: Optional[int] = None,
     analytical_flops_partial: bool = False,
     analytical_io_bytes: Optional[int] = None,
+    profiling_input_manifest: Optional[Path] = None,
+    output_artifact_key: Optional[str] = None,
 ) -> ProviderEngineResult:
     """Execute a single engine for a graph (single attempt)."""
     # Initialise the result conservatively as an error and mutate fields as
@@ -1273,8 +1471,6 @@ def run_single_provider_engine(
                     f"Reference provider '{config.validation.provider.value}' "
                     f"does not support this graph"
                 )
-                # User asked for validation but no reference output was usable.
-                # Treat as a correctness failure so --validate stays a hard gate.
                 result.correctness = _reference_unavailable_correctness(
                     config, error_message
                 )
@@ -1287,6 +1483,46 @@ def run_single_provider_engine(
                     atol=atol,
                     error_message="No reference provider requested",
                 )
+
+            if config.tensor_output_dir is not None:
+                if reference_outputs is None:
+                    try:
+                        bm.zero_outputs()
+                        executor.execute_once(handle, variant_pack)
+                    except Exception as e:
+                        warning = (
+                            f"Tensor output capture failed: {type(e).__name__}: {e}"
+                        )
+                        result.warnings = [*(result.warnings or []), warning]
+                        warn_once("tensor_artifacts", warning)
+                    else:
+                        _capture_row_outputs(
+                            result,
+                            config,
+                            graph_path,
+                            graph_json,
+                            tensor_infos,
+                            bm,
+                            phase="output",
+                            provider=provider,
+                            engine_id=engine_id,
+                            artifact_key=output_artifact_key
+                            or _graph_source_key(graph_path),
+                        )
+                else:
+                    _capture_row_outputs(
+                        result,
+                        config,
+                        graph_path,
+                        graph_json,
+                        tensor_infos,
+                        bm,
+                        phase="output",
+                        provider=provider,
+                        engine_id=engine_id,
+                        artifact_key=output_artifact_key
+                        or _graph_source_key(graph_path),
+                    )
 
             # Reaching here means the OOTB timed pass succeeded (any
             # failure raised out of this try block already), so the row
@@ -1342,8 +1578,10 @@ def run_single_provider_engine(
                     seed=config.seed,
                     warmup_iters=config.warmup_iters,
                     benchmark_iters=config.benchmark_iters,
+                    input_init=config.input_init,
                     metrics_config=config.metrics,
                     plugin_path=plugin_path,
+                    input_manifest=profiling_input_manifest,
                 )
                 if extra:
                     result.extra_metrics = extra
@@ -1381,7 +1619,7 @@ def run_single_provider_engine(
         )
         return result
 
-    except (ValueError, RuntimeError, OSError) as e:
+    except (ValueError, RuntimeError, OSError, ValidationError) as e:
         error_msg = str(e)
         result.cpu_build_time_ms = None
         result.gpu_kernel_stats = None

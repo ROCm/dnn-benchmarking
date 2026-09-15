@@ -26,6 +26,7 @@ from ..common.exceptions import GraphLoadError
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import MetricsConfig, SuiteConfig
 from ..execution.buffer_manager import generate_input_data
+from ..execution.tensor_artifacts import load_input_tensors
 from ..execution.suite_runner import run_single_provider_engine, set_plugin_path
 from ..graph.loader import GraphLoader
 
@@ -95,6 +96,8 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
     # `plugin_path` is forwarded so the child SuiteConfig matches the
     # parent's selected engine/plugin row. The outer suite runner passes
     # exactly one plugin path for this single-engine subprocess.
+    input_manifest = getattr(args, "input_manifest", None)
+    input_init = getattr(args, "input_init", "random")
     suite_config = SuiteConfig(
         warmup_iters=args.warmup,
         benchmark_iters=args.iters,
@@ -103,9 +106,18 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
         verbose=False,
         metrics=MetricsConfig(tier="off"),
         plugin_paths=[plugin_path] if plugin_path is not None else None,
+        input_manifest=input_manifest,
+        input_init=input_init,
     )
 
     try:
+        input_data = (
+            load_input_tensors(input_manifest, graph_json, tensor_infos)
+            if input_manifest is not None
+            else generate_input_data(
+                tensor_infos, args.seed, graph_json, init=input_init
+            )
+        )
         result = run_single_provider_engine(
             graph_path=graph_path,
             graph_json_str=json.dumps(graph_json),
@@ -118,7 +130,7 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
             plugin_path=plugin_path,
             reference_outputs=None,
             reference_error=None,
-            input_data=generate_input_data(tensor_infos, args.seed),
+            input_data=input_data,
             validation_requested=False,
             graph_json=graph_json,
         )

@@ -159,6 +159,48 @@ class TestParserGlobAndFilters:
         assert "forwarded unchanged to PyTorch" in help_text
 
 
+class TestTensorDataFlags:
+    """Argparse-layer coverage for the dense tensor input/output flags."""
+
+    def test_input_manifest_default_none_accepts_path(self) -> None:
+        parser = create_parser()
+        assert parser.parse_args(["--graph", "g.json"]).input_manifest is None
+        args = parser.parse_args(
+            ["--graph", "g.json", "--input-manifest", "/tensors/manifest.json"]
+        )
+        assert args.input_manifest == Path("/tensors/manifest.json")
+
+    def test_input_init_defaults_to_random(self) -> None:
+        args = create_parser().parse_args(["--graph", "g.json"])
+        assert args.input_init == "random"
+
+    @pytest.mark.parametrize("mode", ["random", "zeros", "ones"])
+    def test_input_init_accepts_all_modes(self, mode: str) -> None:
+        parser = create_parser()
+        args = parser.parse_args(["--graph", "g.json", "--input-init", mode])
+        assert args.input_init == mode
+
+    def test_input_init_rejects_unknown_mode(self) -> None:
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--graph", "g.json", "--input-init", "bogus"])
+
+    def test_tensor_output_dir_default_none_accepts_path(self, tmp_path) -> None:
+        parser = create_parser()
+        assert parser.parse_args(["--graph", "g.json"]).tensor_output_dir is None
+        args = parser.parse_args(
+            ["--graph", "g.json", "--tensor-output-dir", str(tmp_path / "tensors")]
+        )
+        assert args.tensor_output_dir == Path(str(tmp_path / "tensors"))
+
+    def test_tensor_data_flags_visible_in_help(self) -> None:
+        help_text = create_parser().format_help()
+        assert "Tensor Data" in help_text
+        assert "--input-manifest" in help_text
+        assert "--input-init" in help_text
+        assert "--tensor-output-dir" in help_text
+
+
 class TestMainRouting:
     """Tests for main() routing — single and multi files both go through the orchestrator."""
 
@@ -260,6 +302,37 @@ class TestMainRouting:
 
         suite_config = mock_benchmark.call_args.kwargs["config"]
         assert suite_config.engine_filter == [1, 2]
+
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_tensor_options_propagate_to_suite_config(
+        self, mock_benchmark: MagicMock
+    ) -> None:
+        mock_benchmark.return_value = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_graph_files(Path(tmpdir), 1)
+            with patch(
+                "sys.argv",
+                [
+                    "dnn-benchmark",
+                    "--graph",
+                    paths[0],
+                    "--input-manifest",
+                    "/inputs",
+                    "--input-init",
+                    "ones",
+                    "--tensor-output-dir",
+                    "/outputs",
+                ],
+            ):
+                from dnn_benchmarking.cli.main import main
+
+                main()
+
+        config = mock_benchmark.call_args.kwargs["config"]
+        assert config.input_manifest == Path("/inputs")
+        assert config.input_init == "ones"
+        assert config.tensor_output_dir == Path("/outputs")
 
     @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
     def test_plugin_paths_propagate_to_suite_config(

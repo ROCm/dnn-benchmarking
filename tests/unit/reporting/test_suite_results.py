@@ -307,6 +307,16 @@ class TestProviderEngineResult:
         assert "correctness" in d
         assert d["correctness"]["execution_success"] is False
 
+    def test_tensor_manifest_serializes_for_success_row(self):
+        pe = ProviderEngineResult(
+            provider="miopen",
+            engine_id=3,
+            status="success",
+            tensor_manifest="artifacts/output/manifest.json",
+        )
+
+        assert pe.to_dict()["tensor_manifest"] == "artifacts/output/manifest.json"
+
 
 class TestCorrectnessFailed:
     """Tests for CorrectnessResult.failed factory (S-01)."""
@@ -348,6 +358,16 @@ class TestGraphResult:
         assert d["graph_path"] == "/p/conv.json"
         assert len(d["results"]) == 1
         assert d["results"][0]["status"] == "error"
+
+    def test_input_tensor_manifest_serializes_at_graph_level(self):
+        gr = GraphResult(
+            graph_name="conv",
+            graph_path="/p/conv.json",
+            results=[],
+            input_tensor_manifest="artifacts/input/manifest.json",
+        )
+
+        assert gr.to_dict()["input_tensor_manifest"] == "artifacts/input/manifest.json"
 
     def test_count_by_status_buckets_all_outcomes(self):
         """count_by_status returns the correct bucket counts."""

@@ -329,3 +329,29 @@ class TestSuiteConfigBackend:
 
     def test_timing_backend_enum_values(self) -> None:
         assert TimingBackendName.TORCH.value == "torch"
+
+
+class TestSuiteConfigTensorData:
+    """SuiteConfig dense tensor input/output field defaults and validation."""
+
+    def test_defaults(self) -> None:
+        config = SuiteConfig()
+        assert config.input_manifest is None
+        assert config.input_init == "random"
+        assert config.tensor_output_dir is None
+
+    @pytest.mark.parametrize("mode", ["random", "zeros", "ones"])
+    def test_accepted_init_modes(self, mode: str) -> None:
+        assert SuiteConfig(input_init=mode).input_init == mode
+
+    def test_invalid_init_mode_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Invalid input_init"):
+            SuiteConfig(input_init="bogus")
+
+    def test_input_manifest_string_path_converted_to_path(self) -> None:
+        config = SuiteConfig(input_manifest="/tensors/manifest.json")
+        assert config.input_manifest == Path("/tensors/manifest.json")
+
+    def test_tensor_output_dir_string_path_converted_to_path(self) -> None:
+        config = SuiteConfig(tensor_output_dir="/tensors/out")
+        assert config.tensor_output_dir == Path("/tensors/out")
