@@ -139,6 +139,7 @@ class TestProviderEngineResult:
             provider="miopen",
             engine_id=1,
             status="success",
+            engine_name="MIOPEN_ENGINE",
             cpu_build_time_ms=10.5,
             gpu_kernel_stats=stats,
             host_stats=stats,
@@ -152,9 +153,18 @@ class TestProviderEngineResult:
         assert "correctness" in d
         assert d["gpu_kernel_stats"]["mean_ms"] == 1.0
         assert d["engine_id"] == 1
-        assert d["engine_name"] == "miopen"
+        assert d["engine_name"] == "MIOPEN_ENGINE"
         assert d["engine_version"] == "unavailable"
         assert d["started_at"].endswith("+00:00")
+
+    def test_engine_name_defaults_to_provider_for_older_callers(self):
+        result = ProviderEngineResult(
+            provider="pytorch",
+            engine_id=0,
+            status="success",
+        )
+
+        assert result.to_dict()["engine_name"] == "pytorch"
 
     def test_success_serializes_plugin_path(self):
         stats = BenchmarkStats(

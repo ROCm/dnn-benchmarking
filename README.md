@@ -555,8 +555,9 @@ dnn-benchmark --graph 'graphs/*.json' --backend pytorch -o cuda_pytorch_results.
 ```
 
 Each JSON file is a full `SuiteResult`: `graphs` is a list of graph entries,
-each carrying its `graph_name` plus result rows with E2E and kernel timing
-statistics and whatever machine metadata the host could provide
+each carrying its `graph_name` plus result rows with `engine_id`, the canonical
+`engine_name` reported by the loaded hipDNN handle, E2E and kernel timing
+statistics, and whatever machine metadata the host could provide
 (`rocm_version` and the amdsmi snapshot are `None` on CUDA, and `gpu_arch` is
 `"unknown"`). Graphs match across files by `graph_name`, so the artifacts can
 be diffed offline. (An offline comparison helper is planned but not yet

@@ -229,6 +229,7 @@ class ProviderEngineResult:
     Attributes:
         provider: Provider name.
         engine_id: Engine ID used.
+        engine_name: Canonical name reported by the loaded hipDNN engine.
         status: One of 'success', 'error', 'skipped'.
         engine_version: Loaded provider plugin version.
         started_at: UTC timestamp immediately before this engine run.
@@ -329,6 +330,7 @@ class ProviderEngineResult:
     oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
     tensor_manifest: Optional[str] = None
+    engine_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate status field."""
@@ -356,7 +358,7 @@ class ProviderEngineResult:
         d: Dict[str, Any] = {
             "provider": self.provider,
             "engine_id": self.engine_id,
-            "engine_name": self.provider,
+            "engine_name": self.engine_name or self.provider,
             "engine_version": self.engine_version,
             "started_at": self.started_at,
             "status": self.status,

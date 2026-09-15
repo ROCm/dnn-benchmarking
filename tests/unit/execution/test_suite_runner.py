@@ -102,6 +102,14 @@ def test_resolve_engine_version_uses_loaded_plugin_metadata():
     handle.get_engine_info.assert_called_once_with(7)
 
 
+def test_resolve_engine_name_uses_loaded_handle_metadata():
+    handle = MagicMock()
+    handle.engine_id_to_name.return_value = "MIOPEN_ENGINE"
+
+    assert _resolve_engine_name(handle, 7) == "MIOPEN_ENGINE"
+    handle.engine_id_to_name.assert_called_once_with(7)
+
+
 def _make_exec_factory(
     engine_ids=None,
     init_time_ms: float = 1.0,
@@ -167,7 +175,7 @@ class TestRunGraphAllProviders:
         mock_resolve_name,
     ):
         """run_graph_all_providers returns one ProviderEngineResult per discovered engine ID."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(
@@ -184,6 +192,11 @@ class TestRunGraphAllProviders:
             handle=MagicMock(),
         )
 
+        assert [r.engine_name for r in result.results] == [
+            "engine_0",
+            "engine_1",
+            "engine_2",
+        ]
         assert isinstance(result, GraphResult)
         assert len(result.results) == 3
         assert [r.engine_id for r in result.results] == [0, 1, 2]
@@ -437,7 +450,7 @@ class TestDiscoveryFailure:
         mock_resolve_name,
     ):
         """Explicit --engine IDs run in CLI order without discovery filtering."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1])
         mock_bm_cls.return_value = _make_bm_mock()
@@ -519,7 +532,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """When --engine filter is set, only that engine ID is iterated."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2])
@@ -548,7 +561,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """engine_filter=[1, 3, 99] runs exactly those IDs in caller order."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2, 3])
@@ -577,7 +590,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """Repeated engine IDs are separate ordered selections."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
         mock_bm_cls.return_value = _make_bm_mock()
@@ -623,7 +636,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """A later per-engine handle failure records an error row and continues."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
         mock_bm_cls.return_value = _make_bm_mock()
@@ -1358,21 +1371,11 @@ class TestResolveEngineName:
     """Tests for _resolve_engine_name fallback behavior."""
 
     def test_falls_back_to_hex_when_lookup_fails(self):
-        """If hipdnn_frontend isn't importable, the helper falls back to a hex display."""
-        # Force the import inside _resolve_engine_name to fail by injecting a
-        # missing module entry. We use unittest.mock.patch on builtins.__import__
-        # to surgically reject just hipdnn_frontend.
-        import builtins
+        """A handle lookup failure keeps a stable hexadecimal display."""
+        handle = MagicMock()
+        handle.engine_id_to_name.side_effect = RuntimeError("not available")
 
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "hipdnn_frontend":
-                raise ImportError("simulated missing module")
-            return real_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=fake_import):
-            assert _resolve_engine_name(0xABC) == "engine_0xabc"
+        assert _resolve_engine_name(handle, 0xABC) == "engine_0xabc"
 
 
 class TestProfilingPassInvocation:
@@ -1382,7 +1385,7 @@ class TestProfilingPassInvocation:
     not bubble out as engine errors."""
 
     def _setup_mocks(self, mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name):
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda handle, eid: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(
             engine_ids=[0], has_kernel_timings=True
@@ -1877,7 +1880,7 @@ class TestOraclePass:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda handle, eid: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -1931,7 +1934,7 @@ class TestOraclePass:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda handle, eid: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2104,7 +2107,7 @@ class TestOracleTunedPlanValidation:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda handle, eid: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2251,7 +2254,7 @@ class TestOracleExhaustiveEnvGuard:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda handle, eid: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",

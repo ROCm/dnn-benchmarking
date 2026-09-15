@@ -247,37 +247,16 @@ def _tolerance_for_output(
     return _default_tolerance_for_output(tensor_info, output_node_type)
 
 
-def _resolve_engine_name(engine_id: int) -> str:
-    """Resolve an engine ID to its registered name.
-
-    Looks up the name via ``hipdnn_frontend.engine_id_to_name``. If the ID
-    isn't registered (returns empty string), falls back to a hex display
-    string so callers always have something printable.
-
-    Unexpected exceptions (plugin import error, registry corruption)
-    emit a one-shot warning to stderr so a silent fallback doesn't hide
-    a real plugin-init bug — the hex fallback only changes the artifact
-    path and reporting label, but the underlying error usually indicates
-    a broader registry problem worth surfacing.
-
-    Args:
-        engine_id: int engine ID.
-
-    Returns:
-        Registered engine name or ``f"engine_0x..."`` fallback.
-    """
+def _resolve_engine_name(handle: Any, engine_id: int) -> str:
+    """Return the canonical name reported by the loaded hipDNN engine."""
     try:
-        import hipdnn_frontend as hipdnn
-
-        name = hipdnn.engine_id_to_name(engine_id)
+        name = handle.engine_id_to_name(engine_id)
         if name:
-            return name
+            return str(name)
     except Exception as e:
-        from ..metrics._diagnostic import warn_once
-
         warn_once(
             "suite_runner",
-            f"engine_id_to_name failed for {engine_id:#x}: {e}; "
+            f"engine name lookup failed for {engine_id:#x}: {e}; "
             "falling back to hex display string",
         )
     return f"engine_{engine_id:#x}"
@@ -322,6 +301,7 @@ def _engine_setup_error_result(
         provider=provider,
         engine_id=engine_id,
         status="error",
+        engine_name=provider,
         plugin_path=str(plugin_path) if plugin_path is not None else None,
         error_message=error_message,
         correctness=CorrectnessResult.failed(
@@ -597,6 +577,7 @@ def _run_timed_pytorch_row(
         provider=ReferenceProviderName.PYTORCH.value,
         engine_id=0,
         status="skipped",
+        engine_name=ReferenceProviderName.PYTORCH.value,
         engine_version=engine_version,
         role=role,
     )
@@ -946,8 +927,8 @@ def run_graph_all_providers(
     for selection_index, selection in enumerate(engine_selections):
         engine_id = selection.engine_id
         engine_plugin_path = selection.plugin_path
-        engine_name = _resolve_engine_name(engine_id)
         engine_handle = handle
+        engine_name = f"engine_{engine_id:#x}"
         with Timer() as t:
             if engine_handle is None:
                 try:
@@ -973,6 +954,7 @@ def run_graph_all_providers(
                         reporter.print_engine_result(pe_result)
                     pe_results.append(pe_result)
                     continue
+            engine_name = _resolve_engine_name(engine_handle, engine_id)
 
             if reporter is not None:
                 reporter.print_engine_start(engine_name)
@@ -1392,6 +1374,7 @@ def run_single_provider_engine(
         provider=provider,
         engine_id=engine_id,
         status="error",
+        engine_name=provider,
         engine_version=_resolve_engine_version(handle, engine_id),
     )
 
