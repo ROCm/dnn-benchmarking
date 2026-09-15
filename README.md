@@ -37,6 +37,35 @@ compared offline. See [Cross-Machine Comparison](#cross-machine-comparison-rocm-
 
 ## Installation
 
+### Shared Graph Studio installation
+
+When this repository is embedded under `rocm-libraries/projects/hipdnn/tools`,
+use the outer checkout for the application build:
+
+```bash
+python3 projects/hipdnn/tools/dnn-benchmarking/setup_env.py --graph-studio --gpu-arch <gfx-target> --yes
+build/install/bin/start-graph-studio
+build/install/bin/dnn-benchmark --graph /path/to/graph.json -o /path/to/results.json
+```
+
+Run setup from the outer checkout. It requires Python 3.12+, Bun, Node.js 20+,
+and a native build toolchain. The shared flow preserves `<outer>/.venv`, uses
+wheel-provided ROCm dependencies, and builds hipDNN, providers, Python bindings,
+and Studio together. It installs the app into `<outer>/build/install` and does
+not initialize this repository's nested `rocm-libraries` submodule.
+
+The installed commands set their own runtime paths and select the configured
+Python interpreter. `HIPDNN_SDK` identifies the fresh application backend and
+plugins separately from the dependency SDK; backend selection occurs before
+PyTorch capability probes. Keep the selected Python/ROCm environment in place.
+On Windows, invoke the generated `.bat` launchers.
+
+Use `--source-dir`, `--build-dir`, `--install-prefix`, and `--workspace` to
+change the checkout, build, app destination, or `.venv` owner. In this mode,
+`--reuse-artifacts` reinstalls an existing superbuild and its Python wheel
+without rebuilding. The standalone setup and release-wheel flows below remain
+separate. Neither successful setup nor an all-skipped report proves GPU support.
+
 ### Install from Released Wheels (ROCm/AMD GPUs)
 
 The fastest path. No compiler, no CMake, no `rocm-libraries` checkout, and no

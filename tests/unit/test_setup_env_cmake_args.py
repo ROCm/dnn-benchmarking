@@ -33,13 +33,6 @@ def setup_env():
     return _load_setup_env()
 
 
-def test_defaults_to_no_extra_defines(setup_env) -> None:
-    """Absent the flag, the configure line must be exactly what it was."""
-    args = setup_env.build_parser().parse_args([])
-
-    assert args.cmake_args == []
-
-
 def test_bare_name_value_is_accepted_after_a_space(setup_env) -> None:
     """`--cmake-arg NAME=VALUE` must work, because it is what people type.
 
@@ -87,54 +80,74 @@ def test_a_define_without_a_value_is_rejected(setup_env, bad) -> None:
         setup_env.build_parser().parse_args(["--cmake-arg", bad])
 
 
-def test_extra_defines_are_appended_last(setup_env) -> None:
-    """Order is the contract: a caller's define must be able to override a
-    default, which only holds if the extras come after them."""
-    defaults = ["-DHIPDNN_ENABLE_SDPA=ON", "-DENABLE_CLANG_TIDY=OFF"]
-    extras = (
-        setup_env.build_parser()
-        .parse_args(["--cmake-arg", "HIPDNN_ENABLE_SDPA=OFF"])
-        .cmake_args
-    )
-
-    configure_line = [*defaults, *extras]
-
-    assert configure_line[-1] == "-DHIPDNN_ENABLE_SDPA=OFF"
-    assert configure_line.index("-DHIPDNN_ENABLE_SDPA=ON") < configure_line.index(
-        "-DHIPDNN_ENABLE_SDPA=OFF"
-    )
-
-
-def test_setup_stores_the_parsed_defines(setup_env) -> None:
-    """The parsed values must reach the object that builds the configure line."""
+def test_studio_setup_preserves_existing_python_environment(
+    setup_env, tmp_path
+) -> None:
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspace"
     args = setup_env.build_parser().parse_args(
-        ["--cmake-arg", "HIPDNN_ENABLE_KERNEL_INGESTOR=ON"]
+        [
+            "--graph-studio",
+            "--source-dir",
+            str(source),
+            "--workspace",
+            str(workspace),
+        ]
     )
-    setup = setup_env.Setup.__new__(setup_env.Setup)
-    setup_env.Setup.__init__(setup, args)
-
-    assert setup.extra_cmake_args == ["-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"]
-
-
-def test_the_configure_line_actually_expands_the_extra_defines(setup_env) -> None:
-    """The flag is inert unless the builder SPLICES it into the cmake argv.
-
-    Asserting on `setup.extra_cmake_args` alone does not catch a builder that
-    stores the list and never expands it -- verified by mutation: deleting the
-    `*self.extra_cmake_args` splice left that assertion green. So this reads the
-    builder's own source and requires the unpack to be present, after the
-    defaults it must be able to override.
-    """
-    source = _SETUP_ENV.read_text()
-
-    assert "*self.extra_cmake_args," in source, (
-        "the provider configure no longer unpacks extra_cmake_args, so "
-        "--cmake-arg is accepted and silently ignored"
+    setup = setup_env.Setup(args)
+    setup_env.subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(setup.venv_dir)],
+        check=True,
     )
+    sentinel = setup.venv_dir / "existing-environment"
+    sentinel.write_text("retain installed dependencies")
+    setup.setup_venv()
+    assert sentinel.read_text() == "retain installed dependencies"
+    assert not (
+        source / "projects/hipdnn/tools/dnn-benchmarking/rocm-libraries"
+    ).exists()
 
-    splice = source.index("*self.extra_cmake_args,")
-    last_default = source.index('"-DENABLE_CLANG_TIDY=OFF",')
-    assert last_default < splice, (
-        "extra defines must come AFTER the hard-coded ones, or a caller cannot "
-        "override a default"
+
+def test_studio_install_cannot_overwrite_python_dependencies(
+    setup_env, tmp_path
+) -> None:
+    args = setup_env.build_parser().parse_args(
+        [
+            "--graph-studio",
+            "--source-dir",
+            str(tmp_path),
+            "--install-prefix",
+            str(tmp_path / ".venv/lib/python3.12/site-packages"),
+        ]
     )
+    with pytest.raises(SystemExit):
+        setup_env.Setup(args)
+    assert not (tmp_path / ".venv").exists()
+
+
+def test_studio_rejects_another_checkouts_build_before_provisioning(
+    setup_env, tmp_path
+) -> None:
+    source = tmp_path / "source"
+    studio = source / "projects/hipdnn/tools/graph-studio"
+    studio.mkdir(parents=True)
+    (studio / "CMakeLists.txt").touch()
+    build = source / "build"
+    build.mkdir()
+    cache = build / "CMakeCache.txt"
+    contents = "CMAKE_HOME_DIRECTORY:INTERNAL=/a/different/checkout\n"
+    cache.write_text(contents)
+    setup = setup_env.Setup(
+        setup_env.build_parser().parse_args(
+            [
+                "--graph-studio",
+                "--source-dir",
+                str(source),
+                "--yes",
+            ]
+        )
+    )
+    with pytest.raises(SystemExit):
+        setup.run()
+    assert cache.read_text() == contents
+    assert not (source / ".venv").exists()

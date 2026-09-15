@@ -64,6 +64,7 @@ def install_fake_runtime_wheel(
 def reset_rocm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rocm_runtime, "_INITIALIZED_PIP_ROCM", False)
     monkeypatch.delenv("ROCM_PATH", raising=False)
+    monkeypatch.delenv("HIPDNN_SDK", raising=False)
     # Keep the tests independent of whether a real runtime wheel is installed
     # in the environment running them.
     monkeypatch.setitem(sys.modules, "hipdnn_runtime", None)
@@ -272,3 +273,46 @@ def test_sdk_hipdnn_still_preloads_without_a_runtime_wheel(
 
     assert rocm_runtime.initialize_pip_rocm_runtime() is True
     assert fake_sdk.initialize_calls[0]["preload_shortnames"] == ["hipdnn"]
+
+
+def test_separate_hipdnn_install_owns_plugins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install = tmp_path / "application"
+    monkeypatch.setenv("HIPDNN_SDK", str(install))
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "dependencies"))
+    install_fake_runtime_wheel(monkeypatch, tmp_path / "released-runtime")
+
+    assert rocm_runtime.default_hipdnn_plugin_paths() == [
+        install / "lib" / "hipdnn_plugins" / "engines"
+    ]
+
+
+def test_missing_explicit_backend_does_not_fall_back_to_wheels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HIPDNN_SDK", str(tmp_path / "missing-install"))
+    install_fake_runtime_wheel(monkeypatch, tmp_path / "released-runtime")
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+
+    with pytest.raises(RuntimeError, match="HIPDNN_SDK contains no hipDNN backend"):
+        rocm_runtime.initialize_pip_rocm_runtime()
+
+
+def test_broken_explicit_backend_reports_loader_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    backend = tmp_path / "lib" / "libhipdnn_backend.so"
+    if sys.platform == "win32":
+        backend = tmp_path / "bin" / "hipdnn_backend.dll"
+    backend.parent.mkdir()
+    backend.write_bytes(b"not a native library")
+    monkeypatch.setenv("HIPDNN_SDK", str(tmp_path))
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "dependencies"))
+    monkeypatch.setitem(sys.modules, "rocm_sdk", None)
+
+    with pytest.raises(
+        RuntimeError, match="Failed to load HIPDNN_SDK backend"
+    ) as error:
+        rocm_runtime.initialize_pip_rocm_runtime()
+    assert isinstance(error.value.__cause__, OSError)

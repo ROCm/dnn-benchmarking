@@ -354,8 +354,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         help=(
             "Directory containing hipDNN engine plugin .so files, or a "
             "comma-separated list matching --engine order. A single path is "
-            "shared by all selected engines. If omitted, "
-            "ROCM_PATH/lib/hipdnn_plugins/engines is used when ROCM_PATH is set."
+            "shared by all selected engines. If omitted, plugins resolve from "
+            "HIPDNN_SDK/lib/hipdnn_plugins/engines, then ROCM_PATH, then installed wheels."
         ),
         config_key="plugin_path",
         config_kind=ConfigKind.PATH_OR_PATH_LIST,

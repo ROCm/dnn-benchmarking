@@ -94,15 +94,13 @@ def pip_rocm_plugin_path() -> Optional[Path]:
 def default_hipdnn_plugin_paths() -> Optional[list[Path]]:
     """Return default hipDNN plugin paths.
 
-    ``ROCM_PATH`` wins so users can point at an alternate ROCm/hipDNN install.
-    Without it, prefer a released hipdnn-runtime wheel over whatever hipDNN the
-    ROCm SDK wheels happen to bundle: installing the wheel is how a user asks
-    for that build. Fall back to the SDK for source-built ``setup_env.py``
-    environments, which install hipDNN into the SDK libraries prefix.
+    ``HIPDNN_SDK`` selects a separately installed hipDNN while ROCm dependencies
+    can remain in wheels or ``ROCM_PATH``. Otherwise prefer ``ROCM_PATH``, then
+    a released runtime wheel, then the backend bundled in the ROCm SDK.
     """
-    rocm_path = os.environ.get("ROCM_PATH")
-    if rocm_path:
-        return [_plugin_path_from_prefix(Path(rocm_path))]
+    prefix = os.environ.get("HIPDNN_SDK") or os.environ.get("ROCM_PATH")
+    if prefix:
+        return [_plugin_path_from_prefix(Path(prefix))]
 
     plugin_path = wheel_hipdnn_plugin_path() or pip_rocm_plugin_path()
     if plugin_path is None:
@@ -145,17 +143,44 @@ def _available_preload_shortnames(rocm_sdk: ModuleType, skip: set[str]) -> list[
 
 
 def initialize_pip_rocm_runtime() -> bool:
-    """Preload pip-installed ROCm SDK libraries when no ``ROCM_PATH`` is set.
+    """Initialize the selected hipDNN backend and its ROCm dependencies.
 
-    Returns True when initialization was attempted. ``ROCM_PATH`` deliberately
-    disables this path: an explicit external ROCm install should control its own
-    linker environment.
+    ``HIPDNN_SDK`` owns the backend when set; SDK initialization must not load
+    its competing hipDNN copy. Without that override, ``ROCM_PATH`` preserves
+    the external installation's linker environment.
     """
     global _INITIALIZED_PIP_ROCM
 
-    if os.environ.get("ROCM_PATH"):
+    hipdnn_prefix = os.environ.get("HIPDNN_SDK")
+    if not hipdnn_prefix and os.environ.get("ROCM_PATH"):
         return False
     if _INITIALIZED_PIP_ROCM:
+        return True
+
+    if hipdnn_prefix:
+        prefix = Path(hipdnn_prefix)
+        backend = (
+            prefix / "bin" / "hipdnn_backend.dll"
+            if os.name == "nt"
+            else prefix / "lib" / "libhipdnn_backend.so"
+        )
+        if not backend.is_file():
+            raise RuntimeError(f"HIPDNN_SDK contains no hipDNN backend: {backend}")
+        rocm_sdk = _import_rocm_sdk()
+        try:
+            if rocm_sdk is not None:
+                rocm_sdk.initialize_process(
+                    preload_shortnames=_available_preload_shortnames(
+                        rocm_sdk, {"hipdnn"}
+                    ),
+                    env_override=False,
+                )
+            ctypes.CDLL(str(backend), mode=ctypes.RTLD_GLOBAL)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load HIPDNN_SDK backend {backend}: {e}"
+            ) from e
+        _INITIALIZED_PIP_ROCM = True
         return True
 
     rocm_sdk = _import_rocm_sdk()

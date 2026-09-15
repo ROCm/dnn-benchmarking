@@ -43,6 +43,7 @@ for _var, _default in _LOCAL_CACHE_DEFAULTS.items():
         os.environ[_var] = str(_default)
 
 from ..common.exceptions import GraphLoadError
+from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..reporting.reporter import Reporter
 from .config_file import apply_config_file
 from .internal_profiling import run_internal_profiling
@@ -79,6 +80,15 @@ def main() -> int:
     """CLI entry point."""
     parser = create_parser(suppress_defaults=True)
     args = parser.parse_args()
+    # PyTorch capability and host-info probes preload its SDK backend. Claim the
+    # selected application's backend first, before those probes can run.
+    if os.environ.get("HIPDNN_SDK"):
+        try:
+            initialize_pip_rocm_runtime()
+        except RuntimeError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+
     try:
         apply_config_file(args)
     except ValueError as e:

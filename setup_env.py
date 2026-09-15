@@ -27,6 +27,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import NoReturn
 
@@ -358,11 +359,29 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Set up the dnn-benchmark tool. Requires Python 3.12 or newer.",
         epilog=(
-            "The selected ROCm prefix is exported as ROCM_PATH and its lib\n"
-            "directory is prepended to LD_LIBRARY_PATH by the venv activation\n"
-            "script (Linux). dnn-benchmarking infers plugins from:\n"
-            "  $ROCM_PATH/lib/hipdnn_plugins/engines/"
+            "Standalone setup exports ROCM_PATH and updates the venv activation\n"
+            "script. Graph Studio setup installs launchers under <install-prefix>/bin;\n"
+            "they select the Python environment, HIPDNN_SDK, plugin directory, and\n"
+            "library paths without shell activation."
         ),
+    )
+    parser.add_argument(
+        "--graph-studio",
+        action="store_true",
+        help="Install Graph Studio, benchmarking, and an outer hipDNN superbuild together.",
+    )
+    parser.add_argument(
+        "--source-dir", type=Path, help="Graph Studio: outer rocm-libraries checkout."
+    )
+    parser.add_argument(
+        "--build-dir",
+        type=Path,
+        help="Graph Studio: build directory (default: <source>/build).",
+    )
+    parser.add_argument(
+        "--install-prefix",
+        type=Path,
+        help="Graph Studio: application prefix (default: <build>/install).",
     )
     parser.add_argument(
         "--torch-mode",
@@ -388,11 +407,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=default_workspace(),
+        default=None,
         help=(
             "Workspace root for the venv, Python bytecode cache, and runtime "
             "benchmark caches. The virtual environment is <path>/.venv. "
-            "Default: %(default)s"
+            "Default: the outer checkout for Graph Studio, otherwise DNN_BENCH_WORKSPACE "
+            "or the standalone workspace."
         ),
     )
     parser.add_argument(
@@ -421,7 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Explicit ROCm/hipDNN prefix for binding/provider builds. Takes "
-            "precedence over venv discovery."
+            "precedence over venv discovery. With --graph-studio, this selects "
+            "dependencies only; --install-prefix selects the application destination."
         ),
     )
     parser.add_argument(
@@ -431,7 +452,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip building hipDNN/the provider plugins from source and use "
             "whatever is already installed in the selected ROCm prefix (e.g. a "
             "prior build in the same workspace). Fails if hipDNN is absent there "
-            "-- this never falls back to building."
+            "-- this never falls back to building. With --graph-studio, reinstall "
+            "the existing outer superbuild and Python bindings without rebuilding."
         ),
     )
     parser.add_argument(
@@ -480,6 +502,39 @@ class Setup:
         self.torch_index_url = args.torch_index_url
         self.editable_install = args.editable_install
         self.extra_cmake_args = list(getattr(args, "cmake_args", []) or [])
+        self.graph_studio = args.graph_studio
+        if not self.graph_studio and any(
+            (args.source_dir, args.build_dir, args.install_prefix)
+        ):
+            fail(
+                "--source-dir, --build-dir and --install-prefix require --graph-studio."
+            )
+        self.source_dir = args.source_dir
+        if self.graph_studio:
+            if self.source_dir is None:
+                self.source_dir = next(
+                    (
+                        parent
+                        for parent in SCRIPT_DIR.parents
+                        if (
+                            parent / "projects/hipdnn/tools/graph-studio/CMakeLists.txt"
+                        ).is_file()
+                    ),
+                    None,
+                )
+            if self.source_dir is None:
+                fail("Pass --source-dir pointing to the outer rocm-libraries checkout.")
+            self.source_dir = self.source_dir.resolve()
+            self.build_dir = (args.build_dir or self.source_dir / "build").resolve()
+            self.install_prefix = (
+                args.install_prefix or self.build_dir / "install"
+            ).resolve()
+            if self.source_dir.is_relative_to(self.build_dir):
+                fail("The build directory must not contain the source checkout.")
+            if self.install_prefix == self.source_dir:
+                fail(
+                    "The application install prefix must differ from the source checkout."
+                )
         self.resolved_torch_index_url = ""
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
@@ -488,8 +543,15 @@ class Setup:
 
         # Resolve: this path is written into activate.local, which is sourced
         # from arbitrary working directories.
-        self.workspace = Path(args.workspace).resolve()
+        workspace = args.workspace or (
+            self.source_dir if self.graph_studio else default_workspace()
+        )
+        self.workspace = Path(workspace).resolve()
         self.venv_dir = self.workspace / ".venv"
+        if self.graph_studio and self.install_prefix.is_relative_to(self.venv_dir):
+            fail(
+                "The application install prefix must be outside the Python environment."
+            )
 
         # Child-process environment; PYTHONPYCACHEPREFIX/DNN_BENCH_WORKSPACE and
         # (later) ROCM_PATH are layered onto this before subprocess use.
@@ -610,16 +672,23 @@ class Setup:
                 "Use --torch-mode rocm or --torch-mode cpu to create one and "
                 "install torch automatically.",
             )
-        if self.venv_dir.is_dir() and self.torch_mode != "existing":
+        if (
+            self.venv_dir.is_dir()
+            and self.torch_mode != "existing"
+            and not self.graph_studio
+        ):
             print(f"Removing existing virtual environment at {self.venv_dir}...")
             shutil.rmtree(self.venv_dir)
         if not self.venv_dir.is_dir():
             print(f"Creating virtual environment at {self.venv_dir}...")
             run([sys.executable, "-m", "venv", str(self.venv_dir)])
 
-        self.env["PYTHONPYCACHEPREFIX"] = str(self.workspace / "pycache")
-        self.env["DNN_BENCH_WORKSPACE"] = str(self.workspace)
-        if not IS_WINDOWS:
+        cache_root = (
+            self.build_dir / "benchmark-cache" if self.graph_studio else self.workspace
+        )
+        self.env["PYTHONPYCACHEPREFIX"] = str(cache_root / "pycache")
+        self.env["DNN_BENCH_WORKSPACE"] = str(cache_root)
+        if not IS_WINDOWS and not self.graph_studio:
             self.write_activate_local()
 
         self.installed_torch_mode = self.get_torch_mode()
@@ -1307,8 +1376,207 @@ class Setup:
         sys.stdout.write(report.stdout)
         print("")
 
+    def run_studio(self) -> int:
+        """Build one outer checkout and install without modifying SDK payloads."""
+        source = self.source_dir
+        if not (source / "projects/hipdnn/tools/graph-studio/CMakeLists.txt").is_file():
+            fail(f"Graph Studio source not found under {source}.")
+        if self.torch_mode == "cuda":
+            fail("Graph Studio requires ROCm, not CUDA.")
+        owned_defines = {
+            "CMAKE_INSTALL_PREFIX",
+            "CMAKE_TOOLCHAIN_FILE",
+            "CMAKE_PREFIX_PATH",
+            "CMAKE_PROGRAM_PATH",
+            "ROCM_PATH",
+            "Python_EXECUTABLE",
+            "ROCM_LIBS_ENABLE_COMPONENTS",
+        }
+        for define in self.extra_cmake_args:
+            name, _, value = define[2:].partition("=")
+            if name in owned_defines or name.startswith("GRAPH_STUDIO_"):
+                fail(
+                    f"{name} is owned by Graph Studio setup; use its path options instead."
+                )
+            if (
+                name in {"ENABLE_CLANG_FORMAT", "ENABLE_CLANG_TIDY"}
+                and value.upper() != "ON"
+            ):
+                fail(f"Graph Studio setup requires {name}=ON.")
+        cache = self.build_dir / "CMakeCache.txt"
+        if cache.is_file():
+            for line in cache.read_text().splitlines():
+                if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL="):
+                    if Path(line.split("=", 1)[1]).resolve() != source:
+                        fail(
+                            f"{self.build_dir} belongs to a different source checkout."
+                        )
+        if not self.auto_yes:
+            print(f"Use Python environment: {self.venv_dir}")
+            print(f"Build {source} into {self.build_dir}")
+            print(f"Install application into {self.install_prefix}")
+            if input("Continue? [y/N] ").strip().lower() not in {"y", "yes"}:
+                return 0
+        self.setup_venv()
+        self.env["PATH"] = (
+            str(Path(self.py).parent) + os.pathsep + self.env.get("PATH", "")
+        )
+        self.install_torch()
+        if self.installed_torch_mode == "cuda":
+            fail(
+                "Graph Studio requires ROCm dependencies; this environment contains CUDA torch."
+            )
+        self.pip("install", str(SCRIPT_DIR))
+        self.pip(
+            "install",
+            "build",
+            "cmake>=3.26,<4",
+            "ninja",
+            "clang-format>=18,<19",
+            "clang-tidy>=20,<21",
+        )
+        toolchain = self.toolchain_prefix
+        libraries = self.select_binding_prefix()
+        prefixes = [libraries]
+        if not self.rocm_prefix and self.installed_torch_mode == "rocm":
+            core = self.probe(
+                "import rocm_sdk; "
+                "print(rocm_sdk.find_libraries('amdhip64')[0].parent.parent)"
+            )
+            if core.returncode != 0:
+                sys.stderr.write(core.stderr)
+                fail("Cannot locate the HIP runtime in the selected ROCm wheels.")
+            prefixes.insert(0, core.stdout.strip().splitlines()[-1])
+        prefixes = list(dict.fromkeys([*prefixes, toolchain]))
+        for prefix in prefixes:
+            dependency = Path(prefix).resolve()
+            if self.install_prefix.is_relative_to(
+                dependency
+            ) or dependency.is_relative_to(self.install_prefix):
+                fail("The application prefix must not overlap the ROCm dependency SDK.")
+        library_dirs = [
+            str(Path(prefix) / ("bin" if IS_WINDOWS else "lib"))
+            for prefix in prefixes
+            if (Path(prefix) / ("bin" if IS_WINDOWS else "lib")).is_dir()
+        ]
+        binary_dirs = [
+            str(Path(self.py).parent),
+            f"{toolchain}/bin",
+            f"{toolchain}/lib/llvm/bin",
+        ]
+        cmake = shutil.which("cmake", path=self.env["PATH"])
+        if not cmake:
+            fail("CMake was not installed into the Python environment.")
+        if not self.reuse_artifacts:
+            run(
+                [
+                    cmake,
+                    "--fresh",
+                    "--preset",
+                    "hipdnn-graph-studio",
+                    "-S",
+                    str(source),
+                    "-B",
+                    str(self.build_dir),
+                    "-GNinja",
+                    f"-DROCM_PATH={toolchain}",
+                    f"-DCMAKE_INSTALL_PREFIX={self.install_prefix}",
+                    f"-DCMAKE_PREFIX_PATH={';'.join([str(self.install_prefix), *prefixes])}",
+                    f"-DCMAKE_PROGRAM_PATH={';'.join(binary_dirs)}",
+                    f"-DPython_EXECUTABLE={self.py}",
+                    f"-DGRAPH_STUDIO_PYTHON_EXECUTABLE={self.py}",
+                    f"-DGRAPH_STUDIO_ROCM_RUNTIME_DIRS={';'.join(library_dirs)}",
+                    f"-DGRAPH_STUDIO_ROCM_BIN_DIRS={';'.join(binary_dirs)}",
+                    "-DHIPDNN_SKIP_TESTS=ON",
+                    "-DMIOPENPROVIDER_SKIP_TESTS=ON",
+                    "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
+                    "-DENABLE_CLANG_FORMAT=ON",
+                    "-DENABLE_CLANG_TIDY=ON",
+                    *self.hip_arch_args,
+                    *self.extra_cmake_args,
+                ],
+                cwd=source,
+                env=self._build_env(),
+            )
+            configured = cache.read_text()
+            for option in ("ENABLE_CLANG_FORMAT", "ENABLE_CLANG_TIDY"):
+                if f"{option}:BOOL=ON" not in configured:
+                    fail(f"The configured superbuild must enable {option}.")
+            run([cmake, "--build", str(self.build_dir)], env=self._build_env())
+        elif not cache.is_file():
+            fail("--reuse-artifacts requires an existing Graph Studio superbuild.")
+        run(
+            [
+                cmake,
+                "--install",
+                str(self.build_dir),
+                "--prefix",
+                str(self.install_prefix),
+            ],
+            env=self._build_env(),
+        )
+        bindings = self.build_dir / "projects/hipdnn/python/frontend_bindings"
+        python_source = source / "projects/hipdnn/python"
+        with tempfile.TemporaryDirectory(
+            prefix="studio-wheels-", dir=self.build_dir
+        ) as wheel_dir:
+            run(
+                [
+                    self.py,
+                    str(
+                        python_source / "frontend_wheel_package/pack_frontend_wheel.py"
+                    ),
+                    "--build-dir",
+                    str(bindings),
+                    "--wheel-dir",
+                    wheel_dir,
+                ],
+                env=self.env,
+            )
+            wheels = list(Path(wheel_dir).glob("hipdnn_frontend-*.whl"))
+            if len(wheels) != 1:
+                fail(
+                    "Expected exactly one frontend wheel from the selected superbuild."
+                )
+            self.pip("install", "--force-reinstall", "--no-deps", str(wheels[0]))
+        runtime_lib = self.install_prefix / ("bin" if IS_WINDOWS else "lib")
+        self.env["HIPDNN_SDK"] = str(self.install_prefix)
+        self.env["HIPDNN_PLUGIN_DIR"] = str(runtime_lib / "hipdnn_plugins/engines")
+        self.env["ROCM_PATH"] = toolchain
+        path_key = "PATH" if IS_WINDOWS else "LD_LIBRARY_PATH"
+        self.env[path_key] = os.pathsep.join(
+            [
+                str(runtime_lib),
+                *library_dirs,
+                self.env.get(path_key, ""),
+            ]
+        ).rstrip(os.pathsep)
+        result = self.probe(
+            "from dnn_benchmarking.common.rocm_runtime import initialize_pip_rocm_runtime; "
+            "initialize_pip_rocm_runtime(); import hipdnn_frontend; "
+            "print('Installed hipDNN frontend and backend loaded successfully.')"
+        )
+        sys.stdout.write(result.stdout)
+        if result.returncode:
+            sys.stderr.write(result.stderr)
+            fail("Installed hipDNN runtime verification failed.")
+        launcher = (
+            self.install_prefix
+            / "bin"
+            / ("dnn-benchmark.bat" if IS_WINDOWS else "dnn-benchmark")
+        )
+        run([str(launcher), "--help"], env=self.env)
+        print(
+            f"\nInstalled Graph Studio: {self.install_prefix / 'bin' / 'start-graph-studio'}"
+        )
+        print(f"Installed benchmark CLI: {launcher}")
+        print("GPU execution is verified by running a graph, not by this import check.")
+        return 0
+
     def run(self) -> int:
         self.require_python_version()
+        if self.graph_studio:
+            return self.run_studio()
         self.workspace.mkdir(parents=True, exist_ok=True)
 
         self.confirm_build()
