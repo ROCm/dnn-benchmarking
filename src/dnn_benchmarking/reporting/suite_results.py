@@ -820,12 +820,46 @@ class SuiteResult:
     def save_json(self, path: str) -> None:
         """Write suite results to JSON file.
 
+        Artifact paths are rewritten relative to the report itself, so a reader
+        that has the report can find the tensors and traces beside it without
+        knowing the directory the run was launched from.
+
         Args:
             path: Output file path.
         """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.to_json())
+        p.write_text(json.dumps(_anchor_artifacts(self.to_dict(), p.parent), indent=2))
+
+
+def _anchor_one(value: Optional[str], report_dir: Path) -> Optional[str]:
+    """Rewrite one artifact path relative to ``report_dir``.
+
+    A path outside that directory is left absolute: a reader resolves relative
+    paths under the report and refuses ones that escape it, so a ``..`` path
+    would read as an attempted escape rather than as a locatable file.
+    """
+    if not value:
+        return value
+    resolved = Path(value).resolve()
+    try:
+        return resolved.relative_to(report_dir.resolve()).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _anchor_artifacts(payload: Dict[str, Any], report_dir: Path) -> Dict[str, Any]:
+    """Anchor every artifact path in a serialized suite result to the report."""
+    for graph in payload.get("graphs") or []:
+        graph["input_tensor_manifest"] = _anchor_one(
+            graph.get("input_tensor_manifest"), report_dir
+        )
+        for row in graph.get("results") or []:
+            row["tensor_manifest"] = _anchor_one(row.get("tensor_manifest"), report_dir)
+            trace = (row.get("extra_metrics") or {}).get("trace")
+            if isinstance(trace, dict):
+                trace["path"] = _anchor_one(trace.get("path"), report_dir)
+    return payload
 
 
 def _format_cudnn_version(raw: Optional[int]) -> Optional[str]:

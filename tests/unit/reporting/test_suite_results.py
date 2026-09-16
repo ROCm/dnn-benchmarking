@@ -549,6 +549,48 @@ class TestSuiteResult:
         # Cleanup
         Path(path).unlink()
 
+    def test_save_json_anchors_artifact_paths_to_the_report(self, tmp_path):
+        """Artifact paths are written relative to the report file itself."""
+        run_dir = tmp_path / "run"
+        (run_dir / "tensors").mkdir(parents=True)
+        (run_dir / "tensors" / "manifest.json").write_text("{}")
+        (run_dir / "tensors" / "inputs.json").write_text("{}")
+        (run_dir / "trace.pftrace").write_bytes(b"")
+        outside = tmp_path / "elsewhere" / "manifest.json"
+        outside.parent.mkdir()
+        outside.write_text("{}")
+
+        sr = self._make_suite_result()
+        graph = sr.graphs[0]
+        graph.input_tensor_manifest = str(run_dir / "tensors" / "inputs.json")
+        graph.results[0].tensor_manifest = str(run_dir / "tensors" / "manifest.json")
+        graph.results[0].extra_metrics = {
+            "trace": {"path": str(run_dir / "trace.pftrace")}
+        }
+        sr.graphs[1].results[0].tensor_manifest = str(outside)
+
+        sr.save_json(str(run_dir / "results.json"))
+        loaded = json.loads((run_dir / "results.json").read_text())
+        written = loaded["graphs"][0]
+
+        assert written["input_tensor_manifest"] == "tensors/inputs.json"
+        assert written["results"][0]["tensor_manifest"] == "tensors/manifest.json"
+        assert (
+            written["results"][0]["extra_metrics"]["trace"]["path"] == "trace.pftrace"
+        )
+        # A path outside the report's directory stays absolute: a reader refuses
+        # relative paths that escape, so `..` would read as an escape attempt.
+        outside_written = loaded["graphs"][1]["results"][0]["tensor_manifest"]
+        assert outside_written == str(outside.resolve())
+
+    def test_save_json_keeps_absent_artifact_paths_absent(self, tmp_path):
+        """A row with no artifacts is not given empty path fields."""
+        sr = self._make_suite_result()
+        sr.save_json(str(tmp_path / "results.json"))
+        written = json.loads((tmp_path / "results.json").read_text())["graphs"][0]
+        assert written["input_tensor_manifest"] is None
+        assert written["results"][0]["tensor_manifest"] is None
+
     def test_timing_stats_include_all_fields(self):
         """SuiteResult.to_dict() timing stats include mean, std, min, max, p95, p99."""
         sr = self._make_suite_result()
