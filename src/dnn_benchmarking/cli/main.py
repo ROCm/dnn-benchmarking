@@ -76,6 +76,26 @@ def _resolve_graphs(args, reporter: Reporter):
     return tmpdirs, files, tarball_source
 
 
+def _apply_run_dir(args) -> None:
+    """Point the report and both artifact roots at one directory.
+
+    A reader that holds only the report resolves artifacts beside it, so a
+    single directory is what the viewer can open without further picking.
+    Anything the user set explicitly is left alone.
+    """
+    run_dir = getattr(args, "run_dir", None)
+    if run_dir is None:
+        return
+    defaults = {
+        "output": run_dir / "results.json",
+        "tensor_output_dir": run_dir / "tensors",
+        "profiling_output_dir": run_dir / "profiling-output",
+    }
+    for dest, value in defaults.items():
+        if getattr(args, dest, None) is None:
+            setattr(args, dest, value)
+
+
 def main() -> int:
     """CLI entry point."""
     parser = create_parser(suppress_defaults=True)
@@ -93,6 +113,7 @@ def main() -> int:
         apply_config_file(args)
     except ValueError as e:
         parser.error(str(e))
+    _apply_run_dir(args)
 
     # Backend-specific startup is the authoritative GPU availability check:
     # PyTorch mode requires GPU-enabled torch, while hipDNN mode creates a real

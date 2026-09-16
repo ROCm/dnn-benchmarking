@@ -220,6 +220,21 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_type=str,
     ),
     CliOption(
+        flags=("--run-dir",),
+        dest="run_dir",
+        parser_type=Path,
+        metavar="DIR",
+        group="Output",
+        help=(
+            "Write the report and every artifact into one directory: "
+            "DIR/results.json, DIR/tensors, DIR/profiling-output. The viewer "
+            "opens such a directory in one step. Explicit --output, "
+            "--tensor-output-dir, or --profiling-output-dir still win."
+        ),
+        config_key="run_dir",
+        config_kind=ConfigKind.PATH,
+    ),
+    CliOption(
         flags=("--output", "-o"),
         dest="output",
         parser_type=Path,

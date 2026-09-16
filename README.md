@@ -361,6 +361,21 @@ dnn-benchmark --graph 'graphs/*.json' --warmup 10 --iters 100
 
 # With reproducible random seed
 dnn-benchmark --graph ./graphs/sample_conv_fwd.json --seed 42
+```
+
+### One run, one directory
+
+`--run-dir DIR` puts the report and every artifact it names in one place:
+`DIR/results.json`, `DIR/tensors`, and `DIR/profiling-output`. Artifact paths
+in the report are written relative to the report itself, so the viewer opens
+the whole run — traces and tensors included — from a single directory pick.
+
+```bash
+dnn-benchmark -g graph.json --validate pytorch --emit-trace pftrace --run-dir ./runs/conv-7
+```
+
+`--output`, `--tensor-output-dir`, and `--profiling-output-dir` still win where
+they are given, which is how a run splits its artifacts across directories.
 
 ### Tensor inputs and outputs
 
