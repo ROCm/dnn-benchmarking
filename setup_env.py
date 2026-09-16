@@ -198,6 +198,12 @@ from pathlib import Path
 import sys
 import sysconfig
 
+# Windows wheels ship the shared libraries in bin/ as DLLs; Linux uses lib/.
+if sys.platform == "win32":
+    RUNTIME_DIR, MIOPEN_GLOB, AMD_SMI_GLOB = "bin", "MIOpen.dll", "amd_smi.dll"
+else:
+    RUNTIME_DIR, MIOPEN_GLOB, AMD_SMI_GLOB = "lib", "libMIOpen.so*", "libamd_smi.so*"
+
 kind = sys.argv[1]
 venv_root = Path(sys.prefix).resolve()
 
@@ -224,16 +230,17 @@ for root in roots:
                 "_rocm_sdk_libraries_"
             ):
                 continue
-            lib_dir = child.joinpath("lib")
-            if not lib_dir.is_dir() or not any(lib_dir.glob("libMIOpen.so*")):
+            lib_dir = child.joinpath(RUNTIME_DIR)
+            if not lib_dir.is_dir() or not any(lib_dir.glob(MIOPEN_GLOB)):
                 continue
         elif kind == "core":
             if not child.name.startswith("_rocm_sdk_core"):
                 continue
             amd_smi_dir = child.joinpath("share/amd_smi")
+            runtime_dir = child.joinpath(RUNTIME_DIR)
             if not (
-                child.joinpath("lib").is_dir()
-                and any(child.joinpath("lib").glob("libamd_smi.so*"))
+                runtime_dir.is_dir()
+                and any(runtime_dir.glob(AMD_SMI_GLOB))
                 and amd_smi_dir.is_dir()
                 and (
                     amd_smi_dir.joinpath("setup.py").is_file()
