@@ -39,6 +39,8 @@ _ROCM_PRELOAD_ORDER = (
 
 _INITIALIZED_PIP_ROCM = False
 
+_PLUGIN_ENGINE_SUBDIR = Path("hipdnn_plugins") / "engines"
+
 
 def _import_rocm_sdk() -> Optional[ModuleType]:
     try:
@@ -49,7 +51,13 @@ def _import_rocm_sdk() -> Optional[ModuleType]:
 
 
 def _plugin_path_from_prefix(prefix: Path) -> Path:
-    return prefix / "lib" / "hipdnn_plugins" / "engines"
+    # Windows installs the engine plugins under bin/, next to the runtime DLLs
+    # that resolve them; every other layout keeps them under lib/.
+    if os.name == "nt":
+        windows_dir = prefix / "bin" / _PLUGIN_ENGINE_SUBDIR
+        if windows_dir.is_dir():
+            return windows_dir
+    return prefix / "lib" / _PLUGIN_ENGINE_SUBDIR
 
 
 def _hipdnn_library_path(rocm_sdk: ModuleType) -> Optional[Path]:

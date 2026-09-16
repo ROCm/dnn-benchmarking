@@ -288,6 +288,18 @@ def test_separate_hipdnn_install_owns_plugins(
     ]
 
 
+def test_windows_hipdnn_install_keeps_plugins_next_to_the_dlls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install = tmp_path / "application"
+    plugin_dir = install / "bin" / "hipdnn_plugins" / "engines"
+    plugin_dir.mkdir(parents=True)
+    monkeypatch.setattr(rocm_runtime.os, "name", "nt")
+    monkeypatch.setenv("HIPDNN_SDK", str(install))
+
+    assert rocm_runtime.default_hipdnn_plugin_paths() == [plugin_dir]
+
+
 def test_missing_explicit_backend_does_not_fall_back_to_wheels(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
