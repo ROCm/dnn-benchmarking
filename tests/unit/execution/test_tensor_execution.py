@@ -100,7 +100,7 @@ def test_output_capture_runs_after_timing_and_records_manifest(
     assert manifest["phase"] == "output"
     assert manifest["producer"] == {"engine_id": "7", "provider": "engine"}
     assert np.fromfile(
-        Path(result.tensor_manifest).parent / "tensor-2.bin", dtype="<f4"
+        Path(result.tensor_manifest).parent / "g.tensor2.bin", dtype="<f4"
     ).tolist() == [3.0, 4.0]
 
 

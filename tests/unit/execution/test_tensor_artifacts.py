@@ -1,13 +1,10 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for the dense tensor artifact manifest contract (tensor_artifacts).
+"""Tests for the element-space tensor artifact manifest contract.
 
-Exercises the public API only (``graph_fingerprint``, ``load_input_tensors``,
-``write_tensor_manifest``): round-trip of written manifests/bin files back
-into logical numpy arrays, multi-graph directory selection, and the
-untrusted-input rejections (graph mismatch, path traversal, checksum/size
-tampering, missing/duplicate tensors, pass-by-value mismatch).
+Exercises round-trip storage, hipDNN-compatible filenames, multi-graph
+selection, and trust-boundary rejection paths.
 """
 
 import json
@@ -51,10 +48,10 @@ def test_graph_fingerprint_is_stable_regardless_of_key_order():
 
 
 def test_roundtrip_strided_float_tensor(tmp_path):
-    """A dense-c manifest round-trips a strided float tensor's logical values."""
+    """Element-space bytes preserve strided logical values and zero padding."""
     graph_json = {"name": "graphA", "nodes": []}
-    tensor_info = _tensor_info(uid=1, dims=[2, 3], strides=[1, 2], data_type="float")
-    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    tensor_info = _tensor_info(uid=1, dims=[2, 2], strides=[3, 1], data_type="float")
+    array = np.arange(4, dtype=np.float32).reshape(2, 2)
 
     manifest_path = write_tensor_manifest(
         root=tmp_path,
@@ -68,7 +65,7 @@ def test_roundtrip_strided_float_tensor(tmp_path):
     manifest = _read_manifest(manifest_path)
     assert manifest["format"] == "dnn-benchmarking-tensors"
     assert manifest["version"] == 1
-    assert manifest["layout"] == "dense-c"
+    assert manifest["layout"] == "element-space"
     assert manifest["byte_order"] == "little"
     assert manifest["phase"] == "input"
     assert manifest["graph"]["name"] == "graphA"
@@ -77,18 +74,20 @@ def test_roundtrip_strided_float_tensor(tmp_path):
 
     (entry,) = manifest["tensors"]
     assert entry["uid"] == "1"
-    assert entry["data_type"] == "float"
-    assert entry["shape"] == [2, 3]
-    assert entry["graph_strides"] == [1, 2]
+    assert entry["shape"] == [2, 2]
+    assert entry["graph_strides"] == [3, 1]
     assert entry["encoding"] == "f32"
-    assert entry["file"] == "tensor-1.bin"
-    assert entry["byte_length"] == 24
+    assert entry["file"] == "a.hipdnn.tensor1.bin"
+    assert entry["storage_elements"] == 5
+    assert entry["byte_length"] == 20
     assert len(entry["sha256"]) == 64
 
     loaded = load_input_tensors(manifest_path, graph_json, [tensor_info])
     assert set(loaded) == {1}
     assert loaded[1].flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(loaded[1], array)
+    raw = (manifest_path.parent / entry["file"]).read_bytes()
+    assert raw == np.array([0.0, 1.0, 0.0, 2.0, 3.0], dtype="<f4").tobytes()
 
     # A directory source finds the same manifest recursively.
     loaded_from_dir = load_input_tensors(tmp_path, graph_json, [tensor_info])
@@ -113,6 +112,10 @@ def test_roundtrip_bfloat16_tensor(tmp_path):
     assert entry["data_type"] == "bfloat16"
     assert entry["encoding"] == "bf16"
     assert entry["byte_length"] == 8  # 4 elements * 2-byte bf16 words
+    assert entry["storage_elements"] == 4
+    assert (manifest_path.parent / entry["file"]).read_bytes() == np.array(
+        [0x3F80, 0xC000, 0x3F00, 0x0000], dtype="<u2"
+    ).tobytes()
 
     loaded = load_input_tensors(manifest_path, graph_json, [tensor_info])
     assert loaded[2].dtype == np.float32
@@ -204,7 +207,7 @@ def test_checksum_tampering_is_rejected(tmp_path):
         phase="input",
     )
 
-    bin_path = manifest_path.parent / "tensor-1.bin"
+    bin_path = manifest_path.parent / "a.tensor1.bin"
     data = bytearray(bin_path.read_bytes())
     data[0] ^= 0xFF  # Same length, different content -> checksum mismatch.
     bin_path.write_bytes(bytes(data))
@@ -226,7 +229,7 @@ def test_size_tampering_is_rejected(tmp_path):
         phase="input",
     )
 
-    bin_path = manifest_path.parent / "tensor-1.bin"
+    bin_path = manifest_path.parent / "a.tensor1.bin"
     bin_path.write_bytes(bin_path.read_bytes() + b"\x00\x00\x00\x00")
 
     with pytest.raises(ValidationError, match="size mismatch"):
@@ -276,8 +279,26 @@ def test_manifest_dimension_booleans_are_rejected(tmp_path, field):
     manifest = _read_manifest(manifest_path)
     manifest["tensors"][0][field] = [True]
     manifest_path.write_text(json.dumps(manifest))
-
     with pytest.raises(ValidationError, match=field):
+        load_input_tensors(manifest_path, graph_json, [tensor_info])
+
+
+def test_storage_element_mismatch_is_rejected(tmp_path):
+    graph_json = {"name": "graphA"}
+    tensor_info = _tensor_info(uid=1, dims=[2], strides=[1], data_type="float")
+    manifest_path = write_tensor_manifest(
+        root=tmp_path,
+        graph_path=Path("/a.json"),
+        graph_json=graph_json,
+        tensor_infos=[tensor_info],
+        tensors={1: np.array([1.0, 2.0], dtype=np.float32)},
+        phase="input",
+    )
+    manifest = _read_manifest(manifest_path)
+    manifest["tensors"][0]["storage_elements"] = 3
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValidationError, match="storage_elements mismatch"):
         load_input_tensors(manifest_path, graph_json, [tensor_info])
 
 

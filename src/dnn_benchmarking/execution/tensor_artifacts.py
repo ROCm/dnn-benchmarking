@@ -1,18 +1,18 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Dense-tensor artifact manifests: producer-side JSON + ``.bin`` I/O.
+"""Element-space tensor artifact manifests: producer-side JSON + ``.bin`` I/O.
 
 A manifest is a small, versioned JSON document plus sibling
-``tensor-<uid>.bin`` files holding dense, C-contiguous, little-endian
-tensor bytes. Input manifests let a caller supply reproducible external
-data for every non-virtual, non-output tensor a graph needs (including
-pass-by-value scalars, which are still cross-checked against the value
-already embedded in the graph). Output/reference manifests record what
-a run produced, keyed by phase and optional producer identity.
+``<graph>.tensor<uid>.bin`` files holding little-endian tensor storage. The
+payload includes stride gaps so it is byte-compatible with hipDNN golden test
+bundles. Input manifests let a caller supply reproducible external data for
+every non-virtual, non-output tensor a graph needs, including pass-by-value
+scalars. Output/reference manifests record what a run produced, keyed by phase
+and optional producer identity.
 
-Manifests are untrusted input: every field is validated before any byte
-is trusted, decoded, or returned to a caller.
+Manifests are untrusted input: every field is validated before any byte is
+trusted, decoded, or returned to a caller.
 """
 
 import hashlib
@@ -26,17 +26,17 @@ import numpy as np
 
 from ..common.exceptions import ValidationError
 from ..graph.tensor_info import DTYPE_SIZES, TensorInfo
-from .buffer_manager import DTYPE_MAP, _bfloat16_bytes_to_ndarray, _f32_to_bf16_bytes
+from .buffer_manager import DTYPE_MAP, _f32_to_bf16_bytes
 
 MANIFEST_FORMAT = "dnn-benchmarking-tensors"
 MANIFEST_VERSION = 1
-MANIFEST_LAYOUT = "dense-c"
+MANIFEST_LAYOUT = "element-space"
 MANIFEST_BYTE_ORDER = "little"
 MANIFEST_FILENAME = "manifest.json"
 MANIFEST_PHASES = ("input", "output", "reference")
 
-# Per-dtype canonical wire tag. Independent of graph_strides (recorded only
-# for producer-side context, since manifest bytes are always dense-c).
+# Per-dtype canonical wire tag. Tensor bytes use graph strides and include
+# deterministic zero-filled storage gaps.
 _ENCODING_BY_DTYPE = {
     "float": "f32",
     "half": "f16",
@@ -47,9 +47,8 @@ _ENCODING_BY_DTYPE = {
     "uint8": "uint8",
 }
 
-# Little-endian numpy dtype codes for every non-bfloat16 supported type.
-# bfloat16 has no native numpy dtype and is handled via buffer_manager's
-# bit-manipulation helpers instead.
+# Explicit little-endian storage encodings. hipDNN golden files are native
+# little-endian on supported hosts; spelling it here keeps manifests portable.
 _WIRE_DTYPE_CODE = {
     "float": "f4",
     "half": "f2",
@@ -58,6 +57,7 @@ _WIRE_DTYPE_CODE = {
     "int32": "i4",
     "uint8": "u1",
 }
+
 
 _UID_RE = re.compile(r"-?[0-9]+")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -81,8 +81,9 @@ def load_input_tensors(
     pass-by-value ones, whose decoded value is cross-checked against the
     value already embedded in the graph).
 
-    Returns dense, C-contiguous logical arrays keyed by tensor UID. bfloat16
-    values are exposed as float32, matching the rest of the codebase.
+    Returns dense, C-contiguous logical arrays keyed by tensor UID. The
+    manifest payload itself preserves graph stride gaps. bfloat16 values are
+    exposed as float32, matching the rest of the codebase.
     """
     source = Path(source)
     fingerprint = graph_fingerprint(graph_json)
@@ -133,10 +134,12 @@ def load_input_tensors(
     for uid in required_uids:
         entry = by_uid[uid]
         tensor_info = info_by_uid[uid]
-        _validate_entry_matches_tensor_info(entry, tensor_info, manifest_path)
+        _validate_entry_matches_tensor_info(
+            entry, tensor_info, manifest["graph"]["path"], manifest_path
+        )
         data_bytes = _read_and_verify_tensor_bytes(manifest_dir, entry, manifest_path)
         data_type = tensor_info.data_type.lower()
-        array = _decode_dense(data_bytes, list(tensor_info.dims), data_type)
+        array = _decode_element_space(data_bytes, tensor_info, data_type)
         if tensor_info.is_pass_by_value:
             _verify_pass_by_value(array, tensor_info, data_type, manifest_path)
         result[uid] = array
@@ -155,10 +158,9 @@ def write_tensor_manifest(
     engine_id: Optional[int] = None,
     artifact_key: Optional[str] = None,
 ) -> Path:
-    """Write a dense tensor manifest and sibling ``.bin`` files under ``root``.
+    """Write an element-space manifest and sibling ``.bin`` files.
 
-    Only the UIDs present in ``tensors`` are written; each must name a known
-    ``tensor_infos`` entry with a matching dense shape and dtype. The target
+    Every tensor must match its graph shape and logical dtype. The target
     directory is derived from the graph name, its content hash, ``phase``,
     and the optional ``provider``/``engine_id``/``artifact_key`` so repeated
     engines or suites never collide; user-controlled segments are sanitized.
@@ -226,9 +228,9 @@ def write_tensor_manifest(
                 f"write_tensor_manifest: tensor uid {uid} dtype {array.dtype} does not match "
                 f"expected {expected_dtype} for data_type {data_type!r}"
             )
-        data_bytes = _encode_dense(array, data_type)
+        data_bytes = _encode_element_space(array, tensor_info, data_type)
         digest = hashlib.sha256(data_bytes).hexdigest()
-        file_name = f"tensor-{uid}.bin"
+        file_name = _tensor_file_name(graph_path, uid)
         _atomic_write_bytes(manifest_dir / file_name, data_bytes)
         tensor_entries.append(
             {
@@ -237,6 +239,7 @@ def write_tensor_manifest(
                 "data_type": data_type,
                 "shape": list(tensor_info.dims),
                 "graph_strides": list(tensor_info.strides),
+                "storage_elements": tensor_info.storage_elements,
                 "encoding": _ENCODING_BY_DTYPE[data_type],
                 "file": file_name,
                 "byte_length": len(data_bytes),
@@ -272,9 +275,8 @@ def write_tensor_manifest(
 
 
 # --------------------------------------------------------------------------
-# Dense encode/decode. Non-bfloat16 dtypes are plain little-endian numpy
-# round-trips; bfloat16 reuses buffer_manager's RNE bit-manipulation helpers
-# rather than duplicating that conversion.
+# Element-space encode/decode. The graph strides define logical offsets into
+# the payload. Storage gaps are zero-filled when writing.
 # --------------------------------------------------------------------------
 
 
@@ -292,30 +294,53 @@ def _canonical_dtype(data_type: str) -> np.dtype:
     return np.dtype(dtype)
 
 
-def _encode_dense(data: np.ndarray, data_type: str) -> bytes:
-    """Encode a dense logical ndarray into canonical little-endian bytes."""
+def _storage_view(storage: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
+    if tensor_info.strides:
+        return np.lib.stride_tricks.as_strided(
+            storage,
+            shape=tuple(tensor_info.dims),
+            strides=tuple(
+                stride * storage.dtype.itemsize for stride in tensor_info.strides
+            ),
+        )
+    return storage.reshape(tensor_info.dims)
+
+
+def _encode_element_space(
+    data: np.ndarray, tensor_info: TensorInfo, data_type: str
+) -> bytes:
+    """Encode logical values into zero-filled, little-endian element storage."""
     if data_type == "bfloat16":
-        return _f32_to_bf16_bytes(np.ascontiguousarray(data, dtype=np.float32))
-    wire_dtype = np.dtype("<" + _WIRE_DTYPE_CODE[data_type])
-    return np.ascontiguousarray(data).astype(wire_dtype).tobytes()
+        logical_words = np.frombuffer(
+            _f32_to_bf16_bytes(np.ascontiguousarray(data, dtype=np.float32)),
+            dtype=np.uint16,
+        ).reshape(tensor_info.dims)
+        storage = np.zeros(tensor_info.storage_elements, dtype="<u2")
+        _storage_view(storage, tensor_info)[...] = logical_words
+    else:
+        wire_dtype = np.dtype("<" + _WIRE_DTYPE_CODE[data_type])
+        storage = np.zeros(tensor_info.storage_elements, dtype=wire_dtype)
+        _storage_view(storage, tensor_info)[...] = data
+    return storage.tobytes()
 
 
-def _decode_dense(data_bytes: bytes, shape: List[int], data_type: str) -> np.ndarray:
-    """Decode canonical little-endian bytes into a dense logical ndarray."""
+def _decode_element_space(
+    data_bytes: bytes, tensor_info: TensorInfo, data_type: str
+) -> np.ndarray:
+    """Decode little-endian graph storage into a dense logical ndarray."""
     if data_type == "bfloat16":
-        return np.ascontiguousarray(_bfloat16_bytes_to_ndarray(data_bytes, shape))
-    count = 1
-    for dim in shape:
-        count *= int(dim)
+        storage = np.frombuffer(
+            data_bytes, dtype="<u2", count=tensor_info.storage_elements
+        )
+        logical_words = np.ascontiguousarray(_storage_view(storage, tensor_info))
+        f32_bits = logical_words.astype(np.uint32) << np.uint32(16)
+        return np.ascontiguousarray(f32_bits.view(np.float32).reshape(tensor_info.dims))
     wire_dtype = np.dtype("<" + _WIRE_DTYPE_CODE[data_type])
-    raw = np.frombuffer(data_bytes, dtype=wire_dtype, count=count)
-    native = raw.astype(DTYPE_MAP[data_type])
-    return np.ascontiguousarray(native.reshape(shape))
-
-
-# --------------------------------------------------------------------------
-# Manifest structural validation (trust boundary).
-# --------------------------------------------------------------------------
+    storage = np.frombuffer(
+        data_bytes, dtype=wire_dtype, count=tensor_info.storage_elements
+    )
+    logical = _storage_view(storage, tensor_info)
+    return np.ascontiguousarray(logical, dtype=DTYPE_MAP[data_type])
 
 
 def _load_manifest_json(path: Path) -> Any:
@@ -432,6 +457,15 @@ def _validate_tensor_entry_shape(entry: Any, manifest_path: Path, index: int) ->
             f"{manifest_path}: tensors[{index}].graph_strides must be a list of ints"
         )
 
+    storage_elements = entry.get("storage_elements")
+    if (
+        not isinstance(storage_elements, int)
+        or isinstance(storage_elements, bool)
+        or storage_elements < 0
+    ):
+        raise ValidationError(
+            f"{manifest_path}: tensors[{index}].storage_elements must be a non-negative int"
+        )
     byte_length = entry.get("byte_length")
     if (
         not isinstance(byte_length, int)
@@ -468,7 +502,10 @@ def _tensor_entries_by_uid(
 
 
 def _validate_entry_matches_tensor_info(
-    entry: Dict[str, Any], tensor_info: TensorInfo, manifest_path: Path
+    entry: Dict[str, Any],
+    tensor_info: TensorInfo,
+    graph_path: str,
+    manifest_path: Path,
 ) -> None:
     """Cross-check a manifest tensor entry against the graph's own TensorInfo."""
     if entry["data_type"] != tensor_info.data_type.lower():
@@ -484,16 +521,19 @@ def _validate_entry_matches_tensor_info(
             f"{manifest_path}: tensor uid {tensor_info.uid} graph_strides mismatch"
         )
 
-    expected_file = f"tensor-{tensor_info.uid}.bin"
+    expected_file = _tensor_file_name(Path(graph_path), tensor_info.uid)
     if entry["file"] != expected_file:
         raise ValidationError(
-            f"{manifest_path}: tensor uid {tensor_info.uid} file must be {expected_file!r}"
+            f"{manifest_path}: tensor uid {tensor_info.uid} file must be "
+            f"{expected_file!r}"
         )
 
-    dtype_size = DTYPE_SIZES[entry["data_type"]]
-    expected_len = dtype_size
-    for dim in tensor_info.dims:
-        expected_len *= int(dim)
+    if entry["storage_elements"] != tensor_info.storage_elements:
+        raise ValidationError(
+            f"{manifest_path}: tensor uid {tensor_info.uid} storage_elements mismatch: "
+            f"expected {tensor_info.storage_elements}, got {entry['storage_elements']}"
+        )
+    expected_len = tensor_info.size_bytes
     if entry["byte_length"] != expected_len:
         raise ValidationError(
             f"{manifest_path}: tensor uid {tensor_info.uid} byte_length mismatch: "
@@ -604,6 +644,11 @@ def _sanitize_segment(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", value).replace("..", "_")
     cleaned = cleaned.strip("._")
     return cleaned or "unknown"
+
+
+def _tensor_file_name(graph_path: Path, uid: int) -> str:
+    """Return the hipDNN golden-bundle tensor filename for one UID."""
+    return f"{_sanitize_segment(graph_path.stem)}.tensor{uid}.bin"
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:

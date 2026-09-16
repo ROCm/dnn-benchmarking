@@ -366,8 +366,8 @@ dnn-benchmark --graph ./graphs/sample_conv_fwd.json --seed 42
 
 Use `--input-init zeros` or `--input-init ones` for deterministic generated
 inputs. The default remains seeded random data. `--tensor-output-dir DIR`
-writes dense, C-order input and output values as `.bin` files with versioned
-JSON manifests:
+writes full element-space input and output storage as `.bin` files with
+versioned JSON manifests:
 
 ```bash
 dnn-benchmark -g graph.json --seed 42 --tensor-output-dir ./tensor-artifacts
@@ -377,10 +377,11 @@ dnn-benchmark -g graph.json --input-manifest ./tensor-artifacts \
 
 An input manifest must match the graph content and include every non-virtual
 input tensor. The loader verifies tensor UIDs, shapes, data types, graph
-strides, exact byte lengths, SHA-256 checksums, and embedded scalar values.
-The wire encodings are little-endian `f32`, `f16`, `bf16`, `f64`, `int8`,
-`int32`, and `uint8`. Files contain logical values without graph padding;
-the runner packs them into each graph tensor's declared strides.
+strides, storage elements, exact byte lengths, SHA-256 checksums, and embedded
+scalar values. The wire encodings are little-endian `f32`, `f16`, `bf16`,
+`f64`, `int8`, `int32`, and `uint8`. Each `<graph>.tensor<uid>.bin` file has
+the same element-space layout as a hipDNN golden test tensor: logical values
+use the graph strides, and storage gaps contain deterministic zeros.
 
 Output capture runs once after benchmark timing. With validation enabled, the
 same execution used for correctness supplies the captured outputs; otherwise
