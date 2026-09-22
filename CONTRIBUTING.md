@@ -19,4 +19,4 @@ For security vulnerabilities, do not open a public issue. Follow [SECURITY.md](S
 
 ## License
 
-By contributing, you agree that your contribution is licensed under the repository's [MIT License](LICENSE.md).
+By contributing, you agree that your contribution is licensed under the repository's [MIT License](LICENSE).
