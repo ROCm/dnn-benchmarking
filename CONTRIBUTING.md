@@ -17,6 +17,16 @@ For security vulnerabilities, do not open a public issue. Follow [SECURITY.md](S
 5. Open a pull request against `main`. Explain the change, its motivation, validation, and any related issue.
 6. Ensure all required CI checks pass and request review from the applicable CODEOWNERS.
 
+## Security requirements
+
+Contributors must not:
+
+- Commit secrets, tokens, passwords, or credentials.
+- Introduce vulnerable dependencies without justification.
+- Bypass security controls or required security reviews.
+
+All contributions may be subject to automated security scanning.
+
 ## License
 
 By contributing, you agree that your contribution is licensed under the repository's [MIT License](LICENSE).
