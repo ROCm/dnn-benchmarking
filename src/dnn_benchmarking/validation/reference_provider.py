@@ -23,11 +23,14 @@ class ReferenceOutput:
         data: The computed output data as numpy array.
         tensor_uid: UID of the tensor in the graph.
         metadata: Optional provider-specific metadata.
+        device_data: Same logical values as ``data`` as a torch GPU tensor,
+            or None when only host data exists.
     """
 
     data: "np.ndarray"
     tensor_uid: int
     metadata: Optional[Dict[str, Any]] = None
+    device_data: Optional[Any] = None
 
 
 class ReferenceProvider(ABC):

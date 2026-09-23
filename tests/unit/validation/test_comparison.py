@@ -179,3 +179,38 @@ class TestArrayComparator:
 
         assert comparator.rtol == 1e-3
         assert comparator.atol == 1e-6
+
+
+class TestCompareTensors:
+    """compare_tensors matches compare on verdicts, diffs, and messages."""
+
+    def test_fp16_parity_without_overflow(self) -> None:
+        torch = pytest.importorskip("torch")
+        a = np.array([60000, 1.0], dtype=np.float16)
+        b = np.array([-60000, 1.0], dtype=np.float16)
+        comparator = ArrayComparator(rtol=1e-3, atol=1e-3)
+
+        host = comparator.compare(a, b)
+        device = comparator.compare_tensors(torch.from_numpy(a), torch.from_numpy(b))
+
+        # fp16 subtraction would overflow to inf; float64 keeps it finite.
+        assert host.max_abs_diff == 120000.0
+        assert host == device
+
+    def test_nan_rejected(self) -> None:
+        torch = pytest.importorskip("torch")
+        result = ArrayComparator().compare_tensors(
+            torch.tensor([float("nan")]), torch.tensor([0.0]), "output", "reference"
+        )
+
+        assert result.passed is False
+        assert result.message == "output contains NaN or Inf values"
+
+    def test_shape_mismatch(self) -> None:
+        torch = pytest.importorskip("torch")
+        result = ArrayComparator().compare_tensors(
+            torch.zeros(2, 3), torch.zeros(3, 2), "output", "reference"
+        )
+
+        assert result.passed is False
+        assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"

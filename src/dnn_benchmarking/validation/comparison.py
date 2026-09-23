@@ -7,9 +7,12 @@ Shared by reference validation and any direct array comparisons.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -74,6 +77,11 @@ class ArrayComparator:
         Returns:
             ComparisonResult with pass/fail status and difference metrics.
         """
+        # Compare in float64 so fp16 differences cannot overflow and the host
+        # and device paths (compare_tensors) reach the same verdict.
+        actual = np.asarray(actual, dtype=np.float64)
+        expected = np.asarray(expected, dtype=np.float64)
+
         # Check for NaN/Inf in actual
         if np.any(np.isnan(actual)) or np.any(np.isinf(actual)):
             return ComparisonResult(
@@ -113,6 +121,62 @@ class ArrayComparator:
         # Perform allclose comparison
         passed = np.allclose(actual, expected, rtol=self._rtol, atol=self._atol)
 
+        return self._result(passed, max_abs_diff, max_rel_diff)
+
+    def compare_tensors(
+        self,
+        actual: "torch.Tensor",
+        expected: "torch.Tensor",
+        actual_label: str = "actual",
+        expected_label: str = "expected",
+    ) -> ComparisonResult:
+        """Compare two torch tensors on their device, with ``compare`` semantics.
+
+        ``expected`` moves to the device of ``actual``. Both are compared in
+        float64, as in ``compare``, so verdicts and messages are identical.
+        """
+        import torch
+
+        a = actual.detach().to(torch.float64)
+        e = expected.detach().to(device=a.device, dtype=torch.float64)
+
+        if not bool(torch.isfinite(a).all()):
+            return ComparisonResult(
+                passed=False,
+                max_abs_diff=float("inf"),
+                max_rel_diff=float("inf"),
+                message=f"{actual_label} contains NaN or Inf values",
+            )
+        if not bool(torch.isfinite(e).all()):
+            return ComparisonResult(
+                passed=False,
+                max_abs_diff=float("inf"),
+                max_rel_diff=float("inf"),
+                message=f"{expected_label} contains NaN or Inf values",
+            )
+        if a.shape != e.shape:
+            return ComparisonResult(
+                passed=False,
+                max_abs_diff=float("inf"),
+                max_rel_diff=float("inf"),
+                message=(
+                    f"Shape mismatch: {actual_label}={tuple(a.shape)} "
+                    f"vs {expected_label}={tuple(e.shape)}"
+                ),
+            )
+
+        abs_diff = (a - e).abs()
+        max_abs_diff = float(abs_diff.max()) if abs_diff.numel() else 0.0
+        max_rel_diff = (
+            float((abs_diff / (e.abs() + 1e-10)).max()) if abs_diff.numel() else 0.0
+        )
+        passed = bool(torch.allclose(a, e, rtol=self._rtol, atol=self._atol))
+        return self._result(passed, max_abs_diff, max_rel_diff)
+
+    def _result(
+        self, passed: bool, max_abs_diff: float, max_rel_diff: float
+    ) -> ComparisonResult:
+        """Build the ComparisonResult and message shared by both comparisons."""
         if passed:
             message = f"Match (rtol={self._rtol}, atol={self._atol})"
         else:
@@ -121,7 +185,6 @@ class ArrayComparator:
                 f"max_rel_diff={max_rel_diff:.2e} "
                 f"(rtol={self._rtol}, atol={self._atol})"
             )
-
         return ComparisonResult(
             passed=passed,
             max_abs_diff=max_abs_diff,

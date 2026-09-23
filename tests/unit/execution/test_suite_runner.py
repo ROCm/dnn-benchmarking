@@ -1353,6 +1353,33 @@ class TestCheckCorrectnessOutputCount:
         assert result.rtol == pytest.approx(0.25)
         assert result.atol == pytest.approx(0.25)
 
+    def test_device_reference_is_compared_without_host_copy(self):
+        torch = pytest.importorskip("torch")
+        bm = MagicMock()
+        bm.get_output_tensor.return_value = torch.tensor([1.0, 2.0])
+
+        # Host data disagrees, so a pass proves the device tensors were used.
+        ref_outputs = {
+            7: ReferenceOutput(
+                data=np.array([9.0, 9.0], dtype=np.float32),
+                tensor_uid=7,
+                device_data=torch.tensor([1.0, 2.0]),
+            )
+        }
+
+        result = _check_correctness(
+            buffer_manager=bm,
+            tensor_infos=[_make_tensor_info(7, is_output=True)],
+            graph_json={"nodes": []},
+            ref_outputs=ref_outputs,
+            reference_provider_name="pytorch",
+            config=SuiteConfig(validation=ValidationConfig(provider="pytorch")),
+        )
+
+        assert result.tolerance_match is True
+        assert result.max_abs_diff == 0.0
+        bm.get_output_data.assert_not_called()
+
 
 class TestResolveEngineName:
     """Tests for _resolve_engine_name fallback behavior."""

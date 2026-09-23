@@ -534,8 +534,9 @@ class Setup:
         It is a git submodule (see .gitmodules) tracking develop by default, so
         `git submodule update --init` also works. This is the fast path used only
         when the directory isn't already populated: a sparse, blobless clone of
-        the .gitmodules-pinned branch limited to the hipDNN/provider sources and
-        root CMake tooling this script builds.
+        the pinned submodule commit (falls back to the .gitmodules branch),
+        limited to the hipDNN/provider sources and root CMake tooling this
+        script builds.
         To build against a different ref, check it out directly, e.g.
         `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
@@ -558,8 +559,14 @@ class Setup:
         branch = git_output(
             ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
         )
+        try:
+            ref = git_output(
+                ["-C", str(SCRIPT_DIR), "rev-parse", "HEAD:rocm-libraries"]
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            ref = branch
         print(
-            f"Fetching rocm-libraries ({branch}) via sparse checkout "
+            f"Fetching rocm-libraries ({ref}) via sparse checkout "
             "(cmake, projects/hipdnn, dnn-providers)..."
         )
         if ROCM_LIBRARIES_DIR.exists():
@@ -595,7 +602,7 @@ class Setup:
                 "--depth",
                 "1",
                 "origin",
-                branch,
+                ref,
             ]
         )
         run_git(["-C", str(ROCM_LIBRARIES_DIR), "checkout", "--quiet", "FETCH_HEAD"])

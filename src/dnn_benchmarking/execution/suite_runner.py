@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import (
     BenchmarkConfig,
@@ -110,6 +111,15 @@ def _tolerance_for_output(
     if override is not None:
         return override
     return _default_tolerance_for_output(tensor_info, output_node_type)
+
+
+def _hipdnn_buffer_device() -> Optional[str]:
+    """Torch device for hipDNN I/O buffers, or None for hipdnn.DeviceBuffer.
+
+    ``"cuda"`` is torch's current device; hipDNN requires it to match the
+    current HIP device used by the handle.
+    """
+    return "cuda" if torch_support.gpu_usable() else None
 
 
 def _resolve_engine_name(engine_id: int) -> str:
@@ -268,31 +278,42 @@ def _check_correctness(
             if not ti.is_output:
                 continue
 
-            actual = buffer_manager.get_output_data(ti.uid)
-            if actual is None:
-                continue
-
-            if ti.uid not in ref_outputs:
-                rtol, atol = _tolerance_for_output(
-                    config, ti, output_node_types.get(ti.uid)
-                )
-                return CorrectnessResult(
-                    execution_success=True,
-                    tolerance_match=False,
-                    rtol=rtol,
-                    atol=atol,
-                    error_message=(
-                        f"Reference provider '{reference_provider_name}' did not "
-                        f"produce output tensor UID {ti.uid}"
-                    ),
-                )
-
             rtol, atol = _tolerance_for_output(
                 config, ti, output_node_types.get(ti.uid)
             )
             validator = Validator(rtol=rtol, atol=atol)
-            expected = ref_outputs[ti.uid].data
-            result = validator.validate(actual, ti, reference_data=expected)
+            ref = ref_outputs.get(ti.uid)
+
+            # Compare on the GPU when both sides are device tensors.
+            result = None
+            if ref is not None and ref.device_data is not None:
+                actual_tensor = buffer_manager.get_output_tensor(ti.uid)
+                if actual_tensor is not None:
+                    import torch
+
+                    try:
+                        result = validator.validate_tensors(
+                            actual_tensor, ti, ref.device_data
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        result = None  # Fall back to the host comparison.
+
+            if result is None:
+                actual = buffer_manager.get_output_data(ti.uid)
+                if actual is None:
+                    continue
+                if ref is None:
+                    return CorrectnessResult(
+                        execution_success=True,
+                        tolerance_match=False,
+                        rtol=rtol,
+                        atol=atol,
+                        error_message=(
+                            f"Reference provider '{reference_provider_name}' did not "
+                            f"produce output tensor UID {ti.uid}"
+                        ),
+                    )
+                result = validator.validate(actual, ti, reference_data=ref.data)
             output_count += 1
             used_rtol = max(used_rtol, rtol)
             used_atol = max(used_atol, atol)
@@ -390,12 +411,20 @@ def _pytorch_reference_outputs_from_buffer(
     buffer_manager: Any,
 ) -> Dict[int, ReferenceOutput]:
     outputs: Dict[int, ReferenceOutput] = {}
+    tensors = buffer_manager.get_tensors()
     for tensor_info in buffer_manager.get_output_tensors():
         data = buffer_manager.get_output_data(tensor_info.uid)
         if data is not None:
+            tensor = tensors.get(tensor_info.uid)
             outputs[tensor_info.uid] = ReferenceOutput(
                 data=data,
                 tensor_uid=tensor_info.uid,
+                # Clone: the buffer manager frees its tensors on exit.
+                device_data=(
+                    tensor.detach().clone()
+                    if tensor is not None and tensor.is_cuda
+                    else None
+                ),
             )
     return outputs
 
@@ -1067,7 +1096,10 @@ def _run_oracle_pass(
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
-            candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
+            # Graph.autotune takes raw pointers only; execute accepts DLPack.
+            candidates = executor.autotune(
+                oracle_handle, bm.create_variant_pack(as_pointers=True), engine_id
+            )
             eligible_candidates = [
                 candidate
                 for candidate in candidates
@@ -1216,7 +1248,7 @@ def run_single_provider_engine(
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
 
-        with BufferManager(tensor_infos) as bm:
+        with BufferManager(tensor_infos, device=_hipdnn_buffer_device()) as bm:
             bm.allocate_all()
             bm.load_input_data(input_data)
             bm.zero_outputs()
