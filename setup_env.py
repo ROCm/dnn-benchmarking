@@ -1196,9 +1196,11 @@ class Setup:
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
+            # Prefer the freshly installed runtime over the toolchain prefix. The
+            # devel wheel can contain an older libhipdnn_backend.so.
             lib_dirs = tuple(
                 str(Path(prefix) / "lib")
-                for prefix in (toolchain_prefix, install_prefix)
+                for prefix in (install_prefix, toolchain_prefix)
                 if prefix and (Path(prefix) / "lib").is_dir()
             )
             current = self.env.get("LD_LIBRARY_PATH", "")
