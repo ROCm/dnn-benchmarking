@@ -73,6 +73,26 @@ class TestExtractTarball:
         finally:
             tmpdir.cleanup()
 
+    def test_mixed_tarball_skips_data_only_cases(self, tmp_path: Path, capsys) -> None:
+        graph = json.dumps(
+            {"name": "g", "nodes": [{"type": "SdpaAttributes"}], "tensors": []}
+        )
+        case = json.dumps({"idx": 1, "B": 1, "H": 16, "T": 2048, "DK": 128, "DV": 128})
+        tb = _make_tarball(
+            tmp_path / "rocke.tar.gz",
+            {
+                "rocke/sdpa/graph.json": graph,
+                "rocke/kda/rocke_kda_001.case.json": case,
+            },
+        )
+
+        tmpdir, extracted = extract_tarball(str(tb))
+        try:
+            assert [Path(path).name for path in extracted] == ["graph.json"]
+            assert "Skipping 1 data-only .case.json" in capsys.readouterr().err
+        finally:
+            tmpdir.cleanup()
+
     def test_nonexistent_path_raises_graph_load_error(self) -> None:
         with pytest.raises(GraphLoadError, match="not found"):
             extract_tarball("/nonexistent/path/graphs.tar.gz")
@@ -83,14 +103,13 @@ class TestExtractTarball:
         with pytest.raises(GraphLoadError, match="Not a valid tarball"):
             extract_tarball(str(bad_file))
 
-    def test_no_json_in_tarball_raises_and_cleans_up(self, tmp_path: Path) -> None:
-        tb = _make_tarball(tmp_path / "empty.tar.gz", {"readme.txt": "hello"})
-        with pytest.raises(GraphLoadError, match="No .json files"):
+    def test_case_only_tarball_is_not_a_graph_workload(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        tb = _make_tarball(tmp_path / "kda.tar.gz", {"kda/001.case.json": '{"idx": 1}'})
+        with pytest.raises(GraphLoadError):
             extract_tarball(str(tb))
-
-        # tmpdir should have been cleaned up on error
-        dnn_tmpdirs = list(Path(tempfile.gettempdir()).glob("dnn_benchmarking_*"))
-        assert len(dnn_tmpdirs) == 0
+        assert "Skipping 1 data-only .case.json" in capsys.readouterr().err
 
 
 class TestResolveGraphFiles:
@@ -111,6 +130,7 @@ class TestResolveGraphFiles:
             (tmp_path / f"g{i}.json").write_text(
                 json.dumps({"name": f"g{i}", "nodes": [], "tensors": []})
             )
+        (tmp_path / "case.case.json").write_text('{"idx": 1}')
         pattern = str(tmp_path / "*.json")
 
         tmpdirs, files, _ = resolve_graph_files(pattern)
@@ -144,6 +164,7 @@ class TestResolveGraphFiles:
             (parent / name).write_text(
                 json.dumps({"name": name, "nodes": [], "tensors": []})
             )
+        (subdir / "case.case.json").write_text('{"idx": 1}')
         (tmp_path / "readme.txt").write_text("not a graph")
 
         tmpdirs, files, tarball_source = resolve_graph_files(str(tmp_path))

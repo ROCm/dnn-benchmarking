@@ -4,6 +4,7 @@
 """Graph file resolution utilities: tarball extraction and glob expansion."""
 
 import glob as _glob
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -12,6 +13,10 @@ from typing import List, Optional, Tuple
 from ..common.exceptions import GraphLoadError
 
 _TARBALL_SUFFIXES = {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz"}
+
+
+def _is_graph_json(path: str) -> bool:
+    return path.endswith(".json") and not path.endswith(".case.json")
 
 
 def is_tarball(path: str) -> bool:
@@ -30,7 +35,7 @@ def extract_tarball(tarball_path: str) -> Tuple[tempfile.TemporaryDirectory, Lis
         Tuple of (TemporaryDirectory to keep alive, sorted list of JSON file paths).
 
     Raises:
-        GraphLoadError: If the tarball cannot be opened, contains no JSON files,
+        GraphLoadError: If the tarball cannot be opened, contains no graph JSON files,
             or extraction fails.
     """
     if not Path(tarball_path).exists():
@@ -41,11 +46,20 @@ def extract_tarball(tarball_path: str) -> Tuple[tempfile.TemporaryDirectory, Lis
     tmpdir = tempfile.TemporaryDirectory(prefix="dnn_benchmarking_")
     try:
         with tarfile.open(tarball_path) as tf:
-            json_members = [
-                m for m in tf.getmembers() if m.name.endswith(".json") and m.isfile()
-            ]
+            members = tf.getmembers()
+            case_count = sum(
+                m.isfile() and m.name.endswith(".case.json") for m in members
+            )
+            if case_count:
+                print(
+                    f"Skipping {case_count} data-only .case.json files in {tarball_path}",
+                    file=sys.stderr,
+                )
+            json_members = [m for m in members if m.isfile() and _is_graph_json(m.name)]
             if not json_members:
-                raise GraphLoadError(f"No .json files found in tarball: {tarball_path}")
+                raise GraphLoadError(
+                    f"No graph .json files found in tarball: {tarball_path}"
+                )
             tf.extractall(path=tmpdir.name, members=json_members, filter="data")
     except GraphLoadError:
         tmpdir.cleanup()
@@ -97,7 +111,7 @@ def resolve_graph_files(
     # Bare directory: recursively collect JSON files and extract tarballs.
     if Path(graph_arg).is_dir():
         all_files = sorted(_glob.glob(f"{graph_arg}/**/*", recursive=True))
-        jsons = [p for p in all_files if p.endswith(".json")]
+        jsons = [p for p in all_files if _is_graph_json(p)]
         tarballs = [p for p in all_files if is_tarball(p)]
         if tarballs:
             tarball_source = graph_arg
@@ -114,7 +128,7 @@ def resolve_graph_files(
         matched = [graph_arg]
 
     tarballs = [p for p in matched if is_tarball(p)]
-    jsons = [p for p in matched if p.endswith(".json")]
+    jsons = [p for p in matched if _is_graph_json(p)]
 
     if tarballs:
         tarball_source = graph_arg
