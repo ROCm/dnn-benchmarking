@@ -111,7 +111,7 @@ def default_hipdnn_plugin_paths() -> Optional[list[Path]]:
     return [plugin_path]
 
 
-def _preload_wheel_hipdnn() -> bool:
+def _preload_wheel_hipdnn() -> Optional[ctypes.CDLL]:
     """Load the hipdnn-runtime wheel's backend so it claims the SONAME.
 
     The ROCm SDK libraries wheel bundles its own ``libhipdnn_backend.so``. Both
@@ -119,17 +119,29 @@ def _preload_wheel_hipdnn() -> bool:
     request -- and the SDK's copy tracks the nightly, not this release, which
     surfaces as an ``undefined symbol`` when the bindings look for a newer
     entry point. Loading ours first, globally, makes the released wheel win.
+    Returns the loaded backend, or None when no runtime wheel is installed.
     """
     try:
         import hipdnn_runtime  # type: ignore[import-not-found]
     except ImportError:
-        return False
+        return None
 
     backend = hipdnn_runtime.backend_library()
     if not backend.is_file():
-        return False
-    ctypes.CDLL(str(backend), mode=ctypes.RTLD_GLOBAL)
-    return True
+        return None
+    try:
+        library = ctypes.CDLL(str(backend), mode=ctypes.RTLD_GLOBAL)
+    except OSError as e:
+        raise RuntimeError(f"Failed to load hipDNN backend {backend}: {e}") from e
+
+    # The hip-kernel provider compiles its build-time install prefix in as the
+    # ASM SDPA kernel directory, which is a path on the machine that built the
+    # wheel. Point it at this wheel's copy; an explicit setting still wins.
+    os.environ.setdefault(
+        "HIPDNN_AITER_ASM_DIR",
+        str(hipdnn_runtime.plugin_path() / "hip_kernel_provider" / "asm_kernels"),
+    )
+    return library
 
 
 def _available_preload_shortnames(rocm_sdk: ModuleType, skip: set[str]) -> list[str]:
@@ -165,7 +177,17 @@ def initialize_pip_rocm_runtime() -> bool:
 
     # A released hipdnn-runtime wheel owns hipDNN; keep the SDK's copy out of
     # the preload entirely so it cannot take the SONAME back.
-    skip = {"hipdnn"} if _preload_wheel_hipdnn() else set()
+    wheel_backend = _preload_wheel_hipdnn()
+    skip = set()
+    if wheel_backend is not None:
+        skip.add("hipdnn")
+        # ROCm torch's _rocm_init preloads "hipdnn" too, by absolute path.
+        # dlopen matches a path by file, not SONAME, so that maps the SDK's copy
+        # beside ours, and the oracle pass then segfaults in the backend.
+        # rocm_sdk skips any shortname it already holds a handle for.
+        # ponytail: private rocm_sdk cache; the requirements file pins the SDK
+        # and the release build's payload check fails if this stops working.
+        getattr(rocm_sdk, "_ALL_CDLLS", {})["hipdnn"] = wheel_backend
     preload_shortnames = _available_preload_shortnames(rocm_sdk, skip)
     if not preload_shortnames:
         return False

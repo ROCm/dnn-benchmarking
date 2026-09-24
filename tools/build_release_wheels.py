@@ -27,11 +27,14 @@ import argparse
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -196,7 +199,11 @@ def ensure_pinned_rocm_libraries() -> str:
                 "dnn-providers",
             ]
         )
-    if git_output("rev-parse", "HEAD", cwd=ROCM_LIBRARIES_DIR) != pinned:
+    have_pin = subprocess.run(
+        ["git", "-C", ROCM_LIBRARIES_DIR, "cat-file", "-e", f"{pinned}^{{commit}}"],
+        capture_output=True,
+    )
+    if have_pin.returncode != 0:
         run(
             [
                 "git",
@@ -210,7 +217,9 @@ def ensure_pinned_rocm_libraries() -> str:
                 pinned,
             ]
         )
-        run(["git", "-C", ROCM_LIBRARIES_DIR, "checkout", "--quiet", pinned])
+    # Check out even when HEAD already names the pin: a --no-checkout clone
+    # whose default-branch tip is the pin has HEAD there and no files at all.
+    run(["git", "-C", ROCM_LIBRARIES_DIR, "checkout", "--quiet", pinned])
     return pinned
 
 
@@ -263,8 +272,50 @@ class BuildEnv:
         )
         return result.stdout.strip()
 
+    def nightly_torch_version(self) -> str:
+        """Newest final torch release the index built against this ROCm SDK.
+
+        The requirements file pins torch to it. PyPI is an extra index there,
+        and pip gives indexes no priority, so an unpinned torch can resolve to
+        a newer PyPI build that has no ROCm device extra. PyPI never carries a
+        ``+rocm`` local version, so the exact pin matches only the nightly.
+
+        Each ROCm nightly is built for several torch versions, including an
+        alpha from torch's main branch. Prefer the newest final release: on
+        the 10.1.0a20260822 nightly, 2.15.0a0 fails every kernel launch on
+        gfx90a with "device kernel image is invalid", while 2.14.0 runs.
+        """
+        rocm_version = self.distribution_version("rocm")
+        url = f"{self.index_url.rstrip('/')}/torch/"
+        with urllib.request.urlopen(url) as response:
+            page = urllib.parse.unquote(response.read().decode("utf-8"))
+        local = re.escape(f"+rocm{rocm_version}")
+        found = sorted(set(re.findall(rf"torch-([\w.]+{local})-", page)))
+        if not found:
+            fail(f"ERROR: {url} lists no torch built against ROCm {rocm_version}.")
+        # PEP 440 ordering needs `packaging`, which the build venv has (`build`
+        # depends on it) and the system interpreter running this may not.
+        result = subprocess.run(
+            [
+                str(self.python),
+                "-c",
+                "import sys; from packaging.version import Version; "
+                "found = [Version(v) for v in sys.argv[1:]]; "
+                "final = [v for v in found if not v.is_prerelease]; "
+                "print(max(final or found))",
+                *found,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
     def pip(self, *args) -> None:
         run([self.python, "-m", "pip", "install", *args])
+
+    def uninstall(self, *names: str) -> None:
+        run([self.python, "-m", "pip", "uninstall", "--quiet", "--yes", *names])
 
     def ensure(self) -> None:
         if self.python.is_file():
@@ -509,6 +560,121 @@ def build_benchmark_wheel(env: BuildEnv, output_dir: Path) -> Path:
         return collect_one(wheelhouse, "dnn_benchmarking-*.whl", output_dir)
 
 
+# Runs in a fresh interpreter for each architecture: the backend SONAME can be
+# loaded only once per process. argv: <arch> <1 if the install tree had ASM
+# SDPA kernels for arch, else 0>.
+PAYLOAD_CHECK = """\
+import importlib.util, os, subprocess, sys
+from pathlib import Path
+
+arch, expect_asm = sys.argv[1], sys.argv[2] == "1"
+import hipdnn_runtime
+
+assert hipdnn_runtime.__gpu_arch__ == arch, hipdnn_runtime.__gpu_arch__
+plugins = sorted(hipdnn_runtime.plugin_path().glob("*.so"))
+assert plugins, "no engine plugins packaged"
+
+
+def unresolved(library, symbols=True):
+    # `ldd -r` resolves one file's DT_NEEDED through its own RPATH, the way a
+    # process that has preloaded nothing would. In-process loads cannot show
+    # this: the runtime preload puts every SONAME in place first.
+    out = subprocess.run(["ldd", "-r", str(library)], capture_output=True, text=True)
+    return [
+        line.strip()
+        for line in (out.stdout + out.stderr).splitlines()
+        if "not found" in line or (symbols and "undefined symbol" in line)
+    ]
+
+
+frontend = Path(importlib.util.find_spec("hipdnn_frontend").origin).parent
+# The bindings leave the Python C API undefined for the interpreter to supply,
+# so only missing libraries count against them.
+checks = [(hipdnn_runtime.backend_library(), True)]
+checks += [(plugin, True) for plugin in plugins]
+checks += [(module, False) for module in frontend.glob("*.so")]
+for library, symbols in checks:
+    problems = unresolved(library, symbols)
+    assert not problems, f"{library}: " + "; ".join(problems[:5])
+
+from dnn_benchmarking.common.rocm_runtime import initialize_pip_rocm_runtime
+
+assert initialize_pip_rocm_runtime(), "the pip ROCm runtime did not initialize"
+# Extension modules load with RTLD_NOW, so this fails on any backend entry
+# point the bindings need and the preloaded backend lacks.
+import hipdnn_frontend  # noqa: F401
+import rocm_sdk
+
+# What ROCm torch's _rocm_init does on `import torch`. It preloads "hipdnn" by
+# absolute path, which maps the SDK's copy beside ours unless rocm_runtime has
+# claimed that shortname; two backends in one process segfault in autotune.
+rocm_sdk.initialize_process(preload_shortnames=["hipdnn"])
+with open("/proc/self/maps", encoding="utf-8") as maps:
+    backends = {l.split()[-1] for l in maps if "libhipdnn_backend" in l}
+assert backends == {str(hipdnn_runtime.backend_library())}, backends
+
+asm = hipdnn_runtime.plugin_path() / "hip_kernel_provider" / "asm_kernels"
+assert os.environ["HIPDNN_AITER_ASM_DIR"] == str(asm)
+shipped = sorted(p.name for p in asm.iterdir()) if asm.is_dir() else []
+assert shipped == ([arch] if expect_asm else []), shipped
+assert not expect_asm or any(asm.rglob("*.co")), "ASM kernel directory is empty"
+print(f"{arch}: backend, bindings, and {len(plugins)} plugins resolve;"
+      f" ASM kernels: {shipped or 'none'}")
+"""
+
+
+def check_wheels(
+    env: BuildEnv,
+    runtime_wheels: dict[str, Path],
+    frontend: Path,
+    benchmark: Path,
+    work_dir: Path,
+) -> None:
+    """Load every architecture's payload against the pinned ROCm SDK.
+
+    Needs no GPU. It proves that each packaged library and plugin resolves its
+    dependencies and symbols through the packaged RPATHs, that the bindings use
+    the wheel's backend, and that each wheel carries its own architecture's ASM
+    kernels and no others. The build venv already holds the SDK version that
+    the requirements file pins, so it stands in for a user venv without a
+    second multi-GB download. The wheels are uninstalled again afterwards.
+    """
+    check_script = work_dir / "check_payload.py"
+    check_script.write_text(PAYLOAD_CHECK, encoding="utf-8")
+    child_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("ROCM_PATH", "LD_LIBRARY_PATH", "HIPDNN_AITER_ASM_DIR")
+    }
+    installed = ["hipdnn-frontend", "dnn-benchmarking"]
+    env.pip("--quiet", frontend, benchmark)
+    try:
+        run([env.bin / "dnn-benchmark", "--help"], stdout=subprocess.DEVNULL)
+        for arch, wheel in runtime_wheels.items():
+            installed.append(f"hipdnn-runtime-{arch}")
+            env.pip("--quiet", "--no-deps", wheel)
+            asm = (
+                work_dir
+                / "stage"
+                / arch
+                / "lib"
+                / "hipdnn_plugins"
+                / "engines"
+                / "hip_kernel_provider"
+                / "asm_kernels"
+                / arch
+            )
+            expect_asm = "1" if asm.is_dir() else "0"
+            run(
+                [env.python, check_script, arch, expect_asm],
+                env=child_env,
+                cwd=work_dir,
+            )
+            env.uninstall(installed.pop())
+    finally:
+        env.uninstall(*installed)
+
+
 def collect_one(wheelhouse: Path, pattern: str, output_dir: Path) -> Path:
     wheels = sorted(wheelhouse.glob(pattern))
     if len(wheels) != 1:
@@ -524,6 +690,7 @@ def write_requirements(
     arch: str,
     wheels: dict[str, Path],
     commit: str,
+    torch_version: str,
     base_url: str,
     output_dir: Path,
 ) -> Path:
@@ -541,11 +708,9 @@ def write_requirements(
     differs. It also makes pip read Requires-Python from the wheel metadata,
     so a too-old interpreter fails with a message that names the floor.
 
-    Only the ROCm SDK version is pinned. torch's device package depends on
-    ``rocm-sdk-device-<arch>`` at an exact version, so that single pin drags
-    torch to the same nightly these wheels were compiled and verified against --
-    which matters, because hipDNN and the SDK share library names and a skewed
-    pair fails at load time, not at install time.
+    torch and the ROCm SDK are pinned exactly, to the nightly these wheels were
+    compiled and verified against. hipDNN and the SDK share library names, so a
+    skewed pair fails at load time, not at install time.
     """
     rocm_version = env.distribution_version("rocm")
     path = output_dir / f"requirements-{arch}.txt"
@@ -561,10 +726,10 @@ def write_requirements(
             # rocm-libraries {commit}. Needs Python >= {PYTHON_FLOOR}.
             # Install with:
             #   pip install -r {path.name}
-            --index-url {ROCM_TORCH_INDEX_URL}
+            --index-url {env.index_url}
             --extra-index-url https://pypi.org/simple
             --pre
-            torch[device-{arch}]
+            torch[device-{arch}]=={torch_version}
             rocm[libraries,device-{arch}]=={rocm_version}
             """
         )
@@ -687,8 +852,10 @@ def main(argv=None) -> int:
     frontend = build_frontend_wheel(env, work_dir / "stage" / archs[0], output_dir)
     benchmark = build_benchmark_wheel(env, output_dir)
     built = [*runtime_wheels.values(), frontend, benchmark]
+    check_wheels(env, runtime_wheels, frontend, benchmark, work_dir)
 
     base_url = (args.base_url or output_dir.as_uri()).rstrip("/")
+    torch_version = env.nightly_torch_version()
     requirements = [
         write_requirements(
             env,
@@ -699,6 +866,7 @@ def main(argv=None) -> int:
                 "dnn-benchmarking": benchmark,
             },
             commit,
+            torch_version,
             base_url,
             output_dir,
         )

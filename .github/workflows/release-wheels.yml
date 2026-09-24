@@ -68,8 +68,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends patchelf
 
       # The base URL is baked into the generated requirements files, so it has
-      # to name the download URL of the tag this run is about to create.
-      - name: Build wheels
+      # to name the download URL of the tag this run is about to create. After
+      # packaging, the script checks every architecture's payload against the
+      # pinned ROCm SDK: each library and plugin resolves through its packaged
+      # RPATH, the bindings import against the wheel's backend, and each wheel
+      # carries only its own ASM kernels. No GPU here, so a real benchmark on
+      # each architecture stays a manual step before publishing.
+      - name: Build and check wheels
         env:
           PIP_NO_CACHE_DIR: "1"
           ARCHS: ${{ inputs.archs }}
@@ -82,34 +87,6 @@ jobs:
           done
           python tools/build_release_wheels.py $arch_args \
             --base-url "$ASSETS_URL/$TAG"
-
-      # Wheels are only as good as the interpreter that can load them. This
-      # runner has no GPU, so prove the packaging instead: the payload imports,
-      # reports the architecture it was built for, and the plugin directory it
-      # exposes exists. A real benchmark stays a manual on-hardware step.
-      - name: Smoke test the packaged wheels
-        env:
-          ARCHS: ${{ inputs.archs }}
-        run: |
-          first_arch="${ARCHS%% *}"
-          python -m venv .smoke
-          .smoke/bin/python -m pip install --quiet --upgrade pip
-          .smoke/bin/python -m pip install --quiet \
-            dist/hipdnn_runtime_"$first_arch"-*.whl \
-            dist/hipdnn_frontend-*.whl \
-            dist/dnn_benchmarking-*.whl
-          .smoke/bin/python - <<'PY'
-          import hipdnn_runtime
-          from dnn_benchmarking.common.rocm_runtime import wheel_hipdnn_plugin_path
-
-          print("packaged arch:", hipdnn_runtime.__gpu_arch__)
-          plugins = wheel_hipdnn_plugin_path()
-          assert plugins is not None, "runtime wheel exposes no plugin directory"
-          engines = sorted(p.name for p in plugins.glob("*.so"))
-          print("engine plugins:", engines)
-          assert engines, f"no engine plugins packaged under {plugins}"
-          PY
-          .smoke/bin/dnn-benchmark --help > /dev/null
 
       - name: Publish release
         env:
@@ -145,7 +122,7 @@ jobs:
             echo
             echo '## Verification'
             echo
-            echo 'Built and packaging-smoked in CI on a runner with no GPU. Benchmark runs on real hardware are a separate manual step.'
+            echo 'Built in CI on a runner with no GPU. Every architecture passed a load check against the pinned ROCm SDK. Benchmark runs on real hardware are a separate manual step.'
           } > release-notes.md
 
           gh release create "$TAG" dist/*.whl dist/requirements-*.txt \

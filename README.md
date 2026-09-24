@@ -139,15 +139,20 @@ wheels bundle an older hipDNN that lacks entry points the bindings need, so the
 runtime wheel ships its own. The tool loads that copy first.
 
 The `release-wheels` workflow builds and publishes a release. Start it manually
-from the Actions tab: CI cross-compiles the wheels and cannot run them on the
-target GPUs. To publish by hand:
+from the Actions tab. The build loads every architecture's payload against the
+pinned ROCm SDK; CI has no GPU, so it runs no benchmark. To publish by hand from
+a pushed commit:
 
 ```bash
 TAG=v0.1.0
 python3 tools/build_release_wheels.py \
     --base-url https://github.com/ROCm/dnn-benchmarking/releases/download/$TAG
-gh release create $TAG dist/*.whl dist/requirements-*.txt
+gh release create $TAG dist/*.whl dist/requirements-*.txt \
+    --target "$(git rev-parse HEAD)"
 ```
+
+Without `--target`, `gh` tags the newest commit on the default branch, which
+can differ from the commit that built the wheels.
 
 Do not publish to `rocm.nightlies.amd.com`. That index belongs to TheRock.
 

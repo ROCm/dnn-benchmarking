@@ -1,6 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -55,7 +56,7 @@ def install_fake_runtime_wheel(
 
     loaded: list[str] = []
     monkeypatch.setattr(
-        rocm_runtime.ctypes, "CDLL", lambda path, mode=0: loaded.append(path)
+        rocm_runtime.ctypes, "CDLL", lambda path, mode=0: loaded.append(path) or path
     )
     return loaded
 
@@ -64,6 +65,9 @@ def install_fake_runtime_wheel(
 def reset_rocm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rocm_runtime, "_INITIALIZED_PIP_ROCM", False)
     monkeypatch.delenv("ROCM_PATH", raising=False)
+    # Registers a restore, so a value initialize_pip_rocm_runtime() sets does
+    # not leak into later tests.
+    monkeypatch.delenv("HIPDNN_AITER_ASM_DIR", raising=False)
     # Keep the tests independent of whether a real runtime wheel is installed
     # in the environment running them.
     monkeypatch.setitem(sys.modules, "hipdnn_runtime", None)
@@ -272,3 +276,55 @@ def test_sdk_hipdnn_still_preloads_without_a_runtime_wheel(
 
     assert rocm_runtime.initialize_pip_rocm_runtime() is True
     assert fake_sdk.initialize_calls[0]["preload_shortnames"] == ["hipdnn"]
+
+
+def test_runtime_wheel_points_asm_sdpa_kernels_at_the_wheel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The hip-kernel provider bakes the builder's install prefix in as its ASM
+    kernel directory; without the override SDPA looks on the build machine."""
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+    wheel_root = tmp_path / "hipdnn_runtime"
+    install_fake_runtime_wheel(monkeypatch, wheel_root)
+
+    rocm_runtime.initialize_pip_rocm_runtime()
+
+    assert os.environ["HIPDNN_AITER_ASM_DIR"] == str(
+        wheel_root
+        / "lib"
+        / "hipdnn_plugins"
+        / "engines"
+        / "hip_kernel_provider"
+        / "asm_kernels"
+    )
+
+
+def test_explicit_asm_kernel_dir_beats_the_runtime_wheel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+    install_fake_runtime_wheel(monkeypatch, tmp_path / "hipdnn_runtime")
+    monkeypatch.setenv("HIPDNN_AITER_ASM_DIR", "/custom/asm")
+
+    rocm_runtime.initialize_pip_rocm_runtime()
+
+    assert os.environ["HIPDNN_AITER_ASM_DIR"] == "/custom/asm"
+
+
+def test_runtime_wheel_backend_load_failure_is_a_runtime_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both CLI entry points report RuntimeError; a raw OSError would escape."""
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+    wheel_root = tmp_path / "hipdnn_runtime"
+    install_fake_runtime_wheel(monkeypatch, wheel_root)
+
+    def fail_cdll(path, mode=0):
+        raise OSError("libamdhip64.so.7: cannot open shared object file")
+
+    monkeypatch.setattr(rocm_runtime.ctypes, "CDLL", fail_cdll)
+
+    with pytest.raises(RuntimeError, match="libhipdnn_backend.so.*libamdhip64") as e:
+        rocm_runtime.initialize_pip_rocm_runtime()
+    assert isinstance(e.value.__cause__, OSError)
+    assert "HIPDNN_AITER_ASM_DIR" not in os.environ
