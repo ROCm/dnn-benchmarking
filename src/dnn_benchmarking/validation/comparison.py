@@ -92,9 +92,10 @@ class ArrayComparator:
         actual = np.asarray(actual)
         # float32 minimum: fp16 differences cannot overflow, and the host and
         # device paths (compare_tensors) run the same float operations.
-        # asarray copies only when the dtype changes.
+        # Only expected is converted (asarray copies only when the dtype
+        # changes), because that buffer becomes |e|. actual is cast element by
+        # element inside the subtraction.
         dtype = np.dtype(_compare_dtype_name(actual.dtype, expected_in.dtype))
-        actual = np.asarray(actual, dtype=dtype)
         expected = np.asarray(expected_in, dtype=dtype)
 
         if not np.isfinite(actual).all():
@@ -126,7 +127,7 @@ class ArrayComparator:
         # temporary is updated in place after its last read. Overflow to inf
         # in float32 is a real mismatch, so its warning is not useful.
         with np.errstate(over="ignore"):
-            abs_diff = np.subtract(actual, expected)
+            abs_diff = np.subtract(actual, expected, dtype=dtype)
             np.abs(abs_diff, out=abs_diff)
             max_abs_diff = float(abs_diff.max())
             # Take |e| in place only on a converted copy, never on the caller's.
@@ -198,8 +199,9 @@ class ArrayComparator:
 
         dtype = getattr(torch, _compare_dtype_name(a.dtype, e.dtype))
         e_conv = e.to(dtype)  # Same tensor, not a copy, when e is already dtype.
-        # a.to(dtype) is a temporary that is freed once the difference exists.
-        abs_diff = (a.to(dtype) - e_conv).abs_()
+        # Mixed-dtype subtraction casts a element by element inside the
+        # kernel; the result has dtype because dtype is at least as wide as a.
+        abs_diff = torch.sub(a, e_conv).abs_()
         max_abs_diff = float(abs_diff.max())
         # Take |e| in place only on a converted copy, never on the caller's e.
         abs_expected = e_conv.abs_() if e_conv is not e else e_conv.abs()
