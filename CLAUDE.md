@@ -37,7 +37,7 @@ Required for any engine gated behind a non-default option: with the option OFF t
 compiles into no plugin at all, yet the plugin `.so` still installs, so `--plugin-path`
 looks satisfied and every graph reports `no engines applicable`. That particular option
 also requires rocm-kpack (CMake package + `rocm_kpack` Python package + zstandard/msgpack),
-which the torch-wheel ROCm SDK does not provide — see the README for the working invocation.
+which the torch-wheel ROCm SDK does not provide — see docs/source-build.md for the working invocation.
 
 ### Kernel selection
 
