@@ -214,3 +214,27 @@ class TestCompareTensors:
 
         assert result.passed is False
         assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_chunked_strided_parity(
+        self, monkeypatch: pytest.MonkeyPatch, fails: bool
+    ) -> None:
+        """Chunks that split a strided tensor give the whole-array result."""
+        torch = pytest.importorskip("torch")
+        from dnn_benchmarking.validation import comparison
+
+        monkeypatch.setattr(comparison, "_TENSOR_CHUNK", 5)
+        rng = np.random.default_rng(0)
+        expected = rng.standard_normal((4, 6)).astype(np.float32)
+        actual = expected + np.float32(1e-6)
+        if fails:
+            actual[3, 4] += 1.0  # Mismatch in the last chunk only.
+        comparator = ArrayComparator(rtol=1e-4, atol=1e-4)
+
+        host = comparator.compare(actual[:, ::2], expected[:, ::2])
+        device = comparator.compare_tensors(
+            torch.from_numpy(actual)[:, ::2], torch.from_numpy(expected)[:, ::2]
+        )
+
+        assert host.passed is not fails
+        assert host == device

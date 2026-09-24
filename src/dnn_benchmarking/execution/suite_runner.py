@@ -18,7 +18,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import (
     BenchmarkConfig,
@@ -113,13 +112,22 @@ def _tolerance_for_output(
     return _default_tolerance_for_output(tensor_info, output_node_type)
 
 
-def _hipdnn_buffer_device() -> Optional[str]:
+def _hipdnn_buffer_device(
+    reference_outputs: Optional[Dict[int, ReferenceOutput]],
+) -> Optional[str]:
     """Torch device for hipDNN I/O buffers, or None for hipdnn.DeviceBuffer.
 
-    ``"cuda"`` is torch's current device; hipDNN requires it to match the
-    current HIP device used by the handle.
+    Torch storage is used only when a device reference exists, so the
+    outputs can be compared on the GPU. Timing-only runs, and runs whose
+    reference is host-only, keep the DeviceBuffer baseline. ``"cuda"`` is
+    torch's current device; hipDNN requires it to match the current HIP
+    device used by the handle.
     """
-    return "cuda" if torch_support.gpu_usable() else None
+    if reference_outputs and any(
+        ref.device_data is not None for ref in reference_outputs.values()
+    ):
+        return "cuda"
+    return None
 
 
 def _resolve_engine_name(engine_id: int) -> str:
@@ -409,7 +417,15 @@ def _compute_reference_outputs_once(
 
 def _pytorch_reference_outputs_from_buffer(
     buffer_manager: Any,
+    keep_device: bool = True,
 ) -> Dict[int, ReferenceOutput]:
+    """Collect reference outputs from a PyTorch buffer manager.
+
+    ``data`` is always a host copy (one per output per graph); the host
+    fallback comparison needs it. With ``keep_device``, a device clone is
+    also kept so each engine can compare on the GPU without a host copy of
+    its own output.
+    """
     outputs: Dict[int, ReferenceOutput] = {}
     tensors = buffer_manager.get_tensors()
     for tensor_info in buffer_manager.get_output_tensors():
@@ -422,7 +438,7 @@ def _pytorch_reference_outputs_from_buffer(
                 # Clone: the buffer manager frees its tensors on exit.
                 device_data=(
                     tensor.detach().clone()
-                    if tensor is not None and tensor.is_cuda
+                    if keep_device and tensor is not None and tensor.is_cuda
                     else None
                 ),
             )
@@ -554,7 +570,12 @@ def _run_timed_pytorch_row(
                 if role == "reference":
                     buffer_manager.zero_outputs()
                     executor.execute_once(tensors)
-                    outputs = _pytorch_reference_outputs_from_buffer(buffer_manager)
+                    # A profiling child allocates its own VRAM, so profiled
+                    # runs keep host-only references (and DeviceBuffer I/O).
+                    outputs = _pytorch_reference_outputs_from_buffer(
+                        buffer_manager,
+                        keep_device=not config.metrics.opt_in_pass_requested,
+                    )
 
             if role == "reference":
                 result.correctness = _reference_row_correctness(config)
@@ -1245,7 +1266,8 @@ def run_single_provider_engine(
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
 
-        with BufferManager(tensor_infos, device=_hipdnn_buffer_device()) as bm:
+        buffer_device = _hipdnn_buffer_device(reference_outputs)
+        with BufferManager(tensor_infos, device=buffer_device) as bm:
             bm.allocate_all()
             bm.load_input_data(input_data)
             bm.zero_outputs()
@@ -1336,14 +1358,20 @@ def run_single_provider_engine(
                     reference_outputs=reference_outputs,
                 )
 
-        # BufferManager context has exited — I/O buffers are freed.
-        # Drop the executor reference too so its workspace allocation
-        # is released before the profiling subprocess fires. Without
-        # this, the inner profiling process allocates its own VRAM on
-        # top of the parent's still-pinned workspace, which roughly
-        # doubles peak VRAM and can OOM on large graphs that fit fine
-        # on the headline run.
+        # BufferManager context has exited. Drop the variant pack too: with
+        # torch storage it holds the I/O tensors, so they stay allocated
+        # until the last reference is gone. Drop the executor so its
+        # workspace allocation is released as well. Then return torch's
+        # cached blocks to the driver. Without this, the inner profiling
+        # process allocates its own VRAM on top of the parent's buffers,
+        # which roughly doubles peak VRAM and can OOM on large graphs that
+        # fit fine on the headline run.
+        del variant_pack
         del executor
+        if buffer_device is not None:
+            import torch
+
+            torch.cuda.empty_cache()
 
         # Opt-in profiling pass — runs *after* the timed pass and
         # always-on probes (so profiler overhead can't pollute the

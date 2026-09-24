@@ -23,6 +23,7 @@ from dnn_benchmarking.execution.suite_runner import (
     _run_timed_pytorch_row,
     _TimedPytorchRow,
     _compute_reference_outputs_once,
+    _hipdnn_buffer_device,
     set_plugin_path,
 )
 from dnn_benchmarking.config.benchmark_config import (
@@ -1379,6 +1380,19 @@ class TestCheckCorrectnessOutputCount:
         assert result.tolerance_match is True
         assert result.max_abs_diff == 0.0
         bm.get_output_data.assert_not_called()
+
+
+class TestHipdnnBufferDevice:
+    """Torch I/O storage is chosen only when a GPU comparison can run."""
+
+    def test_device_reference_selects_torch_storage(self) -> None:
+        host = ReferenceOutput(data=np.zeros(1), tensor_uid=1)
+        device = ReferenceOutput(data=np.zeros(1), tensor_uid=2, device_data=object())
+
+        # Timing-only (no reference) and host-only references keep DeviceBuffer.
+        assert _hipdnn_buffer_device(None) is None
+        assert _hipdnn_buffer_device({1: host}) is None
+        assert _hipdnn_buffer_device({1: host, 2: device}) == "cuda"
 
 
 class TestResolveEngineName:

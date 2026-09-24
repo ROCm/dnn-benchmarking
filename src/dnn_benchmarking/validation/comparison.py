@@ -14,6 +14,9 @@ import numpy as np
 if TYPE_CHECKING:
     import torch
 
+# Elements per float64 chunk in compare_tensors: about 32 MiB per temporary.
+_TENSOR_CHUNK = 1 << 22
+
 
 @dataclass
 class ComparisonResult:
@@ -132,14 +135,17 @@ class ArrayComparator:
     ) -> ComparisonResult:
         """Compare two torch tensors on their device, with ``compare`` semantics.
 
-        ``expected`` moves to the device of ``actual``. Both are compared in
+        ``expected`` moves to the device of ``actual``. Values are compared in
         float64, as in ``compare``, so verdicts and messages are identical.
+        The float64 work runs in chunks of ``_TENSOR_CHUNK`` elements, so the
+        extra device memory is bounded instead of several full-size copies.
         """
         import torch
 
-        a = actual.detach().to(torch.float64)
-        e = expected.detach().to(device=a.device, dtype=torch.float64)
+        a = actual.detach()
+        e = expected.detach().to(a.device)
 
+        # isfinite is exact on the native dtype: float64 conversion keeps it.
         if not bool(torch.isfinite(a).all()):
             return ComparisonResult(
                 passed=False,
@@ -165,12 +171,22 @@ class ArrayComparator:
                 ),
             )
 
-        abs_diff = (a - e).abs()
-        max_abs_diff = float(abs_diff.max()) if abs_diff.numel() else 0.0
-        max_rel_diff = (
-            float((abs_diff / (e.abs() + 1e-10)).max()) if abs_diff.numel() else 0.0
-        )
-        passed = bool(torch.allclose(a, e, rtol=self._rtol, atol=self._atol))
+        # A view for contiguous tensors; a native-dtype copy for strided ones.
+        a = a.reshape(-1)
+        e = e.reshape(-1)
+        passed = True
+        max_abs_diff = 0.0
+        max_rel_diff = 0.0
+        for start in range(0, a.numel(), _TENSOR_CHUNK):
+            stop = start + _TENSOR_CHUNK
+            a_chunk = a[start:stop].to(torch.float64)
+            e_abs = e[start:stop].to(torch.float64).abs()
+            abs_diff = (a_chunk - e[start:stop].to(torch.float64)).abs()
+            del a_chunk
+            max_abs_diff = max(max_abs_diff, float(abs_diff.max()))
+            # Same test as np.allclose / torch.allclose on finite values.
+            passed &= bool((abs_diff <= self._atol + self._rtol * e_abs).all())
+            max_rel_diff = max(max_rel_diff, float((abs_diff / (e_abs + 1e-10)).max()))
         return self._result(passed, max_abs_diff, max_rel_diff)
 
     def _result(
