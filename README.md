@@ -37,6 +37,66 @@ compared offline. See [Cross-Machine Comparison](#cross-machine-comparison-rocm-
 
 ## Installation
 
+### Install from Released Wheels (ROCm/AMD GPUs)
+
+The fastest path. No compiler, no CMake, no `rocm-libraries` checkout, and no
+shell activation step: hipDNN and the engine plugins arrive prebuilt for your
+GPU architecture. Released architectures are `gfx90a`, `gfx942`, `gfx950`,
+`gfx1100`, and `gfx1151`.
+
+Each release publishes a requirements file per architecture, so the whole
+install is one command. Create the venv with a Python 3.12 or newer
+interpreter; on distributions whose `python3` is older, name the version
+explicitly:
+
+```bash
+python3.12 -m venv .venv && source .venv/bin/activate
+
+pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/<tag>/requirements-gfx942.txt
+```
+
+Take the tag from the [releases page](https://github.com/ROCm/dnn-benchmarking/releases).
+`releases/latest/download/...` resolves only once a non-prerelease exists.
+
+Substitute the architecture that matches the local GPU; `rocm_agent_enumerator`
+or `rocminfo` reports it. The installed wheel records what it was built for:
+
+```bash
+python -c "import hipdnn_runtime; print(hipdnn_runtime.__gpu_arch__)"
+```
+
+The requirements file carries the index wiring the install needs: torch resolves
+against the ROCm nightly index while `numpy`/`psutil` resolve against PyPI, and
+pip cannot pin one requirement to one index from the command line. It pins the
+ROCm SDK version, which transitively pins torch to the same nightly these wheels
+were compiled against. It names the three wheels built here by release URL and
+sha256, so no index can substitute a different package under the same name.
+
+The `hipdnn_runtime` wheel replaces the hipDNN copy that the ROCm SDK wheels
+bundle. That copy is built from whatever `rocm-libraries` commit the nightly
+used, which usually lags the `rocm-libraries` submodule this repository pins,
+and the bindings built from the pin need backend entry points the older copy
+lacks. Both copies share a SONAME, so the tool loads the runtime wheel's backend
+first and never preloads the SDK's. The installed wheel records its source:
+
+```bash
+python -c "import hipdnn_runtime; print(hipdnn_runtime.__rocm_libraries_commit__)"
+```
+
+Any Python the ROCm nightly index builds torch for works, from 3.12 up. The
+`hipdnn_frontend` and `hipdnn_runtime` wheels are tagged `cp312-abi3`, so one
+build of each covers every supported interpreter.
+
+The plugins resolve from the installed `hipdnn_runtime` package, so
+`ROCM_PATH` is not needed. Setting it still wins, and still points the tool at
+an external ROCm/hipDNN install.
+
+Build the wheels with `tools/build_release_wheels.py`; see
+[Building Release Wheels](#building-release-wheels).
+
+Choose the source build below instead when you are changing hipDNN or the
+providers, or when you need an architecture with no published wheel.
+
 ### Quick Setup (ROCm/AMD GPUs)
 
 Run the provided setup script from the `dnn-benchmarking` directory:
@@ -181,6 +241,74 @@ fields (`rocm_version`, amdsmi GPU snapshot) are `None` in the JSON, while
 `gpu_arch` is the sentinel `"unknown"` (no ROCm gfx target is detectable); the
 timing statistics and graph structure are identical to a ROCm run.
 
+
+### Building Release Wheels
+
+`tools/build_release_wheels.py` produces everything the pip install path needs.
+Run it with the system interpreter; it owns a build venv holding the ROCm SDK
+(`rocm[libraries,devel]`) and pinned CMake:
+
+```bash
+python3 tools/build_release_wheels.py                 # every released arch
+python3 tools/build_release_wheels.py --arch gfx942   # just one
+```
+
+It builds hipDNN and the providers from the `rocm-libraries` commit this
+repository pins as a submodule. Without a checkout it fetches only that commit
+as a sparse clone; with one, it checks the pinned commit out first.
+
+It writes three kinds of wheel into `dist/`, plus one requirements file per
+architecture:
+
+| Wheel | Varies by | Contents |
+| --- | --- | --- |
+| `hipdnn_runtime_<arch>` | GPU architecture | `libhipdnn_backend.so` and the engine plugins compiled for that target |
+| `hipdnn_frontend` | nothing | the nanobind bindings; host code only, so one `cp312-abi3` wheel covers every architecture and every Python 3.12+ |
+| `dnn_benchmarking` | nothing | the pure-Python benchmark package |
+
+Compiling for a target needs only the devel SDK's clang plus `GPU_TARGETS`, not
+that target's device wheel, so one build venv serves every architecture and any
+supported host can build any of them. `--skip-native` repacks the wheels from
+the install trees already under `--work-dir` without recompiling.
+
+Packaging rewrites the RPATH of every shipped library to an `$ORIGIN`-relative
+path reaching the sibling `_rocm_sdk_*` wheels, which is what removes the
+`LD_LIBRARY_PATH` and activation-script requirement. It also drops the
+assembly SDPA kernels built for other architectures, which the superbuild
+installs regardless of `GPU_TARGETS`.
+
+The `release-wheels` workflow does this on CI. Dispatch it manually from the
+Actions tab against the branch you want released, giving it the tag to create
+and, optionally, a narrower architecture list. It builds on a GPU-less runner,
+smoke-tests that the packaged payload imports and exposes its engine plugins,
+and publishes the release. It stays manual on purpose: the wheels are
+cross-compiled, so nothing in CI can confirm they run on the hardware they
+target.
+
+To publish by hand instead, build with `--base-url` naming the URL the assets
+will live at, so the generated requirements files point at the right place, then
+attach everything to a GitHub Release on this repository:
+
+```bash
+TAG=v0.1.0
+python3 tools/build_release_wheels.py \
+    --base-url https://github.com/ROCm/dnn-benchmarking/releases/download/$TAG
+gh release create $TAG dist/*.whl dist/requirements-*.txt
+```
+
+A PEP 503 index you own works equally well. Do **not** push to
+`rocm.nightlies.amd.com`: that bucket belongs to TheRock, and write access is
+gated to IAM roles assumed by TheRock's own workflows.
+
+#### GPU SMI snapshot
+
+The optional amdsmi GPU snapshot needs Python bindings that match the installed
+ROCm SDK exactly; the `amdsmi` distribution on PyPI does not, and segfaults
+against a nightly SDK. The ROCm SDK ships matching sources under
+`_rocm_sdk_core/share/amd_smi`, but recent nightlies omit the `setup.py` that
+makes them installable, so neither this path nor `setup_env.py` can install
+them today. Without it the benchmark logs `module not installed; GPU snapshot
+disabled` once and leaves the corresponding JSON fields `None`.
 
 ## Usage
 
