@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from dnn_benchmarking.common.rocm_runtime import (
+    initialize_pip_rocm_runtime,
+    wheel_hipdnn_plugin_path,
+)
 from dnn_benchmarking.execution.timing import GpuTimerInterface
 
 
@@ -31,6 +35,16 @@ def pytest_addoption(parser):
             "Each directory must exist and contain at least one .so file."
         ),
     )
+
+
+def pytest_configure(config):
+    # Same order as the CLI: preload the pip ROCm runtime before any test module
+    # imports torch. ROCm torch preloads the SDK's own libhipdnn_backend.so, and
+    # once that copy holds the SONAME a runtime wheel's bindings fail to import.
+    try:
+        initialize_pip_rocm_runtime()
+    except RuntimeError as e:
+        config.issue_config_time_warning(pytest.PytestConfigWarning(str(e)), 2)
 
 
 def pytest_collection_modifyitems(config, items):
@@ -341,6 +355,8 @@ def _find_plugin_paths(pytestconfig) -> Optional[List[str]]:
 
     project_root = Path(__file__).parent.parent
     candidates = [
+        # A released hipdnn-runtime wheel: what the tool itself loads.
+        wheel_hipdnn_plugin_path(),
         # Worktree/superbuild: relative to dnn-benchmarking tool
         project_root.parent.parent.parent.parent
         / "dnn-providers"
@@ -354,7 +370,7 @@ def _find_plugin_paths(pytestconfig) -> Optional[List[str]]:
         Path("/opt/rocm/lib/hipdnn_plugins/engines"),
     ]
     for path in candidates:
-        if _valid_plugin_dir(path):
+        if path is not None and _valid_plugin_dir(path):
             return [str(path)]
     return None
 

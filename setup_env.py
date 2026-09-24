@@ -454,7 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
             "the plugin .so is still present, so --plugin-path looks satisfied, "
             "and every graph reports 'no engines applicable'. That option also "
             "needs rocm-kpack, which the torch wheel's bundled ROCm SDK does "
-            "not ship a CMake config for -- see the README."
+            "not ship a CMake config for -- see docs/source-build.md."
         ),
     )
     parser.add_argument(

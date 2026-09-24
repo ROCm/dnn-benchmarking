@@ -29,6 +29,10 @@ env/
 ENV/
 .workspace/
 
+# Scratch trees for tools/build_release_wheels.py: build venv, CMake build
+# directories, and the per-architecture install prefixes it packs from.
+.relbuild/
+
 # IDE
 .idea/
 .vscode/
