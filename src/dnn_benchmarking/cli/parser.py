@@ -109,6 +109,7 @@ _PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
 _METRICS_TIER_CHOICES = frozenset({"basic", "off"})
 _EMIT_TRACE_CHOICES = frozenset({"pftrace"})
 _PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
+_ORACLE_MODE_CHOICES = frozenset({"off", "plan", "exhaustive"})
 
 CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
@@ -151,6 +152,39 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_key="iters",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
+    ),
+    CliOption(
+        flags=("--autotune",),
+        dest="autotune",
+        action="store_true",
+        default=False,
+        help=(
+            "Sample every knob-filtered candidate kernel on each plan's first "
+            "execute and cache the winner, via HIPDNN_FORCE_BENCHMARKING=1. "
+            "Without it an engine serves its cold heuristic's rank-0 pick, so a "
+            "table measures the heuristic rather than what the shipped kernel "
+            "set can deliver -- and an engine that gains good variants can "
+            "measure SLOWER when the tie-break is a coin flip. Required for any "
+            "best-vs-best comparison. Pair with a per-run --cache-dir."
+        ),
+        config_key="autotune",
+        config_kind=ConfigKind.SCALAR,
+        config_type=bool,
+    ),
+    CliOption(
+        flags=("--cache-dir",),
+        dest="cache_dir",
+        parser_type=Path,
+        metavar="PATH",
+        help=(
+            "Set HIPDNN_CACHE_DIR for the run. The ingestor's winner cache is on "
+            "disk and outlives the job, and reads are NOT gated on benchmarking "
+            "while writes are -- so an untuned phase can silently replay a "
+            "previous tuned ranking. Give each phase its own empty root."
+        ),
+        config_key="cache_dir",
+        config_kind=ConfigKind.SCALAR,
+        config_type=str,
     ),
     CliOption(
         flags=("--engine", "-e"),
@@ -205,6 +239,26 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_key="verbose",
         config_kind=ConfigKind.SCALAR,
         config_type=bool,
+    ),
+    CliOption(
+        flags=("--oracle-mode",),
+        dest="oracle_mode",
+        parser_type=str,
+        choices=_ORACLE_MODE_CHOICES,
+        default="off",
+        metavar="MODE",
+        group="Output",
+        help=(
+            "Oracle comparison depth (default: off). 'plan' also times the "
+            "plan hipDNN auto-tuning picks for each engine and reports the "
+            "delta against the heuristic plan. 'exhaustive' additionally "
+            "forces provider kernel benchmarking so providers sample kernel "
+            "variants; both run one tuning sweep per engine and are "
+            "significantly slower, 'exhaustive' much more so."
+        ),
+        config_key="oracle_mode",
+        config_kind=ConfigKind.CHOICE,
+        config_type=str,
     ),
     CliOption(
         flags=("--rtol",),

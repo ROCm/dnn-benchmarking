@@ -19,6 +19,9 @@ pip install -e ".[test]"
 
 # setup_env.py builds the hipDNN frontend extension and installs its wheel
 
+# Append extra CMake defines to the hipDNN/provider configure (repeatable)
+python3 setup_env.py --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=ON
+
 # CUDA host (NVIDIA): PyTorch backend only, skips all ROCm/hipDNN setup
 python3 setup_env.py --torch-mode cuda --workspace .workspace
 ```
@@ -26,6 +29,24 @@ python3 setup_env.py --torch-mode cuda --workspace .workspace
 Pass `/opt/rocm/lib/hipdnn_plugins/engines/` to `--plugin-path` when running benchmarks.
 
 `--torch-mode cuda` installs a CUDA PyTorch wheel (from PyPI, or `--torch-index-url`) and skips hipDNN/provider builds, hipDNN bindings, amdsmi, and ROCm env wiring. Only `--backend pytorch` works on CUDA hosts.
+
+`--cmake-arg NAME=VALUE` appends a define to the hipDNN/provider configure, after the
+defaults, so it can override one. `-DNAME=VALUE` is also accepted but needs the `=` form
+(`--cmake-arg=-DFOO=ON`), since argparse reads a space-separated `-DFOO=ON` as an option.
+Required for any engine gated behind a non-default option: with the option OFF the engine
+compiles into no plugin at all, yet the plugin `.so` still installs, so `--plugin-path`
+looks satisfied and every graph reports `no engines applicable`. That particular option
+also requires rocm-kpack (CMake package + `rocm_kpack` Python package + zstandard/msgpack),
+which the torch-wheel ROCm SDK does not provide — see the README for the working invocation.
+
+### Kernel selection
+
+`--autotune` sets `HIPDNN_FORCE_BENCHMARKING=1`, sampling every knob-filtered candidate on
+each plan's first execute and caching the winner; the default cold-heuristic path serves
+rank-0 instead. The two measure different things — the kernel set vs. the heuristic — so
+the active path is always printed. `--cache-dir` sets `HIPDNN_CACHE_DIR`; the winner cache
+is keyed by graph and device, not by checkout or session, so give each phase its own empty
+root or a concurrent/previous run's rankings leak into this one's results.
 
 ### ROCm PyTorch Setup
 

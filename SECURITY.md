@@ -1,11 +1,15 @@
 # Security Policy
 
-## Reporting a vulnerability
+## Reporting a Vulnerability
 
-Do not open a public GitHub issue for a suspected security vulnerability.
+**Do not open a public GitHub issue.** Report privately via one of:
 
-Report the issue privately through the [AMD Product Security portal](https://www.amd.com/en/resources/product-security.html). Include a description of the issue and its impact, steps to reproduce it, and affected versions or commits.
+- **AMD Product Security portal:** https://www.amd.com/en/resources/product-security.html
+
+Please include: description and impact, steps to reproduce, and affected versions or commits.
+
+We aim to acknowledge reports within 1 business day.
 
 ## Scope
 
-This policy covers code and configuration in this repository. Report vulnerabilities in third-party dependencies to their upstream maintainers as well. For AMD product issues unrelated to this repository, use the AMD Product Security portal.
+This policy covers code and configuration in this repository. For vulnerabilities in third-party dependencies, report upstream. For AMD product issues unrelated to this repo, use the [AMD Product Security portal](https://www.amd.com/en/resources/product-security.html).

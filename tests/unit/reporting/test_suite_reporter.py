@@ -12,8 +12,10 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
+    build_oracle_delta,
 )
 
 
@@ -650,3 +652,322 @@ class TestMachineSummaryPlatformLabel:
         assert "ROCm:    6.2.0" in out
         assert "CUDA:" not in out
         assert "cuDNN:" not in out
+
+
+def _make_oracle(**overrides) -> OracleResult:
+    kwargs = dict(
+        plan_name="tuned_plan_7",
+        compiled_plan_index=2,
+        rank=0,
+        sweep_min_time_ms=0.210,
+        compiled_plans_benchmarked=5,
+        compiled_plans_total=5,
+        compiled_plans_failed=0,
+        knob_settings=[],
+        gpu_kernel_stats=BenchmarkStats(
+            mean_ms=0.250,
+            std_ms=0.01,
+            min_ms=0.24,
+            max_ms=0.26,
+            p95_ms=0.255,
+            p99_ms=0.258,
+        ),
+        # The heuristic plan re-timed after the sweep; twice the tuned run,
+        # so the rendered speedup is 2.00x.
+        warm_baseline_gpu_kernel_stats=BenchmarkStats(
+            mean_ms=0.500,
+            std_ms=0.02,
+            min_ms=0.48,
+            max_ms=0.52,
+            p95_ms=0.510,
+            p99_ms=0.516,
+        ),
+    )
+    kwargs.update(overrides)
+    return OracleResult(**kwargs)
+
+
+class TestOracleReporting:
+    """Oracle columns and the verbose oracle block."""
+
+    def _graph_with(self, pe: ProviderEngineResult) -> GraphResult:
+        return GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
+
+    def test_table_omits_oracle_columns_without_oracle_data(self) -> None:
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(
+            self._graph_with(_make_pe_success())
+        )
+        out = output.getvalue()
+        assert "oracle_kernel_mean_ms" not in out
+        assert "oracle_speedup" not in out
+        assert "ootb_kernel_mean_ms" not in out
+        assert "kernel_mean_ms" in out
+
+    def test_table_renders_oracle_columns(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "oracle_kernel_mean_ms" in out
+        assert "oracle_speedup" in out
+        assert "0.250" in out
+        assert "2.00x" in out
+        assert "ootb_kernel_mean_ms" in out
+
+    def test_table_marks_failed_oracle_row(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle_error = "sweep exploded"
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "oracle_speedup" in out
+        assert "failed" in out
+
+    def test_verbose_renders_oracle_block(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Oracle (auto-tuned):" in out
+        # The engine is already in the row header; the block does not repeat it.
+        assert "Engine:" not in out
+        assert "Compiled plans: 5 benchmarked successfully" in out
+        assert "5 total, 0 failed" in out
+        assert "basis: gpu_kernel" in out
+        assert "Warm OOTB:     0.500 ms" in out
+        assert "Tuned vs warm OOTB:" in out
+
+    def test_verbose_reports_exhaustive_provider_selection(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(exhaustive_requested=True, exhaustive_supported=True)
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Exhaustive:    enabled for this provider" in out
+        assert "existing tuned selection may be reused" in out
+        assert "fresh search" not in out
+
+    def test_verbose_omits_the_exhaustive_line_by_default(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Exhaustive:" not in out
+
+    def test_verbose_reports_an_unsupported_exhaustive_provider(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+            exhaustive_requested=True,
+            exhaustive_supported=False,
+        )
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Exhaustive:    unsupported by this engine" in out
+        assert "tuned at plan level only" in out
+        assert "Tuning:        unavailable" in out
+
+    def test_table_marks_a_failed_baseline_invalid_too(self) -> None:
+        """A wrong baseline cannot measure a gain; the row must say so."""
+        pe = _make_pe_success()
+        pe.correctness = self._verdict(False)
+        pe.oracle = _make_oracle(correctness=self._verdict(True))
+        pe.oracle_delta = None
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "invalid" in out
+        assert "2.00x" not in out
+
+    def test_table_speedup_survives_an_unchecked_verdict(self) -> None:
+        """ "Not checked" is not "failed" and must not blank the ratio."""
+        pe = _make_pe_success()
+        pe.correctness = CorrectnessResult(
+            execution_success=True,
+            tolerance_match=None,
+            rtol=1e-5,
+            atol=1e-5,
+            error_message="No reference provider requested",
+        )
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "invalid" not in out
+
+    @staticmethod
+    def _verdict(passed: bool) -> CorrectnessResult:
+        return CorrectnessResult(
+            execution_success=True,
+            tolerance_match=passed,
+            rtol=1e-5,
+            atol=1e-5,
+            error_message=None if passed else "output mismatch",
+        )
+
+    def test_table_shows_the_baseline_the_speedup_is_computed_from(self) -> None:
+        """The ratio must be checkable against numbers on the same line.
+
+        OOTB kernel_mean_ms is not the comparand; without the warm baseline
+        column the printed 2.00x looks wrong against the visible figures.
+        """
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "warm_ootb_kernel_mean_ms" in out
+        # 0.500 baseline / 0.250 tuned = the printed 2.00x.
+        assert "0.500" in out
+        assert "0.250" in out
+        assert "2.00x" in out
+
+    def test_table_marks_a_tuned_plan_that_failed_validation(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(correctness=self._verdict(False))
+        pe.oracle_delta = None
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "invalid" in out
+        assert "2.00x" not in out
+
+    def test_table_keeps_the_speedup_when_the_tuned_plan_validates(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(correctness=self._verdict(True))
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "invalid" not in out
+
+    def test_verbose_explains_a_failed_tuned_validation(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(correctness=self._verdict(False))
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "tuned plan FAILED" in out
+        assert "output mismatch" in out
+        assert "no speedup is reported" in out
+
+    def test_table_marks_row_without_a_tuning_search(self) -> None:
+        """One compiled plan and no forced benchmarking is a remeasurement.
+
+        The ratio is real arithmetic but means nothing, so the table must not
+        print it as a speedup.
+        """
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+        )
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        assert pe.oracle_delta is not None
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "no-search" in out
+        assert "2.00x" not in out
+
+    def test_table_reports_speedup_when_plans_competed(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle()
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "no-search" not in out
+
+    def test_table_reports_speedup_when_only_provider_variants_competed(self) -> None:
+        """Provider-level search counts even though one plan was compiled."""
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+            exhaustive_requested=True,
+            exhaustive_supported=True,
+        )
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        out = output.getvalue()
+        assert "2.00x" in out
+        assert "no-search" not in out
+
+    def test_verbose_explains_a_missing_tuning_search(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            compiled_plans_benchmarked=1,
+            compiled_plans_total=1,
+        )
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Tuning:        unavailable" in out
+        assert "run-to-run noise" in out
+
+    def test_verbose_empty_knobs_do_not_claim_no_variants_explored(self) -> None:
+        """``knob_settings: []`` means no explicit plan knobs, nothing more."""
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(
+            knob_settings=[],
+            exhaustive_requested=True,
+            exhaustive_supported=True,
+        )
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "none set explicitly (engine defaults)" in out
+        assert "Exhaustive:    enabled for this provider" in out
+
+    def test_verbose_renders_knob_lines(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle = _make_oracle(knob_settings=[{"knob_id": "SPLIT_K", "value": 4}])
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "SPLIT_K=4" in out
+        assert "engine defaults" not in out
+
+    def test_verbose_renders_oracle_failure(self) -> None:
+        pe = _make_pe_success()
+        pe.oracle_error = "no autotune candidate benchmarked successfully"
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        out = output.getvalue()
+        assert "Oracle (auto-tuned): unavailable — no autotune candidate" in out
