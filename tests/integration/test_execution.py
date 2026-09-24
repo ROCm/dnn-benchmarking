@@ -811,7 +811,8 @@ class TestGpuValidationPath:
             handle=hipdnn.Handle(),
         )
 
-        engine_rows = [r for r in result.results if r.role == "engine"]
+        # The PyTorch reference row has no comparison; skip it by provider.
+        engine_rows = [r for r in result.results if r.provider != "pytorch"]
         successes = [r for r in engine_rows if r.status == "success"]
         if not successes:
             pytest.skip("No hipDNN engine supports the conv graph")
