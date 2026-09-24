@@ -1096,10 +1096,7 @@ def _run_oracle_pass(
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
-            # Graph.autotune takes raw pointers only; execute accepts DLPack.
-            candidates = executor.autotune(
-                oracle_handle, bm.create_variant_pack(as_pointers=True), engine_id
-            )
+            candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
             eligible_candidates = [
                 candidate
                 for candidate in candidates

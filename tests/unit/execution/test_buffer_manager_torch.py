@@ -51,16 +51,15 @@ class TestTorchBackend:
         assert torch.equal(y_view.float(), torch.from_numpy(bm.get_output_data(y.uid)))
         assert torch.equal(y_view.float(), torch.from_numpy(out))
 
-    def test_variant_pack_forms(self) -> None:
+    def test_variant_pack_holds_torch_storage(self) -> None:
         x = _strided(1, "float", is_output=False)
         bm = BufferManager([x], device="cpu")
         bm.allocate_all()
 
         pack = bm.create_variant_pack()
-        pointers = bm.create_variant_pack(as_pointers=True)
 
-        assert isinstance(pack[x.uid], torch.Tensor)
-        assert pointers == {x.uid: pack[x.uid].data_ptr()}
+        assert list(pack) == [x.uid]
+        assert pack[x.uid] is bm._buffers[x.uid]
 
     def test_zero_outputs_clears_torch_storage(self) -> None:
         y = _strided(2, "float", is_output=True)
@@ -83,4 +82,3 @@ class TestDeviceBufferBackend:
 
         assert bm.get_output_tensor(y.uid) is None
         assert bm.create_variant_pack() == {y.uid: 1234}
-        assert bm.create_variant_pack(as_pointers=True) == {y.uid: 1234}

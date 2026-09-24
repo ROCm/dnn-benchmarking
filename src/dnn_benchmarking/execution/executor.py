@@ -289,7 +289,7 @@ class Executor:
     def autotune(
         self,
         handle: Any,
-        variant_pack: Dict[int, int],
+        variant_pack: Dict[int, Any],
         engine_id: int,
     ) -> List[Any]:
         """Benchmark this engine's compiled plans and activate the winner.

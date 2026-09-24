@@ -357,17 +357,13 @@ class BufferManager:
             buffer = hipdnn.DeviceBuffer(tensor_info.size_bytes)
             self._buffers[tensor_info.uid] = buffer
 
-    def create_variant_pack(self, as_pointers: bool = False) -> Dict[int, Any]:
+    def create_variant_pack(self) -> Dict[int, Any]:
         """Create variant pack mapping tensor UIDs to device memory.
-
-        Args:
-            as_pointers: Return int device pointers for every backend. Use it
-                for hipDNN APIs that take only raw pointers (``autotune``).
 
         Returns:
             Dictionary mapping tensor UID to a device pointer (as int) for
             DeviceBuffer storage, or to the raw uint8 torch tensor for torch
-            storage. hipDNN reads torch tensors through DLPack.
+            storage. hipDNN reads a torch tensor's ``data_ptr()``.
 
         Raises:
             ExecutionError: If buffers not allocated.
@@ -377,8 +373,6 @@ class BufferManager:
 
         if self._device is None:
             return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
-        if as_pointers:
-            return {uid: buffer.data_ptr() for uid, buffer in self._buffers.items()}
         return dict(self._buffers)
 
     def _write_bytes(self, buffer: Any, raw_bytes: bytes) -> None:
