@@ -14,8 +14,16 @@ import numpy as np
 if TYPE_CHECKING:
     import torch
 
-# Elements per float64 chunk in compare_tensors: about 32 MiB per temporary.
-_TENSOR_CHUNK = 1 << 22
+# Comparison dtype: float32 at minimum, as hipDNN's CpuFpReferenceValidation
+# does, and float64 for dtypes float32 cannot hold exactly. Names match both
+# numpy (``dtype.name``) and torch (``str(dtype)`` without ``torch.``).
+_FLOAT64_DTYPES = frozenset({"float64", "int32", "int64", "uint32", "uint64"})
+
+
+def _compare_dtype_name(*dtypes: object) -> str:
+    """Return "float64" if any dtype needs it, else "float32"."""
+    names = {str(dtype).removeprefix("torch.") for dtype in dtypes}
+    return "float64" if names & _FLOAT64_DTYPES else "float32"
 
 
 @dataclass
@@ -80,30 +88,29 @@ class ArrayComparator:
         Returns:
             ComparisonResult with pass/fail status and difference metrics.
         """
-        # Compare in float64 so fp16 differences cannot overflow and the host
-        # and device paths (compare_tensors) reach the same verdict.
-        actual = np.asarray(actual, dtype=np.float64)
-        expected = np.asarray(expected, dtype=np.float64)
+        expected_in = np.asarray(expected)
+        actual = np.asarray(actual)
+        # float32 minimum: fp16 differences cannot overflow, and the host and
+        # device paths (compare_tensors) run the same float operations.
+        # asarray copies only when the dtype changes.
+        dtype = np.dtype(_compare_dtype_name(actual.dtype, expected_in.dtype))
+        actual = np.asarray(actual, dtype=dtype)
+        expected = np.asarray(expected_in, dtype=dtype)
 
-        # Check for NaN/Inf in actual
-        if np.any(np.isnan(actual)) or np.any(np.isinf(actual)):
+        if not np.isfinite(actual).all():
             return ComparisonResult(
                 passed=False,
                 max_abs_diff=float("inf"),
                 max_rel_diff=float("inf"),
                 message=f"{actual_label} contains NaN or Inf values",
             )
-
-        # Check for NaN/Inf in expected
-        if np.any(np.isnan(expected)) or np.any(np.isinf(expected)):
+        if not np.isfinite(expected).all():
             return ComparisonResult(
                 passed=False,
                 max_abs_diff=float("inf"),
                 max_rel_diff=float("inf"),
                 message=f"{expected_label} contains NaN or Inf values",
             )
-
-        # Ensure shapes match
         if actual.shape != expected.shape:
             return ComparisonResult(
                 passed=False,
@@ -111,18 +118,29 @@ class ArrayComparator:
                 max_rel_diff=float("inf"),
                 message=f"Shape mismatch: {actual_label}={actual.shape} vs {expected_label}={expected.shape}",
             )
+        if actual.size == 0:
+            return self._result(True, 0.0, 0.0)
 
-        # Calculate differences
-        abs_diff = np.abs(actual - expected)
-        max_abs_diff = float(np.max(abs_diff)) if abs_diff.size > 0 else 0.0
-
-        # Handle division by zero for relative difference
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rel_diff = abs_diff / (np.abs(expected) + 1e-10)
-            max_rel_diff = float(np.max(rel_diff)) if rel_diff.size > 0 else 0.0
-
-        # Perform allclose comparison
-        passed = np.allclose(actual, expected, rtol=self._rtol, atol=self._atol)
+        # Written-out allclose (|a - e| <= atol + rtol * |e|), so |a - e| and
+        # |e| are computed once and reused for the reported diffs. Each
+        # temporary is updated in place after its last read. Overflow to inf
+        # in float32 is a real mismatch, so its warning is not useful.
+        with np.errstate(over="ignore"):
+            abs_diff = np.subtract(actual, expected)
+            np.abs(abs_diff, out=abs_diff)
+            max_abs_diff = float(abs_diff.max())
+            # Take |e| in place only on a converted copy, never on the caller's.
+            if expected is expected_in:
+                abs_expected = np.abs(expected)
+            else:
+                abs_expected = np.abs(expected, out=expected)
+            threshold = abs_expected * self._rtol
+            threshold += self._atol
+            passed = bool((abs_diff <= threshold).all())
+            del threshold
+            abs_expected += 1e-10
+            abs_diff /= abs_expected
+            max_rel_diff = float(abs_diff.max())
 
         return self._result(passed, max_abs_diff, max_rel_diff)
 
@@ -135,17 +153,21 @@ class ArrayComparator:
     ) -> ComparisonResult:
         """Compare two torch tensors on their device, with ``compare`` semantics.
 
-        ``expected`` moves to the device of ``actual``. Values are compared in
-        float64, as in ``compare``, so verdicts and messages are identical.
-        The float64 work runs in chunks of ``_TENSOR_CHUNK`` elements, so the
-        extra device memory is bounded instead of several full-size copies.
+        ``expected`` moves to the device of ``actual``. Both are compared in
+        the dtype ``compare`` uses, with the same operations, so verdicts and
+        messages are identical.
+
+        ponytail: full-size temporaries. Extra VRAM is about 3.25x the output
+        in the compare dtype (for example 13 bytes per fp16 or fp32 element).
+        An out-of-memory error makes the caller fall back to the host path.
+        Chunk the work if real graphs hit that limit.
         """
         import torch
 
         a = actual.detach()
         e = expected.detach().to(a.device)
 
-        # isfinite is exact on the native dtype: float64 conversion keeps it.
+        # isfinite is exact on the native dtype, so it runs before conversion.
         if not bool(torch.isfinite(a).all()):
             return ComparisonResult(
                 passed=False,
@@ -171,22 +193,22 @@ class ArrayComparator:
                 ),
             )
 
-        # A view for contiguous tensors; a native-dtype copy for strided ones.
-        a = a.reshape(-1)
-        e = e.reshape(-1)
-        passed = True
-        max_abs_diff = 0.0
-        max_rel_diff = 0.0
-        for start in range(0, a.numel(), _TENSOR_CHUNK):
-            stop = start + _TENSOR_CHUNK
-            a_chunk = a[start:stop].to(torch.float64)
-            e_abs = e[start:stop].to(torch.float64).abs()
-            abs_diff = (a_chunk - e[start:stop].to(torch.float64)).abs()
-            del a_chunk
-            max_abs_diff = max(max_abs_diff, float(abs_diff.max()))
-            # Same test as np.allclose / torch.allclose on finite values.
-            passed &= bool((abs_diff <= self._atol + self._rtol * e_abs).all())
-            max_rel_diff = max(max_rel_diff, float((abs_diff / (e_abs + 1e-10)).max()))
+        if a.numel() == 0:
+            return self._result(True, 0.0, 0.0)
+
+        dtype = getattr(torch, _compare_dtype_name(a.dtype, e.dtype))
+        e_conv = e.to(dtype)  # Same tensor, not a copy, when e is already dtype.
+        # a.to(dtype) is a temporary that is freed once the difference exists.
+        abs_diff = (a.to(dtype) - e_conv).abs_()
+        max_abs_diff = float(abs_diff.max())
+        # Take |e| in place only on a converted copy, never on the caller's e.
+        abs_expected = e_conv.abs_() if e_conv is not e else e_conv.abs()
+        del e_conv
+        # Written-out allclose, as in compare, reusing |a - e| and |e|.
+        threshold = abs_expected.mul(self._rtol).add_(self._atol)
+        passed = bool((abs_diff <= threshold).all())
+        del threshold
+        max_rel_diff = float(abs_diff.div_(abs_expected.add_(1e-10)).max())
         return self._result(passed, max_abs_diff, max_rel_diff)
 
     def _result(

@@ -823,11 +823,17 @@ class TestGpuValidationPath:
         assert calls["device"] >= len(successes)
         assert calls["host"] == 0
 
-    def test_large_output_comparison_bounds_memory(self) -> None:
-        """A 128 MiB fp16 comparison stays far below full-size float64 copies."""
+    @pytest.mark.parametrize("dtype_name", ["float16", "float32"])
+    def test_large_output_comparison_vram_budget(self, dtype_name: str) -> None:
+        """compare_tensors on a 64M-element output stays within 13 bytes per element.
+
+        Three float32 temporaries (|a - e|, |e|, threshold) plus one bool
+        mask are needed. Any redundant full-size copy exceeds the budget.
+        """
         torch = _require_torch_kernels()
+        dtype = getattr(torch, dtype_name)
         n = 1 << 26
-        expected = torch.randn(n, device="cuda", dtype=torch.float16)
+        expected = torch.randn(n, device="cuda", dtype=dtype)
         actual = expected.clone()
         actual[-1] += 1.0
         comparator = ArrayComparator(rtol=1e-3, atol=1e-3)
@@ -840,8 +846,10 @@ class TestGpuValidationPath:
 
         assert result.passed is False
         assert result.max_abs_diff >= 0.5
-        # One full-size float64 copy alone is 512 MiB.
-        assert peak < 512 * 1024 * 1024, f"peak extra VRAM {peak / 2**20:.0f} MiB"
+        # 3 x 4-byte temporaries + 1-byte mask per element, plus 1 MiB for the
+        # scalar results of max() and all() (512-byte allocator blocks).
+        budget = 13 * n + (1 << 20)
+        assert peak <= budget, f"peak {peak / 2**20:.0f} MiB > {budget / 2**20:.0f} MiB"
 
 
 @pytest.mark.gpu
