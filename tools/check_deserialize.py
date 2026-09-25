@@ -18,16 +18,9 @@ def iter_files(patterns):
     for pat in patterns:
         pat = os.path.expanduser(pat)
         if os.path.isdir(pat):
-            matches = glob.glob(os.path.join(pat, "**", "*.json"), recursive=True)
+            yield from glob.glob(os.path.join(pat, "**", "*.json"), recursive=True)
         else:
-            matches = glob.glob(pat, recursive=True)
-        cases = [path for path in matches if path.endswith(".case.json")]
-        if cases:
-            print(
-                f"Skipping {len(cases)} data-only .case.json files in {pat}",
-                file=sys.stderr,
-            )
-        yield from (path for path in matches if not path.endswith(".case.json"))
+            yield from glob.glob(pat, recursive=True)
 
 
 def main():
