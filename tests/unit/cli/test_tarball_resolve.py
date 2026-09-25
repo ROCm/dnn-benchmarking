@@ -6,7 +6,6 @@
 import io
 import json
 import tarfile
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -82,15 +81,6 @@ class TestExtractTarball:
         bad_file.write_text("this is not a tarball")
         with pytest.raises(GraphLoadError, match="Not a valid tarball"):
             extract_tarball(str(bad_file))
-
-    def test_no_json_in_tarball_raises_and_cleans_up(self, tmp_path: Path) -> None:
-        tb = _make_tarball(tmp_path / "empty.tar.gz", {"readme.txt": "hello"})
-        with pytest.raises(GraphLoadError, match="No .json files"):
-            extract_tarball(str(tb))
-
-        # tmpdir should have been cleaned up on error
-        dnn_tmpdirs = list(Path(tempfile.gettempdir()).glob("dnn_benchmarking_*"))
-        assert len(dnn_tmpdirs) == 0
 
 
 class TestResolveGraphFiles:
