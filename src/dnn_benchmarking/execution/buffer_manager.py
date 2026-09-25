@@ -3,6 +3,7 @@
 
 """Device buffer management for graph execution."""
 
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -299,13 +300,14 @@ class BufferManager:
 
     This class handles:
     - Allocating device buffers for all tensors
-    - Creating variant packs (UID -> pointer or DLPack tensor mapping)
+    - Creating variant packs (UID -> pointer mapping)
     - Filling input buffers with random data
     - Cleanup of device memory
 
     Storage is ``hipdnn.DeviceBuffer`` by default. With a torch ``device``,
-    each buffer is a raw ``torch.uint8`` tensor that hipDNN reads through
-    DLPack, and outputs can be viewed on the device without a host copy.
+    each buffer is a raw ``torch.uint8`` tensor, and outputs can be viewed on
+    the device without a host copy. hipDNN receives each tensor's
+    ``data_ptr()``; this manager keeps the tensors alive until ``cleanup``.
     """
 
     def __init__(
@@ -357,13 +359,11 @@ class BufferManager:
             buffer = hipdnn.DeviceBuffer(tensor_info.size_bytes)
             self._buffers[tensor_info.uid] = buffer
 
-    def create_variant_pack(self) -> Dict[int, Any]:
-        """Create variant pack mapping tensor UIDs to device memory.
+    def create_variant_pack(self) -> Dict[int, int]:
+        """Create variant pack mapping tensor UIDs to device pointers.
 
         Returns:
-            Dictionary mapping tensor UID to a device pointer (as int) for
-            DeviceBuffer storage, or to the raw uint8 torch tensor for torch
-            storage. hipDNN reads a torch tensor's ``data_ptr()``.
+            Dictionary mapping tensor UID to device pointer (as int).
 
         Raises:
             ExecutionError: If buffers not allocated.
@@ -373,7 +373,7 @@ class BufferManager:
 
         if self._device is None:
             return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
-        return dict(self._buffers)
+        return {uid: buffer.data_ptr() for uid, buffer in self._buffers.items()}
 
     def _write_bytes(self, buffer: Any, raw_bytes: bytes) -> None:
         """Copy graph-layout bytes from the host into one buffer."""
@@ -382,7 +382,12 @@ class BufferManager:
             return
         import torch
 
-        buffer.copy_(torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint8))
+        with warnings.catch_warnings():
+            # copy_ only reads the source, so a read-only view is safe and
+            # avoids a second host copy of the input.
+            warnings.simplefilter("ignore", UserWarning)
+            source = torch.frombuffer(raw_bytes, dtype=torch.uint8)
+        buffer.copy_(source)
 
     def _copy_logical_data_to_buffer(self, uid: int, data: np.ndarray) -> None:
         """Store logical host data and copy its graph-layout bytes to device."""
@@ -565,6 +570,16 @@ class BufferManager:
         """Free all device buffers."""
         self._buffers.clear()
         self._host_data.clear()
+        if self._device is not None:
+            import torch
+
+            if torch.device(self._device).type != "cuda":
+                return
+
+            # Return the freed blocks to the driver. hipDNN workspaces and
+            # the next engine allocate with hipMalloc, which cannot reuse
+            # torch's cached blocks.
+            torch.cuda.empty_cache()
 
     def __enter__(self) -> "BufferManager":
         """Context manager entry."""

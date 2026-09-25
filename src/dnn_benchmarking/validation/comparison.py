@@ -158,10 +158,10 @@ class ArrayComparator:
         the dtype ``compare`` uses, with the same operations, so verdicts and
         messages are identical.
 
-        ponytail: full-size temporaries. Extra VRAM is about 3.25x the output
-        in the compare dtype (for example 13 bytes per fp16 or fp32 element).
-        An out-of-memory error makes the caller fall back to the host path.
-        Chunk the work if real graphs hit that limit.
+        Memory: the temporaries are full size. Extra VRAM is about 3.25x the
+        output in the compare dtype (for example 13 bytes per fp16 or fp32
+        element). An out-of-memory error makes the caller fall back to the
+        host path. Chunk the work if real graphs hit that limit.
         """
         import torch
 

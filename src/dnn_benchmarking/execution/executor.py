@@ -289,7 +289,7 @@ class Executor:
     def autotune(
         self,
         handle: Any,
-        variant_pack: Dict[int, Any],
+        variant_pack: Dict[int, int],
         engine_id: int,
     ) -> List[Any]:
         """Benchmark this engine's compiled plans and activate the winner.
@@ -415,7 +415,7 @@ class Executor:
                 raise ExecutionError(str(e)) from e
         return self._stream_sync_timer
 
-    def execute_once(self, handle: Any, variant_pack: Dict[int, Any]) -> None:
+    def execute_once(self, handle: Any, variant_pack: Dict[int, int]) -> None:
         """Execute the prepared graph once without collecting timings."""
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
@@ -428,12 +428,12 @@ class Executor:
             raise ExecutionError(f"Graph execution failed: {result.get_message()}")
         self._get_stream_sync_timer(stream).synchronize_stream()
 
-    def warmup(self, handle: Any, variant_pack: Dict[int, Any]) -> None:
+    def warmup(self, handle: Any, variant_pack: Dict[int, int]) -> None:
         """Run warmup iterations (timing discarded).
 
         Args:
             handle: hipdnn.Handle instance.
-            variant_pack: Mapping of tensor UIDs to device pointers or DLPack tensors.
+            variant_pack: Mapping of tensor UIDs to device pointers.
 
         Raises:
             ExecutionError: If graph not prepared or execution fails.
@@ -456,7 +456,7 @@ class Executor:
     def benchmark(
         self,
         handle: Any,
-        variant_pack: Dict[int, Any],
+        variant_pack: Dict[int, int],
         graph_name: str = "",
     ) -> BenchmarkResult:
         """Run benchmark iterations and collect timing.
@@ -465,7 +465,7 @@ class Executor:
 
         Args:
             handle: hipdnn.Handle instance.
-            variant_pack: Mapping of tensor UIDs to device pointers or DLPack tensors.
+            variant_pack: Mapping of tensor UIDs to device pointers.
             graph_name: Optional name/identifier for the graph being benchmarked.
 
         Returns:

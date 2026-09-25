@@ -754,7 +754,7 @@ def _require_torch_kernels():
 
 @pytest.mark.gpu
 class TestGpuValidationPath:
-    """hipDNN runs on torch tensors via DLPack and validates on the device."""
+    """hipDNN runs on torch-allocated buffers and validates on the device."""
 
     @pytest.fixture
     def hipdnn(self, plugin_paths: List[str]):

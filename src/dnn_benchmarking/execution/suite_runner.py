@@ -120,8 +120,9 @@ def _hipdnn_buffer_device(
     Torch storage is used only when a device reference exists, so the
     outputs can be compared on the GPU. Timing-only runs, and runs whose
     reference is host-only, keep the DeviceBuffer baseline. ``"cuda"`` is
-    torch's current device; hipDNN requires it to match the current HIP
-    device used by the handle.
+    torch's current device, which torch reads with ``hipGetDevice``. The
+    hipDNN handle uses the same in-process HIP device, so the pointers
+    belong to the handle's device.
     """
     if reference_outputs and any(
         ref.device_data is not None for ref in reference_outputs.values()
@@ -1266,8 +1267,9 @@ def run_single_provider_engine(
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
 
-        buffer_device = _hipdnn_buffer_device(reference_outputs)
-        with BufferManager(tensor_infos, device=buffer_device) as bm:
+        with BufferManager(
+            tensor_infos, device=_hipdnn_buffer_device(reference_outputs)
+        ) as bm:
             bm.allocate_all()
             bm.load_input_data(input_data)
             bm.zero_outputs()
@@ -1358,20 +1360,14 @@ def run_single_provider_engine(
                     reference_outputs=reference_outputs,
                 )
 
-        # BufferManager context has exited. Drop the variant pack too: with
-        # torch storage it holds the I/O tensors, so they stay allocated
-        # until the last reference is gone. Drop the executor so its
-        # workspace allocation is released as well. Then return torch's
-        # cached blocks to the driver. Without this, the inner profiling
-        # process allocates its own VRAM on top of the parent's buffers,
-        # which roughly doubles peak VRAM and can OOM on large graphs that
-        # fit fine on the headline run.
-        del variant_pack
+        # BufferManager context has exited — I/O buffers are freed.
+        # Drop the executor reference too so its workspace allocation
+        # is released before the profiling subprocess fires. Without
+        # this, the inner profiling process allocates its own VRAM on
+        # top of the parent's still-pinned workspace, which roughly
+        # doubles peak VRAM and can OOM on large graphs that fit fine
+        # on the headline run.
         del executor
-        if buffer_device is not None:
-            import torch
-
-            torch.cuda.empty_cache()
 
         # Opt-in profiling pass — runs *after* the timed pass and
         # always-on probes (so profiler overhead can't pollute the

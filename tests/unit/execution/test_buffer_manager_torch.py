@@ -51,15 +51,14 @@ class TestTorchBackend:
         assert torch.equal(y_view.float(), torch.from_numpy(bm.get_output_data(y.uid)))
         assert torch.equal(y_view.float(), torch.from_numpy(out))
 
-    def test_variant_pack_holds_torch_storage(self) -> None:
+    def test_variant_pack_holds_torch_pointers(self) -> None:
         x = _strided(1, "float", is_output=False)
         bm = BufferManager([x], device="cpu")
         bm.allocate_all()
 
         pack = bm.create_variant_pack()
 
-        assert list(pack) == [x.uid]
-        assert pack[x.uid] is bm._buffers[x.uid]
+        assert pack == {x.uid: bm._buffers[x.uid].data_ptr()}
 
     def test_zero_outputs_clears_torch_storage(self) -> None:
         y = _strided(2, "float", is_output=True)
