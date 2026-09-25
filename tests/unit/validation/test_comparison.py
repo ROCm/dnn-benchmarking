@@ -179,3 +179,83 @@ class TestArrayComparator:
 
         assert comparator.rtol == 1e-3
         assert comparator.atol == 1e-6
+
+
+class TestCompareTensors:
+    """compare_tensors matches compare on verdicts, diffs, and messages."""
+
+    def test_fp16_parity_without_overflow(self) -> None:
+        torch = pytest.importorskip("torch")
+        a = np.array([60000, 1.0], dtype=np.float16)
+        b = np.array([-60000, 1.0], dtype=np.float16)
+        comparator = ArrayComparator(rtol=1e-3, atol=1e-3)
+
+        host = comparator.compare(a, b)
+        device = comparator.compare_tensors(torch.from_numpy(a), torch.from_numpy(b))
+
+        # fp16 subtraction would overflow to inf; float32 keeps it finite.
+        assert host.max_abs_diff == 120000.0
+        assert host == device
+
+    def test_nan_rejected(self) -> None:
+        torch = pytest.importorskip("torch")
+        result = ArrayComparator().compare_tensors(
+            torch.tensor([float("nan")]), torch.tensor([0.0]), "output", "reference"
+        )
+
+        assert result.passed is False
+        assert result.message == "output contains NaN or Inf values"
+
+    def test_shape_mismatch(self) -> None:
+        torch = pytest.importorskip("torch")
+        result = ArrayComparator().compare_tensors(
+            torch.zeros(2, 3), torch.zeros(3, 2), "output", "reference"
+        )
+
+        assert result.passed is False
+        assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"
+
+    @pytest.mark.parametrize("dtype", [np.float32, np.float16])
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_strided_parity_leaves_inputs_unchanged(
+        self, dtype: type, fails: bool
+    ) -> None:
+        """Same result on both paths; in-place work never touches the inputs."""
+        torch = pytest.importorskip("torch")
+        rng = np.random.default_rng(0)
+        expected = rng.standard_normal((4, 6)).astype(dtype)
+        actual = (expected + dtype(1e-3)).astype(dtype)
+        if fails:
+            actual[3, 4] += dtype(1.0)
+        a_host, e_host = actual[:, ::2], expected[:, ::2]
+        a_dev, e_dev = (
+            torch.from_numpy(actual)[:, ::2],
+            torch.from_numpy(expected)[:, ::2],
+        )
+        before = (a_host.copy(), e_host.copy())
+        comparator = ArrayComparator(rtol=1e-2, atol=1e-2)
+
+        host = comparator.compare(a_host, e_host)
+        device = comparator.compare_tensors(a_dev, e_dev)
+
+        assert host.passed is not fails
+        assert host == device
+        # The torch views share memory with the numpy arrays, so these cover
+        # both paths.
+        np.testing.assert_array_equal(a_host, before[0])
+        np.testing.assert_array_equal(e_host, before[1])
+
+    def test_int32_compared_in_float64(self) -> None:
+        """float32 would round 2**24 + 1 to 2**24 and hide the difference."""
+        torch = pytest.importorskip("torch")
+        a = np.array([2**24 + 1], dtype=np.int32)
+        e = np.array([2**24], dtype=np.int32)
+        comparator = ArrayComparator(rtol=0.0, atol=0.0)
+
+        host = comparator.compare(a, e)
+
+        assert host.passed is False
+        assert host.max_abs_diff == 1.0
+        assert (
+            comparator.compare_tensors(torch.from_numpy(a), torch.from_numpy(e)) == host
+        )

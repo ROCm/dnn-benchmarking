@@ -112,6 +112,25 @@ def _tolerance_for_output(
     return _default_tolerance_for_output(tensor_info, output_node_type)
 
 
+def _hipdnn_buffer_device(
+    reference_outputs: Optional[Dict[int, ReferenceOutput]],
+) -> Optional[str]:
+    """Torch device for hipDNN I/O buffers, or None for hipdnn.DeviceBuffer.
+
+    Torch storage is used only when a device reference exists, so the
+    outputs can be compared on the GPU. Timing-only runs, and runs whose
+    reference is host-only, keep the DeviceBuffer baseline. ``"cuda"`` is
+    torch's current device, which torch reads with ``hipGetDevice``. The
+    hipDNN handle uses the same in-process HIP device, so the pointers
+    belong to the handle's device.
+    """
+    if reference_outputs and any(
+        ref.device_data is not None for ref in reference_outputs.values()
+    ):
+        return "cuda"
+    return None
+
+
 def _resolve_engine_name(engine_id: int) -> str:
     """Resolve an engine ID to its registered name.
 
@@ -268,31 +287,42 @@ def _check_correctness(
             if not ti.is_output:
                 continue
 
-            actual = buffer_manager.get_output_data(ti.uid)
-            if actual is None:
-                continue
-
-            if ti.uid not in ref_outputs:
-                rtol, atol = _tolerance_for_output(
-                    config, ti, output_node_types.get(ti.uid)
-                )
-                return CorrectnessResult(
-                    execution_success=True,
-                    tolerance_match=False,
-                    rtol=rtol,
-                    atol=atol,
-                    error_message=(
-                        f"Reference provider '{reference_provider_name}' did not "
-                        f"produce output tensor UID {ti.uid}"
-                    ),
-                )
-
             rtol, atol = _tolerance_for_output(
                 config, ti, output_node_types.get(ti.uid)
             )
             validator = Validator(rtol=rtol, atol=atol)
-            expected = ref_outputs[ti.uid].data
-            result = validator.validate(actual, ti, reference_data=expected)
+            ref = ref_outputs.get(ti.uid)
+
+            # Compare on the GPU when both sides are device tensors.
+            result = None
+            if ref is not None and ref.device_data is not None:
+                actual_tensor = buffer_manager.get_output_tensor(ti.uid)
+                if actual_tensor is not None:
+                    import torch
+
+                    try:
+                        result = validator.validate_tensors(
+                            actual_tensor, ti, ref.device_data
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        result = None  # Fall back to the host comparison.
+
+            if result is None:
+                actual = buffer_manager.get_output_data(ti.uid)
+                if actual is None:
+                    continue
+                if ref is None:
+                    return CorrectnessResult(
+                        execution_success=True,
+                        tolerance_match=False,
+                        rtol=rtol,
+                        atol=atol,
+                        error_message=(
+                            f"Reference provider '{reference_provider_name}' did not "
+                            f"produce output tensor UID {ti.uid}"
+                        ),
+                    )
+                result = validator.validate(actual, ti, reference_data=ref.data)
             output_count += 1
             used_rtol = max(used_rtol, rtol)
             used_atol = max(used_atol, atol)
@@ -388,14 +418,30 @@ def _compute_reference_outputs_once(
 
 def _pytorch_reference_outputs_from_buffer(
     buffer_manager: Any,
+    keep_device: bool = True,
 ) -> Dict[int, ReferenceOutput]:
+    """Collect reference outputs from a PyTorch buffer manager.
+
+    ``data`` is always a host copy (one per output per graph); the host
+    fallback comparison needs it. With ``keep_device``, a device clone is
+    also kept so each engine can compare on the GPU without a host copy of
+    its own output.
+    """
     outputs: Dict[int, ReferenceOutput] = {}
+    tensors = buffer_manager.get_tensors()
     for tensor_info in buffer_manager.get_output_tensors():
         data = buffer_manager.get_output_data(tensor_info.uid)
         if data is not None:
+            tensor = tensors.get(tensor_info.uid)
             outputs[tensor_info.uid] = ReferenceOutput(
                 data=data,
                 tensor_uid=tensor_info.uid,
+                # Clone: the buffer manager frees its tensors on exit.
+                device_data=(
+                    tensor.detach().clone()
+                    if keep_device and tensor is not None and tensor.is_cuda
+                    else None
+                ),
             )
     return outputs
 
@@ -525,7 +571,12 @@ def _run_timed_pytorch_row(
                 if role == "reference":
                     buffer_manager.zero_outputs()
                     executor.execute_once(tensors)
-                    outputs = _pytorch_reference_outputs_from_buffer(buffer_manager)
+                    # A profiling child allocates its own VRAM, so profiled
+                    # runs keep host-only references (and DeviceBuffer I/O).
+                    outputs = _pytorch_reference_outputs_from_buffer(
+                        buffer_manager,
+                        keep_device=not config.metrics.opt_in_pass_requested,
+                    )
 
             if role == "reference":
                 result.correctness = _reference_row_correctness(config)
@@ -1216,7 +1267,9 @@ def run_single_provider_engine(
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
 
-        with BufferManager(tensor_infos) as bm:
+        with BufferManager(
+            tensor_infos, device=_hipdnn_buffer_device(reference_outputs)
+        ) as bm:
             bm.allocate_all()
             bm.load_input_data(input_data)
             bm.zero_outputs()

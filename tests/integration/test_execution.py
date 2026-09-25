@@ -738,6 +738,120 @@ class TestPyTorchReferenceValidation:
             ), f"hipDNN Add output does not match PyTorch: {result.message}"
 
 
+def _require_torch_kernels():
+    """Skip unless torch can run a kernel on the GPU; return torch."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("PyTorch GPU not available")
+    try:
+        ok = (torch.ones(4, device="cuda") * 2).sum().item() == 8.0
+    except RuntimeError as e:
+        pytest.skip(f"PyTorch GPU kernels do not run on this host: {e}")
+    if not ok:
+        pytest.skip("PyTorch GPU kernels return wrong results on this host")
+    return torch
+
+
+@pytest.mark.gpu
+class TestGpuValidationPath:
+    """hipDNN runs on torch-allocated buffers and validates on the device."""
+
+    @pytest.fixture
+    def hipdnn(self, plugin_paths: List[str]):
+        """Get hipdnn_frontend module or skip if not available."""
+        _require_torch_kernels()
+        return _setup_hipdnn(plugin_paths)
+
+    def test_validate_pytorch_compares_on_device(
+        self,
+        hipdnn,
+        sample_conv_fwd_json: Dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """--validate pytorch passes, and only the device comparison runs."""
+        from dnn_benchmarking.execution import suite_runner
+        from dnn_benchmarking.validation.validator import Validator
+
+        calls = {"device": 0, "host": 0}
+        validate_tensors = Validator.validate_tensors
+        validate = Validator.validate
+
+        def count_device(self, *args, **kwargs):
+            calls["device"] += 1
+            return validate_tensors(self, *args, **kwargs)
+
+        def count_host(self, *args, **kwargs):
+            calls["host"] += 1
+            return validate(self, *args, **kwargs)
+
+        monkeypatch.setattr(Validator, "validate_tensors", count_device)
+        monkeypatch.setattr(Validator, "validate", count_host)
+        # Record the backend of each engine row's I/O buffers.
+        devices = []
+        pick = suite_runner._hipdnn_buffer_device
+        monkeypatch.setattr(
+            suite_runner,
+            "_hipdnn_buffer_device",
+            lambda refs: devices.append(pick(refs)) or devices[-1],
+        )
+
+        tensor_infos = GraphLoader().extract_tensor_info(sample_conv_fwd_json)
+        config = SuiteConfig(
+            warmup_iters=1,
+            benchmark_iters=2,
+            seed=42,
+            validation=ValidationConfig(provider="pytorch"),
+            metrics=MetricsConfig(tier="off"),
+        )
+        result = run_graph_all_providers(
+            graph_path=Path("/test/graph.json"),
+            graph_json=sample_conv_fwd_json,
+            tensor_infos=tensor_infos,
+            config=config,
+            handle=hipdnn.Handle(),
+        )
+
+        # The PyTorch reference row has no comparison; skip it by provider.
+        engine_rows = [r for r in result.results if r.provider != "pytorch"]
+        successes = [r for r in engine_rows if r.status == "success"]
+        if not successes:
+            pytest.skip("No hipDNN engine supports the conv graph")
+        assert all(r.correctness.tolerance_match is True for r in successes), [
+            r.correctness.error_message for r in successes
+        ]
+        assert devices and set(devices) == {"cuda"}
+        assert calls["device"] >= len(successes)
+        assert calls["host"] == 0
+
+    @pytest.mark.parametrize("dtype_name", ["float16", "float32"])
+    def test_large_output_comparison_vram_budget(self, dtype_name: str) -> None:
+        """compare_tensors on a 64M-element output stays within 13 bytes per element.
+
+        Three float32 temporaries (|a - e|, |e|, threshold) plus one bool
+        mask are needed. Any redundant full-size copy exceeds the budget.
+        """
+        torch = _require_torch_kernels()
+        dtype = getattr(torch, dtype_name)
+        n = 1 << 26
+        expected = torch.randn(n, device="cuda", dtype=dtype)
+        actual = expected.clone()
+        actual[-1] += 1.0
+        comparator = ArrayComparator(rtol=1e-3, atol=1e-3)
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        result = comparator.compare_tensors(actual, expected)
+        peak = torch.cuda.max_memory_allocated() - base
+
+        assert result.passed is False
+        assert result.max_abs_diff >= 0.5
+        # 3 x 4-byte temporaries + 1-byte mask per element, plus 1 MiB for the
+        # scalar results of max() and all() (512-byte allocator blocks).
+        budget = 13 * n + (1 << 20)
+        assert peak <= budget, f"peak {peak / 2**20:.0f} MiB > {budget / 2**20:.0f} MiB"
+
+
 @pytest.mark.gpu
 class TestHardEngineSelectBindings:
     """Real-backend coverage for the hard-select / read-back Graph bindings.

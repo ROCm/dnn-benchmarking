@@ -23,6 +23,7 @@ from dnn_benchmarking.execution.suite_runner import (
     _run_timed_pytorch_row,
     _TimedPytorchRow,
     _compute_reference_outputs_once,
+    _hipdnn_buffer_device,
     set_plugin_path,
 )
 from dnn_benchmarking.config.benchmark_config import (
@@ -1352,6 +1353,46 @@ class TestCheckCorrectnessOutputCount:
         assert result.tolerance_match is True
         assert result.rtol == pytest.approx(0.25)
         assert result.atol == pytest.approx(0.25)
+
+    def test_device_reference_is_compared_without_host_copy(self):
+        torch = pytest.importorskip("torch")
+        bm = MagicMock()
+        bm.get_output_tensor.return_value = torch.tensor([1.0, 2.0])
+
+        # Host data disagrees, so a pass proves the device tensors were used.
+        ref_outputs = {
+            7: ReferenceOutput(
+                data=np.array([9.0, 9.0], dtype=np.float32),
+                tensor_uid=7,
+                device_data=torch.tensor([1.0, 2.0]),
+            )
+        }
+
+        result = _check_correctness(
+            buffer_manager=bm,
+            tensor_infos=[_make_tensor_info(7, is_output=True)],
+            graph_json={"nodes": []},
+            ref_outputs=ref_outputs,
+            reference_provider_name="pytorch",
+            config=SuiteConfig(validation=ValidationConfig(provider="pytorch")),
+        )
+
+        assert result.tolerance_match is True
+        assert result.max_abs_diff == 0.0
+        bm.get_output_data.assert_not_called()
+
+
+class TestHipdnnBufferDevice:
+    """Torch I/O storage is chosen only when a GPU comparison can run."""
+
+    def test_device_reference_selects_torch_storage(self) -> None:
+        host = ReferenceOutput(data=np.zeros(1), tensor_uid=1)
+        device = ReferenceOutput(data=np.zeros(1), tensor_uid=2, device_data=object())
+
+        # Timing-only (no reference) and host-only references keep DeviceBuffer.
+        assert _hipdnn_buffer_device(None) is None
+        assert _hipdnn_buffer_device({1: host}) is None
+        assert _hipdnn_buffer_device({1: host, 2: device}) == "cuda"
 
 
 class TestResolveEngineName:
