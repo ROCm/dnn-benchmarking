@@ -482,18 +482,6 @@ for anonymous reads; archive contents are not stored directly in Git.
   frequent-cadence headline signal.
 - `Workloads/models/` — per-model workload collections.
 
-`Workloads/microbench/rocke.tar.gz` contains one case from each line of Solera's
-scheduled attention, KDA, and Fremont convolution inputs. Its 172 SDPA and 32
-convolution JSON files are hipDNN graphs. The 20 `*.case.json` KDA files are
-data-only: graph discovery and `check_deserialize.py` skip them because hipDNN
-has no KDA operation or provider. Benchmark those cases with Solera instead.
-Attention case 118 preserves its document-mask flags as metadata; the graph
-represents only its causal shape, as the direct rocKE comparison lane does.
-
-The SDPA graphs preserve dimensions and masks but use dense Q/K/V; Solera's
-rocKE lane uses paged KV and block tables. The source `block` value is metadata,
-not a paging configuration in these hipDNN graphs.
-
 ### Download workload archives
 
 Install DVC with S3 support, then pull every tracked workload:
