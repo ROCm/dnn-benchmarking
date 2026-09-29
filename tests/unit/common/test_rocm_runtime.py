@@ -1,6 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -26,10 +27,50 @@ class FakeRocmSdk(ModuleType):
         self.initialize_calls.append(kwargs)
 
 
+class FakeHipdnnRuntime(ModuleType):
+    """Stands in for an installed hipdnn-runtime-<arch> wheel."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__("hipdnn_runtime")
+        self._root = root
+        self.__gpu_arch__ = "gfx942"
+
+    def library_dir(self) -> Path:
+        return self._root / "lib"
+
+    def backend_library(self) -> Path:
+        return self.library_dir() / "libhipdnn_backend.so"
+
+    def plugin_path(self) -> Path:
+        return self.library_dir() / "hipdnn_plugins" / "engines"
+
+
+def install_fake_runtime_wheel(
+    monkeypatch: pytest.MonkeyPatch, root: Path
+) -> list[str]:
+    """Stage a runtime wheel payload on disk and record what gets dlopened."""
+    plugin_dir = root / "lib" / "hipdnn_plugins" / "engines"
+    plugin_dir.mkdir(parents=True)
+    (root / "lib" / "libhipdnn_backend.so").touch()
+    monkeypatch.setitem(sys.modules, "hipdnn_runtime", FakeHipdnnRuntime(root))
+
+    loaded: list[str] = []
+    monkeypatch.setattr(
+        rocm_runtime.ctypes, "CDLL", lambda path, mode=0: loaded.append(path) or path
+    )
+    return loaded
+
+
 @pytest.fixture(autouse=True)
 def reset_rocm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rocm_runtime, "_INITIALIZED_PIP_ROCM", False)
     monkeypatch.delenv("ROCM_PATH", raising=False)
+    # Registers a restore, so a value initialize_pip_rocm_runtime() sets does
+    # not leak into later tests.
+    monkeypatch.delenv("HIPDNN_AITER_ASM_DIR", raising=False)
+    # Keep the tests independent of whether a real runtime wheel is installed
+    # in the environment running them.
+    monkeypatch.setitem(sys.modules, "hipdnn_runtime", None)
 
 
 def test_rocm_path_wins_for_default_plugin_path(
@@ -178,3 +219,112 @@ def test_pip_rocm_initialize_is_idempotent(
     assert rocm_runtime.initialize_pip_rocm_runtime() is True
 
     assert len(fake_sdk.initialize_calls) == 1
+
+
+def test_runtime_wheel_plugin_path_beats_rocm_sdk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sdk_plugin_dir = tmp_path / "sdk" / "lib" / "hipdnn_plugins" / "engines"
+    sdk_plugin_dir.mkdir(parents=True)
+    sdk_library = tmp_path / "sdk" / "lib" / "libhipdnn_backend.so"
+    sdk_library.touch()
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({"hipdnn": sdk_library}))
+
+    wheel_root = tmp_path / "hipdnn_runtime"
+    install_fake_runtime_wheel(monkeypatch, wheel_root)
+
+    assert rocm_runtime.default_hipdnn_plugin_paths() == [
+        wheel_root / "lib" / "hipdnn_plugins" / "engines"
+    ]
+
+
+def test_runtime_wheel_backend_preloads_before_and_instead_of_sdk_hipdnn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wheel's backend must claim the shared SONAME.
+
+    Both copies are called libhipdnn_backend.so, so if the SDK's older one is
+    preloaded the bindings resolve against it and fail on any newer entry point.
+    """
+    lib_dir = tmp_path / "sdk" / "lib"
+    lib_dir.mkdir(parents=True)
+    fake_sdk = FakeRocmSdk(
+        {
+            "amdhip64": lib_dir / "libamdhip64.so",
+            "hipdnn": lib_dir / "libhipdnn_backend.so",
+            "miopen": lib_dir / "libMIOpen.so",
+        }
+    )
+    monkeypatch.setitem(sys.modules, "rocm_sdk", fake_sdk)
+
+    wheel_root = tmp_path / "hipdnn_runtime"
+    loaded = install_fake_runtime_wheel(monkeypatch, wheel_root)
+
+    assert rocm_runtime.initialize_pip_rocm_runtime() is True
+    assert loaded == [str(wheel_root / "lib" / "libhipdnn_backend.so")]
+    assert "hipdnn" not in fake_sdk.initialize_calls[0]["preload_shortnames"]
+    assert "miopen" in fake_sdk.initialize_calls[0]["preload_shortnames"]
+
+
+def test_sdk_hipdnn_still_preloads_without_a_runtime_wheel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lib_dir = tmp_path / "sdk" / "lib"
+    lib_dir.mkdir(parents=True)
+    fake_sdk = FakeRocmSdk({"hipdnn": lib_dir / "libhipdnn_backend.so"})
+    monkeypatch.setitem(sys.modules, "rocm_sdk", fake_sdk)
+
+    assert rocm_runtime.initialize_pip_rocm_runtime() is True
+    assert fake_sdk.initialize_calls[0]["preload_shortnames"] == ["hipdnn"]
+
+
+def test_runtime_wheel_points_asm_sdpa_kernels_at_the_wheel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The hip-kernel provider bakes the builder's install prefix in as its ASM
+    kernel directory; without the override SDPA looks on the build machine."""
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+    wheel_root = tmp_path / "hipdnn_runtime"
+    install_fake_runtime_wheel(monkeypatch, wheel_root)
+
+    rocm_runtime.initialize_pip_rocm_runtime()
+
+    assert os.environ["HIPDNN_AITER_ASM_DIR"] == str(
+        wheel_root
+        / "lib"
+        / "hipdnn_plugins"
+        / "engines"
+        / "hip_kernel_provider"
+        / "asm_kernels"
+    )
+
+
+def test_explicit_asm_kernel_dir_beats_the_runtime_wheel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+    install_fake_runtime_wheel(monkeypatch, tmp_path / "hipdnn_runtime")
+    monkeypatch.setenv("HIPDNN_AITER_ASM_DIR", "/custom/asm")
+
+    rocm_runtime.initialize_pip_rocm_runtime()
+
+    assert os.environ["HIPDNN_AITER_ASM_DIR"] == "/custom/asm"
+
+
+def test_runtime_wheel_backend_load_failure_is_a_runtime_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both CLI entry points report RuntimeError; a raw OSError would escape."""
+    monkeypatch.setitem(sys.modules, "rocm_sdk", FakeRocmSdk({}))
+    wheel_root = tmp_path / "hipdnn_runtime"
+    install_fake_runtime_wheel(monkeypatch, wheel_root)
+
+    def fail_cdll(path, mode=0):
+        raise OSError("libamdhip64.so.7: cannot open shared object file")
+
+    monkeypatch.setattr(rocm_runtime.ctypes, "CDLL", fail_cdll)
+
+    with pytest.raises(RuntimeError, match="libhipdnn_backend.so.*libamdhip64") as e:
+        rocm_runtime.initialize_pip_rocm_runtime()
+    assert isinstance(e.value.__cause__, OSError)
+    assert "HIPDNN_AITER_ASM_DIR" not in os.environ

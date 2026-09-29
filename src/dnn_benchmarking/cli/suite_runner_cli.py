@@ -8,7 +8,10 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from ..common.rocm_runtime import default_hipdnn_plugin_paths
+from ..common.rocm_runtime import (
+    default_hipdnn_plugin_paths,
+    initialize_pip_rocm_runtime,
+)
 from ..common.exceptions import ExecutionError, GraphLoadError
 from ..config.benchmark_config import (
     ExecutionBackendName,
@@ -230,6 +233,16 @@ def run_suite_benchmark(
     tarball_source: Optional[str] = None,
 ) -> int:
     """Run the benchmark suite and return an exit code."""
+    # First, before anything imports torch: the reference-provider check and
+    # the suite header both do. ROCm torch preloads the ROCm SDK's own hipDNN
+    # backend, and once that copy is mapped, a hipdnn-runtime wheel's copy loads
+    # beside it and the process crashes in the backend.
+    try:
+        initialize_pip_rocm_runtime()
+    except RuntimeError as e:
+        reporter.print_error(str(e))
+        return 1
+
     if not _reference_provider_available(config, reporter):
         return 1
 
