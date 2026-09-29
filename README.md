@@ -109,16 +109,20 @@ python3 setup_env.py --workspace .workspace \
 python3 setup_env.py --cmake-arg HIPDNN_ENABLE_SDPA=OFF --cmake-arg=-DCMAKE_BUILD_TYPE=Debug
 ```
 
-rocKE is built by default: setup turns on `HIPKERNELPROVIDER_ENABLE_ROCKE` and
+On Linux, rocKE is built by default: setup turns on `HIPKERNELPROVIDER_ENABLE_ROCKE` and
 `HIPDNN_ENABLE_KERNEL_INGESTOR`, so every rocKE engine ships, including the
 descriptor-backed `hipkernel:Gfx950AttentionDense` when the build targets
 gfx950. The kernel ingestor needs the `rocm-kpack` CMake package from the ROCm
 prefix. Setup installs `msgpack` and `zstandard` into the venv and fetches the
 pinned `rocm_kpack` Python source (`HIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON`);
 pass `--cmake-arg HIPKERNELPROVIDER_KPACK_PYTHON_DIR=<dir>` to use a local copy.
-Setup also passes `CMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations`: the
-ingestor headers otherwise fail under `-Werror` with libstdc++ 12 (Ubuntu
-22.04). A `--cmake-arg CMAKE_CXX_FLAGS=...` replaces it.
+Setup also passes `CMAKE_CXX_FLAGS_INIT=-Wno-error=deprecated-declarations`:
+the ingestor headers otherwise fail under `-Werror` with libstdc++ 12 (Ubuntu
+22.04). Your `CXXFLAGS` still apply. Windows keeps rocKE off (untested).
+
+An existing `rocm-libraries/` checkout is reused. Setup warns when it is not at
+the pinned commit; run `git submodule update rocm-libraries` or delete the
+directory to pick up a pin bump.
 
 Disabling an engine's option does not remove the plugin `.so`, so
 `--plugin-path` still looks satisfied; graphs that only that engine supports

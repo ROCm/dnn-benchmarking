@@ -33,7 +33,7 @@ Pass `/opt/rocm/lib/hipdnn_plugins/engines/` to `--plugin-path` when running ben
 `--cmake-arg NAME=VALUE` appends a define to the hipDNN/provider configure, after the
 defaults, so it can override one. `-DNAME=VALUE` is also accepted but needs the `=` form
 (`--cmake-arg=-DFOO=ON`), since argparse reads a space-separated `-DFOO=ON` as an option.
-rocKE is on by default (`HIPKERNELPROVIDER_ENABLE_ROCKE=ON`, `HIPDNN_ENABLE_KERNEL_INGESTOR=ON`),
+On Linux, rocKE is on by default (`HIPKERNELPROVIDER_ENABLE_ROCKE=ON`, `HIPDNN_ENABLE_KERNEL_INGESTOR=ON`),
 so every rocKE engine ships, including descriptor-backed ones such as
 `hipkernel:Gfx950AttentionDense` on gfx950 builds. The ingestor needs the ROCm prefix's
 `rocm-kpack` CMake package; setup supplies the Python half (fetched `rocm_kpack`,
