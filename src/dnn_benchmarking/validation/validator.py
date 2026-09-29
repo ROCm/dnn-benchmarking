@@ -3,12 +3,15 @@
 
 """Validation module for comparing execution output against reference."""
 
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
 from ..graph.tensor_info import TensorInfo
 from .comparison import ArrayComparator, ComparisonResult
+
+if TYPE_CHECKING:
+    import torch
 
 
 class Validator:
@@ -66,6 +69,20 @@ class Validator:
             )
 
         return self._comparator.compare(
+            output_data, reference_data, "output", "reference"
+        )
+
+    def validate_tensors(
+        self,
+        output_data: "torch.Tensor",
+        tensor_info: TensorInfo,
+        reference_data: "torch.Tensor",
+    ) -> ComparisonResult:
+        """Compare output and reference torch tensors on the device.
+
+        Same semantics and messages as ``validate``; no host copy is made.
+        """
+        return self._comparator.compare_tensors(
             output_data, reference_data, "output", "reference"
         )
 
