@@ -100,36 +100,29 @@ when absent. Write the `-D` spelling with an `=` (`--cmake-arg=-DFOO=ON`) —
 with a space, argparse reads `-DFOO=ON` as an option rather than a value.
 
 ```bash
-# Build the descriptor-backed kernel-ingestor engine, which is gated OFF
+# Skip rocKE, including its descriptor-backed engines
 python3 setup_env.py --workspace .workspace \
-  --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=ON
+  --cmake-arg HIPKERNELPROVIDER_ENABLE_ROCKE=OFF \
+  --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=OFF
 
 # Repeatable; the -D spelling needs the '=' form
 python3 setup_env.py --cmake-arg HIPDNN_ENABLE_SDPA=OFF --cmake-arg=-DCMAKE_BUILD_TYPE=Debug
 ```
 
-This is needed for any engine gated behind a non-default CMake option. Without
-the option the engine's sources compile into no plugin at all — but the plugin
-`.so` is still installed, so `--plugin-path` looks satisfied and every graph
-reports `no engines applicable` rather than a missing-engine error.
+rocKE is built by default: setup turns on `HIPKERNELPROVIDER_ENABLE_ROCKE` and
+`HIPDNN_ENABLE_KERNEL_INGESTOR`, so every rocKE engine ships, including the
+descriptor-backed `hipkernel:Gfx950AttentionDense` when the build targets
+gfx950. The kernel ingestor needs the `rocm-kpack` CMake package from the ROCm
+prefix. Setup installs `msgpack` and `zstandard` into the venv and fetches the
+pinned `rocm_kpack` Python source (`HIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON`);
+pass `--cmake-arg HIPKERNELPROVIDER_KPACK_PYTHON_DIR=<dir>` to use a local copy.
+Setup also passes `CMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations`: the
+ingestor headers otherwise fail under `-Werror` with libstdc++ 12 (Ubuntu
+22.04). A `--cmake-arg CMAKE_CXX_FLAGS=...` replaces it.
 
-`HIPDNN_ENABLE_KERNEL_INGESTOR=ON` additionally needs the `rocm-kpack` CMake
-package (`find_package(rocm-kpack CONFIG REQUIRED)`) and the `rocm_kpack`
-Python package with `zstandard` and `msgpack`, neither of which the default
-`--torch-mode rocm` path provides — the torch wheel's bundled ROCm SDK ships
-`librocm_kpack.so` but no CMake config, so configure hard-fails. Point at a
-ROCm install that ships the package and supply the Python half:
-
-```bash
-python3 setup_env.py --torch-mode existing --rocm-prefix /opt/rocm \
-  --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=ON \
-  --cmake-arg HIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON
-```
-
-`HIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON` clones the pinned `rocm_kpack` source
-(network); `--cmake-arg HIPKERNELPROVIDER_KPACK_PYTHON_DIR=<dir>` uses a local
-copy instead. The hipDNN dev container stages both at `/opt/rocm-kpack/python`
-and needs neither flag.
+Disabling an engine's option does not remove the plugin `.so`, so
+`--plugin-path` still looks satisfied; graphs that only that engine supports
+report `no engines applicable` rather than a missing-engine error.
 
 ### Testing/CI Setup with CPU-Only PyTorch
 
