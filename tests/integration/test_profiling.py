@@ -24,20 +24,8 @@ from dnn_benchmarking.metrics.perf import (
     _read_perf_paranoid,
     _resolve_perf,
 )
-
-
-def _graphs_dir() -> Path:
-    return Path(__file__).parent.parent.parent / "graphs"
-
-
-def _require_gpu():
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            pytest.skip("PyTorch GPU not available")
-    except ImportError as e:
-        pytest.skip(f"PyTorch not available: {e}")
+from tests.conftest import skip_if_no_gpu_torch
+from tests.integration.conftest import GRAPHS_DIR
 
 
 def _require_rocm_tool(name: str) -> str:
@@ -77,7 +65,7 @@ def _require_perf_kernel_events():
 
 
 def _conv_graph() -> Path:
-    p = _graphs_dir() / "sample_conv_fwd.json"
+    p = GRAPHS_DIR / "sample_conv_fwd.json"
     if not p.exists():
         pytest.skip(f"sample graph not found: {p}")
     return p
@@ -117,7 +105,9 @@ def _run_dnn_bench(extra_args, tmp_path) -> dict:
         ],
         _HELPER_TIMEOUT_S,
     )
-    if proc.returncode not in (0, 2):
+    # Profiler failures are recorded in the row, never in the exit code;
+    # a missing tool (exit 2) is excluded by the skip gates above.
+    if proc.returncode != 0:
         pytest.fail(
             f"dnn-benchmark failed (rc={proc.returncode})\n"
             f"stdout:\n{proc.stdout}\n"
@@ -137,21 +127,21 @@ def _first_pe_extra(data: dict) -> dict:
 
 @pytest.mark.rocprofv3
 def test_pmc_basic_populates_counters(tmp_path):
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
     data = _run_dnn_bench(["--pmc", "basic"], tmp_path)
     extra = _first_pe_extra(data)
     assert "pmc" in extra
     pmc = extra["pmc"]
-    # Real counters, recorded failure tail, or an rc==0 warning (e.g.
+    # Per-kernel counters, recorded failure tail, or an rc==0 warning (e.g.
     # the rocpd parser found no .db) — any of these means the slice
     # made the round trip; only a wholly-empty pmc dict is a regression.
-    assert any(k in pmc for k in ("counters", "error_tail", "skipped", "warnings"))
+    assert any(k in pmc for k in ("per_kernel", "error_tail", "skipped", "warnings"))
 
 
 @pytest.mark.rocprofv3
 def test_emit_trace_pftrace_records_artifact(tmp_path):
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
     data = _run_dnn_bench(["--emit-trace", "pftrace"], tmp_path)
     extra = _first_pe_extra(data)
@@ -164,7 +154,7 @@ def test_emit_trace_pftrace_records_artifact(tmp_path):
 
 @pytest.mark.perf
 def test_perf_records_user_cycles(tmp_path):
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_perf()
     _require_perf_kernel_events()
     data = _run_dnn_bench(["--perf"], tmp_path)
@@ -178,7 +168,7 @@ def test_perf_records_user_cycles(tmp_path):
 
 @pytest.mark.rocprof_compute
 def test_roofline_records_csv_artifacts(tmp_path):
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprof-compute")
     data = _run_dnn_bench(["--roofline"], tmp_path)
     extra = _first_pe_extra(data)
@@ -204,7 +194,7 @@ def test_combined_pmc_perf_roofline_merge_into_one_extra_metrics(tmp_path):
     * Future merge logic in `run_profiling_passes` that loses one source
       because of dict-update collisions.
     """
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
     _require_perf()
     _require_rocm_tool("rocprof-compute")
@@ -219,7 +209,7 @@ def test_combined_pmc_perf_roofline_merge_into_one_extra_metrics(tmp_path):
     # each slice — a slice that's wholly empty would indicate the
     # orchestrator skipped it without warning.
     assert any(
-        k in extra["pmc"] for k in ("counters", "error_tail", "skipped", "warnings")
+        k in extra["pmc"] for k in ("per_kernel", "error_tail", "skipped", "warnings")
     )
     assert any(k in extra["perf"] for k in ("cycles_user", "error_tail", "skipped"))
     assert any(
@@ -249,15 +239,16 @@ def test_pmc_basic_strict_requires_db_and_counters(tmp_path):
     in the JSON. A regression that produces no db (or fails to parse)
     surfaces here even though the smoke test would still pass on the
     ``warnings`` branch."""
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
     data = _run_dnn_bench(["--pmc", "basic"], tmp_path)
     extra = _first_pe_extra(data)
     pmc = extra.get("pmc") or {}
     assert "db_path" in pmc, f"db_path missing — slice keys: {sorted(pmc)}"
     assert Path(pmc["db_path"]).exists(), f"rocpd db not on disk: {pmc['db_path']}"
-    counters = pmc.get("counters") or {}
-    assert counters, f"no parsed counters — slice keys: {sorted(pmc)}"
+    per_kernel = pmc.get("per_kernel") or {}
+    assert per_kernel, f"no parsed counters — slice keys: {sorted(pmc)}"
+    counters = {c for k in per_kernel.values() for c in k["counters"]}
     # GRBM_GUI_ACTIVE is in every arch's basic set; if it isn't here,
     # the rocpd schema walk is broken (or the arch table changed
     # without updating this test).
@@ -272,7 +263,7 @@ def test_roofline_strict_requires_csv_and_workload(tmp_path):
     """Asserts the roofline contract: roofline.csv emitted and the
     workload directory exists so ``rocprof-compute analyze --path`` can
     render the actual roofline post-hoc."""
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprof-compute")
     data = _run_dnn_bench(["--roofline"], tmp_path)
     extra = _first_pe_extra(data)
@@ -295,7 +286,7 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     a real artifact, not a tool-error sentinel. This is the closest the
     test suite gets to a full integration cover.
     """
-    _require_gpu()
+    skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
     _require_perf()
     _require_rocm_tool("rocprof-compute")
@@ -307,7 +298,7 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     extra = _first_pe_extra(data)
 
     pmc = extra.get("pmc") or {}
-    assert pmc.get("counters"), f"pmc.counters empty/missing — keys: {sorted(pmc)}"
+    assert pmc.get("per_kernel"), f"pmc.per_kernel empty/missing — keys: {sorted(pmc)}"
 
     trace = extra.get("trace") or {}
     assert trace.get("path"), f"trace.path missing — keys: {sorted(trace)}"

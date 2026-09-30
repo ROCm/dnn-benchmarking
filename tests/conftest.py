@@ -3,7 +3,6 @@
 
 """Pytest fixtures for dnn-benchmarking tests."""
 
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,28 +63,6 @@ def skip_if_no_gpu_torch() -> None:
 
     if not torch.cuda.is_available():
         pytest.skip("PyTorch GPU not available")
-
-
-def skip_if_no_rocm_torch() -> None:
-    """Skip unless this is a ROCm torch build with usable HIP bindings."""
-    try:
-        import torch
-    except ImportError:
-        pytest.skip("PyTorch not available")
-
-    if not torch.cuda.is_available():
-        pytest.skip("PyTorch GPU not available")
-
-    if torch.version.hip is None:
-        pytest.skip("ROCm PyTorch build required")
-
-    try:
-        import hipdnn_frontend as hipdnn
-
-        if hipdnn.hip_get_device_count() <= 0:
-            pytest.skip("No HIP GPU available")
-    except Exception as e:
-        pytest.skip(f"hipdnn_frontend HIP bindings not available: {e}")
 
 
 def skip_if_no_cuda_torch() -> None:
@@ -156,62 +133,6 @@ def sample_conv_fwd_json() -> Dict[str, Any]:
             }
         ],
     }
-
-
-@pytest.fixture
-def sample_matmul_json() -> Dict[str, Any]:
-    """Matmul JSON for testing unsupported operation detection."""
-    return {
-        "name": "sample_matmul",
-        "compute_data_type": "float",
-        "io_data_type": "float",
-        "intermediate_data_type": "float",
-        "preferred_engine_id": 1,
-        "tensors": [
-            {
-                "uid": 1,
-                "name": "input_a",
-                "dims": [16, 16],
-                "strides": [16, 1],
-                "data_type": "float",
-                "virtual": False,
-            },
-            {
-                "uid": 2,
-                "name": "input_b",
-                "dims": [16, 16],
-                "strides": [16, 1],
-                "data_type": "float",
-                "virtual": False,
-            },
-            {
-                "uid": 3,
-                "name": "output_c",
-                "dims": [16, 16],
-                "strides": [16, 1],
-                "data_type": "float",
-                "virtual": False,
-            },
-        ],
-        "nodes": [
-            {
-                "name": "matmul_node",
-                "type": "MatmulAttributes",
-                "compute_data_type": "float",
-                "inputs": {"a_tensor_uid": 1, "b_tensor_uid": 2},
-                "outputs": {"c_tensor_uid": 3},
-            }
-        ],
-    }
-
-
-@pytest.fixture
-def temp_json_file(tmp_path: Path, sample_conv_fwd_json: Dict[str, Any]) -> Path:
-    """Create a temporary JSON file with sample conv fwd graph."""
-    json_path = tmp_path / "test_graph.json"
-    with open(json_path, "w") as f:
-        json.dump(sample_conv_fwd_json, f)
-    return json_path
 
 
 def _valid_plugin_dir(path: Path) -> bool:
