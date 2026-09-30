@@ -9,6 +9,11 @@ FROM ${BASE_IMAGE} AS builder
 ARG DEVICE_TARGET=gfx942
 ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
 ARG ROCM_TORCH_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
+# The build context has no .git (see .dockerignore), so setup_env.py cannot
+# resolve the rocm-libraries submodule pin itself. The build script passes it
+# (`git rev-parse HEAD:rocm-libraries`); empty => setup warns and builds the
+# moving .gitmodules branch.
+ARG ROCM_LIBRARIES_REF=""
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
@@ -62,6 +67,9 @@ set -- \
     -y
 if [ -n "${ROCM_TORCH_INDEX_URL}" ]; then
     set -- "$@" --torch-index-url "${ROCM_TORCH_INDEX_URL}"
+fi
+if [ -n "${ROCM_LIBRARIES_REF}" ]; then
+    set -- "$@" --rocm-libraries-ref "${ROCM_LIBRARIES_REF}"
 fi
 
 python3.12 setup_env.py "$@"

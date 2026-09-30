@@ -1,4 +1,6 @@
-# Local VCS/worktree state is not needed inside the image.
+# Local VCS/worktree state is not needed inside the image. Without it
+# setup_env.py cannot resolve the rocm-libraries pin, so the build script
+# passes it as the ROCM_LIBRARIES_REF build arg.
 .git
 **/.git
 

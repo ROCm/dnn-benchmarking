@@ -45,6 +45,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --strict-markers"
 markers = [
     "gpu: marks tests requiring GPU (deselect with '-m \"not gpu\"')",
     "rocm: marks tests requiring AMD ROCm GPUs (deselect with '-m \"not rocm\"')",

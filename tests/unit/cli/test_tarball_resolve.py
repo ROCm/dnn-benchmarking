@@ -30,32 +30,21 @@ def _make_tarball(dest: Path, members: dict) -> Path:
     return dest
 
 
-class TestIsTarball:
-    """Tests for is_tarball()."""
-
-    def test_recognizes_tar_gz(self) -> None:
-        assert is_tarball("graphs.tar.gz") is True
-
-    def test_recognizes_tgz(self) -> None:
-        assert is_tarball("graphs.tgz") is True
-
-    def test_recognizes_tar_bz2(self) -> None:
-        assert is_tarball("graphs.tar.bz2") is True
-
-    def test_recognizes_tar(self) -> None:
-        assert is_tarball("graphs.tar") is True
-
-    def test_recognizes_tar_xz(self) -> None:
-        assert is_tarball("graphs.tar.xz") is True
-
-    def test_rejects_json(self) -> None:
-        assert is_tarball("graph.json") is False
-
-    def test_rejects_txt(self) -> None:
-        assert is_tarball("shapes.txt") is False
-
-    def test_case_insensitive(self) -> None:
-        assert is_tarball("GRAPHS.TAR.GZ") is True
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("graphs.tar", True),
+        ("graphs.tar.gz", True),
+        ("graphs.tgz", True),
+        ("graphs.tar.bz2", True),
+        ("graphs.tar.xz", True),
+        ("GRAPHS.TAR.GZ", True),
+        ("graph.json", False),
+        ("shapes.txt", False),
+    ],
+)
+def test_is_tarball(name: str, expected: bool) -> None:
+    assert is_tarball(name) is expected
 
 
 class TestExtractTarball:

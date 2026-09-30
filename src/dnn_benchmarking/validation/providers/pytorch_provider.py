@@ -7,13 +7,15 @@ Computes reference outputs by parsing graph JSON and executing
 equivalent PyTorch operations on CPU.
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 import numpy as np
 
 from ...common import torch_support
+from ...common.dtypes import get_dtype
 from ...common.exceptions import UnsupportedGraphError
 from ...config.benchmark_config import ReferenceProviderName
+from ...graph import output_uids
 
 from ..reference_provider import (
     ReferenceOutput,
@@ -29,47 +31,12 @@ def _get_pytorch_ops():
     return pytorch_ops
 
 
-_TORCH_DTYPE_BY_GRAPH_TYPE = {
-    "float": "float32",
-    "half": "float16",
-    "bfloat16": "bfloat16",
-    "double": "float64",
-    "int8": "int8",
-    "int32": "int32",
-    "uint8": "uint8",
-}
-
-
 def _tensor_metadata(graph_json: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
     return {
         int(tensor["uid"]): tensor
         for tensor in graph_json.get("tensors", [])
         if "uid" in tensor
     }
-
-
-def _torch_dtype_for_tensor(
-    torch: Any, tensor_json: Optional[Dict[str, Any]]
-) -> Optional[Any]:
-    if tensor_json is None:
-        return None
-    dtype_name = _TORCH_DTYPE_BY_GRAPH_TYPE.get(
-        str(tensor_json.get("data_type", "float")).lower()
-    )
-    if dtype_name is None:
-        raise UnsupportedGraphError(
-            f"PyTorch reference does not support tensor data_type "
-            f"'{tensor_json.get('data_type')}' for tensor UID {tensor_json.get('uid')}"
-        )
-    return getattr(torch, dtype_name)
-
-
-def _numpy_output_for_tensor(tensor: Any, graph_dtype: Optional[str]) -> np.ndarray:
-    # NumPy has no native bfloat16 dtype. Convert BF16 tensors to float32
-    # numeric values rather than returning their uint16 storage encoding.
-    if graph_dtype == "bfloat16":
-        return tensor.detach().cpu().to(dtype=tensor.float().dtype).numpy()
-    return tensor.detach().cpu().numpy()
 
 
 @ReferenceProviderRegistry.register(ReferenceProviderName.PYTORCH.value)
@@ -171,39 +138,21 @@ class PyTorchReferenceProvider(ReferenceProvider):
         tensor_json_by_uid = _tensor_metadata(graph_json)
         tensors: Dict[int, torch.Tensor] = {}
         for uid, data in input_data.items():
-            tensor = torch.from_numpy(data.copy()).cpu()
-            graph_dtype = _torch_dtype_for_tensor(torch, tensor_json_by_uid.get(uid))
-            if graph_dtype is not None:
-                tensor = tensor.to(dtype=graph_dtype)
+            tensor = torch.from_numpy(data.copy())
+            data_type = tensor_json_by_uid.get(uid, {}).get("data_type")
+            if data_type is not None:
+                tensor = tensor.to(get_dtype(data_type).torch_dtype())
             tensors[uid] = tensor
 
         # Execute graph using shared handlers (works on CPU tensors)
         _get_pytorch_ops().execute_graph(graph_json, tensors)
 
-        # Extract output tensors
-        # Build set of output UIDs from all nodes
-        output_uids: Set[int] = set()
-        for node in graph_json.get("nodes", []):
-            outputs = node.get("outputs", {})
-            for uid in outputs.values():
-                if uid is not None:
-                    output_uids.add(uid)
+        # NumPy has no bfloat16 or fp8, so those outputs are returned as the
+        # float32 values BufferManager also uses for comparison.
+        from ...execution.pytorch_buffer_manager import host_numpy
 
-        # Return outputs that exist in our tensor dict. NumPy has no native
-        # bfloat16 dtype, so BF16 graph outputs are decoded to float32 for the
-        # same comparison representation used by BufferManager.
-        results: Dict[int, ReferenceOutput] = {}
-        for uid in output_uids:
-            if uid in tensors:
-                tensor_json = tensor_json_by_uid.get(uid)
-                graph_dtype = (
-                    str(tensor_json.get("data_type", "")).lower()
-                    if tensor_json is not None
-                    else None
-                )
-                results[uid] = ReferenceOutput(
-                    data=_numpy_output_for_tensor(tensors[uid], graph_dtype),
-                    tensor_uid=uid,
-                )
-
-        return results
+        return {
+            uid: ReferenceOutput(data=host_numpy(tensors[uid]), tensor_uid=uid)
+            for uid in output_uids(graph_json)
+            if uid in tensors
+        }

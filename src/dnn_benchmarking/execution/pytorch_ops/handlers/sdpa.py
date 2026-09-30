@@ -268,24 +268,22 @@ def _run_paged_sdpa(
 
     page_table_k = _tensor(tensors, page_table_k_uid, node)
     page_table_v = _tensor(tensors, page_table_v_uid, node)
-    seq_len_kv = _tensor(tensors, seq_len_kv_uid, node)
-    seq_len_q = (
-        _tensor(tensors, seq_len_q_uid, node) if seq_len_q_uid is not None else None
-    )
+    kv_lengths = _host_ints(tensors, seq_len_kv_uid, node)
 
     if k.ndim != 4 or v.ndim != 4:
         raise ValueError("Paged SDPA expects rank-4 paged K/V containers")
     page_size = int(k.shape[-2])
-    num_seqs = int(seq_len_kv.numel())
+    num_seqs = len(kv_lengths)
     if int(page_table_k.shape[0]) != num_seqs:
         raise ValueError(
             f"Paged SDPA page table has {int(page_table_k.shape[0])} rows for "
             f"{num_seqs} sequences"
         )
 
-    kv_lengths = [int(x) for x in seq_len_kv.flatten().tolist()]
-    if seq_len_q is not None:
-        q_lengths = [int(x) for x in seq_len_q.flatten().tolist()]
+    if seq_len_q_uid is not None:
+        # Host-resolved once per replay map: a .tolist() here would sync the
+        # stream inside the staged timer's gated region and deadlock.
+        q_lengths = _host_ints(tensors, seq_len_q_uid, node)
         if len(q_lengths) != num_seqs:
             raise ValueError("Paged SDPA seq_len_q/seq_len_kv disagree on num_seqs")
     else:
@@ -467,9 +465,14 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, o)
             return
 
-        o = _call_sdpa(
-            q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v, window
-        )
+        if window is not None:
+            # A sliding window has no boolean spelling in torch's SDPA; build
+            # the additive band mask once so O and stats see the same mask.
+            # is_causal is already False: a bounded left edge wins.
+            attn_mask = _sliding_window_mask(
+                int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
+            )
+        o = _call_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v)
         _store_tensor(tensors, o_uid, o)
 
         if stats_uid is not None:

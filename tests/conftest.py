@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from dnn_benchmarking.execution.timing import GpuTimerInterface
-
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -67,18 +65,6 @@ def skip_if_no_gpu_torch() -> None:
     if not torch.cuda.is_available():
         pytest.skip("PyTorch GPU not available")
 
-    # The executor picks the timing backend per platform (HIP on ROCm,
-    # torch.cuda on CUDA). HIP timing lazily imports hipdnn_frontend, so a
-    # ROCm-torch host without those bindings would error mid-benchmark rather
-    # than skip. Require the backend the executor will actually use.
-    from dnn_benchmarking.execution import timing
-
-    if expected_timing_backend() not in timing.get_available_backends():
-        pytest.skip(
-            "resolved GPU timing backend unavailable "
-            "(e.g. hipdnn_frontend HIP bindings missing)"
-        )
-
 
 def skip_if_no_rocm_torch() -> None:
     """Skip unless this is a ROCm torch build with usable HIP bindings."""
@@ -114,33 +100,6 @@ def skip_if_no_cuda_torch() -> None:
 
     if not torch.cuda.is_available():
         pytest.skip("PyTorch GPU not available")
-
-
-class DummyHipTimer(GpuTimerInterface):
-    """Minimal timer implementation for factory tests.
-
-    This is a test fixture that can be used to mock GPU timing
-    without requiring actual GPU hardware.
-    """
-
-    def __init__(self, stream: int = 0) -> None:
-        self.stream = stream
-
-    @property
-    def backend_name(self) -> str:
-        return "hip"
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def synchronize(self) -> None:
-        pass
-
-    def elapsed_ms(self) -> float:
-        return 0.0
 
 
 @pytest.fixture
@@ -255,27 +214,6 @@ def temp_json_file(tmp_path: Path, sample_conv_fwd_json: Dict[str, Any]) -> Path
     return json_path
 
 
-@pytest.fixture
-def skip_if_no_gpu(plugin_paths):
-    """Skip test if no AMD GPU available."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            pytest.skip("PyTorch GPU not available")
-    except ImportError as e:
-        pytest.skip(f"PyTorch not available: {e}")
-
-    try:
-        import hipdnn_frontend as hipdnn
-
-        hipdnn.set_engine_plugin_paths(plugin_paths, hipdnn.PluginLoadingMode.ABSOLUTE)
-
-        hipdnn.Handle()
-    except Exception:
-        pytest.skip("No GPU available or hipdnn_frontend not installed")
-
-
 def _valid_plugin_dir(path: Path) -> bool:
     return path.is_dir() and any(path.glob("*.so"))
 
@@ -366,12 +304,6 @@ def plugin_paths(pytestconfig):
     if paths is None:
         pytest.skip("No hipDNN engine plugin found")
     return paths
-
-
-@pytest.fixture
-def plugin_path(plugin_paths):
-    """Get the first hipDNN engine plugin path, or skip if not found."""
-    return plugin_paths[0]
 
 
 @pytest.fixture

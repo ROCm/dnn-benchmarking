@@ -4,18 +4,25 @@
 """CLI argument parsing for dnn-benchmarking."""
 
 import argparse
-from dataclasses import dataclass
+import importlib.metadata
+import re
+from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, FrozenSet, List, Optional
+from typing import Any, Callable, List, Optional
 
 from ..config.benchmark_config import (
-    EXECUTION_BACKEND_CHOICES,
+    CACHE_MODE_CHOICES,
+    EMIT_TRACE_CHOICES,
     ExecutionBackendName,
-    PYTORCH_SDPA_BACKEND_CHOICES,
+    MetricsConfig,
+    MetricsTier,
+    OracleMode,
+    PMC_SET_CHOICES,
     PyTorchSdpaBackendName,
-    REFERENCE_PROVIDER_CHOICES,
     ReferenceProviderName,
+    SuiteConfig,
+    ValidationConfig,
 )
 
 
@@ -36,13 +43,13 @@ class CliOption:
     flags: tuple[str, ...]
     help: str
     dest: str
+    group: str
     default: Any = None
-    parser_type: Any = None
-    action: Optional[str] = None
+    parser_type: Optional[Callable[[Any], Any]] = None
+    action: Any = None
     nargs: Any = None
     metavar: Optional[str] = None
-    choices: Optional[FrozenSet[Any]] = None
-    group: Optional[str] = None
+    choices: Optional[tuple[str, ...]] = None
     config_key: Optional[str] = None
     config_kind: Optional[ConfigKind] = None
     config_type: Optional[type] = None
@@ -66,78 +73,168 @@ class CliOption:
         return self.config_key is not None
 
 
-def _parse_engine_list(s: str) -> List[int]:
-    """Parse --engine value as a single ID or comma-separated list of IDs.
+def _default(cls: type, name: str) -> Any:
+    """Return a dataclass field default (enum members as their string value)."""
+    value = next(f for f in fields(cls) if f.name == name).default
+    return value.value if isinstance(value, Enum) else value
 
-    Engine IDs are deterministic FNV-1a hashes of the engine name and may
-    be negative when interpreted as signed int64, so we accept any int.
-    Duplicate IDs are preserved because each comma-delimited entry is an
-    ordered execution selection; this allows comparing the same engine ID
-    from different plugin paths.
 
-    Examples:
-      "1"                      -> [1]
-      "1,2,3"                  -> [1, 2, 3]
-      "1, 2"                   -> [1, 2]
-      "1,1,2"                  -> [1, 1, 2]
-      "3,1,3,2"                -> [3, 1, 3, 2]
-      "-4567890123456789012"   -> [-4567890123456789012]
+def _values(enum_cls: type[Enum]) -> tuple[str, ...]:
+    return tuple(member.value for member in enum_cls)
+
+
+def _at_least(kind: type, minimum: float) -> Callable[[Any], Any]:
+    """argparse ``type=`` converter that rejects values below ``minimum``."""
+
+    def convert(text: Any) -> Any:
+        try:
+            value = kind(text)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"expected {kind.__name__}, got {text!r}"
+            ) from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be >= {minimum}, got {value}")
+        return value
+
+    return convert
+
+
+_UINT64 = 1 << 64
+_INT64_MIN = -(1 << 63)
+_ENGINE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
+
+
+def _fnv1a64(name: str) -> int:
+    """64-bit FNV-1a hash; hipDNN derives engine IDs from engine names this way."""
+    value = 0xCBF29CE484222325
+    for byte in name.encode():
+        value = ((value ^ byte) * 0x100000001B3) % _UINT64
+    return value
+
+
+def _signed64(value: int, token: str) -> int:
+    """Wrap an unsigned 64-bit engine ID to the signed int64 hipDNN uses."""
+    if not _INT64_MIN <= value < _UINT64:
+        raise argparse.ArgumentTypeError(f"engine ID {token!r} is outside 64 bits")
+    return value - _UINT64 if value >= 1 << 63 else value
+
+
+def parse_engine_id(token: str) -> int:
+    """Parse one engine as a decimal ID, a 0x hex ID, or an engine name.
+
+    Names resolve to FNV-1a-64 of the exact (case-sensitive) name. Hex and
+    names above 2**63 wrap to signed int64, matching hipDNN's engine IDs.
     """
-    parts = [p.strip() for p in s.split(",")]
-    parts = [p for p in parts if p]
+    text = token.strip()
+    if re.fullmatch(r"[+-]?\d+", text):
+        return _signed64(int(text), token)
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+        return _signed64(int(text, 16), token)
+    if _ENGINE_NAME.fullmatch(text):
+        return _signed64(_fnv1a64(text), token)
+    raise argparse.ArgumentTypeError(
+        f"invalid engine {token!r}: expected a name, decimal ID or 0x hex ID"
+    )
+
+
+def _parse_engine_list(s: str) -> List[int]:
+    """Parse ``--engine`` as an ordered comma list; duplicates are kept."""
+    parts = [p for p in (p.strip() for p in s.split(",")) if p]
     if not parts:
-        raise argparse.ArgumentTypeError("--engine requires at least one ID")
-    try:
-        ids = [int(p) for p in parts]
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"--engine expects integer ID(s), got {s!r}")
-    return ids
+        raise argparse.ArgumentTypeError("requires at least one engine")
+    return [parse_engine_id(p) for p in parts]
 
 
 def _parse_plugin_path_list(s: str) -> List[Path]:
     """Parse --plugin-path as a comma-separated list of plugin directories."""
-    parts = [p.strip() for p in s.split(",")]
-    parts = [p for p in parts if p]
+    parts = [p for p in (p.strip() for p in s.split(",")) if p]
     if not parts:
-        raise argparse.ArgumentTypeError("--plugin-path requires at least one path")
+        raise argparse.ArgumentTypeError("requires at least one path")
     return [Path(p) for p in parts]
 
 
-_BACKEND_CHOICES = EXECUTION_BACKEND_CHOICES
-_REFERENCE_PROVIDER_HELP = ", ".join(sorted(REFERENCE_PROVIDER_CHOICES))
-_PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
-_METRICS_TIER_CHOICES = frozenset({"basic", "off"})
-_EMIT_TRACE_CHOICES = frozenset({"pftrace"})
-_PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
-_ORACLE_MODE_CHOICES = frozenset({"off", "plan", "exhaustive"})
+def _bool_option(
+    flags: tuple[str, ...], dest: str, group: str, cls: type, field: str, help: str
+) -> CliOption:
+    return CliOption(
+        flags=flags,
+        dest=dest,
+        group=group,
+        action=argparse.BooleanOptionalAction,
+        default=_default(cls, field),
+        help=help,
+        config_key=dest,
+        config_kind=ConfigKind.SCALAR,
+        config_type=bool,
+    )
+
+
+def _choice_option(
+    flags: tuple[str, ...],
+    dest: str,
+    group: str,
+    choices: tuple[str, ...],
+    default: Any,
+    help: str,
+    *,
+    optional: bool = False,
+) -> CliOption:
+    return CliOption(
+        flags=flags,
+        dest=dest,
+        group=group,
+        parser_type=str,
+        choices=choices,
+        default=default,
+        help=help,
+        config_key=dest,
+        config_kind=ConfigKind.CHOICE,
+        config_type=str,
+        config_optional=optional,
+    )
+
+
+HELP_GROUPS = (
+    "Input",
+    "Run",
+    "Backend/Selection",
+    "Validation",
+    "Comparison",
+    "Output",
+    "Profiling",
+)
 
 CLI_OPTIONS: tuple[CliOption, ...] = (
+    # Input
     CliOption(
         flags=("--graph", "-g"),
         dest="graph",
+        group="Input",
         nargs="+",
         metavar="PATH",
-        help="One or more paths, directories, glob patterns (e.g., 'graphs/*.json'), or "
-        "tarballs (.tar, .tar.gz, .tgz) containing JSON graph files. "
-        "A directory is searched recursively for .json files. "
-        "Shell expansion (e.g., Workloads/BNorm/*) is accepted directly.",
+        help="graph JSON files, directories, globs, or tarballs "
+        "(.tar, .tar.gz, .tgz, .tar.bz2, .tar.xz)",
         config_key="graphs",
         config_kind=ConfigKind.PATH_LIST,
     ),
     CliOption(
         flags=("--config",),
         dest="config",
+        group="Input",
         parser_type=Path,
         metavar="PATH",
-        help="TOML benchmark recipe. CLI flags override config values.",
+        help="TOML recipe; explicit CLI flags override its values",
     ),
+    # Run
     CliOption(
         flags=("--warmup", "-w"),
         dest="warmup",
-        parser_type=int,
-        default=10,
+        group="Run",
+        parser_type=_at_least(int, 0),
+        default=_default(SuiteConfig, "warmup_iters"),
         metavar="N",
-        help="Number of warmup iterations (default: 10)",
+        help="untimed warmup launches per engine",
         config_key="warmup",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
@@ -145,148 +242,135 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
         flags=("--iters", "-i"),
         dest="iters",
-        parser_type=int,
-        default=100,
+        group="Run",
+        parser_type=_at_least(int, 1),
+        default=_default(SuiteConfig, "benchmark_iters"),
         metavar="N",
-        help="Number of benchmark iterations (default: 100)",
+        help="minimum timed iterations per engine",
         config_key="iters",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
     ),
     CliOption(
-        flags=("--timing-block",),
-        dest="timing_block",
-        parser_type=int,
-        default=1,
-        metavar="N",
-        help=(
-            "Executions per timed sample (default: 1). 1 times each execution "
-            "on its own. N > 1 times N back-to-back executions between one "
-            "GPU event pair and records elapsed/N, matching the rocKE "
-            "benchmarks' block timing"
-        ),
-        config_key="timing_block",
+        flags=("--min-time-ms",),
+        dest="min_time_ms",
+        group="Run",
+        parser_type=_at_least(float, 0),
+        default=_default(SuiteConfig, "min_time_ms"),
+        metavar="MS",
+        help="keep timing until summed kernel time reaches MS (0 = exactly --iters)",
+        config_key="min_time_ms",
         config_kind=ConfigKind.SCALAR,
-        config_type=int,
+        config_type=float,
     ),
-    CliOption(
-        flags=("--autotune",),
-        dest="autotune",
-        action="store_true",
-        default=False,
-        help=(
-            "Sample every knob-filtered candidate kernel on each plan's first "
-            "execute and cache the winner, via HIPDNN_FORCE_BENCHMARKING=1. "
-            "Without it an engine serves its cold heuristic's rank-0 pick, so a "
-            "table measures the heuristic rather than what the shipped kernel "
-            "set can deliver -- and an engine that gains good variants can "
-            "measure SLOWER when the tie-break is a coin flip. Required for any "
-            "best-vs-best comparison. Pair with a per-run --cache-dir."
-        ),
-        config_key="autotune",
-        config_kind=ConfigKind.SCALAR,
-        config_type=bool,
-    ),
-    CliOption(
-        flags=("--cache-dir",),
-        dest="cache_dir",
-        parser_type=Path,
-        metavar="PATH",
-        help=(
-            "Set HIPDNN_CACHE_DIR for the run. The ingestor's winner cache is on "
-            "disk and outlives the job, and reads are NOT gated on benchmarking "
-            "while writes are -- so an untuned phase can silently replay a "
-            "previous tuned ranking. Give each phase its own empty root."
-        ),
-        config_key="cache_dir",
-        config_kind=ConfigKind.SCALAR,
-        config_type=str,
-    ),
-    CliOption(
-        flags=("--engine", "-e"),
-        dest="engine",
-        parser_type=_parse_engine_list,
-        metavar="IDS",
-        help="Engine ID or comma-separated list of IDs to run "
-        "(default: all discovered engines). Examples: -e 1, -e 1,2,3",
+    _choice_option(
+        ("--cache-mode",),
+        "cache_mode",
+        "Run",
+        CACHE_MODE_CHOICES,
+        _default(SuiteConfig, "cache_mode"),
+        "warm reuses caches; cold flushes L2/MALL before each timed iteration",
     ),
     CliOption(
         flags=("--seed", "-s"),
         dest="seed",
+        group="Run",
         parser_type=int,
+        default=_default(SuiteConfig, "seed"),
         metavar="SEED",
-        help="Random seed for reproducible input data (default: None)",
+        help="random seed for input data",
         config_key="seed",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
-        config_optional=True,
+    ),
+    # Backend/Selection
+    _choice_option(
+        ("--backend", "-b"),
+        "backend",
+        "Backend/Selection",
+        _values(ExecutionBackendName),
+        _default(SuiteConfig, "backend"),
+        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch",
     ),
     CliOption(
-        flags=("--backend", "-b"),
-        dest="backend",
-        parser_type=str,
-        choices=_BACKEND_CHOICES,
-        default=ExecutionBackendName.HIPDNN.value,
-        metavar="BACKEND",
-        help="Execution backend (default: hipdnn). "
-        "Options: hipdnn (AMD GPU via hipDNN), pytorch (GPU via PyTorch)",
-        config_key="backend",
-        config_kind=ConfigKind.CHOICE,
-        config_type=str,
+        flags=("--engine", "-e"),
+        dest="engine",
+        group="Backend/Selection",
+        parser_type=_parse_engine_list,
+        default=_default(SuiteConfig, "engine_filter"),
+        metavar="ENGINES",
+        help="comma list of engine names, decimal IDs or 0x hex IDs, run in order "
+        "(default: all discovered)",
     ),
     CliOption(
-        flags=("--output", "-o"),
-        dest="output",
+        flags=("--plugin-path",),
+        dest="plugin_path",
+        group="Backend/Selection",
+        parser_type=_parse_plugin_path_list,
+        metavar="PATHS",
+        help="plugin dir, or comma list matching --engine order "
+        "(default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
+        config_key="plugin_path",
+        config_kind=ConfigKind.PATH_OR_PATH_LIST,
+    ),
+    _bool_option(
+        ("--autotune",),
+        "autotune",
+        "Backend/Selection",
+        SuiteConfig,
+        "autotune",
+        "benchmark candidate kernels on first execute and cache the winner "
+        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --cache-dir",
+    ),
+    CliOption(
+        flags=("--cache-dir",),
+        dest="cache_dir",
+        group="Backend/Selection",
         parser_type=Path,
         metavar="PATH",
-        group="Output",
-        help="Export benchmark results to JSON file for offline comparison",
-        config_key="output",
+        help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
+        config_key="cache_dir",
         config_kind=ConfigKind.PATH,
     ),
-    CliOption(
-        flags=("-v", "--verbose"),
-        dest="verbose",
-        action="store_true",
-        default=False,
-        group="Output",
-        help="Show detailed per-engine breakdown for each graph "
-        "(default: summary table)",
-        config_key="verbose",
-        config_kind=ConfigKind.SCALAR,
-        config_type=bool,
+    _choice_option(
+        ("--pytorch-sdpa-backend",),
+        "pytorch_sdpa_backend",
+        "Backend/Selection",
+        _values(PyTorchSdpaBackendName),
+        _default(SuiteConfig, "pytorch_sdpa_backend"),
+        "PyTorch SDPA category; non-default categories are strict (no fallback)",
     ),
     CliOption(
-        flags=("--oracle-mode",),
-        dest="oracle_mode",
+        flags=("--pytorch-rocm-fa-library",),
+        dest="pytorch_rocm_fa_library",
+        group="Backend/Selection",
         parser_type=str,
-        choices=_ORACLE_MODE_CHOICES,
-        default="off",
-        metavar="MODE",
-        group="Output",
-        help=(
-            "Oracle comparison depth (default: off). 'plan' also times the "
-            "plan hipDNN auto-tuning picks for each engine and reports the "
-            "delta against the heuristic plan. 'exhaustive' additionally "
-            "forces provider kernel benchmarking so providers sample kernel "
-            "variants; both run one tuning sweep per engine and are "
-            "significantly slower, 'exhaustive' much more so."
-        ),
-        config_key="oracle_mode",
-        config_kind=ConfigKind.CHOICE,
+        default=_default(SuiteConfig, "pytorch_rocm_fa_library"),
+        metavar="LIBRARY",
+        help="ROCm Flash Attention implementation passed to PyTorch "
+        "(e.g. aotriton); requires --pytorch-sdpa-backend flash",
+        config_key="pytorch_rocm_fa_library",
+        config_kind=ConfigKind.SCALAR,
         config_type=str,
+    ),
+    # Validation
+    _choice_option(
+        ("--validate",),
+        "validate",
+        "Validation",
+        _values(ReferenceProviderName),
+        _default(ValidationConfig, "provider"),
+        "reference provider for correctness checks; pytorch adds a timed "
+        "reference row",
     ),
     CliOption(
         flags=("--rtol",),
         dest="rtol",
-        parser_type=float,
-        default=None,
+        group="Validation",
+        parser_type=_at_least(float, 0),
+        default=_default(ValidationConfig, "rtol"),
         metavar="TOL",
-        group="Reference Comparison",
-        help=(
-            "Relative tolerance for output comparison (default: dtype-aware; "
-            "if set without --atol, also used as absolute tolerance)"
-        ),
+        help="relative tolerance (default: dtype-aware; alone it sets both)",
         config_key="rtol",
         config_kind=ConfigKind.SCALAR,
         config_type=float,
@@ -295,219 +379,125 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
         flags=("--atol",),
         dest="atol",
-        parser_type=float,
-        default=None,
+        group="Validation",
+        parser_type=_at_least(float, 0),
+        default=_default(ValidationConfig, "atol"),
         metavar="TOL",
-        group="Reference Comparison",
-        help=(
-            "Absolute tolerance for output comparison (default: dtype-aware; "
-            "if set without --rtol, also used as relative tolerance)"
-        ),
+        help="absolute tolerance (default: dtype-aware; alone it sets both)",
         config_key="atol",
         config_kind=ConfigKind.SCALAR,
         config_type=float,
         config_optional=True,
     ),
-    CliOption(
-        flags=("--validate",),
-        dest="validate",
-        parser_type=str,
-        choices=REFERENCE_PROVIDER_CHOICES,
-        default=ReferenceProviderName.NONE.value,
-        metavar="PROVIDER",
-        group="Reference Validation",
-        help=(
-            "Reference provider for validation (default: none). "
-            f"Options: {_REFERENCE_PROVIDER_HELP}. "
-            "With pytorch, suite output includes a timed reference row when "
-            "PyTorch GPU execution is available."
-        ),
-        config_key="validate",
-        config_kind=ConfigKind.CHOICE,
-        config_type=str,
+    # Comparison
+    _choice_option(
+        ("--oracle-mode",),
+        "oracle_mode",
+        "Comparison",
+        _values(OracleMode),
+        _default(SuiteConfig, "oracle_mode"),
+        "also time hipDNN's auto-tuned plan per engine; exhaustive forces "
+        "provider kernel search (much slower)",
     ),
+    # Output
     CliOption(
-        flags=("--pytorch-sdpa-backend",),
-        dest="pytorch_sdpa_backend",
-        parser_type=str,
-        choices=PYTORCH_SDPA_BACKEND_CHOICES,
-        default=PyTorchSdpaBackendName.DEFAULT.value,
-        metavar="BACKEND",
-        group="Reference Validation",
-        help=(
-            "PyTorch scaled-dot-product-attention category (default: default). "
-            f"Options: {_PYTORCH_SDPA_BACKEND_HELP}. Non-default categories are "
-            "strict: the graph must execute native forward SDPA through the "
-            "selected category or it errors; no default or CPU fallback is tried."
-        ),
-        config_key="pytorch_sdpa_backend",
-        config_kind=ConfigKind.CHOICE,
-        config_type=str,
+        flags=("--output", "-o"),
+        dest="output",
+        group="Output",
+        parser_type=Path,
+        metavar="PATH",
+        help="write results to PATH (CSV when PATH ends in .csv, else JSON)",
+        config_key="output",
+        config_kind=ConfigKind.PATH,
     ),
-    CliOption(
-        flags=("--pytorch-rocm-fa-library",),
-        dest="pytorch_rocm_fa_library",
-        parser_type=str,
-        default=None,
-        metavar="LIBRARY",
-        group="Reference Validation",
-        help=(
-            "ROCm Flash Attention implementation preference forwarded unchanged "
-            "to PyTorch (for example: aotriton). Requires "
-            "--pytorch-sdpa-backend flash; ROCm-only. PyTorch rejects unknown "
-            "preferences."
-        ),
-        config_key="pytorch_rocm_fa_library",
-        config_kind=ConfigKind.SCALAR,
-        config_type=str,
+    _bool_option(
+        ("-v", "--verbose"),
+        "verbose",
+        "Output",
+        SuiteConfig,
+        "verbose",
+        "per-engine detail instead of the summary table",
     ),
-    CliOption(
-        flags=("--plugin-path",),
-        dest="plugin_path",
-        parser_type=_parse_plugin_path_list,
-        metavar="PATHS",
-        group="Suite Options",
-        help=(
-            "Directory containing hipDNN engine plugin .so files, or a "
-            "comma-separated list matching --engine order. A single path is "
-            "shared by all selected engines. If omitted, "
-            "ROCM_PATH/lib/hipdnn_plugins/engines is used when ROCM_PATH is set."
-        ),
-        config_key="plugin_path",
-        config_kind=ConfigKind.PATH_OR_PATH_LIST,
+    _bool_option(
+        ("-q", "--quiet"),
+        "quiet",
+        "Output",
+        SuiteConfig,
+        "quiet",
+        "suppress progress lines; tables and the summary still print",
     ),
-    CliOption(
-        flags=("--metrics-tier",),
-        dest="metrics_tier",
-        parser_type=str,
-        choices=_METRICS_TIER_CHOICES,
-        default="basic",
-        metavar="TIER",
-        group="Metrics",
-        help=(
-            "Always-on metric tier (default: basic). 'basic' adds "
-            "analytical FLOPs/IO, workspace size, host CPU rusage + RAM, "
-            "amdsmi GPU snapshot, and machine metadata at zero extra "
-            "runtime cost. 'off' disables all extra metric collection."
-        ),
-        config_key="metrics_tier",
-        config_kind=ConfigKind.CHOICE,
-        config_type=str,
+    _choice_option(
+        ("--metrics-tier",),
+        "metrics_tier",
+        "Output",
+        _values(MetricsTier),
+        _default(MetricsConfig, "tier"),
+        "basic adds FLOPs/IO, workspace, host and GPU snapshots at no timing "
+        "cost; off disables them",
     ),
-    CliOption(
-        flags=("--emit-trace",),
-        dest="emit_trace",
-        parser_type=str,
-        choices=_EMIT_TRACE_CHOICES,
-        metavar="FORMAT",
-        group="Metrics",
-        help=(
-            "Re-run benchmark under rocprofv3 and export a kernel + "
-            "memory-copy trace in Perfetto format. "
-            "Adds ~1 extra workload run (~5%% kernel-time overhead)."
-        ),
-        config_key="emit_trace",
-        config_kind=ConfigKind.CHOICE,
-        config_type=str,
-        config_optional=True,
+    # Profiling
+    _choice_option(
+        ("--pmc",),
+        "pmc",
+        "Profiling",
+        PMC_SET_CHOICES,
+        _default(MetricsConfig, "pmc_set"),
+        "re-run under rocprofv3 with this counter set (~30%% extra wall time)",
+        optional=True,
     ),
-    CliOption(
-        flags=("--pmc",),
-        dest="pmc",
-        parser_type=str,
-        choices=_PMC_CHOICES,
-        metavar="SET",
-        group="Metrics",
-        help=(
-            "Re-run benchmark under rocprofv3 with the named PMC counter "
-            "set. Per-kernel aggregates land in extra_metrics['pmc']. "
-            "'all' requires --pmc-allow-multipass. Adds ~1 extra workload "
-            "run (~30%% wallclock overhead)."
-        ),
-        config_key="pmc",
-        config_kind=ConfigKind.CHOICE,
-        config_type=str,
-        config_optional=True,
+    _bool_option(
+        ("--pmc-allow-multipass",),
+        "pmc_allow_multipass",
+        "Profiling",
+        MetricsConfig,
+        "pmc_allow_multipass",
+        "allow --pmc all (multi-pass replay; can hang for minutes)",
     ),
-    CliOption(
-        flags=("--pmc-allow-multipass",),
-        dest="pmc_allow_multipass",
-        action="store_true",
-        default=False,
-        group="Metrics",
-        help=(
-            "Required to use --pmc all. The unioned counter set exceeds "
-            "the single-pass replay budget on most arches and rocprofv3 "
-            "falls back to multi-pass replay, which has been observed to "
-            "hang for minutes on sub-second workloads."
-        ),
-        config_key="pmc_allow_multipass",
-        config_kind=ConfigKind.SCALAR,
-        config_type=bool,
+    _choice_option(
+        ("--emit-trace",),
+        "emit_trace",
+        "Profiling",
+        EMIT_TRACE_CHOICES,
+        _default(MetricsConfig, "emit_trace"),
+        "re-run under rocprofv3 and write a Perfetto kernel/memcpy trace",
+        optional=True,
     ),
-    CliOption(
-        flags=("--perf",),
-        dest="perf",
-        action="store_true",
-        default=False,
-        group="Metrics",
-        help=(
-            "Wrap re-run in 'perf stat -x,' to collect CPU cycles, "
-            "instructions, IPC, and task-clock. Kernel-space events drop "
-            "silently when /proc/sys/kernel/perf_event_paranoid > 1. "
-            "Adds ~1 extra workload run."
-        ),
-        config_key="perf",
-        config_kind=ConfigKind.SCALAR,
-        config_type=bool,
+    _bool_option(
+        ("--perf",),
+        "perf",
+        "Profiling",
+        MetricsConfig,
+        "perf",
+        "re-run under 'perf stat' for CPU cycles, instructions and IPC",
     ),
-    CliOption(
-        flags=("--roofline",),
-        dest="roofline",
-        action="store_true",
-        default=False,
-        group="Metrics",
-        help=(
-            "Re-run under 'rocprof-compute profile --roof-only' to "
-            "capture HBM/compute ceilings. The CSV artefacts "
-            "(roofline.csv, sysinfo.csv) and the workload directory "
-            "path land in extra_metrics['roofline'] — render the PDF "
-            "post-hoc via 'rocprof-compute analyze --path <workload>'. "
-            "Adds ~3 extra workload runs."
-        ),
-        config_key="roofline",
-        config_kind=ConfigKind.SCALAR,
-        config_type=bool,
+    _bool_option(
+        ("--roofline",),
+        "roofline",
+        "Profiling",
+        MetricsConfig,
+        "roofline",
+        "re-run under 'rocprof-compute --roof-only' for HBM/compute ceilings "
+        "(~3 extra runs)",
     ),
     CliOption(
         flags=("--profiling-output-dir",),
         dest="profiling_output_dir",
+        group="Profiling",
         parser_type=Path,
+        default=_default(MetricsConfig, "profiling_output_dir"),
         metavar="DIR",
-        group="Metrics",
-        help=(
-            "Root directory for profiling artefacts (rocpd dbs, "
-            "pftraces, perf CSVs, roofline CSVs). Default: "
-            "./profiling-output/<utc-timestamp>/."
-        ),
+        help="profiling artefact root (default: ./profiling-output/<utc-timestamp>/)",
         config_key="profiling_output_dir",
         config_kind=ConfigKind.PATH,
     ),
     CliOption(
         flags=("--profiling-timeout",),
         dest="profiling_timeout",
-        parser_type=int,
-        default=600,
+        group="Profiling",
+        parser_type=_at_least(int, 0),
+        default=_default(MetricsConfig, "profiling_timeout_s"),
         metavar="SECONDS",
-        group="Metrics",
-        help=(
-            "Wall-clock budget for each external profiler subprocess "
-            "(rocprofv3, perf, rocprof-compute). Default "
-            "600 s. A wedged child surfaces as 'timed out after Ns' in "
-            "extra_metrics['<source>']['skipped'] instead of hanging the "
-            "suite. Bump for known-long workloads (heavy graph under "
-            "multi-pass PMC replay). Pass 0 to disable the timeout."
-        ),
+        help="timeout per profiler subprocess; 0 disables",
         config_key="profiling_timeout",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
@@ -522,32 +512,54 @@ OPTION_DEFAULTS: dict[str, Any] = {
     option.dest: option.default for option in CLI_OPTIONS
 }
 
+_EPILOG = """\
+examples:
+  dnn-benchmark -g graphs/sample_conv_fwd.json
+  dnn-benchmark -g graphs/sample_conv_fwd.json -w 20 -i 200 --cache-mode cold
+  dnn-benchmark -g graphs/sample_conv_fwd.json -e MIOPEN_ENGINE -v
+  dnn-benchmark -g graphs/sample_conv_fwd.json -e MIOPEN_ENGINE,MIOPEN_ENGINE \\
+      --plugin-path /path/to/build_a/engines,/path/to/build_b/engines
+  dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
+  dnn-benchmark -g graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend flash
+  dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
+
+engines:
+  hipdnn_list_engines --plugin-dir <plugin dir> lists engine names and IDs.
+
+compare two result files:
+  dnn-benchmark compare --help
+
+exit codes:
+  0 ok; 1 error (error row, graph error or write failure); 2 usage or config error;
+  3 correctness mismatch; 130/143 interrupted by SIGINT/SIGTERM
+"""
+
+
+def _version() -> str:
+    try:
+        return importlib.metadata.version("dnn-benchmarking")
+    except importlib.metadata.PackageNotFoundError:
+        return "0+unknown"
+
 
 def _add_cli_option(
-    parser: argparse.ArgumentParser,
-    groups: dict[str, Any],
-    option: CliOption,
-    *,
-    suppress_defaults: bool,
+    groups: dict[str, Any], option: CliOption, *, suppress_defaults: bool
 ) -> None:
-    target = groups.get(option.group, parser)
+    help_text = option.help
+    if option.default is not None and not isinstance(option.default, bool):
+        help_text += f" (default: {option.default})"
     kwargs: dict[str, Any] = {
+        "dest": option.dest,
         "default": argparse.SUPPRESS if suppress_defaults else option.default,
-        "help": option.help,
+        "help": help_text,
     }
-    if option.dest:
-        kwargs["dest"] = option.dest
-    if option.action is not None:
-        kwargs["action"] = option.action
+    for name in ("action", "nargs", "metavar", "choices"):
+        value = getattr(option, name)
+        if value is not None:
+            kwargs[name] = value
     if option.parser_type is not None:
         kwargs["type"] = option.parser_type
-    if option.nargs is not None:
-        kwargs["nargs"] = option.nargs
-    if option.metavar is not None:
-        kwargs["metavar"] = option.metavar
-    if option.choices is not None:
-        kwargs["choices"] = sorted(option.choices)
-    target.add_argument(*option.flags, **kwargs)
+    groups[option.group].add_argument(*option.flags, **kwargs)
 
 
 def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser:
@@ -557,99 +569,29 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
         suppress_defaults: When True, absent public options are omitted from
             the parsed namespace. The CLI entry point uses this so config-file
             values can be merged as ``defaults < config < explicit CLI``.
-
-    Returns:
-        Configured ArgumentParser.
     """
     parser = argparse.ArgumentParser(
         prog="dnn-benchmark",
-        description=(
-            "Benchmarking and validation tool for hipDNN graphs\n\n"
-            "WARNING: This tool is in early development and subject to change.\n"
-            "Do not use it in build workflows or CI pipelines."
-        ),
+        usage="%(prog)s -g PATH [PATH ...] [options]\n"
+        "       %(prog)s --config FILE [options]\n"
+        "       %(prog)s compare ...",
+        description="Benchmark and validate hipDNN graphs "
+        "(early development; not for build workflows or CI gating).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  dnn-benchmark --graph ./graphs/conv1_fwd.json
-  dnn-benchmark --graph ./graphs/conv1_fwd.json --warmup 20 --iters 200
-  dnn-benchmark -g ./graphs/conv1_fwd.json -e 1
-  dnn-benchmark -g ./graphs/conv1_fwd.json -v        # verbose per-engine output
-  dnn-benchmark -g ./graphs/conv1_fwd.json -e 1,2
-  dnn-benchmark --config sample_configs/basic.toml.example --graph ./graphs/conv1_fwd.json
-  dnn-benchmark --config sample_configs/config.toml.example --iters 500
-
-PyTorch Backend (GPU via PyTorch):
-  dnn-benchmark -g ./graph.json --backend pytorch
-  dnn-benchmark -g ./graph.json --backend pytorch -o pytorch_results.json
-  dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend flash --pytorch-rocm-fa-library aotriton -o pytorch_flash_aotriton.json
-  default preserves normal dispatch. Non-default categories are strict.
-  On ROCm, --pytorch-rocm-fa-library forwards a Flash implementation preference
-  (for example, aotriton); PyTorch may use another implementation.
-
-Reference Validation:
-  dnn-benchmark -g ./graph.json --validate pytorch
-  dnn-benchmark -g ./graph.json --validate pytorch --rtol 1e-3
-  dnn-benchmark -g ./graph.json --validate pytorch -v  # includes PyTorch reference row when available
-
-Engine Comparison:
-  dnn-benchmark -g ./graph.json --engine 1,2,3
-  dnn-benchmark -g ./graph.json --engine 1,2 --plugin-path /path/pluginA,/path/pluginB
-
-Engine IDs:
-  hipdnn_list_engines --plugin-dir /path/to/hipdnn_plugins/engines
-  (shipped with hipDNN tools, e.g. /opt/rocm/bin/hipdnn_list_engines)
-
-Suite Mode (multiple graphs):
-  dnn-benchmark -g graphs/                           # all .json/.tar.gz files in directory
-  dnn-benchmark --graph 'graphs/*.json' --warmup 10 --iters 100
-  dnn-benchmark --graph 'graphs/*.json' -o results.json
-  dnn-benchmark --graph 'graphs/*.json' -v           # rich block per (graph, engine)
-
-Tarball Input:
-  dnn-benchmark --graph graphs.tar.gz
-  dnn-benchmark --graph graphs.tgz -o results.json
-        """,
+        epilog=_EPILOG,
+        allow_abbrev=False,
     )
-
-    groups = {
-        "Output": parser.add_argument_group("Output"),
-        "Reference Comparison": parser.add_argument_group("Reference Comparison"),
-        "Reference Validation": parser.add_argument_group("Reference Validation"),
-        "Suite Options": parser.add_argument_group("Suite Options"),
-        "Metrics": parser.add_argument_group("Metrics"),
-    }
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_version()}")
+    groups = {name: parser.add_argument_group(name) for name in HELP_GROUPS}
     for option in CLI_OPTIONS:
-        _add_cli_option(parser, groups, option, suppress_defaults=suppress_defaults)
+        _add_cli_option(groups, option, suppress_defaults=suppress_defaults)
 
-    # --roofline-data-type intentionally absent: rocprof-compute only
-    # accepts it under `analyze`, not `profile`. The profile run captures
-    # ceilings at the tool's default datatype (FP32); rendering FP16/
-    # BF16/etc. PDFs is a post-processing step the user runs themselves
-    # against extra_metrics["roofline"]["workload_path"]:
-    #   rocprof-compute analyze --path <workload_path> --roofline-data-type FP16
-
-    # Hidden re-exec sub-mode: when an opt-in profiling source is
-    # requested, the parent process shells out to a fresh CLI invocation
-    # under the profiler. The child process picks up these flags to
-    # short-circuit setup and run a single (graph, engine) workload.
+    # Hidden re-exec mode used by the profiling orchestrator:
+    #   --internal-profiling-run --graph G --engine E --warmup W --iters I --seed S
     parser.add_argument(
         "--internal-profiling-run",
         action="store_true",
         default=False,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument(
-        "--internal-profiling-engine",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--internal-profiling-graph",
-        type=Path,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-
     return parser

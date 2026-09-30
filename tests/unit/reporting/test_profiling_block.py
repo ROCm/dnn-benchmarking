@@ -1,155 +1,102 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for the Reporter Profiling: block rendering.
+"""Opt-in profiling slice of the verbose detail block.
 
-Each opt-in profiling source contributes one optional line; the block
-itself is suppressed when extra_metrics is empty or only carries
-non-source keys.
+Each source contributes its own lines; failures show the reason and the
+last lines of the tool's stderr so a failed pass is visible without -o.
 """
 
 import io
 from pathlib import Path
 
-from dnn_benchmarking.reporting import Reporter
-from dnn_benchmarking.reporting.suite_results import ProviderEngineResult
+import pytest
+
+from dnn_benchmarking.reporting.reporter import Reporter
+from dnn_benchmarking.reporting.suite_results import GraphResult, ProviderEngineResult
 
 
-def _make_pe(extra_metrics):
-    return ProviderEngineResult(
-        provider="miopen",
+def _render(extra_metrics) -> str:
+    pe = ProviderEngineResult(
+        provider="hipdnn",
         engine_id=1,
+        engine_name="MIOPEN_ENGINE",
         status="success",
         extra_metrics=extra_metrics,
     )
+    out = io.StringIO()
+    Reporter(out, io.StringIO()).print_graph_verbose(
+        GraphResult("g", "/tmp/g.json", [pe], engine_ids=[1])
+    )
+    return out.getvalue()
 
 
-class TestNoProfilingDataSuppressesBlock:
-    def test_none_extra_metrics_emits_nothing(self):
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(None))
-        assert out.getvalue() == ""
-
-    def test_empty_dict_emits_nothing(self):
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe({}))
-        assert out.getvalue() == ""
+@pytest.mark.parametrize("extra", [None, {}])
+def test_no_profiling_data_renders_no_profiling_lines(extra) -> None:
+    assert "profiling" not in _render(extra)
 
 
-class TestPmcRendering:
-    def test_counters_present_renders_first_three(self):
-        extra = {
-            "pmc": {
-                "set": "basic",
-                "arch": "gfx942",
-                "counters": {
-                    "GRBM_GUI_ACTIVE": {"sum": 12345678, "mean_per_kernel": 1.0},
-                    "SQ_WAVES": {"sum": 987654, "mean_per_kernel": 2.0},
-                    "SQ_INSTS_VALU": {"sum": 4321, "mean_per_kernel": 3.0},
-                    "SQ_BUSY_CYCLES": {"sum": 11, "mean_per_kernel": 4.0},
-                },
-            }
-        }
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        text = out.getvalue()
-        assert "Profiling:" in text
-        assert "PMC (basic, gfx942)" in text
-        assert "GRBM_GUI_ACTIVE=12,345,678" in text
-        # Fourth counter is collapsed into a "more" suffix.
-        assert "SQ_BUSY_CYCLES" not in text
-        assert "[1 more, see JSON]" in text
+def test_pmc_shows_busiest_kernels_first_and_folds_the_rest() -> None:
+    per_kernel = {
+        f"kernel_{i}": {"dispatches": i, "counters": {"SQ_WAVES": 64.0 * i}} for i in range(1, 6)
+    }
+    per_kernel["kernel_5"]["counters"].update({"A": 1.0, "B": 2.0, "C": 3.0})
+    per_kernel["kernel_5"]["l2_hit_rate"] = 0.85
+    text = _render({"pmc": {"set": "basic", "arch": "gfx90a", "per_kernel": per_kernel}})
 
-    def test_pmc_skipped_renders_reason(self):
-        extra = {
-            "pmc": {"set": "basic", "arch": "gfx942", "skipped": "no counters defined"}
-        }
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        assert "PMC (basic, gfx942):  skipped — no counters defined" in out.getvalue()
-
-    def test_db_path_renders_with_analyze_hint(self):
-        """The rocpd db is the source of truth — both the aggregates we
-        derived AND the additional speed-of-light blocks rocprof-compute
-        can render. Surface the db path + the analyze command so the
-        user has a copy-paste path into the full dashboard."""
-        extra = {
-            "pmc": {
-                "set": "basic",
-                "arch": "gfx942",
-                "counters": {"GRBM_GUI_ACTIVE": {"sum": 1, "mean_per_kernel": 1.0}},
-                "db_path": "/tmp/prof/sample/MIOPEN_ENGINE/pmc_basic/results.db",
-            }
-        }
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        rendered = out.getvalue()
-        assert "PMC db:" in rendered
-        assert "/tmp/prof/sample/MIOPEN_ENGINE/pmc_basic/results.db" in rendered
-        # analyze takes the db's parent dir, not the db itself. The
-        # reporter derives it via Path, so it renders with the platform
-        # separator.
-        analyze_dir = str(
-            Path("/tmp/prof/sample/MIOPEN_ENGINE/pmc_basic/results.db").parent
-        )
-        assert f"rocprof-compute analyze --path {analyze_dir}" in rendered
+    pmc_lines = [line for line in text.splitlines() if "pmc (basic, gfx90a)" in line]
+    assert "kernel_5 x5" in pmc_lines[0]
+    assert "SQ_WAVES=320" in pmc_lines[0] and "[+1]" in pmc_lines[0]
+    assert "l2_hit 85.0%" in pmc_lines[0]
+    assert "kernel_1 x1" not in text
+    assert "[2 more kernel(s), see JSON]" in text
 
 
-class TestTraceRendering:
-    def test_pftrace_path_renders_with_perfetto_hint(self):
-        extra = {"trace": {"format": "pftrace", "path": "/tmp/out/results.pftrace"}}
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        text = out.getvalue()
-        assert "Trace (pftrace)" in text
-        assert "/tmp/out/results.pftrace" in text
-        assert "ui.perfetto.dev" in text
+def test_pmc_db_path_renders_with_analyze_hint() -> None:
+    db = "/tmp/prof/sample/MIOPEN_ENGINE/pmc_basic/results.db"
+    text = _render({"pmc": {"set": "basic", "arch": "gfx90a", "per_kernel": {}, "db_path": db}})
+    assert db in text
+    assert f"rocprof-compute analyze --path {Path(db).parent}" in text
 
 
-class TestPerfRendering:
-    def test_ipc_and_cycles_render(self):
-        extra = {
-            "perf": {
-                "ipc_user": 0.795,
-                "cycles_user": 1234567890,
-                "instructions_user": 987654321,
-                "task_clock_ms": 123.4,
-            }
-        }
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        text = out.getvalue()
-        assert "CPU (perf)" in text
-        assert "IPC=0.80" in text
-        assert "task_clock=123.4ms" in text
-
-    def test_perf_skipped_renders_reason(self):
-        extra = {"perf": {"skipped": "perf binary not found on PATH"}}
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        assert "skipped — perf binary not found on PATH" in out.getvalue()
+@pytest.mark.parametrize("source", ["pmc", "trace", "perf", "roofline"])
+def test_failed_pass_shows_return_code_and_last_three_stderr_lines(source) -> None:
+    tail = "\n".join(f"stderr line {i}" for i in range(1, 11))
+    text = _render({source: {"returncode": -6, "error_tail": tail}})
+    assert "failed (rc=-6)" in text
+    assert "stderr line 7" not in text
+    for i in (8, 9, 10):
+        assert f"| stderr line {i}" in text
 
 
-class TestRooflineRendering:
-    def test_csv_and_analyze_hint_render(self):
-        """``profile --roof-only`` produces CSVs; we surface roofline.csv
-        and analyze-command hints (ASCII + GUI) the user can copy-paste
-        to render the roofline in any datatype."""
-        extra = {
+def test_timeout_shows_reason_and_stderr_tail() -> None:
+    text = _render({"perf": {"skipped": "timed out after 600 s", "error_tail": "last words"}})
+    assert "perf: skipped — timed out after 600 s" in text
+    assert "| last words" in text
+
+
+def test_trace_path_renders_with_perfetto_hint() -> None:
+    text = _render({"trace": {"format": "pftrace", "path": "/tmp/out/results.pftrace"}})
+    assert "trace (pftrace): /tmp/out/results.pftrace" in text
+    assert "ui.perfetto.dev" in text
+
+
+def test_perf_counters_render_with_scope() -> None:
+    text = _render(
+        {"perf": {"ipc_user": 0.795, "task_clock_ms": 123.4, "scope": "process_total"}}
+    )
+    assert "IPC=0.80" in text and "task_clock=123.4ms" in text
+    assert "process_total" in text
+
+
+def test_roofline_csv_and_analyze_hint_render() -> None:
+    text = _render(
+        {
             "roofline": {
                 "roofline_csv": "/tmp/r/workload/gfx90a/roofline.csv",
-                "sysinfo_csv": "/tmp/r/workload/gfx90a/sysinfo.csv",
                 "workload_path": "/tmp/r/workload/gfx90a",
             }
         }
-        out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
-        rendered = out.getvalue()
-        assert "Roofline CSV:" in rendered
-        assert "/tmp/r/workload/gfx90a/roofline.csv" in rendered
-        # ASCII hint includes --block 4 (avoids the warning-flooded
-        # full speed-of-light output) and --gui hint includes the doc
-        # pointer for the analyze venv setup gotcha.
-        assert "rocprof-compute analyze --path /tmp/r/workload/gfx90a" in rendered
-        assert "--block 4" in rendered
-        assert "--gui" in rendered
+    )
+    assert "/tmp/r/workload/gfx90a/roofline.csv" in text
+    assert "rocprof-compute analyze --path /tmp/r/workload/gfx90a --block 4" in text

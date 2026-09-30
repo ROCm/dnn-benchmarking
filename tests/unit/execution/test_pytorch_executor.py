@@ -11,48 +11,69 @@ from typing import Any, List
 
 import pytest
 
-from dnn_benchmarking.config.benchmark_config import BenchmarkConfig, TimingBackendName
+import dnn_benchmarking.execution.timing as timing_module
+from dnn_benchmarking.common.exceptions import ExecutionError
+from dnn_benchmarking.config.benchmark_config import TimingPolicy
 
 # Import the reference handlers under real (CPU) torch so their module-level
-# torch references (e.g. F.conv1d, torch.dtype defaults) resolve once and are
-# cached. The fixtures below then swap in a minimal fake ``torch`` only for the
-# executor module, without re-importing the handler chain under the fake.
+# torch references resolve once and are cached. The fixtures below then swap
+# in a minimal fake ``torch`` only for the executor (and timing) modules.
 import dnn_benchmarking.execution.pytorch_ops  # noqa: E402,F401
 
 
 class FakeStream:
     def __init__(self, ptr: int) -> None:
         self.cuda_stream = ptr
-        self.synchronize_calls = 0
+
+
+class FakeTorchEvent:
+    def __init__(self, log: List[Any]) -> None:
+        self._log = log
+
+    def record(self, stream: Any) -> None:
+        self._log.append(("torch_record", stream))
 
     def synchronize(self) -> None:
-        self.synchronize_calls += 1
+        pass
+
+    def elapsed_time(self, other: Any) -> float:
+        return 2.0
 
 
 class FakeCuda:
     def __init__(self) -> None:
+        self.log: List[Any] = []
         self.device_depth = 0
-        self.device_entries: List[Any] = []
-        self.stream_entries: List[int] = []
-        self.default_stream_devices: List[Any] = []
-        self.initialized = False
+        self.active_stream: Any = None
         self.default_stream_obj = FakeStream(0xCAFE)
+        self.sync_mode: Any = 0
 
     def is_available(self) -> bool:
         return True
 
     def init(self) -> None:
-        assert self.device_depth > 0
-        self.initialized = True
+        pass
 
     def default_stream(self, device: Any) -> FakeStream:
-        assert self.device_depth > 0
-        self.default_stream_devices.append(device)
         return self.default_stream_obj
+
+    def current_stream(self) -> FakeStream:
+        return self.default_stream_obj
+
+    def synchronize(self) -> None:
+        self.log.append("torch_device_sync")
+
+    def Event(self, enable_timing: bool = False) -> FakeTorchEvent:
+        return FakeTorchEvent(self.log)
+
+    def get_sync_debug_mode(self) -> Any:
+        return self.sync_mode
+
+    def set_sync_debug_mode(self, mode: Any) -> None:
+        self.sync_mode = mode
 
     @contextmanager
     def device(self, device: Any):
-        self.device_entries.append(device)
         self.device_depth += 1
         try:
             yield
@@ -61,87 +82,71 @@ class FakeCuda:
 
     @contextmanager
     def stream(self, stream: FakeStream):
-        assert self.device_depth > 0
-        self.stream_entries.append(stream.cuda_stream)
-        yield
+        self.active_stream = stream
+        try:
+            yield
+        finally:
+            self.active_stream = None
 
 
-class FakeHipTimer:
-    created_streams: List[int] = []
-    start_calls = 0
-    stop_calls = 0
-    sync_calls = 0
+def _install_fake_hip(monkeypatch, log: List[Any]) -> None:
+    class Event:
+        def record(self, stream: int) -> None:
+            log.append(("hip_record", stream))
 
-    fake_cuda: FakeCuda
+        def synchronize(self) -> None:
+            pass
 
-    def __init__(self, stream: int = 0) -> None:
-        assert self.fake_cuda.device_depth > 0
-        self.stream = stream
-        self.created_streams.append(stream)
+        def elapsed_time(self, other) -> float:
+            return 1.0
 
-    @property
-    def backend_name(self) -> str:
-        return "hip"
+    class Gate:
+        def arm(self, stream: int) -> None:
+            log.append(("arm", stream))
 
-    def start(self) -> None:
-        assert self.fake_cuda.device_depth > 0
-        self.__class__.start_calls += 1
+        def release(self) -> None:
+            pass
 
-    def stop(self) -> None:
-        assert self.fake_cuda.device_depth > 0
-        self.__class__.stop_calls += 1
-
-    def elapsed_ms(self) -> float:
-        assert self.fake_cuda.device_depth > 0
-        return 1.25
-
-    def synchronize_stream(self) -> None:
-        assert self.fake_cuda.device_depth > 0
-        self.__class__.sync_calls += 1
+    monkeypatch.setattr(
+        timing_module,
+        "hipdnn",
+        types.SimpleNamespace(
+            HipEvent=Event,
+            HipStallGate=Gate,
+            hip_get_device_count=lambda: 1,
+            hip_device_synchronize=lambda: None,
+            hip_can_use_stream_wait_value=lambda: True,
+        ),
+    )
 
 
-class _RecordingCompiled:
-    """Fake CompiledGraph that records each replay so tests can count executions."""
+class RecordingCompiled:
+    """Fake CompiledGraph recording the tensor map of every replay."""
 
-    def __init__(self, executed: List[str]) -> None:
-        self._executed = executed
+    def __init__(self, cuda: FakeCuda) -> None:
+        self.cuda = cuda
+        self.seen: List[Any] = []
 
     def execute(self, tensors: Any) -> None:
-        self._executed.append("execute")
+        # Work must be enqueued on the executor's stream on its device.
+        assert self.cuda.device_depth > 0
+        assert self.cuda.active_stream is self.cuda.default_stream_obj
+        self.seen.append(tensors)
 
 
-def _load_executor_module(
-    monkeypatch: pytest.MonkeyPatch, fake_cuda: FakeCuda, is_rocm: bool = True
-):
+def _load_executor_module(monkeypatch, fake_cuda: FakeCuda, is_rocm: bool):
     fake_torch = types.ModuleType("torch")
-    fake_torch.__path__ = []  # mark as package for torch.nn.functional imports
+    fake_torch.__path__ = []
     fake_torch.Tensor = object
     fake_torch.cuda = fake_cuda
     fake_torch.device = lambda device: device
-    fake_nn = types.ModuleType("torch.nn")
-    fake_functional = types.ModuleType("torch.nn.functional")
-    fake_nn.functional = fake_functional
-    fake_torch.nn = fake_nn
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "torch.nn", fake_nn)
-    monkeypatch.setitem(sys.modules, "torch.nn.functional", fake_functional)
 
     module_name = "dnn_benchmarking.execution.pytorch_executor"
     old_module = sys.modules.pop(module_name, None)
     module = importlib.import_module(module_name)
-    # The executor resolves the auto/none timing backend from the torch
-    # build (ROCm -> HIP events, CUDA -> torch events), so drive that here.
     monkeypatch.setattr(module.torch_support, "gpu_available", lambda: True)
     monkeypatch.setattr(module.torch_support, "is_rocm_build", lambda: is_rocm)
-    monkeypatch.setattr(module, "HipGpuTimer", FakeHipTimer)
-    # These tests cover the non-staged control flow; disable stalled-queue
-    # staging so a GPU host does not arm a real HIP gate on the fake stream.
-    monkeypatch.setattr(module, "_is_staged_hip_available", lambda: False)
-    monkeypatch.setattr(
-        module,
-        "create_gpu_timer",
-        lambda backend, stream=0, torch_stream=None: FakeHipTimer(stream),
-    )
     monkeypatch.setattr(
         module.pytorch_ops, "get_unsupported_operations", lambda graph: []
     )
@@ -154,464 +159,154 @@ def _load_executor_module(
         sys.modules[module_name] = old_module
         execution_pkg.pytorch_executor = old_module
     elif getattr(execution_pkg, "pytorch_executor", None) is module:
-        # Drop the stale package attribute so later imports (and
-        # mock.patch dotted-name resolution) see a freshly imported module
-        # instead of this fixture's fake-torch variant.
         del execution_pkg.pytorch_executor
 
 
 @pytest.fixture
-def pytorch_executor_module(monkeypatch: pytest.MonkeyPatch):
-    fake_cuda = FakeCuda()
-    FakeHipTimer.created_streams = []
-    FakeHipTimer.start_calls = 0
-    FakeHipTimer.stop_calls = 0
-    FakeHipTimer.sync_calls = 0
-    FakeHipTimer.fake_cuda = fake_cuda
-
-    yield from _load_executor_module(monkeypatch, fake_cuda)
-
-
-def _make_executor(
-    module: Any,
-    collect_kernel_timing: bool = True,
-    pytorch_sdpa_backend: str = "default",
-    pytorch_rocm_fa_library: str | None = None,
-):
-    config = BenchmarkConfig(
-        graph_path="test.json",
-        warmup_iters=2,
-        benchmark_iters=2,
-        pytorch_sdpa_backend=pytorch_sdpa_backend,
-        pytorch_rocm_fa_library=pytorch_rocm_fa_library,
-    )
-    executor = module.PyTorchCudaExecutor(
-        graph_json={"nodes": []},
-        config=config,
-        device="cuda:1",
-        collect_kernel_timing=collect_kernel_timing,
-    )
-    return executor
-
-
-def test_prepare_creates_stream_timer_on_requested_device(
-    pytorch_executor_module,
-) -> None:
-    module = pytorch_executor_module
-    executor = _make_executor(module, collect_kernel_timing=False)
-
-    executor.prepare()
-
-    fake_cuda = module.torch.cuda
-    assert fake_cuda.initialized is True
-    assert fake_cuda.default_stream_devices == ["cuda:1"]
-    assert FakeHipTimer.created_streams == [0xCAFE]
-    assert all(device == "cuda:1" for device in fake_cuda.device_entries)
-
-
-def test_no_kernel_timing_uses_stream_sync_only(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = pytorch_executor_module
-    executed = []
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled(executed),
-    )
-    executor = _make_executor(module, collect_kernel_timing=False)
-    executor.prepare()
-
-    result = executor.benchmark(tensors={}, graph_name="pytorch_none")
-
-    assert executed == ["execute", "execute"]
-    assert result.kernel_timings is None
-    assert result.metadata is not None
-    assert result.metadata.timing_backend == ""
-    assert result.metadata.pytorch_sdpa_backend_requested == "default"
-    assert result.metadata.pytorch_rocm_fa_library_requested is None
-    assert FakeHipTimer.created_streams == [0xCAFE]
-    assert FakeHipTimer.start_calls == 0
-    assert FakeHipTimer.stop_calls == 0
-    assert FakeHipTimer.sync_calls == 2
-
-
-def test_collect_kernel_timing_collects_kernel_timings(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = pytorch_executor_module
-    scopes = []
-
-    @contextmanager
-    def record_scope(state):
-        assert state.selection.value == "flash"
-        assert state.rocm_fa_library == "aotriton"
-        scopes.append("enter")
-        try:
-            yield
-        finally:
-            scopes.append("exit")
-
-    monkeypatch.setattr(module.pytorch_ops, "use_pytorch_sdpa_backend", record_scope)
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled([]),
-    )
-    executor = _make_executor(
-        module,
-        collect_kernel_timing=True,
-        pytorch_sdpa_backend="flash",
-        pytorch_rocm_fa_library="aotriton",
-    )
-    executor.prepare()
-
-    result = executor.benchmark(tensors={}, graph_name="pytorch_hip")
-
-    assert result.kernel_timings == [1.25, 1.25]
-    assert result.metadata is not None
-    assert result.metadata.timing_backend == "hip"
-    assert result.metadata.pytorch_sdpa_backend_requested == "flash"
-    assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
-    assert FakeHipTimer.created_streams == [0xCAFE, 0xCAFE]
-    assert FakeHipTimer.start_calls == 2
-    assert FakeHipTimer.stop_calls == 2
-    assert FakeHipTimer.sync_calls == 0
-    assert scopes == ["enter", "exit"] * 2
-
-
-class _FakeStagedTimer:
-    """Stand-in for StalledRegionTimer that records the staged sequence."""
-
-    def __init__(self, stream: int) -> None:
-        self.stream = stream
-        self.barriers = 0
-        self.measures = 0
-
-    def barrier(self) -> None:
-        self.barriers += 1
-
-    def measure(self, enqueue):
-        self.measures += 1
-        enqueue()
-        return (0.5, 0.25)
-
-
-def test_staged_path_used_when_available(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """On a ROCm build with staging available, benchmark uses the staged
-    timer: a priming execute, then one staged measure per iteration."""
-    module = pytorch_executor_module
-    scopes = []
-
-    @contextmanager
-    def record_scope(state):
-        assert state.selection.value == "flash"
-        assert state.rocm_fa_library == "aotriton"
-        scopes.append("enter")
-        try:
-            yield
-        finally:
-            scopes.append("exit")
-
-    monkeypatch.setattr(module.pytorch_ops, "use_pytorch_sdpa_backend", record_scope)
-    executed: List[str] = []
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled(executed),
-    )
-    created_streams: List[int] = []
-    monkeypatch.setattr(
-        module,
-        "StalledRegionTimer",
-        lambda stream: created_streams.append(stream) or _FakeStagedTimer(stream),
-    )
-    monkeypatch.setattr(module, "_is_staged_hip_available", lambda: True)
-    # The staged path must not fall through to the non-staged GPU-event timer.
-    monkeypatch.setattr(
-        module,
-        "create_gpu_timer",
-        lambda *a, **k: pytest.fail("staged path must not build create_gpu_timer"),
-    )
-
-    executor = _make_executor(
-        module,
-        collect_kernel_timing=True,
-        pytorch_sdpa_backend="flash",
-        pytorch_rocm_fa_library="aotriton",
-    )
-    executor.prepare()
-    result = executor.benchmark(tensors={}, graph_name="pytorch_staged")
-
-    # benchmark_iters == 2 (from _make_executor config).
-    assert result.kernel_timings == [0.25, 0.25]
-    assert result.host_timings == [0.5, 0.5]
-    assert result.metadata is not None
-    assert result.metadata.timing_backend == "hip"
-    assert result.metadata.pytorch_sdpa_backend_requested == "flash"
-    assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
-    # Staged timer built from the torch graph-stream pointer.
-    assert created_streams == [0xCAFE]
-    # One untimed priming execute, then one execute per measured iteration.
-    assert executed == ["execute", "execute", "execute"]
-    assert scopes == ["enter", "exit"] * 3
-
-
-def test_unavailable_backend_has_no_successful_fallback(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = pytorch_executor_module
-    executions = []
-    error = module.pytorch_ops.PyTorchSdpaBackendUnavailableError(
-        "Requested PyTorch SDPA backend 'math' is unavailable; no fallback is used."
-    )
-
-    class UnavailableCompiled:
-        def execute(self, tensors):
-            executions.append("execute")
-            raise error
-
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: UnavailableCompiled(),
-    )
-    executor = _make_executor(
-        module,
-        collect_kernel_timing=False,
-        pytorch_sdpa_backend="math",
-    )
-    executor.prepare()
-
-    with pytest.raises(module.pytorch_ops.PyTorchSdpaBackendUnavailableError) as caught:
-        executor.benchmark(tensors={}, graph_name="unavailable")
-
-    assert caught.value is error
-    assert executions == ["execute"]
-
-
-def test_nondefault_backend_requires_native_sdpa_execution(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = pytorch_executor_module
-    executions: List[str] = []
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled(executions),
-    )
-    executor = _make_executor(
-        module,
-        collect_kernel_timing=False,
-        pytorch_sdpa_backend="math",
-    )
-    executor.prepare()
-
-    with pytest.raises(
-        module.pytorch_ops.PyTorchSdpaBackendUnavailableError,
-        match="The graph did not execute a native forward SDPA call.",
-    ):
-        executor.benchmark(tensors={}, graph_name="missing_sdpa")
-
-    assert executions == ["execute"]
-
-
-def test_cuda_build_skips_staging_even_if_bindings_available(
-    pytorch_executor_module_no_hip, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A CUDA torch build must not stage even when the HIP staging bindings
-    report available: staging would record HIP events on a CUDA stream."""
-    module = pytorch_executor_module_no_hip
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled([]),
-    )
-    monkeypatch.setattr(module, "_is_staged_hip_available", lambda: True)
-
-    def _must_not_build(stream: int):
-        raise AssertionError("staging must not run on a CUDA torch build")
-
-    monkeypatch.setattr(module, "StalledRegionTimer", _must_not_build)
-
-    executor = _make_executor(module, collect_kernel_timing=True)
-    executor.prepare()
-    # Completes without hitting _must_not_build -> non-staged path was taken.
-    result = executor.benchmark(tensors={}, graph_name="cuda_no_stage")
-
-    assert result.kernel_timings is not None
-    assert FakeHipTimer.start_calls == 2
-
-
-def test_block_timing_follows_rocke_protocol(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """timing_block=N: warmup() runs one untimed call; every sample runs
-    warmup_iters untimed executions, then N executions in one event pair
-    (elapsed/N); the first sample is discarded; the stall gate is bypassed."""
-    module = pytorch_executor_module
-    executed: List[str] = []
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled(executed),
-    )
-    monkeypatch.setattr(module, "_is_staged_hip_available", lambda: True)
-    monkeypatch.setattr(
-        module,
-        "StalledRegionTimer",
-        lambda *a, **k: pytest.fail("block timing must not use the stall gate"),
-    )
-    config = BenchmarkConfig(
-        graph_path="test.json", warmup_iters=2, benchmark_iters=3, timing_block=5
-    )
-    executor = module.PyTorchCudaExecutor(
-        graph_json={"nodes": []},
-        config=config,
-        device="cuda:1",
-        collect_kernel_timing=True,
-    )
-    executor.prepare()
-    executed.clear()
-
-    executor.warmup(tensors={})
-    assert executed == ["execute"]
-    executed.clear()
-
-    result = executor.benchmark(tensors={}, graph_name="block")
-
-    assert executed == ["execute"] * (3 * (2 + 5))
-    assert FakeHipTimer.start_calls == 3
-    assert FakeHipTimer.stop_calls == 3
-    assert result.kernel_timings == [0.25, 0.25]
-    assert result.metadata is not None and result.metadata.timing_block == 5
-
-
-def test_warmup_and_execute_once_use_stream_sync(
-    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = pytorch_executor_module
-    scopes = []
-
-    @contextmanager
-    def record_scope(state):
-        assert state.selection.value == "default"
-        scopes.append("enter")
-        try:
-            yield
-        finally:
-            scopes.append("exit")
-
-    monkeypatch.setattr(module.pytorch_ops, "use_pytorch_sdpa_backend", record_scope)
-    executed = []
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled(executed),
-    )
-    executor = _make_executor(module, collect_kernel_timing=False)
-    executor.prepare()
-
-    executor.warmup(tensors={})
-    executor.execute_once(tensors={})
-
-    assert executed == ["execute", "execute", "execute"]
-    assert FakeHipTimer.sync_calls == 2
-    assert module.torch.cuda.stream_entries == [0xCAFE, 0xCAFE]
-    assert scopes == ["enter", "exit"] * 3
+def fake_cuda() -> FakeCuda:
+    return FakeCuda()
 
 
 @pytest.fixture
-def pytorch_executor_module_no_hip(monkeypatch: pytest.MonkeyPatch):
-    """Executor module fixture for a CUDA torch build (no HIP events)."""
-    fake_cuda = FakeCuda()
-    FakeHipTimer.created_streams = []
-    FakeHipTimer.start_calls = 0
-    FakeHipTimer.stop_calls = 0
-    FakeHipTimer.sync_calls = 0
-    FakeHipTimer.fake_cuda = fake_cuda
+def rocm_module(monkeypatch, fake_cuda):
+    _install_fake_hip(monkeypatch, fake_cuda.log)
+    yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=True)
 
+
+@pytest.fixture
+def cuda_module(monkeypatch, fake_cuda):
+    monkeypatch.setattr(timing_module, "hipdnn", None)
+    monkeypatch.setitem(sys.modules, "hipdnn_frontend", None)  # not importable
     yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=False)
 
 
-def test_prepare_without_hip_skips_hip_sync_timer(
-    pytorch_executor_module_no_hip,
-) -> None:
-    module = pytorch_executor_module_no_hip
-    executor = _make_executor(module, collect_kernel_timing=True)
-
-    executor.prepare()
-
-    assert FakeHipTimer.created_streams == []
-
-
-def test_no_hip_synchronizes_through_torch_stream(
-    pytorch_executor_module_no_hip, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = pytorch_executor_module_no_hip
-    executed = []
-    monkeypatch.setattr(
-        module.pytorch_ops,
-        "compile_graph",
-        lambda graph_json: _RecordingCompiled(executed),
+def _prepared(module, monkeypatch, fake_cuda, sdpa="default", **policy):
+    compiled = RecordingCompiled(fake_cuda)
+    monkeypatch.setattr(module.pytorch_ops, "compile_graph", lambda graph: compiled)
+    executor = module.PyTorchCudaExecutor(
+        {"nodes": []},
+        TimingPolicy(**{"warmup_iters": 1, "iters": 2, **policy}),
+        pytorch_sdpa_backend=sdpa,
+        device="cuda:1",
     )
-    executor = _make_executor(module, collect_kernel_timing=False)
     executor.prepare()
-
-    result = executor.benchmark(tensors={}, graph_name="pytorch_cuda")
-
-    assert executed == ["execute", "execute"]
-    assert result.kernel_timings is None
-    assert FakeHipTimer.created_streams == []
-    assert FakeHipTimer.sync_calls == 0
-    assert module.torch.cuda.default_stream_obj.synchronize_calls == 2
+    return executor, compiled
 
 
-def test_auto_on_cuda_build_requests_torch_not_hip(
-    pytorch_executor_module_no_hip, monkeypatch: pytest.MonkeyPatch
+def test_rocm_benchmark_is_staged_on_the_torch_stream(
+    rocm_module, monkeypatch, fake_cuda
 ) -> None:
-    """Auto timing on a CUDA torch build must resolve to torch, never HIP.
+    executor, compiled = _prepared(rocm_module, monkeypatch, fake_cuda)
 
-    Guards the mixed-host case (CUDA torch with visible ROCm/hipDNN): the
-    executor must not record HIP events on a CUDA stream pointer.
-    """
-    module = pytorch_executor_module_no_hip
-    requested = []
+    m = executor.benchmark({1: "x"})
 
-    class FakeTorchTimer:
-        backend_name = "torch"
+    assert (m.mode, m.backend) == ("staged", "hip")
+    assert m.kernel_ms == [1.0, 1.0]
+    hip_streams = {e[1] for e in fake_cuda.log if e[0] in ("hip_record", "arm")}
+    assert hip_streams == {0xCAFE}
 
-        def __init__(self, stream) -> None:
-            self.stream = stream
 
-        def start(self) -> None:
-            pass
+@pytest.mark.parametrize("syncs", [False, True], ids=["staged", "events"])
+def test_every_replay_shares_one_replay_tensor_map(
+    rocm_module, monkeypatch, fake_cuda, syncs: bool
+) -> None:
+    """Host reads are memoized on one ReplayTensors in both timing modes, so
+    timed iterations never repeat a device->host sync."""
+    executor, compiled = _prepared(rocm_module, monkeypatch, fake_cuda)
+    if syncs:
 
-        def stop(self) -> None:
-            pass
+        def execute(tensors: Any) -> None:
+            compiled.seen.append(tensors)
+            if fake_cuda.sync_mode == "error":
+                raise RuntimeError("called a synchronizing CUDA operation")
 
-        def elapsed_ms(self) -> float:
-            return 0.5
+        compiled.execute = execute
 
-    monkeypatch.setattr(
-        module,
-        "create_gpu_timer",
-        lambda backend, stream=0, torch_stream=None: requested.append(backend)
-        or FakeTorchTimer(torch_stream),
+    m = executor.benchmark({1: "x"})
+
+    assert m.mode == ("events" if syncs else "staged")
+    assert all(isinstance(t, rocm_module.pytorch_ops.ReplayTensors) for t in compiled.seen)
+    assert len({id(t) for t in compiled.seen}) == 1
+    assert dict(compiled.seen[0]) == {1: "x"}
+
+
+def test_host_sync_during_priming_selects_events_mode(
+    rocm_module, monkeypatch, fake_cuda
+) -> None:
+    executor, compiled = _prepared(rocm_module, monkeypatch, fake_cuda)
+
+    def execute(tensors: Any) -> None:
+        if fake_cuda.sync_mode == "error":
+            raise RuntimeError("called a synchronizing CUDA operation")
+
+    compiled.execute = execute
+
+    m = executor.benchmark({})
+
+    assert m.mode == "events"
+    assert m.fallback_reason.startswith("host sync in enqueue")
+    assert fake_cuda.sync_mode == 0  # debug mode restored
+    assert not any(e[0] == "arm" for e in fake_cuda.log if isinstance(e, tuple))
+
+
+def test_cuda_build_times_with_torch_events(cuda_module, monkeypatch, fake_cuda) -> None:
+    executor, _ = _prepared(cuda_module, monkeypatch, fake_cuda)
+
+    m = executor.benchmark({})
+
+    assert (m.mode, m.backend) == ("events", "torch")
+    assert m.kernel_ms == [2.0, 2.0]
+    assert m.fallback_reason
+    recorded = {e[1] for e in fake_cuda.log if isinstance(e, tuple)}
+    assert recorded == {fake_cuda.default_stream_obj}
+
+
+def test_unavailable_sdpa_backend_error_propagates_unchanged(
+    rocm_module, monkeypatch, fake_cuda
+) -> None:
+    executor, compiled = _prepared(rocm_module, monkeypatch, fake_cuda, sdpa="math")
+    error = rocm_module.pytorch_ops.PyTorchSdpaBackendUnavailableError(
+        "Requested PyTorch SDPA backend 'math' is unavailable; no fallback is used."
     )
-    monkeypatch.setattr(
-        module.pytorch_ops, "execute_graph", lambda graph, tensors: None
+
+    def execute(tensors: Any) -> None:
+        raise error
+
+    compiled.execute = execute
+
+    with pytest.raises(rocm_module.pytorch_ops.PyTorchSdpaBackendUnavailableError) as e:
+        executor.benchmark({})
+    assert e.value is error
+
+
+def test_nondefault_backend_requires_native_sdpa_execution(
+    rocm_module, monkeypatch, fake_cuda
+) -> None:
+    executor, _ = _prepared(rocm_module, monkeypatch, fake_cuda, sdpa="math")
+
+    with pytest.raises(
+        rocm_module.pytorch_ops.PyTorchSdpaBackendUnavailableError,
+        match="The graph did not execute a native forward SDPA call.",
+    ):
+        executor.benchmark({})
+
+
+def test_execute_once_runs_on_stream_and_drains_it(
+    rocm_module, monkeypatch, fake_cuda
+) -> None:
+    executor, compiled = _prepared(rocm_module, monkeypatch, fake_cuda)
+    fake_cuda.log.clear()
+
+    executor.execute_once({2: "y"})
+
+    assert compiled.seen == [{2: "y"}]
+    assert fake_cuda.log == [("hip_record", 0xCAFE)]
+
+
+def test_benchmark_before_prepare_raises(rocm_module) -> None:
+    executor = rocm_module.PyTorchCudaExecutor(
+        {"nodes": []}, TimingPolicy(), pytorch_sdpa_backend="default"
     )
-    executor = _make_executor(module, collect_kernel_timing=True)
-    executor.prepare()
 
-    result = executor.benchmark(tensors={}, graph_name="pytorch_mixed_host")
-
-    # Resolved to torch despite the factory preferring HIP when available.
-    assert requested == [TimingBackendName.TORCH]
-    # No HIP sync timer created in prepare() either.
-    assert FakeHipTimer.created_streams == []
-    assert result.metadata is not None
-    assert result.metadata.timing_backend == "torch"
+    with pytest.raises(ExecutionError, match="not prepared"):
+        executor.benchmark({})

@@ -1,261 +1,153 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for ArrayComparator and ComparisonResult."""
+"""Tests for compare(): verdicts, mismatch statistics, and host/device parity."""
 
 import numpy as np
 import pytest
 
-from dnn_benchmarking.validation import ArrayComparator, ComparisonResult
+from dnn_benchmarking.validation import compare
 
 
-class TestComparisonResult:
-    """Tests for ComparisonResult dataclass."""
-
-    def test_create_passed_result(self) -> None:
-        """Test creating a passed comparison result."""
-        result = ComparisonResult(
-            passed=True,
-            max_abs_diff=1e-10,
-            max_rel_diff=1e-12,
-            message="Match",
-        )
-
-        assert result.passed is True
-        assert result.max_abs_diff == 1e-10
-        assert result.max_rel_diff == 1e-12
-        assert result.message == "Match"
-
-    def test_create_failed_result(self) -> None:
-        """Test creating a failed comparison result."""
-        result = ComparisonResult(
-            passed=False,
-            max_abs_diff=0.1,
-            max_rel_diff=0.5,
-            message="Mismatch: values differ significantly",
-        )
-
-        assert result.passed is False
-        assert result.max_abs_diff == 0.1
-        assert result.max_rel_diff == 0.5
+def _both(actual: np.ndarray, expected: np.ndarray, **tol):
+    """Compare on the host, and as torch tensors when torch is installed."""
+    host = compare(actual, expected, **tol)
+    try:
+        import torch
+    except ImportError:
+        return host, host
+    return host, compare(torch.from_numpy(actual), torch.from_numpy(expected), **tol)
 
 
-class TestArrayComparator:
-    """Tests for ArrayComparator class."""
+def test_identical_arrays_pass() -> None:
+    a = np.array([1.0, 2.0, 3.0], dtype=np.float32)
 
-    def test_identical_arrays_pass(self) -> None:
-        """Test that identical arrays pass comparison."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([1.0, 2.0, 3.0])
+    result = compare(a, a.copy(), rtol=0.0, atol=0.0)
 
-        result = comparator.compare(a, b)
-
-        assert result.passed is True
-        assert result.max_abs_diff == 0.0
-        assert result.max_rel_diff == 0.0
-
-    def test_arrays_within_tolerance_pass(self) -> None:
-        """Test that arrays within tolerance pass comparison."""
-        comparator = ArrayComparator(rtol=1e-3, atol=1e-6)
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([1.0001, 2.0002, 3.0003])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is True
-
-    def test_arrays_outside_tolerance_fail(self) -> None:
-        """Test that arrays outside tolerance fail comparison."""
-        comparator = ArrayComparator(rtol=1e-5, atol=1e-8)
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([1.1, 2.2, 3.3])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is False
-        assert result.max_abs_diff > 0.05
-
-    def test_shape_mismatch_fails(self) -> None:
-        """Test that shape mismatch fails comparison."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([[1.0, 2.0], [3.0, 4.0]])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is False
-        assert "shape mismatch" in result.message.lower()
-
-    def test_nan_in_actual_fails(self) -> None:
-        """Test that NaN in actual array fails comparison."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, np.nan, 3.0])
-        b = np.array([1.0, 2.0, 3.0])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is False
-        assert "nan" in result.message.lower() or "NaN" in result.message
-
-    def test_nan_in_expected_fails(self) -> None:
-        """Test that NaN in expected array fails comparison."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([1.0, np.nan, 3.0])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is False
-        assert "nan" in result.message.lower() or "NaN" in result.message
-
-    def test_inf_in_actual_fails(self) -> None:
-        """Test that Inf in actual array fails comparison."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, np.inf, 3.0])
-        b = np.array([1.0, 2.0, 3.0])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is False
-        assert "inf" in result.message.lower() or "Inf" in result.message
-
-    def test_inf_in_expected_fails(self) -> None:
-        """Test that Inf in expected array fails comparison."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([1.0, np.inf, 3.0])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is False
-        assert "inf" in result.message.lower() or "Inf" in result.message
-
-    def test_multidimensional_arrays(self) -> None:
-        """Test comparison works with multidimensional arrays."""
-        comparator = ArrayComparator()
-        a = np.random.randn(4, 4, 4, 4).astype(np.float32)
-        b = a.copy()
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is True
-
-    def test_empty_arrays(self) -> None:
-        """Test comparison works with empty arrays."""
-        comparator = ArrayComparator()
-        a = np.array([])
-        b = np.array([])
-
-        result = comparator.compare(a, b)
-
-        assert result.passed is True
-
-    def test_custom_labels_in_message(self) -> None:
-        """Test that custom labels appear in error messages."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, np.nan, 3.0])
-        b = np.array([1.0, 2.0, 3.0])
-
-        result = comparator.compare(a, b, "hipDNN", "pytorch")
-
-        assert "hipDNN" in result.message
-
-    def test_compare_with_diffs_returns_tuple(self) -> None:
-        """Test that compare_with_diffs returns simplified tuple."""
-        comparator = ArrayComparator()
-        a = np.array([1.0, 2.0, 3.0])
-        b = np.array([1.0, 2.0, 3.0])
-
-        passed, max_abs_diff, max_rel_diff = comparator.compare_with_diffs(a, b)
-
-        assert passed is True
-        assert max_abs_diff == 0.0
-        assert max_rel_diff == 0.0
-
-    def test_tolerance_properties(self) -> None:
-        """Test that tolerance properties are accessible."""
-        comparator = ArrayComparator(rtol=1e-3, atol=1e-6)
-
-        assert comparator.rtol == 1e-3
-        assert comparator.atol == 1e-6
+    assert result.passed
+    assert (result.max_abs_diff, result.max_rel_diff, result.n_mismatch) == (0, 0, 0)
+    assert result.n_total == 3
 
 
-class TestCompareTensors:
-    """compare_tensors matches compare on verdicts, diffs, and messages."""
+def test_tolerance_is_atol_plus_rtol_times_expected() -> None:
+    expected = np.array([100.0, 100.0], dtype=np.float32)
+    # atol + rtol*|e| = 1 + 0.01*100 = 2: 2.0 is inside, 2.5 is outside.
+    inside = compare(expected + [2.0, 0.0], expected, rtol=0.01, atol=1.0)
+    outside = compare(expected + [2.5, 0.0], expected, rtol=0.01, atol=1.0)
 
-    def test_fp16_parity_without_overflow(self) -> None:
-        torch = pytest.importorskip("torch")
-        a = np.array([60000, 1.0], dtype=np.float16)
-        b = np.array([-60000, 1.0], dtype=np.float16)
-        comparator = ArrayComparator(rtol=1e-3, atol=1e-3)
+    assert inside.passed
+    assert not outside.passed
 
-        host = comparator.compare(a, b)
-        device = comparator.compare_tensors(torch.from_numpy(a), torch.from_numpy(b))
 
-        # fp16 subtraction would overflow to inf; float32 keeps it finite.
-        assert host.max_abs_diff == 120000.0
-        assert host == device
+def test_mismatch_count_and_worst_index() -> None:
+    expected = np.zeros((3, 4), dtype=np.float32)
+    actual = expected.copy()
+    actual[0, 1] = 0.5
+    actual[2, 3] = -2.0  # worst
+    actual[1, 0] = 0.05  # inside atol
 
-    def test_nan_rejected(self) -> None:
-        torch = pytest.importorskip("torch")
-        result = ArrayComparator().compare_tensors(
-            torch.tensor([float("nan")]), torch.tensor([0.0]), "output", "reference"
-        )
+    for result in _both(actual, expected, rtol=0.0, atol=0.1):
+        assert not result.passed
+        assert result.n_mismatch == 2
+        assert result.n_total == 12
+        assert result.worst_index == (2, 3)
+        assert result.max_abs_diff == 2.0
 
-        assert result.passed is False
-        assert result.message == "output contains NaN or Inf values"
 
-    def test_shape_mismatch(self) -> None:
-        torch = pytest.importorskip("torch")
-        result = ArrayComparator().compare_tensors(
-            torch.zeros(2, 3), torch.zeros(3, 2), "output", "reference"
-        )
+def test_max_rel_diff_ignores_near_zero_references() -> None:
+    """|a - e| / |e| over |e| <= atol would report ~1e6 for a harmless diff."""
+    expected = np.array([1e-7, 2.0], dtype=np.float32)
+    actual = np.array([0.1, 2.2], dtype=np.float32)
 
-        assert result.passed is False
-        assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"
+    for result in _both(actual, expected, rtol=0.2, atol=0.2):
+        assert result.passed
+        assert result.max_rel_diff == pytest.approx(0.1, rel=1e-5)
 
-    @pytest.mark.parametrize("dtype", [np.float32, np.float16])
-    @pytest.mark.parametrize("fails", [False, True])
-    def test_strided_parity_leaves_inputs_unchanged(
-        self, dtype: type, fails: bool
-    ) -> None:
-        """Same result on both paths; in-place work never touches the inputs."""
-        torch = pytest.importorskip("torch")
-        rng = np.random.default_rng(0)
-        expected = rng.standard_normal((4, 6)).astype(dtype)
-        actual = (expected + dtype(1e-3)).astype(dtype)
-        if fails:
-            actual[3, 4] += dtype(1.0)
-        a_host, e_host = actual[:, ::2], expected[:, ::2]
-        a_dev, e_dev = (
-            torch.from_numpy(actual)[:, ::2],
-            torch.from_numpy(expected)[:, ::2],
-        )
-        before = (a_host.copy(), e_host.copy())
-        comparator = ArrayComparator(rtol=1e-2, atol=1e-2)
 
-        host = comparator.compare(a_host, e_host)
-        device = comparator.compare_tensors(a_dev, e_dev)
+def test_max_rel_diff_is_zero_when_every_reference_is_near_zero() -> None:
+    result = compare(np.array([0.01]), np.array([0.0]), rtol=0.0, atol=0.1)
 
-        assert host.passed is not fails
-        assert host == device
-        # The torch views share memory with the numpy arrays, so these cover
-        # both paths.
-        np.testing.assert_array_equal(a_host, before[0])
-        np.testing.assert_array_equal(e_host, before[1])
+    assert result.passed
+    assert result.max_rel_diff == 0.0
 
-    def test_int32_compared_in_float64(self) -> None:
-        """float32 would round 2**24 + 1 to 2**24 and hide the difference."""
-        torch = pytest.importorskip("torch")
-        a = np.array([2**24 + 1], dtype=np.int32)
-        e = np.array([2**24], dtype=np.int32)
-        comparator = ArrayComparator(rtol=0.0, atol=0.0)
 
-        host = comparator.compare(a, e)
+@pytest.mark.parametrize("side", ["actual", "expected"])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_non_finite_values_fail(side: str, bad: float) -> None:
+    good = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    poisoned = good.copy()
+    poisoned[1] = bad
+    actual, expected = (poisoned, good) if side == "actual" else (good, poisoned)
 
-        assert host.passed is False
-        assert host.max_abs_diff == 1.0
-        assert (
-            comparator.compare_tensors(torch.from_numpy(a), torch.from_numpy(e)) == host
-        )
+    for result in _both(actual, expected, rtol=1.0, atol=1.0):
+        assert not result.passed
+        assert result.max_abs_diff == float("inf")
+        assert result.n_mismatch == result.n_total == 3
+
+
+def test_shape_mismatch_fails() -> None:
+    for result in _both(np.zeros((2, 3)), np.zeros((3, 2)), rtol=1.0, atol=1.0):
+        assert not result.passed
+        assert result.max_abs_diff == float("inf")
+
+
+def test_empty_and_scalar_arrays() -> None:
+    assert compare(np.array([]), np.array([]), rtol=0.0, atol=0.0).passed
+    scalar = compare(np.float32(1.0), np.float32(3.0), rtol=0.0, atol=0.5)
+    assert not scalar.passed
+    assert scalar.max_abs_diff == 2.0 and scalar.worst_index == ()
+
+
+def test_fp16_difference_does_not_overflow() -> None:
+    """fp16 subtraction would give inf; the float32 compare dtype stays finite."""
+    a = np.array([60000, 1.0], dtype=np.float16)
+    e = np.array([-60000, 1.0], dtype=np.float16)
+
+    host, device = _both(a, e, rtol=1e-3, atol=1e-3)
+
+    assert host.max_abs_diff == 120000.0
+    assert host == device
+
+
+def test_int32_compared_in_float64() -> None:
+    """float32 would round 2**24 + 1 to 2**24 and hide the difference."""
+    a = np.array([2**24 + 1], dtype=np.int32)
+    e = np.array([2**24], dtype=np.int32)
+
+    host, device = _both(a, e, rtol=0.0, atol=0.0)
+
+    assert not host.passed
+    assert host.max_abs_diff == 1.0
+    assert host == device
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+@pytest.mark.parametrize("fails", [False, True])
+def test_strided_parity_leaves_inputs_unchanged(dtype: type, fails: bool) -> None:
+    rng = np.random.default_rng(0)
+    expected = rng.standard_normal((4, 6)).astype(dtype)
+    actual = (expected + dtype(1e-3)).astype(dtype)
+    if fails:
+        actual[3, 4] += dtype(1.0)
+    a, e = actual[:, ::2], expected[:, ::2]
+    before = (a.copy(), e.copy())
+
+    host, device = _both(a, e, rtol=1e-2, atol=1e-2)
+
+    assert host.passed is not fails
+    assert host == device
+    # torch.from_numpy shares memory, so this covers both paths.
+    np.testing.assert_array_equal(a, before[0])
+    np.testing.assert_array_equal(e, before[1])
+
+
+def test_torch_actual_accepts_numpy_expected() -> None:
+    torch = pytest.importorskip("torch")
+    expected = np.array([1.0, 2.0], dtype=np.float32)
+
+    result = compare(
+        torch.tensor([1.0, 2.5], dtype=torch.bfloat16), expected, rtol=0.0, atol=0.1
+    )
+
+    assert not result.passed
+    assert result.worst_index == (1,)

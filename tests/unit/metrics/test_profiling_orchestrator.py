@@ -20,50 +20,67 @@ def _reset():
 
 
 class TestBuildInnerArgv:
-    def test_includes_internal_flags_and_strips_outer_profiling_flags(self):
+    def test_emits_exactly_the_frozen_child_argv(self):
         argv = orch.build_inner_argv(
             graph_path=Path("/g/x.json"),
             engine_id=42,
             seed=7,
             warmup_iters=5,
-            benchmark_iters=20,
+            iters=20,
             plugin_path=Path("/p"),
         )
-        assert sys.executable in argv
-        assert "--internal-profiling-run" in argv
-        assert "--internal-profiling-engine" in argv
-        assert argv[argv.index("--internal-profiling-engine") + 1] == "42"
-        assert "--metrics-tier" in argv
-        assert argv[argv.index("--metrics-tier") + 1] == "off"
-        assert "--seed" in argv and argv[argv.index("--seed") + 1] == "7"
-        assert "--plugin-path" in argv
-        # Critically, no opt-in profiling flags leak into the inner argv.
-        for forbidden in ("--pmc", "--emit-trace", "--perf", "--roofline"):
-            assert forbidden not in argv
+        # Allowlist, so no profiling/oracle flag can leak into the child.
+        assert argv == [
+            sys.executable,
+            "-m",
+            "dnn_benchmarking",
+            "--internal-profiling-run",
+            "--graph",
+            "/g/x.json",
+            "--engine",
+            "42",
+            "--warmup",
+            "5",
+            "--iters",
+            "20",
+            "--seed",
+            "7",
+            "--plugin-path",
+            "/p",
+        ]
 
-    def test_omits_seed_when_unset(self):
-        argv = orch.build_inner_argv(
-            graph_path=Path("/g/x.json"),
-            engine_id=1,
-            seed=None,
-            warmup_iters=1,
-            benchmark_iters=1,
-            plugin_path=None,
-        )
-        assert "--seed" not in argv
+    def test_omits_plugin_path_when_unset(self):
+        argv = orch.build_inner_argv(Path("/g/x.json"), 1, 0, 1, 1, None)
         assert "--plugin-path" not in argv
+        assert argv[argv.index("--seed") + 1] == "0"
 
-    def test_oracle_never_leaks_into_inner_argv(self):
-        """The inner argv is an allowlist; --oracle-mode must never be forwarded."""
-        argv = orch.build_inner_argv(
-            graph_path=Path("/g/x.json"),
-            engine_id=1,
-            seed=None,
-            warmup_iters=1,
-            benchmark_iters=1,
-            plugin_path=None,
+
+class TestCheckRequestedTools:
+    def test_nothing_requested_needs_nothing(self):
+        with patch.object(orch, "resolve_rocm_tool", return_value=None):
+            assert orch.check_requested_tools(MetricsConfig()) == []
+
+    def test_reports_each_missing_tool_once(self):
+        cfg = MetricsConfig(
+            pmc_set="basic", emit_trace="pftrace", perf=True, roofline=True
         )
-        assert "--oracle-mode" not in argv
+        with (
+            patch.object(orch, "resolve_rocm_tool", return_value=None),
+            patch.object(orch._perf_mod, "_resolve_perf", return_value=None),
+        ):
+            missing = orch.check_requested_tools(cfg)
+        assert len(missing) == 3
+        assert "--pmc/--emit-trace" in missing[0] and "rocprofv3" in missing[0]
+        assert "--perf" in missing[1]
+        assert "--roofline" in missing[2] and "rocprof-compute" in missing[2]
+
+    def test_resolvable_tools_pass(self):
+        cfg = MetricsConfig(pmc_set="basic", perf=True, roofline=True)
+        with (
+            patch.object(orch, "resolve_rocm_tool", return_value="/bin/tool"),
+            patch.object(orch._perf_mod, "_resolve_perf", return_value=("perf", None)),
+        ):
+            assert orch.check_requested_tools(cfg) == []
 
 
 class TestResolveOutputDir:
@@ -95,7 +112,7 @@ class TestResolveOutputDir:
 
         captured_pmc_dirs = []
 
-        def fake_pmc(inner_argv, out_dir, pmc_set, timeout_s):
+        def fake_pmc(inner_argv, out_dir, **kwargs):
             captured_pmc_dirs.append(out_dir)
             return {"pmc": {}}
 
@@ -106,9 +123,8 @@ class TestResolveOutputDir:
                 graph_path=Path("graphs/g.json"),
                 engine_id=1,
                 engine_name="ENGINE_A",
-                seed=None,
+                seed=0,
                 warmup_iters=1,
-                benchmark_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
             )
@@ -121,9 +137,8 @@ class TestResolveOutputDir:
                 graph_path=Path("graphs/g.json"),
                 engine_id=2,
                 engine_name="ENGINE_B",
-                seed=None,
+                seed=0,
                 warmup_iters=1,
-                benchmark_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
             )
@@ -242,9 +257,8 @@ class TestDispatch:
             graph_path=tmp_path / "g.json",
             engine_id=1,
             engine_name="ENGINE_X",
-            seed=None,
+            seed=0,
             warmup_iters=1,
-            benchmark_iters=1,
             metrics_config=cfg,
             plugin_path=None,
             out_dir=tmp_path,
@@ -273,9 +287,8 @@ class TestDispatch:
                 graph_path=tmp_path / "g.json",
                 engine_id=1,
                 engine_name="ENGINE_X",
-                seed=None,
+                seed=0,
                 warmup_iters=1,
-                benchmark_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
                 out_dir=tmp_path,
@@ -290,14 +303,38 @@ class TestDispatch:
                 graph_path=tmp_path / "g.json",
                 engine_id=1,
                 engine_name="ENGINE_X",
-                seed=None,
+                seed=0,
                 warmup_iters=1,
-                benchmark_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
                 out_dir=tmp_path,
             )
         assert result["pmc"]["unexpected_error"] == "boom"
+
+    def test_forwards_iters_and_labels_warnings_with_graph_and_engine(self, tmp_path):
+        cfg = MetricsConfig(pmc_set="basic")
+        captured = {}
+
+        def fake_pmc(**kwargs):
+            captured.update(kwargs)
+            return {"pmc": {}}
+
+        with patch.object(orch._pmc_mod, "run", side_effect=fake_pmc):
+            orch.run_profiling_passes(
+                graph_path=tmp_path / "conv.json",
+                engine_id=1,
+                engine_name="ENGINE_X",
+                seed=3,
+                warmup_iters=2,
+                metrics_config=cfg,
+                plugin_path=None,
+                iters=7,
+                out_dir=tmp_path,
+            )
+        argv = captured["inner_argv"]
+        assert argv[argv.index("--iters") + 1] == "7"
+        assert argv[argv.index("--warmup") + 1] == "2"
+        assert captured["context"] == "conv/ENGINE_X"
 
     def test_forwards_profiling_timeout_to_every_source(self, tmp_path):
         """``--profiling-timeout`` is the single source of truth for the
@@ -334,9 +371,8 @@ class TestDispatch:
                 graph_path=tmp_path / "g.json",
                 engine_id=1,
                 engine_name="ENGINE_X",
-                seed=None,
+                seed=0,
                 warmup_iters=1,
-                benchmark_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
                 out_dir=tmp_path,
@@ -347,11 +383,11 @@ class TestDispatch:
         cfg = MetricsConfig(pmc_set="basic", emit_trace="pftrace")
         captured = {}
 
-        def fake_pmc(inner_argv, out_dir, pmc_set, timeout_s):
+        def fake_pmc(inner_argv, out_dir, **kwargs):
             captured["pmc_dir"] = out_dir
             return {"pmc": {}}
 
-        def fake_trace(inner_argv, out_dir, timeout_s):
+        def fake_trace(inner_argv, out_dir, **kwargs):
             captured["trace_dir"] = out_dir
             return {"trace": {}}
 
@@ -363,9 +399,8 @@ class TestDispatch:
                 graph_path=Path("graphs/sample_conv.json"),
                 engine_id=42,
                 engine_name="MIOPEN_ENGINE",
-                seed=None,
+                seed=0,
                 warmup_iters=1,
-                benchmark_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
                 out_dir=tmp_path,

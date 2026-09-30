@@ -1,86 +1,77 @@
-# Full dnn-benchmark config example.
+# Complete dnn-benchmark config example: every config key is listed here.
 #
-# All public config-supported options are shown here. CLI flags override config
-# values, so this file can be used as a base recipe and adjusted per run:
-#   dnn-benchmark --config sample_configs/config.toml.example --graph graphs/sample_conv_fwd.json --iters 500
+# Explicit CLI flags override config values (booleans too: --no-verbose,
+# --no-autotune, ...), so this file works as a base recipe:
+#   dnn-benchmark --config sample_configs/config.toml.example --iters 500
 #
 # Relative paths are resolved from this config file's directory.
 
-# Config schema version. Currently only version 1 is supported.
+# Config schema version. Only version 1 is supported.
 version = 1
 
-# Workloads to run. Commonly overridden with --graph/-g per run.
+# --- Input -------------------------------------------------------------------
+# Graph JSON files, directories, globs or tarballs (--graph/-g replaces this).
 graphs = [
   "../graphs/sample_conv_fwd.json",
 ]
 
-# Benchmark loop controls.
-# iters: number of timed samples; statistics and TFLOP/s use their median.
-# timing_block: executions inside each sample.
-#   1 (default): each sample is one execution. warmup runs once, up front.
-#   N > 1: rocKE block timing. Each sample runs `warmup` untimed executions,
-#   then times N back-to-back executions between one GPU event pair and
-#   records elapsed/N. The first sample is discarded.
-#   rocKE settings: iters = BENCHMARK_ITERATIONS, warmup = WARMUP_EXECUTIONS,
-#   timing_block = TIMED_EXECUTIONS.
-warmup = 10
-iters = 100
-timing_block = 1
+# --- Run ---------------------------------------------------------------------
+warmup = 10          # untimed warmup launches per engine
+iters = 100          # minimum timed iterations per engine
+min_time_ms = 0.0    # keep timing until summed kernel time reaches this (0 = exactly iters)
+cache_mode = "warm"  # "warm" or "cold" (flush L2/MALL before each timed iteration)
+seed = 0             # random seed for input data
 
-# Optional seed for reproducible input data. Use an integer, or omit/null for no fixed seed.
-seed = 123
+# --- Backend / selection -----------------------------------------------------
+backend = "hipdnn"   # "hipdnn" or "pytorch"
 
-# Execution backend: "hipdnn" or "pytorch". Both support single-graph, glob,
-# tarball, and multi-graph suite execution.
-backend = "hipdnn"
-
-# Output JSON path for the full SuiteResult. Omit or set null to disable JSON output.
-output = "results.json"
-
-# Verbose console output. true matches --verbose/-v; false keeps the summary table.
-verbose = false
-
-# Correctness validation tolerances and provider.
-rtol = 1e-5
-atol = 1e-8
-validate = "none"  # "none" or "pytorch"
-
-# Optional plugin discovery directory. setup_env.py prints the selected prefix; pass
-# <selected-prefix>/lib/hipdnn_plugins/engines when plugin discovery is not
-# already configured by the runtime environment.
+# Plugin directory, or a list matching the [[engines]] order. setup_env.py
+# prints the selected prefix; defaults to $ROCM_PATH/lib/hipdnn_plugins/engines
+# or the pip ROCm SDK.
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
-# Always-on metrics tier: "basic" or "off".
-metrics_tier = "basic"
+autotune = false     # benchmark candidate kernels and cache the winner
+# cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # per-run HIPDNN_CACHE_DIR
 
-# Optional profiling passes. Omit these keys to disable each optional pass.
+pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
+# pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"
+
+# --- Validation --------------------------------------------------------------
+validate = "none"    # "none" or "pytorch"
+# Tolerances default to dtype-aware values; set only to override them.
+# rtol = 1e-3
+# atol = 1e-3
+
+# --- Comparison --------------------------------------------------------------
+# "plan" also times hipDNN's auto-tuned plan per engine; "exhaustive" forces
+# provider kernel search. Both are significantly slower.
+oracle_mode = "off"  # "off", "plan" or "exhaustive"
+
+# --- Output ------------------------------------------------------------------
+output = "/tmp/dnn-benchmark-results.json"  # .csv writes CSV
+verbose = false
+quiet = false
+metrics_tier = "basic"  # "basic" or "off"
+
+# --- Profiling (each enabled pass re-runs the workload under a tool) ---------
+# pmc = "basic"         # "basic", "memory", "flops" or "all"
+pmc_allow_multipass = false  # required for pmc = "all"
 # emit_trace = "pftrace"
-# pmc = "basic"           # "basic", "memory", "flops", or "all"
-pmc_allow_multipass = false
 perf = false
 roofline = false
+# profiling_output_dir = "/tmp/dnn-benchmark-profiling"
+profiling_timeout = 600  # seconds per profiler subprocess; 0 disables
 
-# Root directory for profiling artifacts. Only used when an optional profiling pass is enabled.
-# profiling_output_dir = "profiling-output"
-
-# Timeout in seconds for each external profiler subprocess. Use 0 to disable the timeout.
-profiling_timeout = 600
-
-# Oracle comparison depth: "off", "plan", or "exhaustive".
-# "plan" adds one hipDNN auto-tuning sweep per engine row and reports the
-# tuned timing beside the out-of-the-box timing. "exhaustive" additionally
-# forces provider kernel benchmarking. Both are significantly slower.
-# oracle_mode = "off"
-
-# Optional explicit engine matrix. Uncomment to run only specific engine IDs.
-# If any engine entry sets plugin_path, every engine entry must set plugin_path.
-# When either --engine or --plugin-path is supplied on the CLI, this matrix is
-# ignored as a unit so CLI engine/plugin selections do not mix with config ones.
+# --- Engine matrix -------------------------------------------------------------
+# Ordered engine selections: id is an engine name, a decimal ID, or a "0x..."
+# hex ID. If any entry sets plugin_path, every entry must, and top-level
+# plugin_path must be unset. --engine or --plugin-path on the CLI replaces the
+# whole matrix; a top-level plugin_path is kept when only --engine is given.
 #
 # [[engines]]
-# id = 1
+# id = "MIOPEN_ENGINE"
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 #
 # [[engines]]
-# id = 2
+# id = "MIOPEN_ENGINE"
 # plugin_path = "/path/to/alternate/hipdnn_plugins/engines"

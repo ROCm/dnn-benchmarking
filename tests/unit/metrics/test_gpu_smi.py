@@ -1,247 +1,151 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for metrics.gpu_smi (amdsmi snapshot probe).
+"""Tests for metrics.gpu_smi.
 
-The amdsmi library is *optional* — these tests inject a fake module
-into ``sys.modules`` so they run on any host, ROCm or not. They cover
-the stable-shape contract (snapshot returns all keys, missing ones are
-None) and the lazy-init lifecycle.
+amdsmi is optional, so a fake module stands in for it. The module-level
+resolution caches are cleared around every test.
 """
 
-import sys
 import types
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from dnn_benchmarking.metrics import gpu_smi
-from dnn_benchmarking.metrics._diagnostic import reset as _reset_warns
 
 
 @pytest.fixture(autouse=True)
-def _reset_warn_state():
-    _reset_warns()
-    # AmdsmiSession caches an init flag and a handle map; the module
-    # holds a singleton instance. Drop both for test isolation so each
-    # test exercises a fresh init / handle-resolution path.
-    gpu_smi._reset_default_session_for_tests()
+def _fresh_caches():
+    gpu_smi._amdsmi.cache_clear()
+    gpu_smi._handle_for.cache_clear()
     yield
-    gpu_smi._reset_default_session_for_tests()
-    _reset_warns()
+    gpu_smi._amdsmi.cache_clear()
+    gpu_smi._handle_for.cache_clear()
 
 
-class _FakeAmdSmiException(Exception):
+class _NotSupported(Exception):
     pass
 
 
-def _build_fake_amdsmi(handles=None, raises=None) -> types.ModuleType:
-    """Construct a stand-in for the amdsmi module.
+def _fake_amdsmi(handles=("h0",), bdfs=None, fail=()):
+    """Stand-in amdsmi. ``fail`` names queries that raise NOT_SUPPORTED."""
+    bdfs = bdfs or {}
+    mod = types.SimpleNamespace()
+    mod.AmdSmiClkType = types.SimpleNamespace(GFX="gfx", MEM="mem")
+    mod.AmdSmiTemperatureType = types.SimpleNamespace(HOTSPOT="hotspot")
+    mod.AmdSmiTemperatureMetric = types.SimpleNamespace(CURRENT="cur")
 
-    ``handles`` is the list returned by ``get_processor_handles``.
-    ``raises`` is a dict mapping API names to exception classes;
-    when set, that API raises rather than returning a value.
-    """
-    handles = handles if handles is not None else ["handle0"]
-    raises = raises or {}
-    mod = types.ModuleType("amdsmi")
-    mod.AmdSmiException = _FakeAmdSmiException
+    def q(name, value):
+        def fn(*_a):
+            if name in fail:
+                raise _NotSupported("AMDSMI_STATUS_NOT_SUPPORTED")
+            return value(*_a) if callable(value) else value
 
-    class _ClkType:
-        GFX = "gfx"
-        MEM = "mem"
+        setattr(mod, name, fn)
 
-    class _TempType:
-        EDGE = "edge"
-        HOTSPOT = "hotspot"
-
-    class _TempMetric:
-        CURRENT = "cur"
-
-    mod.AmdSmiClkType = _ClkType
-    mod.AmdSmiTemperatureType = _TempType
-    mod.AmdSmiTemperatureMetric = _TempMetric
-
-    def _maybe_raise(name: str):
-        if name in raises:
-            raise raises[name]("forced failure")
-
-    def amdsmi_init(*_a, **_kw):
-        _maybe_raise("init")
-
-    def amdsmi_shut_down():
-        pass
-
-    def amdsmi_get_processor_handles():
-        _maybe_raise("get_processor_handles")
-        return list(handles)
-
-    def amdsmi_get_gpu_vram_usage(_h):
-        _maybe_raise("vram_usage")
-        return {"vram_used": 1024.0, "vram_total": 32768.0}
-
-    def amdsmi_get_power_info(_h):
-        _maybe_raise("power_info")
-        return {"average_socket_power": 250}
-
-    def amdsmi_get_clock_info(_h, ctype):
-        _maybe_raise(f"clock_{ctype}")
-        return {"clk": 1700 if ctype == "gfx" else 1600}
-
-    def amdsmi_get_temp_metric(_h, sensor, _metric):
-        _maybe_raise(f"temp_{sensor}")
-        return 55 if sensor == "edge" else 65
-
-    def amdsmi_get_gpu_metrics_info(_h):
-        _maybe_raise("metrics_info")
-        return {
-            "average_gfx_activity": 88,
-            "average_umc_activity": 42,
-            "throttle_status": 0,
-        }
-
-    mod.amdsmi_init = amdsmi_init
-    mod.amdsmi_shut_down = amdsmi_shut_down
-    mod.amdsmi_get_processor_handles = amdsmi_get_processor_handles
-    mod.amdsmi_get_gpu_vram_usage = amdsmi_get_gpu_vram_usage
-    mod.amdsmi_get_power_info = amdsmi_get_power_info
-    mod.amdsmi_get_clock_info = amdsmi_get_clock_info
-    mod.amdsmi_get_temp_metric = amdsmi_get_temp_metric
-    mod.amdsmi_get_gpu_metrics_info = amdsmi_get_gpu_metrics_info
-
-    # static_info hits these too
-    def amdsmi_get_gpu_asic_info(_h):
-        return {"num_of_compute_units": 304}
-
-    def amdsmi_get_gpu_vram_info(_h):
-        return {"vram_size": 196608}  # 192 GiB
-
-    def amdsmi_get_pcie_info(_h):
-        return {"pcie_metric": {"pcie_speed": 4, "pcie_width": 16}}
-
-    mod.amdsmi_get_gpu_asic_info = amdsmi_get_gpu_asic_info
-    mod.amdsmi_get_gpu_vram_info = amdsmi_get_gpu_vram_info
-    mod.amdsmi_get_pcie_info = amdsmi_get_pcie_info
+    q("amdsmi_init", None)
+    q("amdsmi_get_processor_handles", list(handles))
+    q("amdsmi_get_gpu_device_bdf", lambda h: bdfs[h])
+    q("amdsmi_get_clock_info", lambda h, t: {"clk": 1700 if t == "gfx" else 1600, "max_clk": 1700})
+    # N/A average must fall back to the current reading.
+    q("amdsmi_get_power_info", {"average_socket_power": "N/A", "current_socket_power": 250})
+    q("amdsmi_get_temp_metric", 65)
+    q("amdsmi_get_gpu_metrics_info", {"throttle_status": False})
+    q("amdsmi_get_gpu_vram_usage", {"vram_used": 1024, "vram_total": 65536})
+    q("amdsmi_get_gpu_asic_info", {"num_of_compute_units": 104})
+    q("amdsmi_get_gpu_vram_info", {"vram_size": 65536})
+    q("amdsmi_get_pcie_info", {"pcie_metric": {"pcie_speed": 16000, "pcie_width": 16}})
+    q("amdsmi_get_gpu_driver_info", {"driver_version": "6.8.5"})
+    q("amdsmi_get_power_cap_info", {"power_cap": 300_000_000})
+    q("amdsmi_get_gpu_compute_partition", "SPX")
     return mod
 
 
-class TestSnapshot:
-    def test_full_snapshot_when_amdsmi_works(self):
-        fake = _build_fake_amdsmi()
-        with patch.dict(sys.modules, {"amdsmi": fake}):
-            snap = gpu_smi.GpuSmiProbe(device_index=0).snapshot()
-        assert snap["vram_used_mb"] == pytest.approx(1024.0)
-        assert snap["vram_total_mb"] == pytest.approx(32768.0)
-        assert snap["power_w"] == pytest.approx(250.0)
-        assert snap["sclk_mhz"] == pytest.approx(1700.0)
-        assert snap["mclk_mhz"] == pytest.approx(1600.0)
-        assert snap["temp_edge_c"] == pytest.approx(55.0)
-        assert snap["temp_hotspot_c"] == pytest.approx(65.0)
-        assert snap["gpu_utilization_pct"] == pytest.approx(88.0)
-        assert snap["memory_utilization_pct"] == pytest.approx(42.0)
-        assert snap["throttle_status"] == 0
-
-    def test_snapshot_keys_stable_when_module_missing(self):
-        with patch.dict(sys.modules, {"amdsmi": None}):
-            snap = gpu_smi.GpuSmiProbe().snapshot()
-        # All keys present, all None.
-        for key in (
-            "vram_used_mb",
-            "vram_total_mb",
-            "power_w",
-            "sclk_mhz",
-            "mclk_mhz",
-            "temp_edge_c",
-            "temp_hotspot_c",
-            "gpu_utilization_pct",
-            "memory_utilization_pct",
-            "throttle_status",
-        ):
-            assert key in snap
-            assert snap[key] is None
-
-    def test_partial_failure_keeps_other_fields(self):
-        # vram_usage raises, but power/clocks/etc still succeed.
-        fake = _build_fake_amdsmi(raises={"vram_usage": _FakeAmdSmiException})
-        with patch.dict(sys.modules, {"amdsmi": fake}):
-            snap = gpu_smi.GpuSmiProbe().snapshot()
-        assert snap["vram_used_mb"] is None
-        assert snap["power_w"] == pytest.approx(250.0)
-        assert snap["sclk_mhz"] == pytest.approx(1700.0)
-
-    def test_init_failure_returns_empty_snapshot(self):
-        fake = _build_fake_amdsmi(raises={"init": _FakeAmdSmiException})
-        with patch.dict(sys.modules, {"amdsmi": fake}):
-            snap = gpu_smi.GpuSmiProbe().snapshot()
-        for v in snap.values():
-            assert v is None
-
-    def test_device_index_out_of_range(self):
-        fake = _build_fake_amdsmi(handles=[])
-        with patch.dict(sys.modules, {"amdsmi": fake}):
-            snap = gpu_smi.GpuSmiProbe(device_index=0).snapshot()
-        for v in snap.values():
-            assert v is None
+def _install(monkeypatch, fake, hip_bdf=None):
+    monkeypatch.setattr(gpu_smi, "_amdsmi", _cached(lambda: fake))
+    monkeypatch.setattr(gpu_smi, "_hip_device_bdf", lambda _i: hip_bdf)
 
 
-class TestStaticInfo:
-    def test_populates_cu_hbm_pcie(self):
-        fake = _build_fake_amdsmi()
-        with patch.dict(sys.modules, {"amdsmi": fake}):
-            info = gpu_smi.GpuSmiProbe().static_info()
-        assert info["gpu_compute_units"] == 304
-        # 196608 MiB / 1024 = 192 GiB
-        assert info["gpu_hbm_gb"] == pytest.approx(192.0)
-        assert info["gpu_pcie_link"] == "gen4 x16"
+def _cached(fn):
+    import functools
+
+    return functools.lru_cache(maxsize=None)(fn)
 
 
-class TestIsAmdsmiAvailable:
-    def test_returns_false_without_module(self):
-        with patch.dict(sys.modules, {"amdsmi": None}):
-            assert gpu_smi.is_amdsmi_available() is False
+class TestClocks:
+    def test_reports_clock_power_temp_throttle(self, monkeypatch):
+        _install(monkeypatch, _fake_amdsmi())
+        assert gpu_smi.GpuSmiProbe().clocks() == {
+            "sclk_mhz": 1700.0,
+            "mclk_mhz": 1600.0,
+            "power_w": 250.0,
+            "temp_hotspot_c": 65.0,
+            "throttle_status": 0,
+        }
+
+    def test_unsupported_readings_are_none_not_errors(self, monkeypatch, capsys):
+        _install(monkeypatch, _fake_amdsmi(fail={"amdsmi_get_temp_metric"}))
+        clocks = gpu_smi.GpuSmiProbe().clocks()
+        assert clocks["temp_hotspot_c"] is None
+        assert clocks["sclk_mhz"] == 1700.0
+        assert capsys.readouterr().err == ""
+
+    def test_none_without_amdsmi_and_silent(self, monkeypatch, capsys):
+        monkeypatch.setattr(gpu_smi, "_amdsmi", _cached(lambda: None))
+        probe = gpu_smi.GpuSmiProbe()
+        assert probe.clocks() is None
+        assert probe.snapshot() == {"vram_used_mb": None, "vram_total_mb": None}
+        # Missing amdsmi is reported once at startup, never per probe.
+        assert capsys.readouterr().err == ""
 
 
-class TestSessionInjection:
-    """Exercise the AmdsmiSession DI seam — no sys.modules patching."""
+class TestDeviceMapping:
+    def test_current_hip_device_maps_by_pci_address(self, monkeypatch):
+        """HIP_VISIBLE_DEVICES remaps HIP index 0 to any physical GPU; the
+        probe must follow the PCI address, not amdsmi's handle order."""
+        fake = _fake_amdsmi(
+            handles=("h0", "h1", "h2"),
+            bdfs={"h0": "0000:03:00.0", "h1": "0000:09:00.0", "h2": "0000:0c:00.0"},
+        )
+        _install(monkeypatch, fake, hip_bdf="0000:09:00")
+        assert gpu_smi.GpuSmiProbe()._handle == "h1"
 
-    def test_probe_uses_injected_session(self):
-        # Build a fake session whose module/handle methods return our
-        # fakes directly, bypassing the real amdsmi import path.
-        fake_module = _build_fake_amdsmi()
-        fake_handle = "stub-handle"
+    def test_falls_back_to_index_when_address_unknown(self, monkeypatch):
+        _install(monkeypatch, _fake_amdsmi(handles=("h0", "h1")))
+        assert gpu_smi.GpuSmiProbe()._handle == "h0"
+        assert gpu_smi.GpuSmiProbe(1)._handle == "h1"
+        assert gpu_smi.GpuSmiProbe(5).clocks() is None
 
-        class _FakeSession:
-            def module(self) -> Any:
-                return fake_module
 
-            def handle(self, _device_index: int) -> Any:
-                return fake_handle
+def test_snapshot_reports_vram_only(monkeypatch):
+    _install(monkeypatch, _fake_amdsmi())
+    assert gpu_smi.GpuSmiProbe().snapshot() == {
+        "vram_used_mb": 1024.0,
+        "vram_total_mb": 65536.0,
+    }
 
-        snap = gpu_smi.GpuSmiProbe(session=_FakeSession()).snapshot()
-        assert snap["vram_used_mb"] == pytest.approx(1024.0)
-        assert snap["power_w"] == pytest.approx(250.0)
 
-    def test_probe_returns_empty_when_session_module_is_none(self):
-        class _NullSession:
-            def module(self) -> Any:
-                return None
+def test_static_info_units(monkeypatch):
+    _install(monkeypatch, _fake_amdsmi())
+    assert gpu_smi.GpuSmiProbe().static_info() == {
+        "gpu_compute_units": 104,
+        "gpu_hbm_gb": 64.0,
+        "gpu_pcie_link": "16 GT/s x16",
+        "amdgpu_driver_version": "6.8.5",
+        "gpu_power_cap_w": 300.0,  # amdsmi reports microwatts
+        "gpu_max_sclk_mhz": 1700.0,
+        "gpu_compute_partition": "SPX",
+    }
 
-            def handle(self, _device_index: int) -> Any:
-                return None
 
-        snap = gpu_smi.GpuSmiProbe(session=_NullSession()).snapshot()
-        for v in snap.values():
-            assert v is None
+def test_amdsmi_init_failure_means_unavailable(monkeypatch):
+    import sys
 
-    def test_session_handle_caches_per_device_index(self):
-        fake = _build_fake_amdsmi(handles=["h0", "h1"])
-        with patch.dict(sys.modules, {"amdsmi": fake}):
-            session = gpu_smi.AmdsmiSession()
-            assert session.handle(0) == "h0"
-            # Replace the handles fn to confirm the cached path doesn't
-            # call back into amdsmi a second time.
-            fake.amdsmi_get_processor_handles = lambda: (_ for _ in ()).throw(
-                AssertionError("should not be called twice")
-            )
-            assert session.handle(0) == "h0"
+    broken = types.ModuleType("amdsmi")
+
+    def boom():
+        raise RuntimeError("init failed")
+
+    broken.amdsmi_init = boom
+    monkeypatch.setitem(sys.modules, "amdsmi", broken)
+    assert gpu_smi.is_amdsmi_available() is False

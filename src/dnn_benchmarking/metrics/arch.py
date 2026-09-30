@@ -14,6 +14,7 @@ path rather than raising, so the orchestrator can still produce
 *something* for the user.
 """
 
+import functools
 import re
 import subprocess
 from typing import Optional
@@ -31,7 +32,7 @@ def _detect_via_torch() -> Optional[str]:
     try:
         import torch
 
-        props = torch.cuda.get_device_properties(0)
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
         # gcnArchName is a ROCm-specific attribute on torch.cuda device
         # properties; on CUDA builds it doesn't exist.
         arch = getattr(props, "gcnArchName", None)
@@ -70,6 +71,7 @@ def _detect_via_rocminfo() -> Optional[str]:
     return None
 
 
+@functools.lru_cache(maxsize=None)
 def detect_arch() -> str:
     """Return the gfx target of the live GPU, or ``"unknown"``.
 

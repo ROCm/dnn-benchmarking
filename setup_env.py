@@ -9,9 +9,11 @@ Invoke directly with the *system* interpreter, before any venv exists::
     python3 setup_env.py [options]        # Linux
     py -3 setup_env.py [options]          # Windows
 
-Creates and owns a venv under the workspace, installs torch per ``--torch-mode``,
-editable-installs the benchmark package, and (for ROCm/CPU/none source builds)
-builds hipDNN + the provider plugins and wires up the hipDNN Python bindings.
+Creates (or, on rerun, reuses) a venv under the workspace, installs torch per
+``--torch-mode``, editable-installs the benchmark package, and (for ROCm/CPU/none
+source builds) builds hipDNN + the provider plugins incrementally and wires up
+the hipDNN Python bindings. ``--clean`` starts over from an empty venv and build
+directories.
 
 Stdlib only: this file must import and run under the system interpreter before
 the package it installs exists. Never import torch/numpy/third-party at module
@@ -19,14 +21,17 @@ top level; any such probe runs in a subprocess against the *venv* interpreter.
 """
 
 import argparse
+import contextlib
 import functools
 import os
 import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -50,15 +55,36 @@ ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-next/"
 # so fall back to a default target known to have published wheels.
 WINDOWS_DEFAULT_GPU_ARCH = "gfx1151"
 
+# A whole gfx target name as the ROCm tools print it (gfx90a, gfx942,
+# gfx1151), not the prefix of a generic ISA such as gfx9-4-generic.
+_GFX_ARCH = re.compile(r"\bgfx[0-9a-f]+(?![\w-])")
+
+# Bound for the arch-detection tools, which hang on a wedged driver.
+DETECT_TIMEOUT_S = 30
+
 
 # --- Small process helpers -------------------------------------------------
 
 
+def warn(*lines: str) -> None:
+    """Print a warning (possibly multi-line) to stderr."""
+    print(f"WARNING: {lines[0]}", *lines[1:], sep="\n", file=sys.stderr)
+
+
 def fail(*lines: str) -> NoReturn:
     """Print an error (possibly multi-line) to stderr and exit 1."""
-    for line in lines:
-        print(line, file=sys.stderr)
+    print(f"ERROR: {lines[0]}", *lines[1:], sep="\n", file=sys.stderr)
     sys.exit(1)
+
+
+def rmtree(path: Path) -> None:
+    """shutil.rmtree that also removes read-only files (git objects on Windows)."""
+
+    def retry_writable(func, failed_path, _exc):
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+
+    shutil.rmtree(path, onexc=retry_writable)
 
 
 def run(cmd, *, env=None, check=True, **kwargs):
@@ -180,7 +206,7 @@ def unify_rocprofiler_libs(core_lib: Path, devel_lib: Path) -> int:
         except OSError as e:
             if staged.is_symlink() or staged.exists():
                 staged.unlink()
-            print(f"WARNING: could not relink {dup} -> {target}: {e}")
+            warn(f"could not relink {dup} -> {target}: {e}")
             return relinked
         relinked += 1
     return relinked
@@ -253,7 +279,7 @@ if len(matches) > 1:
     print(f"ERROR: multiple usable ROCm SDK {kind} prefixes found:", file=sys.stderr)
     for path in sorted(matches.values()):
         print(f"  {path}", file=sys.stderr)
-    print("Use a clean workspace/venv so setup cannot mix ROCm SDK packages.", file=sys.stderr)
+    print("Rerun setup with --clean so it cannot mix ROCm SDK packages.", file=sys.stderr)
     sys.exit(2)
 sys.exit(1)
 """
@@ -436,6 +462,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "Delete and recreate the virtual environment and wipe the hipDNN/"
+            "provider and binding CMake build directories. By default setup "
+            "reuses the existing venv (and its torch) and rebuilds incrementally."
+        ),
+    )
+    parser.add_argument(
+        "--rocm-libraries-ref",
+        default="",
+        metavar="SHA",
+        help=(
+            "rocm-libraries commit to fetch when rocm-libraries/ is absent. "
+            "Default: the submodule commit pinned in this repository (`git "
+            "rev-parse HEAD:rocm-libraries`). Needed where no git metadata "
+            "exists (Docker builds, source tarballs); without it setup falls "
+            "back to the moving .gitmodules branch and warns."
+        ),
+    )
+    parser.add_argument(
         "--cmake-arg",
         dest="cmake_args",
         action="append",
@@ -457,7 +504,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="Skip confirmation prompts.",
+        help=(
+            "Answer yes to every confirmation prompt (source build, --clean, "
+            "replacing a non-git rocm-libraries/ directory). Required when "
+            "stdin is not a terminal and a prompt would be shown."
+        ),
     )
     return parser
 
@@ -472,14 +523,20 @@ class Setup:
         self.torch_mode = args.torch_mode
         self.reuse_artifacts = args.reuse_artifacts
         self.auto_yes = args.yes
+        self.clean = args.clean
         self.rocm_prefix = args.rocm_prefix
+        self.rocm_libraries_ref = args.rocm_libraries_ref
         self.gpu_arch_override = args.gpu_arch
         self.torch_index_url = args.torch_index_url
         self.editable_install = args.editable_install
-        self.extra_cmake_args = list(getattr(args, "cmake_args", []) or [])
+        self.extra_cmake_args = list(args.cmake_args)
         self.resolved_torch_index_url = ""
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
+        self.install_prefix = ""
+        self.current_stage = "preflight"
+        self.n_stages = 0
+        self._stage_index = 0
 
         self.do_build = not self.reuse_artifacts and self.torch_mode != "cuda"
 
@@ -488,9 +545,11 @@ class Setup:
         self.workspace = Path(args.workspace).resolve()
         self.venv_dir = self.workspace / ".venv"
 
-        # Child-process environment; PYTHONPYCACHEPREFIX/DNN_BENCH_WORKSPACE and
-        # (later) ROCM_PATH are layered onto this before subprocess use.
+        # Child-process environment; ROCM_PATH is layered onto this once the
+        # hipDNN prefix is known.
         self.env = dict(os.environ)
+        self.env["PYTHONPYCACHEPREFIX"] = str(self.workspace / "pycache")
+        self.env["DNN_BENCH_WORKSPACE"] = str(self.workspace)
 
     # -- interpreters -------------------------------------------------------
 
@@ -518,7 +577,7 @@ class Setup:
         if sys.version_info < (3, 12):
             version = ".".join(str(p) for p in sys.version_info[:3])
             fail(
-                f"ERROR: setup_env.py requires Python >= 3.12, but the invoking "
+                f"setup_env.py requires Python >= 3.12, but the invoking "
                 f"interpreter is {version}. Run setup with a Python 3.12+ environment."
             )
 
@@ -527,128 +586,124 @@ class Setup:
     def ensure_rocm_libraries_checkout(self) -> None:
         """Fetch rocm-libraries if absent.
 
-        It is a git submodule (see .gitmodules) tracking develop by default, so
-        `git submodule update --init` also works. This is the fast path used only
-        when the directory isn't already populated: a sparse, blobless clone of
-        the pinned submodule commit (falls back to the .gitmodules branch),
-        limited to the hipDNN/provider sources and root CMake tooling this
-        script builds.
+        It is a git submodule (see .gitmodules), so `git submodule update
+        --init` also works. This is the fast path used only when the directory
+        isn't already a checkout: a sparse, blobless clone of the pinned
+        submodule commit (or --rocm-libraries-ref), limited to the hipDNN/
+        provider sources and root CMake tooling this script builds.
         To build against a different ref, check it out directly, e.g.
         `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
-
         gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        branch = git_output(
-            ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
-        )
-        try:
-            ref = git_output(
-                ["-C", str(SCRIPT_DIR), "rev-parse", "HEAD:rocm-libraries"]
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            ref = branch
+        ref = self.rocm_libraries_ref
+        if not ref:
+            try:
+                ref = git_output(
+                    ["-C", str(SCRIPT_DIR), "rev-parse", "HEAD:rocm-libraries"]
+                )
+            except subprocess.CalledProcessError:
+                ref = git_output(
+                    ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
+                )
+                warn(
+                    "could not resolve the pinned rocm-libraries commit (no git "
+                    "metadata, e.g. a Docker build or source tarball); falling "
+                    f"back to the MOVING branch '{ref}'.",
+                    "The hipDNN/provider build is not reproducible. Pass "
+                    "--rocm-libraries-ref <sha> (`git rev-parse "
+                    "HEAD:rocm-libraries` in a checkout of this repository).",
+                )
+        # Only a full commit id can be compared with HEAD; a branch moves.
+        pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
+
         if (ROCM_LIBRARIES_DIR / ".git").exists():
             if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
-                run_git(
-                    [
-                        "-C",
-                        str(ROCM_LIBRARIES_DIR),
-                        "sparse-checkout",
-                        "add",
-                        "cmake",
-                    ]
-                )
+                run_git(["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "add", "cmake"])
             # An existing checkout is reused as-is, so a pin bump or a broken
             # sparse clone would otherwise go unnoticed.
             head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
-            if ref != branch and head != ref:
-                print(
-                    f"WARNING: rocm-libraries is at {head[:12]}, not the pinned "
-                    f"{ref[:12]}. Run `git submodule update rocm-libraries` or "
-                    "delete rocm-libraries/ to build the pinned commit.",
-                    file=sys.stderr,
+            if pinned and head != ref:
+                warn(
+                    f"rocm-libraries is at {head[:12]}, not the pinned {ref[:12]}. "
+                    "Check out that commit in rocm-libraries/ (e.g. `git submodule "
+                    "update rocm-libraries`) or delete the directory to fetch it."
                 )
             if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
-                print(
-                    "WARNING: rocm-libraries/CMakePresets.json is missing "
-                    "(a non-cone sparse checkout). Delete rocm-libraries/ and "
-                    "rerun setup.",
-                    file=sys.stderr,
+                warn(
+                    "rocm-libraries/CMakePresets.json is missing (a non-cone "
+                    "sparse checkout). Delete rocm-libraries/ and rerun setup."
                 )
             return
+
+        # An uninitialised submodule leaves an empty directory; anything else
+        # here is not ours to delete without asking.
+        if ROCM_LIBRARIES_DIR.exists() and any(ROCM_LIBRARIES_DIR.iterdir()):
+            self._confirm(
+                f"replace {ROCM_LIBRARIES_DIR}, which is not a git checkout and "
+                "is not empty"
+            )
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
         print(
             f"Fetching rocm-libraries ({ref}) via sparse checkout "
             "(cmake, projects/hipdnn, dnn-providers)..."
         )
+        # Clone beside the target and move it in only once checked out: a
+        # failed or interrupted fetch must not leave a .git directory behind
+        # that the next run would mistake for a usable checkout.
+        staging = ROCM_LIBRARIES_DIR.with_name(ROCM_LIBRARIES_DIR.name + ".partial")
+        if staging.exists():
+            rmtree(staging)
+        git = ["-C", str(staging)]
+        try:
+            run_git(
+                [
+                    "clone",
+                    "--quiet",
+                    "--filter=blob:none",
+                    "--sparse",
+                    "--no-checkout",
+                    url,
+                    str(staging),
+                ]
+            )
+            # Cone mode explicitly: git < 2.37 defaults to non-cone patterns,
+            # which match "cmake" at any depth and drop root files such as
+            # CMakePresets.json. `set --cone` needs git 2.35; `init --cone` is
+            # older.
+            run_git([*git, "sparse-checkout", "init", "--cone"])
+            run_git(
+                [*git, "sparse-checkout", "set", "cmake", "projects/hipdnn", "dnn-providers"]
+            )
+            run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
+            run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
+        except BaseException:
+            if staging.exists():
+                rmtree(staging)
+            raise
         if ROCM_LIBRARIES_DIR.exists():
-            shutil.rmtree(ROCM_LIBRARIES_DIR)
-        run_git(
-            [
-                "clone",
-                "--quiet",
-                "--filter=blob:none",
-                "--sparse",
-                "--no-checkout",
-                url,
-                str(ROCM_LIBRARIES_DIR),
-            ]
-        )
-        # Cone mode explicitly: git < 2.37 defaults to non-cone patterns, which
-        # match "cmake" at any depth and drop root files such as
-        # CMakePresets.json. `set --cone` needs git 2.35; `init --cone` is older.
-        run_git(["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "init", "--cone"])
-        run_git(
-            [
-                "-C",
-                str(ROCM_LIBRARIES_DIR),
-                "sparse-checkout",
-                "set",
-                "cmake",
-                "projects/hipdnn",
-                "dnn-providers",
-            ]
-        )
-        run_git(
-            [
-                "-C",
-                str(ROCM_LIBRARIES_DIR),
-                "fetch",
-                "--quiet",
-                "--depth",
-                "1",
-                "origin",
-                ref,
-            ]
-        )
-        run_git(["-C", str(ROCM_LIBRARIES_DIR), "checkout", "--quiet", "FETCH_HEAD"])
+            rmtree(ROCM_LIBRARIES_DIR)
+        os.replace(staging, ROCM_LIBRARIES_DIR)
 
     # -- venv lifecycle -----------------------------------------------------
 
     def setup_venv(self) -> None:
-        if self.torch_mode == "existing" and not self.venv_dir.is_dir():
-            fail(
-                f"ERROR: --torch-mode existing requires an existing virtual "
-                f"environment at {self.venv_dir}.",
-                "Use --torch-mode rocm or --torch-mode cpu to create one and "
-                "install torch automatically.",
-            )
-        if self.venv_dir.is_dir() and self.torch_mode != "existing":
-            print(f"Removing existing virtual environment at {self.venv_dir}...")
-            shutil.rmtree(self.venv_dir)
-        if not self.venv_dir.is_dir():
+        """Reuse the workspace venv (and its torch), or create it.
+
+        --clean deletes it first. A fresh venv holds no torch, so
+        installed_torch_mode (probed in run() for a reused venv) stays valid.
+        """
+        if self.clean and self.venv_dir.is_dir():
+            print(f"Removing virtual environment at {self.venv_dir} (--clean)...")
+            rmtree(self.venv_dir)
+            self.installed_torch_mode = "missing"
+        if venv_python(self.venv_dir).exists():
+            print(f"Reusing virtual environment at {self.venv_dir}.")
+        else:
             print(f"Creating virtual environment at {self.venv_dir}...")
             run([sys.executable, "-m", "venv", str(self.venv_dir)])
-
-        self.env["PYTHONPYCACHEPREFIX"] = str(self.workspace / "pycache")
-        self.env["DNN_BENCH_WORKSPACE"] = str(self.workspace)
         if not IS_WINDOWS:
             self.write_activate_local()
-
-        self.installed_torch_mode = self.get_torch_mode()
-        if self.installed_torch_mode == "cuda":
-            self.do_build = False
 
     def write_activate_local(
         self, rocm_prefix: str = "", lib_dirs: tuple[str, ...] = ()
@@ -663,7 +718,7 @@ class Setup:
         for lib_dir in reversed(lib_dirs):
             lines += [
                 'case ":${LD_LIBRARY_PATH:-}:" in',
-                f"    *:{lib_dir}:*) ;;",
+                f"    *:{shlex.quote(lib_dir)}:*) ;;",
                 f"    *) export LD_LIBRARY_PATH={shlex.quote(lib_dir)}"
                 "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ;;",
                 "esac",
@@ -690,10 +745,10 @@ class Setup:
     def require_torch_mode(self, expected: str) -> None:
         if self.installed_torch_mode != expected:
             fail(
-                f"ERROR: --torch-mode {expected} requested, but {self.venv_dir} "
+                f"--torch-mode {expected} requested, but {self.venv_dir} "
                 f"contains torch mode '{self.installed_torch_mode}'.",
-                "Use a clean workspace or remove the existing virtual environment "
-                "before changing torch modes.",
+                "Pass --clean to recreate the virtual environment, or use another "
+                "--workspace, before changing torch modes.",
             )
 
     # -- GPU arch -----------------------------------------------------------
@@ -729,20 +784,33 @@ class Setup:
 
     @staticmethod
     def _detect_gpu_arch() -> str:
-        if shutil.which("rocm_agent_enumerator"):
-            out = subprocess.run(
-                ["rocm_agent_enumerator"], capture_output=True, text=True, check=False
-            ).stdout
-            for line in out.splitlines():
-                if "gfx9" in line:
-                    return line.strip()
-        if shutil.which("rocminfo"):
-            out = subprocess.run(
-                ["rocminfo"], capture_output=True, text=True, check=False
-            ).stdout
-            match = re.search(r"gfx\d+[a-z0-9]*", out)
-            if match:
-                return match.group(0)
+        """The one GPU arch the ROCm tools report, "" when none.
+
+        gfx000 is the CPU agent. A host with several distinct archs has no
+        single right answer, so the user must choose.
+        """
+        for tool in ("rocm_agent_enumerator", "rocminfo"):
+            if not shutil.which(tool):
+                continue
+            try:
+                out = subprocess.run(
+                    [tool],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=DETECT_TIMEOUT_S,
+                ).stdout
+            except subprocess.TimeoutExpired:
+                warn(f"{tool} did not finish within {DETECT_TIMEOUT_S}s; ignoring it.")
+                continue
+            archs = sorted(set(_GFX_ARCH.findall(out)) - {"gfx000"})
+            if len(archs) > 1:
+                fail(
+                    f"{tool} reports several GPU architectures: {', '.join(archs)}.",
+                    "Pass --gpu-arch to choose the one to install and build for.",
+                )
+            if archs:
+                return archs[0]
         return ""
 
     # -- ROCm wheel prefix discovery ----------------------------------------
@@ -766,7 +834,7 @@ class Setup:
             # has already said which.
             sys.exit(1)
         fail(
-            "ERROR: no usable ROCm SDK libraries package found in this venv.",
+            "no usable ROCm SDK libraries package found in this venv.",
             "Expected a _rocm_sdk_libraries (or _rocm_sdk_libraries_<arch>) "
             "package containing MIOpen libraries.",
             "Use a ROCm torch wheel that includes ROCm SDK libraries, or pass "
@@ -802,7 +870,7 @@ class Setup:
 
         if not index_url:
             fail(
-                "ERROR: no ROCm SDK compiler/toolchain prefix found in this venv.",
+                "no ROCm SDK compiler/toolchain prefix found in this venv.",
                 "Expected the rocm-sdk-devel package (rocm[devel]) alongside the "
                 "rocm_sdk module.",
                 "Install rocm-sdk-devel from the same ROCm torch index, or pass "
@@ -820,7 +888,7 @@ class Setup:
         if root:
             return root
         fail(
-            "ERROR: rocm-sdk-devel installed, but `rocm-sdk path --root` could "
+            "rocm-sdk-devel installed, but `rocm-sdk path --root` could "
             "not resolve the devel prefix (see the error above).",
             "The rocm_sdk module comes from the `rocm` package; installing "
             "rocm[devel] pins both at matching versions.",
@@ -846,11 +914,7 @@ class Setup:
         if status == 0:
             candidates.append(Path(prefix) / "share" / "amd_smi")
         elif status != 1:
-            print(
-                "Warning: ROCm SDK core discovery failed; skipping SDK amdsmi "
-                "candidate.",
-                file=sys.stderr,
-            )
+            warn("ROCm SDK core discovery failed; skipping SDK amdsmi candidate.")
         candidates += [
             Path(prefix) / "share" / "amd_smi" for prefix in prefixes if prefix
         ]
@@ -868,16 +932,11 @@ class Setup:
             else:
                 if self.amdsmi_importable():
                     return
-            print(
-                f"Warning: amdsmi install from {candidate} failed; trying next "
-                "candidate.",
-                file=sys.stderr,
-            )
+            warn(f"amdsmi install from {candidate} failed; trying next candidate.")
 
-        print(
-            "Warning: amdsmi Python bindings were not installed; GPU SMI "
-            "snapshot will be disabled.",
-            file=sys.stderr,
+        warn(
+            "amdsmi Python bindings were not installed; GPU SMI snapshot will "
+            "be disabled."
         )
 
     # -- hipDNN prefix selection --------------------------------------------
@@ -938,7 +997,7 @@ class Setup:
         """The resolved --gpu-arch, or a fatal error naming what's missing."""
         if not self.gpu_arch:
             fail(
-                "ERROR: could not detect a GPU architecture.",
+                "could not detect a GPU architecture.",
                 "Pass --gpu-arch (e.g. gfx90a, gfx942, gfx950) or --torch-index-url "
                 "to override detection.",
             )
@@ -953,7 +1012,7 @@ class Setup:
         if mode == "existing":
             if self.installed_torch_mode == "missing":
                 fail(
-                    "ERROR: --torch-mode existing requires torch to already be "
+                    "--torch-mode existing requires torch to already be "
                     f"installed in {self.venv_dir}.",
                     "Use --torch-mode rocm or --torch-mode cpu to install torch "
                     "automatically.",
@@ -1080,6 +1139,17 @@ class Setup:
         program_path = f"{toolchain_prefix}/bin;{toolchain_prefix}/lib/llvm/bin"
         return prefix_path, program_path
 
+    def install_build_deps(self) -> None:
+        """pip packages the source build runs in the venv interpreter."""
+        # `build` packs the hipdnn_frontend wheel. rocKE (Linux only, see
+        # rocke_args) packs its kernels with rocm_kpack, which the configure
+        # imports from Python3_EXECUTABLE; its msgpack/zstandard deps are not
+        # pulled in.
+        deps = ["build"]
+        if not IS_WINDOWS:
+            deps += ["msgpack>=1.0.0", "zstandard>=0.20.0"]
+        self.pip("install", *deps)
+
     def rocke_args(self, toolchain_prefix: str) -> list[str]:
         """Configure defines that build rocKE and its ingestor engines.
 
@@ -1090,9 +1160,6 @@ class Setup:
         """
         if IS_WINDOWS:
             return []
-        # rocKE packs its kernels with rocm_kpack, which the configure imports
-        # from Python3_EXECUTABLE; its msgpack/zstandard deps are not pulled in.
-        self.pip("install", "msgpack>=1.0.0", "zstandard>=0.20.0")
         args = [
             "-DHIPKERNELPROVIDER_ENABLE_ROCKE=ON",
             "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
@@ -1130,8 +1197,8 @@ class Setup:
             fail("ninja not found on PATH.")
 
         build_dir = ROCM_LIBRARIES_DIR / "build"
-        if build_dir.exists():
-            shutil.rmtree(build_dir)
+        if self.clean and build_dir.exists():
+            rmtree(build_dir)
         prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
         print(f"Building hipDNN and providers to {install_prefix}...")
         run(
@@ -1179,14 +1246,17 @@ class Setup:
         bindings_source = python_dir / "frontend_bindings"
         if not bindings_source.is_dir():
             fail(f"hipDNN frontend bindings not found at {bindings_source}")
-        bindings_build = python_dir / "build" / "frontend_bindings"
-        wheel_dir = python_dir / "build" / "wheel_package"
         build_root = python_dir / "build"
-        if build_root.exists():
-            shutil.rmtree(build_root)
+        bindings_build = build_root / "frontend_bindings"
+        wheel_dir = build_root / "wheel_package"
+        if self.clean and build_root.exists():
+            rmtree(build_root)
+        # The packer's output, not a build cache: a wheel left by an earlier
+        # run would make the pick below ambiguous or stale.
+        if wheel_dir.exists():
+            rmtree(wheel_dir)
 
         prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
-        self.pip("install", "build")
         run(
             [
                 cmake,
@@ -1218,7 +1288,7 @@ class Setup:
         )
         wheels = sorted(wheel_dir.glob("hipdnn_frontend-*.whl"))
         if len(wheels) != 1:
-            fail(f"ERROR: expected exactly one hipdnn_frontend wheel in {wheel_dir}")
+            fail(f"expected exactly one hipdnn_frontend wheel in {wheel_dir}")
         self.pip("install", "--force-reinstall", str(wheels[0]))
 
         if IS_WINDOWS:
@@ -1235,13 +1305,21 @@ class Setup:
                     encoding="ascii",
                 )
 
-    def build_and_install(self, install_prefix: str) -> None:
+    def build_hipdnn(self) -> None:
+        """Build (or, with --reuse-artifacts, locate) hipDNN and the provider
+        plugins, then point the venv's environment at them."""
+        if self.gpu_arch:
+            # Belt-and-suspenders for any torch C++/HIP extension compile (none
+            # today: the bindings are nanobind host code linking hip::host).
+            self.env.setdefault("PYTORCH_ROCM_ARCH", self.gpu_arch)
+        install_prefix = self.install_prefix = self.select_binding_prefix()
+        print(f"Using hipDNN/ROCm prefix: {install_prefix}")
         toolchain_prefix = self.toolchain_prefix
         if self.do_build:
             self.build_superbuild(install_prefix, toolchain_prefix)
         elif not self.prefix_has_hipdnn(install_prefix):
             fail(
-                "ERROR: --reuse-artifacts was passed, but hipDNN CMake configs "
+                "--reuse-artifacts was passed, but hipDNN CMake configs "
                 f"were not found under {install_prefix}.",
                 "Drop --reuse-artifacts to build from source, or pass a usable "
                 "--rocm-prefix.",
@@ -1257,11 +1335,7 @@ class Setup:
                 self.plugin_engines_dir = candidate
                 break
         if not self.plugin_engines_dir:
-            print(
-                f"Warning: no native hipDNN engine plugins found under "
-                f"{install_prefix}.",
-                file=sys.stderr,
-            )
+            warn(f"no native hipDNN engine plugins found under {install_prefix}.")
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
@@ -1278,41 +1352,56 @@ class Setup:
             self.env["LD_LIBRARY_PATH"] = ":".join(ordered)
             self.write_activate_local(install_prefix, lib_dirs)
 
+    def install_bindings(self) -> None:
+        if self.do_build:
+            self.build_and_install_bindings(self.install_prefix, self.toolchain_prefix)
+        elif self.probe("import hipdnn_frontend").returncode != 0:
+            warn("hipdnn_frontend is not importable in this environment.")
+
+    def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
-            install_prefix,
-            toolchain_prefix,
+            self.install_prefix,
+            self.toolchain_prefix,
             self.rocm_prefix,
             DEFAULT_ROCM_PREFIX,
         )
-        if self.do_build:
-            self.build_and_install_bindings(install_prefix, toolchain_prefix)
-        elif self.probe("import hipdnn_frontend").returncode != 0:
-            print(
-                "WARNING: hipdnn_frontend is not importable in this environment.",
-                file=sys.stderr,
-            )
+        self.unify_wheel_rocprofiler_libs()
 
     # -- confirmation prompt ------------------------------------------------
 
-    def confirm_build(self) -> None:
+    def _confirm(self, action: str) -> None:
+        """Return if the user agrees to `action`; exit otherwise.
+
+        Only an explicit y/yes (or Enter, the default) proceeds. With no
+        terminal to ask, -y is the only way to agree.
+        """
         if self.auto_yes:
             return
-        actions = []
-        if self.venv_dir.is_dir() and self.torch_mode != "existing":
-            actions.append(f"replace the virtual environment at {self.venv_dir}")
-        if self.do_build:
-            actions.append("build and install hipDNN and provider plugins from source")
-        if not actions:
-            return
-        confirm = input(f"This will {' and '.join(actions)}. Continue? [Y/n] ")
-        if confirm.strip().lower() == "n":
+        if not sys.stdin.isatty():
+            fail(
+                f"setup needs confirmation to {action}, but stdin is not a terminal.",
+                "Pass -y to proceed non-interactively.",
+            )
+        answer = input(f"This will {action}. Continue? [Y/n] ")
+        if answer.strip().lower() not in ("", "y", "yes"):
             print("Aborted.")
             sys.exit(0)
+
+    def confirm_build(self) -> None:
+        actions = []
+        if self.clean and self.venv_dir.is_dir():
+            actions.append(f"delete and recreate the virtual environment at {self.venv_dir}")
+        if self.do_build:
+            actions.append(
+                "build and install hipDNN and provider plugins from source"
+                + (" from scratch" if self.clean else "")
+            )
+        if actions:
+            self._confirm(" and ".join(actions))
 
     # -- verify -------------------------------------------------------------
 
     def verify(self) -> None:
-        print("==> Verifying installation")
         result = self.probe("import dnn_benchmarking; print('dnn_benchmarking OK')")
         sys.stdout.write(result.stdout)
         if result.returncode != 0:
@@ -1323,11 +1412,7 @@ class Setup:
         if result.returncode == 0:
             sys.stdout.write(result.stdout)
         else:
-            print(
-                "WARNING: hipdnn_frontend could not be imported (ROCm runtime or "
-                "bindings missing).",
-                file=sys.stderr,
-            )
+            warn("hipdnn_frontend could not be imported (ROCm runtime or bindings missing).")
 
         result = subprocess.run(
             [self.py, "-m", "dnn_benchmarking", "--help"],
@@ -1378,49 +1463,76 @@ class Setup:
         sys.stdout.write(report.stdout)
         print("")
 
-    def run(self) -> int:
-        self.require_python_version()
-        self.workspace.mkdir(parents=True, exist_ok=True)
+    @contextlib.contextmanager
+    def stage(self, name: str):
+        """Announce one numbered setup stage and time it.
 
-        self.confirm_build()
-        self.setup_venv()
-        print(f"Torch mode: {self.torch_mode}")
+        current_stage stays set when the body raises, so main() can say
+        which stage failed.
+        """
+        self._stage_index += 1
+        self.current_stage = name
+        print(f"==> [{self._stage_index}/{self.n_stages}] {name}", flush=True)
+        start = time.monotonic()
+        yield
+        print(f"    done in {time.monotonic() - start:.1f}s", flush=True)
 
+    def install_package(self) -> None:
         # pyproject.toml intentionally omits torch so pip never replaces the
-        # selected wheel; install it explicitly, before the package.
-        self.install_torch()
+        # selected wheel; torch is installed explicitly, before the package.
         if self.editable_install:
             self.pip("install", "-e", str(SCRIPT_DIR))
         else:
             self.pip("install", str(SCRIPT_DIR))
 
+    def run(self) -> int:
+        self.require_python_version()
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        if venv_python(self.venv_dir).exists() and not self.clean:
+            self.installed_torch_mode = self.get_torch_mode()
+        elif self.torch_mode == "existing":
+            fail(
+                f"--torch-mode existing requires an existing virtual "
+                f"environment at {self.venv_dir}.",
+                "Use --torch-mode rocm or --torch-mode cpu to create one and "
+                "install torch automatically.",
+            )
         # CUDA torch supports only the PyTorch execution backend: no hipDNN
         # Python bindings, engine plugins, amdsmi, or ROCm prefix.
-        if self.installed_torch_mode == "cuda" or self.torch_mode == "cuda":
-            print("")
-            print("CUDA torch selected: skipping hipDNN/provider builds, hipDNN Python")
-            print("bindings, and ROCm environment setup.")
-            print("")
-            self.verify()
-            self._print_complete(cuda=True)
-            return 0
+        cuda = self.torch_mode == "cuda" or self.installed_torch_mode == "cuda"
+        if cuda:
+            self.do_build = False
+        self.confirm_build()
 
-        # rocm-libraries provides the hipDNN sources and provider plugins.
-        self.ensure_rocm_libraries_checkout()
+        stages = [
+            ("Virtual environment", self.setup_venv),
+            (f"PyTorch (--torch-mode {self.torch_mode})", self.install_torch),
+            ("dnn-benchmarking package", self.install_package),
+        ]
+        if cuda:
+            print(
+                "CUDA torch: skipping hipDNN/provider builds, hipDNN Python "
+                "bindings, and ROCm environment setup."
+            )
+        else:
+            stages.append(("rocm-libraries sources", self.ensure_rocm_libraries_checkout))
+            if self.do_build:
+                stages.append(("Build dependencies", self.install_build_deps))
+            stages += [
+                ("hipDNN and provider plugins", self.build_hipdnn),
+                ("hipDNN Python bindings", self.install_bindings),
+                ("amdsmi and rocprofiler libraries", self.install_runtime_extras),
+            ]
+        stages.append(("Verify installation", self.verify))
 
-        if self.gpu_arch:
-            # Belt-and-suspenders for any torch C++/HIP extension compile (none
-            # today: the bindings are nanobind host code linking hip::host).
-            self.env.setdefault("PYTORCH_ROCM_ARCH", self.gpu_arch)
+        self.n_stages = len(stages)
+        for name, step in stages:
+            with self.stage(name):
+                step()
 
-        binding_prefix = self.select_binding_prefix()
-        print(f"Using hipDNN/ROCm prefix: {binding_prefix}")
-        self.build_and_install(binding_prefix)
-        self.unify_wheel_rocprofiler_libs()
-
-        self.verify()
-        self._print_complete()
-        self.report_profiling_sources()
+        self._print_complete(cuda=cuda)
+        if not cuda:
+            self.report_profiling_sources()
         return 0
 
     def _print_complete(self, cuda: bool = False) -> None:
@@ -1464,16 +1576,23 @@ class Setup:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.clean and args.torch_mode == "existing":
+        parser.error("--clean deletes the virtual environment --torch-mode existing reuses")
+    setup = Setup(args)
     try:
-        return Setup(args).run()
+        return setup.run()
     except subprocess.CalledProcessError as exc:
         cmd = exc.cmd if isinstance(exc.cmd, str) else " ".join(str(c) for c in exc.cmd)
-        print(f"ERROR: command failed (exit {exc.returncode}): {cmd}", file=sys.stderr)
-        return 1
+        reason = f"command exited {exc.returncode}: {cmd}"
+    except (EOFError, OSError) as exc:
+        reason = str(exc) or type(exc).__name__
     except KeyboardInterrupt:
-        print("\nAborted.", file=sys.stderr)
+        print(f"\nAborted during stage '{setup.current_stage}'.", file=sys.stderr)
         return 130
+    print(f"ERROR: stage '{setup.current_stage}' failed: {reason}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

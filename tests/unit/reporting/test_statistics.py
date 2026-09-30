@@ -1,301 +1,66 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for BenchmarkStats and BenchmarkResult."""
-
-import json
+"""Tests for BenchmarkStats and noise_warnings."""
 
 import pytest
 
-from dnn_benchmarking.reporting import BenchmarkStats
-from dnn_benchmarking.reporting.statistics import BenchmarkMetadata, BenchmarkResult
+from dnn_benchmarking.reporting.statistics import BenchmarkStats, noise_warnings
 
 
 class TestBenchmarkStats:
-    """Tests for BenchmarkStats dataclass."""
-
-    def test_from_timings_basic(self) -> None:
-        """Test basic stats calculation."""
-        timings = [1.0, 2.0, 3.0, 4.0, 5.0]
-        stats = BenchmarkStats.from_timings(timings)
-
+    def test_from_timings_summarizes_samples(self) -> None:
+        stats = BenchmarkStats.from_timings([1.0, 2.0, 3.0, 4.0, 5.0])
+        assert stats.n == 5
         assert stats.mean_ms == 3.0
+        assert stats.median_ms == 3.0
         assert stats.min_ms == 1.0
         assert stats.max_ms == 5.0
 
-    def test_from_timings_single_value(self) -> None:
-        """Test stats with single value."""
-        timings = [5.0]
-        stats = BenchmarkStats.from_timings(timings)
-
-        assert stats.mean_ms == 5.0
+    def test_single_value_has_zero_spread(self) -> None:
+        stats = BenchmarkStats.from_timings([5.0])
         assert stats.std_ms == 0.0
-        assert stats.min_ms == 5.0
-        assert stats.max_ms == 5.0
-        assert stats.p95_ms == 5.0
-        assert stats.p99_ms == 5.0
+        assert stats.cv == 0.0
+        assert stats.iqr_ms == 0.0
 
-    def test_median_even_count_is_upper_middle_sample(self) -> None:
-        """Even counts take sorted[n // 2] like Solera, not the mean of the two
-        middle values (Solera's default 5 samples minus the first gives n=4)."""
-        stats = BenchmarkStats.from_timings([4.0, 1.0, 3.0, 2.0])
-        assert stats.median_ms == 3.0
-
-    def test_from_timings_empty_raises(self) -> None:
-        """Test that empty timings raises ValueError."""
-        with pytest.raises(ValueError, match="timings list cannot be empty"):
+    def test_empty_raises(self) -> None:
+        with pytest.raises(ValueError):
             BenchmarkStats.from_timings([])
 
-    def test_from_timings_std_calculation(self) -> None:
-        """Test standard deviation calculation (sample std, ddof=1)."""
-        timings = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
-        stats = BenchmarkStats.from_timings(timings)
+    def test_std_is_sample_std(self) -> None:
+        stats = BenchmarkStats.from_timings([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
+        assert stats.std_ms == pytest.approx((32 / 7) ** 0.5)
+        assert stats.cv == pytest.approx(stats.std_ms / 5.0)
 
-        assert stats.mean_ms == 5.0
-        # Sample std (ddof=1): sqrt(32/7) ≈ 2.138
-        assert stats.std_ms == pytest.approx(2.1381, rel=0.01)
+    def test_percentiles_and_iqr(self) -> None:
+        stats = BenchmarkStats.from_timings(list(range(1, 101)))
+        assert stats.p25_ms == pytest.approx(25.75)
+        assert stats.median_ms == pytest.approx(50.5)
+        assert stats.p75_ms == pytest.approx(75.25)
+        assert stats.p95_ms == pytest.approx(95.05)
+        assert stats.iqr_ms == pytest.approx(49.5)
 
-    def test_from_timings_percentiles(self) -> None:
-        """Test percentile calculations."""
-        # 100 values from 1 to 100
-        timings = list(range(1, 101))
-        stats = BenchmarkStats.from_timings(timings)
+    def test_to_dict_nulls_p95_below_20_samples(self) -> None:
+        assert BenchmarkStats.from_timings([1.0] * 19).to_dict()["p95_ms"] is None
+        assert BenchmarkStats.from_timings([1.0] * 20).to_dict()["p95_ms"] == 1.0
 
-        assert stats.mean_ms == 50.5
-        assert stats.min_ms == 1.0
-        assert stats.max_ms == 100.0
-        # For 100 uniformly spaced values, p95 should be around 95.05
-        assert stats.p95_ms == pytest.approx(95.05, rel=0.01)
-        assert stats.p99_ms == pytest.approx(99.01, rel=0.01)
-
-    def test_from_timings_uniform_values(self) -> None:
-        """Test with all identical values."""
-        timings = [10.0] * 100
-        stats = BenchmarkStats.from_timings(timings)
-
-        assert stats.mean_ms == 10.0
-        assert stats.std_ms == 0.0
-        assert stats.min_ms == 10.0
-        assert stats.max_ms == 10.0
-        assert stats.p95_ms == 10.0
-        assert stats.p99_ms == 10.0
+    def test_to_dict_carries_iqr(self) -> None:
+        d = BenchmarkStats.from_timings(list(range(1, 101))).to_dict()
+        assert d["iqr_ms"] == pytest.approx(d["p75_ms"] - d["p25_ms"])
 
 
-class TestBenchmarkMetadata:
-    """Tests for BenchmarkMetadata dataclass."""
+class TestNoiseWarnings:
+    def test_quiet_samples_have_no_warnings(self) -> None:
+        assert noise_warnings(BenchmarkStats.from_timings([1.0] * 50)) == []
 
-    def test_default_values(self) -> None:
-        """Test metadata has reasonable defaults."""
-        metadata = BenchmarkMetadata()
-        assert metadata.graph_name == ""
-        assert metadata.graph_path == ""
-        assert metadata.warmup_iters == 0
-        assert metadata.benchmark_iters == 0
-        assert metadata.engine_id == 0
-        assert metadata.timing_backend == ""
-        # hostname and timestamp are auto-generated
-        assert metadata.pytorch_sdpa_backend_requested is None
-        assert metadata.pytorch_rocm_fa_library_requested is None
-        assert metadata.hostname != ""
-        assert metadata.timestamp != ""
+    def test_high_cv_is_flagged_with_enough_samples(self) -> None:
+        stats = BenchmarkStats.from_timings([1.0, 1.3] * 10)
+        assert any(w.startswith("noisy:") for w in noise_warnings(stats))
 
-    def test_custom_values(self) -> None:
-        """Test metadata with custom values."""
-        metadata = BenchmarkMetadata(
-            graph_name="test_graph",
-            graph_path="/path/to/graph.json",
-            warmup_iters=10,
-            benchmark_iters=100,
-            engine_id=1,
-            timing_backend="hip",
-        )
-        assert metadata.graph_name == "test_graph"
-        assert metadata.graph_path == "/path/to/graph.json"
-        assert metadata.warmup_iters == 10
-        assert metadata.benchmark_iters == 100
-        assert metadata.engine_id == 1
-        assert metadata.timing_backend == "hip"
+    def test_high_cv_not_flagged_below_10_samples(self) -> None:
+        stats = BenchmarkStats.from_timings([1.0, 1.3] * 4)
+        assert not any(w.startswith("noisy:") for w in noise_warnings(stats))
 
-
-class TestBenchmarkResult:
-    """Tests for BenchmarkResult dataclass and serialization."""
-
-    def test_has_kernel_timings_false_when_none(self) -> None:
-        """Test has_kernel_timings is False when timings are None."""
-        result = BenchmarkResult(host_timings=[1.0, 2.0], kernel_timings=None)
-        assert result.has_kernel_timings is False
-
-    def test_has_kernel_timings_false_when_empty(self) -> None:
-        """Test has_kernel_timings is False when timings are empty."""
-        result = BenchmarkResult(host_timings=[1.0, 2.0], kernel_timings=[])
-        assert result.has_kernel_timings is False
-
-    def test_has_kernel_timings_true(self) -> None:
-        """Test has_kernel_timings is True when timings exist."""
-        result = BenchmarkResult(host_timings=[1.0, 2.0], kernel_timings=[0.5, 0.6])
-        assert result.has_kernel_timings is True
-
-    def test_timing_backend_from_metadata(self) -> None:
-        """Test timing_backend property reads from metadata."""
-        metadata = BenchmarkMetadata(timing_backend="hip")
-        result = BenchmarkResult(
-            host_timings=[1.0], kernel_timings=[0.5], metadata=metadata
-        )
-        assert result.timing_backend == "hip"
-
-    def test_timing_backend_empty_without_metadata(self) -> None:
-        """Test timing_backend is empty when no metadata."""
-        result = BenchmarkResult(host_timings=[1.0])
-        assert result.timing_backend == ""
-
-    def test_to_dict_basic(self) -> None:
-        """Test to_dict with basic result."""
-        result = BenchmarkResult(
-            host_timings=[1.0, 2.0, 3.0], kernel_timings=[0.5, 0.6, 0.7]
-        )
-        data = result.to_dict()
-        assert data["host_timings"] == [1.0, 2.0, 3.0]
-        assert data["kernel_timings"] == [0.5, 0.6, 0.7]
-        assert "metadata" not in data or data["metadata"] is None
-
-    def test_to_dict_with_metadata(self) -> None:
-        """Test to_dict includes metadata."""
-        metadata = BenchmarkMetadata(
-            graph_name="test", timing_backend="hip", benchmark_iters=100
-        )
-        result = BenchmarkResult(
-            host_timings=[1.0], kernel_timings=[0.5], metadata=metadata
-        )
-        data = result.to_dict()
-        assert "metadata" in data
-        assert data["metadata"]["graph_name"] == "test"
-        assert data["metadata"]["timing_backend"] == "hip"
-        assert data["metadata"]["benchmark_iters"] == 100
-
-    def test_sdpa_requests_round_trip_through_result_json(self) -> None:
-        result = BenchmarkResult(
-            host_timings=[1.0],
-            metadata=BenchmarkMetadata(
-                pytorch_sdpa_backend_requested="flash",
-                pytorch_rocm_fa_library_requested="aotriton",
-            ),
-        )
-
-        serialized = result.to_dict()
-        loaded = BenchmarkResult.from_dict(serialized)
-
-        assert serialized["metadata"]["pytorch_sdpa_backend_requested"] == "flash"
-        assert serialized["metadata"]["pytorch_rocm_fa_library_requested"] == "aotriton"
-        assert "pytorch_sdpa_category_executed" not in serialized["metadata"]
-        assert loaded.metadata is not None
-        assert loaded.metadata.pytorch_sdpa_backend_requested == "flash"
-        assert loaded.metadata.pytorch_rocm_fa_library_requested == "aotriton"
-
-    def test_to_json(self) -> None:
-        """Test to_json produces valid JSON."""
-        result = BenchmarkResult(host_timings=[1.0, 2.0], kernel_timings=[0.5, 0.6])
-        json_str = result.to_json()
-        # Should be valid JSON
-        parsed = json.loads(json_str)
-        assert parsed["host_timings"] == [1.0, 2.0]
-        assert parsed["kernel_timings"] == [0.5, 0.6]
-
-    def test_from_dict(self) -> None:
-        """Test from_dict creates correct result."""
-        data = {
-            "host_timings": [1.0, 2.0, 3.0],
-            "kernel_timings": [0.5, 0.6, 0.7],
-        }
-        result = BenchmarkResult.from_dict(data)
-        assert result.host_timings == [1.0, 2.0, 3.0]
-        assert result.kernel_timings == [0.5, 0.6, 0.7]
-        assert result.metadata is None
-
-    def test_from_dict_with_metadata(self) -> None:
-        """Test from_dict with metadata."""
-        data = {
-            "host_timings": [1.0],
-            "kernel_timings": None,
-            "metadata": {
-                "graph_name": "test_graph",
-                "graph_path": "/path/graph.json",
-                "warmup_iters": 10,
-                "benchmark_iters": 100,
-                "engine_id": 1,
-                "timing_backend": "hip",
-                "hostname": "test-host",
-                "timestamp": "2026-01-20T12:00:00",
-            },
-        }
-        result = BenchmarkResult.from_dict(data)
-        assert result.metadata is not None
-        assert result.metadata.graph_name == "test_graph"
-        assert result.metadata.timing_backend == "hip"
-
-    def test_from_dict_accepts_legacy_gpu_backend_metadata(self) -> None:
-        """Test from_dict accepts pre-rename gpu_backend metadata."""
-        data = {
-            "host_timings": [1.0],
-            "kernel_timings": None,
-            "metadata": {
-                "graph_name": "test_graph",
-                "gpu_backend": "hip",
-            },
-        }
-        result = BenchmarkResult.from_dict(data)
-        assert result.metadata is not None
-        assert result.metadata.timing_backend == "hip"
-
-    def test_from_dict_drops_legacy_gpu_backend_when_timing_backend_exists(
-        self,
-    ) -> None:
-        """Test from_dict ignores legacy gpu_backend when timing_backend exists."""
-        data = {
-            "host_timings": [1.0],
-            "kernel_timings": None,
-            "metadata": {
-                "graph_name": "test_graph",
-                "gpu_backend": "legacy",
-                "timing_backend": "hip",
-            },
-        }
-        result = BenchmarkResult.from_dict(data)
-        assert result.metadata is not None
-        assert result.metadata.timing_backend == "hip"
-
-    def test_round_trip_serialization(self, tmp_path) -> None:
-        """Test that results survive JSON round-trip."""
-        original = BenchmarkResult(
-            host_timings=[1.0, 2.0, 3.0],
-            kernel_timings=[0.5, 0.6, 0.7],
-            metadata=BenchmarkMetadata(
-                graph_name="test_graph",
-                graph_path="/path/to/graph.json",
-                warmup_iters=10,
-                benchmark_iters=100,
-                engine_id=1,
-                timing_backend="hip",
-            ),
-        )
-
-        path = tmp_path / "results.json"
-        original.save_json(str(path))
-        loaded = BenchmarkResult.load_json(str(path))
-
-        assert loaded.host_timings == original.host_timings
-        assert loaded.kernel_timings == original.kernel_timings
-        assert loaded.metadata is not None
-        assert loaded.metadata.graph_name == original.metadata.graph_name
-        assert loaded.metadata.timing_backend == original.metadata.timing_backend
-        assert loaded.metadata.benchmark_iters == original.metadata.benchmark_iters
-
-    def test_round_trip_no_kernel_timings(self, tmp_path) -> None:
-        """Test round-trip with no kernel timings."""
-        original = BenchmarkResult(host_timings=[1.0, 2.0])
-
-        path = tmp_path / "results.json"
-        original.save_json(str(path))
-        loaded = BenchmarkResult.load_json(str(path))
-
-        assert loaded.host_timings == original.host_timings
-        assert loaded.kernel_timings is None
+    def test_outlier_max_is_flagged(self) -> None:
+        stats = BenchmarkStats.from_timings([1.0] * 9 + [2.5])
+        assert any(w.startswith("outlier:") for w in noise_warnings(stats))

@@ -3,10 +3,11 @@
 
 """Benchmark configuration dataclasses."""
 
+import argparse
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import List, Optional
 
 
 class ReferenceProviderName(str, Enum):
@@ -14,15 +15,6 @@ class ReferenceProviderName(str, Enum):
 
     NONE = "none"
     PYTORCH = "pytorch"
-
-
-class TimingBackendName(str, Enum):
-    """Supported GPU timing backend names."""
-
-    HIP = "hip"
-    TORCH = "torch"
-    AUTO = "auto"
-    NONE = "none"
 
 
 class ExecutionBackendName(str, Enum):
@@ -43,9 +35,8 @@ class PyTorchSdpaBackendName(str, Enum):
     OVERRIDEABLE = "overrideable"
 
 
-PYTORCH_SDPA_BACKEND_CHOICES = frozenset(
-    backend.value for backend in PyTorchSdpaBackendName
-)
+def _one_of(flag: str, enum_cls: type[Enum]) -> str:
+    return f"{flag} must be one of: " + ", ".join(e.value for e in enum_cls)
 
 
 def _normalize_pytorch_sdpa_settings(
@@ -57,27 +48,38 @@ def _normalize_pytorch_sdpa_settings(
         selection = PyTorchSdpaBackendName(selection)
     except ValueError as e:
         raise ValueError(
-            f"Invalid PyTorch SDPA backend: '{selection}'. "
-            f"Valid options: {PYTORCH_SDPA_BACKEND_CHOICES}"
+            _one_of("--pytorch-sdpa-backend", PyTorchSdpaBackendName)
         ) from e
 
     if rocm_fa_library is not None and not isinstance(rocm_fa_library, str):
-        raise ValueError("pytorch_rocm_fa_library must be a string when set")
+        raise ValueError("--pytorch-rocm-fa-library must be a string when set")
     if rocm_fa_library is not None and selection is not PyTorchSdpaBackendName.FLASH:
         raise ValueError(
-            "pytorch_rocm_fa_library requires pytorch_sdpa_backend='flash'"
+            "--pytorch-rocm-fa-library requires --pytorch-sdpa-backend flash"
         )
     return selection, rocm_fa_library
 
 
-EXECUTION_BACKEND_CHOICES = frozenset(backend.value for backend in ExecutionBackendName)
-
-
-REFERENCE_PROVIDER_CHOICES = frozenset(
-    provider.value for provider in ReferenceProviderName
-)
-
 CACHE_MODE_CHOICES = ("warm", "cold")
+
+
+class OracleMode(str, Enum):
+    """Oracle comparison depth."""
+
+    OFF = "off"
+    PLAN = "plan"
+    EXHAUSTIVE = "exhaustive"
+
+
+class MetricsTier(str, Enum):
+    """Always-on metric collection tier."""
+
+    BASIC = "basic"
+    OFF = "off"
+
+
+PMC_SET_CHOICES = ("basic", "memory", "flops", "all")
+EMIT_TRACE_CHOICES = ("pftrace",)
 
 
 @dataclass(frozen=True)
@@ -119,52 +121,6 @@ class TimingPolicy:
 
 
 @dataclass
-class BenchmarkConfig:
-    """Configuration for benchmark execution.
-
-    Attributes:
-        graph_path: Path to the JSON-serialized hipDNN graph file.
-        warmup_iters: Number of warmup iterations before benchmarking.
-        benchmark_iters: Number of benchmark iterations for timing.
-        engine_id: Engine ID to use (1 = MIOpen).
-        pytorch_sdpa_backend: Strict PyTorch SDPA category selection.
-        pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
-            preference forwarded to PyTorch with the Flash category.
-    """
-
-    graph_path: Path
-    warmup_iters: int = 10
-    benchmark_iters: int = 100
-    engine_id: int = 1
-    pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
-    pytorch_rocm_fa_library: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        """Validate configuration values.
-
-        Note: engine_id is a 64-bit identifier (FNV-1a hash of the engine
-        name) and may be negative when interpreted as signed int64, so we
-        do not bound-check it.
-        """
-        if isinstance(self.graph_path, str):
-            self.graph_path = Path(self.graph_path)
-
-        (
-            self.pytorch_sdpa_backend,
-            self.pytorch_rocm_fa_library,
-        ) = _normalize_pytorch_sdpa_settings(
-            self.pytorch_sdpa_backend,
-            self.pytorch_rocm_fa_library,
-        )
-
-        if self.warmup_iters < 0:
-            raise ValueError("warmup_iters must be non-negative")
-
-        if self.benchmark_iters <= 0:
-            raise ValueError("benchmark_iters must be positive")
-
-
-@dataclass
 class ValidationConfig:
     """Configuration for reference validation.
 
@@ -185,14 +141,11 @@ class ValidationConfig:
         try:
             self.provider = ReferenceProviderName(self.provider)
         except ValueError as e:
-            raise ValueError(
-                f"Invalid provider: '{self.provider}'. "
-                f"Valid options: {REFERENCE_PROVIDER_CHOICES}"
-            ) from e
+            raise ValueError(_one_of("--validate", ReferenceProviderName)) from e
         if self.rtol is not None and self.rtol < 0:
-            raise ValueError("rtol must be non-negative")
+            raise ValueError("--rtol must be >= 0")
         if self.atol is not None and self.atol < 0:
-            raise ValueError("atol must be non-negative")
+            raise ValueError("--atol must be >= 0")
 
     @property
     def enabled(self) -> bool:
@@ -265,9 +218,9 @@ class MetricsConfig:
             block indefinitely.
     """
 
-    tier: Literal["basic", "off"] = "basic"
-    emit_trace: Optional[Literal["pftrace"]] = None
-    pmc_set: Optional[Literal["basic", "memory", "flops", "all"]] = None
+    tier: MetricsTier = MetricsTier.BASIC
+    emit_trace: Optional[str] = None
+    pmc_set: Optional[str] = None
     perf: bool = False
     roofline: bool = False
     pmc_allow_multipass: bool = False
@@ -275,37 +228,17 @@ class MetricsConfig:
     profiling_timeout_s: int = 600
 
     def __post_init__(self) -> None:
-        # Normalise empty / whitespace-only strings to None. The CLI
-        # uses argparse `choices=` so this only matters for programmatic
-        # / TOML callers, but the `Optional[Literal[...]]` annotation
-        # isn't enforced at runtime: without this, ``pmc_set=""`` slips
-        # past every downstream check (the `is not None` guards see a
-        # truthy-empty string, `== "all"` is false, and the empty value
-        # rides into the orchestrator as ``--pmc ""``).
-        if isinstance(self.emit_trace, str) and not self.emit_trace.strip():
-            self.emit_trace = None
-        if isinstance(self.pmc_set, str) and not self.pmc_set.strip():
-            self.pmc_set = None
-
-        valid_tiers = {"basic", "off"}
-        if self.tier not in valid_tiers:
+        """Validate choices, the multipass opt-in, and the timeout."""
+        try:
+            self.tier = MetricsTier(self.tier)
+        except ValueError as e:
+            raise ValueError(_one_of("--metrics-tier", MetricsTier)) from e
+        if self.emit_trace is not None and self.emit_trace not in EMIT_TRACE_CHOICES:
             raise ValueError(
-                f"Invalid metrics tier: '{self.tier}'. " f"Valid options: {valid_tiers}"
+                "--emit-trace must be one of: " + ", ".join(EMIT_TRACE_CHOICES)
             )
-        if self.emit_trace is not None and self.emit_trace != "pftrace":
-            raise ValueError(
-                f"Invalid emit_trace: '{self.emit_trace}'. Valid option: pftrace"
-            )
-        if self.pmc_set is not None and self.pmc_set not in {
-            "basic",
-            "memory",
-            "flops",
-            "all",
-        }:
-            raise ValueError(
-                f"Invalid pmc_set: '{self.pmc_set}'. "
-                "Valid options: basic, memory, flops, all"
-            )
+        if self.pmc_set is not None and self.pmc_set not in PMC_SET_CHOICES:
+            raise ValueError("--pmc must be one of: " + ", ".join(PMC_SET_CHOICES))
         # The 'all' PMC set unions every counter group; rocprofv3 falls
         # back to multi-pass replay, which has been observed to hang for
         # minutes on what should be a sub-second run. Require the explicit
@@ -321,7 +254,7 @@ class MetricsConfig:
             self.profiling_output_dir = Path(self.profiling_output_dir)
         if self.profiling_timeout_s < 0:
             raise ValueError(
-                f"profiling_timeout_s must be >= 0 (0 disables); "
+                f"--profiling-timeout must be >= 0 (0 disables); "
                 f"got {self.profiling_timeout_s}"
             )
 
@@ -375,7 +308,7 @@ class SuiteConfig:
     Attributes:
         warmup_iters: Number of warmup iterations per provider/engine.
         benchmark_iters: Number of benchmark iterations for timing.
-        seed: Optional random seed for reproducible inputs.
+        seed: Random seed for reproducible inputs.
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
@@ -399,7 +332,7 @@ class SuiteConfig:
     seed: int = 0
     engine_filter: Optional[List[int]] = None
     verbose: bool = False
-    oracle_mode: str = "off"
+    oracle_mode: OracleMode = OracleMode.OFF
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None
@@ -422,6 +355,50 @@ class SuiteConfig:
     #: Suppress progress output; tables and the summary still print.
     quiet: bool = False
 
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> "SuiteConfig":
+        """Build a suite config from merged CLI/config-file arguments.
+
+        ``args`` must hold every public option (``apply_config_file`` merges
+        the defaults). hipDNN runs without ``--plugin-path`` fall back to the
+        ROCm install's plugin directory.
+        """
+        plugin_paths = args.plugin_path
+        if plugin_paths is None and args.backend != ExecutionBackendName.PYTORCH:
+            from ..common.rocm_runtime import default_hipdnn_plugin_paths
+
+            plugin_paths = default_hipdnn_plugin_paths()
+        return cls(
+            warmup_iters=args.warmup,
+            benchmark_iters=args.iters,
+            min_time_ms=args.min_time_ms,
+            cache_mode=args.cache_mode,
+            seed=args.seed,
+            engine_filter=args.engine,
+            verbose=args.verbose,
+            quiet=args.quiet,
+            oracle_mode=args.oracle_mode,
+            metrics=MetricsConfig(
+                tier=args.metrics_tier,
+                emit_trace=args.emit_trace,
+                pmc_set=args.pmc,
+                perf=args.perf,
+                roofline=args.roofline,
+                pmc_allow_multipass=args.pmc_allow_multipass,
+                profiling_output_dir=args.profiling_output_dir,
+                profiling_timeout_s=args.profiling_timeout,
+            ),
+            validation=ValidationConfig(
+                provider=args.validate, rtol=args.rtol, atol=args.atol
+            ),
+            plugin_paths=plugin_paths,
+            backend=args.backend,
+            pytorch_sdpa_backend=args.pytorch_sdpa_backend,
+            pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
+            autotune=args.autotune,
+            cache_dir=str(args.cache_dir) if args.cache_dir else None,
+        )
+
     @property
     def timing_policy(self) -> TimingPolicy:
         """Timing loop policy derived from this suite configuration."""
@@ -429,33 +406,37 @@ class SuiteConfig:
             warmup_iters=self.warmup_iters,
             iters=self.benchmark_iters,
             min_time_ms=self.min_time_ms,
+            max_iters=max(TimingPolicy.max_iters, self.benchmark_iters),
             cache_mode=self.cache_mode,
         )
 
     @property
     def oracle_enabled(self) -> bool:
         """True when any oracle comparison should run."""
-        return self.oracle_mode != "off"
+        return self.oracle_mode is not OracleMode.OFF
 
     @property
     def oracle_exhaustive(self) -> bool:
         """True when the oracle pass must force provider kernel benchmarking."""
-        return self.oracle_mode == "exhaustive"
+        return self.oracle_mode is OracleMode.EXHAUSTIVE
 
     def __post_init__(self) -> None:
-        """Validate configuration values."""
+        """Validate values and cross-field constraints; messages name CLI flags."""
         if self.warmup_iters < 0:
-            raise ValueError("warmup_iters must be non-negative")
+            raise ValueError("--warmup must be >= 0")
         if self.benchmark_iters <= 0:
-            raise ValueError("benchmark_iters must be positive")
-        self.timing_policy  # noqa: B018 - constructing the policy validates it
-        if self.engine_filter is not None:
-            if len(self.engine_filter) == 0:
-                raise ValueError("engine_filter must be non-empty when set")
-            # engine IDs are FNV-1a hashes -- may be negative as signed int64.
+            raise ValueError("--iters must be >= 1")
+        if self.min_time_ms < 0:
+            raise ValueError("--min-time-ms must be >= 0")
+        if self.cache_mode not in CACHE_MODE_CHOICES:
+            raise ValueError(
+                "--cache-mode must be one of: " + ", ".join(CACHE_MODE_CHOICES)
+            )
+        if self.engine_filter is not None and len(self.engine_filter) == 0:
+            raise ValueError("--engine must list at least one engine")
         if self.plugin_paths is not None:
             if len(self.plugin_paths) == 0:
-                raise ValueError("plugin_paths must be non-empty when set")
+                raise ValueError("--plugin-path must list at least one path")
             self.plugin_paths = [Path(p) for p in self.plugin_paths]
 
             if len(self.plugin_paths) > 1:
@@ -470,10 +451,11 @@ class SuiteConfig:
         try:
             self.backend = ExecutionBackendName(self.backend)
         except ValueError as e:
-            raise ValueError(
-                f"Invalid backend: '{self.backend}'. "
-                f"Valid options: {EXECUTION_BACKEND_CHOICES}"
-            ) from e
+            raise ValueError(_one_of("--backend", ExecutionBackendName)) from e
+        try:
+            self.oracle_mode = OracleMode(self.oracle_mode)
+        except ValueError as e:
+            raise ValueError(_one_of("--oracle-mode", OracleMode)) from e
         (
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
@@ -481,6 +463,35 @@ class SuiteConfig:
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
         )
+        if self.oracle_exhaustive and self.warmup_iters == 0:
+            raise ValueError(
+                "--oracle-mode exhaustive requires --warmup >= 1: with "
+                "benchmarking forced, a plan's first execute() samples kernel "
+                "variants, and at zero warmup that sampling lands inside the "
+                "timed loop"
+            )
+        if self.backend is ExecutionBackendName.PYTORCH:
+            rejected = [
+                ("--engine", self.engine_filter is not None),
+                ("--plugin-path", self.plugin_paths is not None),
+                (
+                    "--validate pytorch",
+                    self.validation.provider is ReferenceProviderName.PYTORCH,
+                ),
+                ("--pmc", self.metrics.pmc_set is not None),
+                ("--emit-trace", self.metrics.emit_trace is not None),
+                ("--perf", self.metrics.perf),
+                ("--roofline", self.metrics.roofline),
+                ("--oracle-mode", self.oracle_enabled),
+                ("--autotune", self.autotune),
+                ("--cache-dir", self.cache_dir is not None),
+            ]
+            flags = [flag for flag, present in rejected if present]
+            if flags:
+                raise ValueError(
+                    f"{', '.join(flags)} not supported with --backend pytorch "
+                    "(hipDNN-only options)"
+                )
 
     @property
     def plugin_path(self) -> Optional[Path]:

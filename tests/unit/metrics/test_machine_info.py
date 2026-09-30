@@ -1,18 +1,41 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for metrics.machine_info collector."""
+"""Tests for metrics.machine_info (the result ``environment`` block)."""
 
-import os
-import sys
-import types
-from pathlib import Path
 from unittest.mock import mock_open, patch
 
 import pytest
 
 from dnn_benchmarking.metrics import machine_info
 from dnn_benchmarking.metrics._diagnostic import reset as _reset_warns
+
+# Contract: result JSON v2 environment keys (minus end_of_run / selection_env,
+# which the suite runner fills).
+_ENVIRONMENT_KEYS = {
+    "hostname",
+    "cpu_model",
+    "cpu_count",
+    "numa_nodes",
+    "total_ram_gb",
+    "kernel_version",
+    "gpu_model",
+    "gpu_arch",
+    "gpu_compute_units",
+    "gpu_hbm_gb",
+    "gpu_pcie_link",
+    "amdgpu_driver_version",
+    "gpu_power_cap_w",
+    "gpu_max_sclk_mhz",
+    "gpu_compute_partition",
+    "rocm_version",
+    "cuda_version",
+    "cudnn_version",
+    "hipdnn_version",
+    "python_version",
+    "torch_version",
+    "amdsmi_available",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -38,28 +61,23 @@ class TestReadCpuModel:
             assert machine_info._read_cpu_model() is None
 
 
-class TestCollectMachineInfo:
-    def test_returns_all_keys(self):
-        # Force amdsmi unavailable so static GPU fields stay None and
-        # the test doesn't depend on an actual GPU.
-        with patch.object(machine_info, "is_amdsmi_available", return_value=False):
-            info = machine_info.collect_machine_info()
-        expected_keys = {
-            "cpu_model",
-            "cpu_count",
-            "numa_nodes",
-            "total_ram_gb",
-            "kernel_version",
-            "gpu_compute_units",
-            "gpu_hbm_gb",
-            "gpu_pcie_link",
-            "amdgpu_driver_version",
-        }
-        assert set(info.keys()) == expected_keys
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, None), (0, None), (8902, "8.9.2"), (90100, "9.1.0")],
+)
+def test_cudnn_version_decoding_across_packing_schemes(raw, expected):
+    assert machine_info._format_cudnn_version(raw) == expected
 
-    def test_never_raises(self):
-        # Even if every probe blows up, the function must return a dict.
-        with patch.object(machine_info, "_read_cpu_model", side_effect=OSError):
-            with patch.object(machine_info, "is_amdsmi_available", return_value=False):
-                info = machine_info.collect_machine_info()
-        assert isinstance(info, dict)
+
+class TestCollectEnvironmentInfo:
+    def test_has_exactly_the_contract_keys(self):
+        with patch.object(machine_info, "is_amdsmi_available", return_value=False):
+            info = machine_info.collect_environment_info()
+        assert set(info) == _ENVIRONMENT_KEYS
+
+    def test_missing_amdsmi_is_recorded_and_warned_once(self, capsys):
+        with patch.object(machine_info, "is_amdsmi_available", return_value=False):
+            first = machine_info.collect_environment_info()
+            machine_info.collect_environment_info()
+        assert first["amdsmi_available"] is False
+        assert capsys.readouterr().err.count("amdsmi not available") == 1

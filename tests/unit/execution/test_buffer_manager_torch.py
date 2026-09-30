@@ -10,7 +10,7 @@ import pytest
 
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
-    _encode_bfloat16_dense_to_storage_bytes,
+    _encode_to_storage_bytes,
 )
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 
@@ -36,18 +36,17 @@ class TestTorchBackend:
         y = _strided(2, "bfloat16", is_output=True)
         bm = BufferManager([x, y], device="cpu")
         bm.allocate_all()
-        bm.load_input_data({x.uid: np.arange(6, dtype=np.float32).reshape(2, 3)})
+        x_data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        bm.load_input_data({x.uid: x_data})
         out = np.array([[1.0, -2.5, 3.25], [0.5, 4.0, -6.0]], dtype=np.float32)
-        bm._write_bytes(
-            bm._buffers[y.uid], _encode_bfloat16_dense_to_storage_bytes(out, y)
-        )
+        bm._write_bytes(bm._buffers[y.uid], _encode_to_storage_bytes(out, y))
 
         x_view = bm.get_output_tensor(x.uid)
         y_view = bm.get_output_tensor(y.uid)
 
         assert x_view.dtype == torch.float32
         assert y_view.dtype == torch.bfloat16
-        assert torch.equal(x_view, torch.from_numpy(bm.get_input_data(x.uid)))
+        assert torch.equal(x_view, torch.from_numpy(x_data))
         assert torch.equal(y_view.float(), torch.from_numpy(bm.get_output_data(y.uid)))
         assert torch.equal(y_view.float(), torch.from_numpy(out))
 

@@ -71,9 +71,17 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
+# The image build context excludes .git, so resolve the pinned rocm-libraries
+# commit here; setup_env.py otherwise falls back to a moving branch.
+rocm_libraries_ref="$(git -C "${repo_root}" rev-parse HEAD:rocm-libraries 2>/dev/null || true)"
+if [[ -z "${rocm_libraries_ref}" ]]; then
+    echo "WARNING: could not resolve the rocm-libraries submodule commit; the image will build its moving branch." >&2
+fi
+
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" "${container_command}" build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance-linux" \
     --build-arg "DEVICE_TARGET=${device_target}" \
+    --build-arg "ROCM_LIBRARIES_REF=${rocm_libraries_ref}" \
     -t "${tag}" \
     "${build_args[@]}" \
     "${repo_root}"

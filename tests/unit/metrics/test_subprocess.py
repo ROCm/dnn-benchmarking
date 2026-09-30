@@ -18,7 +18,8 @@ import psutil
 import pytest
 
 from dnn_benchmarking.metrics import _subprocess as _subprocess_mod
-from dnn_benchmarking.metrics._subprocess import run_capped
+from dnn_benchmarking.metrics._diagnostic import reset as reset_warn_once
+from dnn_benchmarking.metrics._subprocess import run_capped, run_tool
 
 
 def _alive(pid: int) -> bool:
@@ -104,6 +105,67 @@ class TestRunCapped:
         while time.monotonic() < deadline and _alive(pid):
             time.sleep(0.05)
         assert not _alive(pid), f"tool pid {pid} survived cancellation"
+
+    def test_timeout_keeps_output_printed_before_the_wedge(self):
+        """The last lines before a hang are what diagnose it."""
+        script = (
+            "import sys, time; print('HSA initialized', file=sys.stderr, flush=True); "
+            "time.sleep(30)"
+        )
+        with pytest.raises(subprocess.TimeoutExpired) as exc:
+            run_capped([sys.executable, "-c", script], 2)
+        assert "HSA initialized" in exc.value.stderr
+
+
+class TestRunTool:
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        reset_warn_once()
+
+    def test_success_returns_proc_and_no_fields(self, tmp_path):
+        proc, fields = run_tool(
+            "src", sys.executable, ["-c", "print('ok')"], tmp_path / "o", 60, "g/E"
+        )
+        assert proc.returncode == 0 and fields == {}
+        assert (tmp_path / "o").is_dir()
+
+    def test_nonzero_exit_reports_tail_falling_back_to_stdout(self, tmp_path):
+        _, fields = run_tool(
+            "src",
+            sys.executable,
+            ["-c", "import sys; print('only stdout'); sys.exit(4)"],
+            tmp_path,
+            60,
+            "g/E",
+        )
+        assert fields == {"returncode": 4, "error_tail": "only stdout"}
+
+    def test_timeout_is_skipped_with_tail(self, tmp_path):
+        script = "import sys, time; print('stuck here', file=sys.stderr, flush=True); time.sleep(30)"
+        proc, fields = run_tool(
+            "src", sys.executable, ["-c", script], tmp_path, 2, "g/E"
+        )
+        assert proc is None
+        assert "timed out after 2s" in fields["skipped"]
+        assert "stuck here" in fields["error_tail"]
+
+    def test_missing_binary_is_skipped(self, tmp_path):
+        proc, fields = run_tool("src", None, [], tmp_path, 60, "g/E")
+        assert proc is None and "skipped" in fields
+
+    def test_failure_warning_names_graph_and_engine_each_time(self, tmp_path, capsys):
+        """Per-engine failures must not collapse into one deduplicated line."""
+        for engine in ("A", "B"):
+            run_tool(
+                "src",
+                sys.executable,
+                ["-c", "import sys; sys.exit(1)"],
+                tmp_path,
+                60,
+                f"g/{engine}",
+            )
+        err = capsys.readouterr().err
+        assert "g/A" in err and "g/B" in err
 
 
 class TestKillTree:

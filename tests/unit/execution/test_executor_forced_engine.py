@@ -22,7 +22,7 @@ from unittest.mock import patch
 import pytest
 
 import dnn_benchmarking.execution.executor as executor_module
-from dnn_benchmarking.config.benchmark_config import BenchmarkConfig
+from dnn_benchmarking.config.benchmark_config import TimingPolicy
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 
 
@@ -207,10 +207,9 @@ class _StubDeviceBuffer:
         return None
 
 
-def _executor():
-    config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=0, benchmark_iters=1)
+def _executor(warmup_iters: int = 0):
     # "{}" -> empty graph dict: no data-type attrs / nodes to configure.
-    return executor_module.Executor("{}", config)
+    return executor_module.Executor("{}", TimingPolicy(warmup_iters=warmup_iters))
 
 
 def _fake_module(graph):
@@ -222,16 +221,14 @@ def _fake_module(graph):
     return fake
 
 
-def test_prepare_hard_select_records_actual_engine():
-    """A forced, applicable engine is hard-selected (not soft-preferred) and the
-    engine the backend reports as backing the plan is recorded."""
+def test_prepare_hard_select_uses_the_forced_engine():
+    """A forced, applicable engine is hard-selected (not soft-preferred)."""
     executor = _executor()
     graph = _StubGraph(ranked=[999], selected=999)
     with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
         executor.prepare(handle=object(), engine_id=999)
     assert graph.hard_engine_id == 999  # hard selection was used
     assert graph.plans_created is False  # heuristic path not taken
-    assert executor.selected_engine_id == 999
 
 
 def test_prepare_hard_select_not_applicable_is_skip():
@@ -246,24 +243,13 @@ def test_prepare_hard_select_not_applicable_is_skip():
 
 def test_prepare_discovery_uses_heuristic_plan_creation():
     """With no forced engine, prepare uses the heuristic create_execution_plans
-    path and records whichever engine the backend selected."""
+    path."""
     executor = _executor()
     graph = _StubGraph(ranked=[111, 222], selected=111)
     with patch.dict(sys.modules, {"hipdnn_frontend": _fake_module(graph)}):
         executor.prepare(handle=object(), engine_id=None)
     assert graph.plans_created is True  # heuristic path taken
     assert graph.hard_engine_id is None  # hard selection not used
-    assert executor.selected_engine_id == 111
-
-
-def test_record_selected_engine_mismatch_raises():
-    """If a forced engine differs from the engine actually selected, it is
-    treated as an unsupported-graph skip rather than mislabeled timings."""
-    executor = _executor()
-    executor._graph = _StubGraph(ranked=[111], selected=111)
-    with pytest.raises(UnsupportedGraphError) as exc:
-        executor._record_selected_engine(999)
-    assert "999" in str(exc.value) and "111" in str(exc.value)
 
 
 def test_discover_engines_ranking_runtime_error_becomes_unsupported():
@@ -330,21 +316,17 @@ def _prepared_autotune_executor(graph):
 def test_prepare_for_autotune_builds_all_plans():
     """The autotune build compiles every candidate and never hard-selects."""
     graph = _StubGraph(ranked=[999], selected=999)
-    executor = _prepared_autotune_executor(graph)
+    _prepared_autotune_executor(graph)
     assert graph.plans_created is True
     assert graph.hard_engine_id is None
     assert graph.build_policy == "ALL"
     assert graph.autotune_workspace_queried is True
-    # No plan is pinned yet, so no engine is recorded by prepare().
-    assert executor.selected_engine_id is None
 
 
 def test_prepare_for_autotune_skips_forced_engine_mismatch_check():
     """A requested engine that differs from the reported one must not raise on
     the autotune path: no plan is pinned until autotune() picks a winner."""
-    graph = _StubGraph(ranked=[111], selected=111)
-    executor = _prepared_autotune_executor(graph)
-    assert executor.selected_engine_id is None
+    _prepared_autotune_executor(_StubGraph(ranked=[111], selected=111))
 
 
 def test_autotune_filters_to_engine_and_omits_workspace_size():
@@ -364,7 +346,6 @@ def test_autotune_filters_to_engine_and_omits_workspace_size():
     assert graph.autotune_kwargs["config"].engine_id_filter == [999]
     # Rank order is preserved, so callers can take winners[0].
     assert [w.rank for w in winners] == [0, 1]
-    assert executor.selected_engine_id == 999
     assert executor.plan_name(object()) == "winning_plan"
 
 
@@ -473,8 +454,7 @@ def test_autotune_passes_run_warmup_iterations_to_the_sweep():
     """The sweep's warmup comes from the run's --warmup, not the binding
     default of 1, so first-execute kernel sampling stays out of the window
     that ranks the candidates."""
-    config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=7, benchmark_iters=1)
-    executor = executor_module.Executor("{}", config)
+    executor = _executor(warmup_iters=7)
     graph = _StubGraph(
         ranked=[999], selected=999, autotune_results=[_StubCandidate(rank=0)]
     )
@@ -486,8 +466,7 @@ def test_autotune_passes_run_warmup_iterations_to_the_sweep():
 
 
 def test_autotune_uses_one_warmup_when_run_warmup_is_zero():
-    config = BenchmarkConfig(graph_path="dummy.json", warmup_iters=0, benchmark_iters=1)
-    executor = executor_module.Executor("{}", config)
+    executor = _executor(warmup_iters=0)
     graph = _StubGraph(
         ranked=[999], selected=999, autotune_results=[_StubCandidate(rank=0)]
     )

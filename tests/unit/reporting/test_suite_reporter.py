@@ -1,660 +1,167 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Unit tests for Reporter suite-specific methods."""
+"""Per-graph table and verbose detail block rendering."""
 
 import io
-from unittest.mock import patch
+from typing import List, Optional
 
-from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
+import pytest
+
 from dnn_benchmarking.reporting.reporter import Reporter
-from dnn_benchmarking.reporting.statistics import BenchmarkStats
+from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
     OracleResult,
     ProviderEngineResult,
-    SuiteMetadata,
     build_oracle_delta,
 )
 
 
-def _make_pe_success(
-    engine_id: int = 1,
-    correctness: object = None,
-    provider: str = "miopen",
+def _stats(median_ms: float, n: int = 100, jitter: float = 0.0) -> BenchmarkStats:
+    """Samples around ``median_ms``; ``jitter`` > 0.05 makes them noisy."""
+    timings = [median_ms * (1 + jitter * (-1) ** i) for i in range(n - 1)]
+    return BenchmarkStats.from_timings(timings + [median_ms])
+
+
+def _row(
+    name: str = "MIOPEN_ENGINE",
+    median_ms: Optional[float] = 0.0256,
+    *,
+    role: str = "engine",
+    correctness: Optional[CorrectnessResult] = None,
+    **kwargs,
 ) -> ProviderEngineResult:
-    """Helper: build a successful ProviderEngineResult with timing."""
-    host = BenchmarkStats(
-        mean_ms=1.234,
-        std_ms=0.045,
-        min_ms=1.156,
-        max_ms=1.456,
-        p95_ms=1.312,
-        p99_ms=1.398,
-    )
-    kernel = BenchmarkStats(
-        mean_ms=0.500,
-        std_ms=0.020,
-        min_ms=0.470,
-        max_ms=0.540,
-        p95_ms=0.520,
-        p99_ms=0.535,
-    )
+    stats = _stats(median_ms) if median_ms is not None else None
     return ProviderEngineResult(
-        provider=provider,
-        engine_id=engine_id,
+        provider="pytorch" if role == "reference" else "hipdnn",
+        engine_id=None if role == "reference" else 0x15B46865C717A122,
+        engine_name=None if role == "reference" else name,
         status="success",
-        cpu_build_time_ms=45.23,
-        host_stats=host,
-        gpu_kernel_stats=kernel,
+        role=role,
+        gpu_kernel_stats=stats,
+        host_stats=_stats(0.013) if stats is not None else None,
         correctness=correctness,
+        **kwargs,
     )
 
 
-class TestSuiteReporter:
-    """Tests for Reporter suite progress and summary methods."""
+def _verdict(match: Optional[bool]) -> CorrectnessResult:
+    return CorrectnessResult(
+        execution_success=True,
+        tolerance_match=match,
+        rtol=1e-5,
+        atol=1e-6,
+        error_message=None if match else "output mismatch",
+    )
 
-    def test_print_suite_header(self) -> None:
-        """print_suite_header prints banner with total graph count."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
 
-        reporter.print_suite_header(5)
+def _graph(*rows: ProviderEngineResult, **kwargs) -> GraphResult:
+    return GraphResult(
+        graph_name="g", graph_path="/tmp/g.json", results=list(rows), engine_ids=[1], **kwargs
+    )
 
-        result = output.getvalue()
-        assert "=" * Reporter.WIDTH in result
-        assert "hipDNN Benchmark Suite: 5 graph(s)" in result
 
-    def test_print_suite_graph_start(self) -> None:
-        """print_suite_graph_start prints '[1/3] graph_name...' format."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
+def _table(*rows: ProviderEngineResult, verbose: bool = False) -> str:
+    out = io.StringIO()
+    Reporter(out, io.StringIO(), verbose=verbose).print_graph_table(_graph(*rows))
+    return out.getvalue()
 
-        reporter.print_suite_graph_start(1, 3, "conv_fwd_nchw")
 
-        result = output.getvalue()
-        assert "[1/3] conv_fwd_nchw..." in result
+def _cells(text: str, engine: str) -> List[str]:
+    """Whitespace-split cells of the table row whose engine cell is ``engine``."""
+    for line in text.splitlines():
+        if line.startswith(f"  {engine} "):
+            return line.split()
+    raise AssertionError(f"no row for {engine!r} in:\n{text}")
 
-    def test_print_suite_graph_start_last_graph(self) -> None:
-        """print_suite_graph_start with last graph in sequence."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
 
-        reporter.print_suite_graph_start(3, 3, "matmul_fp16")
+@pytest.fixture(autouse=True)
+def _columns(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "120")
 
-        result = output.getvalue()
-        assert "[3/3] matmul_fp16..." in result
 
-    def test_print_suite_graph_error(self) -> None:
-        """print_suite_graph_error prints inline error for a failed graph."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-
-        reporter.print_suite_graph_error(
-            "conv_fwd", "Graph file not found: /path/to/missing.json"
+class TestTableLayout:
+    @pytest.mark.parametrize("columns", [100, 120])
+    def test_long_name_warning_and_plugin_path_stay_within_terminal_width(
+        self, monkeypatch, columns
+    ) -> None:
+        monkeypatch.setenv("COLUMNS", str(columns))
+        long_name = "HIPBLASLT_ENGINE_WITH_AN_EXTREMELY_LONG_DESCRIPTIVE_NAME_XYZ"
+        warning = (
+            "resample_avgpool_node: ResampleFwdAttributes AVGPOOL_EXCLUDE_PADDING with "
+            "asymmetric padding uses manual valid-count correction " * 2
         )
+        plugin = "/very/long/" + "nested/" * 25 + "libhipdnn_plugin.so"
+        text = _table(_row(long_name, warnings=[warning], plugin_path=plugin), _row())
 
-        result = output.getvalue()
-        assert " ERROR: Graph file not found: /path/to/missing.json" in result
+        lines = text.splitlines()
+        assert max(len(line) for line in lines) <= columns
+        assert plugin not in text
+        assert "HIPBLASLT_ENGINE" in text  # truncated, not dropped
+        assert "resample_avg" in text
 
-    def test_print_suite_summary(self) -> None:
-        """print_suite_summary prints totals from SuiteMetadata."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-
-        meta = SuiteMetadata(
-            timestamp="2026-01-01T00:00:00Z",
-            hostname="testhost",
-            total_graphs=3,
-            total_combinations=9,
-            pass_combinations=6,
-            fail_combinations=2,
-            skip_combinations=1,
-            error_combinations=0,
+    def test_vs_best_is_best_successful_engine_median_over_row_median(self) -> None:
+        text = _table(
+            _row("FAST", 0.020),
+            _row("MID", 0.025),
+            _row("SLOW", 0.040),
+            # A wrong answer is not a "best" and the reference is not an engine.
+            _row("WRONG", 0.005, correctness=_verdict(False)),
+            _row("pytorch", 0.010, role="reference"),
         )
-        reporter.print_suite_summary(meta)
+        assert _cells(text, "FAST")[-1] == "1.00x"
+        assert _cells(text, "MID")[-1] == "0.80x"
+        assert _cells(text, "SLOW")[-1] == "0.50x"
+        assert _cells(text, "WRONG")[-1] == "4.00x"
+        assert _cells(text, "pytorch")[-1] == "ref"
 
-        result = output.getvalue()
-        assert "Suite Summary:" in result
-        assert "Graphs:       3" in result
-        assert "Combinations: 9" in result
-        assert "Passed:       6" in result
-        assert "Failed:       2" in result
-        assert "Skipped:      1" in result
-        assert "Errors:       0" in result
-
-    def test_print_suite_footer(self) -> None:
-        """print_suite_footer prints closing banner."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-
-        reporter.print_suite_footer()
-
-        result = output.getvalue()
-        assert "=" * Reporter.WIDTH in result
-
-    def test_all_output_goes_to_output_stream(self) -> None:
-        """All output goes to self._output stream (consistent with Reporter pattern)."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-
-        # Call all suite methods
-        reporter.print_suite_header(2)
-        reporter.print_suite_graph_start(1, 2, "test_graph")
-        reporter.print_suite_graph_error("bad_graph", "Load failed")
-        reporter.print_suite_summary(
-            SuiteMetadata(
-                timestamp="2026-01-01T00:00:00Z",
-                hostname="testhost",
-                total_graphs=2,
-                total_combinations=4,
-                pass_combinations=3,
-                fail_combinations=0,
-                skip_combinations=1,
-                error_combinations=0,
-            )
+    def test_skipped_and_error_rows_show_their_reason(self) -> None:
+        skipped = ProviderEngineResult.skipped_row(
+            "hipdnn", 7, "No engine configurations available for the graph.", engine_name="SKIPPER"
         )
-        reporter.print_suite_footer()
-
-        result = output.getvalue()
-        # All output should be in the StringIO, not stdout
-        assert len(result) > 0
-        assert "hipDNN Benchmark Suite" in result
-        assert "[1/2] test_graph..." in result
-        assert "Suite Summary:" in result
-
-    def test_print_suite_header_single_graph(self) -> None:
-        """Test header with single graph shows '1 graph(s)'."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-
-        reporter.print_suite_header(1)
-
-        result = output.getvalue()
-        assert "hipDNN Benchmark Suite: 1 graph(s)" in result
-
-    def test_print_suite_summary_separator_line(self) -> None:
-        """Test summary has separator line before content."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-
-        reporter.print_suite_summary(
-            SuiteMetadata(
-                timestamp="2026-01-01T00:00:00Z",
-                hostname="testhost",
-                total_graphs=1,
-                total_combinations=2,
-                pass_combinations=1,
-                fail_combinations=0,
-                skip_combinations=1,
-                error_combinations=0,
-            )
+        errored = ProviderEngineResult.error_row(
+            "hipdnn", 8, "HIP error:\n  invalid device function", engine_name="BROKEN"
         )
+        text = _table(_row(), skipped, errored)
+        assert "No engine configurations available" in text
+        assert "HIP error: invalid device function" in text
+        assert "no engines applicable" not in text
+        assert _cells(text, "SKIPPER")[1] == "skipped"
+        assert _cells(text, "BROKEN")[1] == "error"
 
-        result = output.getvalue()
-        assert "-" * Reporter.WIDTH in result
+    def test_noisy_row_is_marked_and_partial_flops_are_approximate(self) -> None:
+        noisy = _row("NOISY")
+        noisy.gpu_kernel_stats = _stats(0.0256, jitter=0.2)
+        steady = _row("STEADY", derived_tflops_per_s=1.5, analytical_flops_partial=True)
+        text = _table(noisy, steady)
+        assert "µs*" in _cells(text, "NOISY")
+        assert "µs*" not in _cells(text, "STEADY")
+        assert "~1.50" in _cells(text, "STEADY")
 
+    def test_kernel_median_uses_readable_units(self) -> None:
+        text = _table(_row("SMALL", 0.0256), _row("BIG", 4.1837))
+        assert "25.60 µs" in text
+        assert "4.184 ms" in text
 
-class TestVerboseReporter:
-    """Tests for print_verbose_graph_result (rich per-engine block)."""
+    def test_legend_printed_once_after_first_table(self) -> None:
+        out = io.StringIO()
+        reporter = Reporter(out, io.StringIO())
+        reporter.print_graph_table(_graph(_row()))
+        reporter.print_graph_table(_graph(_row()))
+        assert out.getvalue().count("kernel_med = median device time per launch") == 1
 
-    def test_verbose_success_renders_header_init_and_stats(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        gr = GraphResult(
-            graph_name="conv1_fwd",
-            graph_path="/tmp/conv1_fwd.json",
-            results=[_make_pe_success(engine_id=1)],
+    def test_graph_error_is_shown_instead_of_rows(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_table(
+            GraphResult("bad", "/tmp/bad.json", [], error="Invalid JSON in graph file")
         )
-        reporter.print_verbose_graph_result(
-            gr, SuiteConfig(warmup_iters=10, benchmark_iters=100)
-        )
-        out = output.getvalue()
-
-        assert "hipDNN Benchmark: conv1_fwd" in out
-        assert "Engine ID:  1" in out
-        assert "Graph build time:" in out
-        assert "Host Submission Statistics:" in out
-        assert "Kernel Execution Statistics:" in out
-        assert "Mean:" in out
-
-    def test_verbose_renders_block_per_engine(self) -> None:
-        """A GraphResult with multiple engines renders one block each."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[
-                _make_pe_success(engine_id=0),
-                _make_pe_success(engine_id=2),
-            ],
-        )
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        assert "Engine ID:  0" in out
-        assert "Engine ID:  2" in out
-        # Two distinct rich blocks
-        assert out.count("hipDNN Benchmark: g") == 2
-
-    def test_verbose_correctness_pass_renders_passed(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        correctness = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=True,
-            rtol=1e-5,
-            atol=1e-8,
-            max_abs_diff=1e-6,
-            max_rel_diff=1e-6,
-        )
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[_make_pe_success(correctness=correctness)],
-        )
-        reporter.print_verbose_graph_result(
-            gr, SuiteConfig(validation=ValidationConfig(provider="pytorch"))
-        )
-        out = output.getvalue()
-        assert "Reference Validation: PASSED" in out
-        assert "pytorch" in out
-
-    def test_verbose_correctness_fail_renders_failed_with_diffs(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        correctness = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=False,
-            rtol=1e-5,
-            atol=1e-8,
-            max_abs_diff=2.5e-3,
-            max_rel_diff=1.7e-2,
-        )
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[_make_pe_success(correctness=correctness)],
-        )
-        reporter.print_verbose_graph_result(
-            gr, SuiteConfig(validation=ValidationConfig(provider="pytorch"))
-        )
-        out = output.getvalue()
-        assert "Reference Validation: FAILED" in out
-        assert "Max abs diff:" in out
-        assert "Max rel diff:" in out
-
-    def test_verbose_correctness_none_renders_skipped(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        correctness = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=None,
-            rtol=1e-5,
-            atol=1e-8,
-            error_message="reference provider unavailable",
-        )
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[_make_pe_success(correctness=correctness)],
-        )
-        reporter.print_verbose_graph_result(
-            gr, SuiteConfig(validation=ValidationConfig(provider="pytorch"))
-        )
-        out = output.getvalue()
-        assert "Reference Validation: SKIPPED" in out
-        assert "reference provider unavailable" in out
-
-    def test_verbose_error_status_renders_error(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[
-                ProviderEngineResult(
-                    provider="miopen",
-                    engine_id=1,
-                    status="error",
-                    error_message="boom",
-                )
-            ],
-        )
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        assert "ERROR: boom" in out
-
-    def test_verbose_skipped_status_renders_skipped(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[
-                ProviderEngineResult(
-                    provider="miopen",
-                    engine_id=1,
-                    status="skipped",
-                    skip_reason="not supported",
-                )
-            ],
-        )
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        assert "SKIPPED" in out
-        assert "not supported" in out
-
-    def test_verbose_header_uses_per_engine_provider_name(self) -> None:
-        """Verbose header must render the engine's actual provider, not '(MIOpen)'."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[
-                _make_pe_success(engine_id=1, provider="MIOPEN_ENGINE"),
-                _make_pe_success(engine_id=2, provider="HIPBLASLT_ENGINE"),
-            ],
-        )
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        assert "Engine ID:  1 (MIOPEN_ENGINE)" in out
-        assert "Engine ID:  2 (HIPBLASLT_ENGINE)" in out
-        # The legacy literal must not appear anywhere in suite-mode verbose output.
-        assert "(MIOpen)" not in out
-
-    def test_verbose_reference_row_uses_reference_header(self) -> None:
-        """Timed validation-provider rows must not render as hipDNN engines."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        gr = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[
-                _make_pe_success(engine_id=0, provider="pytorch", correctness=None)
-            ],
-        )
-        gr.results[0].role = "reference"
-
-        reporter.print_verbose_graph_result(
-            gr, SuiteConfig(validation=ValidationConfig(provider="pytorch"))
-        )
-        out = output.getvalue()
-
-        assert "Validation Reference Benchmark: g" in out
-        assert "Provider:   pytorch" in out
-        assert "Engine ID:" not in out
-        assert "Reference: timing baseline (no correctness comparison)" in out
-
-    def test_verbose_reference_row_renders_warnings(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        pe = _make_pe_success(engine_id=0, provider="pytorch", correctness=None)
-        pe.role = "reference"
-        pe.warnings = [
-            "RMSNormBackwardAttributes uses a manual formula; "
-            "PyTorch reference timing is not solely built-in PyTorch operator time."
-        ]
-        gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
-
-        reporter.print_verbose_graph_result(
-            gr, SuiteConfig(validation=ValidationConfig(provider="pytorch"))
-        )
-
-        out = output.getvalue()
-        assert "Warnings:" in out
-        assert "WARNING: RMSNormBackwardAttributes" in out
-        assert "Reference: timing baseline" in out
-
-    def test_graph_result_table_renders_warning_column(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        pe = _make_pe_success(engine_id=0, provider="pytorch", correctness=None)
-        pe.role = "reference"
-        pe.warnings = [
-            "manual RMSNorm backward; PyTorch reference timing is not solely "
-            "built-in PyTorch operator time."
-        ]
-        graph = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
-
-        reporter.print_graph_result_table(graph)
-
-        out = output.getvalue()
-        assert "warnings" in out
-        assert "manual RMSNorm backward" in out
-
-    def test_verbose_profiling_renders_when_always_on_metrics_absent(self) -> None:
-        """``--metrics-tier off --pmc basic`` leaves every always-on metric
-        field unset but still populates ``extra_metrics``. The profiling
-        block must render regardless of the always-on suppression — users
-        who opted into profiling need to see where their artefacts landed.
-        """
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            cpu_build_time_ms=12.3,
-            host_stats=BenchmarkStats(
-                mean_ms=1.0,
-                std_ms=0.1,
-                min_ms=0.9,
-                max_ms=1.1,
-                p95_ms=1.05,
-                p99_ms=1.09,
-            ),
-            gpu_kernel_stats=BenchmarkStats(
-                mean_ms=0.5,
-                std_ms=0.05,
-                min_ms=0.45,
-                max_ms=0.55,
-                p95_ms=0.52,
-                p99_ms=0.54,
-            ),
-            extra_metrics={
-                "pmc": {
-                    "set": "basic",
-                    "arch": "gfx942",
-                    "counters": {
-                        "GRBM_GUI_ACTIVE": {"sum": 999, "mean_per_kernel": 1.0}
-                    },
-                }
-            },
-        )
-        gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        # Always-on block must be suppressed (no Derived Metrics header)…
-        assert "Derived Metrics:" not in out
-        # …but the profiling block still renders.
-        assert "Profiling:" in out
-        assert "PMC (basic, gfx942)" in out
-
-    def test_verbose_metrics_render_na_when_no_analytical_model(self) -> None:
-        """Ops without an analytical FLOPs model must show N/A, not 0."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            analytical_flops=None,
-            analytical_flops_partial=True,
-            analytical_io_bytes=4096,
-            gpu_kernel_stats=BenchmarkStats(
-                mean_ms=0.5,
-                std_ms=0.05,
-                min_ms=0.45,
-                max_ms=0.55,
-                p95_ms=0.52,
-                p99_ms=0.54,
-            ),
-        )
-        gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        assert "Derived Metrics:" in out
-        assert "Analytical FLOPs:     N/A (no analytical model)" in out
-        assert "Throughput:           N/A (no analytical model)" in out
-        assert "Analytical FLOPs:     0" not in out
-
-    def test_verbose_profiling_surfaces_error_tail_for_each_source(self) -> None:
-        """Tool failures in trace/perf/roofline must show in verbose
-        output, not only in JSON. Without -o, a silent profiler failure
-        is invisible."""
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            cpu_build_time_ms=12.3,
-            host_stats=BenchmarkStats(
-                mean_ms=1.0,
-                std_ms=0.1,
-                min_ms=0.9,
-                max_ms=1.1,
-                p95_ms=1.05,
-                p99_ms=1.09,
-            ),
-            gpu_kernel_stats=BenchmarkStats(
-                mean_ms=0.5,
-                std_ms=0.05,
-                min_ms=0.45,
-                max_ms=0.55,
-                p95_ms=0.52,
-                p99_ms=0.54,
-            ),
-            extra_metrics={
-                "trace": {"format": "pftrace", "error_tail": "boom", "returncode": 3},
-                "perf": {"error_tail": "perf: bad event", "returncode": 2},
-                "roofline": {"error_tail": "workload failed", "returncode": 1},
-            },
-        )
-        gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
-        reporter.print_verbose_graph_result(gr, SuiteConfig())
-        out = output.getvalue()
-        assert "Trace (pftrace):" in out and "rc=3" in out
-        assert "CPU (perf):" in out and "rc=2" in out
-        assert "Roofline:" in out and "rc=1" in out
+        assert "Invalid JSON in graph file" in out.getvalue()
+        assert "no engines applicable" not in out.getvalue()
 
 
-class TestPrintHeader:
-    """Tests for print_header provider override."""
-
-    def test_print_header_default_is_miopen(self) -> None:
-        """When no provider is supplied, the legacy '(MIOpen)' literal is preserved."""
-        from pathlib import Path
-
-        from dnn_benchmarking.config.benchmark_config import BenchmarkConfig
-
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        cfg = BenchmarkConfig(
-            graph_path=Path("/tmp/x.json"),
-            warmup_iters=10,
-            benchmark_iters=100,
-            engine_id=1,
-        )
-        reporter.print_header(cfg, "graph")
-        assert "(MIOpen)" in output.getvalue()
-
-    def test_print_header_uses_provided_provider(self) -> None:
-        from pathlib import Path
-
-        from dnn_benchmarking.config.benchmark_config import BenchmarkConfig
-
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        cfg = BenchmarkConfig(
-            graph_path=Path("/tmp/x.json"),
-            warmup_iters=10,
-            benchmark_iters=100,
-            engine_id=42,
-        )
-        reporter.print_header(cfg, "graph", provider="HIPBLASLT_ENGINE")
-        out = output.getvalue()
-        assert "Engine ID:  42 (HIPBLASLT_ENGINE)" in out
-        assert "(MIOpen)" not in out
-
-    def test_reference_row_status_renders_reference(self) -> None:
-        output = io.StringIO()
-        reporter = Reporter(output=output)
-        graph = GraphResult(
-            graph_name="g",
-            graph_path="/tmp/g.json",
-            results=[
-                ProviderEngineResult(
-                    provider="pytorch",
-                    engine_id=0,
-                    status="success",
-                    role="reference",
-                    host_stats=BenchmarkStats(
-                        mean_ms=2.0,
-                        median_ms=2.0,
-                        std_ms=0.0,
-                        min_ms=2.0,
-                        max_ms=2.0,
-                        p95_ms=2.0,
-                        p99_ms=2.0,
-                    ),
-                )
-            ],
-        )
-
-        reporter.print_graph_result_table(graph)
-
-        assert "reference" in output.getvalue()
-
-
-class TestMachineSummaryPlatformLabel:
-    """The suite header shows a platform-appropriate accelerator label.
-
-    A CUDA wheel reports cuda_version (and cudnn_version); a ROCm wheel
-    reports rocm_version. The header must show only the label that matches
-    the running platform — CUDA hosts never print a ROCm line, and ROCm
-    hosts never print a CUDA/cuDNN line.
-    """
-
-    @patch("dnn_benchmarking.reporting.suite_results.collect_environment_info")
-    def test_cuda_host_shows_cuda_and_cudnn_not_rocm(self, mock_env) -> None:
-        mock_env.return_value = {
-            "cpu_model": "Test CPU",
-            "gpu_model": "NVIDIA GeForce RTX 5080",
-            "rocm_version": None,
-            "cuda_version": "13.0",
-            "cudnn_version": "9.20.0",
-        }
-        output = io.StringIO()
-        Reporter(output=output).print_suite_header(1)
-        out = output.getvalue()
-
-        assert "CUDA:    13.0" in out
-        assert "cuDNN:   9.20.0" in out
-        assert "ROCm:" not in out
-
-    @patch("dnn_benchmarking.reporting.suite_results.collect_environment_info")
-    def test_rocm_host_shows_rocm_not_cuda(self, mock_env) -> None:
-        mock_env.return_value = {
-            "cpu_model": "Test CPU",
-            "gpu_model": "AMD Instinct MI300X",
-            "rocm_version": "6.2.0",
-            "cuda_version": None,
-            "cudnn_version": None,
-        }
-        output = io.StringIO()
-        Reporter(output=output).print_suite_header(1)
-        out = output.getvalue()
-
-        assert "ROCm:    6.2.0" in out
-        assert "CUDA:" not in out
-        assert "cuDNN:" not in out
-
-
-def _make_oracle(**overrides) -> OracleResult:
+def _oracle(**overrides) -> OracleResult:
     kwargs = dict(
         plan_name="tuned_plan_7",
         compiled_plan_index=2,
@@ -664,310 +171,109 @@ def _make_oracle(**overrides) -> OracleResult:
         compiled_plans_total=5,
         compiled_plans_failed=0,
         knob_settings=[],
-        gpu_kernel_stats=BenchmarkStats(
-            mean_ms=0.250,
-            std_ms=0.01,
-            min_ms=0.24,
-            max_ms=0.26,
-            p95_ms=0.255,
-            p99_ms=0.258,
-        ),
-        # The heuristic plan re-timed after the sweep; twice the tuned run,
-        # so the rendered speedup is 2.00x.
-        warm_baseline_gpu_kernel_stats=BenchmarkStats(
-            mean_ms=0.500,
-            std_ms=0.02,
-            min_ms=0.48,
-            max_ms=0.52,
-            p95_ms=0.510,
-            p99_ms=0.516,
-        ),
+        # Warm heuristic twice as slow as the tuned run: speedup 2.00x.
+        gpu_kernel_stats=_stats(0.250),
+        warm_baseline_gpu_kernel_stats=_stats(0.500),
     )
     kwargs.update(overrides)
     return OracleResult(**kwargs)
 
 
-class TestOracleReporting:
-    """Oracle columns and the verbose oracle block."""
+def _oracle_row(baseline: Optional[CorrectnessResult] = None, **oracle_overrides):
+    pe = _row(correctness=baseline)
+    pe.oracle = _oracle(**oracle_overrides)
+    pe.oracle_delta = build_oracle_delta(pe.oracle)
+    return pe
 
-    def _graph_with(self, pe: ProviderEngineResult) -> GraphResult:
-        return GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
 
-    def test_table_omits_oracle_columns_without_oracle_data(self) -> None:
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(
-            self._graph_with(_make_pe_success())
+class TestOracleColumn:
+    def test_no_oracle_column_without_oracle_data(self) -> None:
+        assert "oracle" not in _table(_row()).splitlines()[1]
+
+    @pytest.mark.parametrize(
+        "pe, expected",
+        [
+            (_oracle_row(), "2.00x"),
+            # Unchecked is not failed and keeps the ratio.
+            (_oracle_row(_verdict(None)), "2.00x"),
+            # A wrong baseline or tuned plan cannot measure a gain.
+            (_oracle_row(_verdict(False)), "invalid"),
+            (_oracle_row(correctness=_verdict(False)), "invalid"),
+            # One compiled plan and no provider search: the ratio is noise.
+            (_oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1), "no-search"),
+            (
+                _oracle_row(
+                    compiled_plans_benchmarked=1,
+                    compiled_plans_total=1,
+                    exhaustive_requested=True,
+                    exhaustive_supported=True,
+                ),
+                "2.00x",
+            ),
+            (_row(oracle_error="sweep exploded"), "failed"),
+        ],
+    )
+    def test_oracle_cell(self, pe, expected) -> None:
+        text = _table(pe)
+        assert "oracle" in text.splitlines()[1]
+        assert expected in _cells(text, "MIOPEN_ENGINE")
+
+
+class TestVerboseBlock:
+    def _verbose_row(self) -> ProviderEngineResult:
+        pe = _row(
+            plugin_path="/opt/plugins/libmiopen_plugin.so",
+            cpu_build_time_ms=4.5,
+            correctness=CorrectnessResult(
+                execution_success=True,
+                tolerance_match=False,
+                rtol=1e-5,
+                atol=1e-6,
+                max_abs_diff=6.2e-3,
+                n_mismatch=3,
+                n_total=1024,
+            ),
+            clocks_before={"sclk_mhz": 1700.0, "throttle_status": 0},
+            clocks_after={"sclk_mhz": 1500.0, "throttle_status": 0},
+            timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
         )
-        out = output.getvalue()
-        assert "oracle_kernel_mean_ms" not in out
-        assert "oracle_speedup" not in out
-        assert "ootb_kernel_mean_ms" not in out
-        assert "kernel_mean_ms" in out
+        pe.host_stats = _stats(0.013, n=10)
+        return pe
 
-    def test_table_renders_oracle_columns(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "oracle_kernel_mean_ms" in out
-        assert "oracle_speedup" in out
-        assert "0.250" in out
-        assert "2.00x" in out
-        assert "ootb_kernel_mean_ms" in out
+    def test_table_always_printed_and_verbose_adds_detail(self) -> None:
+        plain = _table(self._verbose_row())
+        verbose = _table(self._verbose_row(), verbose=True)
+        assert verbose.startswith(plain)
+        assert "/opt/plugins/libmiopen_plugin.so" not in plain
+        assert "/opt/plugins/libmiopen_plugin.so" in verbose
 
-    def test_table_marks_failed_oracle_row(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle_error = "sweep exploded"
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "oracle_speedup" in out
-        assert "failed" in out
+    def test_detail_block_renders_identity_costs_stats_and_correctness(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_verbose(_graph(self._verbose_row()))
+        text = out.getvalue()
 
-    def test_verbose_renders_oracle_block(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Oracle (auto-tuned):" in out
-        # The engine is already in the row header; the block does not repeat it.
-        assert "Engine:" not in out
-        assert "Compiled plans: 5 benchmarked successfully" in out
-        assert "5 total, 0 failed" in out
-        assert "basis: gpu_kernel" in out
-        assert "Warm OOTB:     0.500 ms" in out
-        assert "Tuned vs warm OOTB:" in out
+        assert "MIOPEN_ENGINE (0x15B46865C717A122)" in text
+        assert "build 4 ms" in text and "first call 7.8 s" in text
+        assert "staged/hip, cache warm, warmup 10" in text
+        kernel = next(line.split() for line in text.splitlines() if line.split()[:1] == ["kernel"])
+        # n, mean, median, std, min, p95, max, unit
+        assert kernel[1] == "100" and kernel[3] == "25.600" and kernel[-1] == "µs"
+        submit = next(line.split() for line in text.splitlines() if line.split()[:1] == ["submit"])
+        assert submit[1] == "10" and submit[6] == "-"  # no p95 below 20 samples
+        assert "sclk 1700->1500 MHz" in text
+        assert "FAILED" in text and "max_abs_diff 6.20e-03" in text
+        assert "n_mismatch 3/1024" in text
 
-    def test_verbose_reports_exhaustive_provider_selection(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(exhaustive_requested=True, exhaustive_supported=True)
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Exhaustive:    enabled for this provider" in out
-        assert "existing tuned selection may be reused" in out
-        assert "fresh search" not in out
+    def test_oracle_detail_names_plan_knobs_and_speedup(self) -> None:
+        pe = _oracle_row(knob_settings=[{"knob_id": "SPLIT_K", "value": 4}])
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
+        text = out.getvalue()
+        assert "tuned_plan_7" in text and "SPLIT_K=4" in text
+        assert "500.00 µs warm heuristic -> 250.00 µs tuned = 2.00x" in text
 
-    def test_verbose_omits_the_exhaustive_line_by_default(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Exhaustive:" not in out
-
-    def test_verbose_reports_an_unsupported_exhaustive_provider(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-            exhaustive_requested=True,
-            exhaustive_supported=False,
-        )
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Exhaustive:    unsupported by this engine" in out
-        assert "tuned at plan level only" in out
-        assert "Tuning:        unavailable" in out
-
-    def test_table_marks_a_failed_baseline_invalid_too(self) -> None:
-        """A wrong baseline cannot measure a gain; the row must say so."""
-        pe = _make_pe_success()
-        pe.correctness = self._verdict(False)
-        pe.oracle = _make_oracle(correctness=self._verdict(True))
-        pe.oracle_delta = None
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "invalid" in out
-        assert "2.00x" not in out
-
-    def test_table_speedup_survives_an_unchecked_verdict(self) -> None:
-        """ "Not checked" is not "failed" and must not blank the ratio."""
-        pe = _make_pe_success()
-        pe.correctness = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=None,
-            rtol=1e-5,
-            atol=1e-5,
-            error_message="No reference provider requested",
-        )
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "2.00x" in out
-        assert "invalid" not in out
-
-    @staticmethod
-    def _verdict(passed: bool) -> CorrectnessResult:
-        return CorrectnessResult(
-            execution_success=True,
-            tolerance_match=passed,
-            rtol=1e-5,
-            atol=1e-5,
-            error_message=None if passed else "output mismatch",
-        )
-
-    def test_table_shows_the_baseline_the_speedup_is_computed_from(self) -> None:
-        """The ratio must be checkable against numbers on the same line.
-
-        OOTB kernel_mean_ms is not the comparand; without the warm baseline
-        column the printed 2.00x looks wrong against the visible figures.
-        """
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "warm_ootb_kernel_mean_ms" in out
-        # 0.500 baseline / 0.250 tuned = the printed 2.00x.
-        assert "0.500" in out
-        assert "0.250" in out
-        assert "2.00x" in out
-
-    def test_table_marks_a_tuned_plan_that_failed_validation(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(correctness=self._verdict(False))
-        pe.oracle_delta = None
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "invalid" in out
-        assert "2.00x" not in out
-
-    def test_table_keeps_the_speedup_when_the_tuned_plan_validates(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(correctness=self._verdict(True))
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "2.00x" in out
-        assert "invalid" not in out
-
-    def test_verbose_explains_a_failed_tuned_validation(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(correctness=self._verdict(False))
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "tuned plan FAILED" in out
-        assert "output mismatch" in out
-        assert "no speedup is reported" in out
-
-    def test_table_marks_row_without_a_tuning_search(self) -> None:
-        """One compiled plan and no forced benchmarking is a remeasurement.
-
-        The ratio is real arithmetic but means nothing, so the table must not
-        print it as a speedup.
-        """
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-        )
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        assert pe.oracle_delta is not None
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "no-search" in out
-        assert "2.00x" not in out
-
-    def test_table_reports_speedup_when_plans_competed(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "2.00x" in out
-        assert "no-search" not in out
-
-    def test_table_reports_speedup_when_only_provider_variants_competed(self) -> None:
-        """Provider-level search counts even though one plan was compiled."""
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-            exhaustive_requested=True,
-            exhaustive_supported=True,
-        )
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "2.00x" in out
-        assert "no-search" not in out
-
-    def test_verbose_explains_a_missing_tuning_search(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-        )
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Tuning:        unavailable" in out
-        assert "run-to-run noise" in out
-
-    def test_verbose_empty_knobs_do_not_claim_no_variants_explored(self) -> None:
-        """``knob_settings: []`` means no explicit plan knobs, nothing more."""
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            knob_settings=[],
-            exhaustive_requested=True,
-            exhaustive_supported=True,
-        )
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "none set explicitly (engine defaults)" in out
-        assert "Exhaustive:    enabled for this provider" in out
-
-    def test_verbose_renders_knob_lines(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(knob_settings=[{"knob_id": "SPLIT_K", "value": 4}])
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "SPLIT_K=4" in out
-        assert "engine defaults" not in out
-
-    def test_verbose_renders_oracle_failure(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle_error = "no autotune candidate benchmarked successfully"
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Oracle (auto-tuned): unavailable — no autotune candidate" in out
+    def test_failed_tuned_validation_is_explained(self) -> None:
+        pe = _oracle_row(correctness=_verdict(False))
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
+        assert "tuned plan FAILED validation (output mismatch)" in out.getvalue()

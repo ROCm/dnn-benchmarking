@@ -3,7 +3,7 @@
 
 """Validation module for dnn-benchmarking."""
 
-from .comparison import ArrayComparator, ComparisonResult
+from .comparison import ComparisonResult, compare
 from .reference_provider import (
     ReferenceOutput,
     ReferenceProvider,
@@ -15,10 +15,10 @@ from .validator import Validator
 from . import providers  # noqa: F401
 
 __all__ = [
-    "ArrayComparator",
     "ComparisonResult",
     "ReferenceOutput",
     "ReferenceProvider",
     "ReferenceProviderRegistry",
     "Validator",
+    "compare",
 ]

@@ -5,8 +5,17 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from dnn_benchmarking.metrics import arch as _arch
 from dnn_benchmarking.metrics.arch import detect_arch
+
+
+@pytest.fixture(autouse=True)
+def _uncached():
+    detect_arch.cache_clear()
+    yield
+    detect_arch.cache_clear()
 
 
 class TestDetectArchTorchPath:
