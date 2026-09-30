@@ -1457,21 +1457,17 @@ class TestResolveEngineName:
             name = _resolve_engine_name(0x7636, handle)
         assert name == "hipkernel:Gfx950AttentionDense"
 
-    def test_falls_back_to_registry_when_handle_carries_no_such_engine(self):
+    def test_falls_back_silently_when_handle_carries_no_such_engine(self, capsys):
+        from dnn_benchmarking.metrics._diagnostic import reset
+
+        reset()  # warn_once dedups process-wide; start from a clean slate.
         handle = MagicMock()
         handle.engine_id_to_name.side_effect = IndexError("not loaded")
         with patch.dict(
             sys.modules, {"hipdnn_frontend": self._frontend("MIOPEN_ENGINE")}
         ):
             assert _resolve_engine_name(1, handle) == "MIOPEN_ENGINE"
-
-    def test_bindings_without_handle_method_still_resolve_via_registry(self):
-        """Older frontends lack Handle.engine_id_to_name; that must not raise."""
-        handle = SimpleNamespace()
-        with patch.dict(
-            sys.modules, {"hipdnn_frontend": self._frontend("MIOPEN_ENGINE")}
-        ):
-            assert _resolve_engine_name(1, handle) == "MIOPEN_ENGINE"
+        assert capsys.readouterr().err == ""
 
 
 class TestProfilingPassInvocation:

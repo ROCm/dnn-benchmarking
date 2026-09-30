@@ -140,10 +140,11 @@ def _resolve_engine_name(engine_id: int, handle: Any = None) -> str:
     string so callers always have something printable.
 
     A handle that does not carry the ID (``IndexError``) falls through
-    silently. Any other exception emits a one-shot warning to stderr so a
-    silent fallback doesn't hide a real plugin-init bug — the hex fallback only
-    changes the artifact path and reporting label, but the underlying error
-    usually indicates a broader registry problem worth surfacing.
+    silently. Any other exception emits a warning to stderr (deduplicated per
+    engine ID and message by ``warn_once``) so a silent fallback doesn't hide a
+    real plugin-init bug — the hex fallback only changes the artifact path and
+    reporting label, but the underlying error usually indicates a broader
+    registry problem worth surfacing.
 
     Args:
         engine_id: int engine ID.
