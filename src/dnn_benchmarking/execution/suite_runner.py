@@ -52,7 +52,6 @@ from ..validation.reference_provider import (
 )
 from ..validation.validator import Validator
 
-
 # bf16 has a 7-bit mantissa: 1 ULP ~= 2^-7 = 0.78% relative. Backward
 # convolutions (wgrad/dgrad) accumulate over large reductions, and the MIOpen
 # kernels hipDNN and PyTorch select round 2-3 ULP apart even when they pick the
@@ -131,25 +130,41 @@ def _hipdnn_buffer_device(
     return None
 
 
-def _resolve_engine_name(engine_id: int) -> str:
+def _resolve_engine_name(engine_id: int, handle: Any = None) -> str:
     """Resolve an engine ID to its registered name.
 
-    Looks up the name via ``hipdnn_frontend.engine_id_to_name``. If the ID
-    isn't registered (returns empty string), falls back to a hex display
+    Asks ``handle.engine_id_to_name`` first: it queries the loaded plugins, so
+    it also names plugin-supplied engines such as the ``hipkernel:*`` kernel
+    ingestor engines. Falls back to ``hipdnn_frontend.engine_id_to_name``,
+    which only knows engines built into hipDNN, and finally to a hex display
     string so callers always have something printable.
 
-    Unexpected exceptions (plugin import error, registry corruption)
-    emit a one-shot warning to stderr so a silent fallback doesn't hide
-    a real plugin-init bug — the hex fallback only changes the artifact
-    path and reporting label, but the underlying error usually indicates
-    a broader registry problem worth surfacing.
+    A handle that does not carry the ID (``IndexError``) falls through
+    silently. Any other exception emits a one-shot warning to stderr so a
+    silent fallback doesn't hide a real plugin-init bug — the hex fallback only
+    changes the artifact path and reporting label, but the underlying error
+    usually indicates a broader registry problem worth surfacing.
 
     Args:
         engine_id: int engine ID.
+        handle: Optional hipdnn.Handle whose loaded plugins may carry the ID.
 
     Returns:
-        Registered engine name or ``f"engine_0x..."`` fallback.
+        Engine name or ``f"engine_0x..."`` fallback.
     """
+    if handle is not None:
+        try:
+            name = handle.engine_id_to_name(engine_id)
+            if name:
+                return name
+        except IndexError:
+            pass
+        except Exception as e:
+            warn_once(
+                "suite_runner",
+                f"handle engine_id_to_name failed for {engine_id:#x}: {e}; "
+                "falling back to the built-in registry",
+            )
     try:
         import hipdnn_frontend as hipdnn
 
@@ -157,8 +172,6 @@ def _resolve_engine_name(engine_id: int) -> str:
         if name:
             return name
     except Exception as e:
-        from ..metrics._diagnostic import warn_once
-
         warn_once(
             "suite_runner",
             f"engine_id_to_name failed for {engine_id:#x}: {e}; "
@@ -816,7 +829,7 @@ def run_graph_all_providers(
     for selection in engine_selections:
         engine_id = selection.engine_id
         engine_plugin_path = selection.plugin_path
-        engine_name = _resolve_engine_name(engine_id)
+        engine_name = _resolve_engine_name(engine_id, handle)
         engine_handle = handle
         with Timer() as t:
             if engine_handle is None:
@@ -829,6 +842,7 @@ def run_graph_all_providers(
                         hipdnn.PluginLoadingMode.ABSOLUTE,
                     )
                     engine_handle = hipdnn.Handle()
+                    engine_name = _resolve_engine_name(engine_id, engine_handle)
                 except (ImportError, RuntimeError, ValueError, OSError) as e:
                     pe_result = _engine_setup_error_result(
                         provider=engine_name,
