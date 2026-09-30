@@ -5,6 +5,7 @@
 
 from .benchmark_config import (
     BenchmarkConfig,
+    CACHE_MODE_CHOICES,
     EXECUTION_BACKEND_CHOICES,
     EngineSelection,
     ExecutionBackendName,
@@ -15,11 +16,13 @@ from .benchmark_config import (
     ReferenceProviderName,
     SuiteConfig,
     TimingBackendName,
+    TimingPolicy,
     ValidationConfig,
 )
 
 __all__ = [
     "BenchmarkConfig",
+    "CACHE_MODE_CHOICES",
     "EXECUTION_BACKEND_CHOICES",
     "EngineSelection",
     "ExecutionBackendName",
@@ -30,5 +33,6 @@ __all__ = [
     "ReferenceProviderName",
     "SuiteConfig",
     "TimingBackendName",
+    "TimingPolicy",
     "ValidationConfig",
 ]

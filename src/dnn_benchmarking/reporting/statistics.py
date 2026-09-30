@@ -8,7 +8,7 @@ import socket
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -25,70 +25,107 @@ def _get_timestamp() -> str:
 
 @dataclass
 class BenchmarkStats:
-    """Statistics from benchmark execution.
+    """Summary statistics of one timing sample set (milliseconds).
+
+    No field has a default: a partially built instance must fail loudly
+    rather than report a silent ``0.0``.
 
     Attributes:
-        mean_ms: Mean execution time in milliseconds.
-        median_ms: Upper median, ``sorted(timings)[n // 2]`` - the rocKE /
-            Solera definition. Always an observed sample, never an average.
-        std_ms: Standard deviation of execution time in milliseconds.
-        min_ms: Minimum execution time in milliseconds.
-        max_ms: Maximum execution time in milliseconds.
-        p95_ms: 95th percentile execution time in milliseconds.
-        p99_ms: 99th percentile execution time in milliseconds.
-        total_ms: Total execution time across all iterations in milliseconds.
+        n: Number of samples.
+        mean_ms: Arithmetic mean.
+        std_ms: Sample standard deviation (ddof=1; 0 for n == 1).
+        cv: Coefficient of variation, ``std_ms / mean_ms``.
+        min_ms: Minimum.
+        p25_ms: 25th percentile.
+        median_ms: Median; the headline number.
+        p75_ms: 75th percentile.
+        p95_ms: 95th percentile (serialized as null when n < 20).
+        max_ms: Maximum.
     """
 
+    n: int
     mean_ms: float
     std_ms: float
+    cv: float
     min_ms: float
-    max_ms: float
+    p25_ms: float
+    median_ms: float
+    p75_ms: float
     p95_ms: float
-    p99_ms: float
-    total_ms: float = 0.0
-    median_ms: float = 0.0
+    max_ms: float
 
     @classmethod
-    def from_timings(cls, timings: List[float]) -> "BenchmarkStats":
-        """Calculate statistics from a list of timing values.
-
-        Args:
-            timings: List of execution times in milliseconds.
-
-        Returns:
-            BenchmarkStats with calculated statistics.
+    def from_timings(cls, timings: Sequence[float]) -> "BenchmarkStats":
+        """Summarize a non-empty list of timings in milliseconds.
 
         Raises:
-            ValueError: If timings list is empty.
+            ValueError: If ``timings`` is empty.
         """
-        if not timings:
+        if len(timings) == 0:
             raise ValueError("timings list cannot be empty")
-
-        arr = np.array(timings)
-
+        arr = np.asarray(timings, dtype=np.float64)
+        mean = float(arr.mean())
+        std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+        p25, median, p75, p95 = (float(v) for v in np.percentile(arr, [25, 50, 75, 95]))
         return cls(
-            mean_ms=float(np.mean(arr)),
-            median_ms=float(np.sort(arr)[len(arr) // 2]),
-            std_ms=float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
-            min_ms=float(np.min(arr)),
-            max_ms=float(np.max(arr)),
-            p95_ms=float(np.percentile(arr, 95)),
-            p99_ms=float(np.percentile(arr, 99)),
-            total_ms=float(np.sum(arr)),
+            n=int(arr.size),
+            mean_ms=mean,
+            std_ms=std,
+            cv=std / mean if mean > 0 else 0.0,
+            min_ms=float(arr.min()),
+            p25_ms=p25,
+            median_ms=median,
+            p75_ms=p75,
+            p95_ms=p95,
+            max_ms=float(arr.max()),
         )
 
-    def to_dict(self) -> Dict[str, float]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "mean_ms": self.mean_ms,
-            "median_ms": self.median_ms,
-            "std_ms": self.std_ms,
-            "min_ms": self.min_ms,
-            "max_ms": self.max_ms,
-            "p95_ms": self.p95_ms,
-            "p99_ms": self.p99_ms,
-            "total_ms": self.total_ms,
-        }
+    @property
+    def iqr_ms(self) -> float:
+        """Interquartile range."""
+        return self.p75_ms - self.p25_ms
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a JSON-ready dict; p95 is null below 20 samples."""
+        d: Dict[str, Any] = asdict(self)
+        if self.n < 20:
+            d["p95_ms"] = None
+        d["iqr_ms"] = self.iqr_ms
+        return d
+
+
+NOISY_CV = 0.05
+OUTLIER_RATIO = 2.0
+
+
+def noise_warnings(stats: BenchmarkStats) -> List[str]:
+    """Flag dispersion a reader should know about; samples are never trimmed."""
+    warnings: List[str] = []
+    if stats.n >= 10 and stats.cv > NOISY_CV:
+        warnings.append(f"noisy: CV {stats.cv:.1%}")
+    if stats.median_ms > 0 and stats.max_ms > OUTLIER_RATIO * stats.median_ms:
+        warnings.append(f"outlier: max {stats.max_ms / stats.median_ms:.1f}x median")
+    return warnings
+
+
+@dataclass
+class TimingInfo:
+    """How a row's timings were measured (serialized as the row's ``timing``).
+
+    Attributes mirror ``execution.timing.Measurement`` minus the samples.
+    """
+
+    mode: str
+    backend: str
+    cache_mode: str
+    warmup_iters: int
+    first_call_ms: float
+    capped: bool = False
+    fallback_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a JSON-ready dict."""
+        return asdict(self)
 
 
 @dataclass
@@ -100,8 +137,7 @@ class BenchmarkMetadata:
         graph_name: Name/identifier of the graph being benchmarked.
         graph_path: Path to the graph JSON file.
         warmup_iters: Number of warmup iterations.
-        benchmark_iters: Number of benchmark iterations (timed samples).
-        timing_block: Executions per timed sample (1 = per-execution timing).
+        benchmark_iters: Number of benchmark iterations.
         engine_id: Engine ID used for execution.
         timing_backend: GPU timer backend used ("hip" or "").
         execution_backend: Execution backend used ("hipdnn", "pytorch", or "").
@@ -117,7 +153,6 @@ class BenchmarkMetadata:
     graph_path: str = ""
     warmup_iters: int = 0
     benchmark_iters: int = 0
-    timing_block: int = 1
     engine_id: int = 0
     timing_backend: str = ""
     execution_backend: str = ""

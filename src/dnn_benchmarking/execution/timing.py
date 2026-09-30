@@ -26,11 +26,41 @@ stream. ``TorchGpuTimer`` records events on the provided torch stream
 
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Callable, List, Optional, Tuple, Type
 
 from ..common import torch_support
 from ..config.benchmark_config import TimingBackendName
+
+
+@dataclass
+class Measurement:
+    """Samples and provenance of one timed loop (see ``measure``).
+
+    Attributes:
+        kernel_ms: Device span per timed iteration.
+        host_ms: Host submit time (enqueue only) per timed iteration.
+        mode: ``staged`` (stall-gated gap-free span) or ``events``.
+        backend: Event backend, ``hip`` or ``torch``.
+        cache_mode: ``warm`` or ``cold``.
+        warmup_iters: Untimed enqueues actually run (always >= 1).
+        first_call_ms: Wall time of the first untimed enqueue plus sync;
+            captures one-time plan compile / kernel find cost.
+        capped: True when ``max_iters`` stopped the loop before the
+            ``min_time_ms`` budget was met.
+        fallback_reason: Why staged mode was not used, when it was not.
+    """
+
+    kernel_ms: List[float]
+    host_ms: List[float]
+    mode: str
+    backend: str
+    cache_mode: str
+    warmup_iters: int
+    first_call_ms: float
+    capped: bool = False
+    fallback_reason: Optional[str] = None
 
 
 _HIP_EVENT_API = ("HipEvent", "hip_get_device_count")

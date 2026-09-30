@@ -77,6 +77,46 @@ REFERENCE_PROVIDER_CHOICES = frozenset(
     provider.value for provider in ReferenceProviderName
 )
 
+CACHE_MODE_CHOICES = ("warm", "cold")
+
+
+@dataclass(frozen=True)
+class TimingPolicy:
+    """How one timed loop runs; shared by the hipDNN and PyTorch executors.
+
+    Attributes:
+        warmup_iters: Untimed enqueues before the loop. The loop always runs
+            at least one untimed enqueue (priming) even when this is 0.
+        iters: Minimum number of timed iterations.
+        min_time_ms: Keep sampling until the summed device time reaches this
+            budget (0 disables the time budget; the loop is then fixed-count).
+        max_iters: Hard cap on timed iterations.
+        cache_mode: ``warm`` reuses caches between iterations; ``cold``
+            flushes L2/MALL before every timed iteration.
+    """
+
+    warmup_iters: int = 10
+    iters: int = 100
+    min_time_ms: float = 0.0
+    max_iters: int = 10_000
+    cache_mode: str = "warm"
+
+    def __post_init__(self) -> None:
+        """Validate loop bounds and the cache mode."""
+        if self.warmup_iters < 0:
+            raise ValueError("warmup_iters must be non-negative")
+        if self.iters <= 0:
+            raise ValueError("iters must be positive")
+        if self.min_time_ms < 0:
+            raise ValueError("min_time_ms must be non-negative")
+        if self.max_iters < self.iters:
+            raise ValueError("max_iters must be >= iters")
+        if self.cache_mode not in CACHE_MODE_CHOICES:
+            raise ValueError(
+                f"cache_mode must be one of {CACHE_MODE_CHOICES}, "
+                f"got {self.cache_mode!r}"
+            )
+
 
 @dataclass
 class BenchmarkConfig:
@@ -85,12 +125,7 @@ class BenchmarkConfig:
     Attributes:
         graph_path: Path to the JSON-serialized hipDNN graph file.
         warmup_iters: Number of warmup iterations before benchmarking.
-        benchmark_iters: Number of benchmark iterations (timed samples).
-        timing_block: Executions per timed sample. ``1`` times each execution
-            on its own (stalled-queue staging when available). ``N > 1`` times
-            ``N`` back-to-back executions between one event pair and records
-            ``elapsed / N`` per sample, the block timing used by the rocKE
-            benchmarks (Solera ``TIMED_EXECUTIONS``, rocKE ``time_launches``).
+        benchmark_iters: Number of benchmark iterations for timing.
         engine_id: Engine ID to use (1 = MIOpen).
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
@@ -100,7 +135,6 @@ class BenchmarkConfig:
     graph_path: Path
     warmup_iters: int = 10
     benchmark_iters: int = 100
-    timing_block: int = 1
     engine_id: int = 1
     pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
     pytorch_rocm_fa_library: Optional[str] = None
@@ -128,9 +162,6 @@ class BenchmarkConfig:
 
         if self.benchmark_iters <= 0:
             raise ValueError("benchmark_iters must be positive")
-
-        if self.timing_block <= 0:
-            raise ValueError("timing_block must be positive")
 
 
 @dataclass
@@ -343,9 +374,7 @@ class SuiteConfig:
 
     Attributes:
         warmup_iters: Number of warmup iterations per provider/engine.
-        benchmark_iters: Number of benchmark iterations (timed samples).
-        timing_block: Executions per timed sample; see
-            :attr:`BenchmarkConfig.timing_block`.
+        benchmark_iters: Number of benchmark iterations for timing.
         seed: Optional random seed for reproducible inputs.
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
@@ -367,8 +396,7 @@ class SuiteConfig:
 
     warmup_iters: int = 10
     benchmark_iters: int = 100
-    timing_block: int = 1
-    seed: Optional[int] = None
+    seed: int = 0
     engine_filter: Optional[List[int]] = None
     verbose: bool = False
     oracle_mode: str = "off"
@@ -387,6 +415,22 @@ class SuiteConfig:
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
     cache_dir: Optional[str] = None
+    #: Summed device-time budget per timed loop (0 = fixed iteration count).
+    min_time_ms: float = 0.0
+    #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
+    cache_mode: str = "warm"
+    #: Suppress progress output; tables and the summary still print.
+    quiet: bool = False
+
+    @property
+    def timing_policy(self) -> TimingPolicy:
+        """Timing loop policy derived from this suite configuration."""
+        return TimingPolicy(
+            warmup_iters=self.warmup_iters,
+            iters=self.benchmark_iters,
+            min_time_ms=self.min_time_ms,
+            cache_mode=self.cache_mode,
+        )
 
     @property
     def oracle_enabled(self) -> bool:
@@ -404,8 +448,7 @@ class SuiteConfig:
             raise ValueError("warmup_iters must be non-negative")
         if self.benchmark_iters <= 0:
             raise ValueError("benchmark_iters must be positive")
-        if self.timing_block <= 0:
-            raise ValueError("timing_block must be positive")
+        self.timing_policy  # noqa: B018 - constructing the policy validates it
         if self.engine_filter is not None:
             if len(self.engine_filter) == 0:
                 raise ValueError("engine_filter must be non-empty when set")

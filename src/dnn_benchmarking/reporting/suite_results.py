@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 from ..common import torch_support
 from ..metrics.arch import detect_arch
-from .statistics import BenchmarkStats
+from .statistics import BenchmarkStats, TimingInfo
 
 
 @dataclass
@@ -335,6 +335,13 @@ class ProviderEngineResult:
     oracle: Optional[OracleResult] = None
     oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
+    # How the timings were measured, and GPU clock state around the loop.
+    timing: Optional[TimingInfo] = None
+    clocks_before: Optional[Dict[str, Any]] = None
+    clocks_after: Optional[Dict[str, Any]] = None
+    # Display name of the engine (e.g. MIOPEN_ENGINE); ``provider`` is the
+    # backend ("hipdnn" | "pytorch").
+    engine_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate status field."""
@@ -509,6 +516,8 @@ class GraphResult:
     graph_path: str
     results: List[ProviderEngineResult]
     engine_ids: List[int] = field(default_factory=list)
+    graph_id: Optional[str] = None
+    error: Optional[str] = None
 
     def is_no_engine_graph(self) -> bool:
         """True when this graph result represents a no-engine outcome."""
