@@ -20,6 +20,10 @@ import numpy as np
 # numpy (``dtype.name``) and torch (``str(dtype)`` without ``torch.``).
 _FLOAT64_DTYPES = frozenset({"float64", "int32", "int64", "uint32", "uint64"})
 
+# Summing a bool mask casts it to the sum dtype first; int32 costs 4 bytes
+# per element instead of int64's 8, and chunks this size cannot overflow it.
+_COUNT_CHUNK = 1 << 30
+
 
 def _compare_dtype_name(*dtypes: object) -> str:
     """Return "float64" if any dtype needs it, else "float32"."""
@@ -74,23 +78,26 @@ def compare(
     there); anything else is compared as NumPy arrays. Values are compared in
     float32, or float64 when either side needs it. Any NaN or Inf fails.
 
-    Memory: the temporaries are full size, about 3x the output in the compare
-    dtype. A torch out-of-memory error propagates so the caller can fall back
-    to host arrays.
+    Memory: at most three full-size temporaries in the compare dtype plus a
+    bool mask (13 bytes per element for float32). A torch out-of-memory
+    error propagates so the caller can fall back to host arrays.
     """
     if hasattr(actual, "detach"):
         import torch as xp
 
         a = actual.detach()
-        e = xp.as_tensor(expected, device=a.device)
-        dtype = getattr(xp, _compare_dtype_name(a.dtype, e.dtype))
-        e = e.to(dtype)
+        ref = xp.as_tensor(expected, device=a.device)
+        dtype = getattr(xp, _compare_dtype_name(a.dtype, ref.dtype))
+        e = ref.to(dtype)
     else:
         xp = np
         a = np.asarray(actual)
-        e = np.asarray(expected)
-        dtype = np.dtype(_compare_dtype_name(a.dtype, e.dtype))
-        e = e.astype(dtype, copy=False)
+        ref = np.asarray(expected)
+        dtype = np.dtype(_compare_dtype_name(a.dtype, ref.dtype))
+        e = ref.astype(dtype, copy=False)
+    # A converted copy is ours to overwrite; otherwise e is the caller's data.
+    owns_e = e is not ref
+    del ref
     shape = tuple(a.shape)
     n_total = math.prod(shape)
 
@@ -118,19 +125,27 @@ def compare(
     with np.errstate(over="ignore"):
         diff = a - e
         xp.abs(diff, out=diff)
-        abs_e = xp.abs(e)
+        abs_e = xp.abs(e, out=e) if owns_e else xp.abs(e)
         threshold = abs_e * rtol
         threshold += atol
-        n_mismatch = int((diff > threshold).sum())
+        mismatch = (diff > threshold).reshape(-1)
         del threshold
+        n_mismatch = sum(
+            int(mismatch[i : i + _COUNT_CHUNK].sum(dtype=xp.int32))
+            for i in range(0, n_total, _COUNT_CHUNK)
+        )
+        del mismatch
         flat_worst = int(diff.argmax())
         max_abs_diff = float(diff.reshape(-1)[flat_worst])
-        significant = abs_e > atol
-        max_rel_diff = (
-            float((diff[significant] / abs_e[significant]).max())
-            if bool(significant.any())
-            else 0.0
-        )
+        # Relative difference over |e| > atol: dividing by inf zeroes the
+        # rest, and every ratio is >= 0, so max() is 0.0 when none qualify.
+        # where() rather than mask assignment, which torch turns into an
+        # 8-byte-per-element index.
+        denominator = xp.where(abs_e > atol, abs_e, math.inf)
+        del abs_e
+        diff /= denominator
+        del denominator
+        max_rel_diff = float(diff.max())
     worst_index = tuple(int(i) for i in np.unravel_index(flat_worst, shape))
 
     if n_mismatch == 0:

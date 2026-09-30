@@ -34,7 +34,7 @@ def _passed_row(name: str = "MIOPEN_ENGINE") -> ProviderEngineResult:
         host_stats=BenchmarkStats.from_timings([0.013] * 100),
         elapsed_time_ms=7900.0,
         timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
-        correctness=CorrectnessResult(True, True, 1e-5, 1e-6),
+        correctness=CorrectnessResult(True, 1e-5, 1e-6),
     )
 
 
@@ -107,8 +107,14 @@ class TestProgress:
         assert len(lines) == 1
         assert lines[0].startswith("  MIOPEN_ENGINE ... passed")
         assert "25.60 µs" in lines[0]
-        assert "cv 0.0%" in lines[0] and "setup 7.8 s" in lines[0]
-        assert "exec" not in lines[0]
+        assert "setup 7.8 s" in lines[0]
+
+    def test_sub_10ms_setup_keeps_two_significant_digits(self) -> None:
+        err = io.StringIO()
+        row = _passed_row()
+        row.timing.first_call_ms = 0.123
+        Reporter(io.StringIO(), err).engine_done(row)
+        assert "setup 0.12 ms" in err.getvalue()
 
     def test_tty_line_is_pending_then_completed_in_place(self) -> None:
         err = _Tty()
@@ -210,7 +216,7 @@ class TestSummaries:
         unchecked = _passed_row("U")
         unchecked.correctness = None
         failed = _passed_row("F")
-        failed.correctness = CorrectnessResult(True, False, 1e-5, 1e-6)
+        failed.correctness = CorrectnessResult(False, 1e-5, 1e-6)
         suite = SuiteResult(
             run=RunInfo(started_at="t", argv=[], config={}),
             environment={},

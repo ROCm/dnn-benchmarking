@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
-from .timing import EventTimer, Measurement, Timer, measure
+from ..reporting.suite_results import engine_id_hex
+from .timing import Measurement, Timer, device_sync, measure
 
 
 def _get_handle_stream(handle: Any) -> int:
@@ -37,7 +38,6 @@ class Executor:
         self._workspace_ptr: int = 0
         self._workspace_size: int = 0
         self._init_time_ms: float = 0.0
-        self._stream_sync: Optional[EventTimer] = None
 
     def _build_through_operation_graph(self, handle: Any) -> Any:
         """Create the hipdnn graph and run it up to ``build_operation_graph``.
@@ -166,8 +166,8 @@ class Executor:
                 result = self._graph.create_execution_plan_ext(engine_id)
                 if result.is_bad():
                     raise UnsupportedGraphError(
-                        f"Forced engine {engine_id} not applicable to this graph: "
-                        f"{result.get_message()}"
+                        f"Forced engine {engine_id_hex(engine_id)} not applicable "
+                        f"to this graph: {result.get_message()}"
                     )
             else:
                 result = self._graph.create_execution_plans()
@@ -307,9 +307,9 @@ class Executor:
         actual = int(self._graph.get_execution_plan_engine_id())
         if actual != requested_engine_id:
             raise UnsupportedGraphError(
-                f"Forced engine {requested_engine_id} was not selected; the "
-                f"backend ran engine {actual} (silent fallback). Skipping to "
-                f"avoid mislabeled results."
+                f"Forced engine {engine_id_hex(requested_engine_id)} was not "
+                f"selected; the backend ran engine {engine_id_hex(actual)} "
+                f"(silent fallback). Skipping to avoid mislabeled results."
             )
 
     def _get_execution_stream(self, handle: Any) -> int:
@@ -324,15 +324,6 @@ class Executor:
             )
         return stream
 
-    def _synchronize_stream(self, stream: int) -> None:
-        """Block until the execution stream drains (reusable HIP event)."""
-        if self._stream_sync is None:
-            try:
-                self._stream_sync = EventTimer("hip", stream)
-            except RuntimeError as e:
-                raise ExecutionError(str(e)) from e
-        self._stream_sync.synchronize_stream()
-
     def execute_once(self, handle: Any, variant_pack: Dict[int, int]) -> None:
         """Execute the prepared graph once without collecting timings."""
         if self._graph is None:
@@ -340,11 +331,14 @@ class Executor:
         if self._workspace is not None:
             self._workspace.zeros()
 
-        stream = self._get_execution_stream(handle)
+        self._get_execution_stream(handle)
         result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
         if result.is_bad():
             raise ExecutionError(f"Graph execution failed: {result.get_message()}")
-        self._synchronize_stream(stream)
+        try:
+            device_sync("hip")
+        except RuntimeError as e:
+            raise ExecutionError(str(e)) from e
 
     def benchmark(self, handle: Any, variant_pack: Dict[int, int]) -> Measurement:
         """Prime and time the prepared graph per the executor's policy.

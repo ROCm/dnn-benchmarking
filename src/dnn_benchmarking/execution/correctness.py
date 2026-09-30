@@ -35,7 +35,6 @@ def mismatch(config: SuiteConfig, message: str) -> CorrectnessResult:
     """A negative verdict with no comparison (validation is a hard gate)."""
     rtol, atol = config.validation.tolerance_override or DEFAULT_TOLERANCE
     return CorrectnessResult(
-        execution_success=True,
         tolerance_match=False,
         rtol=rtol,
         atol=atol,
@@ -106,7 +105,6 @@ def check_correctness(
     )
     passed = all(c[3].passed for c in compared)
     return CorrectnessResult(
-        execution_success=True,
         tolerance_match=passed,
         rtol=max(c[1] for c in compared),
         atol=max(c[2] for c in compared),

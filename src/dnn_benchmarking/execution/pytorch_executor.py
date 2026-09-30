@@ -11,7 +11,7 @@ from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
 from . import pytorch_ops
-from .timing import EventTimer, Measurement, Timer, is_hip_available, measure
+from .timing import Measurement, Timer, is_hip_available, measure
 
 
 class PyTorchCudaExecutor:
@@ -63,7 +63,6 @@ class PyTorchCudaExecutor:
         )
         self._init_time_ms: float = 0.0
         self._stream: Optional[Any] = None
-        self._stream_sync: Optional[EventTimer] = None
         self._compiled: Optional[pytorch_ops.CompiledGraph] = None
 
     def prepare(self) -> None:
@@ -85,12 +84,6 @@ class PyTorchCudaExecutor:
             with torch.cuda.device(self._device):
                 torch.cuda.init()
                 self._stream = torch.cuda.default_stream(self._device)
-                try:
-                    self._stream_sync = EventTimer(
-                        self._backend, self._stream.cuda_stream, self._stream
-                    )
-                except RuntimeError as e:
-                    raise ExecutionError(str(e)) from e
 
         self._init_time_ms = t.elapsed_ms
 
@@ -103,8 +96,7 @@ class PyTorchCudaExecutor:
         stream = self._get_stream()
         with torch.cuda.device(self._device), torch.cuda.stream(stream):
             self._execute_graph(tensors)
-            assert self._stream_sync is not None
-            self._stream_sync.synchronize_stream()
+            stream.synchronize()
 
     def benchmark(self, tensors: Dict[int, torch.Tensor]) -> Measurement:
         """Prime and time the graph per the executor's policy.

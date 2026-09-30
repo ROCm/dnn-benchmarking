@@ -49,7 +49,6 @@ def _row(
 
 def _verdict(match: Optional[bool]) -> CorrectnessResult:
     return CorrectnessResult(
-        execution_success=True,
         tolerance_match=match,
         rtol=1e-5,
         atol=1e-6,
@@ -83,7 +82,7 @@ def _columns(monkeypatch):
 
 
 class TestTableLayout:
-    @pytest.mark.parametrize("columns", [100, 120])
+    @pytest.mark.parametrize("columns", [100, 160])
     def test_long_name_warning_and_plugin_path_stay_within_terminal_width(
         self, monkeypatch, columns
     ) -> None:
@@ -100,7 +99,6 @@ class TestTableLayout:
         assert max(len(line) for line in lines) <= columns
         assert plugin not in text
         assert "HIPBLASLT_ENGINE" in text  # truncated, not dropped
-        assert "resample_avg" in text
 
     def test_vs_best_is_best_successful_engine_median_over_row_median(self) -> None:
         text = _table(
@@ -127,7 +125,6 @@ class TestTableLayout:
         text = _table(_row(), skipped, errored)
         assert "No engine configurations available" in text
         assert "HIP error: invalid device function" in text
-        assert "no engines applicable" not in text
         assert _cells(text, "SKIPPER")[1] == "skipped"
         assert _cells(text, "BROKEN")[1] == "error"
 
@@ -149,8 +146,44 @@ class TestTableLayout:
         out = io.StringIO()
         reporter = Reporter(out, io.StringIO())
         reporter.print_graph_table(_graph(_row()))
+        first = out.getvalue()
         reporter.print_graph_table(_graph(_row()))
-        assert out.getvalue().count("kernel_med = median device time per launch") == 1
+        second = out.getvalue()[len(first):]
+        assert len(second.splitlines()) < len(first.splitlines())
+
+    def test_iqr_column_is_iqr_over_median(self) -> None:
+        pe = _row()
+        pe.gpu_kernel_stats = BenchmarkStats.from_timings([0.9] * 10 + [1.1] * 10)
+        text = _table(pe)
+        header = text.splitlines()[1].split()
+        assert header[1:4] == ["verdict", "kernel_med", "iqr%"]
+        assert _cells(text, "MIOPEN_ENGINE")[4] == "20.0"
+
+    def test_note_skips_noise_but_keeps_other_warnings(self) -> None:
+        text = _table(_row("NOISY", warnings=["noisy: IQR 9% of median", "throttled"]))
+        assert "throttled" in text
+        assert "noisy:" not in text
+
+    def test_engine_name_wins_over_the_note(self, monkeypatch) -> None:
+        monkeypatch.setenv("COLUMNS", "100")
+        name = "MIOPEN_ENGINE_DETERMINISTIC"
+        text = _table(_row(name, warnings=["throttled " * 20]), _row())
+        assert f"  {name} " in text
+        assert max(len(line) for line in text.splitlines()) <= 100
+
+    def test_title_links_file_stem_to_graph_name(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_table(
+            GraphResult("pointwise_add_1x2", "/g/sample_add.json", [], graph_id="abc")
+        )
+        assert out.getvalue().splitlines()[0] == "sample_add (pointwise_add_1x2)  [abc]"
+
+    def test_no_engine_graph_shows_why(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_table(
+            GraphResult("g", "/tmp/g.json", [], message="No engine configurations available")
+        )
+        assert "No engine configurations available" in out.getvalue()
 
     def test_graph_error_is_shown_instead_of_rows(self) -> None:
         out = io.StringIO()
@@ -158,7 +191,6 @@ class TestTableLayout:
             GraphResult("bad", "/tmp/bad.json", [], error="Invalid JSON in graph file")
         )
         assert "Invalid JSON in graph file" in out.getvalue()
-        assert "no engines applicable" not in out.getvalue()
 
 
 def _oracle(**overrides) -> OracleResult:
@@ -225,7 +257,6 @@ class TestVerboseBlock:
             plugin_path="/opt/plugins/libmiopen_plugin.so",
             cpu_build_time_ms=4.5,
             correctness=CorrectnessResult(
-                execution_success=True,
                 tolerance_match=False,
                 rtol=1e-5,
                 atol=1e-6,
@@ -253,8 +284,7 @@ class TestVerboseBlock:
         text = out.getvalue()
 
         assert "MIOPEN_ENGINE (0x15B46865C717A122)" in text
-        assert "build 4 ms" in text and "first call 7.8 s" in text
-        assert "staged/hip, cache warm, warmup 10" in text
+        assert "build 4.5 ms" in text and "first call 7.8 s" in text
         kernel = next(line.split() for line in text.splitlines() if line.split()[:1] == ["kernel"])
         # n, mean, median, std, min, p95, max, unit
         assert kernel[1] == "100" and kernel[3] == "25.600" and kernel[-1] == "µs"
@@ -270,10 +300,10 @@ class TestVerboseBlock:
         Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
         text = out.getvalue()
         assert "tuned_plan_7" in text and "SPLIT_K=4" in text
-        assert "500.00 µs warm heuristic -> 250.00 µs tuned = 2.00x" in text
+        assert "500.00 µs" in text and "250.00 µs" in text and "2.00x" in text
 
     def test_failed_tuned_validation_is_explained(self) -> None:
         pe = _oracle_row(correctness=_verdict(False))
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
-        assert "tuned plan FAILED validation (output mismatch)" in out.getvalue()
+        assert "output mismatch" in out.getvalue()

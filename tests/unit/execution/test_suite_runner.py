@@ -268,8 +268,8 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     assert row.timing.mode == "events" and row.timing.first_call_ms == 5.0
     assert row.workspace_bytes == 64 and row.vram_used_mb == 12.0
     warnings = " | ".join(row.warnings)
-    for expected in ("noisy: CV", "outlier: max 5.0x median",
-                     "capped at max_iters", "events timing: no stream wait"):
+    for expected in ("outlier: max 5.0x median", "capped at max_iters",
+                     "events timing: no stream wait"):
         assert expected in warnings
 
 
@@ -291,7 +291,7 @@ CLOCK = {"sclk_mhz": 1700.0, "throttle_status": 0}
     "before, after, throttled",
     [
         (CLOCK, CLOCK, False),
-        (CLOCK, {**CLOCK, "sclk_mhz": 1400.0}, True),
+        (CLOCK, {**CLOCK, "sclk_mhz": 1400.0}, False),  # DPM drop, not throttling
         (CLOCK, {**CLOCK, "throttle_status": 4}, True),
         (None, None, False),
     ],
@@ -306,13 +306,14 @@ def test_clocks_bracket_the_timed_loop(fake, before, after, throttled):
     assert ("throttled" in row.warnings) is throttled
 
 
-def test_unsupported_graph_has_no_engines_and_no_rows(fake):
+def test_unsupported_graph_has_no_engines_and_keeps_the_reason(fake):
     fake.discover_error = UnsupportedGraphError("nothing applies")
 
     graph, _ = _run()
 
     assert graph.status == "no_engines"
     assert graph.results == [] and graph.error is None
+    assert graph.message == "nothing applies"
 
 
 def test_unsupported_graph_still_gets_the_pytorch_reference_row(fake_torch):
@@ -394,6 +395,7 @@ def test_failed_timed_reference(fake_torch, sdpa_backend, reference_status,
     assert (reference.error_message or reference.skip_reason) == (
         "ExecutionError: PyTorch GPU not available"
     )
+    assert engine.verdict == engine_verdict
 
 
 def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
@@ -426,6 +428,27 @@ def test_profiling_payload_lands_on_the_row(fake, monkeypatch):
 
     assert graph.results[0].extra_metrics == {"perf": {"cycles": "ENG_A"}}
     assert "profiling ENG_A" in progress
+
+
+def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    def fail(**kw):
+        raise FileNotFoundError("/proc/nope")
+
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", fail)
+
+    graph, progress = _run(metrics=MetricsConfig(perf=True))
+
+    assert [(r.status, r.engine_name) for r in graph.results] == [
+        ("success", "ENG_A"), ("success", "ENG_B")
+    ]
+    for row in graph.results:
+        assert row.gpu_kernel_stats is not None and row.extra_metrics is None
+        assert "profiling failed: FileNotFoundError: /proc/nope" in row.warnings
+    # Every profiling progress line is completed.
+    assert progress.count("profiling ENG_A ... done") == 1
+    assert progress.count("profiling ENG_B ... done") == 1
 
 
 class TestPytorchBackend:

@@ -3,6 +3,7 @@
 
 """Suite runner on a real GPU: rows, metrics, engine selection, oracle, PyTorch."""
 
+import io
 import json
 import re
 
@@ -20,6 +21,7 @@ from dnn_benchmarking.execution.suite_runner import (
     run_graph_all_providers,
     run_graph_pytorch_backend,
 )
+from dnn_benchmarking.reporting.reporter import Reporter
 from tests.conftest import expected_timing_backend
 from tests.integration.conftest import load_graph
 
@@ -36,6 +38,7 @@ def _run_conv(hipdnn, **config):
         tensor_infos,
         SuiteConfig(warmup_iters=1, benchmark_iters=3, **config),
         hipdnn.Handle(),
+        Reporter(output=io.StringIO()),
     )
     assert result.error is None, result.error
     successes = [r for r in result.results if r.status == "success"]
@@ -133,7 +136,9 @@ def test_pytorch_backend_times_graph(torch_gpu, graph_name: str) -> None:
     config = SuiteConfig(
         warmup_iters=1, benchmark_iters=2, backend=ExecutionBackendName.PYTORCH
     )
-    result = run_graph_pytorch_backend(path, graph_json, tensor_infos, config)
+    result = run_graph_pytorch_backend(
+        path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
+    )
 
     [row] = result.results
     assert (row.provider, row.status, row.verdict) == (
@@ -154,7 +159,9 @@ def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
         backend=ExecutionBackendName.PYTORCH,
         pytorch_sdpa_backend=PyTorchSdpaBackendName.MATH,
     )
-    result = run_graph_pytorch_backend(path, graph_json, tensor_infos, config)
+    result = run_graph_pytorch_backend(
+        path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
+    )
 
     [row] = result.results
     assert row.verdict == "error"

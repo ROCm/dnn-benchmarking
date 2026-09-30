@@ -5,10 +5,11 @@
 
 import csv
 import json
+import os
 
 import pytest
 
-from dnn_benchmarking.reporting.statistics import BenchmarkStats
+from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
     ROW_COLUMNS,
     CorrectnessResult,
@@ -22,8 +23,8 @@ from dnn_benchmarking.reporting.suite_results import (
 )
 
 
-def _correct(match, execution_success=True) -> CorrectnessResult:
-    return CorrectnessResult(execution_success, match, rtol=1e-3, atol=1e-5)
+def _correct(match) -> CorrectnessResult:
+    return CorrectnessResult(match, rtol=1e-3, atol=1e-5)
 
 
 def _row(status="success", role="engine", correctness=None) -> ProviderEngineResult:
@@ -34,7 +35,9 @@ def _row(status="success", role="engine", correctness=None) -> ProviderEngineRes
 
 def _suite(graphs, complete=True) -> SuiteResult:
     return SuiteResult(
-        run=RunInfo(started_at="t", argv=["x"], config={}, complete=complete),
+        run=RunInfo(
+            started_at="t", argv=["x"], config={"seed": 7}, complete=complete
+        ),
         environment={"gpu_arch": "gfx90a"},
         graphs=graphs,
     )
@@ -46,7 +49,6 @@ class TestVerdict:
         [
             (_row(correctness=_correct(True)), "passed"),
             (_row(correctness=_correct(False)), "failed"),
-            (_row(correctness=_correct(None, execution_success=False)), "failed"),
             (_row(correctness=_correct(None)), "unchecked"),
             (_row(correctness=None), "unchecked"),
             (_row(role="reference", correctness=_correct(False)), "reference"),
@@ -136,16 +138,6 @@ class TestBuildOracleDelta:
         assert delta.delta_ms == 1.0
         assert delta.speedup == 2.0
 
-    def test_falls_back_to_host_when_tuned_side_lacks_kernel(self) -> None:
-        delta = build_oracle_delta(
-            _oracle(
-                host_stats=BenchmarkStats.from_timings([4.0]),
-                warm_baseline_gpu_kernel_stats=BenchmarkStats.from_timings([2.0]),
-                warm_baseline_host_stats=BenchmarkStats.from_timings([8.0]),
-            )
-        )
-        assert (delta.basis, delta.speedup) == ("host", 2.0)
-
     def test_no_warm_baseline_means_no_delta(self) -> None:
         # The row's own OOTB timing must never stand in for the baseline.
         tuned = BenchmarkStats.from_timings([1.0])
@@ -176,13 +168,15 @@ def _sample_suite(complete=True) -> SuiteResult:
         engine_name="MIOPEN_ENGINE",
         gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 30),
         host_stats=BenchmarkStats.from_timings([0.01] * 30),
-        correctness=CorrectnessResult(True, True, 1e-3, 1e-5, max_abs_diff=2e-6),
+        correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
+        timing=TimingInfo("staged", "hip", "cold", 10, 3.0),
         derived_tflops_per_s=1.5,
     )
     return _suite(
         [
             GraphResult("g", "g.json", [row], engine_ids=[-1], graph_id="0123456789ab"),
             GraphResult("bad", "bad.json", [], error="parse failed"),
+            GraphResult("none", "none.json", [], message="no engine configs"),
         ],
         complete=complete,
     )
@@ -195,6 +189,21 @@ class TestWriteLoad:
         suite.write(path)
         assert SuiteResult.load(path) == json.loads(suite.to_json())
         assert [p.name for p in path.parent.iterdir()] == ["r.json"]
+
+    def test_written_file_follows_umask(self, tmp_path) -> None:
+        path = tmp_path / "r.json"
+        old = os.umask(0o022)
+        try:
+            _sample_suite().write(path)
+        finally:
+            os.umask(old)
+        assert path.stat().st_mode & 0o777 == 0o644
+
+    def test_load_rejects_non_json_naming_the_file(self, tmp_path) -> None:
+        path = tmp_path / "r.csv"
+        _sample_suite().write(path)
+        with pytest.raises(ValueError, match="r.csv"):
+            SuiteResult.load(path)
 
     def test_failed_serialization_leaves_previous_file(self, tmp_path) -> None:
         path = tmp_path / "r.json"
@@ -226,7 +235,7 @@ class TestWriteLoad:
             reader = csv.DictReader(f)
             rows = list(reader)
         assert tuple(reader.fieldnames) == ROW_COLUMNS
-        row, graph_error = rows
+        row, graph_error, no_engines = rows
         assert row["gpu_arch"] == "gfx90a"
         assert row["graph_id"] == "0123456789ab"
         assert row["engine_id"] == "0xFFFFFFFFFFFFFFFF"
@@ -234,5 +243,9 @@ class TestWriteLoad:
         assert float(row["kernel_median_ms"]) == 0.5
         assert float(row["host_median_ms"]) == 0.01
         assert float(row["max_abs_diff"]) == 2e-6
+        assert (row["n"], row["timing_mode"], row["cache_mode"]) == ("30", "staged", "cold")
+        assert row["seed"] == no_engines["seed"] == "7"
         assert (graph_error["graph_name"], graph_error["status"]) == ("bad", "error")
         assert graph_error["message"] == "parse failed"
+        assert no_engines["status"] == "no_engines"
+        assert no_engines["message"] == "no engine configs"

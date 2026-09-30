@@ -5,18 +5,23 @@
 
 :func:`collect_environment_info` is called once at suite start, before
 any progress output, so its single amdsmi notice cannot interleave with
-a progress line. Every key is always present; unknown values are None.
+a progress line. Every key is always present; unknown values are None,
+except ``gpu_arch``, which is ``"unknown"``. torch is queried only when the
+process has already imported it: importing it takes seconds.
 """
 
+import importlib.util
 import os
 import platform
 import re
+import runpy
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..common import torch_support
 from ._diagnostic import warn_once
-from .arch import detect_arch
+from .arch import detect_gpu
 from .gpu_smi import GpuSmiProbe, is_amdsmi_available
 
 
@@ -76,30 +81,39 @@ def _format_cudnn_version(raw: Optional[int]) -> Optional[str]:
     return f"{major}.{minor}.{patch}"
 
 
+def _torch_build_versions() -> Dict[str, Any]:
+    """Globals of ``torch/version.py``, run on its own without importing torch."""
+    try:
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.submodule_search_locations:
+            return {}
+        package_dir = Path(next(iter(spec.submodule_search_locations)))
+        return runpy.run_path(str(package_dir / "version.py"))
+    except Exception as e:
+        warn_once("machine_info", f"torch version probe failed: {e}")
+        return {}
+
+
 def _torch_info() -> Dict[str, Any]:
+    versions = _torch_build_versions()
+    hip, cuda = versions.get("hip"), versions.get("cuda")
     info: Dict[str, Any] = {
-        "torch_version": None,
-        "rocm_version": None,
-        "cuda_version": None,
+        "torch_version": versions.get("__version__"),
+        "rocm_version": hip,
+        "cuda_version": None if hip else cuda,
         "cudnn_version": None,
-        "gpu_model": None,
     }
-    if not torch_support.module_available():
+    torch = sys.modules.get("torch")
+    if torch is None:
         return info
     try:
-        import torch
-
-        info["torch_version"] = torch.__version__
-        info["rocm_version"] = getattr(torch.version, "hip", None)
-        if torch_support.is_cuda_build():
-            info["cuda_version"] = getattr(torch.version, "cuda", None)
+        if info["cuda_version"]:
             info["cudnn_version"] = _format_cudnn_version(torch.backends.cudnn.version())
         if torch_support.gpu_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            info["gpu_model"] = props.name
             info["gpu_compute_units"] = props.multi_processor_count
     except Exception as e:
-        warn_once("machine_info", f"torch version probe failed: {e}")
+        warn_once("machine_info", f"torch probe failed: {e}")
     return info
 
 
@@ -124,6 +138,7 @@ def collect_environment_info() -> Dict[str, Any]:
             "amdsmi not available; GPU clocks, power and throttle status "
             "will not be recorded",
         )
+    gpu_arch, gpu_model = detect_gpu()
     info: Dict[str, Any] = {
         "hostname": platform.node() or None,
         "cpu_model": _read_cpu_model(),
@@ -131,7 +146,8 @@ def collect_environment_info() -> Dict[str, Any]:
         "numa_nodes": _read_numa_nodes(),
         "total_ram_gb": _read_total_ram_gb(),
         "kernel_version": platform.release() or None,
-        "gpu_arch": detect_arch(),
+        "gpu_model": gpu_model,
+        "gpu_arch": gpu_arch,
         "hipdnn_version": _hipdnn_version(),
         "python_version": platform.python_version(),
         "amdsmi_available": amdsmi_available,

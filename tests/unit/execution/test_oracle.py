@@ -150,8 +150,7 @@ def test_no_successful_candidate_is_an_oracle_error(tuned, candidates):
 
 
 def test_failing_tuned_plan_suppresses_speedup_but_keeps_row_verdict(tuned):
-    passed = CorrectnessResult(execution_success=True, tolerance_match=True,
-                               rtol=1e-5, atol=1e-6)
+    passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
     refs = {1: ReferenceOutput(data=np.zeros(2, np.float32), tensor_uid=1)}
     bm = _BM({1: np.ones(2, np.float32)})
 

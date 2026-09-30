@@ -53,14 +53,15 @@ def test_torch_dtype_has_registry_size(name: str) -> None:
     assert dtype.torch_dtype().itemsize == dtype.size
 
 
-def test_hipdnn_names_are_hipdnn_enum_members() -> None:
+def test_upper_case_names_are_hipdnn_enum_members() -> None:
+    """The executor maps graph dtype names to hipDNN via ``name.upper()``."""
     try:
         import hipdnn_frontend as hipdnn
     except Exception:  # ImportError, or OSError without the ROCm libraries
         pytest.skip("hipdnn_frontend not importable")
 
     for name in NAMES:
-        assert hasattr(hipdnn.DataType, get_dtype(name).hipdnn_name), name
+        assert hasattr(hipdnn.DataType, get_dtype(name).name.upper()), name
 
 
 @pytest.mark.parametrize("name", ["fp4_e2m1", "unset", "float32", "", None])

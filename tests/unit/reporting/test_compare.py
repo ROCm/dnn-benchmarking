@@ -5,6 +5,8 @@
 
 import json
 
+import pytest
+
 from dnn_benchmarking.reporting.compare import main
 from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
@@ -30,7 +32,7 @@ def _row(name, median, *, cv=0.0, match=True, status="success", role="engine"):
         role=role,
         engine_name=name,
         gpu_kernel_stats=_stats(median, cv) if status == "success" else None,
-        correctness=CorrectnessResult(True, match, 1e-3, 1e-5),
+        correctness=CorrectnessResult(match, 1e-3, 1e-5),
     )
 
 
@@ -116,16 +118,14 @@ def test_graphs_only_in_one_file_are_listed(tmp_path, capsys):
     assert (report["only_in_a"], report["only_in_b"]) == (["gone"], ["new"])
 
 
-def test_join_on_graph_id_with_name_fallback(tmp_path, capsys):
+def test_join_on_graph_id(tmp_path, capsys):
     a = _write(tmp_path, "a.json", [("renamed_a", "same", [_row("E", 1.0)]),
-                                    ("same_name", "id_a", [_row("E", 1.0)]),
-                                    ("no_id", None, [_row("E", 1.0)])])  # fmt: skip
+                                    ("same_name", "id_a", [_row("E", 1.0)])])  # fmt: skip
     b = _write(tmp_path, "b.json", [("renamed_b", "same", [_row("E", 1.0)]),
-                                    ("same_name", "id_b", [_row("E", 1.0)]),
-                                    ("no_id", "z", [_row("E", 1.0)])])  # fmt: skip
+                                    ("same_name", "id_b", [_row("E", 1.0)])])  # fmt: skip
     _, report = _json(capsys, [a, b])
     # Same content under a new name joins; same name with different content does not.
-    assert [p["graph"] for p in report["pairs"]] == ["renamed_a", "no_id"]
+    assert [p["graph"] for p in report["pairs"]] == ["renamed_a"]
     assert report["only_in_a"] == ["same_name"]
     assert report["only_in_b"] == ["same_name"]
 
@@ -154,11 +154,21 @@ def test_unreadable_or_incompatible_input_exits_2(tmp_path, capsys):
     assert main([a, a, "--by", "nope"]) == 2
 
 
-def test_table_fits_120_columns(tmp_path, capsys):
+def test_missing_ref_on_both_sides_is_one_label(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])])
+    _, report = _json(capsys, [a, b, "--by", "ref"])
+    assert report["pairs"][0]["label"] == "no ref row in either"
+
+
+@pytest.mark.parametrize("columns", [80, 100, 200])
+def test_table_fits_terminal_width(tmp_path, capsys, monkeypatch, columns):
+    monkeypatch.setenv("COLUMNS", str(columns))
     long = "conv_fwd_" + "x" * 150
     a = _write(tmp_path, "a.json", [(long, "id", [_row("ENGINE_" + "Y" * 60, 123.456)])])
     b = _write(tmp_path, "b.json", [(long, "id", [_row("ENGINE_" + "Y" * 60, 0.001)])])
     assert main([a, b]) == 0
     out = capsys.readouterr().out
-    assert "B speedup vs A" in out
-    assert max(len(line) for line in out.splitlines()) <= 120
+    assert max(len(line) for line in out.splitlines()) <= columns
+    # Same units as the run table.
+    assert "123.456 ms" in out and "1.00 µs" in out

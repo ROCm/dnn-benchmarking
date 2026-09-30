@@ -35,9 +35,6 @@ from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRe
 from .correctness import check_correctness, mismatch
 from .oracle import run_oracle_pass
 
-# sclk_after below this fraction of sclk_before flags the row "throttled".
-_THROTTLE_SCLK_RATIO = 0.9
-
 
 @dataclass
 class _GraphContext:
@@ -48,7 +45,7 @@ class _GraphContext:
     graph_name: str
     tensor_infos: List[TensorInfo]
     config: SuiteConfig
-    reporter: Optional[Reporter]
+    reporter: Reporter
     input_data: Dict[int, Any]
     flops: Optional[int] = None
     flops_partial: bool = False
@@ -58,16 +55,12 @@ class _GraphContext:
     graph_json_str: str = ""  # hipDNN runs only
 
 
-def set_plugin_path(
-    hipdnn: Any, plugin_path: Optional[Path], loading_mode: Optional[Any] = None
-) -> None:
+def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
     """Set the process-wide hipDNN plugin search path for the next handle."""
-    if plugin_path is None:
-        return
-    paths = [str(plugin_path)]
-    if loading_mode is None:
-        loading_mode = hipdnn.PluginLoadingMode.ABSOLUTE
-    hipdnn.set_engine_plugin_paths(paths, loading_mode)
+    if plugin_path is not None:
+        hipdnn.set_engine_plugin_paths(
+            [str(plugin_path)], hipdnn.PluginLoadingMode.ABSOLUTE
+        )
 
 
 def _engine_identity(handle: Any, engine_id: int) -> Tuple[str, str]:
@@ -113,43 +106,27 @@ def _hipdnn_buffer_device(
     return None
 
 
-def _timed_row(run: Callable[[], ProviderEngineResult]) -> ProviderEngineResult:
-    """Run one row, stamping its start time and wall time."""
+def _report_row(
+    reporter: Reporter,
+    label: str,
+    run: Callable[[], ProviderEngineResult],
+) -> ProviderEngineResult:
+    """Run one row between progress events, stamping its start and wall time."""
+    reporter.engine_start(label)
     started_at = datetime.now(timezone.utc).isoformat()
     with Timer() as t:
         row = run()
     row.started_at = started_at
     row.elapsed_time_ms = t.elapsed_ms
+    reporter.engine_done(row)
     return row
 
 
-def _report_row(
-    reporter: Optional[Reporter],
-    label: str,
-    run: Callable[[], ProviderEngineResult],
-) -> ProviderEngineResult:
-    if reporter is not None:
-        reporter.engine_start(label)
-    row = _timed_row(run)
-    if reporter is not None:
-        reporter.engine_done(row)
-    return row
-
-
-def _throttled(
-    before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]
-) -> bool:
-    if not after:
-        return False
-    if after.get("throttle_status"):
-        return True
-    sclk_before = (before or {}).get("sclk_mhz")
-    sclk_after = after.get("sclk_mhz")
-    return bool(
-        sclk_before
-        and sclk_after is not None
-        and sclk_after < _THROTTLE_SCLK_RATIO * sclk_before
-    )
+def _throttled(after: Optional[Dict[str, Any]]) -> bool:
+    # Only the SMU's throttle status counts: sclk alone moves with DPM demand
+    # (1700 -> 1430 MHz over a 3-iteration loop on an idle MI210), so a lower
+    # after-sample is not evidence of throttling.
+    return bool(after and after.get("throttle_status"))
 
 
 def _measure_row(
@@ -188,7 +165,7 @@ def _measure_row(
             f"{m.fallback_reason}",
         )
         warnings.append(f"events timing: {m.fallback_reason}")
-    if _throttled(row.clocks_before, row.clocks_after):
+    if _throttled(row.clocks_after):
         warnings.append("throttled")
     row.warnings = warnings
 
@@ -272,7 +249,7 @@ def _graph_context(
     graph_json: Dict[str, Any],
     tensor_infos: List[TensorInfo],
     config: SuiteConfig,
-    reporter: Optional[Reporter],
+    reporter: Reporter,
 ) -> _GraphContext:
     """Generate inputs and per-graph analytical FLOPs/IO (shape-only, once)."""
     graph_name = graph_json.get("name", graph_path.stem)
@@ -478,23 +455,27 @@ def _run_profiling(
     engine_name: str,
     plugin_path: Optional[Path],
 ) -> None:
+    """Run the opt-in profiler passes; a failure annotates the timed row."""
     from ..metrics.profiling_orchestrator import run_profiling_passes
 
-    reporter = ctx.reporter
-    if reporter is not None:
-        reporter.profiling_start(engine_name)
+    extra = None
+    ctx.reporter.profiling_start(engine_name)
     with Timer() as t:
-        extra = run_profiling_passes(
-            graph_path=ctx.graph_path,
-            engine_id=engine_id,
-            engine_name=engine_name,
-            seed=ctx.config.seed,
-            warmup_iters=ctx.config.warmup_iters,
-            metrics_config=ctx.config.metrics,
-            plugin_path=plugin_path,
-        )
-    if reporter is not None:
-        reporter.profiling_done(engine_name, t.elapsed_ms / 1000.0)
+        try:
+            extra = run_profiling_passes(
+                graph_path=ctx.graph_path,
+                engine_id=engine_id,
+                engine_name=engine_name,
+                seed=ctx.config.seed,
+                warmup_iters=ctx.config.warmup_iters,
+                metrics_config=ctx.config.metrics,
+                plugin_path=plugin_path,
+            )
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            warn_once("profiling", f"profiling pass failed: {msg}")
+            row.warnings = (row.warnings or []) + [f"profiling failed: {msg}"]
+    ctx.reporter.profiling_done(engine_name, t.elapsed_ms / 1000.0)
     row.extra_metrics = extra or None
 
 
@@ -541,7 +522,7 @@ def run_graph_all_providers(
     tensor_infos: list,
     config: SuiteConfig,
     handle: Any,
-    reporter: Optional[Reporter] = None,
+    reporter: Reporter,
 ) -> GraphResult:
     """Run a single graph against every selected or discovered hipDNN engine.
 
@@ -580,8 +561,9 @@ def run_graph_all_providers(
                 discovery_handle = hipdnn.Handle()
             discovery = Executor(graph_json_str, config.timing_policy)
             engine_ids = discovery.discover_engines(discovery_handle)
-        except UnsupportedGraphError:
+        except UnsupportedGraphError as e:
             engine_ids = []
+            graph.message = str(e)
         except Exception as e:
             graph.error = f"Engine discovery failed: {type(e).__name__}: {e}"
             return graph
@@ -617,7 +599,7 @@ def _run_engine_selection(
         try:
             import hipdnn_frontend as hipdnn
 
-            set_plugin_path(hipdnn, plugin_path, hipdnn.PluginLoadingMode.ABSOLUTE)
+            set_plugin_path(hipdnn, plugin_path)
             handle = hipdnn.Handle()
         except Exception as e:
             label = engine_id_hex(engine_id) or ""
@@ -647,7 +629,7 @@ def run_graph_pytorch_backend(
     graph_json: Dict[str, Any],
     tensor_infos: list,
     config: SuiteConfig,
-    reporter: Optional[Reporter] = None,
+    reporter: Reporter,
 ) -> GraphResult:
     """Run a single graph through the PyTorch executor as the sole engine row.
 
@@ -663,22 +645,14 @@ def run_graph_pytorch_backend(
     )
 
     # Unsupported operations are an unsupported-graph signal, checked before
-    # input generation (a static inspection). A torch import failure is
-    # ignored here: the timed row surfaces it as an engine error.
-    unsupported: List[str] = []
-    try:
-        from . import pytorch_ops
+    # input generation (a static inspection).
+    from . import pytorch_ops
 
-        unsupported = sorted(pytorch_ops.get_unsupported_operations(graph_json))
-    except Exception:
-        pass
+    unsupported = sorted(pytorch_ops.get_unsupported_operations(graph_json))
     if unsupported:
         msg = f"Graph contains unsupported operations: {unsupported}"
-        strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
-        make = (
-            ProviderEngineResult.error_row
-            if strict
-            else ProviderEngineResult.skipped_row
+        make = _error_or_skip(
+            config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
         )
         graph.results.append(
             _report_row(

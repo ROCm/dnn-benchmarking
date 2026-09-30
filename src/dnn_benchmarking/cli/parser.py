@@ -195,16 +195,6 @@ def _choice_option(
     )
 
 
-HELP_GROUPS = (
-    "Input",
-    "Run",
-    "Backend/Selection",
-    "Validation",
-    "Comparison",
-    "Output",
-    "Profiling",
-)
-
 CLI_OPTIONS: tuple[CliOption, ...] = (
     # Input
     CliOption(
@@ -416,7 +406,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Output",
         SuiteConfig,
         "verbose",
-        "per-engine detail instead of the summary table",
+        "add a per-engine detail block under each graph table",
     ),
     _bool_option(
         ("-q", "--quiet"),
@@ -582,7 +572,11 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
         allow_abbrev=False,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_version()}")
-    groups = {name: parser.add_argument_group(name) for name in HELP_GROUPS}
+    # Help groups appear in the order CLI_OPTIONS first uses them.
+    groups = {
+        name: parser.add_argument_group(name)
+        for name in dict.fromkeys(o.group for o in CLI_OPTIONS)
+    }
     for option in CLI_OPTIONS:
         _add_cli_option(groups, option, suppress_defaults=suppress_defaults)
 

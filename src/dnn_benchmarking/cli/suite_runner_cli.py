@@ -49,10 +49,6 @@ _SELECTION_ENV = (
     "MIOPEN_CUSTOM_CACHE_DIR",
 )
 
-#: Hazard kinds returned by :func:`_apply_tuning_environment`.
-LEAKED_FORCE_BENCHMARKING = "leaked_force_benchmarking"
-AUTOTUNE_WITHOUT_CACHE_DIR = "autotune_without_cache_dir"
-
 
 class _Terminated(BaseException):
     """Raised by the SIGTERM handler; BaseException so per-graph isolation
@@ -90,6 +86,13 @@ def run_suite_cli(
         if problem:
             reporter.error(f"--output {output_path}: {problem}")
             return 2
+    if config.metrics.opt_in_pass_requested:
+        # The orchestrator puts its timestamped run directory under this root.
+        profiling_dir = config.metrics.profiling_output_dir or Path("profiling-output")
+        problem = _dir_problem(profiling_dir)
+        if problem:
+            reporter.error(f"--profiling-output-dir {profiling_dir}: {problem}")
+            return 2
 
     missing = check_requested_tools(config.metrics)
     for message in missing:
@@ -122,13 +125,17 @@ def _output_problem(path: Path) -> Optional[str]:
     """Why results cannot be written to ``path``, or None when they can."""
     if path.is_dir():
         return "is a directory"
-    parent = path.parent
+    return _dir_problem(path.parent)
+
+
+def _dir_problem(directory: Path) -> Optional[str]:
+    """Why files cannot be created in ``directory`` (created if missing), or None."""
     try:
-        parent.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return f"cannot create {parent}: {e.strerror or e}"
-    if not os.access(parent, os.W_OK | os.X_OK):
-        return f"{parent} is not writable"
+        return f"cannot create {directory}: {e.strerror or e}"
+    if not os.access(directory, os.W_OK | os.X_OK):
+        return f"{directory} is not writable"
     return None
 
 
@@ -327,14 +334,13 @@ def _warn_oracle(config: SuiteConfig, reporter: Reporter) -> None:
         )
 
 
-def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> List[str]:
+def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     """Set the kernel-selection environment and state the path in effect.
 
     Prints one info line ``kernel selection: heuristic|autotune; cache: ...``
-    plus one warning per hazard. Returns the hazard kinds
-    (:data:`LEAKED_FORCE_BENCHMARKING`, :data:`AUTOTUNE_WITHOUT_CACHE_DIR`).
+    plus one warning per hazard.
     """
-    hazards: List[str] = []
+    leaked = False
     if config.cache_dir:
         os.environ["HIPDNN_CACHE_DIR"] = config.cache_dir
     cache = os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
@@ -344,16 +350,15 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> List[s
     elif _truthy_env("HIPDNN_FORCE_BENCHMARKING"):
         # Process-wide and inherited from the shell: the run is NOT on the
         # heuristic path even though --autotune was not passed.
-        hazards.append(LEAKED_FORCE_BENCHMARKING)
+        leaked = True
         reporter.warning(
             "HIPDNN_FORCE_BENCHMARKING is set in the environment without "
             "--autotune; kernels are benchmarked, not heuristic-selected"
         )
-    autotune = config.autotune or bool(hazards)
+    autotune = config.autotune or leaked
     if config.autotune and not config.cache_dir:
         # The winner cache outlives the run and reads are not gated on
         # benchmarking, so a previous session's ranking can be reported.
-        hazards.append(AUTOTUNE_WITHOUT_CACHE_DIR)
         reporter.warning(
             "--autotune without --cache-dir: winners cached by earlier runs "
             "may be reported instead of measured"
@@ -361,4 +366,3 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> List[s
     reporter.info(
         f"kernel selection: {'autotune' if autotune else 'heuristic'}; cache: {cache}"
     )
-    return hazards

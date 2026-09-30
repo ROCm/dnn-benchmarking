@@ -80,15 +80,21 @@ class BenchmarkStats:
         return d
 
 
-NOISY_CV = 0.05
+NOISY_IQR = 0.05
 OUTLIER_RATIO = 2.0
 
 
 def noise_warnings(stats: BenchmarkStats) -> List[str]:
-    """Flag dispersion a reader should know about; samples are never trimmed."""
+    """Flag dispersion a reader should know about; samples are never trimmed.
+
+    Noise uses the robust spread IQR/median, so a few slow samples (reported
+    by the outlier flag) do not mark an otherwise tight distribution noisy.
+    """
     warnings: List[str] = []
-    if stats.n >= 10 and stats.cv > NOISY_CV:
-        warnings.append(f"noisy: CV {stats.cv:.1%}")
+    if stats.n >= 10 and stats.median_ms > 0:
+        spread = stats.iqr_ms / stats.median_ms
+        if spread > NOISY_IQR:
+            warnings.append(f"noisy: IQR {spread:.1%} of median")
     if stats.median_ms > 0 and stats.max_ms > OUTLIER_RATIO * stats.median_ms:
         warnings.append(f"outlier: max {stats.max_ms / stats.median_ms:.1f}x median")
     return warnings

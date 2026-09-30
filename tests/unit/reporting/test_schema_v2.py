@@ -42,7 +42,7 @@ SUMMARY_KEYS = {
     "graphs", "rows", "passed", "unchecked", "failed", "skipped", "errors",
     "graph_errors", "no_engine_graphs",
 }  # fmt: skip
-GRAPH_KEYS = {"graph_id", "graph_name", "graph_path", "status", "error", "results"}
+GRAPH_KEYS = {"graph_id", "graph_name", "graph_path", "status", "error", "message", "results"}
 ROW_KEYS = {
     "provider", "role", "engine", "status", "verdict", "message", "started_at",
     "elapsed_s", "build_ms", "timing", "kernel", "host", "metrics", "correctness",
@@ -110,7 +110,6 @@ def full_suite() -> SuiteResult:
         host_stats=_stats(0.01),
         elapsed_time_ms=1500.0,
         correctness=CorrectnessResult(
-            execution_success=True,
             tolerance_match=True,
             rtol=1e-3,
             atol=1e-5,

@@ -48,7 +48,7 @@ def _passed(engine_id: int = 1) -> ProviderEngineResult:
         provider="hipdnn",
         engine_id=engine_id,
         status="success",
-        correctness=CorrectnessResult(True, True, 1e-3, 1e-3),
+        correctness=CorrectnessResult(tolerance_match=True, rtol=1e-3, atol=1e-3),
     )
 
 
@@ -57,7 +57,7 @@ def _failed() -> ProviderEngineResult:
         provider="hipdnn",
         engine_id=2,
         status="success",
-        correctness=CorrectnessResult(True, False, 1e-3, 1e-3),
+        correctness=CorrectnessResult(tolerance_match=False, rtol=1e-3, atol=1e-3),
     )
 
 
@@ -203,12 +203,24 @@ def test_final_write_failure_exits_1(tmp_path, backend) -> None:
     assert code == 1
 
 
-def test_unwritable_output_is_usage_error(tmp_path, backend) -> None:
+@pytest.mark.parametrize(
+    "flag, argv",
+    [
+        ("--output", lambda d: ["-o", str(d / "out.json")]),
+        ("--profiling-output-dir", lambda d: ["--perf", "--profiling-output-dir", str(d / "x")]),
+    ],
+    ids=["output", "profiling-output-dir"],
+)
+def test_unwritable_output_is_usage_error(
+    tmp_path, backend, monkeypatch, flag, argv
+) -> None:
+    monkeypatch.setattr(suite_runner_cli, "check_requested_tools", lambda m: [])
     blocker = tmp_path / "file"
     blocker.write_text("")
     backend(lambda path: _graph(path, [_passed()]))
-    code, _ = _run(_args("-o", str(blocker / "out.json")), _graphs(tmp_path, 1))
+    code, text = _run(_args(*argv(blocker)), _graphs(tmp_path, 1))
     assert code == 2
+    assert f"ERROR: {flag} " in text
     assert backend.calls == []
 
 

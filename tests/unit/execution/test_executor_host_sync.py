@@ -119,9 +119,9 @@ def test_handle_stream_change_after_prepare_raises(hip_log) -> None:
         executor.benchmark(_Handle(456), {})
 
 
-def test_execute_once_drains_the_handle_stream(hip_log) -> None:
+def test_execute_once_drains_the_device(hip_log) -> None:
     executor = _executor(hip_log)
 
     executor.execute_once(_Handle(99), {})
 
-    assert hip_log == ["execute", ("record", 99), "event_sync"]
+    assert hip_log == ["execute", "device_sync"]

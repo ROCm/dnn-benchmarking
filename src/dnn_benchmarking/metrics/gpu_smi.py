@@ -17,9 +17,19 @@ does not silently point the probe at another GPU.
 """
 
 import functools
-from typing import Any, Callable, Dict, Optional
+import os
+import sys
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..common import torch_support
+
+# Set when the HIP device list is a remapped subset of the physical GPUs.
+_VISIBILITY_ENV = (
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+)
 
 _UNAVAILABLE_VALUES = {"", "N/A", "NA", "NONE", "NULL", "UNSUPPORTED"}
 
@@ -61,7 +71,15 @@ def is_amdsmi_available() -> bool:
 
 
 def _hip_device_bdf(device_index: Optional[int]) -> Optional[str]:
-    """``dddd:bb:dd`` PCI address of a HIP device (None = current), via torch."""
+    """``dddd:bb:dd`` PCI address of a HIP device (None = current), via torch.
+
+    Importing torch takes seconds, so it is imported only when device
+    visibility is remapped. Otherwise the caller maps the HIP index directly.
+    """
+    # ponytail: assumes HIP and amdsmi both list unmasked GPUs in PCI order
+    # (true on MI210/MI300 nodes); query the HIP runtime if that ever breaks.
+    if "torch" not in sys.modules and not any(map(os.environ.get, _VISIBILITY_ENV)):
+        return None
     if not torch_support.module_available() or not torch_support.gpu_available():
         return None
     try:
@@ -150,6 +168,21 @@ class GpuSmiProbe:
             snap["vram_used_mb"] = _query(lambda: vram["vram_used"])
             snap["vram_total_mb"] = _query(lambda: vram["vram_total"])
         return snap
+
+    def identity(self) -> Tuple[Optional[str], Optional[str]]:
+        """``(target_graphics_version, market_name)``; None where unreported.
+
+        Older amdsmi builds have no ``target_graphics_version``.
+        """
+        if self._handle is None:
+            return None, None
+        asic = _query(lambda: self._amdsmi.amdsmi_get_gpu_asic_info(self._handle), dict)
+        if not asic:
+            return None, None
+        return (
+            _query(lambda: asic["target_graphics_version"], str),
+            _query(lambda: asic["market_name"], str),
+        )
 
     def static_info(self) -> Dict[str, Any]:
         """One-time static GPU facts for the environment block.

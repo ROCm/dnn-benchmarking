@@ -53,12 +53,18 @@ class TestNoiseWarnings:
     def test_quiet_samples_have_no_warnings(self) -> None:
         assert noise_warnings(BenchmarkStats.from_timings([1.0] * 50)) == []
 
-    def test_high_cv_is_flagged_with_enough_samples(self) -> None:
+    def test_wide_iqr_is_flagged_with_enough_samples(self) -> None:
         stats = BenchmarkStats.from_timings([1.0, 1.3] * 10)
         assert any(w.startswith("noisy:") for w in noise_warnings(stats))
 
-    def test_high_cv_not_flagged_below_10_samples(self) -> None:
+    def test_wide_iqr_not_flagged_below_10_samples(self) -> None:
         stats = BenchmarkStats.from_timings([1.0, 1.3] * 4)
+        assert not any(w.startswith("noisy:") for w in noise_warnings(stats))
+
+    def test_few_slow_samples_do_not_make_a_tight_core_noisy(self) -> None:
+        """High CV from two slow samples; the robust spread stays zero."""
+        stats = BenchmarkStats.from_timings([1.0] * 18 + [1.9, 1.9])
+        assert stats.cv > 0.05
         assert not any(w.startswith("noisy:") for w in noise_warnings(stats))
 
     def test_outlier_max_is_flagged(self) -> None:

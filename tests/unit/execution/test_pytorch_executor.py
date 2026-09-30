@@ -22,8 +22,12 @@ import dnn_benchmarking.execution.pytorch_ops  # noqa: E402,F401
 
 
 class FakeStream:
-    def __init__(self, ptr: int) -> None:
+    def __init__(self, ptr: int, log: List[Any]) -> None:
         self.cuda_stream = ptr
+        self._log = log
+
+    def synchronize(self) -> None:
+        self._log.append("stream_sync")
 
 
 class FakeTorchEvent:
@@ -45,7 +49,7 @@ class FakeCuda:
         self.log: List[Any] = []
         self.device_depth = 0
         self.active_stream: Any = None
-        self.default_stream_obj = FakeStream(0xCAFE)
+        self.default_stream_obj = FakeStream(0xCAFE, self.log)
         self.sync_mode: Any = 0
 
     def is_available(self) -> bool:
@@ -300,7 +304,7 @@ def test_execute_once_runs_on_stream_and_drains_it(
     executor.execute_once({2: "y"})
 
     assert compiled.seen == [{2: "y"}]
-    assert fake_cuda.log == [("hip_record", 0xCAFE)]
+    assert fake_cuda.log == ["stream_sync"]
 
 
 def test_benchmark_before_prepare_raises(rocm_module) -> None:

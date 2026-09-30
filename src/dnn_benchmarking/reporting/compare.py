@@ -17,16 +17,16 @@ import csv
 import json
 import math
 import sys
+import textwrap
 from dataclasses import asdict, dataclass
 from statistics import geometric_mean
 from typing import Any, Dict, List, Optional, Tuple
 
+from .reporter import _clip, _fmt_time, _width
 from .suite_results import SuiteResult
 
 CONVENTION = "speedup = A_median / B_median (B speedup vs A; >1 means B is faster)"
 _USABLE = ("passed", "unchecked", "reference")
-_WIDTHS = (31, 20, 9, 20, 9, 9)  # graph, A engine, A ms, B engine, B ms, speedup
-_MAX_WIDTH = 120
 
 
 @dataclass
@@ -111,6 +111,7 @@ def _pair(
     rb: Optional[Dict[str, Any]],
     metric: str,
     threshold: float,
+    kind: str = "engine",
 ) -> Pair:
     a_ms, a_cv = _stat(ra, metric) if ra else (None, None)
     b_ms, b_cv = _stat(rb, metric) if rb else (None, None)
@@ -126,6 +127,8 @@ def _pair(
         label="",
         in_geomean=False,
     )
+    if ra is None and rb is None:
+        pair.label = f"no {kind} row in either"
     for side, row, ms in (("A", ra, a_ms), ("B", rb, b_ms)):
         if row is None:
             pair.label = pair.label or f"no {side} row"
@@ -151,16 +154,11 @@ def _pair(
 def _match_graphs(
     a: Dict[str, Any], b: Dict[str, Any]
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[str], List[str]]:
-    """Join on graph_id; graph_name only when either side has no graph_id."""
+    """Join on graph_id (null only for graphs that failed to load: no rows)."""
     by_id = {g["graph_id"]: g for g in b["graphs"] if g["graph_id"]}
-    by_name = {g["graph_name"]: g for g in b["graphs"]}
     matched, only_a, used = [], [], set()
     for ga in a["graphs"]:
         gb = by_id.get(ga["graph_id"]) if ga["graph_id"] else None
-        if gb is None:
-            cand = by_name.get(ga["graph_name"])
-            if cand is not None and not (ga["graph_id"] and cand["graph_id"]):
-                gb = cand
         if gb is None or id(gb) in used:
             only_a.append(ga["graph_name"])
             continue
@@ -185,7 +183,8 @@ def compare(
         name = ga["graph_name"]
         if by != "engine":
             ra, rb = _pick(ga, by, metric), _pick(gb, by, metric)
-            pairs.append(_pair(name, ra, rb, metric, threshold))
+            kind = "ref" if by == "ref" else "engine"
+            pairs.append(_pair(name, ra, rb, metric, threshold, kind))
             continue
         rows_b = {_row_key(r): r for r in gb["results"]}
         for ra in ga["results"]:
@@ -214,13 +213,8 @@ def _config_warnings(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     ]
 
 
-def _cut(text: Optional[str], width: int) -> str:
-    text = text or "-"
-    return text if len(text) <= width else text[: width - 1] + "~"
-
-
-def _ms(v: Optional[float]) -> str:
-    return "-" if v is None else f"{v:.4g}"
+def _time(v: Optional[float]) -> str:
+    return "-" if v is None else _fmt_time(v)
 
 
 def _describe(label: str, path: str, doc: Dict[str, Any]) -> str:
@@ -232,40 +226,58 @@ def _describe(label: str, path: str, doc: Dict[str, Any]) -> str:
 
 
 def _print_table(report: Dict[str, Any], a: Tuple[str, Dict], b: Tuple[str, Dict]) -> None:
-    out = sys.stdout
-    print(_cut(_describe("A", *a), _MAX_WIDTH), file=out)
-    print(_cut(_describe("B", *b), _MAX_WIDTH), file=out)
-    print(
-        f"{CONVENTION}; metric={report['metric']} median; "
-        f"threshold {report['threshold_pct']:g}%",
-        file=out,
+    out, width = sys.stdout, _width()
+    print(_clip(_describe("A", *a), width), file=out)
+    print(_clip(_describe("B", *b), width), file=out)
+    heading = f"{CONVENTION}; metric={report['metric']} median; threshold {report['threshold_pct']:g}%"
+    for line in textwrap.wrap(heading, width):
+        print(line, file=out)
+    pairs = report["pairs"]
+    # (header, right-aligned, cells)
+    columns = [
+        ("graph", False, [p["graph"] for p in pairs]),
+        ("A engine", False, [p["engine_a"] or "-" for p in pairs]),
+        ("A time", True, [_time(p["a_ms"]) for p in pairs]),
+        ("B engine", False, [p["engine_b"] or "-" for p in pairs]),
+        ("B time", True, [_time(p["b_ms"]) for p in pairs]),
+        ("speedup", True, ["-" if p["speedup"] is None else f"{p['speedup']:.2f}x" for p in pairs]),
+        ("note", False, [p["label"] for p in pairs]),
+    ]
+    widths = [max(len(h), *(len(c) for c in cells)) for h, _, cells in columns]
+    # Graph and engine names share the squeeze; narrowest first so a short
+    # column hands its unused share to the others.
+    flex = sorted((0, 1, 3), key=lambda i: widths[i])
+    avail = width - 2 * (len(columns) - 1) - sum(
+        w for i, w in enumerate(widths) if i not in flex
     )
-    g, e, m, _, _, s = _WIDTHS
-    header = (
-        f"{'graph':<{g}} {'A engine':<{e}} {'A ms':>{m}} "
-        f"{'B engine':<{e}} {'B ms':>{m}} {'speedup':>{s}}  note"
-    )
-    print(header, file=out)
-    for p in report["pairs"]:
-        speed = "-" if p["speedup"] is None else f"{p['speedup']:.2f}x"
-        print(
-            f"{_cut(p['graph'], g):<{g}} {_cut(p['engine_a'], e):<{e}} "
-            f"{_ms(p['a_ms']):>{m}} {_cut(p['engine_b'], e):<{e}} "
-            f"{_ms(p['b_ms']):>{m}} {speed:>{s}}  {_cut(p['label'], 12)}",
-            file=out,
-        )
+    for n, i in enumerate(flex):
+        widths[i] = min(widths[i], max(8, avail // (len(flex) - n)))
+        avail -= widths[i]
+
+    def render(cells: List[str]) -> str:
+        parts = []
+        for (_, right, _), w, cell in zip(columns, widths, cells):
+            cell = _clip(cell, w)
+            parts.append(cell.rjust(w) if right else cell.ljust(w))
+        return _clip("  ".join(parts).rstrip(), width)
+
+    print(render([h for h, _, _ in columns]), file=out)
+    for i in range(len(pairs)):
+        print(render([cells[i] for _, _, cells in columns]), file=out)
     for side, names in (("A", report["only_in_a"]), ("B", report["only_in_b"])):
         for name in names:
-            print(_cut(f"only in {side}: {name}", _MAX_WIDTH), file=out)
+            print(_clip(f"graph only in {side}: {name}", width), file=out)
     geo = report["geomean_speedup"]
-    n = sum(p["in_geomean"] for p in report["pairs"])
-    print(
-        f"{len(report['pairs'])} pairs, {n} in geomean; geomean B speedup vs A: "
+    n = sum(p["in_geomean"] for p in pairs)
+    footer = (
+        f"{len(pairs)} pairs, {n} in geomean; geomean B speedup vs A: "
         f"{'-' if geo is None else f'{geo:.3f}x'}; "
         f"{report['regressions']} regression(s); "
-        f"only in A: {len(report['only_in_a'])}, only in B: {len(report['only_in_b'])}",
-        file=out,
+        f"graphs only in A: {len(report['only_in_a'])}, "
+        f"graphs only in B: {len(report['only_in_b'])}"
     )
+    for line in textwrap.wrap(footer, width):
+        print(line, file=out)
 
 
 def main(argv: List[str]) -> int:

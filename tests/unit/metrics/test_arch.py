@@ -1,73 +1,75 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for the GPU arch detection chain."""
+"""Tests for the GPU identity detection chain."""
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from dnn_benchmarking.metrics import arch as _arch
-from dnn_benchmarking.metrics.arch import detect_arch
+from dnn_benchmarking.metrics.arch import detect_arch, detect_gpu
+
+_ROCMINFO = """\
+  Name:                    AMD EPYC 7513 32-Core Processor
+  Marketing Name:          AMD EPYC 7513 32-Core Processor
+  Device Type:             CPU
+  Name:                    gfx90a
+  Marketing Name:          AMD Instinct MI210
+  Device Type:             GPU
+      Name:                    amdgcn-amd-amdhsa--gfx90a:sramecc+:xnack-
+"""
 
 
 @pytest.fixture(autouse=True)
 def _uncached():
-    detect_arch.cache_clear()
+    detect_gpu.cache_clear()
     yield
-    detect_arch.cache_clear()
+    detect_gpu.cache_clear()
 
 
-class TestDetectArchTorchPath:
-    """Patches ``_arch._detect_via_torch`` directly rather than the
-    ``torch.cuda.*`` symbols. The latter form raises
-    ``ModuleNotFoundError`` at collection time on hosts without torch —
-    a real concern for the unit suite, which is supposed to run cleanly
-    on a CI box without ROCm or torch installed."""
-
-    def test_torch_returns_gfx942(self):
-        with (
-            patch.object(_arch, "_detect_via_torch", return_value="gfx942"),
-            patch.object(_arch, "_detect_via_rocminfo", return_value=None),
-        ):
-            assert detect_arch() == "gfx942"
-
-    def test_torch_path_returns_none_falls_through_to_rocminfo(self):
-        with (
-            patch.object(_arch, "_detect_via_torch", return_value=None),
-            patch.object(_arch, "_detect_via_rocminfo", return_value="gfx90a"),
-        ):
-            assert detect_arch() == "gfx90a"
+def _sources(torch=(None, None), amdsmi=(None, None), rocminfo=(None, None)):
+    return (
+        patch.object(_arch, "_detect_via_torch", return_value=torch),
+        patch.object(_arch, "_detect_via_amdsmi", return_value=amdsmi),
+        patch.object(_arch, "_detect_via_rocminfo", return_value=rocminfo),
+    )
 
 
-class TestDetectArchRocminfoPath:
-    def test_rocminfo_returns_gfx_target(self):
-        sample = "  Name:  gfx942\n  Marketing Name: AMD Instinct MI300X\n"
-        proc = MagicMock(returncode=0, stdout=sample, stderr="")
-        # Patch resolve_rocm_tool (not bare shutil.which) so the test
-        # mirrors production resolution: rocminfo is found under
-        # $ROCM_PATH/bin even when /opt/rocm/bin isn't on PATH.
-        with (
-            patch.object(_arch, "_detect_via_torch", return_value=None),
-            patch.object(
-                _arch, "resolve_rocm_tool", return_value="/opt/rocm/bin/rocminfo"
-            ),
-            patch("subprocess.run", return_value=proc),
-        ):
-            assert detect_arch() == "gfx942"
-
-    def test_rocminfo_missing_returns_unknown(self):
-        with (
-            patch.object(_arch, "_detect_via_torch", return_value=None),
-            patch.object(_arch, "resolve_rocm_tool", return_value=None),
-        ):
-            assert detect_arch() == "unknown"
+def test_each_field_comes_from_the_first_source_reporting_it():
+    torch, amdsmi, rocminfo = _sources(
+        amdsmi=(None, "Aldebaran/MI200 [Instinct MI210]"),
+        rocminfo=("gfx90a", "AMD Instinct MI210"),
+    )
+    with torch, amdsmi, rocminfo:
+        assert detect_gpu() == ("gfx90a", "Aldebaran/MI200 [Instinct MI210]")
 
 
-class TestDetectArchUnknown:
-    def test_no_torch_no_rocminfo_returns_unknown(self):
-        with (
-            patch.object(_arch, "_detect_via_torch", return_value=None),
-            patch.object(_arch, "_detect_via_rocminfo", return_value=None),
-        ):
-            assert detect_arch() == "unknown"
+def test_later_sources_skipped_once_both_fields_are_known():
+    torch, amdsmi, rocminfo = _sources(torch=("gfx942", "AMD Instinct MI300X"))
+    with torch, amdsmi as smi, rocminfo as info:
+        assert detect_arch() == "gfx942"
+    smi.assert_not_called()
+    info.assert_not_called()
+
+
+def test_nothing_detected_is_unknown_arch_and_no_model():
+    torch, amdsmi, rocminfo = _sources()
+    with torch, amdsmi, rocminfo:
+        assert detect_gpu() == ("unknown", None)
+
+
+def test_rocminfo_reports_the_first_gpu_agent_not_the_cpu():
+    proc = MagicMock(returncode=0, stdout=_ROCMINFO, stderr="")
+    # resolve_rocm_tool, not shutil.which: production finds rocminfo under
+    # $ROCM_PATH/bin even when it is not on PATH.
+    with (
+        patch.object(_arch, "resolve_rocm_tool", return_value="/opt/rocm/bin/rocminfo"),
+        patch("subprocess.run", return_value=proc),
+    ):
+        assert _arch._detect_via_rocminfo() == ("gfx90a", "AMD Instinct MI210")
+
+
+def test_rocminfo_missing_reports_nothing():
+    with patch.object(_arch, "resolve_rocm_tool", return_value=None):
+        assert _arch._detect_via_rocminfo() == (None, None)

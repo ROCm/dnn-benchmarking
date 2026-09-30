@@ -26,6 +26,7 @@ from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
+from ..execution.suite_runner import set_plugin_path
 from ..graph.loader import GraphLoader
 
 
@@ -60,10 +61,7 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
         return _fail(f"hipDNN unavailable: {e}")
 
     try:
-        if plugin_path is not None:
-            hipdnn.set_engine_plugin_paths(
-                [str(plugin_path)], hipdnn.PluginLoadingMode.ABSOLUTE
-            )
+        set_plugin_path(hipdnn, plugin_path)
         handle = hipdnn.Handle()
 
         loader = GraphLoader()

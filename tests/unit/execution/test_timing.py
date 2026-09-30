@@ -107,9 +107,10 @@ def test_zero_warmup_still_primes_before_first_gated_enqueue(monkeypatch) -> Non
     assert log.count("enqueue") == 3
 
 
-def test_cold_flush_precedes_each_arm_and_never_runs_during_priming(
-    monkeypatch,
-) -> None:
+def test_warmups_run_the_timed_path_and_are_discarded(monkeypatch) -> None:
+    """After one priming enqueue (never flushed), the remaining warmups use
+    the same flush + stall-gated path as timed iterations, so clocks and
+    caches are in steady state when sampling starts; only timed ones are kept."""
     log: List[str] = []
     _install_fake_hip(monkeypatch, log)
 
@@ -119,14 +120,17 @@ def test_cold_flush_precedes_each_arm_and_never_runs_during_priming(
         policy=TimingPolicy(warmup_iters=3, iters=2, cache_mode="cold"),
     )
 
-    enqueues = [i for i, e in enumerate(log) if e == "enqueue"]
-    last_priming = enqueues[2]
-    assert "flush" not in log[:last_priming]
+    priming = log.index("enqueue")
+    assert log[priming + 1] == "device_sync"
+    assert "flush" not in log[: priming + 2]
     arms = [i for i, e in enumerate(log) if e == "arm"]
-    assert len(arms) == 2
+    assert len(arms) == 2 + 2  # 2 warmups after priming, 2 timed
     for arm in arms:
         # flush, then a full device drain, then the gate is armed.
         assert log[arm - 2 : arm] == ["flush", "device_sync"]
+    assert log.count("enqueue") == 1 + 2 + 2
+    assert len(m.kernel_ms) == len(m.host_ms) == 2
+    assert m.warmup_iters == 3
     assert log.count(f"alloc:{timing_module._FLUSH_BYTES}") == 1
     assert m.cache_mode == "cold"
 

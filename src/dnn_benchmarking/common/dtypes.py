@@ -19,7 +19,7 @@ from .exceptions import UnsupportedGraphError
 
 @dataclass(frozen=True)
 class DType:
-    """One graph data type.
+    """One graph data type; ``name.upper()`` is its ``hipdnn_frontend.DataType``.
 
     Attributes:
         name: Graph JSON name, lower case.
@@ -28,14 +28,12 @@ class DType:
             so those are exchanged as float32 values that are exactly
             representable in the graph type.
         torch_name: ``torch`` attribute name, or None when torch has no match.
-        hipdnn_name: ``hipdnn_frontend.DataType`` member name.
     """
 
     name: str
     size: int
     numpy: np.dtype
     torch_name: Optional[str]
-    hipdnn_name: str
 
     def torch_dtype(self) -> Any:
         """The torch dtype; raises UnsupportedGraphError if this torch lacks it."""
@@ -54,18 +52,18 @@ _F32 = np.dtype(np.float32)
 _DTYPES = {
     dtype.name: dtype
     for dtype in (
-        DType("float", 4, _F32, "float32", "FLOAT"),
-        DType("half", 2, np.dtype(np.float16), "float16", "HALF"),
-        DType("bfloat16", 2, _F32, "bfloat16", "BFLOAT16"),
-        DType("double", 8, np.dtype(np.float64), "float64", "DOUBLE"),
-        DType("int8", 1, np.dtype(np.int8), "int8", "INT8"),
-        DType("uint8", 1, np.dtype(np.uint8), "uint8", "UINT8"),
-        DType("int32", 4, np.dtype(np.int32), "int32", "INT32"),
-        DType("int64", 8, np.dtype(np.int64), "int64", "INT64"),
-        DType("boolean", 1, np.dtype(np.bool_), "bool", "BOOLEAN"),
-        DType("fp8_e4m3", 1, _F32, "float8_e4m3fn", "FP8_E4M3"),
-        DType("fp8_e5m2", 1, _F32, "float8_e5m2", "FP8_E5M2"),
-        DType("fp8_e8m0", 1, _F32, "float8_e8m0fnu", "FP8_E8M0"),
+        DType("float", 4, _F32, "float32"),
+        DType("half", 2, np.dtype(np.float16), "float16"),
+        DType("bfloat16", 2, _F32, "bfloat16"),
+        DType("double", 8, np.dtype(np.float64), "float64"),
+        DType("int8", 1, np.dtype(np.int8), "int8"),
+        DType("uint8", 1, np.dtype(np.uint8), "uint8"),
+        DType("int32", 4, np.dtype(np.int32), "int32"),
+        DType("int64", 8, np.dtype(np.int64), "int64"),
+        DType("boolean", 1, np.dtype(np.bool_), "bool"),
+        DType("fp8_e4m3", 1, _F32, "float8_e4m3fn"),
+        DType("fp8_e5m2", 1, _F32, "float8_e5m2"),
+        DType("fp8_e8m0", 1, _F32, "float8_e8m0fnu"),
     )
 }
 

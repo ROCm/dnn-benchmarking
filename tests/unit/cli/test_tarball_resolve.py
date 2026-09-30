@@ -184,26 +184,25 @@ class TestResolveGraphFilesMulti:
         for td in tmpdirs:
             td.cleanup()
 
-    def test_multiple_json_args(self, tmp_path: Path) -> None:
-        paths = []
-        for i in range(3):
-            f = tmp_path / f"g{i}.json"
-            f.write_text(json.dumps({"name": f"g{i}", "nodes": [], "tensors": []}))
-            paths.append(str(f))
+    def test_keeps_command_line_order_and_dedupes_by_resolved_path(
+        self, tmp_path: Path
+    ) -> None:
+        for name in ("g0", "g1", "g2"):
+            (tmp_path / f"{name}.json").write_text(
+                json.dumps({"name": name, "nodes": [], "tensors": []})
+            )
+        g2 = str(tmp_path / "g2.json")
+        g1_alias = str(tmp_path / "sub" / ".." / "g1.json")
+        (tmp_path / "sub").mkdir()
 
-        tmpdirs, files, _ = resolve_graph_files_multi(paths)
-        assert len(files) == 3
-        for td in tmpdirs:
-            td.cleanup()
-
-    def test_deduplicates_overlapping_args(self, tmp_path: Path) -> None:
-        f = tmp_path / "graph.json"
-        f.write_text(json.dumps({"name": "g", "nodes": [], "tensors": []}))
-
-        tmpdirs, files, _ = resolve_graph_files_multi([str(f), str(f)])
-        assert len(files) == 1
-        for td in tmpdirs:
-            td.cleanup()
+        tmpdirs, files, _ = resolve_graph_files_multi(
+            [g2, str(tmp_path / "g*.json"), g1_alias]
+        )
+        # g2 first (as given), then the glob's sorted remainder; the alias of
+        # g1 is a duplicate and is dropped.
+        assert [Path(f).name for f in files] == ["g2.json", "g0.json", "g1.json"]
+        assert files[0] == g2
+        assert tmpdirs == []
 
     def test_mixed_json_and_tarball(self, tmp_path: Path) -> None:
         loose = tmp_path / "loose.json"

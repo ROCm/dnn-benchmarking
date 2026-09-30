@@ -24,6 +24,7 @@ import pytest
 import dnn_benchmarking.execution.executor as executor_module
 from dnn_benchmarking.config.benchmark_config import TimingPolicy
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
+from dnn_benchmarking.reporting.suite_results import engine_id_hex
 
 
 class _StubResult:
@@ -272,7 +273,8 @@ def test_prepare_forced_engine_mismatch_is_skip():
         with pytest.raises(UnsupportedGraphError) as exc:
             executor.prepare(handle=object(), engine_id=999)
     assert graph.hard_engine_id == 999  # hard select was attempted
-    assert "999" in str(exc.value) and "111" in str(exc.value)
+    assert engine_id_hex(999) in str(exc.value)
+    assert engine_id_hex(111) in str(exc.value)
 
 
 def test_prepare_create_execution_plans_failure_is_execution_error():

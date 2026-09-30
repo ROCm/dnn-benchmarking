@@ -3,11 +3,13 @@
 
 """Tests for metrics.machine_info (the result ``environment`` block)."""
 
+import importlib.util
+import sys
 from unittest.mock import mock_open, patch
 
 import pytest
 
-from dnn_benchmarking.metrics import machine_info
+from dnn_benchmarking.metrics import arch, gpu_smi, machine_info
 from dnn_benchmarking.metrics._diagnostic import reset as _reset_warns
 
 # Contract: result JSON v2 environment keys (minus end_of_run / selection_env,
@@ -69,6 +71,29 @@ def test_cudnn_version_decoding_across_packing_schemes(raw, expected):
     assert machine_info._format_cudnn_version(raw) == expected
 
 
+@pytest.mark.parametrize(
+    "hip, cuda, rocm_version, cuda_version",
+    [("7.0.1", None, "7.0.1", None), (None, "12.4", None, "12.4")],
+)
+def test_torch_versions_come_from_version_py_without_importing_torch(
+    tmp_path, monkeypatch, hip, cuda, rocm_version, cuda_version
+):
+    package = tmp_path / "torch"
+    package.mkdir()
+    (package / "__init__.py").write_text("raise ImportError('torch was imported')\n")
+    (package / "version.py").write_text(
+        f"__version__ = '2.9.0'\nhip = {hip!r}\ncuda = {cuda!r}\n"
+    )
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    info = machine_info._torch_info()
+
+    assert info["torch_version"] == "2.9.0"
+    assert info["rocm_version"] == rocm_version
+    assert info["cuda_version"] == cuda_version
+
+
 class TestCollectEnvironmentInfo:
     def test_has_exactly_the_contract_keys(self):
         with patch.object(machine_info, "is_amdsmi_available", return_value=False):
@@ -81,3 +106,34 @@ class TestCollectEnvironmentInfo:
             machine_info.collect_environment_info()
         assert first["amdsmi_available"] is False
         assert capsys.readouterr().err.count("amdsmi not available") == 1
+
+    def test_does_not_import_torch(self, monkeypatch):
+        """Importing torch costs seconds at startup on the hipDNN backend."""
+        attempts = []
+
+        class _RecordTorchImport:
+            """Finds torch (version lookups may), records and fails loading it."""
+
+            def find_spec(self, name, path=None, target=None):
+                return importlib.util.spec_from_loader(name, self) if name == "torch" else None
+
+            def create_module(self, spec):
+                return None
+
+            def exec_module(self, module):
+                attempts.append(module.__name__)
+                raise ImportError("torch import attempted")
+
+        monkeypatch.delitem(sys.modules, "torch", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [_RecordTorchImport(), *sys.meta_path])
+        for var in gpu_smi._VISIBILITY_ENV:
+            monkeypatch.delenv(var, raising=False)
+        arch.detect_gpu.cache_clear()
+        gpu_smi._handle_for.cache_clear()
+        try:
+            with patch.object(arch, "resolve_rocm_tool", return_value=None):
+                machine_info.collect_environment_info()
+        finally:
+            arch.detect_gpu.cache_clear()
+            gpu_smi._handle_for.cache_clear()
+        assert attempts == []

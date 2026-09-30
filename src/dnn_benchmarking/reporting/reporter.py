@@ -62,8 +62,14 @@ def _fmt_time(ms: float) -> str:
 
 
 def _fmt_duration(ms: float) -> str:
-    """Wall-clock cost (setup, build) in ms below a second, else seconds."""
+    """Wall-clock cost (setup, build): 2 significant digits below 10 ms."""
+    if ms < 10:
+        return f"{ms:.2g} ms"
     return f"{ms:.0f} ms" if ms < 1e3 else f"{ms / 1e3:.1f} s"
+
+
+def _iqr_pct(stats: BenchmarkStats) -> float:
+    return stats.iqr_ms / stats.median_ms * 100 if stats.median_ms > 0 else 0.0
 
 
 def _fmt_mib(mib: float) -> str:
@@ -148,9 +154,6 @@ class Reporter:
         self._break()
         print(text, file=self._err, flush=True)
 
-    def _diagnostic_sink(self, line: str) -> None:
-        self._print_err(line)
-
     def _begin(self, head: str) -> None:
         if self._quiet or not self._tty:
             return
@@ -158,7 +161,7 @@ class Reporter:
         self._err.write(head)
         self._err.flush()
         self._pending = head
-        _diagnostic.set_sink(self._diagnostic_sink)
+        _diagnostic.set_sink(self._print_err)
 
     def _finish(self, head: str, outcome: str) -> None:
         if self._quiet:
@@ -225,7 +228,7 @@ class Reporter:
             parts.append(_fmt_time(kernel.median_ms))
         detail = []
         if kernel is not None:
-            detail.append(f"cv {kernel.cv:.1%}")
+            detail.append(f"iqr {_iqr_pct(kernel):.1f}%")
         if pe.timing is not None:
             detail.append(f"setup {_fmt_duration(pe.timing.first_call_ms)}")
         elif pe.elapsed_time_ms:
@@ -310,11 +313,17 @@ class Reporter:
     def print_graph_table(self, graph_result: GraphResult) -> None:
         """Print one row per engine; with ``verbose`` also the detail blocks."""
         gr = graph_result
-        self._print(gr.graph_name + (f"  [{gr.graph_id}]" if gr.graph_id else ""))
+        title = gr.graph_name
+        stem = Path(gr.graph_path).stem
+        if stem != gr.graph_name:
+            # The progress line announced the file stem; show both to link them.
+            title = f"{stem} ({gr.graph_name})"
+        self._print(title + (f"  [{gr.graph_id}]" if gr.graph_id else ""))
         if gr.error:
             self._print(_clip(f"  graph error: {_one_line(gr.error)}", _width()))
         elif not gr.results:
-            self._print("  no engines applicable")
+            msg = f": {_one_line(gr.message)}" if gr.message else ""
+            self._print(_clip(f"  no engines applicable{msg}", _width()))
         if not gr.results:
             self._print()
             return
@@ -334,10 +343,10 @@ class Reporter:
         # (header, right-aligned, cells)
         columns: List[Tuple[str, bool, List[str]]] = [
             ("engine", False, [_display_name(pe) for pe in rows]),
-            ("status", False, [pe.verdict for pe in rows]),
+            ("verdict", False, [pe.verdict for pe in rows]),
             ("kernel_med", True, [self._kernel_cell(pe) for pe in rows]),
-            ("cv%", True, [self._stat_cell(pe.gpu_kernel_stats, lambda s: f"{s.cv * 100:.1f}") for pe in rows]),
-            ("submit", True, [self._stat_cell(pe.host_stats, lambda s: _fmt_time(s.median_ms)) for pe in rows]),
+            ("iqr%", True, ["-" if pe.gpu_kernel_stats is None else f"{_iqr_pct(pe.gpu_kernel_stats):.1f}" for pe in rows]),
+            ("submit", True, ["-" if pe.host_stats is None else _fmt_time(pe.host_stats.median_ms) for pe in rows]),
             ("tflops", True, [self._tflops_cell(pe) for pe in rows]),
             ("gbps", True, ["-" if pe.derived_gbytes_per_s is None else f"{pe.derived_gbytes_per_s:.1f}" for pe in rows]),
             ("vs_best", True, [self._vs_best_cell(pe, best) for pe in rows]),
@@ -357,10 +366,8 @@ class Reporter:
             w for i, w in enumerate(natural) if i not in flexible
         )
         if has_note:
-            # Names up to 32 columns win over the note; beyond that the note does.
-            natural[0] = min(
-                natural[0], max(16, budget - natural[-1], min(32, budget - 16))
-            )
+            # The name keeps up to 32 columns; the note gets what remains.
+            natural[0] = min(natural[0], max(16, min(32, budget - len("note"))))
             natural[-1] = max(len("note"), min(natural[-1], budget - natural[0]))
         else:
             natural[0] = min(natural[0], max(16, budget))
@@ -397,10 +404,6 @@ class Reporter:
         )
 
     @staticmethod
-    def _stat_cell(stats: Optional[BenchmarkStats], fmt) -> str:
-        return "-" if stats is None else fmt(stats)
-
-    @staticmethod
     def _kernel_cell(pe: ProviderEngineResult) -> str:
         stats = pe.gpu_kernel_stats
         if stats is None:
@@ -433,10 +436,12 @@ class Reporter:
         reason = _reason(pe)
         if reason is not None:
             return _one_line(reason)
-        if not pe.warnings:
+        # The kernel_med '*' marker already flags noise.
+        warnings = [w for w in pe.warnings or [] if not w.startswith("noisy:")]
+        if not warnings:
             return ""
-        more = f" (+{len(pe.warnings) - 1})" if len(pe.warnings) > 1 else ""
-        return _one_line(pe.warnings[0]) + more
+        more = f" (+{len(warnings) - 1})" if len(warnings) > 1 else ""
+        return _one_line(warnings[0]) + more
 
     # Verbose detail
 

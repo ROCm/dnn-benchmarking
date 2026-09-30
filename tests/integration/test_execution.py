@@ -3,6 +3,7 @@
 
 """hipDNN graph execution, timing and validation on a real GPU."""
 
+import io
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -21,6 +22,7 @@ from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.suite_runner import run_graph_all_providers
 from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.reporting.suite_results import GraphResult
+from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.validation import compare
 from tests.integration.conftest import load_graph
 
@@ -140,7 +142,12 @@ def test_engines_validate_against_pytorch(hipdnn, graph_name: str) -> None:
     """--validate pytorch: every engine that runs a sample graph passes."""
     path, graph_json, tensor_infos = load_graph(graph_name)
     result = run_graph_all_providers(
-        path, graph_json, tensor_infos, _validate_config(), hipdnn.Handle()
+        path,
+        graph_json,
+        tensor_infos,
+        _validate_config(),
+        hipdnn.Handle(),
+        Reporter(output=io.StringIO()),
     )
     _assert_engines_match_reference(result)
 
@@ -162,6 +169,7 @@ def test_bfloat16_conv_validates_against_pytorch(
         GraphLoader().extract_tensor_info(graph_json),
         _validate_config(),
         hipdnn.Handle(),
+        Reporter(output=io.StringIO()),
     )
     _assert_engines_match_reference(result)
 
@@ -192,6 +200,7 @@ def test_validation_compares_on_device(
         GraphLoader().extract_tensor_info(sample_conv_fwd_json),
         _validate_config(),
         hipdnn.Handle(),
+        Reporter(output=io.StringIO()),
     )
 
     _assert_engines_match_reference(result)

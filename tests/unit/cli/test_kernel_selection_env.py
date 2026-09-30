@@ -11,11 +11,7 @@ import pytest
 from dnn_benchmarking.cli import suite_runner_cli
 from dnn_benchmarking.cli.config_file import apply_config_file
 from dnn_benchmarking.cli.parser import create_parser
-from dnn_benchmarking.cli.suite_runner_cli import (
-    AUTOTUNE_WITHOUT_CACHE_DIR,
-    LEAKED_FORCE_BENCHMARKING,
-    _apply_tuning_environment,
-)
+from dnn_benchmarking.cli.suite_runner_cli import _apply_tuning_environment
 from dnn_benchmarking.config.benchmark_config import SuiteConfig
 from dnn_benchmarking.reporting.reporter import Reporter
 
@@ -27,36 +23,39 @@ def _isolate(monkeypatch):
     monkeypatch.delenv("HIPDNN_CACHE_DIR", raising=False)
 
 
-def _apply(**kwargs):
-    return _apply_tuning_environment(
-        SuiteConfig(**kwargs), Reporter(output=io.StringIO())
-    )
+def _warnings(**kwargs):
+    """The WARNING lines _apply_tuning_environment reports."""
+    out = io.StringIO()
+    _apply_tuning_environment(SuiteConfig(**kwargs), Reporter(output=out))
+    return [line for line in out.getvalue().splitlines() if line.startswith("WARNING")]
 
 
 def test_default_stays_on_the_heuristic_path() -> None:
-    assert _apply() == []
+    assert _warnings() == []
     assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
 
 def test_autotune_without_cache_dir_is_a_hazard() -> None:
-    assert _apply(autotune=True) == [AUTOTUNE_WITHOUT_CACHE_DIR]
+    [warning] = _warnings(autotune=True)
+    assert "--cache-dir" in warning
     assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
 def test_autotune_with_cache_dir_is_isolated() -> None:
-    assert _apply(autotune=True, cache_dir="/tmp/phase-x") == []
+    assert _warnings(autotune=True, cache_dir="/tmp/phase-x") == []
     assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
 
 
 @pytest.mark.parametrize(
-    "value, hazards",
-    [("1", [LEAKED_FORCE_BENCHMARKING]), ("0", [])],
-    ids=["truthy-leak", "off-value"],
+    "value, warned", [("1", True), ("0", False)], ids=["truthy-leak", "off-value"]
 )
-def test_leaked_force_benchmarking(monkeypatch, value, hazards) -> None:
+def test_leaked_force_benchmarking(monkeypatch, value, warned) -> None:
     """hipDNN treats "0" as off, so only a truthy inherited value is a hazard."""
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", value)
-    assert _apply() == hazards
+    warnings = _warnings()
+    assert [("HIPDNN_FORCE_BENCHMARKING" in w) for w in warnings] == (
+        [True] if warned else []
+    )
 
 
 def test_pytorch_backend_leaves_hipdnn_environment_alone(

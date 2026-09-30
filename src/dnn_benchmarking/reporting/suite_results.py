@@ -96,6 +96,10 @@ ROW_COLUMNS = (
     "kernel_median_ms",
     "kernel_cv",
     "host_median_ms",
+    "n",
+    "timing_mode",
+    "cache_mode",
+    "seed",
     "tflops",
     "gbps",
     "workspace_bytes",
@@ -147,9 +151,8 @@ class CorrectnessResult:
     """Correctness tracking for a single provider/engine run.
 
     Attributes:
-        execution_success: Did the run complete without error?
-        tolerance_match: Within rtol/atol? None if execution failed or
-            reference provider unavailable.
+        tolerance_match: Within rtol/atol? None when not checked (no
+            reference requested or reference unavailable).
         rtol: Relative tolerance used.
         atol: Absolute tolerance used.
         max_abs_diff: Maximum absolute difference (if comparison was performed).
@@ -160,7 +163,6 @@ class CorrectnessResult:
         worst_output_uid: Tensor UID of the output with the largest diff.
     """
 
-    execution_success: bool
     tolerance_match: Optional[bool]
     rtol: float
     atol: float
@@ -173,8 +175,8 @@ class CorrectnessResult:
 
     @property
     def passed(self) -> bool:
-        """Overall pass = executed successfully AND tolerance matched."""
-        return self.execution_success and (self.tolerance_match is True)
+        """Validation ran and every output was within tolerance."""
+        return self.tolerance_match is True
 
     @property
     def explicitly_failed(self) -> bool:
@@ -185,24 +187,7 @@ class CorrectnessResult:
         that gate on a real failure must use this instead, or a plain run
         looks like a suite of failures.
         """
-        return not self.execution_success or self.tolerance_match is False
-
-    @classmethod
-    def failed(
-        cls, rtol: float, atol: float, error_message: str
-    ) -> "CorrectnessResult":
-        """Build a CorrectnessResult representing an execution failure.
-
-        Used where the GPU run did not complete and no comparison was
-        performed: execution_success=False, tolerance_match=None.
-        """
-        return cls(
-            execution_success=False,
-            tolerance_match=None,
-            rtol=rtol,
-            atol=atol,
-            error_message=error_message,
-        )
+        return self.tolerance_match is False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to the v2 ``correctness`` object."""
@@ -325,7 +310,7 @@ class OracleDelta:
     well above steady state and would inflate the speedup.
 
     Attributes:
-        basis: Which timing pair the comparison used.
+        basis: Timing pair compared; always ``kernel`` (device median).
         baseline_median_ms: Median of the heuristic plan, re-timed post-sweep.
         oracle_median_ms: Median of the post-tuning run.
         delta_ms: ``baseline_median_ms - oracle_median_ms``; positive means
@@ -333,7 +318,7 @@ class OracleDelta:
         speedup: ``baseline_median_ms / oracle_median_ms``.
     """
 
-    basis: Literal["kernel", "host"]
+    basis: Literal["kernel"]
     baseline_median_ms: float
     oracle_median_ms: float
     delta_ms: float
@@ -569,7 +554,7 @@ class ProviderEngineResult:
 
 
 def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
-    """Compare the warm heuristic baseline against the tuned run by median.
+    """Compare the warm heuristic baseline against the tuned run by kernel median.
 
     Both operands come from ``oracle``: the sweep-adjacent re-timing of the
     heuristic plan and the post-tuning run. The row's own OOTB timing is
@@ -577,30 +562,17 @@ def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
     ``--warmup`` it can sit above steady state and report a speedup that is
     accumulated warmup rather than a better plan.
 
-    Prefers GPU kernel time; falls back to host time when either side has
-    no kernel statistics. Returns None when no comparable pair exists or
-    either median is non-positive.
+    Returns None when either side lacks kernel statistics or either median
+    is non-positive.
     """
-    basis: Literal["kernel", "host"]
-    if (
-        oracle.warm_baseline_gpu_kernel_stats is not None
-        and oracle.gpu_kernel_stats is not None
-    ):
-        basis = "kernel"
-        baseline = oracle.warm_baseline_gpu_kernel_stats.median_ms
-        tuned = oracle.gpu_kernel_stats.median_ms
-    elif oracle.warm_baseline_host_stats is not None and oracle.host_stats is not None:
-        basis = "host"
-        baseline = oracle.warm_baseline_host_stats.median_ms
-        tuned = oracle.host_stats.median_ms
-    else:
+    if oracle.warm_baseline_gpu_kernel_stats is None or oracle.gpu_kernel_stats is None:
         return None
-
+    baseline = oracle.warm_baseline_gpu_kernel_stats.median_ms
+    tuned = oracle.gpu_kernel_stats.median_ms
     if baseline <= 0.0 or tuned <= 0.0:
         return None
-
     return OracleDelta(
-        basis=basis,
+        basis="kernel",
         baseline_median_ms=baseline,
         oracle_median_ms=tuned,
         delta_ms=baseline - tuned,
@@ -619,6 +591,7 @@ class GraphResult:
         engine_ids: Engines applicable to the graph; empty means none.
         graph_id: Join key from :func:`graph_id_for`.
         error: Graph-level failure (load, discovery, input generation).
+        message: Why no engine applied, when ``status`` is ``no_engines``.
     """
 
     graph_name: str
@@ -627,6 +600,7 @@ class GraphResult:
     engine_ids: List[int] = field(default_factory=list)
     graph_id: Optional[str] = None
     error: Optional[str] = None
+    message: Optional[str] = None
 
     @property
     def status(self) -> Literal["ok", "no_engines", "error"]:
@@ -645,6 +619,7 @@ class GraphResult:
             "graph_path": self.graph_path,
             "status": self.status,
             "error": self.error,
+            "message": self.message,
             "results": [r.to_dict() for r in self.results],
         }
 
@@ -742,12 +717,14 @@ class SuiteResult:
         """
         doc = _finite(self.to_dict())
         arch = doc["environment"]["gpu_arch"]
+        seed = doc["run"]["config"]["seed"]
         rows: List[Dict[str, Any]] = []
         for g in doc["graphs"]:
             base = {
                 "gpu_arch": arch,
                 "graph_name": g["graph_name"],
                 "graph_id": g["graph_id"],
+                "seed": seed,
             }
             if not g["results"]:
                 rows.append(
@@ -755,11 +732,12 @@ class SuiteResult:
                         **dict.fromkeys(ROW_COLUMNS),
                         **base,
                         "status": g["status"],
-                        "message": g["error"],
+                        "message": g["error"] or g["message"],
                     }
                 )
             for r in g["results"]:
                 kernel, host = r["kernel"] or {}, r["host"] or {}
+                timing = r["timing"] or {}
                 correctness = r["correctness"] or {}
                 rows.append(
                     {
@@ -773,6 +751,9 @@ class SuiteResult:
                         "kernel_median_ms": kernel.get("median_ms"),
                         "kernel_cv": kernel.get("cv"),
                         "host_median_ms": host.get("median_ms"),
+                        "n": kernel.get("n"),
+                        "timing_mode": timing.get("mode"),
+                        "cache_mode": timing.get("cache_mode"),
                         "tflops": r["metrics"]["tflops"],
                         "gbps": r["metrics"]["gbps"],
                         "workspace_bytes": r["metrics"]["workspace_bytes"],
@@ -802,6 +783,10 @@ class SuiteResult:
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
+                # mkstemp creates 0600; give the result the mode open() would.
+                umask = os.umask(0)
+                os.umask(umask)
+                os.fchmod(f.fileno(), 0o666 & ~umask)
                 f.write(text)
             os.replace(tmp, p)
         except BaseException:
@@ -813,11 +798,17 @@ class SuiteResult:
         """Read a v2 result document.
 
         Raises:
-            OSError / json.JSONDecodeError: Unreadable file.
-            ValueError: Not a schema v2 result file.
+            OSError: Unreadable file.
+            ValueError: Not a schema v2 JSON result file.
         """
         with open(path) as f:
-            doc = json.load(f)
+            try:
+                doc = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{path}: not a JSON result file ({e}); compare needs "
+                    "-o *.json output"
+                ) from None
         version = doc.get("schema_version") if isinstance(doc, dict) else None
         if version != SCHEMA_VERSION:
             raise ValueError(

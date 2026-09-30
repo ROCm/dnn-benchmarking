@@ -23,6 +23,7 @@ Event backends
   where ``hipdnn_frontend`` is not installed.
 """
 
+import atexit
 import time
 import warnings
 from dataclasses import dataclass
@@ -43,7 +44,8 @@ class Measurement:
         mode: ``staged`` (stall-gated gap-free span) or ``events``.
         backend: Event backend, ``hip`` or ``torch``.
         cache_mode: ``warm`` or ``cold``.
-        warmup_iters: Untimed enqueues actually run (always >= 1).
+        warmup_iters: Untimed enqueues actually run (always >= 1): the
+            priming enqueue(s) plus discarded measured-path warmups.
         first_call_ms: Wall time of the first untimed enqueue plus sync;
             captures one-time plan compile / kernel find cost.
         capped: True when ``max_iters`` stopped the loop before the
@@ -122,7 +124,7 @@ def _staged_unavailable_reason() -> Optional[str]:
 
 
 class EventTimer:
-    """Start/stop GPU event pair on one stream; doubles as a stream sync."""
+    """Start/stop GPU event pair on one stream."""
 
     def __init__(self, backend: str, stream: int = 0, torch_stream: Any = None):
         """Create the event pair.
@@ -163,11 +165,6 @@ class EventTimer:
         """Wait for the stop event and return the start->stop span."""
         self._stop.synchronize()
         return float(self._start.elapsed_time(self._stop))
-
-    def synchronize_stream(self) -> None:
-        """Block until all work enqueued on the stream so far has completed."""
-        self.stop()
-        self._stop.synchronize()
 
 
 class StalledRegionTimer:
@@ -221,7 +218,8 @@ class StalledRegionTimer:
         return (t1 - t0) * 1000.0, float(self._start.elapsed_time(self._stop))
 
 
-def _device_sync(backend: str) -> None:
+def device_sync(backend: str) -> None:
+    """Block until all work on the current device (``hip`` or ``torch``) is done."""
     if backend == "hip":
         _require_hip_runtime().hip_device_synchronize()
     else:
@@ -246,12 +244,16 @@ def _flush_cache(backend: str) -> None:
                 f"Cannot allocate the {_FLUSH_BYTES >> 20} MiB cold-cache flush "
                 f"buffer ({e}); rerun with --cache-mode warm"
             ) from e
+        if not _flush_buffers:
+            # Free device buffers before interpreter teardown; nanobind
+            # reports module-global instances still alive at exit as leaks.
+            atexit.register(_flush_buffers.clear)
         _flush_buffers[backend] = buf
     if backend == "hip":
         buf.zeros()
     else:
         buf.zero_()
-    _device_sync(backend)
+    device_sync(backend)
 
 
 def _probe_host_sync(enqueue: Callable[[], None]) -> Optional[str]:
@@ -297,16 +299,18 @@ def measure(
     backend: str = "hip",
     torch_stream: Any = None,
 ) -> Measurement:
-    """Prime, then time ``enqueue`` per ``policy`` (a ``TimingPolicy``).
+    """Prime, warm up, then time ``enqueue`` per ``policy`` (a ``TimingPolicy``).
 
-    Priming runs ``max(1, policy.warmup_iters)`` untimed enqueues; the first
-    is timed with a device sync as ``first_call_ms``. For torch-driven
-    enqueues (``torch_stream`` given) one priming enqueue after the first runs
-    under ``torch.cuda.set_sync_debug_mode("error")``; if it synchronizes, the
-    loop uses events mode. The loop stops once ``policy.iters`` samples exist
+    Priming: the first enqueue is timed with a device sync as
+    ``first_call_ms``. For torch-driven enqueues (``torch_stream`` given) one
+    more priming enqueue runs under ``torch.cuda.set_sync_debug_mode("error")``;
+    if it synchronizes, the loop uses events mode. The rest of
+    ``policy.warmup_iters`` run through the timed-iteration path (same mode,
+    same cold flush) and are discarded, so clocks and caches reach the timed
+    loop's steady state. The loop stops once ``policy.iters`` samples exist
     and their kernel time sums to ``policy.min_time_ms``, or at
-    ``policy.max_iters`` (``capped``). In cold cache mode every timed
-    iteration is preceded by a cache flush and device sync.
+    ``policy.max_iters`` (``capped``). In cold cache mode every warmup and
+    timed iteration is preceded by a cache flush and device sync.
 
     Args:
         enqueue: Submits one iteration of work to ``stream`` / ``torch_stream``.
@@ -324,17 +328,14 @@ def measure(
 
     t0 = time.perf_counter()
     enqueue()
-    _device_sync(backend)
+    device_sync(backend)
     first_call_ms = (time.perf_counter() - t0) * 1000.0
     primed = 1
     reason: Optional[str] = None
     if torch_stream is not None:
         reason = _probe_host_sync(enqueue)
         primed += 1
-    for _ in range(primed, policy.warmup_iters):
-        enqueue()
-    primed = max(primed, policy.warmup_iters)
-    _device_sync(backend)
+        device_sync(backend)
 
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
@@ -348,26 +349,33 @@ def measure(
         except RuntimeError as e:
             reason = str(e)
 
+    cold = policy.cache_mode == "cold"
+
+    def iteration() -> Tuple[float, float]:
+        """One ``(host_ms, kernel_ms)`` sample on the timed path."""
+        if cold:
+            _flush_cache(backend)
+        if staged is not None:
+            return staged.measure(enqueue)
+        events.start()
+        t0 = time.perf_counter()
+        enqueue()
+        t1 = time.perf_counter()
+        events.stop()
+        return (t1 - t0) * 1000.0, events.elapsed_ms()
+
+    for _ in range(primed, policy.warmup_iters):
+        iteration()
+
     kernel_ms: List[float] = []
     host_ms: List[float] = []
     total_ms = 0.0
     capped = False
-    cold = policy.cache_mode == "cold"
     while len(kernel_ms) < policy.iters or total_ms < policy.min_time_ms:
         if len(kernel_ms) >= policy.max_iters:
             capped = True
             break
-        if cold:
-            _flush_cache(backend)
-        if staged is not None:
-            host, kernel = staged.measure(enqueue)
-        else:
-            events.start()
-            t0 = time.perf_counter()
-            enqueue()
-            t1 = time.perf_counter()
-            events.stop()
-            host, kernel = (t1 - t0) * 1000.0, events.elapsed_ms()
+        host, kernel = iteration()
         host_ms.append(host)
         kernel_ms.append(kernel)
         total_ms += kernel
@@ -378,7 +386,7 @@ def measure(
         mode="staged" if staged is not None else "events",
         backend=backend,
         cache_mode=policy.cache_mode,
-        warmup_iters=primed,
+        warmup_iters=max(primed, policy.warmup_iters),
         first_call_ms=first_call_ms,
         capped=capped,
         fallback_reason=reason,
