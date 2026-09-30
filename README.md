@@ -46,10 +46,10 @@ launch and, if you ask, compares the output with a PyTorch reference.
    ```
 
    ```text
-   sample_conv_fwd_16x16x16x16_k16_3x3  [e50543fd1d83]
-     engine                       status     kernel_med  cv%    submit  tflops  gbps  vs_best  note
-     MIOPEN_ENGINE                unchecked   25.60 µs*  9.7  11.64 µs    0.74  20.8    0.99x  noisy: CV 9.7%
-     MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.44 µs*  9.5  11.53 µs    0.74  21.0    1.00x  noisy: CV 9.5%
+   sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [e50543fd1d83]
+     engine                       verdict    kernel_med  iqr%    submit  tflops  gbps  vs_best
+     MIOPEN_ENGINE                unchecked   25.44 µs    1.9  11.55 µs    0.74  21.0    1.00x
+     MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.60 µs    1.3  11.47 µs    0.74  20.8    0.99x
    ```
 
 3. Run the same graph through PyTorch:

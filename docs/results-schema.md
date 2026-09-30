@@ -16,7 +16,8 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 - `MB` and `GB` in environment key names are binary units: MiB (2^20 bytes)
   and GiB (2^30 bytes). `gbps` in `metrics` is decimal: 10^9 bytes per second.
 - The writer replaces the file atomically. A reader never sees a
-  half-written file.
+  half-written file. The file mode follows the umask, as for a file that
+  `open()` creates.
 - `SuiteResult.load(path)` reads a file. It rejects any `schema_version`
   other than 2. It prints a warning on stderr when `run.complete` is `false`.
 
@@ -77,22 +78,22 @@ collected at suite end.
 | `numa_nodes` | int | NUMA nodes in `/sys/devices/system/node`. |
 | `total_ram_gb` | float | Host RAM, GiB. |
 | `kernel_version` | string | Linux kernel release. |
-| `gpu_model` | string | GPU name from PyTorch device properties. |
+| `gpu_model` | string | GPU name: from PyTorch when the process has already imported it (PyTorch backend), else amdsmi `market_name`, else the `Marketing Name` from `rocminfo`. |
 | `gpu_arch` | string | gfx target (for example `gfx90a`). `"unknown"` when no AMD GPU is found, for example on a CUDA host. |
-| `gpu_compute_units` | int | Compute units. |
+| `gpu_compute_units` | int | Compute units, from amdsmi, or from PyTorch when the process has already imported it. |
 | `gpu_hbm_gb` | float | Device memory, GiB. |
 | `gpu_pcie_link` | string | PCIe link, for example `16 GT/s x16`. |
 | `amdgpu_driver_version` | string | amdgpu driver version. |
 | `gpu_power_cap_w` | float | Power cap, W. |
 | `gpu_max_sclk_mhz` | float | Maximum shader clock, MHz. |
 | `gpu_compute_partition` | string | Compute partition mode. |
-| `rocm_version` | string | `torch.version.hip`. `null` without a ROCm PyTorch. |
-| `cuda_version` | string | `torch.version.cuda` on a CUDA PyTorch. |
-| `cudnn_version` | string | cuDNN version on a CUDA PyTorch. |
+| `rocm_version` | string | The `hip` value of the installed `torch/version.py`. The tool reads the file without an import of PyTorch. `null` without a ROCm PyTorch. |
+| `cuda_version` | string | The `cuda` value of `torch/version.py` for a CUDA PyTorch. `null` for a ROCm PyTorch. |
+| `cudnn_version` | string | cuDNN version. Set only for a CUDA PyTorch that the process has already imported. |
 | `hipdnn_version` | string | `hipdnn_frontend.__version__`. |
 | `python_version` | string | Python version. |
-| `torch_version` | string | PyTorch version. |
-| `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, the GPU fields above and all clock fields are `null`. |
+| `torch_version` | string | `__version__` of `torch/version.py`. |
+| `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition`, the VRAM values and all clock values are `null`. |
 | `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle-mode` or `--autotune` is set. |
 | `end_of_run` | object | Snapshot at suite end: `host_rss_mb` (process RSS, MiB), `host_ram_available_mb` (MiB), `vram_used_mb` (MiB), `vram_total_mb` (MiB). |
 
@@ -122,6 +123,7 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `graph_path` | string | Path of the graph file. |
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
 | `error` | string or null | Graph-level failure, as `ExceptionType: message`. |
+| `message` | string or null | Why no engine applies, when `status` is `no_engines` and hipDNN gave a reason. The console shows `no engines applicable: <message>`. |
 | `results` | array | One [row](#row) per engine or provider. Empty when `status` is `no_engines` or `error`. |
 
 ### graph_id
@@ -242,7 +244,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 
 | Key | Type | Meaning |
 |---|---|---|
-| `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch. `null` when no comparison ran. |
+| `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch, or when validation was requested but no usable reference exists (`message` gives the reason). `null` when no comparison ran. |
 | `rtol` | float | Relative tolerance used. |
 | `atol` | float | Absolute tolerance used. |
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
@@ -259,11 +261,12 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 
 | Note | Condition |
 |---|---|
-| `noisy: CV x%` | `kernel.cv` is more than 0.05 and `kernel.n` is 10 or more. |
+| `noisy: IQR x% of median` | `kernel.iqr_ms / kernel.median_ms` is more than 0.05 and `kernel.n` is 10 or more. |
 | `outlier: max Nx median` | `kernel.max_ms` is more than 2 x `kernel.median_ms`. |
 | `capped at max_iters` | `timing.capped` is `true`. |
 | `events timing: <reason>` | `timing.fallback_reason` is set. stderr also shows the reason one time per process. |
-| `throttled` | `clocks_after.throttle_status` is not 0, or `clocks_after.sclk_mhz` is less than 0.9 x `clocks_before.sclk_mhz`. |
+| `throttled` | `clocks_after.throttle_status` is not 0. |
+| `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
 
 The tool never removes samples because of a warning.
 
@@ -294,15 +297,14 @@ ran for the row.
 | `baseline_kernel` | stats or null | Default (OOTB) plan timed again after the sweep, device time. |
 | `baseline_host` | stats or null | Default plan timed again after the sweep, host submit time. |
 | `correctness` | object or null | Correctness of the tuned plan. The row `correctness` is for the default plan. |
-| `delta` | object or null | Comparison by median. See below. |
+| `delta` | object or null | Comparison by kernel median. See below. |
 
-`delta` compares `baseline_kernel` with `kernel` (basis `kernel`). When either
-side has no kernel statistics, it compares the host statistics (basis
-`host`).
+`delta` compares `baseline_kernel` with `kernel`. It is `null` when either
+side has no kernel statistics.
 
 | Key | Meaning |
 |---|---|
-| `basis` | `kernel` or `host`. |
+| `basis` | Always `kernel`. |
 | `baseline_median_ms` | Median of the default plan, timed after the sweep. |
 | `oracle_median_ms` | Median of the tuned plan. |
 | `delta_ms` | `baseline_median_ms - oracle_median_ms`. A positive value means the tuned plan is faster. |
@@ -354,7 +356,7 @@ it.
 | `error` | `status` is `error`. |
 | `skipped` | `status` is `skipped`. |
 | `reference` | `role` is `reference` and the row ran. |
-| `failed` | Validation ran and found a mismatch, or the run did not complete. |
+| `failed` | Validation found a mismatch, or validation was requested but no usable reference exists. |
 | `passed` | Validation ran and every output is within tolerance. |
 | `unchecked` | The row ran, but no validation result exists. This is not a pass. |
 
@@ -397,6 +399,10 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `kernel_median_ms` | `row.kernel.median_ms` |
 | `kernel_cv` | `row.kernel.cv` |
 | `host_median_ms` | `row.host.median_ms` |
+| `n` | `row.kernel.n` |
+| `timing_mode` | `row.timing.mode` |
+| `cache_mode` | `row.timing.cache_mode` |
+| `seed` | `run.config.seed` |
 | `tflops` | `row.metrics.tflops` |
 | `gbps` | `row.metrics.gbps` |
 | `workspace_bytes` | `row.metrics.workspace_bytes` |
@@ -404,5 +410,8 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `message` | `row.message` |
 
 A graph with no rows (status `error` or `no_engines`) gives one line. That
-line has the graph status in `status` and the graph error in `message`.
-`dnn-benchmark compare` reads JSON only.
+line has the graph status in `status`, and the graph `error` or `message` in
+`message`.
+
+`dnn-benchmark compare` reads JSON only. It stops with exit code 2 on a CSV
+file.

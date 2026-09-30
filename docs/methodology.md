@@ -13,7 +13,7 @@ measures it. The code is `src/dnn_benchmarking/execution/timing.py`
   mode and statistics.
 - Each row records how it was measured in `timing`: mode, event backend,
   cache mode, warmup count, first-call cost, cap and fallback reason.
-- TFLOP/s and GB/s use the median. The tool reports the spread (CV, IQR) and
+- TFLOP/s and GB/s use the median. The tool reports the spread (IQR, CV) and
   flags noise. It never removes samples.
 
 ## What `kernel_med` measures
@@ -61,39 +61,49 @@ the value is the pure host submit cost. It does not include device time. A
 
 ## Priming and `first_call_ms`
 
-Before the timed loop, `measure()` always primes the engine:
+Before the warmup, `measure()` always primes the engine:
 
 1. It runs the first `enqueue()` and a full device sync, and records the wall
    time as `first_call_ms`. This value includes one-time costs such as kernel
    compile, MIOpen find and lazy allocation. The console shows it as `setup`
    and `first call`.
 2. For the PyTorch backend, it runs one more `enqueue()` with
-   `torch.cuda.set_sync_debug_mode("error")`. If this call synchronizes with
-   the host, the loop uses `events` mode.
-3. It runs more untimed launches until the total untimed count is `--warmup`.
-4. It does a full device sync.
+   `torch.cuda.set_sync_debug_mode("error")`, then a device sync. If this
+   call synchronizes with the host, the loop uses `events` mode.
 
-`timing.warmup_iters` is the number of untimed launches that ran. It is 1 or
-more, also when `--warmup 0` is given. For the PyTorch backend it is 2 or
-more.
+Priming launches are not timed and never flushed.
 
 ## Warmup
 
-`--warmup N` (default 10) is a launch count, not a time budget. The first
-launch is part of the count. The warmup launches run back to back, with one
-device sync at the end.
+`--warmup N` (default 10) is a launch count, not a time budget. The priming
+launches are part of the count. The remaining `N - 1` launches (`N - 2` for
+the PyTorch backend) go through the timed-iteration path: the same mode
+(`staged` or `events`), the same per-iteration sync and, in `cold` mode, the
+same flush. The tool discards their samples.
+
+Thus the GPU clocks and the caches reach the state of the timed loop before
+the first sample. Back-to-back warmup launches do not do this: the timed loop
+syncs after each launch, so the clocks can change at the start of the loop.
+On MI210 (`sample_conv_fwd`, 100 iterations), back-to-back warmup gave a
+kernel CV of 9.7 % and a maximum of 50.6 us (2 x median). Warmup through the
+timed path gave a CV of 0.95 % and a maximum of 26.2 us. The median did not
+change (25.4 to 25.6 us).
+
+`timing.warmup_iters` is the number of untimed launches, priming included:
+`max(priming launches, --warmup)`. It is 1 or more, also when `--warmup 0`
+is given. For the PyTorch backend it is 2 or more.
 
 ## Cache modes
 
 | Mode | Behavior |
 |---|---|
 | `warm` (default) | No flush. Inputs, outputs and workspace stay in L2 and MALL between iterations if they fit. This is the steady state of a layer that runs many times. |
-| `cold` | Before each timed iteration: write zeros to a 512 MiB device buffer, then do a full device sync. Then the timed iteration starts. |
+| `cold` | Before each warmup and timed iteration: write zeros to a 512 MiB device buffer, then do a full device sync. Then the iteration starts. |
 
 Notes for `cold`:
 
-- The flush and the sync are outside the timed span. Warmup and priming
-  launches are never flushed.
+- The flush and the sync are outside the timed span. Priming launches are
+  never flushed.
 - 512 MiB is two times or more the largest last-level cache that the tool
   targets (MI300X MALL, 256 MiB). MI210 L2 is 8 MiB.
 - The tool allocates the buffer one time per process, at the first cold
@@ -137,8 +147,11 @@ The tool does not remove outliers. It adds warnings to the row:
 
 | Warning | Condition |
 |---|---|
-| `noisy: CV x%` | CV more than 5 % and 10 or more samples. The table marks `kernel_med` with `*`. |
-| `outlier: max Nx median` | Maximum more than 2 x median. The table marks `kernel_med` with `*`. |
+| `noisy: IQR x% of median` | `iqr_ms / median_ms` more than 5 % and 10 or more samples. The table marks `kernel_med` with `*`. |
+| `outlier: max Nx median` | Maximum more than 2 x median. The table marks `kernel_med` with `*` and shows the warning in `note`. |
+
+The noise flag uses IQR/median, not CV. A few slow samples raise the CV a
+lot but do not change the IQR. The `outlier` flag reports those samples.
 
 The median is the headline because one slow iteration moves the mean but not
 the median. In the MI210 runs below, one 37.6 us sample in a 29 us matmul run
@@ -162,8 +175,9 @@ With `--metrics-tier basic` (default) and amdsmi available, the runner reads
 the GPU clocks right before and right after the timed loop:
 `sclk_mhz`, `mclk_mhz`, `power_w`, `temp_hotspot_c` and `throttle_status`.
 The row gets the warning `throttled` when `throttle_status` after the loop is
-not 0, or when `sclk` after the loop is less than 90 % of `sclk` before the
-loop. The tool does not set or lock clocks.
+not 0. A lower `sclk` after the loop alone is not a warning: on an idle MI210
+the clock moved from 1700 MHz to 1430 MHz over a 3-iteration loop because of
+power management, not throttling. The tool does not set or lock clocks.
 
 ## Profiling child process
 
@@ -199,7 +213,7 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 
 | Feature | dnn-benchmarking | rocKE | PyTorch / Triton |
 |---|---|---|---|
-| Warmup | Fixed count (default 10), first call timed separately | Fixed count (default 5) | do_bench: 25 ms time budget. Timer: block-size estimate. |
+| Warmup | Fixed count (default 10) through the timed path, first call timed separately | Fixed count (default 5) | do_bench: 25 ms time budget. Timer: block-size estimate. |
 | Iterations | `--iters` floor plus optional `--min-time-ms` budget, cap 10000 | Fixed (default 100) | do_bench: 100 ms budget. `blocked_autorange`: 0.2 s minimum. |
 | Event granularity | One event pair per launch, stall-gated | One event pair around N launches | do_bench: one pair per launch. Graph variant: one pair per replay. |
 | Sync | After each launch | One at the end | do_bench: one at the end. Timer: one per block. |
@@ -208,7 +222,7 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 | Cache flush | `--cache-mode cold`, 512 MiB | Documented only | do_bench: 256 MB zero before each launch |
 | Rotating buffers | No | Documented only | No |
 | Graph replay | No | Yes | `do_bench_cudagraph` |
-| Outliers | Flagged, never removed | Discard first run | Timer: IQR warnings |
+| Outliers | Flagged (IQR/median noise flag, max/median outlier flag), never removed | Discard first run | Timer: IQR warnings |
 | Statistics | n, mean, std, CV, min, p25, median, p75, p95, max, IQR | median, min, max, mean, stdev, spread | do_bench: mean or quantiles. Timer: median, IQR. |
 | Headline | Median | Median over attempts | do_bench: mean (default). Timer: median. |
 | TFLOP/s basis | Median | Median | User calculates |
@@ -270,9 +284,11 @@ hipDNN and `--backend pytorch` on the same graphs, kernel median in ms:
 | relu | 0.155 | 0.156 |
 | rmsnorm | 0.010 | 0.032 |
 
-These numbers are from the review before this overhaul. The timed loop was
-already stall-gated then. The warm-mode medians of the current loop are
-expected to match. Measure again after a timing change.
+The tables above come from the review before this overhaul. The timed loop
+was already stall-gated then, but the warmup ran back to back, so the
+minimum-to-maximum ranges can include clock-ramp outliers. The current loop gave
+the same conv_fwd medians (25.44 and 25.60 us) with a maximum of 26.4 us.
+Measure again after a timing change.
 
 ## Not yet
 

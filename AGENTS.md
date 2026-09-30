@@ -14,7 +14,8 @@ reference.
 backends share the suite path, the timed loop (`execution/timing.measure`)
 and the result schema. A CUDA host without hipDNN can thus produce a result
 file that `dnn-benchmark compare` can compare with a ROCm result. The package
-stays importable without `hipdnn_frontend`: every hipDNN import is lazy.
+stays importable without `hipdnn_frontend`: every hipDNN import is lazy. The
+hipDNN backend does not import `torch` at startup.
 
 User documentation:
 
@@ -58,7 +59,7 @@ package, run `PYTHONPATH=src python -m dnn_benchmarking ...`.
 |---|---|
 | 0 | Success. An all-skipped run is also 0. |
 | 1 | Row error, graph error, result write failure, or backend not available at startup. |
-| 2 | Usage error: argparse, config file, backend-incompatible option, unknown `--engine`, unwritable `-o`, missing profiler tool. |
+| 2 | Usage error: argparse, config file, backend-incompatible option, unknown `--engine`, unwritable `-o` or `--profiling-output-dir`, missing profiler tool. |
 | 3 | At least one correctness mismatch. 3 wins over 1, and 1 wins over 0. |
 | 130 / 143 | SIGINT / SIGTERM. The result file is partial (`run.complete = false`). |
 
@@ -124,7 +125,10 @@ Rules that keep the design intact:
   `suite_results.py`, and to `docs/results-schema.md`.
 - Add a CLI option only in `cli/parser.py:CLI_OPTIONS`. The config file and
   the defaults derive from that table.
-- Keep `hipdnn_frontend` and `torch` imports lazy.
+- Keep `hipdnn_frontend` and `torch` imports lazy. Importing `torch` takes
+  seconds, so the hipDNN path must not import it at startup. Code that only
+  reads torch facts (environment, GPU identity) uses `sys.modules["torch"]`
+  when torch is already loaded, and does not import it.
 
 ## Tests
 

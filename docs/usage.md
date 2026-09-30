@@ -23,18 +23,21 @@ override a config file.
 | `-g`, `--graph PATH [PATH ...]` | required | Graph JSON files, directories, globs or tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`). Quote globs so the shell does not expand them. |
 | `--config PATH` | none | TOML recipe. Explicit CLI flags override its values. See [Config files](#config-files). |
 
-The tool extracts a tarball to a temporary directory and deletes the
-directory at the end of the run. All graphs share one execution path: one
-graph, a glob and a tarball give the same output format.
+Graphs run in command-line order. The files that one argument expands to
+(a glob, a directory or a tarball) run in sorted order. A file that you name
+two times runs one time, at its first position. The tool extracts a tarball
+to a temporary directory and deletes the directory at the end of the run.
+All graphs share one execution path: one graph, a glob and a tarball give
+the same output format.
 
 ### Run
 
 | Option | Default | Description |
 |---|---|---|
-| `-w`, `--warmup N` | 10 | Untimed launches per engine before the timed loop. The first launch is timed separately as `first_call_ms`. At least one launch always runs. |
+| `-w`, `--warmup N` | 10 | Untimed launches per engine before the timed loop. The first launch is timed separately as `first_call_ms`. The other launches use the timed-iteration path (same mode and cache flush) and are discarded. At least one launch always runs. |
 | `-i`, `--iters N` | 100 | Minimum timed iterations per engine. |
 | `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of 10000 samples applies. |
-| `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each timed iteration. |
+| `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each warmup and timed iteration. |
 | `-s`, `--seed SEED` | 0 | Random seed for the input data. |
 
 [methodology.md](methodology.md) explains each value.
@@ -91,7 +94,7 @@ profiler, after the timed row completes. The timed numbers do not change.
 | `--emit-trace {pftrace}` | off | Write a Perfetto kernel and memcpy trace with `rocprofv3`. |
 | `--perf`, `--no-perf` | off | Collect CPU cycles, instructions and IPC with `perf stat`. |
 | `--roofline`, `--no-roofline` | off | Collect HBM and compute ceilings with `rocprof-compute --roof-only` (about 3 extra runs). |
-| `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. |
+| `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. The tool checks at startup that it can create files there. |
 | `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process. `0` disables the limit. |
 
 See [Profiling](#profiling) below.
@@ -266,27 +269,36 @@ Table columns:
 | Column | Meaning |
 |---|---|
 | `engine` | Engine name (hipDNN) or `pytorch`. |
-| `status` | Row verdict: `passed`, `unchecked`, `failed`, `reference`, `skipped` or `error`. |
-| `kernel_med` | Median device time per launch, in us, ms or s. `*` marks a noisy row. |
-| `cv%` | Coefficient of variation of the kernel samples. |
+| `verdict` | Row verdict: `passed`, `unchecked`, `failed`, `reference`, `skipped` or `error`. |
+| `kernel_med` | Median device time per launch, in µs, ms or s. `*` marks a noisy row or an outlier. |
+| `iqr%` | Interquartile range of the kernel samples, as a percentage of the median. |
 | `submit` | Median host time of the enqueue call. |
 | `tflops` | TFLOP/s from the median. `~` means the FLOP count is partial. |
 | `gbps` | GB/s (10^9 bytes/s) from the median. |
 | `vs_best` | Best median of the graph divided by the row median. `1.00x` is the fastest row. `ref` marks the reference row. |
 | `oracle` | Only with `--oracle-mode`. See [Oracle mode](#oracle-mode). |
-| `note` | The skip or error reason, or the first row warning. `(+N)` shows the number of more warnings. |
+| `note` | The skip or error reason, or the first row warning other than `noisy:`. `(+N)` shows the number of more warnings. |
 
-Example (MI210):
+Example (MI210, `-g graphs/sample_conv_fwd.json graphs/sample_layernorm.json`):
 
 ```text
-sample_conv_fwd_16x16x16x16_k16_3x3  [e50543fd1d83]
-  engine                       status     kernel_med  cv%    submit  tflops  gbps  vs_best  note
-  MIOPEN_ENGINE                unchecked   25.60 µs*  9.7  11.64 µs    0.74  20.8    0.99x  noisy: CV 9.7%
-  MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.44 µs*  9.5  11.53 µs    0.74  21.0    1.00x  noisy: CV 9.5%
+sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [e50543fd1d83]
+  engine                       verdict    kernel_med  iqr%    submit  tflops  gbps  vs_best
+  MIOPEN_ENGINE                unchecked   25.44 µs    1.9  11.55 µs    0.74  21.0    1.00x
+  MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.60 µs    1.3  11.47 µs    0.74  20.8    0.99x
+  kernel_med = median device time per launch (staged stall-gate; cache warm); submit = host enqueue time; vs_best = best
+  median / row median; * = noisy
+
+sample_layernorm (sample_layernorm_2x3x4)  [ad562fbb5a14]
+  no engines applicable: Failed to get ranked engine ids: No engine configurations available for the graph.
+
+Summary: 2 graph(s), 2 row(s): 0 passed, 2 unchecked, 0 failed, 0 skipped, 0 error(s); 1 graph(s) without engines
 ```
 
-The value in brackets after the graph name is the `graph_id`. `unchecked`
-means that the row ran without validation. It is not a pass.
+The graph title is the file stem, then the `name` of the graph JSON in
+parentheses when it is different. The value in brackets is the `graph_id`.
+A graph with no applicable engine shows the reason from hipDNN.
+`unchecked` means that the row ran without validation. It is not a pass.
 
 `-v` adds a block for each row with the plugin path, costs (build, first
 call, row total), timing mode, a statistics table for kernel and submit time,
@@ -310,7 +322,7 @@ After Ctrl-C or SIGTERM the file holds every completed graph and has
 |---|---|
 | 0 | All rows ran. No row failed validation. A run where every row is skipped also exits 0. |
 | 1 | A row error, a graph error, a result write failure, or a backend that is not available at startup (hipDNN, PyTorch or the reference provider). |
-| 2 | Usage error: a bad flag, a bad config file, an option that the backend does not support, an unknown `--engine`, an output path that cannot be written, or a missing profiler tool. |
+| 2 | Usage error: a bad flag, a bad config file, an option that the backend does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
 | 143 | Interrupted by SIGTERM. |
@@ -334,8 +346,8 @@ reads JSON only, not CSV.
 Rules:
 
 - `speedup = A_median / B_median`. A value more than 1 means B is faster.
-- Graphs join on `graph_id`. The tool uses `graph_name` only when one side
-  has no `graph_id`.
+- Graphs join on `graph_id` only. A graph that did not load has no
+  `graph_id`, so it shows as `graph only in A` or `graph only in B`.
 - In `--by engine` mode, rows join on role, provider, engine ID and engine
   name.
 - `best` and `ref` select only rows with the verdict `passed`, `unchecked`
@@ -373,10 +385,12 @@ The child does not recurse and does not print on success.
 [methodology.md](methodology.md#profiling-child-process) tells why the
 child does not use the timed loop.
 
-Before the first graph, the tool checks that each requested profiler exists.
-If one is missing, the run stops with exit code 2. A pass that starts but
-fails does not stop the run: the row records `skipped`, `returncode` or
-`error_tail` in `extra_metrics`.
+Before the first graph, the tool checks that each requested profiler exists
+and that it can create files in `--profiling-output-dir`. If a check fails,
+the run stops with exit code 2. A pass that starts but fails does not stop
+the run: the row records `skipped`, `returncode` or `error_tail` in
+`extra_metrics`. If a pass raises an exception, the row keeps its timed
+values and gets the warning `profiling failed: <error>`.
 
 Artefacts go to
 `<profiling-output-dir>/<graph-stem>-<hash6>/<engine-name>/<pass>/`. The file

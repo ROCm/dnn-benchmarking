@@ -37,10 +37,13 @@ a run; the table is what it is checking and how to close each gap.
 | `--roofline` | `rocprof-compute` **paired with the ROCm whose `rocprofv3` it drives** | The `rocprofiler-compute` system package. Deliberately absent from the wheel-only Docker image: pulling it in means adding a second ROCm install, which is the mismatch above. A hand-installed copy is not a shortcut — rocprofiler-compute 3.3.0 against ROCm 7.15 dies on `$ROCM_PATH/share/rocprofiler-sdk/counter_defs.yaml`, which that ROCm does not ship. Note it also clears the whole `-p` directory it is given, so never point it at a directory holding other artefacts |
 
 Before the first graph, dnn-benchmarking checks that each requested
-profiler exists. If one is missing, the run stops with exit code 2 and names
-the tool. A profiler that starts but fails is not fatal: the row records a
-`skipped` reason (or `returncode` and `error_tail`) in `extra_metrics` and
-the benchmark continues.
+profiler exists and that it can create files in `--profiling-output-dir`
+(default `./profiling-output`). If a check fails, the run stops with exit
+code 2 and names the problem. A profiler that starts but fails is not
+fatal: the row records a `skipped` reason (or `returncode` and
+`error_tail`) in `extra_metrics` and the benchmark continues. If a pass
+raises an exception, the row keeps its timed values and gets the warning
+`profiling failed: <error>`.
 
 ## Profiling integration tests
 
