@@ -1,2611 +1,464 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Unit tests for suite_runner module."""
+"""Tests for execution.suite_runner, asserted on the GraphResult it returns."""
 
-import os
+import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
 
-from dnn_benchmarking.execution.suite_runner import (
-    run_graph_all_providers,
-    run_graph_pytorch_backend,
-    _resolve_engine_name,
-    _resolve_engine_version,
-    _get_reference_provider,
-    _check_correctness,
-    _BFLOAT16_RTOL,
-    _BFLOAT16_ATOL,
-    _run_timed_pytorch_row,
-    _TimedPytorchRow,
-    _compute_reference_outputs_once,
-    _hipdnn_buffer_device,
-    set_plugin_path,
-    _collect_basic_metrics_post_loop,
-)
+from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
-    ReferenceProviderName,
     SuiteConfig,
     ValidationConfig,
 )
-from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
-from dnn_benchmarking.execution.timing import StallFallbackError
-from dnn_benchmarking.reporting.statistics import (
-    BenchmarkMetadata,
-    BenchmarkResult,
-    BenchmarkStats,
-)
-from dnn_benchmarking.reporting.suite_results import (
-    CorrectnessResult,
-    GraphResult,
-    ProviderEngineResult,
-)
-from dnn_benchmarking.validation.reference_provider import ReferenceOutput
-
-
-def _make_tensor_info(
-    uid: int,
-    is_output: bool = False,
-    is_virtual: bool = False,
-    data_type: str = "float",
-    dims=None,
-    strides=None,
-    value=None,
-):
-    """Create a mock TensorInfo object."""
-    ti = MagicMock()
-    ti.uid = uid
-    ti.is_output = is_output
-    ti.is_virtual = is_virtual
-    ti.data_type = data_type
-    ti.dims = dims or [1]
-    ti.strides = strides or []
-    ti.value = value
-    ti.is_pass_by_value = value is not None
-    ti.storage_elements = 1
-    ti.size_bytes = 4
-    return ti
-
-
-def _make_graph_json():
-    """Create a minimal graph JSON dict."""
-    return {"name": "test_graph", "nodes": [], "tensors": []}
-
-
-def _make_config(**overrides):
-    """Create a SuiteConfig with optional overrides."""
-    defaults = {
-        "warmup_iters": 2,
-        "benchmark_iters": 3,
-        "seed": 42,
-    }
-    defaults.update(overrides)
-    return SuiteConfig(**defaults)
-
-
-def _make_bm_mock():
-    """Create a BufferManager mock that supports the context-manager protocol."""
-    mock_bm = MagicMock()
-    mock_bm.__enter__ = MagicMock(return_value=mock_bm)
-    mock_bm.__exit__ = MagicMock(return_value=False)
-    mock_bm.create_variant_pack.return_value = {1: 100}
-    return mock_bm
-
-
-def test_resolve_engine_version_uses_loaded_plugin_metadata():
-    handle = MagicMock()
-    handle.get_engine_info.return_value.version = "2.3.4"
-
-    assert _resolve_engine_version(handle, 7) == "2.3.4"
-    handle.get_engine_info.assert_called_once_with(7)
-
-
-def _make_exec_factory(
-    engine_ids=None,
-    init_time_ms: float = 1.0,
-    has_kernel_timings: bool = False,
-    prepare_side_effect=None,
-    discover_side_effect=None,
-):
-    """Build a factory for Executor() that handles both discovery and execution.
-
-    The first Executor() call (in run_graph_all_providers) is for discovery
-    and only uses .discover_engines(); subsequent calls are per-engine and
-    use .prepare(), .warmup(), .benchmark(). All instances share the same
-    mock by default; override with side_effects when behaviour must differ.
-    """
-
-    def make_instance(*args, **kwargs):
-        m = MagicMock()
-        m.init_time_ms = init_time_ms
-        if discover_side_effect is not None:
-            m.discover_engines.side_effect = discover_side_effect
-        else:
-            m.discover_engines.return_value = engine_ids or []
-        if prepare_side_effect is not None:
-            m.prepare.side_effect = prepare_side_effect
-        bench_result = MagicMock()
-        bench_result.host_timings = [1.0]
-        bench_result.kernel_timings = [0.5] if has_kernel_timings else None
-        bench_result.has_kernel_timings = has_kernel_timings
-        m.benchmark.return_value = bench_result
-        return m
-
-    return make_instance
-
-
-class TestPluginPathLoading:
-    """Explicit benchmark plugin paths should replace default plugin search paths."""
-
-    def test_set_plugin_path_defaults_to_absolute_loading(self) -> None:
-        hipdnn = MagicMock()
-        hipdnn.PluginLoadingMode.ABSOLUTE = "absolute"
-
-        set_plugin_path(hipdnn, Path("/plugins/engines"))
-
-        # set_plugin_path forwards the native string form of the path; compare
-        # against that rather than a hardcoded POSIX path so this holds on Windows.
-        hipdnn.set_engine_plugin_paths.assert_called_once_with(
-            [str(Path("/plugins/engines"))], "absolute"
-        )
-
-
-class TestRunGraphAllProviders:
-    """Tests for run_graph_all_providers function."""
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_one_result_per_discovered_engine(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """run_graph_all_providers returns one ProviderEngineResult per discovered engine ID."""
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0, 1, 2], has_kernel_timings=True
-        )
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        config = _make_config()
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=config,
-            handle=MagicMock(),
-        )
-
-        assert isinstance(result, GraphResult)
-        assert len(result.results) == 3
-        assert [r.engine_id for r in result.results] == [0, 1, 2]
-        assert [r.provider for r in result.results] == [
-            "engine_0",
-            "engine_1",
-            "engine_2",
-        ]
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_stall_timeout_restarts_every_engine_unstalled(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-        mock_bm_cls.return_value = _make_bm_mock()
-        benchmark_calls: list[tuple[int, bool]] = []
-        created = 0
-
-        def make_executor(*args, **kwargs):
-            nonlocal created
-            executor = MagicMock()
-            executor.init_time_ms = 1.0
-            if created == 0:
-                executor.discover_engines.return_value = [1, 2]
-            else:
-                engine_id = kwargs["config"].engine_id
-
-                def benchmark(*args, allow_staging=True, **kwargs):
-                    benchmark_calls.append((engine_id, allow_staging))
-                    if engine_id == 2 and allow_staging:
-                        raise StallFallbackError("timed out")
-                    return BenchmarkResult(
-                        host_timings=[1.0],
-                        kernel_timings=[0.5],
-                        metadata=BenchmarkMetadata(timing_backend="hip"),
-                    )
-
-                executor.benchmark.side_effect = benchmark
-            created += 1
-            return executor
-
-        mock_exec_cls.side_effect = make_executor
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert [row.status for row in result.results] == ["success", "success"]
-        assert benchmark_calls == [(1, True), (2, True), (1, False), (2, False)]
-        assert all(
-            "remeasured without stalling" in row.warnings[0] for row in result.results
-        )
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_prepare_failure_records_error_status(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """When Executor.prepare() fails, the result is status='error' with no timing."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0],
-            prepare_side_effect=ExecutionError("build failed"),
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        r = result.results[0]
-        assert r.status == "error"
-        assert "build failed" in r.error_message
-        assert r.cpu_build_time_ms is None
-        assert r.gpu_kernel_stats is None
-        assert r.host_stats is None
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_check_support_failure_records_skipped_status(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """An UnsupportedGraphError is recorded as skipped."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0],
-            prepare_side_effect=UnsupportedGraphError(
-                "Backend support check failed: not supported"
-            ),
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        r = result.results[0]
-        assert r.status == "skipped"
-        assert r.skip_reason is not None
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_successful_execution_records_separated_timing(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """Success: status='success' with separate cpu_build_time_ms / gpu_kernel_stats / host_stats."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0], init_time_ms=12.5, has_kernel_timings=True
-        )
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        r = result.results[0]
-        assert r.status == "success"
-        assert r.cpu_build_time_ms == 12.5
-        assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
-        assert isinstance(r.host_stats, BenchmarkStats)
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_cpu_build_time_from_init_time_ms(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """cpu_build_time_ms comes from Executor.init_time_ms."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0], init_time_ms=42.0
-        )
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert result.results[0].cpu_build_time_ms == 42.0
-
-
-class TestDiscoveryFailure:
-    """Discovery-level failures are surfaced as graph-level errors."""
-
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    def test_discovery_exception_is_recorded_as_graph_error(self, mock_exec_cls):
-        """When discover_engines raises, the graph gets a single error entry."""
-        mock_exec_cls.side_effect = _make_exec_factory(
-            discover_side_effect=ExecutionError("backend rejected graph")
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        r = result.results[0]
-        assert r.status == "error"
-        assert "Engine discovery failed" in r.error_message
-        assert "backend rejected graph" in r.error_message
-
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    def test_empty_discovery_recorded_as_graph_error(self, mock_exec_cls):
-        """When discovery returns no engines, surface as a graph-level error."""
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[])
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        assert result.results[0].status == "error"
-        assert "No engines discovered" in result.results[0].error_message
-
-    def test_input_generation_exception_recorded_as_graph_error(self):
-        """Bad tensor metadata during shared input generation does not abort the suite."""
-        with (
-            patch("dnn_benchmarking.execution.suite_runner.Executor") as mock_exec_cls,
-            patch(
-                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
-                return_value=None,
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.generate_input_data",
-                side_effect=ValueError("bad tensor strides"),
-            ),
-        ):
-            mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[7])
-
-            result = run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(),
-                handle=MagicMock(),
-            )
-
-        assert len(result.results) == 1
-        r = result.results[0]
-        assert r.status == "error"
-        assert r.provider == "unknown"
-        assert "Input data generation failed" in r.error_message
-        assert "bad tensor strides" in r.error_message
-        assert r.correctness is not None
-        assert r.correctness.passed is False
-        assert result.engine_ids == [7]
-
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    def test_no_engines_unsupported_error_recorded_as_skipped(self, mock_exec_cls):
-        """UnsupportedGraphError during discovery is recorded as skipped."""
-        mock_exec_cls.side_effect = _make_exec_factory(
-            discover_side_effect=UnsupportedGraphError(
-                "Failed to get ranked engine ids: No engine configurations available for the graph."
-            )
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        r = result.results[0]
-        assert r.status == "skipped"
-        assert "No engine configurations" in (r.skip_reason or "")
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_engine_filter_runs_explicit_id_without_discovery(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """Explicit --engine IDs run in CLI order without discovery filtering."""
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(engine_filter=[99]),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        assert result.results[0].status == "success"
-        assert result.results[0].engine_id == 99
-
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_engine_name_comes_from_the_per_engine_handle(
-        self, mock_bm_cls, mock_exec_cls, mock_get_ref
-    ):
-        """With --engine and no shared handle, the row is named by the handle
-        built for that engine, so plugin-supplied engines are not shown as hex."""
-        mock_get_ref.return_value = None
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
-        mock_bm_cls.return_value = _make_bm_mock()
-        plugin_handle = MagicMock()
-        plugin_handle.engine_id_to_name.return_value = "hipkernel:Gfx950AttentionDense"
-        frontend = SimpleNamespace(
-            Handle=MagicMock(return_value=plugin_handle),
-            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
-            engine_id_to_name=lambda _id: "",  # built-in registry: unknown
-        )
-
-        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
-            result = run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(engine_filter=[0x7636]),
-                handle=None,
-            )
-
-        assert result.results[0].provider == "hipkernel:Gfx950AttentionDense"
-
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_setup_failure_row_keeps_the_built_in_registry_name(
-        self, mock_bm_cls, mock_exec_cls, mock_get_ref
-    ):
-        """When the per-engine handle cannot be built there is no handle to ask,
-        but the row must still carry the built-in engine name, not hex."""
-        mock_get_ref.return_value = None
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
-        mock_bm_cls.return_value = _make_bm_mock()
-        frontend = SimpleNamespace(
-            Handle=MagicMock(side_effect=RuntimeError("plugin failed to load")),
-            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
-            engine_id_to_name=lambda _id: "MIOPEN_ENGINE",
-        )
-
-        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
-            result = run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(engine_filter=[1]),
-                handle=None,
-            )
-
-        row = result.results[0]
-        assert (row.status, row.provider) == ("error", "MIOPEN_ENGINE")
-
-
-class TestSuiteConfigValidation:
-    """Tests for SuiteConfig dataclass validation."""
-
-    def test_valid_config(self):
-        config = SuiteConfig(warmup_iters=5, benchmark_iters=10)
-        assert config.warmup_iters == 5
-        assert config.benchmark_iters == 10
-        assert config.engine_filter is None
-        assert config.validation.rtol is None
-        assert config.validation.atol is None
-        assert config.validation.tolerance_override is None
-        assert config.validation.provider is ReferenceProviderName.NONE
-
-    def test_negative_warmup_raises(self):
-        with pytest.raises(ValueError, match="warmup_iters"):
-            SuiteConfig(warmup_iters=-1, benchmark_iters=10)
-
-    def test_zero_benchmark_iters_raises(self):
-        with pytest.raises(ValueError, match="benchmark_iters"):
-            SuiteConfig(warmup_iters=0, benchmark_iters=0)
-
-    def test_engine_filter_accepts_list(self):
-        config = SuiteConfig(engine_filter=[1, 2, 3])
-        assert config.engine_filter == [1, 2, 3]
-
-    def test_engine_filter_empty_list_raises(self):
-        with pytest.raises(ValueError, match="engine_filter"):
-            SuiteConfig(engine_filter=[])
-
-    def test_engine_filter_accepts_negative_ids(self):
-        """Engine IDs are FNV-1a hashes; negative values must be allowed."""
-        config = SuiteConfig(engine_filter=[1, -1234567890])
-        assert config.engine_filter == [1, -1234567890]
-
-    def test_verbose_default_false(self):
-        config = SuiteConfig()
-        assert config.verbose is False
-
-    def test_verbose_can_be_set(self):
-        config = SuiteConfig(verbose=True)
-        assert config.verbose is True
-
-    def test_default_reference_provider_accepted(self):
-        config = SuiteConfig()
-        assert config.validation.provider is ReferenceProviderName.NONE
-        for provider in ("none", "pytorch"):
-            SuiteConfig(validation=ValidationConfig(provider=provider))
-
-
-class TestEngineFilter:
-    """Tests for engine filter behavior."""
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_engine_filter_limits_iteration(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """When --engine filter is set, only that engine ID is iterated."""
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(engine_filter=[2]),
-            handle=MagicMock(),
-        )
-
-        assert len(result.results) == 1
-        assert result.results[0].engine_id == 2
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_engine_filter_list_keeps_intersection(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """engine_filter=[1, 3, 99] runs exactly those IDs in caller order."""
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2, 3])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(engine_filter=[1, 3, 99]),
-            handle=MagicMock(),
-        )
-
-        engine_ids = [r.engine_id for r in result.results]
-        assert engine_ids == [1, 3, 99]
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_same_engine_runs_with_distinct_plugin_paths(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """Repeated engine IDs are separate ordered selections."""
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-        mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
-        mock_bm_cls.return_value = _make_bm_mock()
-        hipdnn = MagicMock()
-        hipdnn.PluginLoadingMode.ABSOLUTE = "absolute"
-        hipdnn.Handle.side_effect = [MagicMock(), MagicMock()]
-
-        with patch.dict("sys.modules", {"hipdnn_frontend": hipdnn}):
-            result = run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(
-                    engine_filter=[1, 1],
-                    plugin_paths=[Path("/plugins/a"), Path("/plugins/b")],
-                ),
-                handle=None,
-            )
-
-        assert [r.engine_id for r in result.results] == [1, 1]
-        # plugin_path is stored as str(Path(...)), so it carries the
-        # platform separator.
-        assert [r.plugin_path for r in result.results] == [
-            str(Path("/plugins/a")),
-            str(Path("/plugins/b")),
-        ]
-        hipdnn.set_engine_plugin_paths.assert_has_calls(
-            [
-                call([str(Path("/plugins/a"))], "absolute"),
-                call([str(Path("/plugins/b"))], "absolute"),
-            ]
-        )
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_per_engine_handle_creation_failure_records_error_result(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """A later per-engine handle failure records an error row and continues."""
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-        mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
-        mock_bm_cls.return_value = _make_bm_mock()
-        hipdnn = MagicMock()
-        hipdnn.PluginLoadingMode.ABSOLUTE = "absolute"
-        hipdnn.Handle.side_effect = [MagicMock(), RuntimeError("bad plugin")]
-
-        with patch.dict("sys.modules", {"hipdnn_frontend": hipdnn}):
-            result = run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(
-                    engine_filter=[1, 2],
-                    plugin_paths=[Path("/plugins/a"), Path("/plugins/b")],
-                ),
-                handle=None,
-            )
-
-        assert [r.status for r in result.results] == ["success", "error"]
-        assert result.results[0].plugin_path == str(Path("/plugins/a"))
-        assert result.results[1].plugin_path == str(Path("/plugins/b"))
-        assert "bad plugin" in (result.results[1].error_message or "")
-        assert result.results[1].correctness is not None
-        assert result.results[1].correctness.execution_success is False
-
-
-class TestNoRetryOnFailure:
-    """Single attempt per engine -- no automatic retry."""
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_no_retry_on_failure(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """No retry on failure -- single attempt per engine."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0],
-            prepare_side_effect=ExecutionError("fail"),
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        # One Executor for discovery + one for the single failed engine.
-        assert mock_exec_cls.call_count == 2
-        assert result.results[0].status == "error"
-
-
-class TestCorrectnessChecking:
-    """Tests for correctness checking via the reference provider path."""
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_tolerance_match_populated_from_comparator(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_check_corr,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """Successful execution populates correctness.tolerance_match from the validator."""
-        mock_resolve_name.return_value = "engine_0"
-
-        mock_get_ref.return_value = MagicMock()
-        mock_check_corr.return_value = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=True,
-            rtol=1e-5,
-            atol=1e-8,
-            max_abs_diff=1e-7,
-            max_rel_diff=1e-6,
-        )
-
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.tolerance_match is True
-        assert r.correctness.execution_success is True
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_tolerance_match_none_when_not_requested(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """When --validate is not requested, tolerance_match is None (no correctness performed)."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),  # reference_provider defaults to "none"
-            handle=MagicMock(),
-        )
-
-        r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.tolerance_match is None
-        assert r.correctness.execution_success is True
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_tolerance_match_false_when_requested_but_unsupported(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """--validate requested but provider doesn't support graph -> tolerance_match=False."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None  # provider unavailable for this graph
-
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(validation=ValidationConfig(provider="pytorch")),
-            handle=MagicMock(),
-        )
-
-        r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.tolerance_match is False
-        assert r.correctness.execution_success is True
-        assert "does not support" in (r.correctness.error_message or "")
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_execution_success_false_on_error(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """correctness.execution_success is False when benchmark errors."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0],
-            prepare_side_effect=ExecutionError("boom"),
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.execution_success is False
-        assert r.correctness.tolerance_match is None
-
-    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_validate_pytorch_adds_timed_reference_row(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_check_corr,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_timed_reference,
-    ):
-        """--validate pytorch adds a timed reference row and reuses its outputs."""
-        mock_resolve_name.return_value = "engine_1"
-        ref_outputs = {
-            2: ReferenceOutput(data=np.array([1.0], dtype=np.float32), tensor_uid=2)
-        }
-        ref_provider = MagicMock()
-        ref_provider.name = "pytorch"
-        mock_get_ref.return_value = ref_provider
-        timed_result = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="success",
-            role="reference",
-            host_stats=BenchmarkStats.from_timings([2.0]),
-            gpu_kernel_stats=BenchmarkStats.from_timings([1.0]),
-        )
-        mock_timed_reference.return_value = MagicMock(
-            result=timed_result,
-            outputs=ref_outputs,
-        )
-        mock_check_corr.return_value = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=True,
-            rtol=1e-5,
-            atol=1e-6,
-        )
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[1])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=_make_config(validation=ValidationConfig(provider="pytorch")),
-            handle=MagicMock(),
-        )
-
-        assert [r.role for r in result.results] == ["reference", "engine"]
-        assert result.results[0].provider == "pytorch"
-        assert result.results[0].status == "success"
-        ref_provider.compute_reference.assert_not_called()
-        assert mock_check_corr.call_args.args[3] is ref_outputs
-
-    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_validate_pytorch_falls_back_when_timed_reference_skips(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_check_corr,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_timed_reference,
-    ):
-        """A skipped timed PyTorch row does not prevent CPU reference fallback."""
-        mock_resolve_name.return_value = "engine_1"
-        ref_outputs = {
-            2: ReferenceOutput(data=np.array([1.0], dtype=np.float32), tensor_uid=2)
-        }
-        ref_provider = MagicMock()
-        ref_provider.name = "pytorch"
-        ref_provider.compute_reference.return_value = ref_outputs
-        mock_get_ref.return_value = ref_provider
-        skipped_result = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="skipped",
-            role="reference",
-            skip_reason="PyTorch GPU not available",
-        )
-        mock_timed_reference.return_value = MagicMock(
-            result=skipped_result,
-            outputs=None,
-        )
-        mock_check_corr.return_value = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=True,
-            rtol=1e-5,
-            atol=1e-6,
-        )
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[1])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=_make_config(validation=ValidationConfig(provider="pytorch")),
-            handle=MagicMock(),
-        )
-
-        assert result.results[0].role == "reference"
-        assert result.results[0].status == "skipped"
-        assert ref_provider.compute_reference.call_count == 1
-        assert mock_check_corr.call_args.args[3] is ref_outputs
-
-    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_validate_pytorch_nondefault_never_falls_back_after_timed_failure(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_check_corr,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_timed_reference,
-    ):
-        reason = "The graph did not execute a native forward SDPA call."
-        ref_provider = MagicMock()
-        mock_get_ref.return_value = ref_provider
-        mock_timed_reference.return_value = _TimedPytorchRow(
-            result=ProviderEngineResult(
-                provider="pytorch",
-                engine_id=0,
-                status="error",
-                role="reference",
-                error_message=reason,
-            ),
-            outputs=None,
-        )
-        mock_resolve_name.return_value = "engine_1"
-        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[1])
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(
-                validation=ValidationConfig(provider="pytorch"),
-                pytorch_sdpa_backend="math",
-            ),
-            handle=MagicMock(),
-        )
-
-        ref_provider.compute_reference.assert_not_called()
-        mock_check_corr.assert_not_called()
-        assert result.results[0].error_message == reason
-
-    def test_cpu_pytorch_reference_receives_rocm_fa_preference(self) -> None:
-        from dnn_benchmarking.config import PyTorchSdpaBackendName
-        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
-        from dnn_benchmarking.validation.providers.pytorch_provider import (
-            PyTorchReferenceProvider,
-        )
-
-        class ScopedProvider(PyTorchReferenceProvider):
-            def compute_reference(self, graph_json, input_data):
-                state = _sdpa_backend._ACTIVE_SDPA_BACKEND.get()
-                assert state is not None
-                assert state.selection is PyTorchSdpaBackendName.FLASH
-                assert state.rocm_fa_library == "aotriton"
-                return {}
-
-        outputs, error = _compute_reference_outputs_once(
-            ScopedProvider(),
-            _make_graph_json(),
-            {},
-            _make_config(
-                validation=ValidationConfig(provider="pytorch"),
-                pytorch_sdpa_backend="flash",
-                pytorch_rocm_fa_library="aotriton",
-            ),
-        )
-
-        assert outputs is None
-        assert error is not None
-        assert "The graph did not execute a native forward SDPA call." in error
-
-    def test_cpu_pytorch_reference_succeeds_after_native_sdpa(self) -> None:
-        import torch
-
-        from dnn_benchmarking.execution import pytorch_ops
-        from dnn_benchmarking.validation.providers.pytorch_provider import (
-            PyTorchReferenceProvider,
-        )
-
-        class ExecutedProvider(PyTorchReferenceProvider):
-            def compute_reference(self, graph_json, input_data):
-                query = torch.rand(1, 1, 2, 4)
-                return pytorch_ops.execute_selected_sdpa(
-                    query,
-                    query,
-                    query,
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=None,
-                )
-
-        outputs, error = _compute_reference_outputs_once(
-            ExecutedProvider(),
-            _make_graph_json(),
-            {},
-            _make_config(
-                validation=ValidationConfig(provider="pytorch"),
-                pytorch_sdpa_backend="math",
-            ),
-        )
-
-        assert outputs is not None
-        assert error is None
-
-    def test_cpu_pytorch_reference_preserves_unavailable_selection(self) -> None:
-        from contextlib import nullcontext
-
-        import torch
-        from torch.nn import attention
-
-        from dnn_benchmarking.config import PyTorchSdpaBackendName
-        from dnn_benchmarking.execution import pytorch_ops
-        from dnn_benchmarking.validation.providers.pytorch_provider import (
-            PyTorchReferenceProvider,
-        )
-
-        class StrictCpuProvider(PyTorchReferenceProvider):
-            def compute_reference(self, graph_json, input_data):
-                query = torch.rand(1, 1, 2, 4)
-                return pytorch_ops.execute_selected_sdpa(
-                    query,
-                    query,
-                    query,
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=None,
-                )
-
-        dispatch_error = RuntimeError("No viable backend for this CPU input")
-        sdpa = MagicMock(side_effect=dispatch_error)
-        with (
-            patch.object(attention, "sdpa_kernel", return_value=nullcontext()),
-            patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa),
-        ):
-            outputs, error = _compute_reference_outputs_once(
-                StrictCpuProvider(),
-                _make_graph_json(),
-                {},
-                _make_config(
-                    validation=ValidationConfig(provider="pytorch"),
-                    pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT,
-                ),
-            )
-
-        assert outputs is None
-        assert error is not None
-        assert error.startswith(
-            "Requested PyTorch SDPA backend 'efficient' is unavailable; "
-            "no fallback is used."
-        )
-        sdpa.assert_called_once()
-
-    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
-    def test_timed_pytorch_reference_uses_auto_timing(
-        self,
-        mock_buffer_manager_cls,
-        mock_pytorch_executor_cls,
-    ):
-        """PyTorch reference rows let the executor resolve timing from runtime."""
-        executor = MagicMock()
-        executor.init_time_ms = 0.5
-        bench_result = MagicMock()
-        bench_result.host_timings = [1.0, 2.0]
-        bench_result.kernel_timings = None
-        bench_result.has_kernel_timings = False
-        executor.benchmark.return_value = bench_result
-        bench_result.metadata = BenchmarkMetadata()
-        mock_pytorch_executor_cls.return_value = executor
-
-        buffer_manager = _make_bm_mock()
-        buffer_manager.get_tensors.return_value = {}
-        buffer_manager.get_output_tensors.return_value = []
-        mock_buffer_manager_cls.return_value = buffer_manager
-
-        result = _run_timed_pytorch_row(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            graph_name="test_graph",
-            tensor_infos=[],
-            config=_make_config(
-                validation=ValidationConfig(provider="pytorch"),
-                metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="flash",
-                pytorch_rocm_fa_library="aotriton",
-            ),
-            input_data={},
-            analytical_flops=None,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-        )
-
-        mock_pytorch_executor_cls.assert_called_once()
-        assert result.result.host_stats is not None
-        assert result.result.gpu_kernel_stats is None
-        assert result.result.status == "success"
-        benchmark_config = mock_pytorch_executor_cls.call_args.args[1]
-        assert benchmark_config.pytorch_sdpa_backend.value == "flash"
-        assert benchmark_config.pytorch_rocm_fa_library == "aotriton"
-
-
-@patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-@patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
-def test_timed_pytorch_reference_attaches_manual_reference_warnings(
-    mock_buffer_manager_cls,
-    mock_executor_cls,
-):
-    graph_json = {
-        "nodes": [
-            {
-                "name": "rms_bwd",
-                "type": "RMSNormBackwardAttributes",
-                "inputs": {
-                    "dy_tensor_uid": 1,
-                    "x_tensor_uid": 1,
-                    "scale_tensor_uid": 2,
-                    "inv_rms_tensor_uid": 3,
-                },
-                "outputs": {"dx_tensor_uid": 4, "dscale_tensor_uid": 2},
-            }
-        ],
-        "tensors": [
-            {"uid": 1, "dims": [2, 3, 4]},
-            {"uid": 2, "dims": [4]},
-            {"uid": 3, "dims": [2, 3, 1]},
-            {"uid": 4, "dims": [2, 3, 4]},
-        ],
-    }
-    executor = MagicMock()
-    executor.init_time_ms = 1.25
-    executor.benchmark.return_value = MagicMock(
-        host_timings=[2.0],
-        kernel_timings=[],
-        has_kernel_timings=False,
+from dnn_benchmarking.execution import suite_runner
+from dnn_benchmarking.execution.timing import Measurement
+from dnn_benchmarking.graph.tensor_info import TensorInfo
+from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
+from dnn_benchmarking.reporting.reporter import Reporter
+from dnn_benchmarking.reporting.suite_results import graph_id_for
+
+GRAPH = {"name": "g", "nodes": [], "tensors": []}
+PATH = Path("g.json")
+REF = np.arange(4, dtype=np.float32)
+
+
+def _tensor(uid, is_output):
+    return TensorInfo(uid=uid, name=f"t{uid}", dims=[4], strides=[1],
+                      data_type="float", is_virtual=False, is_output=is_output)
+
+
+TENSORS = [_tensor(1, False), _tensor(2, True)]
+
+
+def _measurement(**kw):
+    base = dict(kernel_ms=[1.0] * 10, host_ms=[0.01] * 10, mode="staged",
+                backend="hip", cache_mode="warm", warmup_iters=2, first_call_ms=5.0)
+    return Measurement(**{**base, **kw})
+
+
+class Fake:
+    """Knobs shared by the fake executors, buffers and probes of one test."""
+
+    def __init__(self):
+        self.discovered = [1, 2]
+        self.discover_error = None
+        self.prepare_errors = {}
+        self.bench_errors = {}
+        self.measurement = {}
+        self.engine_output = REF.copy()
+        self.torch_error = None
+        self.clocks = []
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    reset_warnings()
+    f = Fake()
+
+    class Executor:
+        def __init__(self, graph_json_str, policy):
+            self.init_time_ms, self.workspace_size = 2.0, 64
+
+        def discover_engines(self, handle):
+            if f.discover_error:
+                raise f.discover_error
+            return list(f.discovered)
+
+        def prepare(self, handle, engine_id=None, for_autotune=False):
+            self.engine_id = engine_id
+            if engine_id in f.prepare_errors:
+                raise f.prepare_errors[engine_id]
+
+        def benchmark(self, handle, variant_pack):
+            if self.engine_id in f.bench_errors:
+                raise f.bench_errors[self.engine_id]
+            return _measurement(**f.measurement)
+
+        def execute_once(self, handle, variant_pack):
+            pass
+
+    class BufferManager:
+        def __init__(self, tensor_infos, device=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def allocate_all(self):
+            pass
+
+        def load_input_data(self, data):
+            pass
+
+        def zero_outputs(self):
+            pass
+
+        def create_variant_pack(self):
+            return {}
+
+        def get_output_tensor(self, uid):
+            return None
+
+        def get_output_data(self, uid):
+            return f.engine_output
+
+    class Probe:
+        def clocks(self):
+            return f.clocks.pop(0) if f.clocks else None
+
+        def snapshot(self):
+            return {"vram_used_mb": 12.0}
+
+    monkeypatch.setattr(suite_runner, "Executor", Executor)
+    monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
+    monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
+    monkeypatch.setitem(sys.modules, "hipdnn_frontend", SimpleNamespace(
+        engine_id_to_name=lambda eid: "",
+    ))
+    return f
+
+
+@pytest.fixture
+def fake_torch(fake, monkeypatch):
+    """PyTorch executor/buffers and a CPU reference provider."""
+    pytest.importorskip("torch")
+    from dnn_benchmarking.execution import pytorch_buffer_manager, pytorch_executor
+
+    class TorchExecutor:
+        def __init__(self, graph_json, policy, *, pytorch_sdpa_backend,
+                     pytorch_rocm_fa_library=None):
+            self.init_time_ms = 1.0
+
+        def prepare(self):
+            if fake.torch_error:
+                raise fake.torch_error
+
+        def benchmark(self, tensors):
+            return _measurement()
+
+        def execute_once(self, tensors):
+            pass
+
+    class TorchBuffers:
+        def __init__(self, tensor_infos):
+            self._outputs = [t for t in tensor_infos if t.is_output]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        allocate_all = load_input_data = zero_outputs = lambda self, *a: None
+
+        def get_tensors(self):
+            return {t.uid: SimpleNamespace(is_cuda=False) for t in self._outputs}
+
+        def get_output_tensors(self):
+            return self._outputs
+
+        def get_output_data(self, uid):
+            return REF.copy()
+
+    class CpuReference:
+        def compute_reference(self, graph_json, input_data):
+            return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+
+    monkeypatch.setattr(pytorch_executor, "PyTorchCudaExecutor", TorchExecutor)
+    monkeypatch.setattr(pytorch_buffer_manager, "PyTorchCudaBufferManager", TorchBuffers)
+    monkeypatch.setattr(suite_runner, "_reference_provider",
+                        lambda config, graph_json: (CpuReference(), None))
+    return fake
+
+
+def _handle(names=None):
+    names = names or {1: "ENG_A", 2: "ENG_B"}
+    return SimpleNamespace(get_engine_info=lambda eid: SimpleNamespace(
+        engine_name=names.get(eid, ""), version="2.1"))
+
+
+def _run(handle="default", **config):
+    out = io.StringIO()
+    graph = suite_runner.run_graph_all_providers(
+        PATH, GRAPH, TENSORS, SuiteConfig(**config),
+        _handle() if handle == "default" else handle, Reporter(out),
     )
-    mock_executor_cls.return_value = executor
+    return graph, out.getvalue()
 
-    buffer_manager = MagicMock()
-    buffer_manager.__enter__.return_value = buffer_manager
-    buffer_manager.__exit__.return_value = False
-    buffer_manager.get_tensors.return_value = {}
-    buffer_manager.get_output_tensors.return_value = [
-        _make_tensor_info(4, is_output=True)
+
+def _validate(**config):
+    return _run(validation=ValidationConfig(provider="pytorch"), **config)
+
+
+def test_one_hipdnn_row_per_engine_named_from_engine_info(fake):
+    graph, progress = _run()
+
+    assert graph.graph_id == graph_id_for(GRAPH)
+    assert graph.status == "ok" and graph.error is None
+    assert [(r.provider, r.engine_id, r.engine_name, r.engine_version, r.verdict)
+            for r in graph.results] == [
+        ("hipdnn", 1, "ENG_A", "2.1", "unchecked"),
+        ("hipdnn", 2, "ENG_B", "2.1", "unchecked"),
     ]
-    buffer_manager.get_output_data.return_value = np.zeros((2, 3, 4), dtype=np.float32)
-    mock_buffer_manager_cls.return_value = buffer_manager
+    assert "ENG_A" in progress and "ENG_B" in progress
 
-    timed = _run_timed_pytorch_row(
-        graph_path=Path("rms_bwd.json"),
-        graph_json=graph_json,
-        graph_name="rms_bwd",
-        tensor_infos=[_make_tensor_info(4, is_output=True)],
-        config=_make_config(warmup_iters=0, benchmark_iters=1),
-        input_data={},
-        analytical_flops=None,
-        analytical_flops_partial=False,
-        analytical_io_bytes=None,
+
+@pytest.mark.parametrize(
+    "info_name, registry_name, expected",
+    [
+        ("ENG_A", "REG", "ENG_A"),
+        ("", "REG", "REG"),
+        ("", "", "0x0000000000000001"),
+    ],
+)
+def test_engine_name_falls_back_to_registry_then_hex(
+    fake, monkeypatch, info_name, registry_name, expected
+):
+    monkeypatch.setitem(sys.modules, "hipdnn_frontend",
+                        SimpleNamespace(engine_id_to_name=lambda eid: registry_name))
+    fake.discovered = [1]
+
+    graph, _ = _run(handle=_handle({1: info_name}))
+
+    assert graph.results[0].engine_name == expected
+
+
+@pytest.mark.parametrize(
+    "stage, error, status, message",
+    [
+        ("prepare", UnsupportedGraphError("no plan"), "skipped", "no plan"),
+        ("prepare", ExecutionError("build"), "error", "ExecutionError: build"),
+        ("bench", RuntimeError("hip"), "error", "RuntimeError: hip"),
+    ],
+)
+def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, message):
+    getattr(fake, f"{stage}_errors")[1] = error
+
+    failed, ok = _run()[0].results
+
+    assert (failed.status, failed.verdict, failed.error_message or failed.skip_reason) \
+        == (status, status, message)
+    assert failed.engine_name == "ENG_A"
+    assert failed.gpu_kernel_stats is None and failed.correctness is None
+    assert ok.status == "success"
+
+
+def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch):
+    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
+    fake.discovered = [1]
+    # Median 1 ms, mean 1.4 ms: throughput must come from the median.
+    fake.measurement = dict(kernel_ms=[1.0] * 9 + [5.0], capped=True,
+                            mode="events", fallback_reason="no stream wait")
+
+    row = _run()[0].results[0]
+
+    assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
+    assert row.derived_tflops_per_s == pytest.approx(2.0)
+    assert row.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
+    assert row.timing.mode == "events" and row.timing.first_call_ms == 5.0
+    assert row.workspace_bytes == 64 and row.vram_used_mb == 12.0
+    warnings = " | ".join(row.warnings)
+    for expected in ("noisy: CV", "outlier: max 5.0x median",
+                     "capped at max_iters", "events timing: no stream wait"):
+        assert expected in warnings
+
+
+def test_metrics_tier_off_skips_probes_and_throughput(fake, monkeypatch):
+    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
+    fake.discovered = [1]
+    fake.clocks = [{"sclk_mhz": 1700}] * 2
+
+    row = _run(metrics=MetricsConfig(tier="off"))[0].results[0]
+
+    assert row.gpu_kernel_stats is not None
+    assert row.clocks_before is None and row.derived_tflops_per_s is None
+
+
+CLOCK = {"sclk_mhz": 1700.0, "throttle_status": 0}
+
+
+@pytest.mark.parametrize(
+    "before, after, throttled",
+    [
+        (CLOCK, CLOCK, False),
+        (CLOCK, {**CLOCK, "sclk_mhz": 1400.0}, True),
+        (CLOCK, {**CLOCK, "throttle_status": 4}, True),
+        (None, None, False),
+    ],
+)
+def test_clocks_bracket_the_timed_loop(fake, before, after, throttled):
+    fake.discovered = [1]
+    fake.clocks = [before, after]
+
+    row = _run()[0].results[0]
+
+    assert (row.clocks_before, row.clocks_after) == (before, after)
+    assert ("throttled" in row.warnings) is throttled
+
+
+def test_unsupported_graph_has_no_engines_and_no_rows(fake):
+    fake.discover_error = UnsupportedGraphError("nothing applies")
+
+    graph, _ = _run()
+
+    assert graph.status == "no_engines"
+    assert graph.results == [] and graph.error is None
+
+
+def test_unsupported_graph_still_gets_the_pytorch_reference_row(fake_torch):
+    fake_torch.discover_error = UnsupportedGraphError("nothing applies")
+
+    graph, _ = _validate()
+
+    assert graph.status == "no_engines"
+    assert [(r.provider, r.role, r.engine_id, r.verdict) for r in graph.results] == [
+        ("pytorch", "reference", None, "reference")
+    ]
+    assert graph.results[0].gpu_kernel_stats is not None
+
+
+@pytest.mark.parametrize(
+    "patch, error",
+    [
+        ("discover", "Engine discovery failed: ExecutionError: driver"),
+        ("inputs", "Input data generation failed: ValueError: bad dims"),
+    ],
+)
+def test_graph_level_failure_sets_error_without_rows(fake, monkeypatch, patch, error):
+    if patch == "discover":
+        fake.discover_error = ExecutionError("driver")
+    else:
+        def fail(*a):
+            raise ValueError("bad dims")
+        monkeypatch.setattr(suite_runner, "generate_input_data", fail)
+
+    graph, _ = _run()
+
+    assert graph.status == "error" and graph.error == error
+    assert graph.results == []
+
+
+@pytest.mark.parametrize(
+    "engine_output, verdict",
+    [(REF.copy(), "passed"), (REF + 1.0, "failed")],
+)
+def test_engines_are_validated_against_the_timed_reference(
+    fake_torch, engine_output, verdict
+):
+    fake_torch.discovered = [1]
+    fake_torch.engine_output = engine_output
+
+    reference, engine = _validate()[0].results
+
+    assert (reference.role, reference.verdict) == ("reference", "reference")
+    assert engine.verdict == verdict
+    assert engine.correctness.n_total == 4
+
+
+def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
+    reason = "Reference provider 'pytorch' does not support this graph"
+    monkeypatch.setattr(suite_runner, "_reference_provider", lambda c, g: (None, reason))
+    fake.discovered = [1]
+
+    (engine,) = _validate()[0].results
+
+    assert engine.verdict == "failed"
+    assert engine.correctness.error_message == reason
+
+
+@pytest.mark.parametrize(
+    "sdpa_backend, reference_status, engine_verdict",
+    [
+        ("default", "skipped", "passed"),  # CPU reference serves as fallback
+        ("math", "error", "failed"),  # strict selection never falls back
+    ],
+)
+def test_failed_timed_reference(fake_torch, sdpa_backend, reference_status,
+                                engine_verdict):
+    fake_torch.discovered = [1]
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+
+    reference, engine = _validate(pytorch_sdpa_backend=sdpa_backend)[0].results
+
+    assert reference.status == reference_status
+    assert (reference.error_message or reference.skip_reason) == (
+        "ExecutionError: PyTorch GPU not available"
     )
 
-    assert timed.result.status == "success"
-    assert timed.result.warnings
-    assert "RMSNormBackwardAttributes" in timed.result.warnings[0]
-    assert "not solely built-in PyTorch operator time" in timed.result.warnings[0]
+
+def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
+    def no_handle():
+        raise RuntimeError("plugin load failed")
+
+    monkeypatch.setitem(sys.modules, "hipdnn_frontend", SimpleNamespace(
+        PluginLoadingMode=SimpleNamespace(ABSOLUTE="abs"),
+        set_engine_plugin_paths=lambda paths, mode: None,
+        Handle=no_handle,
+    ))
+
+    graph, _ = _run(handle=None, engine_filter=[1, 1],
+                    plugin_paths=[Path("/a"), Path("/b")])
+
+    assert [(r.status, r.plugin_path, r.error_message) for r in graph.results] == [
+        ("error", "/a", "RuntimeError: plugin load failed"),
+        ("error", "/b", "RuntimeError: plugin load failed"),
+    ]
 
 
-class TestCheckCorrectnessOutputCount:
-    """_check_correctness returns tolerance_match=False when no outputs are comparable."""
+def test_profiling_payload_lands_on_the_row(fake, monkeypatch):
+    from dnn_benchmarking.metrics import profiling_orchestrator
 
-    def test_no_outputs_returns_false(self):
-        bm = MagicMock()
-        bm.get_output_data.return_value = None
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes",
+                        lambda **kw: {"perf": {"cycles": kw["engine_name"]}})
+    fake.discovered = [1]
 
-        config = SuiteConfig(validation=ValidationConfig(provider="pytorch"))
-        result = _check_correctness(
-            buffer_manager=bm,
-            tensor_infos=[],
-            graph_json=_make_graph_json(),
-            ref_outputs={},
-            reference_provider_name="pytorch",
-            config=config,
+    graph, progress = _run(metrics=MetricsConfig(perf=True))
+
+    assert graph.results[0].extra_metrics == {"perf": {"cycles": "ENG_A"}}
+    assert "profiling ENG_A" in progress
+
+
+class TestPytorchBackend:
+    def _run(self, graph_json=GRAPH, **config):
+        return suite_runner.run_graph_pytorch_backend(
+            PATH, graph_json, TENSORS, SuiteConfig(backend="pytorch", **config),
+            Reporter(io.StringIO()),
         )
 
-        assert result.tolerance_match is False
-        assert result.execution_success is True
-        assert "No output tensors to compare" in (result.error_message or "")
+    def test_single_timed_pytorch_row(self, fake_torch):
+        graph = self._run()
 
-    def test_missing_reference_output_returns_false(self):
-        bm = MagicMock()
-        bm.get_output_data.return_value = np.array([0.0], dtype=np.float32)
+        (row,) = graph.results
+        assert graph.graph_id == graph_id_for(GRAPH) and graph.status == "ok"
+        assert (row.provider, row.engine_id, row.engine_name, row.role, row.verdict) \
+            == ("pytorch", None, "pytorch", "engine", "unchecked")
+        assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
+        assert row.timing.mode == "staged"
 
-        result = _check_correctness(
-            buffer_manager=bm,
-            tensor_infos=[_make_tensor_info(7, is_output=True)],
-            graph_json={
-                "nodes": [
-                    {
-                        "type": "SdpaAttributes",
-                        "outputs": {"o_tensor_uid": 7},
-                    }
-                ]
-            },
-            ref_outputs={},
-            reference_provider_name="pytorch",
-            config=SuiteConfig(validation=ValidationConfig(provider="pytorch")),
-        )
+    def test_executor_failure_is_an_error_row(self, fake_torch):
+        fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
 
-        assert result.tolerance_match is False
-        assert "did not produce output tensor UID 7" in (result.error_message or "")
+        (row,) = self._run().results
 
-    def test_zero_bf16_sdpa_forward_output_uses_bfloat16_tolerance(self):
-        bm = MagicMock()
-        bm.get_output_data.return_value = np.zeros((2,), dtype=np.float32)
-
-        ref_outputs = {
-            7: ReferenceOutput(
-                data=np.ones((2,), dtype=np.float32),
-                tensor_uid=7,
-            )
-        }
-
-        result = _check_correctness(
-            buffer_manager=bm,
-            tensor_infos=[
-                _make_tensor_info(7, is_output=True, data_type="bfloat16"),
-            ],
-            graph_json={
-                "nodes": [
-                    {
-                        "type": "SdpaAttributes",
-                        "outputs": {"o_tensor_uid": 7},
-                    }
-                ]
-            },
-            ref_outputs=ref_outputs,
-            reference_provider_name="pytorch",
-            config=SuiteConfig(validation=ValidationConfig(provider="pytorch")),
-        )
-
-        assert result.tolerance_match is False
-        assert result.rtol == pytest.approx(_BFLOAT16_RTOL)
-        assert result.atol == pytest.approx(_BFLOAT16_ATOL)
-
-    def test_small_bf16_output_difference_exceeds_absolute_floor(self):
-        bm = MagicMock()
-        bm.get_output_data.return_value = np.zeros((1,), dtype=np.float32)
-
-        ref_outputs = {
-            7: ReferenceOutput(
-                data=np.array([5e-3], dtype=np.float32),
-                tensor_uid=7,
-            )
-        }
-
-        result = _check_correctness(
-            buffer_manager=bm,
-            tensor_infos=[
-                _make_tensor_info(7, is_output=True, data_type="bfloat16"),
-            ],
-            graph_json={
-                "nodes": [{"type": "PointwiseAttributes", "outputs": {"y": 7}}]
-            },
-            ref_outputs=ref_outputs,
-            reference_provider_name="pytorch",
-            config=SuiteConfig(validation=ValidationConfig(provider="pytorch")),
-        )
-
-        assert result.tolerance_match is False
-        assert result.atol == pytest.approx(1e-3)
-
-    def test_single_explicit_tolerance_overrides_both_values(self):
-        bm = MagicMock()
-        bm.get_output_data.return_value = np.array([1.0], dtype=np.float32)
-
-        ref_outputs = {
-            7: ReferenceOutput(
-                data=np.array([1.1], dtype=np.float32),
-                tensor_uid=7,
-            )
-        }
-
-        result = _check_correctness(
-            buffer_manager=bm,
-            tensor_infos=[_make_tensor_info(7, is_output=True, data_type="bfloat16")],
-            graph_json={
-                "nodes": [
-                    {
-                        "type": "SdpaAttributes",
-                        "outputs": {"o_tensor_uid": 7},
-                    }
-                ]
-            },
-            ref_outputs=ref_outputs,
-            reference_provider_name="pytorch",
-            config=SuiteConfig(
-                validation=ValidationConfig(provider="pytorch", rtol=0.25)
-            ),
-        )
-
-        assert result.tolerance_match is True
-        assert result.rtol == pytest.approx(0.25)
-        assert result.atol == pytest.approx(0.25)
-
-    def test_device_reference_is_compared_without_host_copy(self):
-        torch = pytest.importorskip("torch")
-        bm = MagicMock()
-        bm.get_output_tensor.return_value = torch.tensor([1.0, 2.0])
-
-        # Host data disagrees, so a pass proves the device tensors were used.
-        ref_outputs = {
-            7: ReferenceOutput(
-                data=np.array([9.0, 9.0], dtype=np.float32),
-                tensor_uid=7,
-                device_data=torch.tensor([1.0, 2.0]),
-            )
-        }
-
-        result = _check_correctness(
-            buffer_manager=bm,
-            tensor_infos=[_make_tensor_info(7, is_output=True)],
-            graph_json={"nodes": []},
-            ref_outputs=ref_outputs,
-            reference_provider_name="pytorch",
-            config=SuiteConfig(validation=ValidationConfig(provider="pytorch")),
-        )
-
-        assert result.tolerance_match is True
-        assert result.max_abs_diff == 0.0
-        bm.get_output_data.assert_not_called()
-
-
-class TestHipdnnBufferDevice:
-    """Torch I/O storage is chosen only when a GPU comparison can run."""
-
-    def test_device_reference_selects_torch_storage(self) -> None:
-        host = ReferenceOutput(data=np.zeros(1), tensor_uid=1)
-        device = ReferenceOutput(data=np.zeros(1), tensor_uid=2, device_data=object())
-
-        # Timing-only (no reference) and host-only references keep DeviceBuffer.
-        assert _hipdnn_buffer_device(None) is None
-        assert _hipdnn_buffer_device({1: host}) is None
-        assert _hipdnn_buffer_device({1: host, 2: device}) == "cuda"
-
-
-class TestResolveEngineName:
-    """Tests for _resolve_engine_name fallback behavior."""
-
-    def test_falls_back_to_hex_when_lookup_fails(self):
-        """If hipdnn_frontend isn't importable, the helper falls back to a hex display."""
-        # Force the import inside _resolve_engine_name to fail by injecting a
-        # missing module entry. We use unittest.mock.patch on builtins.__import__
-        # to surgically reject just hipdnn_frontend.
-        import builtins
-
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "hipdnn_frontend":
-                raise ImportError("simulated missing module")
-            return real_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=fake_import):
-            assert _resolve_engine_name(0xABC, None) == "engine_0xabc"
-
-    @staticmethod
-    def _frontend(registry_name):
-        return SimpleNamespace(engine_id_to_name=lambda _id: registry_name)
-
-    def test_handle_names_plugin_engine_missing_from_builtin_registry(self):
-        handle = MagicMock()
-        handle.engine_id_to_name.return_value = "hipkernel:Gfx950AttentionDense"
-        with patch.dict(sys.modules, {"hipdnn_frontend": self._frontend("")}):
-            name = _resolve_engine_name(0x7636, handle)
-        assert name == "hipkernel:Gfx950AttentionDense"
-
-    def test_falls_back_silently_when_handle_carries_no_such_engine(self, capsys):
-        from dnn_benchmarking.metrics._diagnostic import reset
-
-        reset()  # warn_once dedups process-wide; start from a clean slate.
-        handle = MagicMock()
-        handle.engine_id_to_name.side_effect = IndexError("not loaded")
-        with patch.dict(
-            sys.modules, {"hipdnn_frontend": self._frontend("MIOPEN_ENGINE")}
-        ):
-            assert _resolve_engine_name(1, handle) == "MIOPEN_ENGINE"
-        assert capsys.readouterr().err == ""
-
-
-class TestProfilingPassInvocation:
-    """suite_runner.py:521-542 calls the profiling orchestrator after the
-    timed pass when any opt-in metric is requested. The orchestrator's
-    payload lands on result.extra_metrics; orchestrator exceptions must
-    not bubble out as engine errors."""
-
-    def _setup_mocks(self, mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name):
-        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
-        mock_get_ref.return_value = None
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0], has_kernel_timings=True
-        )
-        mock_bm_cls.return_value = _make_bm_mock()
-
-    @patch("dnn_benchmarking.metrics.profiling_orchestrator.run_profiling_passes")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_orchestrator_called_once_and_payload_lands_in_extra_metrics(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_orch,
-    ):
-        self._setup_mocks(mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name)
-        payload = {
-            "pmc": {"set": "basic", "counters": {"GRBM_GUI_ACTIVE": {"sum": 1.0}}}
-        }
-        mock_orch.return_value = payload
-
-        config = _make_config(metrics=MetricsConfig(tier="basic", pmc_set="basic"))
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=config,
-            handle=MagicMock(),
-        )
-
-        # The orchestrator runs exactly once per (graph, engine). Two
-        # calls here would catch the duplicate-block bug fixed in
-        # commit 196a0fb33ca.
-        assert mock_orch.call_count == 1
-        assert len(result.results) == 1
-        assert result.results[0].extra_metrics == payload
-
-    @patch("dnn_benchmarking.metrics.profiling_orchestrator.run_profiling_passes")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_orchestrator_not_called_when_no_opt_in_flag(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_orch,
-    ):
-        self._setup_mocks(mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name)
-
-        # Default MetricsConfig() — basic tier, no opt-in source set.
-        config = _make_config(metrics=MetricsConfig())
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=config,
-            handle=MagicMock(),
-        )
-
-        mock_orch.assert_not_called()
-        assert result.results[0].extra_metrics is None
-
-    @patch("dnn_benchmarking.metrics.profiling_orchestrator.run_profiling_passes")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_orchestrator_exception_does_not_fail_engine(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_orch,
-        capsys,
-    ):
-        """Orchestrator failure (tool missing, parse error, anything) must
-        keep the timed pass's status='success' — the headline timing data
-        already exists; profiling is best-effort."""
-        self._setup_mocks(mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name)
-        mock_orch.side_effect = RuntimeError("rocprofv3 missing")
-
-        config = _make_config(metrics=MetricsConfig(tier="basic", pmc_set="basic"))
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=config,
-            handle=MagicMock(),
-        )
-
-        # Engine still passes; extra_metrics stays None.
-        assert result.results[0].status == "success"
-        assert result.results[0].extra_metrics is None
-        # warn_once writes to stderr.
-        captured = capsys.readouterr()
-        assert "profiling pass failed" in captured.err
-        assert "rocprofv3 missing" in captured.err
-
-    @patch("dnn_benchmarking.metrics.profiling_orchestrator.run_profiling_passes")
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_orchestrator_runs_after_buffermanager_teardown(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-        mock_orch,
-    ):
-        """Profiling pass must fire *after* the BufferManager context
-        exits — only then are the parent's I/O buffers and the
-        executor's workspace freed. Without this ordering, the inner
-        profiling subprocess allocates its own VRAM on top of the
-        parent's still-pinned tensors, which roughly doubles peak VRAM
-        and can OOM on large graphs that fit fine on the headline run.
-        """
-        self._setup_mocks(mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name)
-
-        # Track __exit__ vs orchestrator invocation order via shared list.
-        order: list[str] = []
-        bm_instance = mock_bm_cls.return_value
-        original_exit = bm_instance.__exit__
-
-        def tracking_exit(*args, **kwargs):
-            order.append("bm_exit")
-            return original_exit(*args, **kwargs)
-
-        bm_instance.__exit__ = tracking_exit
-
-        def tracking_orch(**kwargs):
-            order.append("orch")
-            return {"pmc": {"set": "basic"}}
-
-        mock_orch.side_effect = tracking_orch
-
-        config = _make_config(metrics=MetricsConfig(tier="basic", pmc_set="basic"))
-        run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
-            config=config,
-            handle=MagicMock(),
-        )
-
-        # Strict ordering: bm context must exit BEFORE the orchestrator
-        # runs. Reversing this (the pre-fix state) is the bug.
-        assert order == [
-            "bm_exit",
-            "orch",
-        ], f"profiling must run after BufferManager teardown; got {order}"
-
-
-class TestRunGraphPytorchBackend:
-    """run_graph_pytorch_backend emits one provider='pytorch' engine row."""
-
-    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
-    def test_single_engine_row(self, mock_timed_row):
-        row = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="success",
-            host_stats=BenchmarkStats.from_timings([2.0]),
-        )
-        mock_timed_row.return_value = MagicMock(result=row, outputs=None)
-
-        result = run_graph_pytorch_backend(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-        )
-
-        assert mock_timed_row.call_args.kwargs["role"] == "engine"
-        assert result.engine_ids == [0]
-        assert [r.provider for r in result.results] == ["pytorch"]
-        assert result.results[0].status == "success"
-
-    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
-    def test_stall_timeout_restarts_pytorch_row_unstalled(self, mock_timed_row):
-        row = ProviderEngineResult(provider="pytorch", engine_id=0, status="success")
-        mock_timed_row.side_effect = [
-            StallFallbackError("timed out"),
-            MagicMock(result=row, outputs=None),
-        ]
-
-        result = run_graph_pytorch_backend(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-        )
-
-        assert mock_timed_row.call_count == 2
-        assert mock_timed_row.call_args_list[1].kwargs["allow_staging"] is False
-        assert "remeasured without stalling" in result.results[0].warnings[0]
-
-    @patch("dnn_benchmarking.execution.suite_runner.generate_input_data")
-    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
-    def test_unsupported_operations_skip_row(
-        self, mock_timed_row, mock_gen, monkeypatch
-    ):
-        import sys
-        import types
-
-        import dnn_benchmarking.execution as execution_pkg
-
-        fake_ops = types.SimpleNamespace(
-            get_unsupported_operations=lambda graph_json: ["FooAttributes"]
-        )
-        monkeypatch.setattr(execution_pkg, "pytorch_ops", fake_ops, raising=False)
-        monkeypatch.setitem(
-            sys.modules, "dnn_benchmarking.execution.pytorch_ops", fake_ops
-        )
-
-        result = run_graph_pytorch_backend(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-        )
-
-        mock_timed_row.assert_not_called()
-        # Unsupported graphs must be skipped before any input allocation.
-        mock_gen.assert_not_called()
-        row = result.results[0]
-        assert row.status == "skipped"
-        assert "unsupported operations" in (row.skip_reason or "")
-        assert result.engine_ids == [0]
-
-    @patch("dnn_benchmarking.execution.suite_runner.generate_input_data")
-    def test_input_generation_failure_is_error_row(self, mock_gen):
-        mock_gen.side_effect = ValueError("boom")
-
-        result = run_graph_pytorch_backend(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-        )
-
-        row = result.results[0]
         assert row.status == "error"
-        assert "Input data generation failed" in (row.error_message or "")
+        assert row.error_message == "ExecutionError: PyTorch GPU not available"
 
+    @pytest.mark.parametrize("sdpa_backend, status", [("default", "skipped"),
+                                                      ("math", "error")])
+    def test_unsupported_operations(self, fake_torch, sdpa_backend, status):
+        graph_json = {**GRAPH, "nodes": [{"type": "NotARealOp"}]}
 
-class TestTimedPytorchRowEngineRole:
-    """Engine-role rows report failures as errors, not skips."""
+        (row,) = self._run(graph_json, pytorch_sdpa_backend=sdpa_backend).results
 
-    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
-    def test_engine_role_success_has_no_reference_correctness(
-        self,
-        mock_buffer_manager_cls,
-        mock_pytorch_executor_cls,
-    ):
-        executor = MagicMock()
-        executor.init_time_ms = 0.5
-        bench_result = MagicMock()
-        bench_result.host_timings = [1.0, 2.0]
-        bench_result.kernel_timings = None
-        bench_result.has_kernel_timings = False
-        executor.benchmark.return_value = bench_result
-        mock_pytorch_executor_cls.return_value = executor
-
-        buffer_manager = _make_bm_mock()
-        buffer_manager.get_tensors.return_value = {}
-        buffer_manager.get_output_tensors.return_value = []
-        mock_buffer_manager_cls.return_value = buffer_manager
-
-        row = _run_timed_pytorch_row(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            graph_name="test_graph",
-            tensor_infos=[],
-            config=_make_config(metrics=MetricsConfig(tier="off")),
-            input_data={},
-            analytical_flops=None,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-            role="engine",
-        )
-
-        assert row.result.status == "success"
-        assert row.result.role == "engine"
-        assert row.outputs is None
-        # Engine rows never run the extra reference-output extraction pass.
-        executor.execute_once.assert_not_called()
-        assert row.result.correctness is not None
-        assert row.result.correctness.tolerance_match is None
-        assert "No reference provider requested" in (
-            row.result.correctness.error_message or ""
-        )
-
-    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    def test_engine_role_failure_is_error(self, mock_pytorch_executor_cls):
-        mock_pytorch_executor_cls.side_effect = RuntimeError("no GPU")
-
-        row = _run_timed_pytorch_row(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            graph_name="test_graph",
-            tensor_infos=[],
-            config=_make_config(
-                metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="flash",
-            ),
-            input_data={},
-            analytical_flops=None,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-            role="engine",
-        )
-
-        assert row.result.status == "error"
-        assert "no GPU" in (row.result.error_message or "")
-
-    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    def test_reference_role_strict_failure_is_error(self, mock_pytorch_executor_cls):
-        mock_pytorch_executor_cls.side_effect = RuntimeError("no GPU")
-
-        row = _run_timed_pytorch_row(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            graph_name="test_graph",
-            tensor_infos=[],
-            config=_make_config(
-                metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="efficient",
-            ),
-            input_data={},
-            analytical_flops=None,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-            role="reference",
-        )
-
-        assert row.result.status == "error"
-        assert "no GPU" in (row.result.error_message or "")
-
-    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
-    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    def test_strict_reference_output_failure_is_error(
-        self,
-        mock_pytorch_executor_cls,
-        mock_buffer_manager_cls,
-    ):
-        executor = MagicMock()
-        executor.init_time_ms = 0.5
-        executor.benchmark.return_value = BenchmarkResult(
-            host_timings=[1.0],
-            kernel_timings=[0.5],
-            metadata=BenchmarkMetadata(),
-        )
-        executor.execute_once.side_effect = RuntimeError("output pass failed")
-        mock_pytorch_executor_cls.return_value = executor
-        mock_buffer_manager_cls.return_value = _make_bm_mock()
-
-        row = _run_timed_pytorch_row(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            graph_name="test_graph",
-            tensor_infos=[],
-            config=_make_config(
-                metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="math",
-            ),
-            input_data={},
-            analytical_flops=None,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-            role="reference",
-        )
-
-        assert row.result.status == "error"
-
-    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
-    def test_reference_role_strict_backend_unavailable_is_marked_for_no_fallback(
-        self, mock_pytorch_executor_cls
-    ):
-        from dnn_benchmarking.execution.pytorch_ops import (
-            PyTorchSdpaBackendUnavailableError,
-        )
-
-        reason = (
-            "Requested PyTorch ROCm Flash Attention library 'aotriton' is "
-            "unavailable; no fallback is used."
-        )
-        mock_pytorch_executor_cls.side_effect = PyTorchSdpaBackendUnavailableError(
-            reason
-        )
-
-        row = _run_timed_pytorch_row(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            graph_name="test_graph",
-            tensor_infos=[],
-            config=_make_config(
-                metrics=MetricsConfig(tier="off"),
-                pytorch_sdpa_backend="flash",
-                pytorch_rocm_fa_library="aotriton",
-            ),
-            input_data={},
-            analytical_flops=None,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-            role="reference",
-        )
-
-        assert row.result.status == "error"
-        assert row.result.error_message == reason
-
-
-def _make_candidate(**overrides):
-    """Build a stand-in hipdnn_frontend.AutotuneResult."""
-    values = {
-        "engine_id": 0,
-        "engine_name": "engine_0",
-        "compiled_plan_index": 2,
-        "rank": 0,
-        "min_time_ms": 0.2,
-        "succeeded": True,
-        "knob_settings": [],
-        # hipDNN reports capability on the compiled-plan path. It cannot
-        # report whether an environment-enabled provider reused a cached tuned
-        # selection or performed a fresh search.
-        "supports_exhaustive": False,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def _make_oracle_exec_factory(autotune_side_effect=None, order=None, candidates=None):
-    """Executor factory whose third instance is the oracle pass.
-
-    Instance order inside run_graph_all_providers is discovery, OOTB, then
-    oracle. The oracle instance reports half the OOTB kernel time so the
-    delta is unambiguous.
-
-    Args:
-        autotune_side_effect: Exception the sweep raises, if any.
-        order: When given, receives ``"<role>.<method>"`` labels in call
-            order so a test can pin when each pass runs relative to the
-            sweep.
-        candidates: Sweep result list. Defaults to one success and one
-            failure. Pass an explicit list to model a real multi-plan sweep.
-    """
-    instances = []
-
-    def _candidates():
-        if candidates is not None:
-            return candidates
-        return [
-            _make_candidate(),
-            _make_candidate(succeeded=False, rank=-1, error_message="candidate failed"),
-        ]
-
-    def make_instance(*args, **kwargs):
-        m = MagicMock()
-        role = {0: "discovery", 1: "ootb", 2: "oracle"}.get(
-            len(instances), f"extra{len(instances)}"
-        )
-        m.init_time_ms = 5.0
-        m.discover_engines.return_value = [0]
-        m.plan_name.return_value = "tuned_plan"
-        kernel_ms = 0.5 if len(instances) < 2 else 0.25
-        bench_result = MagicMock()
-        bench_result.host_timings = [1.0]
-        bench_result.kernel_timings = [kernel_ms]
-        bench_result.has_kernel_timings = True
-        m.benchmark.return_value = bench_result
-        if autotune_side_effect is not None:
-            m.autotune.side_effect = autotune_side_effect
-        else:
-            m.autotune.return_value = list(_candidates())
-
-        if order is not None:
-
-            def _benchmark(*a, _role=role, **k):
-                order.append(f"{_role}.benchmark")
-                return bench_result
-
-            def _autotune(*a, _role=role, **k):
-                order.append(f"{_role}.autotune")
-                if autotune_side_effect is not None:
-                    raise autotune_side_effect
-                return list(_candidates())
-
-            m.benchmark.side_effect = _benchmark
-            m.autotune.side_effect = _autotune
-
-        instances.append(m)
-        return m
-
-    return make_instance, instances
-
-
-class TestOraclePass:
-    """--oracle-mode adds a second tuned pass per engine row without changing OOTB."""
-
-    def _run(self, factory, oracle_mode="plan"):
-        with (
-            patch(
-                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid, handle=None: f"engine_{eid}",
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
-                return_value=None,
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.BufferManager",
-                return_value=_make_bm_mock(),
-            ),
-        ):
-            return run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(oracle_mode=oracle_mode),
-                handle=MagicMock(),
-            )
-
-    def test_oracle_uses_second_executor_with_autotune_prepare(self):
-        factory, instances = _make_oracle_exec_factory()
-        self._run(factory)
-
-        # discovery, OOTB, oracle
-        assert len(instances) == 3
-        ootb, oracle = instances[1], instances[2]
-        assert ootb.prepare.call_args.kwargs.get("for_autotune") is None
-        assert oracle.prepare.call_args.kwargs["for_autotune"] is True
-        assert oracle.autotune.call_count == 1
-        assert oracle.benchmark.call_count == 1
-
-    def test_oracle_uses_an_isolated_handle_on_the_same_stream(self):
-        class Handle:
-            instances = []
-
-            def __init__(self):
-                self.stream = -1
-                self.__class__.instances.append(self)
-
-            def get_stream(self):
-                return self.stream
-
-            def set_stream(self, stream):
-                self.stream = stream
-
-        factory, instances = _make_oracle_exec_factory()
-        ootb_handle = Handle()
-        ootb_handle.stream = 17
-        with (
-            patch(
-                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid, handle=None: f"engine_{eid}",
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
-                return_value=None,
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.BufferManager",
-                return_value=_make_bm_mock(),
-            ),
-        ):
-            run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(oracle_mode="exhaustive"),
-                handle=ootb_handle,
-            )
-
-        oracle_handle = instances[2].prepare.call_args.args[0]
-        assert oracle_handle is not ootb_handle
-        assert oracle_handle.stream == 17
-        assert instances[1].benchmark.call_args_list[-1].args[0] is ootb_handle
-        assert instances[2].benchmark.call_args.args[0] is oracle_handle
-
-    def test_delta_baseline_is_retimed_after_the_sweep(self):
-        """The comparison operands must share the sweep's warmup history.
-
-        The sweep executes the engine's plans many times, so timing the
-        tuned plan straight afterwards measures a hotter device than the
-        OOTB pass ever saw. The heuristic plan is therefore re-timed
-        between the sweep and the tuned run. Comparing against the row's
-        pre-sweep OOTB timing instead reports a speedup on graphs where
-        the sweep had one candidate and changed nothing.
-        """
-        order = []
-        factory, instances = _make_oracle_exec_factory(order=order)
-        result = self._run(factory)
-
-        assert order == [
-            "ootb.benchmark",
-            "oracle.autotune",
-            "ootb.benchmark",
-            "oracle.benchmark",
-        ]
-        # Re-timed, not reused: the OOTB executor runs a second warmup too.
-        assert instances[1].warmup.call_count == 2
-
-        oracle = result.results[0].oracle
-        assert oracle.warm_baseline_gpu_kernel_stats is not None
-        assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
-        assert result.results[0].oracle_delta.baseline_mean_ms == 0.5
-
-    def test_tuned_and_warm_ootb_report_median_tflops(self):
-        """Both oracle operands get TFLOP/s from the row's FLOPs and their own
-        kernel median, so tuned and warm OOTB throughput compare directly."""
-        factory, _ = _make_oracle_exec_factory()
-        with patch(
-            "dnn_benchmarking.execution.suite_runner.compute_flops",
-            return_value=(10**9, False),
-        ):
-            result = self._run(factory)
-
-        row = result.results[0]
-        # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB, warm OOTB); 0.25 ms -> 4 (tuned).
-        assert row.derived_tflops_per_s == pytest.approx(2.0)
-        assert row.oracle.warm_baseline_derived_tflops_per_s == pytest.approx(2.0)
-        assert row.oracle.derived_tflops_per_s == pytest.approx(4.0)
-        d = row.oracle.to_dict()
-        assert d["derived_tflops_per_s"] == pytest.approx(4.0)
-        assert d["warm_baseline_derived_tflops_per_s"] == pytest.approx(2.0)
-
-    def test_oracle_failure_leaves_ootb_row_intact(self):
-        factory, _ = _make_oracle_exec_factory(
-            autotune_side_effect=ExecutionError("no candidate succeeded")
-        )
-        result = self._run(factory)
-
-        r = result.results[0]
-        assert r.status == "success"
-        assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
-        assert r.oracle is None
-        assert r.oracle_delta is None
-        assert r.oracle_error == "ExecutionError: no candidate succeeded"
-
-    def test_no_oracle_pass_when_mode_is_off(self):
-        factory, instances = _make_oracle_exec_factory()
-        result = self._run(factory, oracle_mode="off")
-
-        r = result.results[0]
-        assert r.oracle is None
-        assert r.oracle_delta is None
-        assert r.oracle_error is None
-        # discovery + OOTB only.
-        assert len(instances) == 2
-
-    def test_plan_mode_records_no_exhaustive_request(self):
-        factory, _ = _make_oracle_exec_factory()
-        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
-        assert oracle.exhaustive_requested is False
-
-    def test_winner_is_the_rank_zero_plan_when_several_plans_compete(self):
-        """A real multi-plan sweep records the rank-0 winner and true counts.
-
-        Deterministic: hipDNN returns successes first in ascending rank, so the
-        winner is fixed by the input, not by measured time. No speedup is
-        asserted; a sweep that finds nothing faster is still a valid sweep.
-        """
-        factory, _ = _make_oracle_exec_factory(
-            candidates=[
-                _make_candidate(
-                    compiled_plan_index=7,
-                    rank=0,
-                    min_time_ms=0.10,
-                    knob_settings=[SimpleNamespace(knob_id="SPLIT_K", value=4)],
-                ),
-                _make_candidate(compiled_plan_index=3, rank=1, min_time_ms=0.30),
-                _make_candidate(
-                    compiled_plan_index=9,
-                    succeeded=False,
-                    rank=-1,
-                    error_message="candidate failed",
-                ),
-            ]
-        )
-        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
-
-        assert oracle.compiled_plan_index == 7
-        assert oracle.rank == 0
-        assert oracle.sweep_min_time_ms == 0.10
-        assert oracle.compiled_plans_benchmarked == 2
-        assert oracle.compiled_plans_total == 3
-        assert oracle.compiled_plans_failed == 1
-        assert oracle.knob_settings == [{"knob_id": "SPLIT_K", "value": 4}]
-        # Several plans competed, so the comparison is meaningful whatever the
-        # measured ratio turned out to be.
-        assert oracle.tuning_available is True
-
-    def test_single_plan_plan_mode_reports_no_tuning_search(self):
-        """One plan and no provider-level search searched nothing."""
-        factory, _ = _make_oracle_exec_factory(candidates=[_make_candidate()])
-        oracle = self._run(factory, oracle_mode="plan").results[0].oracle
-
-        assert oracle.compiled_plans_total == 1
-        assert oracle.exhaustive_requested is False
-        assert oracle.tuning_available is False
-
-    def test_exhaustive_capability_counts_as_provider_level_tuning(self):
-        """A capable provider can select variants hidden inside one plan."""
-        factory, _ = _make_oracle_exec_factory(
-            candidates=[_make_candidate(supports_exhaustive=True)]
-        )
-        oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
-
-        assert oracle.compiled_plans_total == 1
-        assert oracle.exhaustive_requested is True
-        assert oracle.exhaustive_supported is True
-        assert oracle.tuning_available is True
-
-    def test_exhaustive_unsupported_provider_is_not_a_search(self):
-        """A request cannot add alternatives to an incapable engine."""
-        factory, _ = _make_oracle_exec_factory(
-            candidates=[_make_candidate(supports_exhaustive=False)]
-        )
-        oracle = self._run(factory, oracle_mode="exhaustive").results[0].oracle
-
-        assert oracle.compiled_plans_total == 1
-        assert oracle.exhaustive_requested is True
-        assert oracle.exhaustive_supported is False
-        assert oracle.tuning_available is False
-
-
-class TestOracleTunedPlanValidation:
-    """--validate gates the tuned plan, not only the OOTB run."""
-
-    def _run(self, factory, correctness):
-        """Run with a reference available and a pinned correctness verdict.
-
-        ``correctness`` is one verdict for every check, or a list consumed in
-        call order (OOTB first, tuned second).
-        """
-        check_kwargs = (
-            {"side_effect": list(correctness)}
-            if isinstance(correctness, list)
-            else {"return_value": correctness}
-        )
-        with (
-            patch(
-                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid, handle=None: f"engine_{eid}",
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
-                return_value=MagicMock(),
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner."
-                "_compute_reference_outputs_once",
-                return_value=({1: MagicMock()}, None),
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner._check_correctness",
-                **check_kwargs,
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.BufferManager",
-                return_value=_make_bm_mock(),
-            ),
-        ):
-            return run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(oracle_mode="plan"),
-                handle=MagicMock(),
-            )
-
-    @staticmethod
-    def _verdict(passed: bool) -> CorrectnessResult:
-        return CorrectnessResult(
-            execution_success=True,
-            tolerance_match=passed,
-            rtol=1e-5,
-            atol=1e-5,
-            error_message=None if passed else "output mismatch",
-        )
-
-    def test_failing_tuned_plan_publishes_no_speedup(self):
-        """Fault injection: a wrong tuned result must not carry a speedup.
-
-        This is the regression guard for a tuned plan that computes garbage
-        twice as fast and previously reported a clean 2.00x.
-        """
-        factory, _ = _make_oracle_exec_factory()
-        r = self._run(factory, self._verdict(False)).results[0]
-
-        assert r.oracle is not None
-        assert r.oracle.correctness.passed is False
-        # Timings survive as evidence; the comparison does not.
-        assert r.oracle.gpu_kernel_stats is not None
-        assert r.oracle_delta is None
-
-    def test_failing_baseline_publishes_no_speedup(self):
-        """Inverse fault injection: a wrong baseline cannot measure a gain.
-
-        The tuned plan is correct here and the baseline is not. Comparing
-        against a broken comparand produced a clean 2.00x even though one
-        operand was garbage, so eligibility must consider both sides.
-        """
-        factory, _ = _make_oracle_exec_factory()
-        # OOTB check first, tuned check second.
-        r = self._run(factory, [self._verdict(False), self._verdict(True)]).results[0]
-
-        assert r.correctness.passed is False
-        assert r.oracle.correctness.passed is True
-        # Both verdicts survive separately; only the comparison is refused.
-        assert r.oracle.gpu_kernel_stats is not None
-        assert r.oracle_delta is None
-
-    def test_unchecked_correctness_does_not_suppress_the_comparison(self):
-        """ "Not checked" is not "failed".
-
-        A plain run records tolerance_match=None on the row. Treating that as
-        a failure would suppress every speedup when --validate is absent.
-        """
-        factory, _ = _make_oracle_exec_factory()
-        unchecked = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=None,
-            rtol=1e-5,
-            atol=1e-5,
-            error_message="No reference provider requested",
-        )
-        r = self._run(factory, [unchecked, self._verdict(True)]).results[0]
-
-        assert r.oracle_delta is not None
-        assert r.oracle_delta.speedup == 2.0
-
-    def test_passing_tuned_plan_still_reports_a_speedup(self):
-        factory, _ = _make_oracle_exec_factory()
-        r = self._run(factory, self._verdict(True)).results[0]
-
-        assert r.oracle.correctness.passed is True
-        assert r.oracle_delta is not None
-        assert r.oracle_delta.speedup == 2.0
-
-    def test_a_failing_tuned_plan_leaves_the_ootb_verdict_passing(self):
-        """OOTB correctness is the row's; the tuned verdict is the oracle's.
-
-        The OOTB plan is correct and the tuned plan is not, so the two must
-        disagree. A row that reports the tuned failure as its own would fail
-        a passing engine.
-        """
-        factory, _ = _make_oracle_exec_factory()
-        # First call is the OOTB check, second is the tuned check.
-        r = self._run(factory, [self._verdict(True), self._verdict(False)]).results[0]
-
-        assert r.correctness.passed is True
-        assert r.oracle.correctness.passed is False
-        assert r.status == "success"
-        assert r.oracle_delta is None
-
-    def test_tuned_plan_is_validated_after_its_timed_loop(self):
-        """Validation must never land inside a measurement."""
-        factory, instances = _make_oracle_exec_factory()
-        self._run(factory, self._verdict(True))
-
-        oracle_exec = instances[2]
-        # benchmark() then execute_once() on the tuned executor.
-        assert oracle_exec.benchmark.call_count == 1
-        assert oracle_exec.execute_once.call_count == 1
-
-    def test_without_a_reference_no_tuned_verdict_is_recorded(self):
-        """--validate off leaves the tuned check off too, and the delta stands."""
-        factory, _ = _make_oracle_exec_factory()
-        r = TestOraclePass()._run(factory, oracle_mode="plan").results[0]
-
-        assert r.oracle.correctness is None
-        assert r.oracle_delta is not None
-
-
-class TestOracleExhaustiveEnvGuard:
-    """Exhaustive mode scopes provider controls to an isolated oracle handle."""
-
-    @pytest.fixture(autouse=True)
-    def _clean_env(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("HIPDNN_FORCE_BENCHMARKING", raising=False)
-        monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
-
-    def _run(self, factory, oracle_mode, monkeypatch):
-        with (
-            patch(
-                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid, handle=None: f"engine_{eid}",
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
-                return_value=None,
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
-            ),
-            patch(
-                "dnn_benchmarking.execution.suite_runner.BufferManager",
-                return_value=_make_bm_mock(),
-            ),
-        ):
-            return run_graph_all_providers(
-                graph_path=Path("test.json"),
-                graph_json=_make_graph_json(),
-                tensor_infos=[_make_tensor_info(1)],
-                config=_make_config(oracle_mode=oracle_mode),
-                handle=MagicMock(),
-            )
-
-    def test_exhaustive_forces_benchmarking_before_plan_build(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        seen = {}
-        factory, instances = _make_oracle_exec_factory()
-
-        def make_instance_with_capture(*args, **kwargs):
-            m = factory(*args, **kwargs)
-            if len(instances) == 3:
-                seen["force"] = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
-            return m
-
-        self._run(make_instance_with_capture, "exhaustive", monkeypatch)
-
-        assert seen["force"] == "1"
-        # Compiled plans must use STANDARD autotune mode. Provider
-        # benchmarking was latched while the plans were built.
-        assert instances[2].autotune.call_args.kwargs == {}
-
-    def test_exhaustive_disables_the_cache_before_plan_build(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An exhaustive winner must not persist into a later OOTB baseline."""
-        seen = {}
-        factory, instances = _make_oracle_exec_factory()
-
-        def make_instance_with_capture(*args, **kwargs):
-            m = factory(*args, **kwargs)
-            if len(instances) == 3:
-                seen["disable_cache"] = os.environ.get("HIPDNN_DISABLE_CACHE")
-            return m
-
-        self._run(make_instance_with_capture, "exhaustive", monkeypatch)
-
-        assert seen["disable_cache"] == "1"
-
-    def test_exhaustive_restores_env_after_run(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        factory, _ = _make_oracle_exec_factory()
-        self._run(factory, "exhaustive", monkeypatch)
-        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
-        assert "HIPDNN_DISABLE_CACHE" not in os.environ
-
-    def test_exhaustive_restores_preexisting_value_not_delete(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
-        factory, _ = _make_oracle_exec_factory()
-        self._run(factory, "exhaustive", monkeypatch)
-        assert os.environ["HIPDNN_DISABLE_CACHE"] == "0"
-
-    def test_exhaustive_marks_supported_provider_tuning(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        factory, _ = _make_oracle_exec_factory(
-            candidates=[_make_candidate(supports_exhaustive=True)]
-        )
-        oracle = self._run(factory, "exhaustive", monkeypatch).results[0].oracle
-        assert oracle.exhaustive_requested is True
-        assert oracle.exhaustive_supported is True
-        assert oracle.tuning_available is True
-
-    def test_plan_mode_never_sets_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        seen = {}
-        factory, instances = _make_oracle_exec_factory()
-
-        def make_instance_with_capture(*args, **kwargs):
-            m = factory(*args, **kwargs)
-            if len(instances) == 3:
-                seen["force"] = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
-                seen["disable_cache"] = os.environ.get("HIPDNN_DISABLE_CACHE")
-            return m
-
-        result = self._run(make_instance_with_capture, "plan", monkeypatch)
-
-        assert seen == {"force": None, "disable_cache": None}
-        assert result.results[0].oracle.exhaustive_requested is False
-
-    def test_exception_inside_guard_still_restores_env(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        factory, _ = _make_oracle_exec_factory(
-            autotune_side_effect=ExecutionError("no candidate succeeded")
-        )
-        result = self._run(factory, "exhaustive", monkeypatch)
-        assert (
-            result.results[0].oracle_error == "ExecutionError: no candidate succeeded"
-        )
-        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
-        assert "HIPDNN_DISABLE_CACHE" not in os.environ
-
-
-def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
-    """derived_tflops_per_s divides by the kernel *median* (rocKE parity),
-    and CPU time is per timed execution (iters * timing_block)."""
-    result = ProviderEngineResult(provider="hipdnn", engine_id=1, status="success")
-    # Mean 4 ms, median 1 ms.
-    result.gpu_kernel_stats = BenchmarkStats.from_timings([1.0, 1.0, 10.0])
-    probe = SimpleNamespace(
-        delta=SimpleNamespace(user_time_ms=60.0, kernel_time_ms=6.0)
-    )
-
-    with patch("dnn_benchmarking.execution.suite_runner.GpuSmiProbe"):
-        _collect_basic_metrics_post_loop(
-            result=result,
-            cpu_time_probe=probe,
-            timed_executions=3 * 20,
-            analytical_flops=10**12,
-            analytical_flops_partial=False,
-            analytical_io_bytes=None,
-        )
-
-    assert result.derived_tflops_per_s == pytest.approx(1000.0)
-    assert result.cpu_user_time_per_iter_us == pytest.approx(1000.0)
-    assert result.cpu_kernel_time_per_iter_us == pytest.approx(100.0)
+        assert row.status == status
+        assert "NotARealOp" in (row.error_message or row.skip_reason)

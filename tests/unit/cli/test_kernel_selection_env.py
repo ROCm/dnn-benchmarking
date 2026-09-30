@@ -1,123 +1,77 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for kernel-selection environment setup in the suite CLI."""
+"""Kernel-selection environment: what is set, and which hazards are reported."""
+
+import io
+import os
 
 import pytest
 
+from dnn_benchmarking.cli import suite_runner_cli
+from dnn_benchmarking.cli.config_file import apply_config_file
+from dnn_benchmarking.cli.parser import create_parser
+from dnn_benchmarking.cli.suite_runner_cli import (
+    AUTOTUNE_WITHOUT_CACHE_DIR,
+    LEAKED_FORCE_BENCHMARKING,
+    _apply_tuning_environment,
+)
+from dnn_benchmarking.config.benchmark_config import SuiteConfig
+from dnn_benchmarking.reporting.reporter import Reporter
+
 
 @pytest.fixture(autouse=True)
-def _isolate_selection_env(monkeypatch):
-    """HIPDNN_FORCE_BENCHMARKING is process-wide with no per-engine granularity,
-    so a value left behind by one test changes an unrelated one. Caught for real:
-    without this, these tests leaked the flag into test_suite_cli.py and made it
-    fail on an extra warning. monkeypatch restores whatever was there before."""
+def _isolate(monkeypatch):
+    # Process-wide variables; monkeypatch restores them after each test.
     monkeypatch.delenv("HIPDNN_FORCE_BENCHMARKING", raising=False)
     monkeypatch.delenv("HIPDNN_CACHE_DIR", raising=False)
-    yield
 
 
-class TestKernelSelectionEnvironment:
-    """The selection path must be set deliberately and stated out loud.
+def _apply(**kwargs):
+    return _apply_tuning_environment(
+        SuiteConfig(**kwargs), Reporter(output=io.StringIO())
+    )
 
-    An engine has two selection paths that answer different questions: the cold
-    heuristic (which measures how good the heuristic is) and benchmarking (which
-    measures what the shipped kernel set can deliver). The default is the first,
-    silently. A perf table whose path is unstated is not interpretable, and a
-    kernel set that gains good variants can measure *slower* on the heuristic
-    path when the tie-break is arbitrary -- so the path is announced on every
-    run, not only when it is requested.
-    """
 
-    @staticmethod
-    def _config(**kwargs):
-        from dnn_benchmarking.config.benchmark_config import SuiteConfig
+def test_default_stays_on_the_heuristic_path() -> None:
+    assert _apply() == []
+    assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
-        return SuiteConfig(**kwargs)
 
-    @staticmethod
-    def _reporter():
-        class _R:
-            def __init__(self):
-                self.messages = []
+def test_autotune_without_cache_dir_is_a_hazard() -> None:
+    assert _apply(autotune=True) == [AUTOTUNE_WITHOUT_CACHE_DIR]
+    assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
-            def print_warning(self, message):
-                self.messages.append(message)
 
-            def print_error(self, message):
-                self.messages.append(message)
+def test_autotune_with_cache_dir_is_isolated() -> None:
+    assert _apply(autotune=True, cache_dir="/tmp/phase-x") == []
+    assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
 
-        return _R()
 
-    def _apply(self, monkeypatch, **kwargs):
-        from dnn_benchmarking.cli.suite_runner_cli import _apply_tuning_environment
+@pytest.mark.parametrize(
+    "value, hazards",
+    [("1", [LEAKED_FORCE_BENCHMARKING]), ("0", [])],
+    ids=["truthy-leak", "off-value"],
+)
+def test_leaked_force_benchmarking(monkeypatch, value, hazards) -> None:
+    """hipDNN treats "0" as off, so only a truthy inherited value is a hazard."""
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", value)
+    assert _apply() == hazards
 
-        monkeypatch.delenv("HIPDNN_FORCE_BENCHMARKING", raising=False)
-        monkeypatch.delenv("HIPDNN_CACHE_DIR", raising=False)
-        reporter = self._reporter()
-        _apply_tuning_environment(self._config(**kwargs), reporter)
-        return reporter
 
-    def test_default_does_not_force_benchmarking(self, monkeypatch) -> None:
-        import os
+def test_pytorch_backend_leaves_hipdnn_environment_alone(
+    tmp_path, monkeypatch
+) -> None:
+    applied = []
+    monkeypatch.setattr(
+        suite_runner_cli, "_apply_tuning_environment", lambda c, r: applied.append(c)
+    )
+    monkeypatch.setattr(suite_runner_cli, "collect_environment_info", lambda: {})
+    monkeypatch.setattr(
+        suite_runner_cli, "start_backend", lambda c, r: lambda *a: None
+    )
 
-        self._apply(monkeypatch)
-        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
-
-    def test_default_states_the_heuristic_path(self, monkeypatch) -> None:
-        reporter = self._apply(monkeypatch)
-        assert any("COLD HEURISTIC" in m for m in reporter.messages)
-
-    def test_autotune_forces_benchmarking(self, monkeypatch) -> None:
-        import os
-
-        self._apply(monkeypatch, autotune=True)
-        assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
-
-    def test_autotune_states_the_benchmarked_path(self, monkeypatch) -> None:
-        reporter = self._apply(monkeypatch, autotune=True)
-        assert any("BENCHMARKED" in m for m in reporter.messages)
-
-    def test_autotune_without_cache_dir_warns(self, monkeypatch) -> None:
-        """The winner cache outlives the run, and reads are not gated on
-        benchmarking while writes are -- so a tuned run with no explicit root can
-        report a previous kernel set's winners as if it measured them."""
-        reporter = self._apply(monkeypatch, autotune=True)
-        assert any("outlives this run" in m for m in reporter.messages)
-
-    def test_cache_dir_is_exported(self, monkeypatch) -> None:
-        import os
-
-        self._apply(monkeypatch, autotune=True, cache_dir="/tmp/phase-x")
-        assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
-
-    def test_cache_dir_suppresses_the_warning(self, monkeypatch) -> None:
-        reporter = self._apply(monkeypatch, autotune=True, cache_dir="/tmp/phase-x")
-        assert not any("outlives this run" in m for m in reporter.messages)
-
-    def test_a_leaked_force_flag_is_reported(self, monkeypatch) -> None:
-        """The variable is process-wide with no per-engine granularity, so a value
-        left by another shell or test silently changes the selection path. Report
-        what is in effect, not what was asked for."""
-        from dnn_benchmarking.cli.suite_runner_cli import _apply_tuning_environment
-
-        monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "1")
-        reporter = self._reporter()
-        _apply_tuning_environment(self._config(), reporter)
-        assert any("is set in the environment" in m for m in reporter.messages)
-        assert not any("COLD HEURISTIC" in m for m in reporter.messages)
-
-    def test_missing_cache_dir_warns_about_the_shared_cache(self, monkeypatch) -> None:
-        """The winner cache is keyed by graph content and device -- not by
-        checkout, engine or session. Two agents benchmarking the same graphs on
-        one box read and write each other's rankings through the per-user
-        default, and reads are ungated while writes are gated on benchmarking,
-        so an untuned run can report another session's tuned result as its own."""
-        reporter = self._apply(monkeypatch)
-        assert any("shared per-user cache" in m for m in reporter.messages)
-
-    def test_explicit_cache_dir_suppresses_the_shared_warning(
-        self, monkeypatch
-    ) -> None:
-        reporter = self._apply(monkeypatch, cache_dir="/tmp/phase-x")
-        assert not any("shared per-user cache" in m for m in reporter.messages)
+    args = create_parser(suppress_defaults=True).parse_args(["-b", "pytorch"])
+    apply_config_file(args)
+    suite_runner_cli.run_suite_cli(args, [], Reporter(output=io.StringIO()))
+    assert applied == []

@@ -9,7 +9,6 @@ from .reference_provider import (
     ReferenceProvider,
     ReferenceProviderRegistry,
 )
-from .validator import Validator
 
 # Import providers to register them with the registry
 from . import providers  # noqa: F401
@@ -19,6 +18,5 @@ __all__ = [
     "ReferenceOutput",
     "ReferenceProvider",
     "ReferenceProviderRegistry",
-    "Validator",
     "compare",
 ]
