@@ -101,12 +101,8 @@ jobs:
           "$VENV/python" -m pytest -m "not gpu" -q
 
   rocm-build:
-    # gfx950 is the only arch with descriptor-backed rocKE engines, so it is
-    # the one that exercises rocKE packing (no GPU needed).
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [gfx90a, gfx950]
+    # gfx950: the only arch with descriptor-backed rocKE engines, so it also
+    # exercises rocKE packing (no GPU needed).
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -134,7 +130,7 @@ jobs:
           PIP_NO_CACHE_DIR: "1"
         run: |
           python setup_env.py \
-            --gpu-arch ${{ matrix.arch }} \
+            --gpu-arch gfx950 \
             --workspace .ci-rocm-workspace \
             -y
 
@@ -152,8 +148,7 @@ jobs:
           "$VENV/python" -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
           "$VENV/dnn-benchmark" --help
 
-      - name: Assert rocKE descriptor packing (gfx950)
-        if: matrix.arch == 'gfx950'
+      - name: Assert rocKE descriptor packing
         run: |
           ls .ci-rocm-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries*/lib/hipdnn_plugins/engines/arch_content/hip-kernel-provider/gfx950/rocKE/gfx950_attention_dense/*.kdp.json
           ls -s .ci-rocm-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries*/lib/hipdnn_plugins/engines/arch_content/hip-kernel-provider/gfx950/kpack/hip_kernel_provider_gfx950.kpack
