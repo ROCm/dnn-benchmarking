@@ -486,6 +486,35 @@ class TestDiscoveryFailure:
 
         assert result.results[0].provider == "hipkernel:Gfx950AttentionDense"
 
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_setup_failure_row_keeps_the_built_in_registry_name(
+        self, mock_bm_cls, mock_exec_cls, mock_get_ref
+    ):
+        """When the per-engine handle cannot be built there is no handle to ask,
+        but the row must still carry the built-in engine name, not hex."""
+        mock_get_ref.return_value = None
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
+        mock_bm_cls.return_value = _make_bm_mock()
+        frontend = SimpleNamespace(
+            Handle=MagicMock(side_effect=RuntimeError("plugin failed to load")),
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
+            engine_id_to_name=lambda _id: "MIOPEN_ENGINE",
+        )
+
+        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
+            result = run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(engine_filter=[1]),
+                handle=None,
+            )
+
+        row = result.results[0]
+        assert (row.status, row.provider) == ("error", "MIOPEN_ENGINE")
+
 
 class TestSuiteConfigValidation:
     """Tests for SuiteConfig dataclass validation."""
@@ -1444,7 +1473,7 @@ class TestResolveEngineName:
             return real_import(name, *args, **kwargs)
 
         with patch("builtins.__import__", side_effect=fake_import):
-            assert _resolve_engine_name(0xABC) == "engine_0xabc"
+            assert _resolve_engine_name(0xABC, None) == "engine_0xabc"
 
     @staticmethod
     def _frontend(registry_name):

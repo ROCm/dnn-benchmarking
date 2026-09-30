@@ -130,7 +130,7 @@ def _hipdnn_buffer_device(
     return None
 
 
-def _resolve_engine_name(engine_id: int, handle: Any = None) -> str:
+def _resolve_engine_name(engine_id: int, handle: Any) -> str:
     """Resolve an engine ID to its registered name.
 
     Asks ``handle.engine_id_to_name`` first: it queries the loaded plugins, so
@@ -148,7 +148,8 @@ def _resolve_engine_name(engine_id: int, handle: Any = None) -> str:
 
     Args:
         engine_id: int engine ID.
-        handle: Optional hipdnn.Handle whose loaded plugins may carry the ID.
+        handle: The hipdnn.Handle that runs the engine, or None when no handle
+            exists (for example, creating it failed).
 
     Returns:
         Engine name or ``f"engine_0x..."`` fallback.
@@ -830,7 +831,6 @@ def run_graph_all_providers(
     for selection in engine_selections:
         engine_id = selection.engine_id
         engine_plugin_path = selection.plugin_path
-        engine_name = _resolve_engine_name(engine_id, handle)
         engine_handle = handle
         with Timer() as t:
             if engine_handle is None:
@@ -843,8 +843,8 @@ def run_graph_all_providers(
                         hipdnn.PluginLoadingMode.ABSOLUTE,
                     )
                     engine_handle = hipdnn.Handle()
-                    engine_name = _resolve_engine_name(engine_id, engine_handle)
                 except (ImportError, RuntimeError, ValueError, OSError) as e:
+                    engine_name = _resolve_engine_name(engine_id, None)  # no handle
                     pe_result = _engine_setup_error_result(
                         provider=engine_name,
                         engine_id=engine_id,
@@ -859,6 +859,7 @@ def run_graph_all_providers(
                     pe_results.append(pe_result)
                     continue
 
+            engine_name = _resolve_engine_name(engine_id, engine_handle)
             if reporter is not None:
                 reporter.print_engine_start(engine_name)
 
