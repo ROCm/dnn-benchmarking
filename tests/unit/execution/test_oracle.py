@@ -25,15 +25,24 @@ ENV = ("HIPDNN_FORCE_BENCHMARKING", "HIPDNN_DISABLE_CACHE")
 
 def _m(kernel_ms):
     return Measurement(
-        kernel_ms=list(kernel_ms), host_ms=[0.01] * len(kernel_ms), mode="staged",
-        backend="hip", cache_mode="warm", warmup_iters=1, first_call_ms=1.0,
+        kernel_ms=list(kernel_ms),
+        host_ms=[0.01] * len(kernel_ms),
+        mode="staged",
+        backend="hip",
+        cache_mode="warm",
+        warmup_iters=1,
+        first_call_ms=1.0,
     )
 
 
 def _candidate(succeeded=True, excluded=False, rank=0):
     return SimpleNamespace(
-        succeeded=succeeded, excluded_by_caller=excluded, rank=rank,
-        compiled_plan_index=rank, min_time_ms=0.4, knob_settings=[],
+        succeeded=succeeded,
+        excluded_by_caller=excluded,
+        rank=rank,
+        compiled_plan_index=rank,
+        min_time_ms=0.4,
+        knob_settings=[],
         supports_exhaustive=True,
     )
 
@@ -101,14 +110,29 @@ def _run(mode="plan", correctness=None, bm=None, refs=None):
         provider="hipdnn", engine_id=5, status="success", correctness=correctness
     )
     baseline = SimpleNamespace(benchmark=lambda h, vp: _m([1.0, 1.0, 1.0, 10.0]))
-    out = TensorInfo(uid=1, name="y", dims=[2], strides=[1], data_type="float",
-                     is_virtual=False, is_output=True)
+    out = TensorInfo(
+        uid=1,
+        name="y",
+        dims=[2],
+        strides=[1],
+        data_type="float",
+        is_virtual=False,
+        is_output=True,
+    )
     oracle_mod.run_oracle_pass(
-        row=row, handle=_Handle(), engine_id=5, graph_json_str="{}", graph_name="g",
-        config=SuiteConfig(oracle_mode=mode,
-                           validation=ValidationConfig(provider="pytorch")),
-        bm=bm or _BM(), variant_pack={}, ootb_executor=baseline,
-        tensor_infos=[out], reference_outputs=refs,
+        row=row,
+        handle=_Handle(),
+        engine_id=5,
+        graph_json_str="{}",
+        graph_name="g",
+        config=SuiteConfig(
+            oracle_mode=mode, validation=ValidationConfig(provider="pytorch")
+        ),
+        bm=bm or _BM(),
+        variant_pack={},
+        ootb_executor=baseline,
+        tensor_infos=[out],
+        reference_outputs=refs,
     )
     return row
 
@@ -126,13 +150,17 @@ def test_delta_compares_post_sweep_medians(tuned):
 
 def test_candidate_counts_ignore_caller_excluded_plans(tuned):
     tuned.candidates = [
-        _candidate(rank=0), _candidate(succeeded=False, rank=1),
+        _candidate(rank=0),
+        _candidate(succeeded=False, rank=1),
         _candidate(excluded=True, rank=2),
     ]
     o = _run().oracle
 
-    assert (o.compiled_plans_total, o.compiled_plans_benchmarked,
-            o.compiled_plans_failed) == (2, 1, 1)
+    assert (
+        o.compiled_plans_total,
+        o.compiled_plans_benchmarked,
+        o.compiled_plans_failed,
+    ) == (2, 1, 1)
     assert o.rank == 0
 
 

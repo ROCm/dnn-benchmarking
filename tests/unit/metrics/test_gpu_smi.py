@@ -46,9 +46,15 @@ def _fake_amdsmi(handles=("h0",), bdfs=None, fail=()):
     q("amdsmi_init", None)
     q("amdsmi_get_processor_handles", list(handles))
     q("amdsmi_get_gpu_device_bdf", lambda h: bdfs[h])
-    q("amdsmi_get_clock_info", lambda h, t: {"clk": 1700 if t == "gfx" else 1600, "max_clk": 1700})
+    q(
+        "amdsmi_get_clock_info",
+        lambda h, t: {"clk": 1700 if t == "gfx" else 1600, "max_clk": 1700},
+    )
     # N/A average must fall back to the current reading.
-    q("amdsmi_get_power_info", {"average_socket_power": "N/A", "current_socket_power": 250})
+    q(
+        "amdsmi_get_power_info",
+        {"average_socket_power": "N/A", "current_socket_power": 250},
+    )
     q("amdsmi_get_temp_metric", 65)
     q("amdsmi_get_gpu_metrics_info", {"throttle_status": False})
     q("amdsmi_get_gpu_vram_usage", {"vram_used": 1024, "vram_total": 65536})

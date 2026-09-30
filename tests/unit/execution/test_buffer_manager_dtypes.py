@@ -31,7 +31,11 @@ NAMES = [
     "fp8_e5m2",
     "fp8_e8m0",
 ]
-FP8 = {"fp8_e4m3": "float8_e4m3fn", "fp8_e5m2": "float8_e5m2", "fp8_e8m0": "float8_e8m0fnu"}
+FP8 = {
+    "fp8_e4m3": "float8_e4m3fn",
+    "fp8_e5m2": "float8_e5m2",
+    "fp8_e8m0": "float8_e8m0fnu",
+}
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -88,6 +92,4 @@ def test_fp8_encode_rounds_to_nearest_code(name: str) -> None:
     decoded = _fp8_values(name)[_f32_to_fp8(probes, name)]
 
     nearest = grid[np.abs(probes[:, None] - grid[None, :]).argmin(axis=1)]
-    np.testing.assert_array_equal(
-        np.abs(decoded - probes), np.abs(nearest - probes)
-    )
+    np.testing.assert_array_equal(np.abs(decoded - probes), np.abs(nearest - probes))

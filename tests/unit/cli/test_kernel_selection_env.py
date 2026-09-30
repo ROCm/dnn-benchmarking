@@ -58,17 +58,13 @@ def test_leaked_force_benchmarking(monkeypatch, value, warned) -> None:
     )
 
 
-def test_pytorch_backend_leaves_hipdnn_environment_alone(
-    tmp_path, monkeypatch
-) -> None:
+def test_pytorch_backend_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) -> None:
     applied = []
     monkeypatch.setattr(
         suite_runner_cli, "_apply_tuning_environment", lambda c, r: applied.append(c)
     )
     monkeypatch.setattr(suite_runner_cli, "collect_environment_info", lambda: {})
-    monkeypatch.setattr(
-        suite_runner_cli, "start_backend", lambda c, r: lambda *a: None
-    )
+    monkeypatch.setattr(suite_runner_cli, "start_backend", lambda c, r: lambda *a: None)
 
     args = create_parser(suppress_defaults=True).parse_args(["-b", "pytorch"])
     apply_config_file(args)

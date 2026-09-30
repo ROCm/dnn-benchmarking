@@ -65,7 +65,13 @@ class TestStreams:
         reporter.print_graph_table(_graph(_passed_row()))
 
         assert "kernel_med" in out.getvalue()
-        for text in ("[1/1] g", "MIOPEN_ENGINE ...", "Initializing hipDNN", "WARNING: cache shared", "ERROR: plugin missing"):
+        for text in (
+            "[1/1] g",
+            "MIOPEN_ENGINE ...",
+            "Initializing hipDNN",
+            "WARNING: cache shared",
+            "ERROR: plugin missing",
+        ):
             assert text in err.getvalue()
             assert text not in out.getvalue()
         assert "kernel_med" not in err.getvalue()
@@ -155,11 +161,15 @@ class TestProgress:
         reporter = Reporter(io.StringIO(), err)
         reporter.engine_start("A")
         reporter.engine_done(
-            ProviderEngineResult.skipped_row("hipdnn", 1, "No engine configurations available")
+            ProviderEngineResult.skipped_row(
+                "hipdnn", 1, "No engine configurations available"
+            )
         )
         reporter.engine_start("B")
         reporter.engine_done(
-            ProviderEngineResult.error_row("hipdnn", 2, "Graph validation failed:\nbatch mismatch")
+            ProviderEngineResult.error_row(
+                "hipdnn", 2, "Graph validation failed:\nbatch mismatch"
+            )
         )
         lines = err.getvalue().splitlines()
         assert lines == [
@@ -201,7 +211,10 @@ class TestSuiteHeader:
         assert "AMD EPYC 7513" in text
         assert "AMD Instinct MI210 (gfx90a, 104 CUs, 64 GB HBM)" in text
         assert "ROCm:    7.0.2" in text
-        assert "warmup 10, iters 100 (min-time 0 ms), cache cold, seed 0, backend hipdnn" in text
+        assert (
+            "warmup 10, iters 100 (min-time 0 ms), cache cold, seed 0, backend hipdnn"
+            in text
+        )
 
     def test_cuda_host_shows_cuda_not_rocm(self) -> None:
         out = io.StringIO()
@@ -229,7 +242,10 @@ class TestSummaries:
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_summary(suite, "out.json")
         text = out.getvalue()
-        assert "3 graph(s), 4 row(s): 1 passed, 1 unchecked, 1 failed, 1 skipped, 0 error(s)" in text
+        assert (
+            "3 graph(s), 4 row(s): 1 passed, 1 unchecked, 1 failed, 1 skipped, 0 error(s)"
+            in text
+        )
         assert "1 graph error(s)" in text
         assert "Results: out.json" in text
 
@@ -239,7 +255,9 @@ class TestSummaries:
         def tuned(speedup: float, plans: int) -> ProviderEngineResult:
             pe = _passed_row()
             pe.oracle = OracleResult("p", 0, 0, 0.1, plans, plans, 0, [])
-            pe.oracle_delta = OracleDelta("gpu_kernel", speedup, 1.0, speedup - 1.0, speedup)
+            pe.oracle_delta = OracleDelta(
+                "gpu_kernel", speedup, 1.0, speedup - 1.0, speedup
+            )
             return pe
 
         out = io.StringIO()

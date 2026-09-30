@@ -38,7 +38,9 @@ def _row(name, median, *, cv=0.0, match=True, status="success", role="engine"):
 
 def _write(tmp_path, fname, graphs, **config):
     suite = SuiteResult(
-        run=RunInfo("t", [], {"cache_mode": "warm", "iters": 100, **config}, complete=True),
+        run=RunInfo(
+            "t", [], {"cache_mode": "warm", "iters": 100, **config}, complete=True
+        ),
         environment={"gpu_model": "MI210", "gpu_arch": "gfx90a"},
         graphs=[
             GraphResult(name, f"{name}.json", rows, engine_ids=[1], graph_id=gid)
@@ -165,7 +167,9 @@ def test_missing_ref_on_both_sides_is_one_label(tmp_path, capsys):
 def test_table_fits_terminal_width(tmp_path, capsys, monkeypatch, columns):
     monkeypatch.setenv("COLUMNS", str(columns))
     long = "conv_fwd_" + "x" * 150
-    a = _write(tmp_path, "a.json", [(long, "id", [_row("ENGINE_" + "Y" * 60, 123.456)])])
+    a = _write(
+        tmp_path, "a.json", [(long, "id", [_row("ENGINE_" + "Y" * 60, 123.456)])]
+    )
     b = _write(tmp_path, "b.json", [(long, "id", [_row("ENGINE_" + "Y" * 60, 0.001)])])
     assert main([a, b]) == 0
     out = capsys.readouterr().out

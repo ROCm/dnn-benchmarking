@@ -16,7 +16,9 @@ from dnn_benchmarking.metrics._diagnostic import reset as reset_warn_once
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     reset_warn_once()
-    monkeypatch.setattr(roofline_mod, "resolve_rocm_tool", lambda name: "rocprof-compute")
+    monkeypatch.setattr(
+        roofline_mod, "resolve_rocm_tool", lambda name: "rocprof-compute"
+    )
 
 
 def _run(out_dir, returncode=0, stderr="", side_effect=None):

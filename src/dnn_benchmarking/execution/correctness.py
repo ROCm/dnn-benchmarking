@@ -100,9 +100,7 @@ def check_correctness(
     if not compared:
         return mismatch(config, "No output tensors to compare")
 
-    uid, _, _, worst = max(
-        compared, key=lambda c: (not c[3].passed, c[3].max_abs_diff)
-    )
+    uid, _, _, worst = max(compared, key=lambda c: (not c[3].passed, c[3].max_abs_diff))
     passed = all(c[3].passed for c in compared)
     return CorrectnessResult(
         tolerance_match=passed,

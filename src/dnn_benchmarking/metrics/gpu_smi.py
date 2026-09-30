@@ -163,7 +163,9 @@ class GpuSmiProbe:
         snap: Dict[str, Optional[float]] = {"vram_used_mb": None, "vram_total_mb": None}
         if self._handle is None:
             return snap
-        vram = _query(lambda: self._amdsmi.amdsmi_get_gpu_vram_usage(self._handle), dict)
+        vram = _query(
+            lambda: self._amdsmi.amdsmi_get_gpu_vram_usage(self._handle), dict
+        )
         if vram:
             snap["vram_used_mb"] = _query(lambda: vram["vram_used"])
             snap["vram_total_mb"] = _query(lambda: vram["vram_total"])

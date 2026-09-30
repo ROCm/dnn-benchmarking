@@ -50,11 +50,20 @@ class _Stdin:
     [
         # The space form is what people type; argparse would reject a bare
         # `-DFOO=ON` value, so NAME=VALUE must work.
-        (["--cmake-arg", "HIPDNN_ENABLE_KERNEL_INGESTOR=ON"], ["-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"]),
-        (["--cmake-arg=-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"], ["-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"]),
+        (
+            ["--cmake-arg", "HIPDNN_ENABLE_KERNEL_INGESTOR=ON"],
+            ["-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"],
+        ),
+        (
+            ["--cmake-arg=-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"],
+            ["-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON"],
+        ),
         (["--cmake-arg", "A=1", "--cmake-arg", "B=2"], ["-DA=1", "-DB=2"]),
         # Only the first `=` separates name from value.
-        (["--cmake-arg", "CMAKE_CXX_FLAGS=-DA=1 -DB=2"], ["-DCMAKE_CXX_FLAGS=-DA=1 -DB=2"]),
+        (
+            ["--cmake-arg", "CMAKE_CXX_FLAGS=-DA=1 -DB=2"],
+            ["-DCMAKE_CXX_FLAGS=-DA=1 -DB=2"],
+        ),
     ],
 )
 def test_cmake_arg_normalises_to_defines(setup_env, argv, expected) -> None:
@@ -80,7 +89,9 @@ def test_superbuild_configure_lets_extra_defines_override_defaults(
     (toolchain / "lib" / "libamd_comgr.so.3").write_text("")
     commands = []
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
-    monkeypatch.setattr(setup_env, "run", lambda cmd, **kwargs: commands.append(list(cmd)))
+    monkeypatch.setattr(
+        setup_env, "run", lambda cmd, **kwargs: commands.append(list(cmd))
+    )
     monkeypatch.setattr(setup_env, "require_working_cmake", lambda: "cmake")
     monkeypatch.setattr(setup_env.shutil, "which", lambda name: name)
     argv = ["--cmake-arg", "HIPDNN_ENABLE_SDPA=OFF"] + (["--clean"] if clean else [])
@@ -102,7 +113,9 @@ def test_superbuild_configure_lets_extra_defines_override_defaults(
 
 
 @pytest.mark.parametrize("answer", ["", "y", "Y", "yes", " YES "])
-def test_confirm_proceeds_on_yes_or_enter(setup_env, tmp_path, monkeypatch, answer) -> None:
+def test_confirm_proceeds_on_yes_or_enter(
+    setup_env, tmp_path, monkeypatch, answer
+) -> None:
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
     monkeypatch.setattr("builtins.input", lambda prompt: answer)
 
@@ -110,7 +123,9 @@ def test_confirm_proceeds_on_yes_or_enter(setup_env, tmp_path, monkeypatch, answ
 
 
 @pytest.mark.parametrize("answer", ["n", "no", "q", "nope", "yess"])
-def test_confirm_aborts_on_anything_else(setup_env, tmp_path, monkeypatch, answer) -> None:
+def test_confirm_aborts_on_anything_else(
+    setup_env, tmp_path, monkeypatch, answer
+) -> None:
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
     monkeypatch.setattr("builtins.input", lambda prompt: answer)
 
@@ -123,7 +138,9 @@ def _no_prompt(prompt):
     raise AssertionError("prompted")
 
 
-def test_confirm_without_a_terminal_requires_yes_flag(setup_env, tmp_path, monkeypatch) -> None:
+def test_confirm_without_a_terminal_requires_yes_flag(
+    setup_env, tmp_path, monkeypatch
+) -> None:
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
     monkeypatch.setattr("builtins.input", _no_prompt)
 
@@ -175,7 +192,9 @@ def _fake_tools(setup_env, monkeypatch, outputs):
         ({"rocm_agent_enumerator": "gfx000\n", "rocminfo": _ROCMINFO_MI300}, "gfx942"),
         (
             {
-                "rocm_agent_enumerator": subprocess.TimeoutExpired("rocm_agent_enumerator", 30),
+                "rocm_agent_enumerator": subprocess.TimeoutExpired(
+                    "rocm_agent_enumerator", 30
+                ),
                 "rocminfo": _ROCMINFO_MI300,
             },
             "gfx942",
@@ -191,7 +210,9 @@ def test_detect_gpu_arch(setup_env, monkeypatch, outputs, expected) -> None:
 
 
 def test_detect_gpu_arch_refuses_to_pick_among_several(setup_env, monkeypatch) -> None:
-    _fake_tools(setup_env, monkeypatch, {"rocm_agent_enumerator": "gfx000\ngfx90a\ngfx942\n"})
+    _fake_tools(
+        setup_env, monkeypatch, {"rocm_agent_enumerator": "gfx000\ngfx90a\ngfx942\n"}
+    )
 
     with pytest.raises(SystemExit) as exc:
         setup_env.Setup._detect_gpu_arch()
@@ -233,7 +254,9 @@ def test_unify_relinks_only_same_file_duplicates(setup_env, tmp_path) -> None:
     assert setup_env.unify_rocprofiler_libs(core, devel) == 0
 
 
-def test_unify_keeps_the_library_when_symlinking_fails(setup_env, tmp_path, monkeypatch) -> None:
+def test_unify_keeps_the_library_when_symlinking_fails(
+    setup_env, tmp_path, monkeypatch
+) -> None:
     core, devel = _lib_dirs(tmp_path)
 
     def refuse(self, target):
@@ -272,7 +295,13 @@ def test_activate_local_is_idempotent(setup_env, tmp_path) -> None:
 
     assert activate.read_text().count("activate.local") == 1
     ld_path = subprocess.run(
-        ["bash", "-c", 'source "$1"; source "$1"; printf %s "$LD_LIBRARY_PATH"', "_", str(activate)],
+        [
+            "bash",
+            "-c",
+            'source "$1"; source "$1"; printf %s "$LD_LIBRARY_PATH"',
+            "_",
+            str(activate),
+        ],
         env={"PATH": os.environ["PATH"], "LD_LIBRARY_PATH": "/usr/lib"},
         capture_output=True,
         text=True,
@@ -286,7 +315,16 @@ def test_activate_local_is_idempotent(setup_env, tmp_path) -> None:
 
 def _git(*args, cwd=None):
     subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", *args],
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
         cwd=cwd,
         check=True,
         capture_output=True,
@@ -327,7 +365,9 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
     return repo / "rocm-libraries"
 
 
-def test_failed_fetch_leaves_no_checkout_to_reuse(setup_env, tmp_path, rocm_libraries) -> None:
+def test_failed_fetch_leaves_no_checkout_to_reuse(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
     setup = _setup(setup_env, tmp_path, "--rocm-libraries-ref", "no-such-ref")
 
     with pytest.raises(subprocess.CalledProcessError):

@@ -28,7 +28,9 @@ def _namespace(argv: list[str]):
 class TestFromNamespace:
     """SuiteConfig.from_namespace maps merged CLI/config args onto the config."""
 
-    def test_config_file_and_cli_values_reach_suite_config(self, tmp_path: Path) -> None:
+    def test_config_file_and_cli_values_reach_suite_config(
+        self, tmp_path: Path
+    ) -> None:
         config = tmp_path / "bench.toml"
         config.write_text(
             """
@@ -120,7 +122,9 @@ class TestSuiteConfigValidation:
             SuiteConfig(**kwargs)
 
     def test_exhaustive_oracle_requires_warmup(self) -> None:
-        with pytest.raises(ValueError, match="--oracle-mode exhaustive requires --warmup"):
+        with pytest.raises(
+            ValueError, match="--oracle-mode exhaustive requires --warmup"
+        ):
             SuiteConfig(oracle_mode="exhaustive", warmup_iters=0)
         assert SuiteConfig(oracle_mode="exhaustive", warmup_iters=1).oracle_exhaustive
 
@@ -204,4 +208,3 @@ class TestValidationConfig:
     def test_invalid_values_name_the_flag(self, kwargs: dict, flag: str) -> None:
         with pytest.raises(ValueError, match=flag):
             ValidationConfig(**kwargs)
-

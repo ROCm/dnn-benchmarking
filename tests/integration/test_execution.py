@@ -17,7 +17,12 @@ from dnn_benchmarking.config import (
     TimingPolicy,
     ValidationConfig,
 )
-from dnn_benchmarking.execution import BufferManager, Executor, correctness, suite_runner
+from dnn_benchmarking.execution import (
+    BufferManager,
+    Executor,
+    correctness,
+    suite_runner,
+)
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.suite_runner import run_graph_all_providers
 from dnn_benchmarking.graph import GraphLoader
@@ -55,8 +60,7 @@ def _assert_engines_match_reference(result: GraphResult) -> None:
     verdicts = {r.verdict for r in engines}
     assert "passed" in verdicts
     assert verdicts <= {"passed", "skipped"}, [
-        (r.engine_name, r.verdict, r.error_message or r.correctness)
-        for r in engines
+        (r.engine_name, r.verdict, r.error_message or r.correctness) for r in engines
     ]
 
 

@@ -115,7 +115,11 @@ class TestCollectEnvironmentInfo:
             """Finds torch (version lookups may), records and fails loading it."""
 
             def find_spec(self, name, path=None, target=None):
-                return importlib.util.spec_from_loader(name, self) if name == "torch" else None
+                return (
+                    importlib.util.spec_from_loader(name, self)
+                    if name == "torch"
+                    else None
+                )
 
             def create_module(self, spec):
                 return None

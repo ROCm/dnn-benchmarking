@@ -28,16 +28,12 @@ def _correct(match) -> CorrectnessResult:
 
 
 def _row(status="success", role="engine", correctness=None) -> ProviderEngineResult:
-    return ProviderEngineResult(
-        "hipdnn", 1, status, role=role, correctness=correctness
-    )
+    return ProviderEngineResult("hipdnn", 1, status, role=role, correctness=correctness)
 
 
 def _suite(graphs, complete=True) -> SuiteResult:
     return SuiteResult(
-        run=RunInfo(
-            started_at="t", argv=["x"], config={"seed": 7}, complete=complete
-        ),
+        run=RunInfo(started_at="t", argv=["x"], config={"seed": 7}, complete=complete),
         environment={"gpu_arch": "gfx90a"},
         graphs=graphs,
     )
@@ -243,7 +239,11 @@ class TestWriteLoad:
         assert float(row["kernel_median_ms"]) == 0.5
         assert float(row["host_median_ms"]) == 0.01
         assert float(row["max_abs_diff"]) == 2e-6
-        assert (row["n"], row["timing_mode"], row["cache_mode"]) == ("30", "staged", "cold")
+        assert (row["n"], row["timing_mode"], row["cache_mode"]) == (
+            "30",
+            "staged",
+            "cold",
+        )
         assert row["seed"] == no_engines["seed"] == "7"
         assert (graph_error["graph_name"], graph_error["status"]) == ("bad", "error")
         assert graph_error["message"] == "parse failed"

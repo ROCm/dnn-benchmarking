@@ -30,16 +30,30 @@ REF = np.arange(4, dtype=np.float32)
 
 
 def _tensor(uid, is_output):
-    return TensorInfo(uid=uid, name=f"t{uid}", dims=[4], strides=[1],
-                      data_type="float", is_virtual=False, is_output=is_output)
+    return TensorInfo(
+        uid=uid,
+        name=f"t{uid}",
+        dims=[4],
+        strides=[1],
+        data_type="float",
+        is_virtual=False,
+        is_output=is_output,
+    )
 
 
 TENSORS = [_tensor(1, False), _tensor(2, True)]
 
 
 def _measurement(**kw):
-    base = dict(kernel_ms=[1.0] * 10, host_ms=[0.01] * 10, mode="staged",
-                backend="hip", cache_mode="warm", warmup_iters=2, first_call_ms=5.0)
+    base = dict(
+        kernel_ms=[1.0] * 10,
+        host_ms=[0.01] * 10,
+        mode="staged",
+        backend="hip",
+        cache_mode="warm",
+        warmup_iters=2,
+        first_call_ms=5.0,
+    )
     return Measurement(**{**base, **kw})
 
 
@@ -122,9 +136,13 @@ def fake(monkeypatch):
     monkeypatch.setattr(suite_runner, "Executor", Executor)
     monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
     monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
-    monkeypatch.setitem(sys.modules, "hipdnn_frontend", SimpleNamespace(
-        engine_id_to_name=lambda eid: "",
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "hipdnn_frontend",
+        SimpleNamespace(
+            engine_id_to_name=lambda eid: "",
+        ),
+    )
     return f
 
 
@@ -135,8 +153,14 @@ def fake_torch(fake, monkeypatch):
     from dnn_benchmarking.execution import pytorch_buffer_manager, pytorch_executor
 
     class TorchExecutor:
-        def __init__(self, graph_json, policy, *, pytorch_sdpa_backend,
-                     pytorch_rocm_fa_library=None):
+        def __init__(
+            self,
+            graph_json,
+            policy,
+            *,
+            pytorch_sdpa_backend,
+            pytorch_rocm_fa_library=None,
+        ):
             self.init_time_ms = 1.0
 
         def prepare(self):
@@ -175,23 +199,35 @@ def fake_torch(fake, monkeypatch):
             return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
 
     monkeypatch.setattr(pytorch_executor, "PyTorchCudaExecutor", TorchExecutor)
-    monkeypatch.setattr(pytorch_buffer_manager, "PyTorchCudaBufferManager", TorchBuffers)
-    monkeypatch.setattr(suite_runner, "_reference_provider",
-                        lambda config, graph_json: (CpuReference(), None))
+    monkeypatch.setattr(
+        pytorch_buffer_manager, "PyTorchCudaBufferManager", TorchBuffers
+    )
+    monkeypatch.setattr(
+        suite_runner,
+        "_reference_provider",
+        lambda config, graph_json: (CpuReference(), None),
+    )
     return fake
 
 
 def _handle(names=None):
     names = names or {1: "ENG_A", 2: "ENG_B"}
-    return SimpleNamespace(get_engine_info=lambda eid: SimpleNamespace(
-        engine_name=names.get(eid, ""), version="2.1"))
+    return SimpleNamespace(
+        get_engine_info=lambda eid: SimpleNamespace(
+            engine_name=names.get(eid, ""), version="2.1"
+        )
+    )
 
 
 def _run(handle="default", **config):
     out = io.StringIO()
     graph = suite_runner.run_graph_all_providers(
-        PATH, GRAPH, TENSORS, SuiteConfig(**config),
-        _handle() if handle == "default" else handle, Reporter(out),
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(**config),
+        _handle() if handle == "default" else handle,
+        Reporter(out),
     )
     return graph, out.getvalue()
 
@@ -205,8 +241,10 @@ def test_one_hipdnn_row_per_engine_named_from_engine_info(fake):
 
     assert graph.graph_id == graph_id_for(GRAPH)
     assert graph.status == "ok" and graph.error is None
-    assert [(r.provider, r.engine_id, r.engine_name, r.engine_version, r.verdict)
-            for r in graph.results] == [
+    assert [
+        (r.provider, r.engine_id, r.engine_name, r.engine_version, r.verdict)
+        for r in graph.results
+    ] == [
         ("hipdnn", 1, "ENG_A", "2.1", "unchecked"),
         ("hipdnn", 2, "ENG_B", "2.1", "unchecked"),
     ]
@@ -224,8 +262,11 @@ def test_one_hipdnn_row_per_engine_named_from_engine_info(fake):
 def test_engine_name_falls_back_to_registry_then_hex(
     fake, monkeypatch, info_name, registry_name, expected
 ):
-    monkeypatch.setitem(sys.modules, "hipdnn_frontend",
-                        SimpleNamespace(engine_id_to_name=lambda eid: registry_name))
+    monkeypatch.setitem(
+        sys.modules,
+        "hipdnn_frontend",
+        SimpleNamespace(engine_id_to_name=lambda eid: registry_name),
+    )
     fake.discovered = [1]
 
     graph, _ = _run(handle=_handle({1: info_name}))
@@ -246,8 +287,11 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
 
     failed, ok = _run()[0].results
 
-    assert (failed.status, failed.verdict, failed.error_message or failed.skip_reason) \
-        == (status, status, message)
+    assert (
+        failed.status,
+        failed.verdict,
+        failed.error_message or failed.skip_reason,
+    ) == (status, status, message)
     assert failed.engine_name == "ENG_A"
     assert failed.gpu_kernel_stats is None and failed.correctness is None
     assert ok.status == "success"
@@ -257,8 +301,12 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
     fake.discovered = [1]
     # Median 1 ms, mean 1.4 ms: throughput must come from the median.
-    fake.measurement = dict(kernel_ms=[1.0] * 9 + [5.0], capped=True,
-                            mode="events", fallback_reason="no stream wait")
+    fake.measurement = dict(
+        kernel_ms=[1.0] * 9 + [5.0],
+        capped=True,
+        mode="events",
+        fallback_reason="no stream wait",
+    )
 
     row = _run()[0].results[0]
 
@@ -268,8 +316,11 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     assert row.timing.mode == "events" and row.timing.first_call_ms == 5.0
     assert row.workspace_bytes == 64 and row.vram_used_mb == 12.0
     warnings = " | ".join(row.warnings)
-    for expected in ("outlier: max 5.0x median", "capped at max_iters",
-                     "events timing: no stream wait"):
+    for expected in (
+        "outlier: max 5.0x median",
+        "capped at max_iters",
+        "events timing: no stream wait",
+    ):
         assert expected in warnings
 
 
@@ -339,8 +390,10 @@ def test_graph_level_failure_sets_error_without_rows(fake, monkeypatch, patch, e
     if patch == "discover":
         fake.discover_error = ExecutionError("driver")
     else:
+
         def fail(*a):
             raise ValueError("bad dims")
+
         monkeypatch.setattr(suite_runner, "generate_input_data", fail)
 
     graph, _ = _run()
@@ -368,7 +421,9 @@ def test_engines_are_validated_against_the_timed_reference(
 
 def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
     reason = "Reference provider 'pytorch' does not support this graph"
-    monkeypatch.setattr(suite_runner, "_reference_provider", lambda c, g: (None, reason))
+    monkeypatch.setattr(
+        suite_runner, "_reference_provider", lambda c, g: (None, reason)
+    )
     fake.discovered = [1]
 
     (engine,) = _validate()[0].results
@@ -384,8 +439,9 @@ def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
         ("math", "error", "failed"),  # strict selection never falls back
     ],
 )
-def test_failed_timed_reference(fake_torch, sdpa_backend, reference_status,
-                                engine_verdict):
+def test_failed_timed_reference(
+    fake_torch, sdpa_backend, reference_status, engine_verdict
+):
     fake_torch.discovered = [1]
     fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
 
@@ -402,14 +458,19 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
     def no_handle():
         raise RuntimeError("plugin load failed")
 
-    monkeypatch.setitem(sys.modules, "hipdnn_frontend", SimpleNamespace(
-        PluginLoadingMode=SimpleNamespace(ABSOLUTE="abs"),
-        set_engine_plugin_paths=lambda paths, mode: None,
-        Handle=no_handle,
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "hipdnn_frontend",
+        SimpleNamespace(
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE="abs"),
+            set_engine_plugin_paths=lambda paths, mode: None,
+            Handle=no_handle,
+        ),
+    )
 
-    graph, _ = _run(handle=None, engine_filter=[1, 1],
-                    plugin_paths=[Path("/a"), Path("/b")])
+    graph, _ = _run(
+        handle=None, engine_filter=[1, 1], plugin_paths=[Path("/a"), Path("/b")]
+    )
 
     assert [(r.status, r.plugin_path, r.error_message) for r in graph.results] == [
         ("error", "/a", "RuntimeError: plugin load failed"),
@@ -420,8 +481,11 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
 def test_profiling_payload_lands_on_the_row(fake, monkeypatch):
     from dnn_benchmarking.metrics import profiling_orchestrator
 
-    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes",
-                        lambda **kw: {"perf": {"cycles": kw["engine_name"]}})
+    monkeypatch.setattr(
+        profiling_orchestrator,
+        "run_profiling_passes",
+        lambda **kw: {"perf": {"cycles": kw["engine_name"]}},
+    )
     fake.discovered = [1]
 
     graph, progress = _run(metrics=MetricsConfig(perf=True))
@@ -441,7 +505,8 @@ def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
     graph, progress = _run(metrics=MetricsConfig(perf=True))
 
     assert [(r.status, r.engine_name) for r in graph.results] == [
-        ("success", "ENG_A"), ("success", "ENG_B")
+        ("success", "ENG_A"),
+        ("success", "ENG_B"),
     ]
     for row in graph.results:
         assert row.gpu_kernel_stats is not None and row.extra_metrics is None
@@ -454,7 +519,10 @@ def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
 class TestPytorchBackend:
     def _run(self, graph_json=GRAPH, **config):
         return suite_runner.run_graph_pytorch_backend(
-            PATH, graph_json, TENSORS, SuiteConfig(backend="pytorch", **config),
+            PATH,
+            graph_json,
+            TENSORS,
+            SuiteConfig(backend="pytorch", **config),
             Reporter(io.StringIO()),
         )
 
@@ -463,8 +531,13 @@ class TestPytorchBackend:
 
         (row,) = graph.results
         assert graph.graph_id == graph_id_for(GRAPH) and graph.status == "ok"
-        assert (row.provider, row.engine_id, row.engine_name, row.role, row.verdict) \
-            == ("pytorch", None, "pytorch", "engine", "unchecked")
+        assert (
+            row.provider,
+            row.engine_id,
+            row.engine_name,
+            row.role,
+            row.verdict,
+        ) == ("pytorch", None, "pytorch", "engine", "unchecked")
         assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
         assert row.timing.mode == "staged"
 
@@ -476,8 +549,9 @@ class TestPytorchBackend:
         assert row.status == "error"
         assert row.error_message == "ExecutionError: PyTorch GPU not available"
 
-    @pytest.mark.parametrize("sdpa_backend, status", [("default", "skipped"),
-                                                      ("math", "error")])
+    @pytest.mark.parametrize(
+        "sdpa_backend, status", [("default", "skipped"), ("math", "error")]
+    )
     def test_unsupported_operations(self, fake_torch, sdpa_backend, status):
         graph_json = {**GRAPH, "nodes": [{"type": "NotARealOp"}]}
 

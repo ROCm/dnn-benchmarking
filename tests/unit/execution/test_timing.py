@@ -95,9 +95,7 @@ def test_zero_warmup_still_primes_before_first_gated_enqueue(monkeypatch) -> Non
     log: List[str] = []
     _install_fake_hip(monkeypatch, log)
 
-    m = measure(
-        _enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=0, iters=2)
-    )
+    m = measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=0, iters=2))
 
     first_arm = log.index("arm")
     assert log.index("enqueue") < first_arm
@@ -178,7 +176,9 @@ def test_fixed_count_reaching_iters_is_not_capped(monkeypatch) -> None:
     _install_fake_hip(monkeypatch, log)
 
     m = measure(
-        _enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=3, max_iters=3)
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=1, iters=3, max_iters=3),
     )
 
     assert len(m.kernel_ms) == 3

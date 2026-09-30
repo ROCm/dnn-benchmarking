@@ -148,7 +148,9 @@ class EventTimer:
             import torch
 
             self._stream = (
-                torch_stream if torch_stream is not None else torch.cuda.current_stream()
+                torch_stream
+                if torch_stream is not None
+                else torch.cuda.current_stream()
             )
             self._start = torch.cuda.Event(enable_timing=True)
             self._stop = torch.cuda.Event(enable_timing=True)

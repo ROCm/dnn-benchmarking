@@ -108,7 +108,9 @@ def _torch_info() -> Dict[str, Any]:
         return info
     try:
         if info["cuda_version"]:
-            info["cudnn_version"] = _format_cudnn_version(torch.backends.cudnn.version())
+            info["cudnn_version"] = _format_cudnn_version(
+                torch.backends.cudnn.version()
+            )
         if torch_support.gpu_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             info["gpu_compute_units"] = props.multi_processor_count

@@ -10,7 +10,13 @@ import tomllib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from .parser import CONFIG_OPTIONS, OPTION_DEFAULTS, CliOption, ConfigKind, parse_engine_id
+from .parser import (
+    CONFIG_OPTIONS,
+    OPTION_DEFAULTS,
+    CliOption,
+    ConfigKind,
+    parse_engine_id,
+)
 
 _ALLOWED_TOP_LEVEL_KEYS: Set[str] = {
     str(option.config_key) for option in CONFIG_OPTIONS
@@ -171,7 +177,9 @@ def _normalise_engines(engines: Any, base_dir: Path) -> Dict[str, Any]:
             raise ValueError(f"Config engine {index}: {e}") from e
 
         plugin_path = engine.get("plugin_path")
-        if plugin_path is not None and (not isinstance(plugin_path, str) or not plugin_path):
+        if plugin_path is not None and (
+            not isinstance(plugin_path, str) or not plugin_path
+        ):
             raise ValueError(f"Config engine {index} plugin_path must be a string")
         plugin_paths.append(
             None if plugin_path is None else _path_from_config(base_dir, plugin_path)

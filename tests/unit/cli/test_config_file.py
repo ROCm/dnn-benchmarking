@@ -29,7 +29,7 @@ def _parse_with_config(argv: list[str]):
 
 
 def _config_error(tmp_path: Path, body: str) -> str:
-    config = _write_config(tmp_path / "bench.toml", f'version = 1\n{body}\n')
+    config = _write_config(tmp_path / "bench.toml", f"version = 1\n{body}\n")
     args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
     with pytest.raises(ValueError) as excinfo:
         apply_config_file(args)

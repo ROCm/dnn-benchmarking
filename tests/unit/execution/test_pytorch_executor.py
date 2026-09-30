@@ -229,7 +229,9 @@ def test_every_replay_shares_one_replay_tensor_map(
     m = executor.benchmark({1: "x"})
 
     assert m.mode == ("events" if syncs else "staged")
-    assert all(isinstance(t, rocm_module.pytorch_ops.ReplayTensors) for t in compiled.seen)
+    assert all(
+        isinstance(t, rocm_module.pytorch_ops.ReplayTensors) for t in compiled.seen
+    )
     assert len({id(t) for t in compiled.seen}) == 1
     assert dict(compiled.seen[0]) == {1: "x"}
 
@@ -253,7 +255,9 @@ def test_host_sync_during_priming_selects_events_mode(
     assert not any(e[0] == "arm" for e in fake_cuda.log if isinstance(e, tuple))
 
 
-def test_cuda_build_times_with_torch_events(cuda_module, monkeypatch, fake_cuda) -> None:
+def test_cuda_build_times_with_torch_events(
+    cuda_module, monkeypatch, fake_cuda
+) -> None:
     executor, _ = _prepared(cuda_module, monkeypatch, fake_cuda)
 
     m = executor.benchmark({})

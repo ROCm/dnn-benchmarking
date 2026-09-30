@@ -57,9 +57,7 @@ class PyTorchCudaExecutor:
         # ROCm torch shares the HIP runtime, so HIP events (and staging) can
         # bracket its stream; CUDA torch must use torch.cuda events.
         self._backend = (
-            "hip"
-            if torch_support.is_rocm_build() and is_hip_available()
-            else "torch"
+            "hip" if torch_support.is_rocm_build() and is_hip_available() else "torch"
         )
         self._init_time_ms: float = 0.0
         self._stream: Optional[Any] = None

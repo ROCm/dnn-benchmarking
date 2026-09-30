@@ -619,7 +619,9 @@ class Setup:
 
         if (ROCM_LIBRARIES_DIR / ".git").exists():
             if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
-                run_git(["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "add", "cmake"])
+                run_git(
+                    ["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "add", "cmake"]
+                )
             # An existing checkout is reused as-is, so a pin bump or a broken
             # sparse clone would otherwise go unnoticed.
             head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
@@ -673,7 +675,14 @@ class Setup:
             # older.
             run_git([*git, "sparse-checkout", "init", "--cone"])
             run_git(
-                [*git, "sparse-checkout", "set", "cmake", "projects/hipdnn", "dnn-providers"]
+                [
+                    *git,
+                    "sparse-checkout",
+                    "set",
+                    "cmake",
+                    "projects/hipdnn",
+                    "dnn-providers",
+                ]
             )
             run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
             run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
@@ -1390,7 +1399,9 @@ class Setup:
     def confirm_build(self) -> None:
         actions = []
         if self.clean and self.venv_dir.is_dir():
-            actions.append(f"delete and recreate the virtual environment at {self.venv_dir}")
+            actions.append(
+                f"delete and recreate the virtual environment at {self.venv_dir}"
+            )
         if self.do_build:
             actions.append(
                 "build and install hipDNN and provider plugins from source"
@@ -1412,7 +1423,9 @@ class Setup:
         if result.returncode == 0:
             sys.stdout.write(result.stdout)
         else:
-            warn("hipdnn_frontend could not be imported (ROCm runtime or bindings missing).")
+            warn(
+                "hipdnn_frontend could not be imported (ROCm runtime or bindings missing)."
+            )
 
         result = subprocess.run(
             [self.py, "-m", "dnn_benchmarking", "--help"],
@@ -1515,7 +1528,9 @@ class Setup:
                 "bindings, and ROCm environment setup."
             )
         else:
-            stages.append(("rocm-libraries sources", self.ensure_rocm_libraries_checkout))
+            stages.append(
+                ("rocm-libraries sources", self.ensure_rocm_libraries_checkout)
+            )
             if self.do_build:
                 stages.append(("Build dependencies", self.install_build_deps))
             stages += [
@@ -1579,7 +1594,9 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.clean and args.torch_mode == "existing":
-        parser.error("--clean deletes the virtual environment --torch-mode existing reuses")
+        parser.error(
+            "--clean deletes the virtual environment --torch-mode existing reuses"
+        )
     setup = Setup(args)
     try:
         return setup.run()

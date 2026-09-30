@@ -58,7 +58,11 @@ def _verdict(match: Optional[bool]) -> CorrectnessResult:
 
 def _graph(*rows: ProviderEngineResult, **kwargs) -> GraphResult:
     return GraphResult(
-        graph_name="g", graph_path="/tmp/g.json", results=list(rows), engine_ids=[1], **kwargs
+        graph_name="g",
+        graph_path="/tmp/g.json",
+        results=list(rows),
+        engine_ids=[1],
+        **kwargs,
     )
 
 
@@ -117,7 +121,10 @@ class TestTableLayout:
 
     def test_skipped_and_error_rows_show_their_reason(self) -> None:
         skipped = ProviderEngineResult.skipped_row(
-            "hipdnn", 7, "No engine configurations available for the graph.", engine_name="SKIPPER"
+            "hipdnn",
+            7,
+            "No engine configurations available for the graph.",
+            engine_name="SKIPPER",
         )
         errored = ProviderEngineResult.error_row(
             "hipdnn", 8, "HIP error:\n  invalid device function", engine_name="BROKEN"
@@ -148,7 +155,7 @@ class TestTableLayout:
         reporter.print_graph_table(_graph(_row()))
         first = out.getvalue()
         reporter.print_graph_table(_graph(_row()))
-        second = out.getvalue()[len(first):]
+        second = out.getvalue()[len(first) :]
         assert len(second.splitlines()) < len(first.splitlines())
 
     def test_iqr_column_is_iqr_over_median(self) -> None:
@@ -181,7 +188,9 @@ class TestTableLayout:
     def test_no_engine_graph_shows_why(self) -> None:
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_table(
-            GraphResult("g", "/tmp/g.json", [], message="No engine configurations available")
+            GraphResult(
+                "g", "/tmp/g.json", [], message="No engine configurations available"
+            )
         )
         assert "No engine configurations available" in out.getvalue()
 
@@ -232,7 +241,10 @@ class TestOracleColumn:
             (_oracle_row(_verdict(False)), "invalid"),
             (_oracle_row(correctness=_verdict(False)), "invalid"),
             # One compiled plan and no provider search: the ratio is noise.
-            (_oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1), "no-search"),
+            (
+                _oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1),
+                "no-search",
+            ),
             (
                 _oracle_row(
                     compiled_plans_benchmarked=1,
@@ -285,10 +297,14 @@ class TestVerboseBlock:
 
         assert "MIOPEN_ENGINE (0x15B46865C717A122)" in text
         assert "build 4.5 ms" in text and "first call 7.8 s" in text
-        kernel = next(line.split() for line in text.splitlines() if line.split()[:1] == ["kernel"])
+        kernel = next(
+            line.split() for line in text.splitlines() if line.split()[:1] == ["kernel"]
+        )
         # n, mean, median, std, min, p95, max, unit
         assert kernel[1] == "100" and kernel[3] == "25.600" and kernel[-1] == "µs"
-        submit = next(line.split() for line in text.splitlines() if line.split()[:1] == ["submit"])
+        submit = next(
+            line.split() for line in text.splitlines() if line.split()[:1] == ["submit"]
+        )
         assert submit[1] == "10" and submit[6] == "-"  # no p95 below 20 samples
         assert "sclk 1700->1500 MHz" in text
         assert "FAILED" in text and "max_abs_diff 6.20e-03" in text

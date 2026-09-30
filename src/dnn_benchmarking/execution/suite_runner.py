@@ -505,9 +505,13 @@ def _prepare_references(
     if outputs is not None:
         ctx.reference_outputs = outputs
     elif config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT:
-        ctx.reference_error = row.error_message or row.skip_reason or (
-            f"Requested PyTorch SDPA backend '{config.pytorch_sdpa_backend.value}' "
-            "is unavailable; no fallback is used."
+        ctx.reference_error = (
+            row.error_message
+            or row.skip_reason
+            or (
+                f"Requested PyTorch SDPA backend '{config.pytorch_sdpa_backend.value}' "
+                "is unavailable; no fallback is used."
+            )
         )
     else:
         ctx.reference_outputs, ctx.reference_error = _compute_reference_outputs_once(
@@ -583,7 +587,9 @@ def run_graph_all_providers(
 
     for selection in config.engine_selections_for(engine_ids):
         graph.results.append(
-            _run_engine_selection(ctx, handle, selection.engine_id, selection.plugin_path)
+            _run_engine_selection(
+                ctx, handle, selection.engine_id, selection.plugin_path
+            )
         )
     return graph
 

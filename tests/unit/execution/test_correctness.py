@@ -14,8 +14,13 @@ from dnn_benchmarking.validation import ReferenceOutput
 
 def _out(uid, data_type="float"):
     return TensorInfo(
-        uid=uid, name=f"t{uid}", dims=[4], strides=[1], data_type=data_type,
-        is_virtual=False, is_output=True,
+        uid=uid,
+        name=f"t{uid}",
+        dims=[4],
+        strides=[1],
+        data_type=data_type,
+        is_virtual=False,
+        is_output=True,
     )
 
 
@@ -33,7 +38,9 @@ class _HostBM:
 
 
 def _config(rtol=None, atol=None):
-    return SuiteConfig(validation=ValidationConfig(provider="pytorch", rtol=rtol, atol=atol))
+    return SuiteConfig(
+        validation=ValidationConfig(provider="pytorch", rtol=rtol, atol=atol)
+    )
 
 
 def _ref(data):
@@ -55,10 +62,12 @@ def test_tolerance_by_dtype_and_override(data_type, rtol, atol, expected):
 
 def test_aggregates_over_outputs_and_names_the_failing_output():
     ref = {1: _ref([1, 2, 3, 4]), 2: _ref([1, 1, 1, 1])}
-    bm = _HostBM({
-        1: np.array([1, 2, 3, 4], np.float32),
-        2: np.array([1, 1, 9, 5], np.float32),
-    })
+    bm = _HostBM(
+        {
+            1: np.array([1, 2, 3, 4], np.float32),
+            2: np.array([1, 1, 9, 5], np.float32),
+        }
+    )
 
     c = check_correctness(bm, [_out(1), _out(2)], ref, "pytorch", _config())
 
@@ -104,7 +113,10 @@ def test_device_reference_is_compared_without_host_copy():
         def get_output_data(self, uid):
             raise AssertionError("host copy made despite a device reference")
 
-    ref = {1: ReferenceOutput(data=np.ones(4, np.float32), tensor_uid=1,
-                              device_data=torch.ones(4))}
+    ref = {
+        1: ReferenceOutput(
+            data=np.ones(4, np.float32), tensor_uid=1, device_data=torch.ones(4)
+        )
+    }
 
     assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed

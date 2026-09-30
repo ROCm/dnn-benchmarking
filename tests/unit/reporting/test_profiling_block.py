@@ -38,11 +38,14 @@ def test_no_profiling_data_renders_no_profiling_lines(extra) -> None:
 
 def test_pmc_shows_busiest_kernels_first_and_folds_the_rest() -> None:
     per_kernel = {
-        f"kernel_{i}": {"dispatches": i, "counters": {"SQ_WAVES": 64.0 * i}} for i in range(1, 6)
+        f"kernel_{i}": {"dispatches": i, "counters": {"SQ_WAVES": 64.0 * i}}
+        for i in range(1, 6)
     }
     per_kernel["kernel_5"]["counters"].update({"A": 1.0, "B": 2.0, "C": 3.0})
     per_kernel["kernel_5"]["l2_hit_rate"] = 0.85
-    text = _render({"pmc": {"set": "basic", "arch": "gfx90a", "per_kernel": per_kernel}})
+    text = _render(
+        {"pmc": {"set": "basic", "arch": "gfx90a", "per_kernel": per_kernel}}
+    )
 
     pmc_lines = [line for line in text.splitlines() if "pmc (basic, gfx90a)" in line]
     assert "kernel_5 x5" in pmc_lines[0]
@@ -54,7 +57,9 @@ def test_pmc_shows_busiest_kernels_first_and_folds_the_rest() -> None:
 
 def test_pmc_db_path_renders_with_analyze_hint() -> None:
     db = "/tmp/prof/sample/MIOPEN_ENGINE/pmc_basic/results.db"
-    text = _render({"pmc": {"set": "basic", "arch": "gfx90a", "per_kernel": {}, "db_path": db}})
+    text = _render(
+        {"pmc": {"set": "basic", "arch": "gfx90a", "per_kernel": {}, "db_path": db}}
+    )
     assert db in text
     assert f"rocprof-compute analyze --path {Path(db).parent}" in text
 
@@ -70,7 +75,9 @@ def test_failed_pass_shows_return_code_and_last_three_stderr_lines(source) -> No
 
 
 def test_timeout_shows_reason_and_stderr_tail() -> None:
-    text = _render({"perf": {"skipped": "timed out after 600 s", "error_tail": "last words"}})
+    text = _render(
+        {"perf": {"skipped": "timed out after 600 s", "error_tail": "last words"}}
+    )
     assert "perf: skipped — timed out after 600 s" in text
     assert "| last words" in text
 

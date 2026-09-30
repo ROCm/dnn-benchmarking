@@ -207,7 +207,10 @@ def test_final_write_failure_exits_1(tmp_path, backend) -> None:
     "flag, argv",
     [
         ("--output", lambda d: ["-o", str(d / "out.json")]),
-        ("--profiling-output-dir", lambda d: ["--perf", "--profiling-output-dir", str(d / "x")]),
+        (
+            "--profiling-output-dir",
+            lambda d: ["--perf", "--profiling-output-dir", str(d / "x")],
+        ),
     ],
     ids=["output", "profiling-output-dir"],
 )

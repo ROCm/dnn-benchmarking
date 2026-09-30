@@ -99,9 +99,7 @@ class PyTorchCudaBufferManager:
             if data is None:
                 if tensor_info.is_pass_by_value:
                     continue
-                raise ValueError(
-                    f"Missing input data for tensor UID {tensor_info.uid}"
-                )
+                raise ValueError(f"Missing input data for tensor UID {tensor_info.uid}")
 
             tensor = self._tensors.get(tensor_info.uid)
             if tensor is not None:

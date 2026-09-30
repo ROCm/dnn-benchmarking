@@ -37,12 +37,25 @@ ENV_KEYS = {
     "cudnn_version", "hipdnn_version", "python_version", "torch_version",
     "amdsmi_available", "selection_env", "end_of_run",
 }  # fmt: skip
-END_OF_RUN_KEYS = {"host_rss_mb", "host_ram_available_mb", "vram_used_mb", "vram_total_mb"}
+END_OF_RUN_KEYS = {
+    "host_rss_mb",
+    "host_ram_available_mb",
+    "vram_used_mb",
+    "vram_total_mb",
+}
 SUMMARY_KEYS = {
     "graphs", "rows", "passed", "unchecked", "failed", "skipped", "errors",
     "graph_errors", "no_engine_graphs",
 }  # fmt: skip
-GRAPH_KEYS = {"graph_id", "graph_name", "graph_path", "status", "error", "message", "results"}
+GRAPH_KEYS = {
+    "graph_id",
+    "graph_name",
+    "graph_path",
+    "status",
+    "error",
+    "message",
+    "results",
+}
 ROW_KEYS = {
     "provider", "role", "engine", "status", "verdict", "message", "started_at",
     "elapsed_s", "build_ms", "timing", "kernel", "host", "metrics", "correctness",
@@ -127,7 +140,12 @@ def full_suite() -> SuiteResult:
         derived_tflops_per_s=2.0,
         derived_gbytes_per_s=2000.0,
         vram_used_mb=512.0,
-        extra_metrics={"pmc": {"SQ_WAVES": 64}, "perf": None, "roofline": None, "trace": None},
+        extra_metrics={
+            "pmc": {"SQ_WAVES": 64},
+            "perf": None,
+            "roofline": None,
+            "trace": None,
+        },
         oracle=oracle,
         oracle_delta=build_oracle_delta(oracle),
         timing=TimingInfo("staged", "hip", "warm", 10, 12.5),

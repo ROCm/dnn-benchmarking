@@ -52,9 +52,7 @@ def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
     return lifetime
 
 
-def _resolve_graphs(
-    args, reporter
-) -> tuple[list, Optional[List[str]], Optional[str]]:
+def _resolve_graphs(args, reporter) -> tuple[list, Optional[List[str]], Optional[str]]:
     """Resolve --graph args. Returns (tmpdirs, files or None, tarball_source)."""
     from ..graph.resolver import is_tarball, resolve_graph_files_multi
 

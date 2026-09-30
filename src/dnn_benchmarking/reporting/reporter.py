@@ -92,7 +92,9 @@ def _reason(pe: ProviderEngineResult) -> Optional[str]:
 def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
     """Why the oracle speedup is not reportable, or None when it is."""
     tuned_verdict = pe.oracle.correctness if pe.oracle is not None else None
-    if any(v is not None and v.explicitly_failed for v in (pe.correctness, tuned_verdict)):
+    if any(
+        v is not None and v.explicitly_failed for v in (pe.correctness, tuned_verdict)
+    ):
         # A wrong baseline or tuned plan cannot measure a gain.
         return "invalid"
     if pe.oracle is not None and not pe.oracle.tuning_available:
@@ -249,17 +251,26 @@ class Reporter:
             text
             for text in (
                 env.get("gpu_arch"),
-                f"{env['gpu_compute_units']} CUs" if env.get("gpu_compute_units") else None,
+                (
+                    f"{env['gpu_compute_units']} CUs"
+                    if env.get("gpu_compute_units")
+                    else None
+                ),
                 f"{env['gpu_hbm_gb']:g} GB HBM" if env.get("gpu_hbm_gb") else None,
             )
             if text
         ]
         gpu = env.get("gpu_model") or "unknown GPU"
-        self._print(f"GPU:     {gpu}" + (f" ({', '.join(gpu_extras)})" if gpu_extras else ""))
+        self._print(
+            f"GPU:     {gpu}" + (f" ({', '.join(gpu_extras)})" if gpu_extras else "")
+        )
         # A CUDA wheel reports cuda_version; a ROCm wheel does not.
         if env.get("cuda_version"):
             cudnn = env.get("cudnn_version")
-            self._print(f"CUDA:    {env['cuda_version']}" + (f", cuDNN {cudnn}" if cudnn else ""))
+            self._print(
+                f"CUDA:    {env['cuda_version']}"
+                + (f", cuDNN {cudnn}" if cudnn else "")
+            )
         else:
             self._print(f"ROCm:    {env.get('rocm_version') or 'unknown'}")
         rc = run_config
@@ -270,7 +281,9 @@ class Reporter:
         )
         self._print()
 
-    def print_summary(self, suite_result: SuiteResult, output_path: Optional[str]) -> None:
+    def print_summary(
+        self, suite_result: SuiteResult, output_path: Optional[str]
+    ) -> None:
         """Print row/graph counts and where the results were written."""
         s = suite_result.summary()
         line = (
@@ -302,7 +315,9 @@ class Reporter:
                 "(no tuning alternatives or invalid results)"
             )
             return
-        suffix = f"; {excluded} row(s) excluded (no search or invalid)" if excluded else ""
+        suffix = (
+            f"; {excluded} row(s) excluded (no search or invalid)" if excluded else ""
+        )
         self._print(
             f"Oracle: {len(speedups)} tuned row(s), geomean speedup "
             f"{geometric_mean(speedups):.2f}x{suffix}"
@@ -345,10 +360,39 @@ class Reporter:
             ("engine", False, [_display_name(pe) for pe in rows]),
             ("verdict", False, [pe.verdict for pe in rows]),
             ("kernel_med", True, [self._kernel_cell(pe) for pe in rows]),
-            ("iqr%", True, ["-" if pe.gpu_kernel_stats is None else f"{_iqr_pct(pe.gpu_kernel_stats):.1f}" for pe in rows]),
-            ("submit", True, ["-" if pe.host_stats is None else _fmt_time(pe.host_stats.median_ms) for pe in rows]),
+            (
+                "iqr%",
+                True,
+                [
+                    (
+                        "-"
+                        if pe.gpu_kernel_stats is None
+                        else f"{_iqr_pct(pe.gpu_kernel_stats):.1f}"
+                    )
+                    for pe in rows
+                ],
+            ),
+            (
+                "submit",
+                True,
+                [
+                    "-" if pe.host_stats is None else _fmt_time(pe.host_stats.median_ms)
+                    for pe in rows
+                ],
+            ),
             ("tflops", True, [self._tflops_cell(pe) for pe in rows]),
-            ("gbps", True, ["-" if pe.derived_gbytes_per_s is None else f"{pe.derived_gbytes_per_s:.1f}" for pe in rows]),
+            (
+                "gbps",
+                True,
+                [
+                    (
+                        "-"
+                        if pe.derived_gbytes_per_s is None
+                        else f"{pe.derived_gbytes_per_s:.1f}"
+                    )
+                    for pe in rows
+                ],
+            ),
             ("vs_best", True, [self._vs_best_cell(pe, best) for pe in rows]),
         ]
         if with_oracle:
@@ -362,8 +406,11 @@ class Reporter:
         # Engine name and note absorb the squeeze; numeric columns never do.
         has_note = columns[-1][0] == "note"
         flexible = {0, len(columns) - 1} if has_note else {0}
-        budget = width - 2 - 2 * (len(columns) - 1) - sum(
-            w for i, w in enumerate(natural) if i not in flexible
+        budget = (
+            width
+            - 2
+            - 2 * (len(columns) - 1)
+            - sum(w for i, w in enumerate(natural) if i not in flexible)
         )
         if has_note:
             # The name keeps up to 32 columns; the note gets what remains.
@@ -384,7 +431,9 @@ class Reporter:
             self._print(render([cells[i] for _, _, cells in columns]))
         if not self._legend_done:
             self._legend_done = True
-            for line in textwrap.wrap(self._legend(rows), width, subsequent_indent="  "):
+            for line in textwrap.wrap(
+                self._legend(rows), width, subsequent_indent="  "
+            ):
                 self._print(line)
         self._print()
         if self._verbose:
@@ -415,14 +464,21 @@ class Reporter:
     def _tflops_cell(pe: ProviderEngineResult) -> str:
         if pe.derived_tflops_per_s is None:
             return "-"
-        return ("~" if pe.analytical_flops_partial else "") + f"{pe.derived_tflops_per_s:.2f}"
+        return (
+            "~" if pe.analytical_flops_partial else ""
+        ) + f"{pe.derived_tflops_per_s:.2f}"
 
     @staticmethod
     def _vs_best_cell(pe: ProviderEngineResult, best: Optional[float]) -> str:
         if pe.role == "reference":
             return "ref"
         stats = pe.gpu_kernel_stats
-        if best is None or pe.status != "success" or stats is None or stats.median_ms <= 0:
+        if (
+            best is None
+            or pe.status != "success"
+            or stats is None
+            or stats.median_ms <= 0
+        ):
             return "-"
         return f"{best / stats.median_ms:.2f}x"
 
@@ -478,7 +534,9 @@ class Reporter:
             add("cost", ", ".join(costs))
         if pe.timing is not None:
             t = pe.timing
-            text = f"{t.mode}/{t.backend}, cache {t.cache_mode}, warmup {t.warmup_iters}"
+            text = (
+                f"{t.mode}/{t.backend}, cache {t.cache_mode}, warmup {t.warmup_iters}"
+            )
             if t.capped:
                 text += ", capped at max iters"
             if t.fallback_reason:
@@ -503,20 +561,35 @@ class Reporter:
 
     @staticmethod
     def _stats_lines(pe: ProviderEngineResult) -> List[str]:
-        named = [(n, s) for n, s in (("kernel", pe.gpu_kernel_stats), ("submit", pe.host_stats)) if s]
+        named = [
+            (n, s)
+            for n, s in (("kernel", pe.gpu_kernel_stats), ("submit", pe.host_stats))
+            if s
+        ]
         if not named:
             return []
         cols = ("mean", "median", "std", "min", "p95", "max")
         lines = [f"    {'':<12}{'n':>6}" + "".join(f"{c:>10}" for c in cols)]
         for name, s in named:
             scale, suffix = _unit(s.median_ms)
-            values = (s.mean_ms, s.median_ms, s.std_ms, s.min_ms, s.p95_ms if s.n >= 20 else None, s.max_ms)
-            cells = "".join(f"{'-':>10}" if v is None else f"{v * scale:>10.3f}" for v in values)
+            values = (
+                s.mean_ms,
+                s.median_ms,
+                s.std_ms,
+                s.min_ms,
+                s.p95_ms if s.n >= 20 else None,
+                s.max_ms,
+            )
+            cells = "".join(
+                f"{'-':>10}" if v is None else f"{v * scale:>10.3f}" for v in values
+            )
             lines.append(f"    {name:<12}{s.n:>6}{cells}  {suffix}")
         return lines
 
     @staticmethod
-    def _clocks_text(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> str:
+    def _clocks_text(
+        before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]
+    ) -> str:
         before, after = before or {}, after or {}
         parts = []
         for key, label, unit in _CLOCK_KEYS:
@@ -583,10 +656,14 @@ class Reporter:
                 else "exhaustive unsupported by this engine; plan-level tuning only"
             )
         if not o.tuning_available:
-            lines.append("no tuning alternative: re-measured the heuristic plan; delta is noise")
+            lines.append(
+                "no tuning alternative: re-measured the heuristic plan; delta is noise"
+            )
         if o.correctness is not None and not o.correctness.passed:
             detail = o.correctness.error_message or "output mismatch"
-            lines.append(f"tuned plan FAILED validation ({detail}); no speedup reported")
+            lines.append(
+                f"tuned plan FAILED validation ({detail}); no speedup reported"
+            )
         d = pe.oracle_delta
         if d is not None:
             lines.append(
@@ -608,23 +685,31 @@ class Reporter:
             if "error_tail" in slc:
                 if "skipped" not in slc:
                     lines.append(f"{name}: failed (rc={slc.get('returncode', '?')})")
-                lines.extend(f"  | {t}" for t in str(slc["error_tail"]).splitlines()[-3:])
+                lines.extend(
+                    f"  | {t}" for t in str(slc["error_tail"]).splitlines()[-3:]
+                )
 
         trace = extra.get("trace")
         if isinstance(trace, dict):
             name = f"trace ({trace.get('format', '?')})"
             if trace.get("path"):
-                lines.append(f"{name}: {trace['path']}  (open in https://ui.perfetto.dev/)")
+                lines.append(
+                    f"{name}: {trace['path']}  (open in https://ui.perfetto.dev/)"
+                )
             failures(name, trace)
 
         pmc = extra.get("pmc")
         if isinstance(pmc, dict):
             name = f"pmc ({pmc.get('set', '?')}, {pmc.get('arch', '?')})"
             per_kernel = pmc.get("per_kernel") or {}
-            ranked = sorted(per_kernel.items(), key=lambda kv: -kv[1].get("dispatches", 0))
+            ranked = sorted(
+                per_kernel.items(), key=lambda kv: -kv[1].get("dispatches", 0)
+            )
             for kernel, data in ranked[:3]:
                 counters = data.get("counters") or {}
-                shown = "  ".join(f"{c}={v:,.4g}" for c, v in list(counters.items())[:3])
+                shown = "  ".join(
+                    f"{c}={v:,.4g}" for c, v in list(counters.items())[:3]
+                )
                 more = f"  [+{len(counters) - 3}]" if len(counters) > 3 else ""
                 l2 = data.get("l2_hit_rate")
                 l2_text = f"  l2_hit {l2:.1%}" if isinstance(l2, (int, float)) else ""

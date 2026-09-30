@@ -188,7 +188,9 @@ def compare(
             continue
         rows_b = {_row_key(r): r for r in gb["results"]}
         for ra in ga["results"]:
-            pairs.append(_pair(name, ra, rows_b.pop(_row_key(ra), None), metric, threshold))
+            pairs.append(
+                _pair(name, ra, rows_b.pop(_row_key(ra), None), metric, threshold)
+            )
         pairs.extend(_pair(name, None, rb, metric, threshold) for rb in rows_b.values())
     ratios = [p.speedup for p in pairs if p.in_geomean]
     return {
@@ -225,7 +227,9 @@ def _describe(label: str, path: str, doc: Dict[str, Any]) -> str:
     )
 
 
-def _print_table(report: Dict[str, Any], a: Tuple[str, Dict], b: Tuple[str, Dict]) -> None:
+def _print_table(
+    report: Dict[str, Any], a: Tuple[str, Dict], b: Tuple[str, Dict]
+) -> None:
     out, width = sys.stdout, _width()
     print(_clip(_describe("A", *a), width), file=out)
     print(_clip(_describe("B", *b), width), file=out)
@@ -240,15 +244,21 @@ def _print_table(report: Dict[str, Any], a: Tuple[str, Dict], b: Tuple[str, Dict
         ("A time", True, [_time(p["a_ms"]) for p in pairs]),
         ("B engine", False, [p["engine_b"] or "-" for p in pairs]),
         ("B time", True, [_time(p["b_ms"]) for p in pairs]),
-        ("speedup", True, ["-" if p["speedup"] is None else f"{p['speedup']:.2f}x" for p in pairs]),
+        (
+            "speedup",
+            True,
+            ["-" if p["speedup"] is None else f"{p['speedup']:.2f}x" for p in pairs],
+        ),
         ("note", False, [p["label"] for p in pairs]),
     ]
     widths = [max(len(h), *(len(c) for c in cells)) for h, _, cells in columns]
     # Graph and engine names share the squeeze; narrowest first so a short
     # column hands its unused share to the others.
     flex = sorted((0, 1, 3), key=lambda i: widths[i])
-    avail = width - 2 * (len(columns) - 1) - sum(
-        w for i, w in enumerate(widths) if i not in flex
+    avail = (
+        width
+        - 2 * (len(columns) - 1)
+        - sum(w for i, w in enumerate(widths) if i not in flex)
     )
     for n, i in enumerate(flex):
         widths[i] = min(widths[i], max(8, avail // (len(flex) - n)))

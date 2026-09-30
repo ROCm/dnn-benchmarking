@@ -250,7 +250,9 @@ class TestGenerateInputData:
         assert data.min() >= 0.0 and data.max() <= 1.0
         assert len(np.unique(data)) > 1
 
-    @pytest.mark.parametrize("data_type", ["int8", "uint8", "int32", "int64", "boolean"])
+    @pytest.mark.parametrize(
+        "data_type", ["int8", "uint8", "int32", "int64", "boolean"]
+    )
     def test_integer_inputs_are_zero_so_indices_stay_in_bounds(self, data_type) -> None:
         tensor = _tensor(1, data_type, dims=(32, 32))
 
@@ -296,7 +298,11 @@ class TestPagedInputGeneration:
     def _graph(self):
         return {
             "tensors": [
-                {"uid": 2, "name": "K", "dims": [self.NUM_PAGES, 4, self.PAGE_SIZE, 128]},
+                {
+                    "uid": 2,
+                    "name": "K",
+                    "dims": [self.NUM_PAGES, 4, self.PAGE_SIZE, 128],
+                },
             ],
             "nodes": [
                 {
