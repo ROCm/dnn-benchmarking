@@ -565,6 +565,9 @@ class SuiteMetadata:
             selected.
         pytorch_rocm_fa_library_requested: Requested ROCm Flash Attention
             implementation preference; None when not requested.
+        timing_block: Executions per timed sample. ``1`` means each
+            ``gpu_kernel_stats`` sample is one execution; ``N > 1`` means each
+            sample is the average of ``N`` back-to-back executions.
         rocm_version: ROCm/HIP version string (None on CUDA hosts).
         cuda_version: CUDA toolkit version the torch wheel was built
             against (None on ROCm hosts).
@@ -612,6 +615,7 @@ class SuiteMetadata:
     error_combinations: int
     pytorch_sdpa_backend_requested: Optional[str] = None
     pytorch_rocm_fa_library_requested: Optional[str] = None
+    timing_block: int = 1
     rocm_version: Optional[str] = None
     cuda_version: Optional[str] = None
     cudnn_version: Optional[str] = None
@@ -649,6 +653,7 @@ class SuiteMetadata:
             "pytorch_rocm_fa_library_requested": (
                 self.pytorch_rocm_fa_library_requested
             ),
+            "timing_block": self.timing_block,
             "rocm_version": self.rocm_version,
             "cuda_version": self.cuda_version,
             "cudnn_version": self.cudnn_version,
@@ -695,6 +700,7 @@ class SuiteResult:
         *,
         pytorch_sdpa_backend_requested: Optional[str] = None,
         pytorch_rocm_fa_library_requested: Optional[str] = None,
+        timing_block: int = 1,
         oracle: bool = False,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
@@ -758,6 +764,7 @@ class SuiteResult:
             error_combinations=total_error,
             pytorch_sdpa_backend_requested=pytorch_sdpa_backend_requested,
             pytorch_rocm_fa_library_requested=pytorch_rocm_fa_library_requested,
+            timing_block=timing_block,
             rocm_version=env_info.get("rocm_version"),
             cuda_version=env_info.get("cuda_version"),
             cudnn_version=env_info.get("cudnn_version"),

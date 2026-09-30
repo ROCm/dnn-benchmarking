@@ -522,6 +522,7 @@ def _run_timed_pytorch_row(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
+                timing_block=config.timing_block,
                 engine_id=0,
                 pytorch_sdpa_backend=config.pytorch_sdpa_backend,
                 pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
@@ -1107,6 +1108,7 @@ def _run_oracle_pass(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
+                timing_block=config.timing_block,
                 engine_id=engine_id,
             )
             executor = Executor(
@@ -1256,6 +1258,7 @@ def run_single_provider_engine(
             graph_path=graph_path,
             warmup_iters=config.warmup_iters,
             benchmark_iters=config.benchmark_iters,
+            timing_block=config.timing_block,
             engine_id=engine_id,
         )
 

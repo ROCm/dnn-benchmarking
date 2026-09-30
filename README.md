@@ -188,6 +188,10 @@ dnn-benchmark --graph ./graphs/sample_conv_fwd.json --engine 1,2
 # Multiple graphs (glob): same path, default summary table
 dnn-benchmark --graph 'graphs/*.json' --warmup 10 --iters 100
 
+# Block timing: each of the 100 samples times 50 back-to-back executions and
+# records elapsed/50, matching the rocKE benchmarks' timing method
+dnn-benchmark --graph 'graphs/*.json' --iters 100 --timing-block 50
+
 # With reproducible random seed
 dnn-benchmark --graph ./graphs/sample_conv_fwd.json --seed 42
 ```

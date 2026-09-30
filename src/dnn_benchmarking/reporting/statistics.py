@@ -99,7 +99,8 @@ class BenchmarkMetadata:
         graph_name: Name/identifier of the graph being benchmarked.
         graph_path: Path to the graph JSON file.
         warmup_iters: Number of warmup iterations.
-        benchmark_iters: Number of benchmark iterations.
+        benchmark_iters: Number of benchmark iterations (timed samples).
+        timing_block: Executions per timed sample (1 = per-execution timing).
         engine_id: Engine ID used for execution.
         timing_backend: GPU timer backend used ("hip" or "").
         execution_backend: Execution backend used ("hipdnn", "pytorch", or "").
@@ -115,6 +116,7 @@ class BenchmarkMetadata:
     graph_path: str = ""
     warmup_iters: int = 0
     benchmark_iters: int = 0
+    timing_block: int = 1
     engine_id: int = 0
     timing_backend: str = ""
     execution_backend: str = ""

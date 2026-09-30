@@ -487,8 +487,12 @@ class Executor:
         # Stalled-queue staging measures a gap-free GPU span and pure host
         # submission cost; available only on HIP devices supporting
         # stream-wait-value. Falls back to the non-staged loop otherwise.
+        # Block timing (timing_block > 1) always uses the plain event loop:
+        # N executions queued behind the stall gate can fill the HIP queue
+        # and block the host before the gate is released.
+        block = self._config.timing_block
         staged_timer: Optional[StalledRegionTimer] = None
-        if self._collect_kernel_timing and _is_staged_hip_available():
+        if block == 1 and self._collect_kernel_timing and _is_staged_hip_available():
             try:
                 staged_timer = StalledRegionTimer(stream)
             except RuntimeError:
@@ -527,21 +531,25 @@ class Executor:
                     kernel_timings = []
                     timing_backend_name = gpu_timer.backend_name
 
+            # Each sample times ``block`` back-to-back executions between one
+            # event pair and records the per-execution average (block == 1 is
+            # plain per-execution timing).
             for _ in range(self._config.benchmark_iters):
                 kernel_ms = None
                 with Timer() as t:
                     if gpu_timer:
                         gpu_timer.start()
-                    result = self._graph.execute(
-                        handle, variant_pack, self._workspace_ptr
-                    )
-                    if result.is_bad():
-                        raise ExecutionError(
-                            f"Benchmark execution failed: {result.get_message()}"
+                    for _ in range(block):
+                        result = self._graph.execute(
+                            handle, variant_pack, self._workspace_ptr
                         )
+                        if result.is_bad():
+                            raise ExecutionError(
+                                f"Benchmark execution failed: {result.get_message()}"
+                            )
                     if gpu_timer:
                         gpu_timer.stop()
-                        kernel_ms = gpu_timer.elapsed_ms()
+                        kernel_ms = gpu_timer.elapsed_ms() / block
                     else:
                         if stream_sync_timer is None:
                             stream_sync_timer = self._get_stream_sync_timer(stream)
@@ -550,7 +558,7 @@ class Executor:
                 if kernel_ms is not None:
                     assert kernel_timings is not None
                     kernel_timings.append(kernel_ms)
-                host_timings.append(t.elapsed_ms)
+                host_timings.append(t.elapsed_ms / block)
 
         # Build metadata
         metadata = BenchmarkMetadata(
@@ -558,6 +566,7 @@ class Executor:
             graph_path=str(self._config.graph_path),
             warmup_iters=self._config.warmup_iters,
             benchmark_iters=self._config.benchmark_iters,
+            timing_block=block,
             engine_id=self._config.engine_id,
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.HIPDNN.value,

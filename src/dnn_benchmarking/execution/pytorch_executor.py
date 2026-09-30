@@ -180,9 +180,13 @@ class PyTorchCudaExecutor:
         # via .item()) are made async-safe by resolving those scalars once,
         # before the gated loop, via ReplayTensors. Staging is HIP-only; CUDA
         # torch and capability mismatches fall back to direct GPU-event timing.
+        # Block timing (timing_block > 1) always uses the event loop; see
+        # Executor.benchmark for why it skips the stall gate.
+        block = self._config.timing_block
         staged_timer: Optional[StalledRegionTimer] = None
         if (
-            self._collect_kernel_timing
+            block == 1
+            and self._collect_kernel_timing
             and self._resolve_timing_backend() is TimingBackendName.HIP
             and _is_staged_hip_available()
         ):
@@ -221,17 +225,18 @@ class PyTorchCudaExecutor:
                     with torch.cuda.stream(self._get_stream()):
                         if gpu_timer is not None:
                             gpu_timer.start()
-                        self._execute_graph(tensors)
+                        for _ in range(block):
+                            self._execute_graph(tensors)
                         if gpu_timer is not None:
                             gpu_timer.stop()
-                            kernel_ms = gpu_timer.elapsed_ms()
+                            kernel_ms = gpu_timer.elapsed_ms() / block
                         else:
                             self._synchronize_stream()
 
             if kernel_ms is not None:
                 assert kernel_timings is not None
                 kernel_timings.append(kernel_ms)
-            host_timings.append(t.elapsed_ms)
+            host_timings.append(t.elapsed_ms / block)
 
         # Build metadata
         metadata = BenchmarkMetadata(
@@ -239,6 +244,7 @@ class PyTorchCudaExecutor:
             graph_path=str(self._config.graph_path),
             warmup_iters=self._config.warmup_iters,
             benchmark_iters=self._config.benchmark_iters,
+            timing_block=block,
             engine_id=self._config.engine_id,
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.PYTORCH.value,
