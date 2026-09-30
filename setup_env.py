@@ -450,10 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
             "rather than a value unless it is written '--cmake-arg=-DFOO=ON'. "
             "On Linux, rocKE (HIPKERNELPROVIDER_ENABLE_ROCKE, "
             "HIPDNN_ENABLE_KERNEL_INGESTOR) is ON by default; set both OFF to "
-            "skip it. Turning an engine's "
-            "option OFF still installs the plugin .so, so --plugin-path looks "
-            "satisfied and graphs only that engine supports report 'no engines "
-            "applicable'."
+            "skip it."
         ),
     )
     parser.add_argument(
