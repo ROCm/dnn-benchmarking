@@ -5,15 +5,44 @@
 
 Attention forward is two batched matmuls (``QKᵀ`` then ``P·V``); FMA = 2
 FLOPs. Only query heads count (GQA repeats KV heads, which adds no
-arithmetic); softmax/exp/scaling are ignored (matmul-only convention).
+arithmetic); softmax/exp/scaling/sinks are ignored (matmul-only convention).
 
     flops = 2 * batch * num_q_heads * num_nonmasked * (head_dim_qk + head_dim_vo)
 
-where ``num_nonmasked`` is the score-matrix area actually computed per
-query head: ``Sq * Skv`` unmasked, or the causal lower-triangle count.
+where ``num_nonmasked`` is the exact count of unmasked ``(q, kv)`` pairs per
+query head. The mask is resolved the way hipDNN's reference executor and
+providers resolve it (``extractDiagonalBandParams`` / ``getMaskType``):
+
+* deprecated ``causal_mask`` -> top-left causal (bounds/alignment ignored);
+* deprecated ``causal_mask_bottom_right`` -> bottom-right causal;
+* otherwise ``left_bound`` / ``right_bound`` / ``diagonal_alignment``, where
+  row ``i`` keeps ``kv`` in ``[i + off - left, i + off + right]`` with
+  ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT); an unset bound is
+  unbounded.
+
+A causal sliding window of ``W`` keys (``left = W - 1``, ``right = 0``,
+BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
+windowed count the rocKE attention benchmarks report.
 """
 
 from typing import Any, Dict, Optional
+
+
+def _nonmasked_pairs(
+    q_seqlen: int,
+    kv_seqlen: int,
+    left: Optional[int],
+    right: Optional[int],
+    bottom_right: bool,
+) -> int:
+    """Count unmasked (q, kv) pairs for a diagonal band mask."""
+    offset = kv_seqlen - q_seqlen if bottom_right else 0
+    total = 0
+    for i in range(q_seqlen):
+        lo = max(i + offset - left, 0) if left is not None else 0
+        hi = min(i + offset + right + 1, kv_seqlen) if right is not None else kv_seqlen
+        total += max(hi - lo, 0)
+    return total
 
 
 def sdpa_fwd_flops(
@@ -22,8 +51,7 @@ def sdpa_fwd_flops(
     """FLOPs for SdpaAttributes (forward attention).
 
     Returns None (marking the graph partial) when q/k/v tensor data is
-    incomplete or a sliding-window mask is present (the bound->window
-    mapping is not modelled).
+    incomplete.
     """
     inputs = node.get("inputs", {}) or {}
     q_uid = inputs.get("q_tensor_uid")
@@ -54,24 +82,17 @@ def sdpa_fwd_flops(
         batch *= int(d)
 
     attributes = node.get("attributes", {}) or {}
-
-    # Sliding window not modelled: report unknown rather than a wrong count.
-    if (
-        attributes.get("left_bound") is not None
-        or attributes.get("right_bound") is not None
-    ):
-        return None
-
     if attributes.get("causal_mask") is True:
-        diagonal_alignment = attributes.get("diagonal_alignment", "TOP_LEFT")
-        if diagonal_alignment in ("TOP_LEFT", 0, None):
-            offset = 0
-        else:
-            offset = kv_seqlen - q_seqlen
-        num_nonmasked = sum(
-            min(max(i + 1 + offset, 0), kv_seqlen) for i in range(q_seqlen)
-        )
+        left, right, bottom_right = None, 0, False
+    elif attributes.get("causal_mask_bottom_right") is True:
+        left, right, bottom_right = None, 0, True
     else:
-        num_nonmasked = q_seqlen * kv_seqlen
+        # hipDNN encodes "unbounded" as unset or -1.
+        left = attributes.get("left_bound")
+        right = attributes.get("right_bound")
+        left = None if left is None or int(left) < 0 else int(left)
+        right = None if right is None or int(right) < 0 else int(right)
+        bottom_right = attributes.get("diagonal_alignment") in ("BOTTOM_RIGHT", 1)
 
+    num_nonmasked = _nonmasked_pairs(q_seqlen, kv_seqlen, left, right, bottom_right)
     return 2 * batch * q_heads * num_nonmasked * (head_dim_qk + head_dim_vo)

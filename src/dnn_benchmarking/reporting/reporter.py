@@ -689,16 +689,16 @@ class Reporter:
         if not any_present:
             return
 
-        # Pull the unrounded kernel mean used to derive throughput/BW so
+        # Pull the unrounded kernel median used to derive throughput/BW so
         # the printed numbers are reproducible from a single source of
-        # truth — without it, the user can't multiply the rounded mean
+        # truth — without it, the user can't multiply the rounded median
         # back through the FLOPs total to recover the printed TFLOPs.
-        kernel_mean_ms = (
-            pe.gpu_kernel_stats.mean_ms if pe.gpu_kernel_stats is not None else None
+        kernel_median_ms = (
+            pe.gpu_kernel_stats.median_ms if pe.gpu_kernel_stats is not None else None
         )
         derivation_suffix = (
-            f"  (kernel mean {kernel_mean_ms:.4f} ms)"
-            if kernel_mean_ms is not None
+            f"  (kernel median {kernel_median_ms:.4f} ms)"
+            if kernel_median_ms is not None
             else ""
         )
 

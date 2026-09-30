@@ -251,9 +251,9 @@ class ProviderEngineResult:
             recognised compute nodes.
         analytical_io_bytes: Sum of non-virtual tensor sizes (bytes).
         derived_tflops_per_s: Throughput derived from analytical_flops
-            and the GPU kernel mean time.
+            and the GPU kernel median time.
         derived_gbytes_per_s: Bandwidth derived from analytical_io_bytes
-            and the GPU kernel mean time.
+            and the GPU kernel median time.
         cpu_user_time_per_iter_us: User-space CPU time per benchmark
             iteration in microseconds (rusage delta over the loop,
             divided by ``benchmark_iters``). Mostly Python dispatch +

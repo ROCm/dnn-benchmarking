@@ -18,10 +18,13 @@ for the same kernel.
 
 Per-op formulas (FMA = 2 FLOPs throughout):
 
-* Conv2D fwd / dgrad / wgrad:
-  ``2 * N * C_in * R * S * K * H_out * W_out / group_count``
-  — see :mod:`.conv`. Matches MIOpen's
-  ``conv_driver.hpp:1706-1710``.
+* Conv 1D / 2D / 3D fwd / dgrad / wgrad:
+  ``2 * N * (C_in / group) * R * S * K * H_out * W_out``
+  — see :mod:`.conv`. Matches MIOpen's ``conv_driver.hpp`` and the
+  rocKE conv benchmarks; ``C_in / group`` comes from the weight dims.
+* SDPA fwd: ``2 * B * H_q * unmasked_pairs * (D_qk + D_vo)`` — see
+  :mod:`.sdpa`. Exact causal / sliding-window pair counts using
+  hipDNN's mask semantics.
 * GEMM: ``2 * batch * M * N * K`` — see :mod:`.matmul`. Standard
   textbook formula (e.g. NVIDIA's perf model docs).
 * Pointwise (relu, add, mul, …): ``num_output_elements`` (1 op/elem)
@@ -173,28 +176,27 @@ def compute_io_bytes(tensor_infos: Iterable[TensorInfo]) -> int:
 def derive_throughputs(
     flops: Optional[int],
     io_bytes: Optional[int],
-    kernel_mean_ms: Optional[float],
+    kernel_median_ms: Optional[float],
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Derive TFLOPs/s and GB/s from totals + mean kernel time.
+    """Derive TFLOPs/s and GB/s from totals + median kernel time.
+
+    The median is the denominator the rocKE benchmark pipeline
+    (Solera -> Strata) uses for its TFLOP/s, so the two sources are
+    comparable for the same shape. It is also robust to a single noisy
+    iteration, unlike the mean.
 
     Args:
         flops: Total analytical FLOPs (or ``None``).
         io_bytes: Total non-virtual tensor bytes (or ``None``).
-        kernel_mean_ms: Mean GPU kernel time in ms (or ``None``).
+        kernel_median_ms: Median GPU kernel time in ms (or ``None``).
 
     Returns:
         ``(tflops_per_s, gbytes_per_s)`` — either component is ``None``
         when its inputs are missing or zero.
-
-    Note: ``kernel_mean_ms`` is the plain arithmetic mean over post-warmup
-    iterations (no trimming, no outlier rejection — see
-    :class:`reporting.statistics.BenchmarkStats`). A single noisy
-    iteration can therefore skew the derived throughput; for tighter
-    signal use ``gpu_kernel_stats.min_ms`` or ``p95_ms``.
     """
-    if not kernel_mean_ms or kernel_mean_ms <= 0:
+    if not kernel_median_ms or kernel_median_ms <= 0:
         return None, None
-    seconds = kernel_mean_ms / 1000.0
+    seconds = kernel_median_ms / 1000.0
     tflops = (flops / seconds / 1e12) if flops else None
     gbytes = (io_bytes / seconds / 1e9) if io_bytes else None
     return tflops, gbytes

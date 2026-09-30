@@ -1027,15 +1027,16 @@ def _collect_basic_metrics_post_loop(
     result.analytical_flops_partial = analytical_flops_partial
     result.analytical_io_bytes = analytical_io_bytes
 
-    # Derived throughputs use the *arithmetic mean* of post-warmup kernel
-    # timings — no trimming, no outlier rejection. A single noisy iter
-    # (context switch, thermal throttle) skews the headline number; for
-    # tighter signal use gpu_kernel_stats.min_ms or p95_ms.
-    kernel_mean = (
-        result.gpu_kernel_stats.mean_ms if result.gpu_kernel_stats is not None else None
+    # Derived throughputs use the *median* post-warmup kernel time — the
+    # same denominator as the rocKE benchmark pipeline (Solera/Strata), and
+    # robust to a single noisy iteration (context switch, thermal throttle).
+    kernel_median = (
+        result.gpu_kernel_stats.median_ms
+        if result.gpu_kernel_stats is not None
+        else None
     )
     tflops, gbytes = derive_throughputs(
-        analytical_flops, analytical_io_bytes, kernel_mean
+        analytical_flops, analytical_io_bytes, kernel_median
     )
     result.derived_tflops_per_s = tflops
     result.derived_gbytes_per_s = gbytes
