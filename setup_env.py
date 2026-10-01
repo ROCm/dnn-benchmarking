@@ -39,12 +39,12 @@ HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
-ROCM_NIGHTLY_BASE = "https://rocm.nightlies.amd.com"
+ROCM_NIGHTLY_BASE = "https://nightly.repo.amd.com/rocm"
 
 # Single multi-arch nightly index for every OS: GPU selection is a pip extra
 # (torch[device-<arch>]) rather than a per-arch/per-OS URL bucket, so Linux
 # and Windows always resolve the exact same torch/rocm-sdk-* build.
-ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-multi-arch/"
+ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-next/"
 
 # Windows has no rocm_agent_enumerator/rocminfo to detect the local arch with,
 # so fall back to a default target known to have published wheels.
@@ -217,7 +217,7 @@ for root in roots:
         if not child.is_dir():
             continue
         if kind == "libraries":
-            # whl-multi-arch ships a single arch-agnostic "_rocm_sdk_libraries"
+            # Multi-arch indexes ship one arch-agnostic "_rocm_sdk_libraries"
             # package; older per-arch indexes (e.g. v2-staging) name it
             # "_rocm_sdk_libraries_<arch>". Match both.
             if child.name != "_rocm_sdk_libraries" and not child.name.startswith(
