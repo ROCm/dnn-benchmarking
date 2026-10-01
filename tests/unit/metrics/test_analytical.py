@@ -584,6 +584,21 @@ class TestComputeFlops:
         top_left, _ = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
         assert flops == top_left
 
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"left_bound": -2},
+            {"causal_mask": True, "right_bound": -5},
+            {"causal_mask": True, "causal_mask_bottom_right": True},
+        ],
+    )
+    def test_sdpa_masks_hipdnn_rejects_are_partial(self, attrs):
+        graph = _sdpa_graph()
+        graph["nodes"][0]["attributes"].update(attrs)
+        flops, partial = compute_flops(graph)
+        assert flops is None
+        assert partial is True
+
     def test_sdpa_causal_top_left_nonsquare_clamps(self):
         # Sq=8 > Skv=4 exercises the min(i+1, Skv) clamp: rows -> 1+2+3+4+4+4+4+4 = 26.
         flops, partial = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))

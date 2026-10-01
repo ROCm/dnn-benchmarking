@@ -36,6 +36,8 @@ def _nonmasked_pairs(
     bottom_right: bool,
 ) -> int:
     """Count unmasked (q, kv) pairs for a diagonal band mask."""
+    if left is None and right is None:
+        return q_seqlen * kv_seqlen
     offset = kv_seqlen - q_seqlen if bottom_right else 0
     total = 0
     for i in range(q_seqlen):
@@ -51,7 +53,8 @@ def sdpa_fwd_flops(
     """FLOPs for SdpaAttributes (forward attention).
 
     Returns None (marking the graph partial) when q/k/v tensor data is
-    incomplete.
+    incomplete, or when the mask is one hipDNN rejects (a bound below -1,
+    or both deprecated causal flags set).
     """
     inputs = node.get("inputs", {}) or {}
     q_uid = inputs.get("q_tensor_uid")
@@ -81,18 +84,30 @@ def sdpa_fwd_flops(
     for d in q_dims[:-3]:
         batch *= int(d)
 
+    # Validate and resolve the mask in the order of hipDNN's
+    # extractDiagonalBandParams; graphs hipDNN rejects get no count (None).
     attributes = node.get("attributes", {}) or {}
-    if attributes.get("causal_mask") is True:
-        left, right, bottom_right = None, 0, False
-    elif attributes.get("causal_mask_bottom_right") is True:
-        left, right, bottom_right = None, 0, True
+    left = attributes.get("left_bound")
+    right = attributes.get("right_bound")
+    left = -1 if left is None else int(left)
+    right = -1 if right is None else int(right)
+    if left < -1 or right < -1:
+        return None
+    causal_top_left = attributes.get("causal_mask") is True
+    causal_bottom_right = attributes.get("causal_mask_bottom_right") is True
+    if causal_top_left and causal_bottom_right:
+        return None
+
+    if causal_top_left or causal_bottom_right:
+        left, right, bottom_right = -1, 0, causal_bottom_right
     else:
-        # hipDNN encodes "unbounded" as unset or -1.
-        left = attributes.get("left_bound")
-        right = attributes.get("right_bound")
-        left = None if left is None or int(left) < 0 else int(left)
-        right = None if right is None or int(right) < 0 else int(right)
         bottom_right = attributes.get("diagonal_alignment") in ("BOTTOM_RIGHT", 1)
 
-    num_nonmasked = _nonmasked_pairs(q_seqlen, kv_seqlen, left, right, bottom_right)
+    num_nonmasked = _nonmasked_pairs(
+        q_seqlen,
+        kv_seqlen,
+        None if left == -1 else left,
+        None if right == -1 else right,
+        bottom_right,
+    )
     return 2 * batch * q_heads * num_nonmasked * (head_dim_qk + head_dim_vo)

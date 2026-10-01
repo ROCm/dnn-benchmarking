@@ -254,12 +254,12 @@ class ProviderEngineResult:
             and the GPU kernel median time.
         derived_gbytes_per_s: Bandwidth derived from analytical_io_bytes
             and the GPU kernel median time.
-        cpu_user_time_per_iter_us: User-space CPU time per benchmark
-            iteration in microseconds (rusage delta over the loop,
-            divided by ``benchmark_iters``). Mostly Python dispatch +
-            sync overhead.
-        cpu_kernel_time_per_iter_us: Kernel-space CPU time per
-            benchmark iteration in microseconds. Usually near zero;
+        cpu_user_time_per_iter_us: User-space CPU time per timed
+            execution in microseconds (rusage delta over the loop,
+            divided by ``benchmark_iters * timing_block``). Mostly Python
+            dispatch + sync overhead.
+        cpu_kernel_time_per_iter_us: Kernel-space CPU time per timed
+            execution in microseconds. Usually near zero;
             useful only as a spike diagnostic (heavy syscalls / page
             faults during the loop).
         vram_used_mb: Total process-wide GPU VRAM allocated at the

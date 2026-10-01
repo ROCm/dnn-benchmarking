@@ -563,7 +563,7 @@ def _run_timed_pytorch_row(
                     _collect_basic_metrics_post_loop(
                         result=result,
                         cpu_time_probe=cpu_time_probe,
-                        benchmark_iters=config.benchmark_iters,
+                        timed_executions=config.benchmark_iters * config.timing_block,
                         analytical_flops=analytical_flops,
                         analytical_flops_partial=analytical_flops_partial,
                         analytical_io_bytes=analytical_io_bytes,
@@ -995,7 +995,7 @@ def run_graph_pytorch_backend(
 def _collect_basic_metrics_post_loop(
     result: ProviderEngineResult,
     cpu_time_probe: Optional[CpuTimeProbe],
-    benchmark_iters: int,
+    timed_executions: int,
     analytical_flops: Optional[int],
     analytical_flops_partial: bool,
     analytical_io_bytes: Optional[int],
@@ -1009,11 +1009,12 @@ def _collect_basic_metrics_post_loop(
     intermediate results.
     """
     if cpu_time_probe is not None and cpu_time_probe.delta is not None:
-        # Per-iter microseconds is the interpretable unit: the loop
-        # total is dominated by Python dispatch cost, and per-iter
-        # lets users compare directly against the kernel mean (also
-        # reported per-iter).
-        iters = max(benchmark_iters, 1)
+        # Per-execution microseconds is the interpretable unit: the loop
+        # total is dominated by Python dispatch cost, and per-execution
+        # lets users compare directly against the kernel median (also
+        # reported per execution). The loop runs benchmark_iters *
+        # timing_block executions.
+        iters = max(timed_executions, 1)
         result.cpu_user_time_per_iter_us = (
             cpu_time_probe.delta.user_time_ms * 1000.0 / iters
         )
@@ -1308,7 +1309,7 @@ def run_single_provider_engine(
                 _collect_basic_metrics_post_loop(
                     result=result,
                     cpu_time_probe=cpu_time_probe,
-                    benchmark_iters=config.benchmark_iters,
+                    timed_executions=config.benchmark_iters * config.timing_block,
                     analytical_flops=analytical_flops,
                     analytical_flops_partial=analytical_flops_partial,
                     analytical_io_bytes=analytical_io_bytes,

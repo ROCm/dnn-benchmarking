@@ -445,6 +445,45 @@ def test_cuda_build_skips_staging_even_if_bindings_available(
     assert FakeHipTimer.start_calls == 2
 
 
+def test_block_timing_times_n_executions_per_event_pair(
+    pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """timing_block=N wraps N executions in one event pair, records
+    elapsed/N per sample, and bypasses the stall gate."""
+    module = pytorch_executor_module
+    executed: List[str] = []
+    monkeypatch.setattr(
+        module.pytorch_ops,
+        "compile_graph",
+        lambda graph_json: _RecordingCompiled(executed),
+    )
+    monkeypatch.setattr(module, "_is_staged_hip_available", lambda: True)
+    monkeypatch.setattr(
+        module,
+        "StalledRegionTimer",
+        lambda *a, **k: pytest.fail("block timing must not use the stall gate"),
+    )
+    config = BenchmarkConfig(
+        graph_path="test.json", warmup_iters=0, benchmark_iters=2, timing_block=5
+    )
+    executor = module.PyTorchCudaExecutor(
+        graph_json={"nodes": []},
+        config=config,
+        device="cuda:1",
+        collect_kernel_timing=True,
+    )
+    executor.prepare()
+    executed.clear()
+
+    result = executor.benchmark(tensors={}, graph_name="block")
+
+    assert executed == ["execute"] * 10
+    assert FakeHipTimer.start_calls == 2
+    assert FakeHipTimer.stop_calls == 2
+    assert result.kernel_timings == [0.25, 0.25]
+    assert result.metadata is not None and result.metadata.timing_block == 5
+
+
 def test_warmup_and_execute_once_use_stream_sync(
     pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
 ) -> None:
