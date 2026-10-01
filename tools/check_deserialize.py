@@ -7,6 +7,10 @@ Levels:
                    i.e. assemble and finalize the backend operation-graph descriptor
                    (NO plan build, NO kernel execution). Needs a built hipDNN.
 
+Both levels also require every SDPA node to state its scale (an
+attn_scale_value or a scale tensor): an absent scale is the backend's default,
+not necessarily the scale the workload's source measured.
+
 Usage:
   python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
 """
@@ -21,6 +25,26 @@ def iter_files(patterns):
             yield from glob.glob(os.path.join(pat, "**", "*.json"), recursive=True)
         else:
             yield from glob.glob(pat, recursive=True)
+
+
+_SDPA_NODE_TYPES = ("SdpaAttributes", "SdpaBackwardAttributes")
+
+
+def sdpa_nodes_without_scale(graph):
+    """Names of SDPA nodes with neither attn_scale_value nor scale_tensor_uid."""
+    missing = []
+    for node in graph.get("nodes") or []:
+        if node.get("type") not in _SDPA_NODE_TYPES:
+            continue
+        # Forward nodes keep it under "attributes", backward under "parameters".
+        attrs = node.get("attributes") or node.get("parameters") or {}
+        inputs = node.get("inputs") or {}
+        if (
+            attrs.get("attn_scale_value") is None
+            and inputs.get("scale_tensor_uid") is None
+        ):
+            missing.append(node.get("name", "<unnamed>"))
+    return missing
 
 
 def main():
@@ -68,6 +92,12 @@ def main():
     failures = []
     for f in files:
         try:
+            unscaled = sdpa_nodes_without_scale(json.loads(Path(f).read_text()))
+            if unscaled:
+                raise ValueError(
+                    f"SDPA node(s) {unscaled} set neither attn_scale_value nor "
+                    "scale_tensor_uid; write the scale the workload used"
+                )
             if args.level == "json":
                 g = loader.load_json(Path(f))
                 loader.validate(g)
