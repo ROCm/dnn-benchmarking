@@ -1709,6 +1709,53 @@ class TestTimedPytorchRowEngineRole:
         )
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    def test_reference_role_row_is_labelled_and_not_counted_as_an_engine(
+        self,
+        mock_buffer_manager_cls,
+        mock_pytorch_executor_cls,
+    ):
+        """The --validate pytorch row must say it is the reference.
+
+        Unlabelled, it serialised with no `role` and was counted as an engine
+        combination (32 combinations for 16 single-engine graphs).
+        """
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+        executor.benchmark.return_value = BenchmarkResult(
+            host_timings=[1.0],
+            kernel_timings=[0.5],
+            metadata=BenchmarkMetadata(),
+        )
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(metrics=MetricsConfig(tier="off")),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "success"
+        assert row.result.to_dict()["role"] == "reference"
+        engine = ProviderEngineResult(provider="hipdnn", engine_id=7, status="success")
+        graph = GraphResult(
+            graph_name="g",
+            graph_path="g.json",
+            results=[row.result, engine],
+            engine_ids=[7],
+        )
+        counts = graph.count_by_status()
+        assert counts.passed + counts.failed + counts.skipped + counts.errored == 1
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_engine_role_failure_is_error(self, mock_pytorch_executor_cls):
         mock_pytorch_executor_cls.side_effect = RuntimeError("no GPU")
 
