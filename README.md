@@ -47,7 +47,9 @@ automatically on first run via a sparse, blobless clone limited to the two
 subtrees this tool builds (`projects/hipdnn`, `dnn-providers`) rather than
 the full ~9GB monorepo, and build hipDNN plus the provider plugins from it
 by default (pass `--reuse-artifacts` to skip and reuse whatever is already
-installed instead). A submodule already populated by
+installed instead; it fetches no sources and builds no Python bindings, so use
+it with `--torch-mode existing` on a venv that already imports
+`hipdnn_frontend`). A submodule already populated by
 `git submodule update --init` (a full, non-sparse checkout) is left as-is.
 To build against a different rocm-libraries ref, check it out directly,
 e.g. `git -C rocm-libraries fetch --depth 1 origin <ref> && git -C

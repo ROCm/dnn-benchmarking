@@ -441,7 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip building hipDNN/the provider plugins from source and use "
             "whatever is already installed in the selected ROCm prefix (e.g. a "
             "prior build in the same workspace). Fails if hipDNN is absent there "
-            "-- this never falls back to building."
+            "-- this never falls back to building. Builds no Python bindings: "
+            "the venv must already have hipdnn_frontend (--torch-mode existing)."
         ),
     )
     parser.add_argument(
@@ -1318,9 +1319,12 @@ class Setup:
         if self.do_build:
             self.build_and_install_bindings(install_prefix, toolchain_prefix)
         elif self.probe("import hipdnn_frontend").returncode != 0:
-            print(
-                "WARNING: hipdnn_frontend is not importable in this environment.",
-                file=sys.stderr,
+            fail(
+                "ERROR: --reuse-artifacts builds no hipDNN Python bindings, and "
+                f"hipdnn_frontend is not importable in {self.venv_dir}.",
+                "Use --torch-mode existing with a venv that already has "
+                "hipdnn_frontend, or drop --reuse-artifacts to build hipDNN and "
+                "its bindings.",
             )
 
     # -- confirmation prompt ------------------------------------------------
@@ -1446,8 +1450,10 @@ class Setup:
             self._print_complete(cuda=True)
             return 0
 
-        # rocm-libraries provides the hipDNN sources and provider plugins.
-        self.ensure_rocm_libraries_checkout()
+        # rocm-libraries provides the hipDNN sources and provider plugins. A
+        # reused install builds nothing, so it needs no sources.
+        if self.do_build:
+            self.ensure_rocm_libraries_checkout()
 
         if self.gpu_arch:
             # Belt-and-suspenders for any torch C++/HIP extension compile (none
