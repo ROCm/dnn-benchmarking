@@ -35,6 +35,15 @@ IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
+# Root directories the hipDNN/provider configure reads. Without shared/,
+# configure falls back to legacy CTest labels ("shared/ctest or test category
+# YAML not found").
+ROCM_LIBRARIES_ROOT_DIRS = ("cmake", "shared")
+ROCM_LIBRARIES_SPARSE_DIRS = (
+    *ROCM_LIBRARIES_ROOT_DIRS,
+    "projects/hipdnn",
+    "dnn-providers",
+)
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
@@ -549,14 +558,20 @@ class Setup:
         except (subprocess.CalledProcessError, FileNotFoundError):
             ref = branch
         if (ROCM_LIBRARIES_DIR / ".git").exists():
-            if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
+            # A sparse clone made by an older setup lacks root dirs added since.
+            missing = [
+                path
+                for path in ROCM_LIBRARIES_ROOT_DIRS
+                if not (ROCM_LIBRARIES_DIR / path).is_dir()
+            ]
+            if missing and self._rocm_libraries_is_sparse():
                 run_git(
                     [
                         "-C",
                         str(ROCM_LIBRARIES_DIR),
                         "sparse-checkout",
                         "add",
-                        "cmake",
+                        *missing,
                     ]
                 )
             # An existing checkout is reused as-is, so a pin bump or a broken
@@ -580,7 +595,7 @@ class Setup:
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
         print(
             f"Fetching rocm-libraries ({ref}) via sparse checkout "
-            "(cmake, projects/hipdnn, dnn-providers)..."
+            f"({', '.join(ROCM_LIBRARIES_SPARSE_DIRS)})..."
         )
         if ROCM_LIBRARIES_DIR.exists():
             shutil.rmtree(ROCM_LIBRARIES_DIR)
@@ -605,9 +620,7 @@ class Setup:
                 str(ROCM_LIBRARIES_DIR),
                 "sparse-checkout",
                 "set",
-                "cmake",
-                "projects/hipdnn",
-                "dnn-providers",
+                *ROCM_LIBRARIES_SPARSE_DIRS,
             ]
         )
         run_git(
@@ -623,6 +636,24 @@ class Setup:
             ]
         )
         run_git(["-C", str(ROCM_LIBRARIES_DIR), "checkout", "--quiet", "FETCH_HEAD"])
+
+    @staticmethod
+    def _rocm_libraries_is_sparse() -> bool:
+        try:
+            return (
+                git_output(
+                    [
+                        "-C",
+                        str(ROCM_LIBRARIES_DIR),
+                        "config",
+                        "--get",
+                        "core.sparseCheckout",
+                    ]
+                )
+                == "true"
+            )
+        except subprocess.CalledProcessError:
+            return False
 
     # -- venv lifecycle -----------------------------------------------------
 
