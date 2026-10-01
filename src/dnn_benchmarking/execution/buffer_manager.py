@@ -3,7 +3,8 @@
 
 """Device buffer management for graph execution."""
 
-from typing import Dict, List, Optional
+import warnings
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -151,8 +152,98 @@ def _encode_bfloat16_dense_to_storage_bytes(
     return storage.tobytes()
 
 
+def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
+    """Map tensor UID -> paged role for every SDPA node in the graph.
+
+    Roles are read from the node's ``inputs`` map rather than guessed from a
+    tensor name, because names are free-form and a graph is under no obligation
+    to call its page table PAGE_TABLE_K.
+    """
+    roles: Dict[int, str] = {}
+    if not graph_json:
+        return roles
+    for node in graph_json.get("nodes", []) or []:
+        if not str(node.get("type", "")).startswith("Sdpa"):
+            continue
+        inputs = node.get("inputs") or {}
+        for key, role in (
+            ("page_table_k_tensor_uid", "page_table"),
+            ("page_table_v_tensor_uid", "page_table"),
+            ("seq_len_q_tensor_uid", "seq_len_q"),
+            ("seq_len_kv_tensor_uid", "seq_len_kv"),
+        ):
+            uid = inputs.get(key)
+            if uid is not None:
+                roles[int(uid)] = role
+    return roles
+
+
+def _paged_metadata(
+    graph_json: Optional[Dict[str, Any]],
+) -> Tuple[int, int]:
+    """(page_size, num_pages) taken from the paged K container's own dims.
+
+    hipDNN has no page-size scalar: the paged K/V container is
+    ``[num_blocks, num_kv_heads, page_size, head_size]``, so both facts are read
+    off that tensor instead of being assumed.
+    """
+    if not graph_json:
+        return 0, 0
+    tensors = {int(t["uid"]): t for t in graph_json.get("tensors", []) or []}
+    for node in graph_json.get("nodes", []) or []:
+        inputs = node.get("inputs") or {}
+        if inputs.get("page_table_k_tensor_uid") is None:
+            continue
+        k = (
+            tensors.get(int(inputs["k_tensor_uid"]))
+            if inputs.get("k_tensor_uid")
+            else None
+        )
+        if k and len(k.get("dims", [])) == 4:
+            return int(k["dims"][2]), int(k["dims"][0])
+    return 0, 0
+
+
+def _generate_paged_input(
+    tensor_info: TensorInfo,
+    role: str,
+    page_size: int,
+    num_pages: int,
+    rng: "np.random.RandomState",
+) -> np.ndarray:
+    """Structured data for a paged input.
+
+    ``rng.uniform(0, 1).astype(int32)`` is **all zeros**, which for a page table
+    means every sequence reads page 0 and for a sequence length means an empty
+    sequence. Both are degenerate rather than merely random, so these inputs are
+    generated to satisfy their own invariants instead.
+    """
+    dims = list(tensor_info.dims)
+    dtype = DTYPE_MAP.get(tensor_info.data_type.lower(), np.int32)
+
+    if role == "page_table":
+        # Distinct pages per sequence, so a gather that ignores the table or
+        # collapses sequences produces a visibly different answer.
+        num_seqs = int(dims[0])
+        blocks_per_seq = int(dims[1]) if len(dims) > 1 else 1
+        needed = num_seqs * blocks_per_seq
+        pool = num_pages if num_pages > 0 else needed
+        ids = (np.arange(needed) % max(pool, 1)).astype(dtype)
+        return ids.reshape(dims)
+
+    if role in ("seq_len_q", "seq_len_kv"):
+        # Fill the cache: every sequence uses its whole page allocation, which
+        # is the largest length the page table can legally address.
+        length = page_size if page_size > 0 else 1
+        return np.full(dims, length, dtype=dtype)
+
+    return rng.uniform(0.0, 1.0, dims).astype(dtype)
+
+
 def generate_input_data(
-    tensor_infos: List[TensorInfo], seed: Optional[int] = None
+    tensor_infos: List[TensorInfo],
+    seed: Optional[int] = None,
+    graph_json: Optional[Dict[str, Any]] = None,
 ) -> Dict[int, np.ndarray]:
     """Generate one graph-scoped logical input map.
 
@@ -160,9 +251,16 @@ def generate_input_data(
     and reference providers: dense logical ndarrays keyed by tensor UID. BF16
     values are generated as FP32, rounded through BF16 storage, then decoded
     back to numeric FP32 because NumPy has no native bfloat16 dtype.
+
+    ``graph_json`` is optional and only affects **paged** SDPA graphs: page
+    tables and sequence lengths are integer inputs with invariants that uniform
+    noise cannot satisfy (see :func:`_generate_paged_input`). Without it the
+    behaviour is exactly as before.
     """
     rng = np.random.RandomState(seed)
     input_data: Dict[int, np.ndarray] = {}
+    paged_roles = _paged_input_roles(graph_json)
+    page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -172,6 +270,13 @@ def generate_input_data(
         if tensor_info.is_pass_by_value:
             dtype = DTYPE_MAP.get(dtype_key, np.float32)
             input_data[tensor_info.uid] = np.asarray([tensor_info.value], dtype=dtype)
+            continue
+
+        role = paged_roles.get(tensor_info.uid)
+        if role is not None:
+            input_data[tensor_info.uid] = _generate_paged_input(
+                tensor_info, role, page_size, num_pages, rng
+            )
             continue
 
         if dtype_key == "bfloat16":
@@ -198,20 +303,29 @@ class BufferManager:
     - Creating variant packs (UID -> pointer mapping)
     - Filling input buffers with random data
     - Cleanup of device memory
+
+    Storage is ``hipdnn.DeviceBuffer`` by default. With a torch ``device``,
+    each buffer is a raw ``torch.uint8`` tensor, and outputs can be viewed on
+    the device without a host copy. hipDNN receives each tensor's
+    ``data_ptr()``; this manager keeps the tensors alive until ``cleanup``.
     """
 
     def __init__(
         self,
         tensor_infos: List[TensorInfo],
+        device: Optional[str] = None,
     ) -> None:
         """Initialize buffer manager with tensor metadata.
 
         Args:
             tensor_infos: List of TensorInfo objects describing tensors.
+            device: Torch device for torch-backed storage (for example
+                ``"cuda"``), or None for ``hipdnn.DeviceBuffer`` storage.
         """
         self._tensor_infos = tensor_infos
         self._tensor_info_by_uid = {tensor.uid: tensor for tensor in tensor_infos}
-        self._buffers: Dict[int, "DeviceBuffer"] = {}  # UID -> DeviceBuffer
+        self._device = device
+        self._buffers: Dict[int, Any] = {}  # UID -> DeviceBuffer or torch.Tensor
         self._host_data: Dict[int, np.ndarray] = {}  # UID -> logical numpy array
 
     def allocate_all(self) -> None:
@@ -220,6 +334,17 @@ class BufferManager:
         Raises:
             ExecutionError: If hipdnn_frontend is not available.
         """
+        if self._device is not None:
+            import torch
+
+            for tensor_info in self._tensor_infos:
+                if tensor_info.is_virtual or tensor_info.is_pass_by_value:
+                    continue
+                self._buffers[tensor_info.uid] = torch.empty(
+                    tensor_info.size_bytes, dtype=torch.uint8, device=self._device
+                )
+            return
+
         try:
             import hipdnn_frontend as hipdnn
         except ImportError as e:
@@ -246,7 +371,23 @@ class BufferManager:
         if not self._buffers:
             raise ExecutionError("Buffers not allocated. Call allocate_all() first.")
 
-        return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
+        if self._device is None:
+            return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
+        return {uid: buffer.data_ptr() for uid, buffer in self._buffers.items()}
+
+    def _write_bytes(self, buffer: Any, raw_bytes: bytes) -> None:
+        """Copy graph-layout bytes from the host into one buffer."""
+        if self._device is None:
+            buffer.copy_from_host(raw_bytes)
+            return
+        import torch
+
+        with warnings.catch_warnings():
+            # copy_ only reads the source, so a read-only view is safe and
+            # avoids a second host copy of the input.
+            warnings.simplefilter("ignore", UserWarning)
+            source = torch.frombuffer(raw_bytes, dtype=torch.uint8)
+        buffer.copy_(source)
 
     def _copy_logical_data_to_buffer(self, uid: int, data: np.ndarray) -> None:
         """Store logical host data and copy its graph-layout bytes to device."""
@@ -270,8 +411,8 @@ class BufferManager:
             raw_bytes = _encode_dense_to_storage_bytes(logical_data, tensor_info)
             self._host_data[uid] = np.array(logical_data, copy=True)
 
-        if buffer:
-            buffer.copy_from_host(raw_bytes)
+        if buffer is not None:
+            self._write_bytes(buffer, raw_bytes)
 
     def load_input_data(self, input_data: Dict[int, np.ndarray]) -> None:
         """Copy pre-generated graph input data into device buffers.
@@ -334,8 +475,19 @@ class BufferManager:
                 continue
 
             buffer = self._buffers.get(tensor_info.uid)
-            if buffer:
+            if buffer is None:
+                continue
+            if self._device is None:
                 buffer.zeros()
+            else:
+                buffer.zero_()
+
+        if self._device is not None:
+            import torch
+
+            # zero_() runs on torch's stream; hipDNN runs on the handle stream.
+            if torch.device(self._device).type == "cuda":
+                torch.cuda.synchronize()
 
     def get_output_data(self, uid: int) -> Optional[np.ndarray]:
         """Copy output tensor data from device to host.
@@ -361,13 +513,39 @@ class BufferManager:
             return None
 
         dtype_key = tensor_info.data_type.lower()
-        data_bytes = buffer.copy_to_host()
+        if self._device is None:
+            data_bytes = buffer.copy_to_host()
+        else:
+            data_bytes = buffer.cpu().numpy().tobytes()
 
         if dtype_key == "bfloat16":
             return _bfloat16_storage_bytes_to_ndarray(data_bytes, tensor_info)
 
         dtype = DTYPE_MAP.get(dtype_key, np.float32)
         return _dense_from_storage_bytes(data_bytes, tensor_info, dtype)
+
+    def get_output_tensor(self, uid: int) -> Optional["torch.Tensor"]:
+        """Return a typed logical view of an output buffer without a copy.
+
+        Returns None for DeviceBuffer storage, for an unknown UID, and for a
+        data type that torch cannot represent.
+        """
+        if self._device is None:
+            return None
+        buffer = self._buffers.get(uid)
+        tensor_info = self._tensor_info_by_uid.get(uid)
+        if buffer is None or tensor_info is None:
+            return None
+
+        from .pytorch_buffer_manager import TORCH_DTYPE_MAP
+
+        torch_dtype = TORCH_DTYPE_MAP.get(tensor_info.data_type.lower())
+        if torch_dtype is None:
+            return None
+        typed = buffer.view(torch_dtype)
+        if tensor_info.strides:
+            return typed.as_strided(tensor_info.dims, tensor_info.strides)
+        return typed[: tensor_info.num_elements].reshape(tensor_info.dims)
 
     def get_output_tensors(self) -> List[TensorInfo]:
         """Get list of output tensor infos.
@@ -392,6 +570,16 @@ class BufferManager:
         """Free all device buffers."""
         self._buffers.clear()
         self._host_data.clear()
+        if self._device is not None:
+            import torch
+
+            if torch.device(self._device).type != "cuda":
+                return
+
+            # Return the freed blocks to the driver. hipDNN workspaces and
+            # the next engine allocate with hipMalloc, which cannot reuse
+            # torch's cached blocks.
+            torch.cuda.empty_cache()
 
     def __enter__(self) -> "BufferManager":
         """Context manager entry."""

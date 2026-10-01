@@ -39,12 +39,12 @@ HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
-ROCM_NIGHTLY_BASE = "https://rocm.nightlies.amd.com"
+ROCM_NIGHTLY_BASE = "https://nightly.repo.amd.com/rocm"
 
 # Single multi-arch nightly index for every OS: GPU selection is a pip extra
 # (torch[device-<arch>]) rather than a per-arch/per-OS URL bucket, so Linux
 # and Windows always resolve the exact same torch/rocm-sdk-* build.
-ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-multi-arch/"
+ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-next/"
 
 # Windows has no rocm_agent_enumerator/rocminfo to detect the local arch with,
 # so fall back to a default target known to have published wheels.
@@ -217,7 +217,7 @@ for root in roots:
         if not child.is_dir():
             continue
         if kind == "libraries":
-            # whl-multi-arch ships a single arch-agnostic "_rocm_sdk_libraries"
+            # Multi-arch indexes ship one arch-agnostic "_rocm_sdk_libraries"
             # package; older per-arch indexes (e.g. v2-staging) name it
             # "_rocm_sdk_libraries_<arch>". Match both.
             if child.name != "_rocm_sdk_libraries" and not child.name.startswith(
@@ -333,6 +333,26 @@ print("\n" + mode)
 # --- CLI -------------------------------------------------------------------
 
 
+def _cmake_define(value: str) -> str:
+    """Normalise a --cmake-arg value to a `-DNAME=VALUE` CMake define.
+
+    Accepts both spellings. The bare `-D` form only survives argparse when
+    written `--cmake-arg=-DFOO=ON`; with a space, argparse sees a token starting
+    with `-` and reports "expected one argument". Accepting `NAME=VALUE` makes
+    the space form work too, which is the form everyone reaches for first.
+    """
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError("--cmake-arg needs a NAME=VALUE define")
+    if text.startswith("-D"):
+        text = text[2:]
+    if "=" not in text:
+        raise argparse.ArgumentTypeError(
+            f"--cmake-arg expects NAME=VALUE, got {value!r} (no '=' found)"
+        )
+    return f"-D{text}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="setup_env.py",
@@ -416,6 +436,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cmake-arg",
+        dest="cmake_args",
+        action="append",
+        default=[],
+        type=_cmake_define,
+        metavar="NAME=VALUE",
+        help=(
+            "Extra CMake define appended to the hipDNN/provider configure. "
+            "Repeatable. Appended after the defaults, so it can override one. "
+            "Accepts NAME=VALUE or -DNAME=VALUE; the leading -D is added when "
+            "absent, because argparse reads a bare '-DFOO=ON' as an option "
+            "rather than a value unless it is written '--cmake-arg=-DFOO=ON'. "
+            "On Linux, rocKE (HIPKERNELPROVIDER_ENABLE_ROCKE, "
+            "HIPDNN_ENABLE_KERNEL_INGESTOR) is ON by default; set both OFF to "
+            "skip it."
+        ),
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",
@@ -438,6 +476,7 @@ class Setup:
         self.gpu_arch_override = args.gpu_arch
         self.torch_index_url = args.torch_index_url
         self.editable_install = args.editable_install
+        self.extra_cmake_args = list(getattr(args, "cmake_args", []) or [])
         self.resolved_torch_index_url = ""
         self.installed_torch_mode = "missing"
         self.plugin_engines_dir = None
@@ -491,13 +530,24 @@ class Setup:
         It is a git submodule (see .gitmodules) tracking develop by default, so
         `git submodule update --init` also works. This is the fast path used only
         when the directory isn't already populated: a sparse, blobless clone of
-        the .gitmodules-pinned branch limited to the hipDNN/provider sources and
-        root CMake tooling this script builds.
+        the pinned submodule commit (falls back to the .gitmodules branch),
+        limited to the hipDNN/provider sources and root CMake tooling this
+        script builds.
         To build against a different ref, check it out directly, e.g.
         `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
 
+        gitmodules = str(SCRIPT_DIR / ".gitmodules")
+        branch = git_output(
+            ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
+        )
+        try:
+            ref = git_output(
+                ["-C", str(SCRIPT_DIR), "rev-parse", "HEAD:rocm-libraries"]
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            ref = branch
         if (ROCM_LIBRARIES_DIR / ".git").exists():
             if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
                 run_git(
@@ -509,14 +559,27 @@ class Setup:
                         "cmake",
                     ]
                 )
+            # An existing checkout is reused as-is, so a pin bump or a broken
+            # sparse clone would otherwise go unnoticed.
+            head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
+            if ref != branch and head != ref:
+                print(
+                    f"WARNING: rocm-libraries is at {head[:12]}, not the pinned "
+                    f"{ref[:12]}. Run `git submodule update rocm-libraries` or "
+                    "delete rocm-libraries/ to build the pinned commit.",
+                    file=sys.stderr,
+                )
+            if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
+                print(
+                    "WARNING: rocm-libraries/CMakePresets.json is missing "
+                    "(a non-cone sparse checkout). Delete rocm-libraries/ and "
+                    "rerun setup.",
+                    file=sys.stderr,
+                )
             return
-        gitmodules = str(SCRIPT_DIR / ".gitmodules")
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
-        branch = git_output(
-            ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
-        )
         print(
-            f"Fetching rocm-libraries ({branch}) via sparse checkout "
+            f"Fetching rocm-libraries ({ref}) via sparse checkout "
             "(cmake, projects/hipdnn, dnn-providers)..."
         )
         if ROCM_LIBRARIES_DIR.exists():
@@ -532,6 +595,10 @@ class Setup:
                 str(ROCM_LIBRARIES_DIR),
             ]
         )
+        # Cone mode explicitly: git < 2.37 defaults to non-cone patterns, which
+        # match "cmake" at any depth and drop root files such as
+        # CMakePresets.json. `set --cone` needs git 2.35; `init --cone` is older.
+        run_git(["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "init", "--cone"])
         run_git(
             [
                 "-C",
@@ -552,7 +619,7 @@ class Setup:
                 "--depth",
                 "1",
                 "origin",
-                branch,
+                ref,
             ]
         )
         run_git(["-C", str(ROCM_LIBRARIES_DIR), "checkout", "--quiet", "FETCH_HEAD"])
@@ -1013,6 +1080,50 @@ class Setup:
         program_path = f"{toolchain_prefix}/bin;{toolchain_prefix}/lib/llvm/bin"
         return prefix_path, program_path
 
+    def rocke_args(self, toolchain_prefix: str) -> list[str]:
+        """Configure defines that build rocKE and its ingestor engines.
+
+        Every rocKE engine, including descriptor-backed ones such as
+        hipkernel:Gfx950AttentionDense, ships only with both gates ON. Linux
+        only: the Windows ROCm build of rocKE is untested, so Windows keeps the
+        rocm-libraries defaults (both OFF).
+        """
+        if IS_WINDOWS:
+            return []
+        # rocKE packs its kernels with rocm_kpack, which the configure imports
+        # from Python3_EXECUTABLE; its msgpack/zstandard deps are not pulled in.
+        self.pip("install", "msgpack>=1.0.0", "zstandard>=0.20.0")
+        args = [
+            "-DHIPKERNELPROVIDER_ENABLE_ROCKE=ON",
+            "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
+            "-DHIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON",
+            f"-DPython3_EXECUTABLE={self.py}",
+            # The ingestor headers' std::stable_sort trips libstdc++ 12's
+            # deprecated get_temporary_buffer under the wheel clang's -Werror
+            # (Ubuntu 22.04). _INIT keeps the user's $CXXFLAGS, which CMake
+            # puts in front of it.
+            "-DCMAKE_CXX_FLAGS_INIT=-Wno-error=deprecated-declarations",
+        ]
+        comgr = self._comgr_lib(toolchain_prefix)
+        if comgr:
+            args.append(f"-DHIPKERNELPROVIDER_ROCKE_COMGR_LIB={comgr}")
+        return args
+
+    def _comgr_lib(self, toolchain_prefix: str):
+        """libamd_comgr for rocKE's pack step, or None.
+
+        rocKE loads comgr through ctypes from $ROCM_PATH or /opt/rocm*, and
+        neither names the wheel SDK. Some devel wheels lack the runtime .so,
+        which then ships in the sibling core wheel. The core wheel is probed
+        only when the toolchain has no comgr.
+        """
+        libs = sorted((Path(toolchain_prefix) / "lib").glob("libamd_comgr.so*"))
+        if not libs:
+            core_prefix, status = self.find_rocm_wheel_prefix("core")
+            if status == 0:
+                libs = sorted((Path(core_prefix) / "lib").glob("libamd_comgr.so*"))
+        return libs[0] if libs else None
+
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
         cmake = require_working_cmake()
         if not shutil.which("ninja"):
@@ -1041,8 +1152,12 @@ class Setup:
                 "-DMIOPENPROVIDER_SKIP_TESTS=ON",
                 "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
                 "-DENABLE_ASM_SDPA_ENGINE=ON",
+                *self.rocke_args(toolchain_prefix),
                 "-DENABLE_CLANG_FORMAT=OFF",
                 "-DENABLE_CLANG_TIDY=OFF",
+                # LAST, so a caller's -D overrides a default above rather than
+                # being silently overridden by it.
+                *self.extra_cmake_args,
             ],
             cwd=ROCM_LIBRARIES_DIR,
             env=self._build_env(),
@@ -1150,9 +1265,11 @@ class Setup:
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
+            # Install prefix first: the ROCm devel wheel ships its own, older
+            # libhipdnn_backend.so, which must not shadow the one just built.
             lib_dirs = tuple(
                 str(Path(prefix) / "lib")
-                for prefix in (toolchain_prefix, install_prefix)
+                for prefix in (install_prefix, toolchain_prefix)
                 if prefix and (Path(prefix) / "lib").is_dir()
             )
             current = self.env.get("LD_LIBRARY_PATH", "")

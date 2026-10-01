@@ -29,9 +29,10 @@ def compile_pointwise(node: Dict[str, Any], graph_json: Dict[str, Any]) -> Compi
     if in0_uid is None or out_uid is None:
         raise ValueError(f"Pointwise node missing required tensor UIDs: {node}")
 
-    # Clipping bounds for ReLU6-style clamping.
-    lower_clip = inputs.get("relu_lower_clip", 0.0)
-    upper_clip = inputs.get("relu_upper_clip", float("inf"))
+    # Clipping bounds for ReLU6-style clamping. A null attribute means the
+    # bound is not specified; 0.0 is a valid bound and must survive.
+    lower_clip = _node_param(node, "relu_lower_clip", 0.0)
+    upper_clip = _node_param(node, "relu_upper_clip", float("inf"))
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         in0 = tensors[in0_uid]

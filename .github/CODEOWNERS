@@ -1,2 +1,5 @@
+# Protect this file so review requirements cannot be silently removed.
+/.github/CODEOWNERS   @ROCm/rocm-security-gh-admins
+
 # Require dnn-benchmarking reviewer approval for every repository change.
-* @ROCm/dnn-benchmarking-reviewers
+*   @ROCm/dnn-benchmarking-reviewers

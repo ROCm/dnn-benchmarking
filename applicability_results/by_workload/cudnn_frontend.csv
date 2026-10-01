@@ -1,0 +1,107 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,cudnn_frontend,bf16_matmul_bias_m128_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_matmul_bias_m32_n32_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_matmul_bias_m32_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_matmul_bias_m64_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_matmul_bias_m64_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_matmul_bias_m80_n80_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,fp16_conv_bias_relu_n16_c16_h64_w64_k16_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_conv_bias_relu_n16_c32_h32_w32_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_conv_bias_relu_n16_c64_h32_w32_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_conv_bias_relu_n8_c32_h16_w16_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_conv_bias_relu_n8_c32_h24_w24_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_matmul_bias_act_m16_n32_k64_relu,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b16_m32_n32_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b16_m32_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b16_m64_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b16_m80_n80_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b1_m1024_n1024_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b1_m128_n128_k8192,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b1_m32_n64_k32,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b2_m256_n256_k12288,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b32_m128_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_b32_m64_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,fp16_b4_m16_n32_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx942,cudnn_frontend,bf16_layernorm_1024x12288_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_131072x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_16384x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_16384x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_2048x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_4096x16384_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_4096x2048_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_4096x6144_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_4096x8192_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_8192x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_8192x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_8192x5120_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_rmsnorm_8192x8192_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_layernorm_2048x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_layernorm_4096x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_layernorm_4096x768_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_layernorm_8192x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_rmsnorm_4096x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp32_rmsnorm_4096x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,bf16_cmp_gt_4x8x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_add_4x4x4,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_cmp_gt_16x64x196,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_cmp_gt_1x32,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_cmp_gt_2x64x28x28,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_cmp_gt_4x8x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_cmp_gt_8x32,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp32_cmp_gt_4x8x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_b2_hq12_kv12_sq1_skv1024_d64_noncausal_paged64_varlen,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_b4_hq12_kv12_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx942,cudnn_frontend,fp16_b4_hq12_kv12_sq128_skv128_d64_causal_paged8_varlen,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_matmul_bias_m128_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_matmul_bias_m32_n32_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_matmul_bias_m32_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_matmul_bias_m64_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_matmul_bias_m64_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_matmul_bias_m80_n80_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,fp16_conv_bias_relu_n16_c16_h64_w64_k16_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_conv_bias_relu_n16_c32_h32_w32_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_conv_bias_relu_n16_c64_h32_w32_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_conv_bias_relu_n8_c32_h16_w16_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_conv_bias_relu_n8_c32_h24_w24_k64_r3_s3_p1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_matmul_bias_act_m16_n32_k64_relu,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b16_m32_n32_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b16_m32_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b16_m64_n64_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b16_m80_n80_k128,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b1_m1024_n1024_k1024,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b1_m128_n128_k8192,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b1_m32_n64_k32,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b2_m256_n256_k12288,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b32_m128_n128_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_b32_m64_n64_k256,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,fp16_b4_m16_n32_k64,8768140637164053035,HIPBLASLT_ENGINE,engine,success,,True,,
+gfx950,cudnn_frontend,bf16_layernorm_1024x12288_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_131072x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_16384x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_16384x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_2048x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_4096x16384_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_4096x2048_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_4096x6144_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_4096x8192_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_8192x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_8192x4096_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_8192x5120_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_rmsnorm_8192x8192_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_layernorm_2048x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_layernorm_4096x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_layernorm_4096x768_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_layernorm_8192x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_rmsnorm_4096x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp32_rmsnorm_4096x128_nd1,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,bf16_cmp_gt_4x8x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_add_4x4x4,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_cmp_gt_16x64x196,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_cmp_gt_1x32,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_cmp_gt_2x64x28x28,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_cmp_gt_4x8x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_cmp_gt_8x32,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp32_cmp_gt_4x8x16,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_b2_hq12_kv12_sq1_skv1024_d64_noncausal_paged64_varlen,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_b4_hq12_kv12_sq1024_skv1024_d64_causal,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.
+gfx950,cudnn_frontend,fp16_b4_hq12_kv12_sq128_skv128_d64_causal_paged8_varlen,0,unknown,engine,skipped,,False,,Failed to get ranked engine ids: No engine configurations available for the graph.

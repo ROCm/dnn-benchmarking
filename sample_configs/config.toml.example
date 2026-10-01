@@ -57,6 +57,12 @@ roofline = false
 # Timeout in seconds for each external profiler subprocess. Use 0 to disable the timeout.
 profiling_timeout = 600
 
+# Oracle comparison depth: "off", "plan", or "exhaustive".
+# "plan" adds one hipDNN auto-tuning sweep per engine row and reports the
+# tuned timing beside the out-of-the-box timing. "exhaustive" additionally
+# forces provider kernel benchmarking. Both are significantly slower.
+# oracle_mode = "off"
+
 # Optional explicit engine matrix. Uncomment to run only specific engine IDs.
 # If any engine entry sets plugin_path, every engine entry must set plugin_path.
 # When either --engine or --plugin-path is supplied on the CLI, this matrix is

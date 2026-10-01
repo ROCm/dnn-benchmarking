@@ -8,7 +8,7 @@ FROM ${BASE_IMAGE} AS builder
 
 ARG DEVICE_TARGET=gfx942
 ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
-ARG ROCM_TORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
+ARG ROCM_TORCH_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \

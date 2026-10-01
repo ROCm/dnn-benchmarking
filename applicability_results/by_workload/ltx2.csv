@@ -1,0 +1,11 @@
+asic,workload,graph_name,engine_id,engine_name,role,status,correctness_match,applicable,error_message,skip_reason
+gfx942,ltx2,ltx2__bf16_b1_hq32_kv32_sq13376_skv13376_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,ltx2,ltx2__bf16_b1_hq32_kv32_sq17556_skv17556_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,ltx2,ltx2__bf16_b1_hq32_kv32_sq30240_skv30240_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,ltx2,ltx2__bf16_b1_hq32_kv32_sq37632_skv37632_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx942,ltx2,ltx2__bf16_b1_hq32_kv32_sq6144_skv6144_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,ltx2,ltx2__bf16_b1_hq32_kv32_sq13376_skv13376_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,ltx2,ltx2__bf16_b1_hq32_kv32_sq17556_skv17556_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,ltx2,ltx2__bf16_b1_hq32_kv32_sq30240_skv30240_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,ltx2,ltx2__bf16_b1_hq32_kv32_sq37632_skv37632_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,
+gfx950,ltx2,ltx2__bf16_b1_hq32_kv32_sq6144_skv6144_d128_noncausal,4714091817493728420,ASM_SDPA_ENGINE,engine,success,,True,,

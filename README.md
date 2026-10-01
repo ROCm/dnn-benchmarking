@@ -88,6 +88,32 @@ sets `ROCM_PATH` to that prefix and prepends its `lib` directory to
 If GPU architecture detection is unavailable on the setup host, pass
 `--gpu-arch gfx90a`, `--gpu-arch gfx942`, or `--gpu-arch gfx950`.
 
+### Extra CMake Defines (`--cmake-arg`)
+
+`setup_env.py` configures hipDNN and the provider plugins with a fixed set of
+defaults. `--cmake-arg NAME=VALUE` appends an extra define to that configure.
+It is repeatable, and the extra defines are appended *after* the defaults, so
+one can override a default rather than be silently overridden by it.
+
+Both `NAME=VALUE` and `-DNAME=VALUE` are accepted; the leading `-D` is added
+when absent. Write the `-D` spelling with an `=` (`--cmake-arg=-DFOO=ON`) —
+with a space, argparse reads `-DFOO=ON` as an option rather than a value.
+
+```bash
+# Skip rocKE, including its descriptor-backed engines
+python3 setup_env.py --workspace .workspace \
+  --cmake-arg HIPKERNELPROVIDER_ENABLE_ROCKE=OFF \
+  --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=OFF
+
+# Repeatable; the -D spelling needs the '=' form
+python3 setup_env.py --cmake-arg HIPDNN_ENABLE_SDPA=OFF --cmake-arg=-DCMAKE_BUILD_TYPE=Debug
+```
+
+On Linux, setup builds rocKE and its descriptor-backed engines by default
+(`hipkernel:Gfx950AttentionDense` on gfx950); Windows keeps them off. Disabling
+an engine's option still installs the plugin `.so`, so graphs that only that
+engine supports report `no engines applicable` rather than a missing-engine error.
+
 ### Testing/CI Setup with CPU-Only PyTorch
 
 When ROCm/hipDNN artifacts are installed by CI, install CPU-only PyTorch on top
@@ -249,6 +275,71 @@ the following are rejected with `--backend pytorch`:
 - `--engine` / `--plugin-path` (no hipDNN engine plugins are loaded)
 - `--validate pytorch` (the backend would validate against itself)
 - `--pmc` / `--emit-trace` / `--perf` / `--roofline` (rocprofv3-based passes)
+- `--oracle-mode` (auto-tuning is a hipDNN engine feature)
+
+### Oracle (Auto-Tuned) Comparison
+
+Use `--oracle-mode` to compare the normal out-of-the-box (OOTB) plan with
+hipDNN's tuned plan for each engine:
+
+| Mode | Behavior |
+|---|---|
+| `off` | Run only the OOTB plan. This is the default. |
+| `plan` | Benchmark every backend-generated plan for the engine. |
+| `exhaustive` | Run `plan` mode and enable provider-managed kernel selection where supported. |
+
+The exhaustive path keeps every plan returned by the backend. It does not
+generate a Cartesian product of public knob values. The kernel ingestor and
+MIOpen currently support provider-level selection; other engines, including
+hipBLASLt, remain at plan-level tuning. Providers can reuse cached selections,
+so exhaustive mode does not prove that every variant was measured during the
+current invocation.
+
+Both modes are slower than a normal run. Use `--engine` to limit the work.
+`exhaustive` requires `--warmup >= 1`.
+
+The summary table shows:
+
+- `ootb_kernel_mean_ms`: the original OOTB measurement.
+- `warm_ootb_kernel_mean_ms`: the same OOTB plan re-measured after tuning.
+- `oracle_kernel_mean_ms`: the selected plan measured after tuning.
+- `oracle_speedup`: `warm_ootb_kernel_mean_ms / oracle_kernel_mean_ms`.
+
+The warm OOTB measurement is the comparison baseline because it has comparable
+device warmup. The oracle can be slower; `0.99x` is a valid measured result.
+An unsupported single-plan row prints `no-search` and stays outside the suite
+geometric mean.
+
+JSON records the candidate counts and the provider-level state:
+
+| Field | Meaning |
+|---|---|
+| `compiled_plans_benchmarked` | Compiled plans measured successfully. |
+| `compiled_plans_total` | Eligible compiled plans, including failures. |
+| `exhaustive_requested` | The run requested provider-level tuning. |
+| `exhaustive_supported` | The engine advertises `global.benchmarking`. |
+| `exhaustive_enabled` | Provider-level tuning was requested and supported. |
+| `tuning_available` | Multiple plans competed or provider-level tuning was enabled. |
+
+These counts do not include provider-internal kernel variants; hipDNN exposes
+no count for them. An empty `knob_settings` list means that no public plan knob
+was set explicitly.
+
+With `--validate`, the tool validates the OOTB and tuned plans independently.
+It reports no speedup if either plan fails.
+
+Cache state can affect selection. Set
+`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold heuristic baseline.
+Exhaustive mode disables hipDNN's provider caches during its oracle pass, but
+MIOpen FindDb and performance-database entries can still supply existing tuned
+selections. The output records the relevant cache and MIOpen database paths in
+`metadata.hipdnn_selection_env`.
+
+```bash
+HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 python -m dnn_benchmarking \
+  --graph ./graphs/sample_conv_fwd.json \
+  --oracle-mode exhaustive -v -o oracle.json
+```
 
 ### Cross-Machine Comparison (ROCm vs CUDA)
 
@@ -273,6 +364,33 @@ statistics and whatever machine metadata the host could provide
 `"unknown"`). Graphs match across files by `graph_name`, so the artifacts can
 be diffed offline. (An offline comparison helper is planned but not yet
 included.)
+
+### Kernel Selection (`--autotune`, `--cache-dir`)
+
+An engine has two kernel-selection paths, and they answer different questions.
+By default it serves its cold heuristic's rank-0 pick, so a table measures the
+*heuristic*. `--autotune` sets `HIPDNN_FORCE_BENCHMARKING=1`, which samples
+every knob-filtered candidate on each plan's first execute and caches the
+winner — that measures what the shipped *kernel set* can deliver. Use it for
+any best-vs-best comparison: without it, an engine that gains good variants can
+measure slower when the heuristic tie-break is a coin flip.
+
+The selected path is always printed, whether or not it was requested, so a
+table is never ambiguous about which question it answers.
+
+`--cache-dir` sets `HIPDNN_CACHE_DIR` for the run. The winner cache is on disk
+and is keyed by graph content and device — not by checkout, engine, or session
+— and reads are not gated on benchmarking while writes are. Two runs over the
+same graphs therefore share rankings, and an untuned run can silently report a
+ranking some other run tuned. Give each phase its own empty root:
+
+```bash
+# Measure the heuristic (default) — path is announced on stderr
+dnn-benchmark --graph 'graphs/*.json' --cache-dir /tmp/cache-cold
+
+# Measure the kernel set: benchmark every candidate, into an isolated cache
+dnn-benchmark --graph 'graphs/*.json' --autotune --cache-dir /tmp/cache-tuned
+```
 
 ### Config Files
 
@@ -336,6 +454,17 @@ The `Workloads/` directory contains benchmark workload tarballs tracked with
 [DVC](https://dvc.org/). The public DVC remote is configured in `.dvc/config`
 for anonymous reads; archive contents are not stored directly in Git.
 
+- `Workloads/headline/` — the small, curated set currently tracked for
+  regression monitoring: `conv.tar.gz`, `bnorm.tar.gz`, `attn.tar.gz`,
+  `hipblaslt.tar.gz`, `moe.tar.gz`, `norm.tar.gz`. Expected to grow over
+  time. Note: `norm.tar.gz` currently has 0% applicability (no ROCm engine
+  implements RMSNorm/LayerNorm yet) -- tracked here ahead of engine support
+  landing, not because it has a signal today.
+- `Workloads/microbench/` — broader backing/brute-force sets (raw shape
+  sweeps, per-source SDPA/norm/GEMM/MoE collections) not part of the
+  frequent-cadence headline signal.
+- `Workloads/models/` — per-model workload collections.
+
 ### Download workload archives
 
 Install DVC with S3 support, then pull every tracked workload:
@@ -350,7 +479,7 @@ To fetch one workload instead:
 This downloads the tar files tracked by `.dvc` pointer files in `Workloads/`. If the file is already cached locally, DVC restores it without re-downloading.
 
 ```bash
-dvc pull Workloads/conv_fwd.tar.gz.dvc
+dvc pull Workloads/headline/conv.tar.gz.dvc
 ```
 
 Keep credentials in DVC's ignored local configuration (`.dvc/config.local`);

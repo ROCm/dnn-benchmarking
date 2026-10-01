@@ -538,3 +538,105 @@ class TestPyTorchHostNumpy:
             output,
             np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32),
         )
+
+
+class TestPagedInputGeneration:
+    """Page tables and sequence lengths are integer inputs with invariants that
+    uniform noise cannot satisfy.
+
+    ``rng.uniform(0, 1).astype(int32)`` is **all zeros**. For a page table that
+    means every sequence reads page 0; for a sequence length it means an empty
+    sequence. Both are degenerate rather than merely random, and both produce a
+    result that looks like a successful run.
+    """
+
+    PAGE_SIZE = 64
+    NUM_PAGES = 128
+    NUM_SEQS = 2
+    BLOCKS_PER_SEQ = 32
+
+    def _graph(self):
+        return {
+            "tensors": [
+                {
+                    "uid": 2,
+                    "name": "K",
+                    "dims": [self.NUM_PAGES, 4, self.PAGE_SIZE, 128],
+                },
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "page_table_k_tensor_uid": 5,
+                        "page_table_v_tensor_uid": 6,
+                        "seq_len_q_tensor_uid": 7,
+                        "seq_len_kv_tensor_uid": 8,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {},
+                }
+            ],
+        }
+
+    def _int_tensor(self, uid, dims):
+        return TensorInfo(
+            uid=uid,
+            name=f"t{uid}",
+            dims=list(dims),
+            strides=[1] * len(dims),
+            data_type="int32",
+            is_virtual=False,
+        )
+
+    def test_page_table_spans_multiple_pages(self) -> None:
+        table = self._int_tensor(5, [self.NUM_SEQS, self.BLOCKS_PER_SEQ])
+        data = generate_input_data([table], seed=0, graph_json=self._graph())
+        assert data[5].max() > 0, "every sequence would read page 0"
+        assert data[5].dtype == np.int32
+
+    def test_sequence_lengths_are_positive(self) -> None:
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([lengths], seed=0, graph_json=self._graph())
+        assert data[8].min() > 0, "a zero length is an empty sequence"
+
+    def test_page_ids_stay_within_the_cache(self) -> None:
+        table = self._int_tensor(5, [self.NUM_SEQS, self.BLOCKS_PER_SEQ])
+        data = generate_input_data([table], seed=0, graph_json=self._graph())
+        assert data[5].max() < self.NUM_PAGES, "page id addresses beyond the cache"
+
+    def test_lengths_fit_the_page_allocation(self) -> None:
+        """A length longer than blocks_per_seq * page_size cannot be addressed by
+        the page table, and the handler rejects it."""
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([lengths], seed=0, graph_json=self._graph())
+        assert data[8].max() <= self.BLOCKS_PER_SEQ * self.PAGE_SIZE
+
+    def test_without_graph_json_behaviour_is_unchanged(self) -> None:
+        """The graph argument is optional; omitting it must not alter any
+        existing caller's data."""
+        table = self._int_tensor(5, [self.NUM_SEQS, self.BLOCKS_PER_SEQ])
+        before = generate_input_data([table], seed=0)
+        assert (before[5] == 0).all()
+
+    def test_dense_graph_inputs_are_untouched(self) -> None:
+        """A graph with no page table must generate exactly what it did before,
+        even when the graph is passed."""
+        tensor = _make_bf16_input_tensor(uid=31)
+        dense_graph = {
+            "tensors": [],
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "page_table_k_tensor_uid": None},
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {},
+                }
+            ],
+        }
+        with_graph = generate_input_data([tensor], seed=7, graph_json=dense_graph)
+        without = generate_input_data([tensor], seed=7)
+        np.testing.assert_array_equal(with_graph[tensor.uid], without[tensor.uid])

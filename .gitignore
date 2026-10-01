@@ -67,6 +67,8 @@ tmp/
 *.dump
 *.key
 *.pem
+secrets.*
+credentials.*
 *.sarif
 *.spdx
 *.spdx.json
