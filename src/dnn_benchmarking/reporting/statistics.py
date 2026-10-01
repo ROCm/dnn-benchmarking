@@ -29,7 +29,8 @@ class BenchmarkStats:
 
     Attributes:
         mean_ms: Mean execution time in milliseconds.
-        median_ms: Median execution time in milliseconds.
+        median_ms: Upper median, ``sorted(timings)[n // 2]`` - the rocKE /
+            Solera definition. Always an observed sample, never an average.
         std_ms: Standard deviation of execution time in milliseconds.
         min_ms: Minimum execution time in milliseconds.
         max_ms: Maximum execution time in milliseconds.
@@ -67,7 +68,7 @@ class BenchmarkStats:
 
         return cls(
             mean_ms=float(np.mean(arr)),
-            median_ms=float(np.median(arr)),
+            median_ms=float(np.sort(arr)[len(arr) // 2]),
             std_ms=float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
             min_ms=float(np.min(arr)),
             max_ms=float(np.max(arr)),
@@ -99,7 +100,8 @@ class BenchmarkMetadata:
         graph_name: Name/identifier of the graph being benchmarked.
         graph_path: Path to the graph JSON file.
         warmup_iters: Number of warmup iterations.
-        benchmark_iters: Number of benchmark iterations.
+        benchmark_iters: Number of benchmark iterations (timed samples).
+        timing_block: Executions per timed sample (1 = per-execution timing).
         engine_id: Engine ID used for execution.
         timing_backend: GPU timer backend used ("hip" or "").
         execution_backend: Execution backend used ("hipdnn", "pytorch", or "").
@@ -115,6 +117,7 @@ class BenchmarkMetadata:
     graph_path: str = ""
     warmup_iters: int = 0
     benchmark_iters: int = 0
+    timing_block: int = 1
     engine_id: int = 0
     timing_backend: str = ""
     execution_backend: str = ""

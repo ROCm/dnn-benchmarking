@@ -60,7 +60,7 @@ class Reporter:
         self._print(f"Graph:      {config.graph_path}")
         self._print(f"Engine ID:  {config.engine_id} ({engine_label})")
         self._print(f"Warmup:     {config.warmup_iters} iterations")
-        self._print(f"Benchmark:  {config.benchmark_iters} iterations")
+        self._print(f"Benchmark:  {self._iters_label(config)}")
         self._print_line("-")
         self._print("")
 
@@ -74,9 +74,17 @@ class Reporter:
         self._print(f"Graph:      {config.graph_path}")
         self._print(f"Provider:   {provider}")
         self._print(f"Warmup:     {config.warmup_iters} iterations")
-        self._print(f"Benchmark:  {config.benchmark_iters} iterations")
+        self._print(f"Benchmark:  {self._iters_label(config)}")
         self._print_line("-")
         self._print("")
+
+    @staticmethod
+    def _iters_label(config: BenchmarkConfig) -> str:
+        """Describe the timed loop, including block timing when enabled."""
+        label = f"{config.benchmark_iters} iterations"
+        if config.timing_block > 1:
+            label += f" x {config.timing_block} executions per timed block"
+        return label
 
     def print_init_time(self, init_time_ms: float) -> None:
         """Print initialization timing.
@@ -525,6 +533,7 @@ class Reporter:
                 graph_path=Path(graph_result.graph_path),
                 warmup_iters=suite_config.warmup_iters,
                 benchmark_iters=suite_config.benchmark_iters,
+                timing_block=suite_config.timing_block,
                 engine_id=pe.engine_id,
             )
             if pe.role == "reference":
@@ -689,16 +698,16 @@ class Reporter:
         if not any_present:
             return
 
-        # Pull the unrounded kernel mean used to derive throughput/BW so
+        # Pull the unrounded kernel median used to derive throughput/BW so
         # the printed numbers are reproducible from a single source of
-        # truth — without it, the user can't multiply the rounded mean
+        # truth — without it, the user can't multiply the rounded median
         # back through the FLOPs total to recover the printed TFLOPs.
-        kernel_mean_ms = (
-            pe.gpu_kernel_stats.mean_ms if pe.gpu_kernel_stats is not None else None
+        kernel_median_ms = (
+            pe.gpu_kernel_stats.median_ms if pe.gpu_kernel_stats is not None else None
         )
         derivation_suffix = (
-            f"  (kernel mean {kernel_mean_ms:.4f} ms)"
-            if kernel_mean_ms is not None
+            f"  (kernel median {kernel_median_ms:.4f} ms)"
+            if kernel_median_ms is not None
             else ""
         )
 

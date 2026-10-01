@@ -25,6 +25,7 @@ from dnn_benchmarking.execution.suite_runner import (
     _compute_reference_outputs_once,
     _hipdnn_buffer_device,
     set_plugin_path,
+    _collect_basic_metrics_post_loop,
 )
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -2405,3 +2406,28 @@ class TestOracleExhaustiveEnvGuard:
         )
         assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
         assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+
+def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
+    """derived_tflops_per_s divides by the kernel *median* (rocKE parity),
+    and CPU time is per timed execution (iters * timing_block)."""
+    result = ProviderEngineResult(provider="hipdnn", engine_id=1, status="success")
+    # Mean 4 ms, median 1 ms.
+    result.gpu_kernel_stats = BenchmarkStats.from_timings([1.0, 1.0, 10.0])
+    probe = SimpleNamespace(
+        delta=SimpleNamespace(user_time_ms=60.0, kernel_time_ms=6.0)
+    )
+
+    with patch("dnn_benchmarking.execution.suite_runner.GpuSmiProbe"):
+        _collect_basic_metrics_post_loop(
+            result=result,
+            cpu_time_probe=probe,
+            timed_executions=3 * 20,
+            analytical_flops=10**12,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+        )
+
+    assert result.derived_tflops_per_s == pytest.approx(1000.0)
+    assert result.cpu_user_time_per_iter_us == pytest.approx(1000.0)
+    assert result.cpu_kernel_time_per_iter_us == pytest.approx(100.0)

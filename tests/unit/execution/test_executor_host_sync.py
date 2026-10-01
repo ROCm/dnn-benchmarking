@@ -423,3 +423,62 @@ def test_staged_path_primes_plan_before_measuring(monkeypatch) -> None:
     assert calls == ["execute", "barrier", "execute", "execute"]
     assert len(result.host_timings) == 2
     assert result.kernel_timings is not None and len(result.kernel_timings) == 2
+
+
+def test_block_timing_follows_rocke_protocol(monkeypatch) -> None:
+    """timing_block=N follows rocKE time_launches / Solera measure(): warmup()
+    runs one untimed call; every sample runs warmup_iters untimed executions,
+    drains, then times N executions in one event pair (elapsed/N); the first
+    sample is discarded. It bypasses the stall gate even when staging is
+    available, because N gated enqueues can fill the HIP queue."""
+    calls: list[str] = []
+    elapsed = iter([40.0, 8.0, 12.0])
+
+    class TrackingGraph:
+        def execute(
+            self, handle: Any, variant_pack: Dict[int, int], workspace_ptr: int
+        ) -> DummyResult:
+            calls.append("execute")
+            return DummyResult()
+
+    class BlockTimer(DummyHipTimer):
+        def start(self) -> None:
+            calls.append("start")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+        def elapsed_ms(self) -> float:
+            return next(elapsed)
+
+    class SyncTimer:
+        def synchronize_stream(self) -> None:
+            calls.append("sync")
+
+    monkeypatch.setattr(executor_module, "_is_staged_hip_available", lambda: True)
+    monkeypatch.setattr(
+        executor_module,
+        "StalledRegionTimer",
+        lambda *a, **k: pytest.fail("block timing must not use the stall gate"),
+    )
+    monkeypatch.setattr(executor_module, "create_gpu_timer", lambda **k: BlockTimer())
+
+    config = BenchmarkConfig(
+        graph_path="dummy.json", warmup_iters=2, benchmark_iters=3, timing_block=4
+    )
+    executor = executor_module.Executor("{}", config, collect_kernel_timing=True)
+    executor._graph = TrackingGraph()
+    executor._workspace_ptr = 0
+    executor._get_stream_sync_timer = lambda stream: SyncTimer()
+
+    executor.warmup(handle=FakeHandle(0), variant_pack={})
+    assert calls == ["execute", "sync"]
+    calls.clear()
+
+    result = executor.benchmark(handle=FakeHandle(0), variant_pack={})
+
+    sample = ["execute"] * 2 + ["sync", "start"] + ["execute"] * 4 + ["stop"]
+    assert calls == sample * 3
+    assert result.kernel_timings == [2.0, 3.0]
+    assert len(result.host_timings) == 2
+    assert result.metadata is not None and result.metadata.timing_block == 4

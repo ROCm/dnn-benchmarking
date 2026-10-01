@@ -17,6 +17,10 @@ graphs = [
 # Benchmark loop controls.
 warmup = 10
 iters = 100
+# Executions per timed sample. 1 times each execution on its own; N > 1 times
+# N back-to-back executions between one GPU event pair and records elapsed/N
+# (the block timing the rocKE benchmarks use).
+timing_block = 1
 
 # Optional seed for reproducible input data. Use an integer, or omit/null for no fixed seed.
 seed = 123
