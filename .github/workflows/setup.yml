@@ -91,6 +91,7 @@ jobs:
           "$VENV/python" -m pytest -m "not gpu" -q
 
   gpu-test:
+    name: gpu-tests (gfx950, full suite)
     runs-on: linux-gfx950-1gpu-ccs-ossci-rocm
     timeout-minutes: 180
     steps:
