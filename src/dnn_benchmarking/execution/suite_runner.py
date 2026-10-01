@@ -571,7 +571,10 @@ def _run_timed_pytorch_row(
 
                 if role == "reference":
                     buffer_manager.zero_outputs()
-                    executor.execute_once(tensors)
+                    # Timing above used default dispatch; the outputs other
+                    # rows are graded against come from repeatable SDPA.
+                    with pytorch_ops.reference_sdpa_pass():
+                        executor.execute_once(tensors)
                     # A profiling child allocates its own VRAM, so profiled
                     # runs keep host-only references (and DeviceBuffer I/O).
                     outputs = _pytorch_reference_outputs_from_buffer(

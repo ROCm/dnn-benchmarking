@@ -1656,6 +1656,53 @@ class TestPyTorchSdpaBackendSelection:
         sdpa_kernel.assert_not_called()
         preferred_library.assert_not_called()
 
+    @staticmethod
+    def _enabled_backends_at_call(state, reference_pass: bool) -> set[str]:
+        """Run one SDPA call and return the PyTorch backends it was allowed."""
+        seen: set[str] = set()
+
+        def recording_sdpa(*args, **kwargs):
+            backends = torch.backends.cuda
+            for name, enabled in (
+                ("flash", backends.flash_sdp_enabled()),
+                ("efficient", backends.mem_efficient_sdp_enabled()),
+                ("math", backends.math_sdp_enabled()),
+            ):
+                if enabled:
+                    seen.add(name)
+            return torch.empty(0)
+
+        with (
+            patch.object(
+                torch.nn.functional,
+                "scaled_dot_product_attention",
+                side_effect=recording_sdpa,
+            ),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+            pytorch_ops.reference_sdpa_pass() if reference_pass else nullcontext(),
+        ):
+            TestPyTorchSdpaBackendSelection._execute()
+        return seen
+
+    def test_default_reference_pass_runs_on_math_only(self) -> None:
+        """The fused ROCm kernels are not repeatable; a reference must be."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"math"}
+        # Timed default-dispatch calls keep every backend PyTorch offers.
+        assert {"flash", "math"} <= self._enabled_backends_at_call(
+            state, reference_pass=False
+        )
+
+    def test_reference_pass_keeps_a_strict_selection(self) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.FLASH)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"flash"}
+
     @pytest.mark.parametrize("missing", ["sdpa_kernel", "backend_member"])
     def test_missing_public_api_or_backend_member_does_not_call_sdpa(
         self, missing: str

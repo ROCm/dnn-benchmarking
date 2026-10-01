@@ -1756,6 +1756,70 @@ class TestTimedPytorchRowEngineRole:
         assert counts.passed + counts.failed + counts.skipped + counts.errored == 1
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
+        self,
+        mock_buffer_manager_cls,
+        mock_pytorch_executor_cls,
+    ):
+        """Timing measures default dispatch; the graded outputs use MATH."""
+        import torch
+
+        from dnn_benchmarking.execution import pytorch_ops
+
+        def math_only_at_sdpa() -> bool:
+            seen = []
+
+            def recording_sdpa(*args, **kwargs):
+                seen.append(
+                    torch.backends.cuda.math_sdp_enabled()
+                    and not torch.backends.cuda.flash_sdp_enabled()
+                )
+                return torch.empty(0)
+
+            q = torch.rand(1, 1, 2, 4)
+            with patch.object(
+                torch.nn.functional, "scaled_dot_product_attention", recording_sdpa
+            ):
+                pytorch_ops.execute_selected_sdpa(
+                    q, q, q, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+                )
+            return seen[0]
+
+        calls = {}
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+
+        def timed(*args, **kwargs):
+            calls["benchmark"] = math_only_at_sdpa()
+            return BenchmarkResult(
+                host_timings=[1.0], kernel_timings=[0.5], metadata=BenchmarkMetadata()
+            )
+
+        def output_pass(*args, **kwargs):
+            calls["execute_once"] = math_only_at_sdpa()
+
+        executor.benchmark.side_effect = timed
+        executor.execute_once.side_effect = output_pass
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(metrics=MetricsConfig(tier="off")),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert calls == {"benchmark": False, "execute_once": True}
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_engine_role_failure_is_error(self, mock_pytorch_executor_cls):
         mock_pytorch_executor_cls.side_effect = RuntimeError("no GPU")
 
