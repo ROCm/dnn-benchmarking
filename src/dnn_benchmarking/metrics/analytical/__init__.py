@@ -22,24 +22,33 @@ Per-op formulas (FMA = 2 FLOPs throughout):
   ``2 * N * (C_in / group) * R * S * K * H_out * W_out``
   — see :mod:`.conv`. Matches MIOpen's ``conv_driver.hpp`` and the
   rocKE conv benchmarks; ``C_in / group`` comes from the weight dims.
-* SDPA fwd: ``2 * B * H_q * unmasked_pairs * (D_qk + D_vo)`` — see
-  :mod:`.sdpa`. Exact causal / sliding-window pair counts using
-  hipDNN's mask semantics.
+* SDPA fwd: ``2 * B * H_q * unmasked_pairs * (D_qk + D_vo)``; SDPA bwd:
+  ``2 * B * H_q * unmasked_pairs * (3 * D_qk + 2 * D_vo)`` (2.5x fwd for
+  equal head dims, FlashAttention's convention) — see :mod:`.sdpa`.
+  Exact causal / sliding-window pair counts using hipDNN's mask semantics.
 * GEMM: ``2 * batch * M * N * K`` — see :mod:`.matmul`. Standard
-  textbook formula (e.g. NVIDIA's perf model docs).
+  textbook formula (e.g. NVIDIA's perf model docs). MoE grouped matmul
+  fwd: ``2 * routed_rows * K * N``; bwd (weight gradient only):
+  ``2 * token_rows * K * N``.
 * Pointwise (relu, add, mul, …): ``num_output_elements`` (1 op/elem)
   — see :mod:`.elementwise`.
 * Rng: ``num_output_elements`` (conservative; most PRNGs do more
   per draw) — see :mod:`.elementwise`.
-* BatchNorm inference: ``4 * num_output_elements`` (subtract mean,
-  multiply by inv_var, multiply by scale, add bias). Training fwd /
-  bwd: ``8 * num_output_elements`` (above plus mean / variance
-  reductions). LayerNorm / RMSNorm fwd: ``8 * num_output_elements``.
+* Block-scale quantize: ``2 * num_elements`` (block abs-max + scale);
+  dequantize: ``num_elements`` (scale multiply) — see :mod:`.elementwise`.
+* BatchNorm inference (including ``VarianceExt``): ``4 *
+  num_output_elements`` (subtract mean, multiply by inv_var, multiply by
+  scale, add bias). Training fwd: ``8 * num_output_elements`` (above
+  plus mean / variance reductions). BatchNorm / LayerNorm / RMSNorm bwd:
+  ``8 * num_dx_elements``. LayerNorm / RMSNorm fwd: ``8 * num_output_elements``.
   SoftMax fwd: ``4 * num_output_elements`` (max, exp, sum, divide).
   See :mod:`.normalization`. Multipliers follow Composable Kernel's
   norm benchmarks and PyTorch's profiler conventions.
 * Reduction (sum/mean/etc.): ``num_input_elements`` (1 op/elem on
   the input — output is typically scalar/row). See :mod:`.reduction`.
+* Resample (pooling) fwd: ``num_output_elements * window``; bwd:
+  ``num_dy_elements`` for max pooling, ``num_dy_elements * window`` for
+  average pooling. See :mod:`.reduction`.
 
 Per-op FLOP / IO handlers live in this directory split by op family:
 ``conv.py``, ``matmul.py``, ``elementwise.py``, ``normalization.py``,
@@ -58,17 +67,22 @@ from ...graph.tensor_info import TensorInfo
 from .._diagnostic import warn_once
 from ._common import tensor_lookup
 from .conv import conv_dgrad_flops, conv_fwd_flops, conv_wgrad_flops
-from .elementwise import pointwise_flops, rng_flops
-from .matmul import matmul_flops
+from .elementwise import (
+    block_scale_dequantize_flops,
+    block_scale_quantize_flops,
+    pointwise_flops,
+    rng_flops,
+)
+from .matmul import matmul_flops, moe_grouped_matmul_bwd_flops, moe_grouped_matmul_flops
 from .normalization import (
-    batchnorm_backward_flops,
     batchnorm_inference_flops,
     batchnorm_training_flops,
     layernorm_flops,
+    norm_backward_flops,
     softmax_flops,
 )
-from .reduction import reduction_flops
-from .sdpa import sdpa_fwd_flops
+from .reduction import reduction_flops, resample_bwd_flops, resample_fwd_flops
+from .sdpa import sdpa_bwd_flops, sdpa_fwd_flops
 
 # Dispatch table: node "type" -> handler returning int FLOPs (or None
 # when tensor data is incomplete). Unrecognised types flip the
@@ -84,21 +98,31 @@ _FLOP_HANDLERS = {
     "ConvolutionWrwAttributes": conv_wgrad_flops,
     "ConvolutionBwdFilterAttributes": conv_wgrad_flops,
     "MatmulAttributes": matmul_flops,
+    "MoeGroupedMatmulAttributes": moe_grouped_matmul_flops,
+    "MoeGroupedMatmulBwdAttributes": moe_grouped_matmul_bwd_flops,
     "PointwiseAttributes": pointwise_flops,
     # BatchNorm: hipDNN's BatchnormAttributes covers fwd training (with
     # next_running_* outputs) and BatchnormBackwardAttributes covers
     # bwd. BatchnormFwdAttributes / BatchnormBwdAttributes are kept as
     # aliases for older graph snapshots.
     "BatchnormInferenceAttributes": batchnorm_inference_flops,
+    "BatchnormInferenceAttributesVarianceExt": batchnorm_inference_flops,
     "BatchnormAttributes": batchnorm_training_flops,
     "BatchnormFwdAttributes": batchnorm_training_flops,
-    "BatchnormBackwardAttributes": batchnorm_backward_flops,
-    "BatchnormBwdAttributes": batchnorm_backward_flops,
+    "BatchnormBackwardAttributes": norm_backward_flops,
+    "BatchnormBwdAttributes": norm_backward_flops,
     "LayernormAttributes": layernorm_flops,
+    "LayernormBackwardAttributes": norm_backward_flops,
     "RMSNormAttributes": layernorm_flops,
+    "RMSNormBackwardAttributes": norm_backward_flops,
     "SoftmaxAttributes": softmax_flops,
     "SdpaAttributes": sdpa_fwd_flops,
+    "SdpaBackwardAttributes": sdpa_bwd_flops,
     "ReductionAttributes": reduction_flops,
+    "ResampleFwdAttributes": resample_fwd_flops,
+    "ResampleBwdAttributes": resample_bwd_flops,
+    "BlockScaleQuantizeAttributes": block_scale_quantize_flops,
+    "BlockScaleDequantizeAttributes": block_scale_dequantize_flops,
     "RngAttributes": rng_flops,
 }
 

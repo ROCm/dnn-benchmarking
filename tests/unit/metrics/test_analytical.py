@@ -433,8 +433,8 @@ class TestComputeFlops:
                 {
                     "name": "red",
                     "type": "ReductionAttributes",
-                    "inputs": {"x_tensor_uid": 1},
-                    "outputs": {"y_tensor_uid": 2},
+                    "inputs": {"in_tensor_uid": 1},
+                    "outputs": {"out_tensor_uid": 2},
                 }
             ],
         }
@@ -621,6 +621,135 @@ class TestComputeFlops:
         assert flops == 2 * 2 * 64 * (128 * 128) * (128 + 64)
         assert flops == 805306368
         assert partial is False
+
+    def test_sdpa_bwd_five_matmuls_with_parameters_section(self):
+        # hipDNN writes SDPA backward attributes under "parameters".
+        graph = _sdpa_graph(sq=8, skv=8, d=192, dv=128)
+        node = graph["nodes"][0]
+        node["type"] = "SdpaBackwardAttributes"
+        node["parameters"] = {"causal_mask": True}
+        del node["attributes"]
+        flops, partial = compute_flops(graph)
+        # Causal 8x8 -> 36 pairs; 3 matmuls over D_qk, 2 over D_vo.
+        assert flops == 2 * 2 * 64 * 36 * (3 * 192 + 2 * 128)
+        assert partial is False
+
+
+def _graph(node_type, tensors, inputs, outputs, **params):
+    return {
+        "tensors": [
+            {"uid": uid, "dims": dims, "data_type": "float", "virtual": False}
+            for uid, dims in tensors.items()
+        ],
+        "nodes": [{"type": node_type, "inputs": inputs, "outputs": outputs, **params}],
+    }
+
+
+class TestComputeFlopsCoverage:
+    """Handlers for the remaining hipDNN node types, in their real JSON layout."""
+
+    @pytest.mark.parametrize(
+        "mode, extra_inputs, rows",
+        [("none", {}, 128), ("gather", {"token_index_tensor_uid": 5}, 96)],
+    )
+    def test_moe_grouped_matmul_counts_routed_rows(self, mode, extra_inputs, rows):
+        graph = _graph(
+            "MoeGroupedMatmulAttributes",
+            {
+                1: [1, 128, 64],
+                2: [8, 64, 32],
+                3: [8, 1, 1],
+                4: [1, rows, 32],
+                5: [1, 96, 1],
+            },
+            {
+                "token_tensor_uid": 1,
+                "weight_tensor_uid": 2,
+                "first_token_offset_tensor_uid": 3,
+                **extra_inputs,
+            },
+            {"output_tensor_uid": 4},
+            mode=mode,
+        )
+        assert compute_flops(graph) == (2 * rows * 64 * 32, False)
+
+    def test_moe_grouped_matmul_bwd_weight_gradient(self):
+        graph = _graph(
+            "MoeGroupedMatmulBwdAttributes",
+            {1: [1, 128, 32], 2: [1, 128, 64], 3: [8, 1, 1], 4: [8, 64, 32]},
+            {
+                "doutput_tensor_uid": 1,
+                "token_tensor_uid": 2,
+                "first_token_offset_tensor_uid": 3,
+            },
+            {"dweight_tensor_uid": 4},
+        )
+        assert compute_flops(graph) == (2 * 128 * 64 * 32, False)
+
+    def test_block_scale_quantize_and_dequantize(self):
+        quant = _graph(
+            "BlockScaleQuantizeAttributes",
+            {1: [64, 512], 2: [64, 512], 3: [64, 4]},
+            {"x_tensor_uid": 1},
+            {"y_tensor_uid": 2, "scale_tensor_uid": 3},
+            block_size=128,
+        )
+        dequant = _graph(
+            "BlockScaleDequantizeAttributes",
+            {1: [64, 512], 2: [64, 4], 3: [64, 512]},
+            {"x_tensor_uid": 1, "scale_tensor_uid": 2},
+            {"y_tensor_uid": 3},
+            block_size=[128],
+        )
+        assert compute_flops(quant) == (2 * 64 * 512, False)
+        assert compute_flops(dequant) == (64 * 512, False)
+
+    def test_resample_fwd_reads_top_level_window(self):
+        graph = _graph(
+            "ResampleFwdAttributes",
+            {1: [2, 4, 16, 16], 2: [2, 4, 7, 7]},
+            {"x_tensor_uid": 1},
+            {"y_tensor_uid": 2},
+            window=[3, 3],
+            stride=[2, 2],
+            resample_mode="maxpool",
+        )
+        assert compute_flops(graph) == (2 * 4 * 7 * 7 * 9, False)
+
+    @pytest.mark.parametrize(
+        "mode, per_dy", [("MAXPOOL", 1), ("AVGPOOL_INCLUDE_PADDING", 9)]
+    )
+    def test_resample_bwd_max_routes_avg_spreads(self, mode, per_dy):
+        graph = _graph(
+            "ResampleBwdAttributes",
+            {1: [2, 4, 7, 7], 2: [2, 4, 16, 16]},
+            {"dy_tensor_uid": 1},
+            {"dx_tensor_uid": 2},
+            window=[3, 3],
+            resample_mode=mode,
+        )
+        assert compute_flops(graph) == (2 * 4 * 7 * 7 * per_dy, False)
+
+    @pytest.mark.parametrize(
+        "node_type", ["LayernormBackwardAttributes", "RMSNormBackwardAttributes"]
+    )
+    def test_norm_backward_counts_dx(self, node_type):
+        graph = _graph(
+            node_type,
+            {1: [8, 256, 128], 2: [8, 256, 128], 3: [1, 1, 128], 4: [8, 256, 128]},
+            {"dy_tensor_uid": 1, "x_tensor_uid": 2, "scale_tensor_uid": 3},
+            {"dx_tensor_uid": 4},
+        )
+        assert compute_flops(graph) == (8 * 8 * 256 * 128, False)
+
+    def test_batchnorm_inference_variance_ext(self):
+        graph = _graph(
+            "BatchnormInferenceAttributesVarianceExt",
+            {1: [4, 16, 8, 8], 2: [4, 16, 8, 8]},
+            {"x_tensor_uid": 1},
+            {"y_tensor_uid": 2},
+        )
+        assert compute_flops(graph) == (4 * 4 * 16 * 8 * 8, False)
 
 
 class TestComputeIoBytes:

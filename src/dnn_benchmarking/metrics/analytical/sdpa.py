@@ -1,16 +1,27 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""FLOP handler for scaled-dot-product attention forward (SdpaAttributes).
+"""FLOP handlers for scaled-dot-product attention (SdpaAttributes,
+SdpaBackwardAttributes).
 
-Attention forward is two batched matmuls (``QKᵀ`` then ``P·V``); FMA = 2
-FLOPs. Only query heads count (GQA repeats KV heads, which adds no
-arithmetic); softmax/exp/scaling/sinks are ignored (matmul-only convention).
+Matmul-only convention: FMA = 2 FLOPs; softmax/exp/scaling/sinks/dropout
+are ignored. Only query heads count (GQA repeats KV heads, which adds no
+arithmetic; dK/dV head reduction is an accumulate). With ``P`` the count of
+unmasked ``(q, kv)`` pairs per query head:
 
-    flops = 2 * batch * num_q_heads * num_nonmasked * (head_dim_qk + head_dim_vo)
+* forward, two matmuls (``S = QKᵀ``, ``O = P·V``)::
 
-where ``num_nonmasked`` is the exact count of unmasked ``(q, kv)`` pairs per
-query head. The mask is resolved the way hipDNN's reference executor and
+      2 * batch * num_q_heads * P * (head_dim_qk + head_dim_vo)
+
+* backward, five matmuls (recompute ``S = QKᵀ``; ``dV = Pᵀ·dO``;
+  ``dP = dO·Vᵀ``; ``dQ = dS·K``; ``dK = dSᵀ·Q``)::
+
+      2 * batch * num_q_heads * P * (3 * head_dim_qk + 2 * head_dim_vo)
+
+  For ``head_dim_qk == head_dim_vo`` this is 2.5x forward, the convention
+  FlashAttention's benchmarks use.
+
+``P`` is exact. The mask is resolved the way hipDNN's reference executor and
 providers resolve it (``extractDiagonalBandParams`` / ``getMaskType``):
 
 * deprecated ``causal_mask`` -> top-left causal (bounds/alignment ignored);
@@ -25,7 +36,9 @@ BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
 windowed count the rocKE attention benchmarks report.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+from ._common import node_param, node_tensor
 
 
 def _nonmasked_pairs(
@@ -47,67 +60,73 @@ def _nonmasked_pairs(
     return total
 
 
-def sdpa_fwd_flops(
+def _attention_terms(
     node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
-) -> Optional[int]:
-    """FLOPs for SdpaAttributes (forward attention).
+) -> Optional[Tuple[int, int, int]]:
+    """Return ``(batch * num_q_heads * P, head_dim_qk, head_dim_vo)``.
 
-    Returns None (marking the graph partial) when q/k/v tensor data is
-    incomplete, or when the mask is one hipDNN rejects (a bound below -1,
-    or both deprecated causal flags set).
+    Returns None when q/k/v tensor data is incomplete, or when the mask is
+    one hipDNN rejects (a bound below -1, or both deprecated causal flags).
     """
-    inputs = node.get("inputs", {}) or {}
-    q_uid = inputs.get("q_tensor_uid")
-    k_uid = inputs.get("k_tensor_uid")
-    v_uid = inputs.get("v_tensor_uid")
-    if q_uid is None or k_uid is None or v_uid is None:
-        return None
-    q = tensors_by_uid.get(int(q_uid))
-    k = tensors_by_uid.get(int(k_uid))
-    v = tensors_by_uid.get(int(v_uid))
+    q = node_tensor(node, "q_tensor_uid", tensors_by_uid)
+    k = node_tensor(node, "k_tensor_uid", tensors_by_uid)
+    v = node_tensor(node, "v_tensor_uid", tensors_by_uid)
     if not q or not k or not v:
         return None
-
     q_dims = q.get("dims") or []
     k_dims = k.get("dims") or []
     v_dims = v.get("dims") or []
     if len(q_dims) < 3 or len(k_dims) < 3 or len(v_dims) < 3:
         return None
 
-    q_heads = int(q_dims[-3])
     q_seqlen = int(q_dims[-2])
-    head_dim_qk = int(q_dims[-1])
     kv_seqlen = int(k_dims[-2])
-    head_dim_vo = int(v_dims[-1])
-
-    batch = 1
-    for d in q_dims[:-3]:
-        batch *= int(d)
+    rows = 1  # batch * num_q_heads
+    for d in q_dims[:-2]:
+        rows *= int(d)
 
     # Validate and resolve the mask in the order of hipDNN's
-    # extractDiagonalBandParams; graphs hipDNN rejects get no count (None).
-    attributes = node.get("attributes", {}) or {}
-    left = attributes.get("left_bound")
-    right = attributes.get("right_bound")
-    left = -1 if left is None else int(left)
-    right = -1 if right is None else int(right)
+    # extractDiagonalBandParams.
+    left = int(node_param(node, "left_bound", -1))
+    right = int(node_param(node, "right_bound", -1))
     if left < -1 or right < -1:
         return None
-    causal_top_left = attributes.get("causal_mask") is True
-    causal_bottom_right = attributes.get("causal_mask_bottom_right") is True
+    causal_top_left = node_param(node, "causal_mask") is True
+    causal_bottom_right = node_param(node, "causal_mask_bottom_right") is True
     if causal_top_left and causal_bottom_right:
         return None
-
     if causal_top_left or causal_bottom_right:
         left, right, bottom_right = -1, 0, causal_bottom_right
     else:
-        bottom_right = attributes.get("diagonal_alignment") in ("BOTTOM_RIGHT", 1)
+        bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
 
-    num_nonmasked = _nonmasked_pairs(
+    pairs = _nonmasked_pairs(
         q_seqlen,
         kv_seqlen,
         None if left == -1 else left,
         None if right == -1 else right,
         bottom_right,
     )
-    return 2 * batch * q_heads * num_nonmasked * (head_dim_qk + head_dim_vo)
+    return rows * pairs, int(q_dims[-1]), int(v_dims[-1])
+
+
+def sdpa_fwd_flops(
+    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+) -> Optional[int]:
+    """FLOPs for SdpaAttributes: ``2 * B * Hq * P * (Dqk + Dvo)``."""
+    terms = _attention_terms(node, tensors_by_uid)
+    if terms is None:
+        return None
+    pairs, head_dim_qk, head_dim_vo = terms
+    return 2 * pairs * (head_dim_qk + head_dim_vo)
+
+
+def sdpa_bwd_flops(
+    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+) -> Optional[int]:
+    """FLOPs for SdpaBackwardAttributes: ``2 * B * Hq * P * (3*Dqk + 2*Dvo)``."""
+    terms = _attention_terms(node, tensors_by_uid)
+    if terms is None:
+        return None
+    pairs, head_dim_qk, head_dim_vo = terms
+    return 2 * pairs * (3 * head_dim_qk + 2 * head_dim_vo)
