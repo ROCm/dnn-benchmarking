@@ -4,6 +4,7 @@
 """Unit tests for suite_runner module."""
 
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -168,7 +169,7 @@ class TestRunGraphAllProviders:
         mock_resolve_name,
     ):
         """run_graph_all_providers returns one ProviderEngineResult per discovered engine ID."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(
@@ -438,7 +439,7 @@ class TestDiscoveryFailure:
         mock_resolve_name,
     ):
         """Explicit --engine IDs run in CLI order without discovery filtering."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1])
         mock_bm_cls.return_value = _make_bm_mock()
@@ -454,6 +455,65 @@ class TestDiscoveryFailure:
         assert len(result.results) == 1
         assert result.results[0].status == "success"
         assert result.results[0].engine_id == 99
+
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_engine_name_comes_from_the_per_engine_handle(
+        self, mock_bm_cls, mock_exec_cls, mock_get_ref
+    ):
+        """With --engine and no shared handle, the row is named by the handle
+        built for that engine, so plugin-supplied engines are not shown as hex."""
+        mock_get_ref.return_value = None
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
+        mock_bm_cls.return_value = _make_bm_mock()
+        plugin_handle = MagicMock()
+        plugin_handle.engine_id_to_name.return_value = "hipkernel:Gfx950AttentionDense"
+        frontend = SimpleNamespace(
+            Handle=MagicMock(return_value=plugin_handle),
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
+            engine_id_to_name=lambda _id: "",  # built-in registry: unknown
+        )
+
+        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
+            result = run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(engine_filter=[0x7636]),
+                handle=None,
+            )
+
+        assert result.results[0].provider == "hipkernel:Gfx950AttentionDense"
+
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_setup_failure_row_keeps_the_built_in_registry_name(
+        self, mock_bm_cls, mock_exec_cls, mock_get_ref
+    ):
+        """When the per-engine handle cannot be built there is no handle to ask,
+        but the row must still carry the built-in engine name, not hex."""
+        mock_get_ref.return_value = None
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
+        mock_bm_cls.return_value = _make_bm_mock()
+        frontend = SimpleNamespace(
+            Handle=MagicMock(side_effect=RuntimeError("plugin failed to load")),
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
+            engine_id_to_name=lambda _id: "MIOPEN_ENGINE",
+        )
+
+        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
+            result = run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(engine_filter=[1]),
+                handle=None,
+            )
+
+        row = result.results[0]
+        assert (row.status, row.provider) == ("error", "MIOPEN_ENGINE")
 
 
 class TestSuiteConfigValidation:
@@ -520,7 +580,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """When --engine filter is set, only that engine ID is iterated."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2])
@@ -549,7 +609,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """engine_filter=[1, 3, 99] runs exactly those IDs in caller order."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2, 3])
@@ -578,7 +638,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """Repeated engine IDs are separate ordered selections."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
         mock_bm_cls.return_value = _make_bm_mock()
@@ -624,7 +684,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """A later per-engine handle failure records an error row and continues."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
         mock_bm_cls.return_value = _make_bm_mock()
@@ -1413,7 +1473,30 @@ class TestResolveEngineName:
             return real_import(name, *args, **kwargs)
 
         with patch("builtins.__import__", side_effect=fake_import):
-            assert _resolve_engine_name(0xABC) == "engine_0xabc"
+            assert _resolve_engine_name(0xABC, None) == "engine_0xabc"
+
+    @staticmethod
+    def _frontend(registry_name):
+        return SimpleNamespace(engine_id_to_name=lambda _id: registry_name)
+
+    def test_handle_names_plugin_engine_missing_from_builtin_registry(self):
+        handle = MagicMock()
+        handle.engine_id_to_name.return_value = "hipkernel:Gfx950AttentionDense"
+        with patch.dict(sys.modules, {"hipdnn_frontend": self._frontend("")}):
+            name = _resolve_engine_name(0x7636, handle)
+        assert name == "hipkernel:Gfx950AttentionDense"
+
+    def test_falls_back_silently_when_handle_carries_no_such_engine(self, capsys):
+        from dnn_benchmarking.metrics._diagnostic import reset
+
+        reset()  # warn_once dedups process-wide; start from a clean slate.
+        handle = MagicMock()
+        handle.engine_id_to_name.side_effect = IndexError("not loaded")
+        with patch.dict(
+            sys.modules, {"hipdnn_frontend": self._frontend("MIOPEN_ENGINE")}
+        ):
+            assert _resolve_engine_name(1, handle) == "MIOPEN_ENGINE"
+        assert capsys.readouterr().err == ""
 
 
 class TestProfilingPassInvocation:
@@ -1423,7 +1506,7 @@ class TestProfilingPassInvocation:
     not bubble out as engine errors."""
 
     def _setup_mocks(self, mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name):
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(
             engine_ids=[0], has_kernel_timings=True
@@ -1918,7 +2001,7 @@ class TestOraclePass:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -1972,7 +2055,7 @@ class TestOraclePass:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2145,7 +2228,7 @@ class TestOracleTunedPlanValidation:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2292,7 +2375,7 @@ class TestOracleExhaustiveEnvGuard:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
