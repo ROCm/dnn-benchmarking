@@ -279,6 +279,9 @@ def run_suite_cli(
             profiling_output_dir=args.profiling_output_dir,
             profiling_timeout_s=args.profiling_timeout,
         )
+        oracle_mode = args.oracle_mode or (
+            "off" if backend is ExecutionBackendName.PYTORCH else "exhaustive"
+        )
         if backend is ExecutionBackendName.PYTORCH:
             if args.engine:
                 reporter.print_error("--engine is not supported with --backend pytorch")
@@ -300,7 +303,7 @@ def run_suite_cli(
                     "--roofline) are not supported with --backend pytorch"
                 )
                 return 1
-            if args.oracle_mode != "off":
+            if args.oracle_mode not in (None, "off"):
                 reporter.print_error(
                     "--oracle-mode is not supported with --backend pytorch "
                     "(auto-tuning is a hipDNN engine feature)"
@@ -319,7 +322,7 @@ def run_suite_cli(
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
             )
-        if args.oracle_mode == "exhaustive" and args.warmup == 0:
+        if oracle_mode == "exhaustive" and args.warmup == 0:
             reporter.print_error(
                 "--oracle-mode exhaustive requires --warmup >= 1: with "
                 "benchmarking forced, a plan's first execute() samples kernel "
@@ -348,14 +351,14 @@ def run_suite_cli(
             seed=args.seed,
             engine_filter=args.engine,
             verbose=args.verbose,
-            oracle_mode=args.oracle_mode,
+            oracle_mode=oracle_mode,
             metrics=metrics_config,
             validation=validation,
             plugin_paths=plugin_paths,
             backend=backend,
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
-            autotune=getattr(args, "autotune", False),
+            autotune=args.autotune and backend is not ExecutionBackendName.PYTORCH,
             cache_dir=str(args.cache_dir) if getattr(args, "cache_dir", None) else None,
         )
     except ValueError as e:
@@ -424,11 +427,12 @@ def _apply_tuning_environment(config: SuiteConfig, reporter) -> None:
     if leaked:
         reporter.print_warning(
             f"HIPDNN_FORCE_BENCHMARKING={leaked} is set in the environment but "
-            "--autotune was not passed; kernel selection is NOT the default "
-            "heuristic path"
+            "--no-autotune was passed; kernel selection is NOT the default "
+            "benchmarked path"
         )
     else:
         reporter.print_warning(
-            "kernel selection: COLD HEURISTIC (rank-0). Pass --autotune to "
-            "measure what the shipped kernel set can deliver."
+            "kernel selection: COLD HEURISTIC (rank-0), requested by "
+            "--no-autotune. Omit it to measure what the shipped kernel set "
+            "can deliver."
         )

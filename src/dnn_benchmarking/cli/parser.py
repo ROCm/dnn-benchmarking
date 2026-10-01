@@ -156,10 +156,10 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
         flags=("--autotune",),
         dest="autotune",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Sample every knob-filtered candidate kernel on each plan's first "
+            "On by default; --no-autotune restores the cold heuristic. Sample every knob-filtered candidate kernel on each plan's first "
             "execute and cache the winner, via HIPDNN_FORCE_BENCHMARKING=1. "
             "Without it an engine serves its cold heuristic's rank-0 pick, so a "
             "table measures the heuristic rather than what the shipped kernel "
@@ -245,11 +245,12 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         dest="oracle_mode",
         parser_type=str,
         choices=_ORACLE_MODE_CHOICES,
-        default="off",
+        default=None,
         metavar="MODE",
         group="Output",
         help=(
-            "Oracle comparison depth (default: off). 'plan' also times the "
+            "Oracle comparison depth (default: exhaustive; off with --backend "
+            "pytorch). 'off' skips it. 'plan' also times the "
             "plan hipDNN auto-tuning picks for each engine and reports the "
             "delta against the heuristic plan. 'exhaustive' additionally "
             "forces provider kernel benchmarking so providers sample kernel "

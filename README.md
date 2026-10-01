@@ -301,9 +301,9 @@ hipDNN's tuned plan for each engine:
 
 | Mode | Behavior |
 |---|---|
-| `off` | Run only the OOTB plan. This is the default. |
+| `off` | Run only the OOTB plan. This is the default with `--backend pytorch`. |
 | `plan` | Benchmark every backend-generated plan for the engine. |
-| `exhaustive` | Run `plan` mode and enable provider-managed kernel selection where supported. |
+| `exhaustive` | Run `plan` mode and enable provider-managed kernel selection where supported. This is the default. |
 
 The exhaustive path keeps every plan returned by the backend. It does not
 generate a Cartesian product of public knob values. The kernel ingestor and
@@ -312,7 +312,7 @@ hipBLASLt, remain at plan-level tuning. Providers can reuse cached selections,
 so exhaustive mode does not prove that every variant was measured during the
 current invocation.
 
-Both modes are slower than a normal run. Use `--engine` to limit the work.
+Both modes are slower than a normal run. Use `--engine` to limit the work, or `--oracle-mode off` to skip them.
 `exhaustive` requires `--warmup >= 1`.
 
 The summary table shows:
@@ -382,11 +382,11 @@ statistics and whatever machine metadata the host could provide
 be diffed offline. (An offline comparison helper is planned but not yet
 included.)
 
-### Kernel Selection (`--autotune`, `--cache-dir`)
+### Kernel Selection (`--autotune` / `--no-autotune`, `--cache-dir`)
 
 An engine has two kernel-selection paths, and they answer different questions.
-By default it serves its cold heuristic's rank-0 pick, so a table measures the
-*heuristic*. `--autotune` sets `HIPDNN_FORCE_BENCHMARKING=1`, which samples
+With `--no-autotune` it serves its cold heuristic's rank-0 pick, so a table
+measures the *heuristic*. The default (`--autotune`) sets `HIPDNN_FORCE_BENCHMARKING=1`, which samples
 every knob-filtered candidate on each plan's first execute and caches the
 winner — that measures what the shipped *kernel set* can deliver. Use it for
 any best-vs-best comparison: without it, an engine that gains good variants can
@@ -402,11 +402,11 @@ same graphs therefore share rankings, and an untuned run can silently report a
 ranking some other run tuned. Give each phase its own empty root:
 
 ```bash
-# Measure the heuristic (default) — path is announced on stderr
-dnn-benchmark --graph 'graphs/*.json' --cache-dir /tmp/cache-cold
+# Measure the heuristic — path is announced on stderr
+dnn-benchmark --graph 'graphs/*.json' --no-autotune --cache-dir /tmp/cache-cold
 
-# Measure the kernel set: benchmark every candidate, into an isolated cache
-dnn-benchmark --graph 'graphs/*.json' --autotune --cache-dir /tmp/cache-tuned
+# Measure the kernel set (default): benchmark every candidate, into an isolated cache
+dnn-benchmark --graph 'graphs/*.json' --cache-dir /tmp/cache-tuned
 ```
 
 ### Config Files

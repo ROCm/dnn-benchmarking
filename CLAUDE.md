@@ -41,8 +41,8 @@ which the torch-wheel ROCm SDK does not provide — see the README for the worki
 
 ### Kernel selection
 
-`--autotune` sets `HIPDNN_FORCE_BENCHMARKING=1`, sampling every knob-filtered candidate on
-each plan's first execute and caching the winner; the default cold-heuristic path serves
+`--autotune` (on by default; `--no-autotune` disables) sets `HIPDNN_FORCE_BENCHMARKING=1`, sampling every knob-filtered candidate on
+each plan's first execute and caching the winner; `--no-autotune` serves
 rank-0 instead. The two measure different things — the kernel set vs. the heuristic — so
 the active path is always printed. `--cache-dir` sets `HIPDNN_CACHE_DIR`; the winner cache
 is keyed by graph and device, not by checkout or session, so give each phase its own empty

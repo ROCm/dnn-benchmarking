@@ -1351,10 +1351,10 @@ class TestOracleFlag:
         p.write_text(json.dumps({"name": "g", "nodes": [], "tensors": []}))
         return p
 
-    def test_oracle_mode_defaults_to_off(self) -> None:
+    def test_oracle_mode_unset_by_parser(self) -> None:
         parser = create_parser()
         args = parser.parse_args(["--graph", "g.json"])
-        assert args.oracle_mode == "off"
+        assert args.oracle_mode is None
 
     @pytest.mark.parametrize("mode", ["plan", "exhaustive"])
     def test_oracle_mode_parses_and_propagates(self, mode: str) -> None:
@@ -1396,7 +1396,7 @@ class TestOracleFlag:
         assert mock_benchmark.call_args.kwargs["config"].oracle_mode == "plan"
 
     @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
-    def test_oracle_mode_absent_leaves_suite_config_off(
+    def test_oracle_mode_absent_defaults_suite_config_to_exhaustive(
         self, mock_benchmark: MagicMock
     ) -> None:
         mock_benchmark.return_value = 0
@@ -1408,7 +1408,9 @@ class TestOracleFlag:
             with patch("sys.argv", ["dnn-benchmark", "--graph", str(graph)]):
                 main()
 
-        assert mock_benchmark.call_args.kwargs["config"].oracle_mode == "off"
+        config = mock_benchmark.call_args.kwargs["config"]
+        assert config.oracle_mode == "exhaustive"
+        assert config.autotune is True
 
     def test_oracle_mode_with_pytorch_backend_rejected(self) -> None:
         from dnn_benchmarking.cli.main import main

@@ -58,14 +58,18 @@ class TestKernelSelectionEnvironment:
         _apply_tuning_environment(self._config(**kwargs), reporter)
         return reporter
 
-    def test_default_does_not_force_benchmarking(self, monkeypatch) -> None:
+    def test_default_forces_benchmarking(self, monkeypatch) -> None:
         import os
 
-        self._apply(monkeypatch)
-        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
-
-    def test_default_states_the_heuristic_path(self, monkeypatch) -> None:
         reporter = self._apply(monkeypatch)
+        assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
+        assert any("BENCHMARKED" in m for m in reporter.messages)
+
+    def test_no_autotune_states_the_heuristic_path(self, monkeypatch) -> None:
+        import os
+
+        reporter = self._apply(monkeypatch, autotune=False)
+        assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
         assert any("COLD HEURISTIC" in m for m in reporter.messages)
 
     def test_autotune_forces_benchmarking(self, monkeypatch) -> None:
@@ -103,7 +107,7 @@ class TestKernelSelectionEnvironment:
 
         monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "1")
         reporter = self._reporter()
-        _apply_tuning_environment(self._config(), reporter)
+        _apply_tuning_environment(self._config(autotune=False), reporter)
         assert any("is set in the environment" in m for m in reporter.messages)
         assert not any("COLD HEURISTIC" in m for m in reporter.messages)
 

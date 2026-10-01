@@ -359,7 +359,7 @@ class SuiteConfig:
     seed: Optional[int] = None
     engine_filter: Optional[List[int]] = None
     verbose: bool = False
-    oracle_mode: str = "off"
+    oracle_mode: str = "exhaustive"
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None
@@ -370,7 +370,7 @@ class SuiteConfig:
     #: winner (HIPDNN_FORCE_BENCHMARKING=1). Off, an engine serves its cold
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
-    autotune: bool = False
+    autotune: bool = True
     #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
