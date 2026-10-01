@@ -20,7 +20,7 @@ pip install -e ".[test]"
 # setup_env.py builds the hipDNN frontend extension and installs its wheel
 
 # Append extra CMake defines to the hipDNN/provider configure (repeatable)
-python3 setup_env.py --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=ON
+python3 setup_env.py --cmake-arg HIPDNN_ENABLE_SDPA=OFF
 
 # CUDA host (NVIDIA): PyTorch backend only, skips all ROCm/hipDNN setup
 python3 setup_env.py --torch-mode cuda --workspace .workspace
@@ -33,11 +33,9 @@ Pass `/opt/rocm/lib/hipdnn_plugins/engines/` to `--plugin-path` when running ben
 `--cmake-arg NAME=VALUE` appends a define to the hipDNN/provider configure, after the
 defaults, so it can override one. `-DNAME=VALUE` is also accepted but needs the `=` form
 (`--cmake-arg=-DFOO=ON`), since argparse reads a space-separated `-DFOO=ON` as an option.
-Required for any engine gated behind a non-default option: with the option OFF the engine
-compiles into no plugin at all, yet the plugin `.so` still installs, so `--plugin-path`
-looks satisfied and every graph reports `no engines applicable`. That particular option
-also requires rocm-kpack (CMake package + `rocm_kpack` Python package + zstandard/msgpack),
-which the torch-wheel ROCm SDK does not provide — see the README for the working invocation.
+On Linux, rocKE and its descriptor-backed engines are on by default. Turning an engine's
+option OFF still installs the plugin `.so`, so graphs only it supports report
+`no engines applicable`.
 
 ### Kernel selection
 
