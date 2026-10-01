@@ -943,6 +943,10 @@ class TestCorrectnessChecking:
         assert result.results[0].status == "skipped"
         assert ref_provider.compute_reference.call_count == 1
         assert mock_check_corr.call_args.args[3] is ref_outputs
+        # The skipped row must not read as "nothing was validated".
+        reason = result.results[0].skip_reason
+        assert "PyTorch GPU not available" in reason
+        assert "still validated" in reason and "CPU" in reason
 
     @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")

@@ -130,6 +130,15 @@ Python reference validation. The `--backend pytorch` executor needs a GPU torch
 build: ROCm torch (HIP-event timing) or CUDA torch (torch.cuda-event timing,
 see below).
 
+With CPU-only torch, `--validate pytorch` still grades every hipDNN engine row:
+the reference outputs are computed on the CPU. Only the timed `pytorch`
+reference row is skipped, and its `skip_reason` says so and gives the CPU
+reference time. The CPU reference is much slower for large SDPA graphs (on an
+MI355X host with 8 cores, the CPU reference for B4 H48 fp16 graphs took 2.8 s at S1024,
+10 s at S2048 and 65 s at S4096, while the whole three-graph run took about 6 s
+with ROCm torch), so use ROCm torch for large
+correctness runs.
+
 Use `--torch-mode existing` to reuse torch already installed in the target
 virtual environment. Existing ROCm torch uses its bundled ROCm SDK libraries;
 existing CUDA torch takes the CUDA skip path (no hipDNN bindings); existing
