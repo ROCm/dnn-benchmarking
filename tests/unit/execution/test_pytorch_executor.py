@@ -445,11 +445,12 @@ def test_cuda_build_skips_staging_even_if_bindings_available(
     assert FakeHipTimer.start_calls == 2
 
 
-def test_block_timing_times_n_executions_per_event_pair(
+def test_block_timing_follows_rocke_protocol(
     pytorch_executor_module, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """timing_block=N wraps N executions in one event pair, records
-    elapsed/N per sample, and bypasses the stall gate."""
+    """timing_block=N: warmup() runs one untimed call; every sample runs
+    warmup_iters untimed executions, then N executions in one event pair
+    (elapsed/N); the first sample is discarded; the stall gate is bypassed."""
     module = pytorch_executor_module
     executed: List[str] = []
     monkeypatch.setattr(
@@ -464,7 +465,7 @@ def test_block_timing_times_n_executions_per_event_pair(
         lambda *a, **k: pytest.fail("block timing must not use the stall gate"),
     )
     config = BenchmarkConfig(
-        graph_path="test.json", warmup_iters=0, benchmark_iters=2, timing_block=5
+        graph_path="test.json", warmup_iters=2, benchmark_iters=3, timing_block=5
     )
     executor = module.PyTorchCudaExecutor(
         graph_json={"nodes": []},
@@ -475,11 +476,15 @@ def test_block_timing_times_n_executions_per_event_pair(
     executor.prepare()
     executed.clear()
 
+    executor.warmup(tensors={})
+    assert executed == ["execute"]
+    executed.clear()
+
     result = executor.benchmark(tensors={}, graph_name="block")
 
-    assert executed == ["execute"] * 10
-    assert FakeHipTimer.start_calls == 2
-    assert FakeHipTimer.stop_calls == 2
+    assert executed == ["execute"] * (3 * (2 + 5))
+    assert FakeHipTimer.start_calls == 3
+    assert FakeHipTimer.stop_calls == 3
     assert result.kernel_timings == [0.25, 0.25]
     assert result.metadata is not None and result.metadata.timing_block == 5
 

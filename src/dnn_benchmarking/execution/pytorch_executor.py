@@ -131,11 +131,14 @@ class PyTorchCudaExecutor:
         if not self._prepared:
             raise PyTorchExecutionError("Executor not prepared. Call prepare() first.")
 
+        # Block timing (rocKE / Solera protocol) warms up before every sample
+        # in benchmark(); here it only runs the one untimed compile call.
+        count = 1 if self._config.timing_block > 1 else self._config.warmup_iters
         with torch.cuda.device(self._device):
             with torch.cuda.stream(self._get_stream()):
-                for _ in range(self._config.warmup_iters):
+                for _ in range(count):
                     self._execute_graph(tensors)
-            if self._config.warmup_iters > 0:
+            if count > 0:
                 self._synchronize_stream()
 
     def execute_once(self, tensors: Dict[int, torch.Tensor]) -> None:
@@ -218,9 +221,19 @@ class PyTorchCudaExecutor:
                     kernel_timings = []
                     timing_backend_name = gpu_timer.backend_name
 
-        for _ in range(self._config.benchmark_iters):
+        # Block > 1 follows the rocKE / Solera protocol: warmup_iters untimed
+        # executions plus a drain before every sample, and the first sample is
+        # discarded. See Executor.benchmark.
+        per_sample_warmup = self._config.warmup_iters if block > 1 else 0
+        iters = self._config.benchmark_iters
+        for i in range(iters):
             kernel_ms: Optional[float] = None
             with torch.cuda.device(self._device):
+                if per_sample_warmup:
+                    with torch.cuda.stream(self._get_stream()):
+                        for _ in range(per_sample_warmup):
+                            self._execute_graph(tensors)
+                    self._synchronize_stream()
                 with Timer() as t:
                     with torch.cuda.stream(self._get_stream()):
                         if gpu_timer is not None:
@@ -233,6 +246,8 @@ class PyTorchCudaExecutor:
                         else:
                             self._synchronize_stream()
 
+            if block > 1 and i == 0 and iters > 1:
+                continue
             if kernel_ms is not None:
                 assert kernel_timings is not None
                 kernel_timings.append(kernel_ms)

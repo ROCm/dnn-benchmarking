@@ -563,7 +563,7 @@ def _run_timed_pytorch_row(
                     _collect_basic_metrics_post_loop(
                         result=result,
                         cpu_time_probe=cpu_time_probe,
-                        timed_executions=config.benchmark_iters * config.timing_block,
+                        timed_executions=_benchmark_executions(config),
                         analytical_flops=analytical_flops,
                         analytical_flops_partial=analytical_flops_partial,
                         analytical_io_bytes=analytical_io_bytes,
@@ -992,6 +992,18 @@ def run_graph_pytorch_backend(
     )
 
 
+def _benchmark_executions(config: Any) -> int:
+    """Graph executions inside ``benchmark()``, the CPU probe's region.
+
+    Block timing (``timing_block > 1``) also runs ``warmup_iters`` untimed
+    executions before every sample (rocKE / Solera protocol).
+    """
+    per_sample = config.timing_block
+    if config.timing_block > 1:
+        per_sample += config.warmup_iters
+    return config.benchmark_iters * per_sample
+
+
 def _collect_basic_metrics_post_loop(
     result: ProviderEngineResult,
     cpu_time_probe: Optional[CpuTimeProbe],
@@ -1012,8 +1024,8 @@ def _collect_basic_metrics_post_loop(
         # Per-execution microseconds is the interpretable unit: the loop
         # total is dominated by Python dispatch cost, and per-execution
         # lets users compare directly against the kernel median (also
-        # reported per execution). The loop runs benchmark_iters *
-        # timing_block executions.
+        # reported per execution). The divisor counts every execution in
+        # benchmark(), see _benchmark_executions.
         iters = max(timed_executions, 1)
         result.cpu_user_time_per_iter_us = (
             cpu_time_probe.delta.user_time_ms * 1000.0 / iters
@@ -1309,7 +1321,7 @@ def run_single_provider_engine(
                 _collect_basic_metrics_post_loop(
                     result=result,
                     cpu_time_probe=cpu_time_probe,
-                    timed_executions=config.benchmark_iters * config.timing_block,
+                    timed_executions=_benchmark_executions(config),
                     analytical_flops=analytical_flops,
                     analytical_flops_partial=analytical_flops_partial,
                     analytical_io_bytes=analytical_io_bytes,

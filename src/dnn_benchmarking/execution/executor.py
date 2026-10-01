@@ -442,7 +442,10 @@ class Executor:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
 
         stream = self._get_execution_stream(handle)
-        for _ in range(self._config.warmup_iters):
+        # Block timing (rocKE / Solera protocol) warms up before every sample
+        # in benchmark(); here it only runs the one untimed compile call.
+        count = 1 if self._config.timing_block > 1 else self._config.warmup_iters
+        for _ in range(count):
             result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
             if result.is_bad():
                 raise ExecutionError(f"Warmup execution failed: {result.get_message()}")
@@ -450,7 +453,7 @@ class Executor:
         # hipDNN graph execution is asynchronous. Drain untimed warmup work before
         # benchmark() starts the measured loop, otherwise the first timed E2E
         # iteration can include queued warmup kernels.
-        if self._config.warmup_iters > 0:
+        if count > 0:
             self._get_stream_sync_timer(stream).synchronize_stream()
 
     def benchmark(
@@ -531,22 +534,31 @@ class Executor:
                     kernel_timings = []
                     timing_backend_name = gpu_timer.backend_name
 
+            def execute() -> None:
+                result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
+                if result.is_bad():
+                    raise ExecutionError(
+                        f"Benchmark execution failed: {result.get_message()}"
+                    )
+
             # Each sample times ``block`` back-to-back executions between one
             # event pair and records the per-execution average (block == 1 is
-            # plain per-execution timing).
-            for _ in range(self._config.benchmark_iters):
+            # plain per-execution timing). Block > 1 follows the rocKE /
+            # Solera protocol: warmup_iters untimed executions plus a drain
+            # before every sample, and the first sample is discarded.
+            per_sample_warmup = self._config.warmup_iters if block > 1 else 0
+            iters = self._config.benchmark_iters
+            for i in range(iters):
+                for _ in range(per_sample_warmup):
+                    execute()
+                if per_sample_warmup:
+                    self._get_stream_sync_timer(stream).synchronize_stream()
                 kernel_ms = None
                 with Timer() as t:
                     if gpu_timer:
                         gpu_timer.start()
                     for _ in range(block):
-                        result = self._graph.execute(
-                            handle, variant_pack, self._workspace_ptr
-                        )
-                        if result.is_bad():
-                            raise ExecutionError(
-                                f"Benchmark execution failed: {result.get_message()}"
-                            )
+                        execute()
                     if gpu_timer:
                         gpu_timer.stop()
                         kernel_ms = gpu_timer.elapsed_ms() / block
@@ -555,6 +567,8 @@ class Executor:
                             stream_sync_timer = self._get_stream_sync_timer(stream)
                         stream_sync_timer.synchronize_stream()
 
+                if block > 1 and i == 0 and iters > 1:
+                    continue
                 if kernel_ms is not None:
                     assert kernel_timings is not None
                     kernel_timings.append(kernel_ms)

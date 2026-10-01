@@ -29,7 +29,8 @@ class BenchmarkStats:
 
     Attributes:
         mean_ms: Mean execution time in milliseconds.
-        median_ms: Median execution time in milliseconds.
+        median_ms: Upper median, ``sorted(timings)[n // 2]`` - the rocKE /
+            Solera definition. Always an observed sample, never an average.
         std_ms: Standard deviation of execution time in milliseconds.
         min_ms: Minimum execution time in milliseconds.
         max_ms: Maximum execution time in milliseconds.
@@ -67,7 +68,7 @@ class BenchmarkStats:
 
         return cls(
             mean_ms=float(np.mean(arr)),
-            median_ms=float(np.median(arr)),
+            median_ms=float(np.sort(arr)[len(arr) // 2]),
             std_ms=float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
             min_ms=float(np.min(arr)),
             max_ms=float(np.max(arr)),
