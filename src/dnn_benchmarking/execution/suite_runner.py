@@ -508,6 +508,7 @@ def _run_timed_pytorch_row(
         provider=ReferenceProviderName.PYTORCH.value,
         engine_id=0,
         status="skipped",
+        role=role,
         engine_version=engine_version,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
