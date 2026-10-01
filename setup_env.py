@@ -1304,7 +1304,17 @@ class Setup:
             actions.append("build and install hipDNN and provider plugins from source")
         if not actions:
             return
-        confirm = input(f"This will {' and '.join(actions)}. Continue? [Y/n] ")
+        prompt = f"This will {' and '.join(actions)}. Continue? [Y/n] "
+        try:
+            confirm = input(prompt)
+        except (EOFError, OSError):
+            # nohup, srun and CI give no readable stdin, so input() cannot ask.
+            fail(
+                "",
+                "ERROR: no answer to the confirmation prompt (stdin is closed or "
+                "not readable).",
+                "Rerun with -y/--yes to confirm non-interactively.",
+            )
         if confirm.strip().lower() == "n":
             print("Aborted.")
             sys.exit(0)
