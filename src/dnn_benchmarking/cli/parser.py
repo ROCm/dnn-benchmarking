@@ -270,7 +270,10 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "delta against the heuristic plan. 'exhaustive' additionally "
             "forces provider kernel benchmarking so providers sample kernel "
             "variants; both run one tuning sweep per engine and are "
-            "significantly slower, 'exhaustive' much more so."
+            "significantly slower, 'exhaustive' much more so. 'exhaustive' "
+            "also tunes PyTorch (MIOpen exhaustive conv search, TunableOp "
+            "GEMM tuning) when PyTorch is timed; with --backend pytorch only "
+            "'exhaustive' and 'off' apply."
         ),
         config_key="oracle_mode",
         config_kind=ConfigKind.CHOICE,

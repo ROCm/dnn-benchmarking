@@ -280,6 +280,10 @@ def run_suite_cli(
             profiling_output_dir=args.profiling_output_dir,
             profiling_timeout_s=args.profiling_timeout,
         )
+        # --backend pytorch has no oracle pass: --oracle-mode only says whether
+        # PyTorch itself is tuned (exhaustive) or not (off, the default).
+        oracle_mode = args.oracle_mode
+        pytorch_exhaustive = oracle_mode == "exhaustive"
         if backend is ExecutionBackendName.PYTORCH:
             if args.engine:
                 reporter.print_error("--engine is not supported with --backend pytorch")
@@ -301,12 +305,14 @@ def run_suite_cli(
                     "--roofline) are not supported with --backend pytorch"
                 )
                 return 1
-            if args.oracle_mode != "off":
+            if oracle_mode == "plan":
                 reporter.print_error(
-                    "--oracle-mode is not supported with --backend pytorch "
-                    "(auto-tuning is a hipDNN engine feature)"
+                    "--oracle-mode plan is not supported with --backend pytorch "
+                    "(plan search is a hipDNN engine feature); use exhaustive "
+                    "or off"
                 )
                 return 1
+            oracle_mode = "off"
         # --profiling-output-dir is only meaningful when at least one
         # opt-in profiling source fires. Passing it solo is a silent
         # no-op today; surface that as a soft warning so the user
@@ -320,7 +326,7 @@ def run_suite_cli(
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
             )
-        if args.oracle_mode == "exhaustive" and args.warmup == 0:
+        if pytorch_exhaustive and args.warmup == 0:
             reporter.print_error(
                 "--oracle-mode exhaustive requires --warmup >= 1: with "
                 "benchmarking forced, a plan's first execute() samples kernel "
@@ -350,7 +356,8 @@ def run_suite_cli(
             seed=args.seed,
             engine_filter=args.engine,
             verbose=args.verbose,
-            oracle_mode=args.oracle_mode,
+            oracle_mode=oracle_mode,
+            pytorch_exhaustive=pytorch_exhaustive,
             metrics=metrics_config,
             validation=validation,
             plugin_paths=plugin_paths,
@@ -365,6 +372,7 @@ def run_suite_cli(
         return 1
 
     _apply_tuning_environment(config, reporter)
+    _apply_pytorch_tuning(config, reporter)
 
     return run_suite_benchmark(
         graph_paths=graph_paths,
@@ -372,6 +380,25 @@ def run_suite_cli(
         output_path=args.output,
         reporter=reporter,
         tarball_source=tarball_source,
+    )
+
+
+def _apply_pytorch_tuning(config: SuiteConfig, reporter) -> None:
+    """Configure PyTorch's own kernel selection when PyTorch is timed or used."""
+    if not (
+        config.backend is ExecutionBackendName.PYTORCH
+        or config.validation.provider is ReferenceProviderName.PYTORCH
+    ):
+        return
+    from ..common.pytorch_tuning import apply_pytorch_environment
+
+    effective = apply_pytorch_environment(
+        exhaustive=config.pytorch_exhaustive, cache_dir=config.cache_dir
+    )
+    settings = ", ".join(f"{k}={v}" for k, v in effective.items())
+    reporter.print_warning(
+        f"PyTorch kernel selection: "
+        f"{'EXHAUSTIVE' if config.pytorch_exhaustive else 'DEFAULT'} ({settings})"
     )
 
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 from ..common import torch_support
+from ..common.pytorch_tuning import pytorch_environment_snapshot
 from ..metrics.arch import detect_arch
 from .statistics import BenchmarkStats
 
@@ -607,6 +608,8 @@ class SuiteMetadata:
             suite end, via amdsmi. Reflects steady-state allocation, not
             per-kernel peak.
         vram_total_mb: Total VRAM on the GPU at suite end, via amdsmi.
+        pytorch_env: PyTorch kernel-selection settings in effect (NHWC,
+            AOTriton, TunableOp, cudnn.benchmark); None when none were set.
         hipdnn_selection_env: hipDNN cache/benchmarking and MIOpen
             perf-db path environment variables sampled at suite end,
             recorded only for oracle runs (``--oracle-mode plan`` or
@@ -647,6 +650,7 @@ class SuiteMetadata:
     vram_used_mb: Optional[float] = None
     vram_total_mb: Optional[float] = None
     hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
+    pytorch_env: Optional[Dict[str, Optional[str]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -687,6 +691,8 @@ class SuiteMetadata:
         }
         if self.hipdnn_selection_env is not None:
             d["hipdnn_selection_env"] = dict(self.hipdnn_selection_env)
+        if self.pytorch_env is not None:
+            d["pytorch_env"] = dict(self.pytorch_env)
         return d
 
 
@@ -796,6 +802,7 @@ class SuiteResult:
             vram_used_mb=vram_used_mb,
             vram_total_mb=vram_total_mb,
             hipdnn_selection_env=hipdnn_selection_env,
+            pytorch_env=pytorch_environment_snapshot(),
         )
         return cls(metadata=metadata, graphs=graph_results)
 

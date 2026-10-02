@@ -396,6 +396,29 @@ dnn-benchmark --graph 'graphs/*.json' --cache-dir /tmp/cache-cold
 dnn-benchmark --graph 'graphs/*.json' --autotune --cache-dir /tmp/cache-tuned
 ```
 
+### PyTorch Kernel Selection
+
+When PyTorch is timed (`--backend pytorch` or `--validate pytorch`), the CLI sets
+PyTorch-private controls so the baseline is not handicapped. A value already in
+the environment wins, and the settings in effect are printed and recorded in
+`metadata.pytorch_env`.
+
+| Setting | When | Why |
+|---|---|---|
+| `PYTORCH_MIOPEN_SUGGEST_NHWC=1` | always | Without it PyTorch's MIOpen conv path transposes NHWC graphs to NCHW inside the timed region. |
+| `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` | always | AOTriton otherwise rejects architectures it marks experimental and SDPA falls back to a slower backend. |
+| `torch.backends.cudnn.benchmark=True` | `--oracle-mode exhaustive` | MIOpen exhaustive conv search for PyTorch convs only. |
+| `PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1` | `--oracle-mode exhaustive` | TunableOp GEMM tuning. Results go under `--cache-dir`, or a fresh temp directory. |
+
+With `--backend pytorch` there is no oracle pass: `--oracle-mode exhaustive`
+tunes PyTorch, `off` (default) does not, and `plan` is rejected. Tuning happens
+on first use, so `--warmup >= 1` is required.
+
+`MIOPEN_FIND_MODE` and `MIOPEN_FIND_ENFORCE` are not set: the hipDNN MIOpen
+plugin reads them too, so they would also change the hipDNN rows. Both MIOpen
+copies share `MIOPEN_USER_DB_PATH`, so PyTorch's exhaustive search can write
+perf-db entries that hipDNN's MIOpen later reads.
+
 ### Config Files
 
 Use `--config` for repeatable benchmark recipes. CLI flags override config
