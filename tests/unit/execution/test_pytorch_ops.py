@@ -2182,7 +2182,9 @@ class TestPyTorchSdpaPaged:
             8: torch.tensor(self.KV_LENS, dtype=torch.int32),
         }
 
-    def _dense_reference(self, q, dense_k, dense_v, is_causal=False):
+    def _dense_reference(
+        self, q, dense_k, dense_v, is_causal=False, bottom_right=False
+    ):
         import torch.nn.functional as F
 
         rep = self.HQ // self.HKV
@@ -2190,13 +2192,21 @@ class TestPyTorchSdpaPaged:
         for s, q_len in enumerate(self.Q_LENS):
             q_s = q[:, :, start : start + q_len, :]
             start += q_len
+            mask = None
+            if bottom_right:
+                # Each sequence's own offset: query i sees keys up to i + Skv - Sq.
+                kv_len = self.KV_LENS[s]
+                rows = torch.arange(q_len).unsqueeze(1)
+                cols = torch.arange(kv_len).unsqueeze(0)
+                mask = cols <= rows + (kv_len - q_len)
             out.append(
                 F.scaled_dot_product_attention(
                     q_s,
                     dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
                     dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    attn_mask=mask,
                     scale=1.0 / (self.D**0.5),
-                    is_causal=is_causal,
+                    is_causal=is_causal and not bottom_right,
                 )
             )
         return torch.cat(out, dim=-2)
@@ -2240,6 +2250,29 @@ class TestPyTorchSdpaPaged:
 
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"},
+            {"causal_mask_bottom_right": True},
+        ],
+    )
+    def test_paged_bottom_right_uses_each_sequences_own_offset(
+        self, attributes: dict
+    ) -> None:
+        """Sequences with different Sq and Skv get different diagonal offsets
+        (35 and 24 here), so one offset for the packed batch fails this."""
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(**attributes), tensors)
+
+        expected = self._dense_reference(
+            q, dense_k, dense_v, is_causal=True, bottom_right=True
+        )
+        top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+        assert not torch.allclose(tensors[4], top_left, atol=1e-3)
 
     def test_bundle_causal_spelling_matches_boolean_spelling(self) -> None:
         """The shipped paged bundles express causality as (-1, 0) while the model
