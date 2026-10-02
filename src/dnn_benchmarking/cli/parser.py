@@ -249,8 +249,10 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         metavar="MODE",
         group="Output",
         help=(
-            "Oracle comparison depth (default: exhaustive; off with --backend "
-            "pytorch). 'off' skips it. 'plan' also times the "
+            "Oracle comparison depth (default: exhaustive). 'off' skips it. "
+            "'exhaustive' also tunes PyTorch (MIOpen exhaustive conv search, "
+            "TunableOp GEMM tuning) when PyTorch is timed; with --backend "
+            "pytorch only 'exhaustive' and 'off' apply. 'plan' also times the "
             "plan hipDNN auto-tuning picks for each engine and reports the "
             "delta against the heuristic plan. 'exhaustive' additionally "
             "forces provider kernel benchmarking so providers sample kernel "
