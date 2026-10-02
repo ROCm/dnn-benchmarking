@@ -4,7 +4,7 @@
 """hipDNN suite benchmark startup and graph dispatch."""
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import SuiteConfig
@@ -27,27 +27,38 @@ def _run_loaded_hipdnn_graph(
     )
 
 
+def load_hipdnn_bindings() -> Tuple[Any, Optional[Exception]]:
+    """Import hipdnn_frontend. Returns (module, None) or (None, error).
+
+    Call this before anything imports torch. A ROCm torch wheel ships its own,
+    possibly older, libhipdnn_backend; whichever library the process loads
+    first owns that soname, so importing torch first binds hipdnn_frontend to
+    torch's copy instead of the install setup_env put first on
+    LD_LIBRARY_PATH.
+    """
+    try:
+        initialize_pip_rocm_runtime()
+        import hipdnn_frontend
+    except (ImportError, RuntimeError) as e:
+        return None, e
+    return hipdnn_frontend, None
+
+
 def run_hipdnn_suite_benchmark(
     graph_paths: List[Path],
     config: SuiteConfig,
     output_path: Optional[Path],
     reporter: Reporter,
+    hipdnn: Any,
+    load_error: Optional[Exception],
     tarball_source: Optional[str] = None,
 ) -> int:
-    """Run suite graphs through hipDNN providers/engines."""
-    # Load the hipDNN bindings before anything imports torch (the suite header
-    # does, to name the GPU). A ROCm torch wheel ships its own, possibly older,
-    # libhipdnn_backend; whichever process loads first owns that soname, so
-    # importing torch first binds hipdnn_frontend to torch's copy instead of
-    # the install setup_env put first on LD_LIBRARY_PATH.
-    hipdnn = None
-    load_error: Optional[Exception] = None
-    try:
-        initialize_pip_rocm_runtime()
-        import hipdnn_frontend as hipdnn
-    except (ImportError, RuntimeError) as e:
-        load_error = e
+    """Run suite graphs through hipDNN providers/engines.
 
+    ``hipdnn`` and ``load_error`` come from :func:`load_hipdnn_bindings`, which
+    the caller runs before the reference-provider probe and the suite header
+    (both import torch). Load errors are reported here, after the header.
+    """
     reporter.print_suite_header(
         len(graph_paths),
         tarball_source=tarball_source,

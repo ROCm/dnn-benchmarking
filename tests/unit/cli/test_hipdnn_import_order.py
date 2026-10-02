@@ -22,7 +22,10 @@ _REPO = Path(__file__).resolve().parents[3]
 pytest.importorskip("torch")
 
 
-def test_bindings_are_imported_before_torch(tmp_path: Path) -> None:
+# --validate pytorch probes the reference provider, which imports torch,
+# before the hipDNN runner starts.
+@pytest.mark.parametrize("extra_args", [[], ["--validate", "pytorch"]])
+def test_bindings_are_imported_before_torch(tmp_path: Path, extra_args) -> None:
     fake = tmp_path / "fake" / "hipdnn_frontend"
     fake.mkdir(parents=True)
     record = tmp_path / "torch_loaded_at_import.txt"
@@ -54,6 +57,7 @@ def test_bindings_are_imported_before_torch(tmp_path: Path) -> None:
             str(_REPO / "graphs" / "sample_sdpa.json"),
             "--cache-dir",
             str(tmp_path / "cache"),
+            *extra_args,
         ],
         env=env,
         capture_output=True,
