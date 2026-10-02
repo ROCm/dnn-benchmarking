@@ -35,6 +35,15 @@ IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
+# Root directories the hipDNN/provider configure reads. Without shared/,
+# configure falls back to legacy CTest labels ("shared/ctest or test category
+# YAML not found").
+ROCM_LIBRARIES_ROOT_DIRS = ("cmake", "shared")
+ROCM_LIBRARIES_SPARSE_DIRS = (
+    *ROCM_LIBRARIES_ROOT_DIRS,
+    "projects/hipdnn",
+    "dnn-providers",
+)
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
@@ -432,7 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip building hipDNN/the provider plugins from source and use "
             "whatever is already installed in the selected ROCm prefix (e.g. a "
             "prior build in the same workspace). Fails if hipDNN is absent there "
-            "-- this never falls back to building."
+            "-- this never falls back to building. Builds no Python bindings: "
+            "the venv must already have hipdnn_frontend (--torch-mode existing)."
         ),
     )
     parser.add_argument(
@@ -549,14 +559,20 @@ class Setup:
         except (subprocess.CalledProcessError, FileNotFoundError):
             ref = branch
         if (ROCM_LIBRARIES_DIR / ".git").exists():
-            if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
+            # A sparse clone made by an older setup lacks root dirs added since.
+            missing = [
+                path
+                for path in ROCM_LIBRARIES_ROOT_DIRS
+                if not (ROCM_LIBRARIES_DIR / path).is_dir()
+            ]
+            if missing and self._rocm_libraries_is_sparse():
                 run_git(
                     [
                         "-C",
                         str(ROCM_LIBRARIES_DIR),
                         "sparse-checkout",
                         "add",
-                        "cmake",
+                        *missing,
                     ]
                 )
             # An existing checkout is reused as-is, so a pin bump or a broken
@@ -580,7 +596,7 @@ class Setup:
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
         print(
             f"Fetching rocm-libraries ({ref}) via sparse checkout "
-            "(cmake, projects/hipdnn, dnn-providers)..."
+            f"({', '.join(ROCM_LIBRARIES_SPARSE_DIRS)})..."
         )
         if ROCM_LIBRARIES_DIR.exists():
             shutil.rmtree(ROCM_LIBRARIES_DIR)
@@ -605,9 +621,7 @@ class Setup:
                 str(ROCM_LIBRARIES_DIR),
                 "sparse-checkout",
                 "set",
-                "cmake",
-                "projects/hipdnn",
-                "dnn-providers",
+                *ROCM_LIBRARIES_SPARSE_DIRS,
             ]
         )
         run_git(
@@ -623,6 +637,24 @@ class Setup:
             ]
         )
         run_git(["-C", str(ROCM_LIBRARIES_DIR), "checkout", "--quiet", "FETCH_HEAD"])
+
+    @staticmethod
+    def _rocm_libraries_is_sparse() -> bool:
+        try:
+            return (
+                git_output(
+                    [
+                        "-C",
+                        str(ROCM_LIBRARIES_DIR),
+                        "config",
+                        "--get",
+                        "core.sparseCheckout",
+                    ]
+                )
+                == "true"
+            )
+        except subprocess.CalledProcessError:
+            return False
 
     # -- venv lifecycle -----------------------------------------------------
 
@@ -1287,9 +1319,12 @@ class Setup:
         if self.do_build:
             self.build_and_install_bindings(install_prefix, toolchain_prefix)
         elif self.probe("import hipdnn_frontend").returncode != 0:
-            print(
-                "WARNING: hipdnn_frontend is not importable in this environment.",
-                file=sys.stderr,
+            fail(
+                "ERROR: --reuse-artifacts builds no hipDNN Python bindings, and "
+                f"hipdnn_frontend is not importable in {self.venv_dir}.",
+                "Use --torch-mode existing with a venv that already has "
+                "hipdnn_frontend, or drop --reuse-artifacts to build hipDNN and "
+                "its bindings.",
             )
 
     # -- confirmation prompt ------------------------------------------------
@@ -1304,7 +1339,17 @@ class Setup:
             actions.append("build and install hipDNN and provider plugins from source")
         if not actions:
             return
-        confirm = input(f"This will {' and '.join(actions)}. Continue? [Y/n] ")
+        prompt = f"This will {' and '.join(actions)}. Continue? [Y/n] "
+        try:
+            confirm = input(prompt)
+        except (EOFError, OSError):
+            # nohup, srun and CI give no readable stdin, so input() cannot ask.
+            fail(
+                "",
+                "ERROR: no answer to the confirmation prompt (stdin is closed or "
+                "not readable).",
+                "Rerun with -y/--yes to confirm non-interactively.",
+            )
         if confirm.strip().lower() == "n":
             print("Aborted.")
             sys.exit(0)
@@ -1405,8 +1450,10 @@ class Setup:
             self._print_complete(cuda=True)
             return 0
 
-        # rocm-libraries provides the hipDNN sources and provider plugins.
-        self.ensure_rocm_libraries_checkout()
+        # rocm-libraries provides the hipDNN sources and provider plugins. A
+        # reused install builds nothing, so it needs no sources.
+        if self.do_build:
+            self.ensure_rocm_libraries_checkout()
 
         if self.gpu_arch:
             # Belt-and-suspenders for any torch C++/HIP extension compile (none
