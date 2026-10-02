@@ -1656,6 +1656,53 @@ class TestPyTorchSdpaBackendSelection:
         sdpa_kernel.assert_not_called()
         preferred_library.assert_not_called()
 
+    @staticmethod
+    def _enabled_backends_at_call(state, reference_pass: bool) -> set[str]:
+        """Run one SDPA call and return the PyTorch backends it was allowed."""
+        seen: set[str] = set()
+
+        def recording_sdpa(*args, **kwargs):
+            backends = torch.backends.cuda
+            for name, enabled in (
+                ("flash", backends.flash_sdp_enabled()),
+                ("efficient", backends.mem_efficient_sdp_enabled()),
+                ("math", backends.math_sdp_enabled()),
+            ):
+                if enabled:
+                    seen.add(name)
+            return torch.empty(0)
+
+        with (
+            patch.object(
+                torch.nn.functional,
+                "scaled_dot_product_attention",
+                side_effect=recording_sdpa,
+            ),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+            pytorch_ops.reference_sdpa_pass() if reference_pass else nullcontext(),
+        ):
+            TestPyTorchSdpaBackendSelection._execute()
+        return seen
+
+    def test_default_reference_pass_runs_on_math_only(self) -> None:
+        """The fused ROCm kernels are not repeatable; a reference must be."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"math"}
+        # Timed default-dispatch calls keep every backend PyTorch offers.
+        assert {"flash", "math"} <= self._enabled_backends_at_call(
+            state, reference_pass=False
+        )
+
+    def test_reference_pass_keeps_a_strict_selection(self) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.FLASH)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"flash"}
+
     @pytest.mark.parametrize("missing", ["sdpa_kernel", "backend_member"])
     def test_missing_public_api_or_backend_member_does_not_call_sdpa(
         self, missing: str
@@ -2135,7 +2182,9 @@ class TestPyTorchSdpaPaged:
             8: torch.tensor(self.KV_LENS, dtype=torch.int32),
         }
 
-    def _dense_reference(self, q, dense_k, dense_v, is_causal=False):
+    def _dense_reference(
+        self, q, dense_k, dense_v, is_causal=False, bottom_right=False
+    ):
         import torch.nn.functional as F
 
         rep = self.HQ // self.HKV
@@ -2143,13 +2192,21 @@ class TestPyTorchSdpaPaged:
         for s, q_len in enumerate(self.Q_LENS):
             q_s = q[:, :, start : start + q_len, :]
             start += q_len
+            mask = None
+            if bottom_right:
+                # Each sequence's own offset: query i sees keys up to i + Skv - Sq.
+                kv_len = self.KV_LENS[s]
+                rows = torch.arange(q_len).unsqueeze(1)
+                cols = torch.arange(kv_len).unsqueeze(0)
+                mask = cols <= rows + (kv_len - q_len)
             out.append(
                 F.scaled_dot_product_attention(
                     q_s,
                     dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
                     dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    attn_mask=mask,
                     scale=1.0 / (self.D**0.5),
-                    is_causal=is_causal,
+                    is_causal=is_causal and not bottom_right,
                 )
             )
         return torch.cat(out, dim=-2)
@@ -2193,6 +2250,29 @@ class TestPyTorchSdpaPaged:
 
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"},
+            {"causal_mask_bottom_right": True},
+        ],
+    )
+    def test_paged_bottom_right_uses_each_sequences_own_offset(
+        self, attributes: dict
+    ) -> None:
+        """Sequences with different Sq and Skv get different diagonal offsets
+        (35 and 24 here), so one offset for the packed batch fails this."""
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(**attributes), tensors)
+
+        expected = self._dense_reference(
+            q, dense_k, dense_v, is_causal=True, bottom_right=True
+        )
+        top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+        assert not torch.allclose(tensors[4], top_left, atol=1e-3)
 
     def test_bundle_causal_spelling_matches_boolean_spelling(self) -> None:
         """The shipped paged bundles express causality as (-1, 0) while the model

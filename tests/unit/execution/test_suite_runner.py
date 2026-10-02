@@ -943,6 +943,10 @@ class TestCorrectnessChecking:
         assert result.results[0].status == "skipped"
         assert ref_provider.compute_reference.call_count == 1
         assert mock_check_corr.call_args.args[3] is ref_outputs
+        # The skipped row must not read as "nothing was validated".
+        reason = result.results[0].skip_reason
+        assert "PyTorch GPU not available" in reason
+        assert "still validated" in reason and "CPU" in reason
 
     @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
@@ -1707,6 +1711,117 @@ class TestTimedPytorchRowEngineRole:
         assert "No reference provider requested" in (
             row.result.correctness.error_message or ""
         )
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    def test_reference_role_row_is_labelled_and_not_counted_as_an_engine(
+        self,
+        mock_buffer_manager_cls,
+        mock_pytorch_executor_cls,
+    ):
+        """The --validate pytorch row must say it is the reference.
+
+        Unlabelled, it serialised with no `role` and was counted as an engine
+        combination (32 combinations for 16 single-engine graphs).
+        """
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+        executor.benchmark.return_value = BenchmarkResult(
+            host_timings=[1.0],
+            kernel_timings=[0.5],
+            metadata=BenchmarkMetadata(),
+        )
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(metrics=MetricsConfig(tier="off")),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "success"
+        assert row.result.to_dict()["role"] == "reference"
+        engine = ProviderEngineResult(provider="hipdnn", engine_id=7, status="success")
+        graph = GraphResult(
+            graph_name="g",
+            graph_path="g.json",
+            results=[row.result, engine],
+            engine_ids=[7],
+        )
+        counts = graph.count_by_status()
+        assert counts.passed + counts.failed + counts.skipped + counts.errored == 1
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
+        self,
+        mock_buffer_manager_cls,
+        mock_pytorch_executor_cls,
+    ):
+        """Timing measures default dispatch; the graded outputs use MATH."""
+        import torch
+
+        from dnn_benchmarking.execution import pytorch_ops
+
+        def math_only_at_sdpa() -> bool:
+            seen = []
+
+            def recording_sdpa(*args, **kwargs):
+                seen.append(
+                    torch.backends.cuda.math_sdp_enabled()
+                    and not torch.backends.cuda.flash_sdp_enabled()
+                )
+                return torch.empty(0)
+
+            q = torch.rand(1, 1, 2, 4)
+            with patch.object(
+                torch.nn.functional, "scaled_dot_product_attention", recording_sdpa
+            ):
+                pytorch_ops.execute_selected_sdpa(
+                    q, q, q, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+                )
+            return seen[0]
+
+        calls = {}
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+
+        def timed(*args, **kwargs):
+            calls["benchmark"] = math_only_at_sdpa()
+            return BenchmarkResult(
+                host_timings=[1.0], kernel_timings=[0.5], metadata=BenchmarkMetadata()
+            )
+
+        def output_pass(*args, **kwargs):
+            calls["execute_once"] = math_only_at_sdpa()
+
+        executor.benchmark.side_effect = timed
+        executor.execute_once.side_effect = output_pass
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(metrics=MetricsConfig(tier="off")),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert calls == {"benchmark": False, "execute_once": True}
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_engine_role_failure_is_error(self, mock_pytorch_executor_cls):

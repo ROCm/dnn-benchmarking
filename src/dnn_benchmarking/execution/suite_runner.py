@@ -571,7 +571,10 @@ def _run_timed_pytorch_row(
 
                 if role == "reference":
                     buffer_manager.zero_outputs()
-                    executor.execute_once(tensors)
+                    # Timing above used default dispatch; the outputs other
+                    # rows are graded against come from repeatable SDPA.
+                    with pytorch_ops.reference_sdpa_pass():
+                        executor.execute_once(tensors)
                     # A profiling child allocates its own VRAM, so profiled
                     # runs keep host-only references (and DeviceBuffer I/O).
                     outputs = _pytorch_reference_outputs_from_buffer(
@@ -807,12 +810,26 @@ def run_graph_all_providers(
                 )
             )
         else:
-            reference_outputs, reference_error = _compute_reference_outputs_once(
-                ref_provider,
-                graph_json,
-                graph_input_data,
-                config,
-            )
+            with Timer() as cpu_reference_timer:
+                reference_outputs, reference_error = _compute_reference_outputs_once(
+                    ref_provider,
+                    graph_json,
+                    graph_input_data,
+                    config,
+                )
+            # Only the timing row was skipped: say that engines are still
+            # graded, and what the CPU fallback cost, since no row times it.
+            if (
+                timed_reference is not None
+                and timed_reference.result.status == "skipped"
+                and reference_outputs is not None
+            ):
+                timed_reference.result.skip_reason = (
+                    f"Timing skipped ({timed_reference.result.skip_reason}). "
+                    "Engine outputs are still validated against reference "
+                    "outputs computed on the CPU, which took "
+                    f"{cpu_reference_timer.elapsed_ms / 1000:.1f} s."
+                )
 
     for selection in engine_selections:
         engine_id = selection.engine_id

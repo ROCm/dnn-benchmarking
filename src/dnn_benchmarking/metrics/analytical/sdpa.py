@@ -62,9 +62,12 @@ def sdpa_fwd_flops(
     ):
         return None
 
-    if attributes.get("causal_mask") is True:
+    # causal_mask_bottom_right is causal on its own and implies bottom-right,
+    # whatever diagonal_alignment says.
+    bottom_right_flag = attributes.get("causal_mask_bottom_right") is True
+    if attributes.get("causal_mask") is True or bottom_right_flag:
         diagonal_alignment = attributes.get("diagonal_alignment", "TOP_LEFT")
-        if diagonal_alignment in ("TOP_LEFT", 0, None):
+        if not bottom_right_flag and diagonal_alignment in ("TOP_LEFT", 0, None):
             offset = 0
         else:
             offset = kv_seqlen - q_seqlen

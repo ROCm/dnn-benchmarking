@@ -1020,6 +1020,150 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
         np.testing.assert_allclose(outputs[6].data, expected_stats.numpy(), rtol=1e-6)
 
+    @staticmethod
+    def _bottom_right_case(sq: int, skv: int, attributes: dict):
+        """Run one forward SDPA graph and return (outputs, q, k, v)."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        rng = np.random.default_rng(0)
+        q = rng.standard_normal((1, 1, sq, 2)).astype(np.float32)
+        k = rng.standard_normal((1, 1, skv, 2)).astype(np.float32)
+        v = rng.standard_normal((1, 1, skv, 2)).astype(np.float32)
+        graph_json = {
+            "tensors": [
+                {"uid": 1, "dims": [1, 1, sq, 2], "data_type": "float"},
+                {"uid": 2, "dims": [1, 1, skv, 2], "data_type": "float"},
+                {"uid": 3, "dims": [1, 1, skv, 2], "data_type": "float"},
+                {"uid": 4, "dims": [1, 1, sq, 2], "data_type": "float"},
+                {"uid": 6, "dims": [1, 1, sq, 1], "data_type": "float"},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {"dropout_probability": 0.0, **attributes},
+                }
+            ],
+        }
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+        return outputs, q, k, v
+
+    @staticmethod
+    def _masked(q, k, v, keep):
+        """Attention and log-sum-exp with an explicit boolean keep mask."""
+        q_t, k_t, v_t = (torch.from_numpy(x) for x in (q, k, v))
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) / torch.sqrt(
+            torch.tensor(2.0)
+        )
+        scores = scores.masked_fill(~keep, float("-inf"))
+        out = torch.matmul(torch.softmax(scores, dim=-1), v_t)
+        return out.numpy(), torch.logsumexp(scores, dim=-1, keepdim=True).numpy()
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"},
+            {"causal_mask_bottom_right": True},
+        ],
+    )
+    def test_sdpa_bottom_right_causal_aligns_the_last_query_to_the_last_key(
+        self, attributes: dict
+    ) -> None:
+        """Chunked prefill: query i sees keys up to i + Skv - Sq."""
+        outputs, q, k, v = self._bottom_right_case(3, 5, attributes)
+        keep = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, False],
+                [True, True, True, True, True],
+            ]
+        )
+        expected, expected_stats = self._masked(q, k, v, keep)
+
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+        np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
+
+    def test_sdpa_bottom_right_decode_sees_the_whole_cache(self) -> None:
+        """Sq = 1 bottom-right is unmasked attention, not key 0 only."""
+        outputs, q, k, v = self._bottom_right_case(
+            1, 4, {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}
+        )
+        expected, _ = self._masked(q, k, v, torch.ones(1, 4, dtype=torch.bool))
+
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+
+    def test_sdpa_bottom_right_window_counts_back_from_the_shifted_diagonal(
+        self,
+    ) -> None:
+        outputs, q, k, v = self._bottom_right_case(
+            2,
+            5,
+            {
+                "causal_mask": True,
+                "left_bound": 1,
+                "diagonal_alignment": "BOTTOM_RIGHT",
+            },
+        )
+        keep = torch.tensor(
+            [[False, False, True, True, False], [False, False, False, True, True]]
+        )
+        expected, expected_stats = self._masked(q, k, v, keep)
+
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+        np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
+
+    def test_sdpa_top_left_window_stats_use_the_window(self) -> None:
+        """Stats must come from the same band as O, not plain attention."""
+        outputs, q, k, v = self._bottom_right_case(
+            4, 4, {"causal_mask": True, "left_bound": 1}
+        )
+        keep = torch.tensor(
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, True, True, False],
+                [False, False, True, True],
+            ]
+        )
+        expected, expected_stats = self._masked(q, k, v, keep)
+
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+        np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
+
+    def test_sdpa_backward_still_rejects_bottom_right(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 2), dtype=np.float32)
+        stats = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 7,
+                        "dk_tensor_uid": 8,
+                        "dv_tensor_uid": 9,
+                    },
+                    "parameters": {
+                        "causal_mask": True,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ],
+        }
+
+        with pytest.raises(UnsupportedGraphError, match="TOP_LEFT"):
+            provider.compute_reference(
+                graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
+            )
+
     def test_sdpa_additive_attention_mask_matches_torch(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
@@ -1362,8 +1506,6 @@ class TestPyTorchProviderNewOps:
         [
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
-            ({"causal_mask_bottom_right": True}, "bottom-right causal"),
-            ({"diagonal_alignment": "BOTTOM_RIGHT"}, "TOP_LEFT"),
             ({"right_bound": 1}, "forward-looking band"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
         ],

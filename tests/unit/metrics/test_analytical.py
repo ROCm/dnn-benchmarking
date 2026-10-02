@@ -553,6 +553,15 @@ class TestComputeFlops:
         assert flops == 655360
         assert partial is False
 
+    def test_sdpa_causal_mask_bottom_right_alone_is_causal(self):
+        # The boolean-only spelling: causal_mask false, no diagonal_alignment.
+        # Offset Skv-Sq = 2: rows -> 3+4+5 = 12 query-key pairs, not the dense 15.
+        graph = _sdpa_graph(bottom_right=True, sq=3, skv=5)
+        del graph["nodes"][0]["attributes"]["diagonal_alignment"]
+        flops, partial = compute_flops(graph)
+        assert flops == 2 * 2 * 64 * 12 * (128 + 128)
+        assert partial is False
+
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.
         flops, partial = compute_flops(_sdpa_graph(sq=128, skv=128, d=128, dv=64))
