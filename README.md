@@ -516,6 +516,10 @@ failure and prints the first failures with their error messages.
 Both levels also fail an SDPA node (forward or backward) that sets neither
 `attn_scale_value` nor `scale_tensor_uid`: write the scale the workload's source
 used, usually `1/sqrt(head_dim)`, rather than relying on a backend default.
+They also fail a causal SDPA node with Sq = 1 and a top-left diagonal (it
+attends only to key 0; a decode step is unmasked or bottom-right), and print a
+warning for other top-left causal nodes with Sq != Skv, which decode and
+chunked prefill almost always mean as bottom-right.
 
 ## Running Tests
 
