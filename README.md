@@ -485,6 +485,17 @@ dvc pull Workloads/headline/conv.tar.gz.dvc
 Keep credentials in DVC's ignored local configuration (`.dvc/config.local`);
 the committed configuration supports anonymous access and contains no secrets.
 
+DVC keeps per-repository state in a shared site cache, `/var/tmp/dvc` on Linux.
+Where `/var/tmp` is read-only (some containers, including the hipDNN
+Slurm images), `dvc pull` fails with
+`[Errno 30] Read-only file system: '/var/tmp/dvc'`. Point the site cache at any
+writable directory:
+
+```bash
+export DVC_SITE_CACHE_DIR=/tmp/dvc-site    # or: dvc config --local core.site_cache_dir /tmp/dvc-site
+dvc pull
+```
+
 ### Validating graphs
 
 `tools/check_deserialize.py` checks that graph JSON files deserialize and validate
@@ -501,6 +512,16 @@ python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
 Run this after adding new workload graphs to confirm hipDNN can load them. Paths may
 be globs, directories, or tarball-extracted trees; the script exits non-zero on any
 failure and prints the first failures with their error messages.
+
+Both levels also fail an SDPA node (forward or backward) that sets neither
+`attn_scale_value` nor `scale_tensor_uid`: write the scale the workload's source
+used, usually `1/sqrt(head_dim)`, rather than relying on a backend default.
+They also fail a causal SDPA node with Sq = 1 and a top-left diagonal (it
+attends only to key 0; a decode step is unmasked or bottom-right). They print a
+warning for other top-left causal nodes with Sq != Skv, because decode and
+chunked prefill workloads almost always use bottom-right alignment.
+`left_bound = -1` and `right_bound = -1` mark an unbounded band, so a node with
+both and no causal flag counts as unmasked.
 
 ## Running Tests
 
