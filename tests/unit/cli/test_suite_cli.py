@@ -1412,6 +1412,25 @@ class TestOracleFlag:
         assert config.oracle_mode == "exhaustive"
         assert config.autotune is True
 
+    @pytest.mark.parametrize(
+        ("extra", "expected"), [([], True), (["--oracle-mode", "off"], False)]
+    )
+    @patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
+    def test_pytorch_exhaustive_follows_oracle_mode(
+        self, mock_benchmark: MagicMock, extra: list, expected: bool
+    ) -> None:
+        mock_benchmark.return_value = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph = self._create_graph(Path(tmpdir))
+            from dnn_benchmarking.cli.main import main
+
+            with patch("sys.argv", ["dnn-benchmark", "--graph", str(graph), *extra]):
+                main()
+
+        config = mock_benchmark.call_args.kwargs["config"]
+        assert config.pytorch_exhaustive is expected
+
     def test_oracle_mode_with_pytorch_backend_rejected(self) -> None:
         from dnn_benchmarking.cli.main import main
 

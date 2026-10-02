@@ -371,6 +371,9 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = True
+    #: Tune PyTorch's own kernel selection (MIOpen exhaustive search, TunableOp
+    #: GEMM tuning) when PyTorch is timed. Applied by the CLI, not by this class.
+    pytorch_exhaustive: bool = True
     #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
