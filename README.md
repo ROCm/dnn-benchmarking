@@ -85,6 +85,18 @@ The selected prefix is printed as `Using hipDNN/ROCm prefix: ...`; activation
 sets `ROCM_PATH` to that prefix and prepends its `lib` directory to
 `LD_LIBRARY_PATH`. dnn-benchmarking infers plugins from
 `$ROCM_PATH/lib/hipdnn_plugins/engines`.
+
+In `--torch-mode rocm` (and `existing` with ROCm torch) without `--rocm-prefix`,
+hipDNN is built into the torch wheel's ROCm SDK prefix and replaces the wheel's
+own `libhipdnn_backend`, so the process has one hipDNN. Passing `--rocm-prefix`
+with ROCm torch mixes two SDKs: the wheel still ships its own, possibly older,
+`libhipdnn_backend`, and its HIP runtime and comgr are what torch loads.
+dnn-benchmark imports the hipDNN bindings before torch, so they bind to the
+`--rocm-prefix` hipDNN on `LD_LIBRARY_PATH`. The HIP runtime is still the
+wheel's, not the one that install was built and tested against. Do not
+`LD_PRELOAD` the install's hipDNN to force it: with two LLVM copies in one
+process, startup aborts (`LLVM ERROR: support is already registered`).
+
 If GPU architecture detection is unavailable on the setup host, pass
 `--gpu-arch gfx90a`, `--gpu-arch gfx942`, or `--gpu-arch gfx950`.
 
