@@ -230,10 +230,10 @@ def run_suite_benchmark(
     tarball_source: Optional[str] = None,
 ) -> int:
     """Run the benchmark suite and return an exit code."""
-    if not _reference_provider_available(config, reporter):
-        return 1
-
     if config.backend == ExecutionBackendName.PYTORCH:
+        if not _reference_provider_available(config, reporter):
+            return 1
+
         from .pytorch_suite_runner import run_pytorch_suite_benchmark
 
         return run_pytorch_suite_benchmark(
@@ -244,13 +244,20 @@ def run_suite_benchmark(
             tarball_source=tarball_source,
         )
 
-    from .hipdnn_suite_runner import run_hipdnn_suite_benchmark
+    from .hipdnn_suite_runner import load_hipdnn_bindings, run_hipdnn_suite_benchmark
+
+    # The PyTorch reference probe imports torch, so the bindings load first.
+    hipdnn, load_error = load_hipdnn_bindings()
+    if not _reference_provider_available(config, reporter):
+        return 1
 
     return run_hipdnn_suite_benchmark(
         graph_paths=graph_paths,
         config=config,
         output_path=output_path,
         reporter=reporter,
+        hipdnn=hipdnn,
+        load_error=load_error,
         tarball_source=tarball_source,
     )
 
