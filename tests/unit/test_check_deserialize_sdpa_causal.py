@@ -59,6 +59,7 @@ _BOTTOM_RIGHT = {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}
         _graph(1, 4096, **_TOP_LEFT),
         _graph(1, 64, paged=True, **_TOP_LEFT),
         _graph(1, 4096, left_bound=127, **_TOP_LEFT),
+        _graph(1, 4096, left_bound=-1, right_bound=0, diagonal_alignment="TOP_LEFT"),
     ],
 )
 def test_top_left_decode_with_one_query_is_an_error(tool, graph) -> None:
@@ -81,6 +82,7 @@ def test_top_left_with_unequal_lengths_is_a_warning(tool) -> None:
         _graph(1, 4096, **_BOTTOM_RIGHT),
         _graph(171, 4096, causal_mask_bottom_right=True),
         _graph(1, 4096),
+        _graph(1, 4096, left_bound=-1, right_bound=-1, diagonal_alignment="TOP_LEFT"),
         _graph(2048, 2048, **_TOP_LEFT),
     ],
 )

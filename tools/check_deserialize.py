@@ -52,11 +52,17 @@ def sdpa_nodes_without_scale(graph):
     return missing
 
 
+# hipDNN writes -1 for an unbounded side of the band, so left_bound=-1,
+# right_bound=-1 is an unmasked node.
+_UNBOUNDED = -1
+
+
 def _sdpa_is_causal(attrs):
+    left = attrs.get("left_bound")
     return bool(
         attrs.get("causal_mask")
         or attrs.get("causal_mask_bottom_right")
-        or attrs.get("left_bound") is not None
+        or (left is not None and left != _UNBOUNDED)
         or attrs.get("right_bound") == 0
     )
 
