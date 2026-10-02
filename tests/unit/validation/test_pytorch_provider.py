@@ -1112,6 +1112,24 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
         np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
 
+    def test_sdpa_top_left_window_stats_use_the_window(self) -> None:
+        """Stats must come from the same band as O, not plain attention."""
+        outputs, q, k, v = self._bottom_right_case(
+            4, 4, {"causal_mask": True, "left_bound": 1}
+        )
+        keep = torch.tensor(
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, True, True, False],
+                [False, False, True, True],
+            ]
+        )
+        expected, expected_stats = self._masked(q, k, v, keep)
+
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+        np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
+
     def test_sdpa_backward_still_rejects_bottom_right(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.zeros((1, 1, 2, 2), dtype=np.float32)
