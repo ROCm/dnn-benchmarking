@@ -43,8 +43,8 @@ Run the provided setup script from the `dnn-benchmarking` directory:
 
 `rocm-libraries` (hipDNN sources and provider plugins) is a git submodule
 tracking its `develop` branch by default. `setup_env.py` fetches it
-automatically on first run via a sparse, blobless clone limited to the two
-subtrees this tool builds (`projects/hipdnn`, `dnn-providers`) rather than
+automatically on first run via a sparse, blobless clone limited to what this
+tool builds (`cmake`, `shared`, `projects/hipdnn`, `dnn-providers`) rather than
 the full ~9GB monorepo, and build hipDNN plus the provider plugins from it
 by default (pass `--reuse-artifacts` to skip and reuse whatever is already
 installed instead; it fetches no sources and builds no Python bindings, so use
@@ -55,12 +55,25 @@ To build against a different rocm-libraries ref, check it out directly,
 e.g. `git -C rocm-libraries fetch --depth 1 origin <ref> && git -C
 rocm-libraries checkout FETCH_HEAD`.
 
+Setup builds only from `rocm-libraries/` in this directory. To benchmark a
+revision you already have in another checkout, add it there as a worktree
+(`rocm-libraries/` must be absent or empty):
+`git -C <your-checkout> worktree add <dnn-benchmarking>/rocm-libraries <rev>`.
+The default `--torch-mode rocm` builds it against the ROCm SDK bundled with
+the torch wheel, not `/opt/rocm`, so it is a separate build from one made
+against the system ROCm. Each run replaces the build and install in this
+checkout, so comparing two revisions needs two `dnn-benchmarking` checkouts.
+
 Requires Python 3.12 or newer.
 
 ```bash
 python3 setup_env.py --workspace .workspace
 source .workspace/.venv/bin/activate
 ```
+
+`setup_env.py` asks for confirmation before it replaces a virtual environment
+or builds from source. Pass `-y`/`--yes` when there is no terminal to answer
+(`nohup`, `srun`, CI); without it, setup stops at the prompt with an error.
 
 By default, setup uses `/workspace` when it already exists and is writable;
 otherwise it uses `.workspace` under the `dnn-benchmarking` directory. Use
