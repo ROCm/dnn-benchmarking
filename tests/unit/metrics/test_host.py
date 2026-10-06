@@ -53,9 +53,3 @@ class TestHostMemorySnapshot:
             snap = host.host_memory_snapshot()
         assert snap["host_rss_mb"] == pytest.approx(256.0)
         assert snap["host_ram_available_mb"] == pytest.approx(16384.0)
-
-
-class TestIsPsutilAvailable:
-    def test_returns_false_without_module(self):
-        with patch.dict(sys.modules, {"psutil": None}):
-            assert host.is_psutil_available() is False

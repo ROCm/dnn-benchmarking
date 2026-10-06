@@ -24,10 +24,19 @@ from tests.integration.conftest import load_graph
 pytestmark = [pytest.mark.gpu, pytest.mark.cuda]
 
 
-def test_pytorch_gpu_timing_cuda() -> None:
+@pytest.mark.parametrize(
+    "graph_name",
+    [
+        "sample_conv_fwd.json",
+        # Batchnorm must take native_batch_norm, not MIOpen, on CUDA builds.
+        "sample_batchnorm_training.json",
+        "sample_batchnorm_backward.json",
+    ],
+)
+def test_pytorch_gpu_timing_cuda(graph_name: str) -> None:
     """The PyTorch executor times with torch.cuda events on CUDA."""
     skip_if_no_cuda_torch()
-    _, graph_json, tensor_infos = load_graph("sample_conv_fwd.json")
+    _, graph_json, tensor_infos = load_graph(graph_name)
     executor = PyTorchCudaExecutor(
         graph_json,
         TimingPolicy(warmup_iters=1, iters=3),
@@ -37,7 +46,7 @@ def test_pytorch_gpu_timing_cuda() -> None:
 
     with PyTorchCudaBufferManager(tensor_infos) as bm:
         bm.allocate_all()
-        bm.load_input_data(generate_input_data(tensor_infos, seed=42))
+        bm.load_input_data(generate_input_data(tensor_infos, 42, graph_json))
         bm.zero_outputs()
         m = executor.benchmark(bm.get_tensors())
 

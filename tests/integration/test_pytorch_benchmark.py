@@ -70,6 +70,7 @@ def test_load_input_data_copies_inputs_to_device(torch_gpu) -> None:
         "sample_sdpa.json",
         "sample_mha_sdpa.json",
         "sample_sdpa_backward.json",
+        "sample_sdpa_paged.json",
         "sample_layernorm.json",
         "sample_rmsnorm.json",
         "sample_rmsnorm_backward.json",

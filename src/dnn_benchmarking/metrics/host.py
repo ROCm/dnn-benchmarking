@@ -13,16 +13,6 @@ from typing import Dict, Optional
 from ._diagnostic import warn_once
 
 
-def is_psutil_available() -> bool:
-    """Return True when the psutil import succeeds."""
-    try:
-        import psutil  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
 def host_memory_snapshot() -> Dict[str, Optional[float]]:
     """Return process RSS and host RAM availability in MB.
 

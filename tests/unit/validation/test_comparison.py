@@ -30,13 +30,15 @@ def test_identical_arrays_pass() -> None:
 
 
 def test_tolerance_is_atol_plus_rtol_times_expected() -> None:
-    expected = np.array([100.0, 100.0], dtype=np.float32)
-    # atol + rtol*|e| = 1 + 0.01*100 = 2: 2.0 is inside, 2.5 is outside.
-    inside = compare(expected + [2.0, 0.0], expected, rtol=0.01, atol=1.0)
-    outside = compare(expected + [2.5, 0.0], expected, rtol=0.01, atol=1.0)
+    expected = np.array([100.0, 100.0, 100.0], dtype=np.float64)
+    # atol + rtol*|e| = 1 + 0.01*100 = 2: 2.0 is inside, 2.5 is outside, and
+    # 2.01 is outside only because the limit uses |expected|, not |actual|
+    # (1 + 0.01*102.01 = 2.0201 would admit it).
+    actual = expected + [2.0, 2.5, 2.01]
 
-    assert inside.passed
-    assert not outside.passed
+    for result in _both(actual, expected, rtol=0.01, atol=1.0):
+        assert result.n_mismatch == 2
+        assert result.worst_index == (1,)
 
 
 def test_mismatch_count_and_worst_index() -> None:

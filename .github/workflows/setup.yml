@@ -122,6 +122,8 @@ jobs:
           pip install -e ".[test]"
           python -c "import hipdnn_frontend; print('hipdnn_frontend OK')"
           python -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
+          # Otherwise every PyTorch GPU test skips and the job still passes.
+          python -c "import torch; assert torch.cuda.is_available(), 'torch sees no GPU'"
           dnn-benchmark --help
           pytest -q
 

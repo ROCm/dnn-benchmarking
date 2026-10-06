@@ -123,9 +123,9 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `graph_name` | string | `name` field of the graph JSON. The file stem when the graph has no `name` or does not load. |
 | `graph_path` | string | Path of the graph file. |
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
-| `error` | string or null | Graph-level failure, as `ExceptionType: message`. |
+| `error` | string or null | Graph-level failure, as `ExceptionType: message`. A failure before any row runs has the prefix `Engine discovery failed: ` or `Input data generation failed: `. |
 | `message` | string or null | Why no engine applies, when `status` is `no_engines` and hipDNN gave a reason. The console shows `no engines applicable: <message>`. |
-| `results` | array | One [row](#row) per engine or provider. Empty when `status` is `no_engines` or `error`. |
+| `results` | array | One [row](#row) per engine or provider. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran. |
 
 ### graph_id
 
@@ -166,8 +166,8 @@ The graph content decides the ID. The file name and the file path do not. Use
 | Key | Type | Meaning |
 |---|---|---|
 | `id` | string or null | Engine ID as `0x` plus 16 upper-case hex digits. `null` for PyTorch rows. |
-| `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. |
-| `version` | string | Plugin version, or `"unavailable"`. |
+| `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
+| `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
 | `plugin_path` | string or null | Plugin the engine was loaded from. |
 
 hipDNN engine IDs are signed 64-bit integers. JSON readers that use
@@ -182,9 +182,9 @@ stores the ID as the hex form of its unsigned 64-bit value
 | `mode` | string | `staged` (stall-gated device span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
 | `backend` | string | Event backend: `hip` or `torch`. |
 | `cache_mode` | string | `warm` or `cold`. |
-| `warmup_iters` | int | Untimed launches that ran before the timed loop. Always 1 or more. In `block` mode, the untimed launches that run before every sample. |
+| `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
 | `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
-| `capped` | bool | `true` when the `max_iters` cap (10000) stopped the loop before `--min-time-ms` was reached. |
+| `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. |
 | `timing_block` | int | Launches per timed sample. `1` except in `block` mode. |
 
@@ -222,12 +222,12 @@ remove outliers.
 | `tflops` | float or null | `flops / kernel.median_ms`, in 10^12 FLOP/s. |
 | `gbps` | float or null | `io_bytes / kernel.median_ms`, in 10^9 bytes/s. |
 | `workspace_bytes` | int or null | Workspace that hipDNN reserved for the plan. |
-| `vram_mb` | float or null | Process VRAM in use after the timed loop, MiB. It can include cached allocations from earlier engines on the same graph. |
-| `clocks_before` | object or null | GPU clocks right before the timed loop. See [clocks](#clocks). |
+| `vram_mb` | float or null | Device VRAM in use after the timed loop, MiB, while the row's buffers are still allocated. amdsmi `vram_used` counts every process on the GPU, not only this one. It can include cached allocations from earlier engines on the same graph. |
+| `clocks_before` | object or null | GPU clocks before priming and warmup, so often the idle clocks. See [clocks](#clocks). |
 | `clocks_after` | object or null | GPU clocks right after the timed loop. |
 
-`--metrics-tier off` sets the analytical values, `vram_mb` and both clock
-objects to `null`.
+`--metrics-tier off` sets the analytical values, `workspace_bytes`, `vram_mb`
+and both clock objects to `null`, and `flops_partial` to `false`.
 
 #### clocks
 
@@ -304,7 +304,8 @@ ran for the row.
 | `delta` | object or null | Comparison by kernel median. See below. |
 
 `delta` compares `baseline_kernel` with `kernel`. It is `null` when either
-side has no kernel statistics.
+side has no kernel statistics, when either median is 0 or less, or when the
+default or the tuned plan failed validation.
 
 | Key | Meaning |
 |---|---|
@@ -365,7 +366,8 @@ it.
 | `unchecked` | The row ran, but no validation result exists. This is not a pass. |
 
 The checks apply in the order of the table. The CLI exit code follows from the
-verdicts. See [usage.md](usage.md#exit-codes).
+verdicts of the `engine` rows; `reference` rows do not count. See
+[usage.md](usage.md#exit-codes).
 
 ## Partial files
 
@@ -414,9 +416,11 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `max_abs_diff` | `row.correctness.max_abs_diff` |
 | `message` | `row.message` |
 
-A graph with no rows (status `error` or `no_engines`) gives one line. That
-line has the graph status in `status`, and the graph `error` or `message` in
-`message`.
+A graph with no rows (status `error`, or `no_engines` without `--validate`)
+gives one line. That line has the graph status in `status`, and the graph
+`error` or `message` in `message`. A `no_engines` graph with `--validate
+pytorch` gives only its `reference` row; the graph status is then not in the
+CSV.
 
 `dnn-benchmark compare` reads JSON only. It stops with exit code 2 on a CSV
 file.

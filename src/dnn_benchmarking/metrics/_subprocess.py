@@ -105,8 +105,10 @@ def run_capped(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
-        # Explicit env: rocprofv3 aborts (rc=-6) after HIP init when
-        # spawned with the inherited-by-default environment (UXE-02).
+        # Explicit env, deliberately not inherited: ``os.environ`` is the
+        # Python-startup snapshot, while the C-level environ also holds the
+        # variables HIP set with setenv() during its init in this process.
+        # Passing those to the profiled child makes rocprofv3 abort (rc=-6).
         env=dict(os.environ),
     ) as proc:
         try:

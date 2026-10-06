@@ -272,15 +272,20 @@ def _run_suite(
         )
         return interrupted
 
-    reporter.print_summary(suite, str(output_path) if output_path else None)
+    reporter.print_summary(
+        suite, str(output_path) if output_path and write_ok else None
+    )
     if config.oracle_enabled:
         reporter.print_oracle_summary(suite.graphs)
     return _exit_code(suite, write_ok)
 
 
 def _exit_code(suite: SuiteResult, write_ok: bool) -> int:
-    """3 on any failed verdict, else 1 on any error or write failure, else 0."""
-    verdicts = {r.verdict for g in suite.graphs for r in g.results}
+    """3 on any failed engine verdict, else 1 on any engine error, graph error
+    or write failure, else 0. Reference rows do not count, matching summary()."""
+    verdicts = {
+        r.verdict for g in suite.graphs for r in g.results if r.role == "engine"
+    }
     if "failed" in verdicts:
         return 3
     if "error" in verdicts or any(g.error for g in suite.graphs) or not write_ok:
@@ -322,11 +327,6 @@ def _warn_oracle(config: SuiteConfig, reporter: Reporter) -> None:
         reporter.warning(
             "--oracle-mode: provider kernel caches are on "
             "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
-        )
-    if config.warmup_iters == 0:
-        reporter.warning(
-            "--oracle-mode with --warmup 0: first-execute kernel sampling lands "
-            "in both timed loops"
         )
     if config.oracle_exhaustive:
         reporter.info(

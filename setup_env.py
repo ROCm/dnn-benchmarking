@@ -23,6 +23,7 @@ top level; any such probe runs in a subprocess against the *venv* interpreter.
 import argparse
 import contextlib
 import functools
+import json
 import os
 import platform
 import re
@@ -61,6 +62,11 @@ _GFX_ARCH = re.compile(r"\bgfx[0-9a-f]+(?![\w-])")
 
 # Bound for the arch-detection tools, which hang on a wedged driver.
 DETECT_TIMEOUT_S = 30
+
+# Written into the venv after setup installs torch: the GPU arch and index URL
+# it used, so a reused venv can refuse a different explicit --gpu-arch or
+# --torch-index-url instead of silently mixing builds.
+TORCH_RECORD = "dnn-bench-torch.json"
 
 
 # --- Small process helpers -------------------------------------------------
@@ -359,6 +365,16 @@ print("\n" + mode)
 # --- CLI -------------------------------------------------------------------
 
 
+def _commit_sha(value: str) -> str:
+    """--rocm-libraries-ref: a full 40-hex commit id, lowercased."""
+    sha = value.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise argparse.ArgumentTypeError(
+            f"expected a full 40-character commit SHA, got {value!r}"
+        )
+    return sha
+
+
 def _cmake_define(value: str) -> str:
     """Normalise a --cmake-arg value to a `-DNAME=VALUE` CMake define.
 
@@ -467,15 +483,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Delete and recreate the virtual environment and wipe the hipDNN/"
             "provider and binding CMake build directories. By default setup "
-            "reuses the existing venv (and its torch) and rebuilds incrementally."
+            "reuses the existing venv (and its torch) and rebuilds incrementally; "
+            "changing its --torch-mode, --gpu-arch or --torch-index-url then "
+            "requires --clean."
         ),
     )
     parser.add_argument(
         "--rocm-libraries-ref",
-        default="",
+        type=_commit_sha,
         metavar="SHA",
         help=(
-            "rocm-libraries commit to fetch when rocm-libraries/ is absent. "
+            "Full 40-character rocm-libraries commit to fetch when "
+            "rocm-libraries/ is absent. "
             "Default: the submodule commit pinned in this repository (`git "
             "rev-parse HEAD:rocm-libraries`). Needed where no git metadata "
             "exists (Docker builds, source tarballs); without it setup falls "
@@ -1029,22 +1048,26 @@ class Setup:
             print(f"Using existing PyTorch in {self.venv_dir}.")
             return
 
+        arch = ""
         if mode == "cpu":
             index_url = self.torch_index_url or "https://download.pytorch.org/whl/cpu"
             if self.installed_torch_mode != "missing":
                 self.require_torch_mode("cpu")
+                self.require_same_torch_source()
                 print(f"Using existing CPU-only PyTorch in {self.venv_dir}.")
                 return
             print(f"Installing CPU-only PyTorch from {index_url}")
             self.pip("install", "torch", "--index-url", index_url)
         elif mode == "cuda":
+            index_url = self.torch_index_url  # "" = PyPI
             if self.installed_torch_mode != "missing":
                 self.require_torch_mode("cuda")
+                self.require_same_torch_source()
                 print(f"Using existing CUDA PyTorch in {self.venv_dir}.")
                 return
-            if self.torch_index_url:
-                print(f"Installing CUDA PyTorch from {self.torch_index_url}")
-                self.pip("install", "torch", "--index-url", self.torch_index_url)
+            if index_url:
+                print(f"Installing CUDA PyTorch from {index_url}")
+                self.pip("install", "torch", "--index-url", index_url)
             else:
                 print("Installing CUDA PyTorch from PyPI")
                 self.pip("install", "torch")
@@ -1053,6 +1076,7 @@ class Setup:
             self.resolved_torch_index_url = index_url
             if self.installed_torch_mode != "missing":
                 self.require_torch_mode("rocm")
+                self.require_same_torch_source(check_arch=True)
                 print(f"Using existing ROCm PyTorch in {self.venv_dir}.")
                 return
             arch = self._require_gpu_arch()
@@ -1074,6 +1098,41 @@ class Setup:
 
         self.installed_torch_mode = self.get_torch_mode()
         self.require_torch_mode(mode)
+        (self.venv_dir / TORCH_RECORD).write_text(
+            json.dumps({"torch_index_url": index_url, "gpu_arch": arch}) + "\n"
+        )
+
+    def require_same_torch_source(self, check_arch: bool = False) -> None:
+        """Fail when an explicit flag differs from what the reused venv holds.
+
+        Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
+        the TORCH_RECORD written when setup installed torch. A venv without
+        the record (torch installed some other way) cannot be checked.
+        """
+        try:
+            record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
+        except (OSError, ValueError):
+            record = None
+        checks = [("--torch-index-url", self.torch_index_url, "torch_index_url")]
+        if check_arch:
+            checks.append(("--gpu-arch", self.gpu_arch_override, "gpu_arch"))
+        for flag, value, key in checks:
+            if not value:
+                continue
+            if record is None:
+                warn(
+                    f"{self.venv_dir} has no {TORCH_RECORD}, so setup cannot check "
+                    f"that its torch matches {flag} {value}.",
+                    "Pass --clean if it does not.",
+                )
+            elif record.get(key) != value:
+                fail(
+                    f"{flag} {value} differs from the "
+                    f"'{record.get(key) or 'default'}' that {self.venv_dir} "
+                    "was set up with.",
+                    "Pass --clean to recreate the virtual environment, or use "
+                    "another --workspace.",
+                )
 
     # -- Source build -------------------------------------------------------
 
@@ -1591,6 +1650,8 @@ class Setup:
 
 
 def main(argv=None) -> int:
+    # Keep in-stage prints in order with child-process output when piped (CI).
+    sys.stdout.reconfigure(line_buffering=True)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.clean and args.torch_mode == "existing":

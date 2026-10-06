@@ -64,13 +64,7 @@ def _failure(message: str, n_total: int) -> ComparisonResult:
 
 
 def compare(
-    actual: Any,
-    expected: Any,
-    *,
-    rtol: float,
-    atol: float,
-    actual_label: str = "output",
-    expected_label: str = "reference",
+    actual: Any, expected: Any, *, rtol: float, atol: float
 ) -> ComparisonResult:
     """Compare ``actual`` against ``expected`` within ``atol + rtol * |expected|``.
 
@@ -103,14 +97,12 @@ def compare(
 
     if tuple(e.shape) != shape:
         return _failure(
-            f"Shape mismatch: {actual_label}={shape} vs "
-            f"{expected_label}={tuple(e.shape)}",
-            n_total,
+            f"Shape mismatch: output={shape} vs reference={tuple(e.shape)}", n_total
         )
     if not bool(xp.isfinite(a).all()):
-        return _failure(f"{actual_label} contains NaN or Inf values", n_total)
+        return _failure("output contains NaN or Inf values", n_total)
     if not bool(xp.isfinite(e).all()):
-        return _failure(f"{expected_label} contains NaN or Inf values", n_total)
+        return _failure("reference contains NaN or Inf values", n_total)
 
     tolerance = f"(rtol={rtol}, atol={atol})"
     if n_total == 0:

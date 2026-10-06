@@ -11,6 +11,7 @@ from typing import Any, Dict
 import numpy as np
 import pytest
 
+from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.config import (
     MetricsConfig,
     SuiteConfig,
@@ -106,7 +107,7 @@ def test_benchmark_measures_and_writes_output(
 
 
 def test_compare_matches_pytorch_reference(
-    hipdnn, sample_conv_fwd_json: Dict[str, Any]
+    hipdnn, torch_gpu, sample_conv_fwd_json: Dict[str, Any]
 ) -> None:
     """Executor output decoded from device buffers matches the PyTorch reference."""
     from dnn_benchmarking.validation import ReferenceProviderRegistry
@@ -142,7 +143,7 @@ def test_compare_matches_pytorch_reference(
         "sample_mha_sdpa.json",
     ],
 )
-def test_engines_validate_against_pytorch(hipdnn, graph_name: str) -> None:
+def test_engines_validate_against_pytorch(hipdnn, torch_gpu, graph_name: str) -> None:
     """--validate pytorch: every engine that runs a sample graph passes."""
     path, graph_json, tensor_infos = load_graph(graph_name)
     result = run_graph_all_providers(
@@ -156,8 +157,23 @@ def test_engines_validate_against_pytorch(hipdnn, graph_name: str) -> None:
     _assert_engines_match_reference(result)
 
 
+def test_paged_sdpa_sample_passes_hipdnn_graph_validation(hipdnn) -> None:
+    """hipDNN deserializes, validates and builds sample_sdpa_paged.json.
+
+    No engine has to run it: "no engines" (UnsupportedGraphError) is fine, a
+    graph-build ExecutionError is not.
+    """
+    _, graph_json, _ = load_graph("sample_sdpa_paged.json")
+    try:
+        Executor(json.dumps(graph_json), TimingPolicy()).discover_engines(
+            hipdnn.Handle()
+        )
+    except UnsupportedGraphError:
+        pass
+
+
 def test_bfloat16_conv_validates_against_pytorch(
-    hipdnn, sample_conv_fwd_json: Dict[str, Any]
+    hipdnn, torch_gpu, sample_conv_fwd_json: Dict[str, Any]
 ) -> None:
     """BF16 device buffers decode and validate against a BF16 reference."""
     graph_json = json.loads(json.dumps(sample_conv_fwd_json))
@@ -179,7 +195,10 @@ def test_bfloat16_conv_validates_against_pytorch(
 
 
 def test_validation_compares_on_device(
-    hipdnn, sample_conv_fwd_json: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    hipdnn,
+    torch_gpu,
+    sample_conv_fwd_json: Dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With a device reference, engine buffers live in torch and compare on GPU."""
     compared = []

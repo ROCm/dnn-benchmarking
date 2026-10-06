@@ -46,9 +46,9 @@ class Measurement:
             ``block`` (rocKE block timing, ``timing_block > 1``).
         backend: Event backend, ``hip`` or ``torch``.
         cache_mode: ``warm`` or ``cold``.
-        warmup_iters: Untimed enqueues actually run (always >= 1): the
-            priming enqueue(s) plus discarded measured-path warmups. In
-            block mode, the untimed executions run before every sample.
+        warmup_iters: Untimed enqueues actually run (always >= 1): priming,
+            any host-sync probe rerun, and discarded measured-path warmups.
+            In block mode, priming plus every per-sample untimed execution.
         first_call_ms: Wall time of the first untimed enqueue plus sync;
             captures one-time plan compile / kernel find cost.
         capped: True when ``max_iters`` stopped the loop before the
@@ -343,11 +343,12 @@ def measure(
     reason: Optional[str] = None
     if torch_stream is not None:
         reason = _probe_host_sync(enqueue)
-        primed += 1
+        # A detected sync costs a second (unchecked) enqueue.
+        primed += 1 if reason is None else 2
         device_sync(backend)
 
     if policy.timing_block > 1:
-        return _measure_blocks(enqueue, events, policy, backend, first_call_ms)
+        return _measure_blocks(enqueue, events, policy, backend, first_call_ms, primed)
 
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
@@ -411,6 +412,7 @@ def _measure_blocks(
     policy: TimingPolicy,
     backend: str,
     first_call_ms: float,
+    untimed: int,
 ) -> Measurement:
     """rocKE block timing (``time_launches`` / Solera ``measure()``).
 
@@ -419,6 +421,9 @@ def _measure_blocks(
     event pair and records the per-execution average. The first sample is
     discarded. The stall gate is not used: N gated enqueues can fill the HIP
     queue and block the host before the gate opens.
+
+    ``untimed`` counts the priming enqueues already run; every per-sample
+    untimed execution is added to it for ``Measurement.warmup_iters``.
     """
     block = policy.timing_block
     kernel_ms: List[float] = []
@@ -432,6 +437,7 @@ def _measure_blocks(
             break
         for _ in range(policy.warmup_iters):
             enqueue()
+        untimed += policy.warmup_iters
         device_sync(backend)
         events.start()
         t0 = time.perf_counter()
@@ -453,7 +459,7 @@ def _measure_blocks(
         mode="block",
         backend=backend,
         cache_mode=policy.cache_mode,
-        warmup_iters=policy.warmup_iters,
+        warmup_iters=untimed,
         first_call_ms=first_call_ms,
         capped=capped,
         timing_block=block,

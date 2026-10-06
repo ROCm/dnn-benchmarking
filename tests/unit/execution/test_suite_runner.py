@@ -490,19 +490,28 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
 
 
 def test_profiling_payload_lands_on_the_row(fake, monkeypatch):
+    """The child gets the timed run's seed (same inputs) and metric flags."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
+    calls = []
+
+    def run_profiling_passes(**kw):
+        calls.append(kw)
+        return {"perf": {"cycles": kw["engine_name"]}}
+
     monkeypatch.setattr(
-        profiling_orchestrator,
-        "run_profiling_passes",
-        lambda **kw: {"perf": {"cycles": kw["engine_name"]}},
+        profiling_orchestrator, "run_profiling_passes", run_profiling_passes
     )
     fake.discovered = [1]
+    metrics = MetricsConfig(perf=True, pmc_set="basic", profiling_timeout_s=42.0)
 
-    graph, progress = _run(metrics=MetricsConfig(perf=True))
+    graph, progress = _run(seed=7, metrics=metrics)
 
     assert graph.results[0].extra_metrics == {"perf": {"cycles": "ENG_A"}}
     assert "profiling ENG_A" in progress
+    [kw] = calls
+    assert kw["seed"] == 7
+    assert kw["metrics_config"] == metrics
 
 
 def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):

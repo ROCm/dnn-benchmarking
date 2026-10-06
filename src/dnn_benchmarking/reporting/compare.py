@@ -5,7 +5,8 @@
 
 Convention: ``speedup = A_median / B_median`` is "B speedup vs A"; above 1
 means B is faster. A pair is ``within noise`` when its relative change is
-at most ``max(threshold, 2 * sqrt(cv_A**2 + cv_B**2))``; a regression is B
+at most ``max(threshold, 2 * sqrt(iqr_A**2 + iqr_B**2))`` (IQR / median per
+side, robust to a few outlier samples); a regression is B
 slower than that. Failed/error rows never enter the geomean.
 
 Exit codes: 0 no regression, 1 regression beyond threshold, 2 usage error,
@@ -31,15 +32,18 @@ _USABLE = ("passed", "unchecked", "reference")
 
 @dataclass
 class Pair:
-    """One compared (graph[, engine]) pair; ms/cv are None when unusable."""
+    """One compared (graph[, engine]) pair; ms/rel_iqr are None when unusable.
+
+    ``rel_iqr`` is IQR / median, the same robust spread statistics.py uses.
+    """
 
     graph: str
     engine_a: Optional[str]
     engine_b: Optional[str]
     a_ms: Optional[float]
     b_ms: Optional[float]
-    a_cv: Optional[float]
-    b_cv: Optional[float]
+    a_rel_iqr: Optional[float]
+    b_rel_iqr: Optional[float]
     speedup: Optional[float]
     label: str
     in_geomean: bool
@@ -87,7 +91,9 @@ def _stat(row: Dict[str, Any], metric: str) -> Tuple[Optional[float], Optional[f
     s = row[metric]
     if row["verdict"] in ("error", "skipped") or not s:
         return None, None
-    return s["median_ms"], s["cv"]
+    return s["median_ms"], (
+        s["iqr_ms"] / s["median_ms"] if s["median_ms"] > 0 else None
+    )
 
 
 def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any]]:
@@ -101,8 +107,16 @@ def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any
     return min(usable, key=lambda r: r[metric]["median_ms"], default=None)
 
 
-def _row_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
-    return (row["role"], row["provider"], row["engine"]["id"], row["engine"]["name"])
+def _keyed(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
+    """Key rows by engine identity plus occurrence index, so duplicated
+    engines (``-e X,X --plugin-path a,b``) pair in order of appearance."""
+    seen: Dict[Tuple[Any, ...], int] = {}
+    out = {}
+    for r in rows:
+        k = (r["role"], r["provider"], r["engine"]["id"], r["engine"]["name"])
+        seen[k] = seen.get(k, -1) + 1
+        out[k + (seen[k],)] = r
+    return out
 
 
 def _pair(
@@ -113,16 +127,16 @@ def _pair(
     threshold: float,
     kind: str = "engine",
 ) -> Pair:
-    a_ms, a_cv = _stat(ra, metric) if ra else (None, None)
-    b_ms, b_cv = _stat(rb, metric) if rb else (None, None)
+    a_ms, a_iqr = _stat(ra, metric) if ra else (None, None)
+    b_ms, b_iqr = _stat(rb, metric) if rb else (None, None)
     pair = Pair(
         graph=graph,
         engine_a=_engine_label(ra) if ra else None,
         engine_b=_engine_label(rb) if rb else None,
         a_ms=a_ms,
         b_ms=b_ms,
-        a_cv=a_cv,
-        b_cv=b_cv,
+        a_rel_iqr=a_iqr,
+        b_rel_iqr=b_iqr,
         speedup=None,
         label="",
         in_geomean=False,
@@ -142,7 +156,7 @@ def _pair(
         pair.label = f"{'+'.join(failed)} failed"
         return pair
     pair.in_geomean = True
-    band = max(threshold / 100.0, 2.0 * math.hypot(a_cv or 0.0, b_cv or 0.0))
+    band = max(threshold / 100.0, 2.0 * math.hypot(a_iqr or 0.0, b_iqr or 0.0))
     change = b_ms / a_ms - 1.0  # positive = B slower
     if abs(change) <= band:
         pair.label = "within noise"
@@ -186,11 +200,9 @@ def compare(
             kind = "ref" if by == "ref" else "engine"
             pairs.append(_pair(name, ra, rb, metric, threshold, kind))
             continue
-        rows_b = {_row_key(r): r for r in gb["results"]}
-        for ra in ga["results"]:
-            pairs.append(
-                _pair(name, ra, rows_b.pop(_row_key(ra), None), metric, threshold)
-            )
+        rows_b = _keyed(gb["results"])
+        for key, ra in _keyed(ga["results"]).items():
+            pairs.append(_pair(name, ra, rows_b.pop(key, None), metric, threshold))
         pairs.extend(_pair(name, None, rb, metric, threshold) for rb in rows_b.values())
     ratios = [p.speedup for p in pairs if p.in_geomean]
     return {

@@ -1909,6 +1909,16 @@ class TestReplayTensorsScalarCache:
         assert _scalar_value(tensors, 1, {}) == 9.0
 
 
+@pytest.mark.parametrize("rocm_build, expected", [(True, True), (False, False)])
+def test_miopen_batchnorm_only_on_rocm_builds(rocm_build, expected) -> None:
+    """CUDA torch has no aten.miopen_batch_norm, even for GPU tensors."""
+    from types import SimpleNamespace
+
+    from dnn_benchmarking.execution.pytorch_ops.handlers.batchnorm import _use_miopen
+
+    assert _use_miopen(SimpleNamespace(is_cuda=True), rocm_build) is expected
+
+
 class TestStorePlanned:
     """The shared store-with-declared-shape helper used by norm/reduction/resample."""
 
@@ -2194,6 +2204,29 @@ class TestPyTorchSdpaPaged:
 
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    def test_replay_reads_seq_lens_from_host_once(self, monkeypatch) -> None:
+        """A seq_len .tolist() on every replay syncs the stream inside the staged
+        timer's gated region and hangs; ReplayTensors must read each once."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        replay = pytorch_ops.ReplayTensors(
+            self._tensors(q, k_pages, v_pages, page_table)
+        )
+        seq_lens = sorted(replay[uid].data_ptr() for uid in (7, 8))
+        reads = []
+        tolist = torch.Tensor.tolist
+
+        def counting_tolist(t):
+            if t.data_ptr() in seq_lens:
+                reads.append(t.data_ptr())
+            return tolist(t)
+
+        monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+        graph = pytorch_ops.compile_graph(self._graph())
+        graph.execute(replay)
+        graph.execute(replay)
+
+        assert sorted(reads) == seq_lens
 
     def test_bundle_causal_spelling_matches_boolean_spelling(self) -> None:
         """The shipped paged bundles express causality as (-1, 0) while the model

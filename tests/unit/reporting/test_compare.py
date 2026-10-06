@@ -19,19 +19,22 @@ from dnn_benchmarking.reporting.suite_results import (
 
 
 def _stats(median: float, cv: float = 0.0) -> BenchmarkStats:
-    # Two-point samples: exact median, CV ~= cv.
+    # Two-point samples: exact median, IQR / median = 2 * cv.
     d = median * cv
     return BenchmarkStats.from_timings([median - d, median + d] * 10)
 
 
-def _row(name, median, *, cv=0.0, match=True, status="success", role="engine"):
+def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
+         timings=None, plugin_path=None):  # fmt: skip
+    stats = BenchmarkStats.from_timings(timings) if timings else _stats(median, cv)
     return ProviderEngineResult(
         "hipdnn",
         1,
         status,
         role=role,
+        plugin_path=plugin_path,
+        gpu_kernel_stats=stats if status == "success" else None,
         engine_name=name,
-        gpu_kernel_stats=_stats(median, cv) if status == "success" else None,
         correctness=CorrectnessResult(match, 1e-3, 1e-5),
     )
 
@@ -61,15 +64,16 @@ def test_best_engine_speedup_and_geomean(tmp_path, capsys):
     a = _write(tmp_path, "a.json", [("g1", "id1", [_row("E1", 2.0), _row("E2", 4.0)]),
                                     ("g2", "id2", [_row("E1", 1.0)])])  # fmt: skip
     b = _write(tmp_path, "b.json", [("g1", "id1", [_row("E1", 3.0), _row("E2", 1.0)]),
-                                    ("g2", "id2", [_row("E1", 0.5)])])  # fmt: skip
+                                    ("g2", "id2", [_row("E1", 2.0)])])  # fmt: skip
     code, report = _json(capsys, [a, b])
-    assert code == 0
+    assert code == 1  # g2 is a 2x regression
     g1, g2 = report["pairs"]
     # Best per side: A picks E1 (2.0), B picks E2 (1.0); B is 2x faster.
     assert (g1["engine_a"], g1["engine_b"], g1["speedup"]) == ("E1", "E2", 2.0)
     assert g1["label"] == "faster"
-    assert g2["speedup"] == 2.0
-    assert report["geomean_speedup"] == 2.0
+    assert g2["speedup"] == 0.5
+    # Geometric mean of 2.0 and 0.5 (arithmetic would be 1.25).
+    assert report["geomean_speedup"] == pytest.approx(1.0)
 
 
 def test_regression_exits_1(tmp_path, capsys):
@@ -90,10 +94,42 @@ def test_changes_within_threshold_or_noise_are_not_regressions(tmp_path, capsys)
     assert code == 0
     assert [p["label"] for p in report["pairs"]] == ["within noise", "within noise"]
     # A 1% threshold makes the quiet 3% slowdown a regression; the noisy 20%
-    # slowdown stays inside its 2 * combined-CV band.
+    # slowdown stays inside its 2 * combined relative-IQR band.
     code, report = _json(capsys, [a, b, "--threshold", "1"])
     assert code == 1
     assert [p["label"] for p in report["pairs"]] == ["REGRESSION", "within noise"]
+
+
+def test_one_outlier_sample_does_not_hide_a_regression(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0, timings=[1.0] * 100)])])
+    b = _write(tmp_path, "b.json",
+               [("g", "id", [_row("E", 1.5, timings=[1.5] * 99 + [30.0])])])  # fmt: skip
+    code, report = _json(capsys, [a, b])
+    assert code == 1
+    assert report["pairs"][0]["label"] == "REGRESSION"
+
+
+def test_by_engine_pairs_duplicated_engines_in_order(tmp_path, capsys):
+    # -e E,E --plugin-path a,b gives two rows with the same engine identity.
+    rows = [_row("E", 1.0, plugin_path="/a"), _row("E", 2.0, plugin_path="/b")]
+    a = _write(tmp_path, "a.json", [("g", "id", rows)])
+    b = _write(tmp_path, "b.json", [("g", "id", rows)])
+    code, report = _json(capsys, [a, b, "--by", "engine"])
+    assert code == 0
+    assert [(p["a_ms"], p["b_ms"], p["label"]) for p in report["pairs"]] == [
+        (1.0, 1.0, "within noise"),
+        (2.0, 2.0, "within noise"),
+    ]
+
+
+def test_by_engine_lists_engines_only_in_b(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E1", 1.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E1", 1.0), _row("E2", 1.0)])])
+    _, report = _json(capsys, [a, b, "--by", "engine"])
+    assert [(p["engine_b"], p["label"]) for p in report["pairs"]] == [
+        ("E1", "within noise"),
+        ("E2", "no A row"),
+    ]
 
 
 def test_failed_rows_excluded_from_geomean(tmp_path, capsys):

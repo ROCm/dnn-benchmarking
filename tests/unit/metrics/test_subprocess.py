@@ -10,6 +10,7 @@ front-end and then waits on those pipes forever, so a wedged rocprofv3
 hangs the whole benchmark instead of skipping one pass.
 """
 
+import ctypes
 import subprocess
 import sys
 import time
@@ -77,6 +78,26 @@ class TestRunCapped:
         proc = run_capped([sys.executable, "-c", "print('ok')"], None)
         assert proc.returncode == 0
         assert proc.stdout.strip() == "ok"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setenv")
+    def test_child_env_drops_natively_set_variables(self):
+        """HIP setenv()s variables during init that make rocprofv3 abort
+        (rc=-6) in the profiled child; run_capped passes ``os.environ``
+        (the Python snapshot) instead of inheriting the C-level environ."""
+        libc = ctypes.CDLL(None)
+        libc.setenv(b"DNN_BENCH_NATIVE_ONLY", b"1", 1)
+        try:
+            proc = run_capped(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.environ.get('DNN_BENCH_NATIVE_ONLY'))",
+                ],
+                60,
+            )
+        finally:
+            libc.unsetenv(b"DNN_BENCH_NATIVE_ONLY")
+        assert proc.stdout.strip() == "None"
 
     def test_missing_binary_raises_oserror(self, tmp_path):
         with pytest.raises(OSError):

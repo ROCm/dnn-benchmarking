@@ -215,6 +215,24 @@ class TestWriteLoad:
         assert path.read_text() == before
         assert [p.name for p in tmp_path.iterdir()] == ["r.json"]
 
+    def test_failed_rename_leaves_previous_file_and_no_temp(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        path = tmp_path / "r.json"
+        _sample_suite().write(path)
+        before = path.read_text()
+        changed = _sample_suite()
+        changed.graphs.clear()
+
+        def fail(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "replace", fail)
+        with pytest.raises(OSError, match="disk full"):
+            changed.write(path)
+        assert path.read_text() == before
+        assert [p.name for p in tmp_path.iterdir()] == ["r.json"]
+
     def test_load_refuses_other_schema_versions(self, tmp_path) -> None:
         path = tmp_path / "v1.json"
         path.write_text(json.dumps({"metadata": {}, "graphs": []}))

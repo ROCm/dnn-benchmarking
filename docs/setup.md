@@ -12,22 +12,33 @@ source .workspace/.venv/bin/activate
 dnn-benchmark -g graphs/sample_conv_fwd.json
 ```
 
-The default `--torch-mode rocm` does not need a system ROCm installation. It
-does these steps:
+The default `--torch-mode rocm` does not need a system ROCm installation.
+Setup prints each stage as `==> [k/n] <name>`. With `--torch-mode rocm` the
+stages are:
 
-1. Create the virtual environment `<workspace>/.venv`. An existing venv and its
-   PyTorch stay. The build is incremental.
-2. Detect the GPU architecture and install the matching ROCm PyTorch nightly
-   (`torch[device-<arch>]`).
-3. Use the ROCm SDK libraries and toolchain from the PyTorch wheels.
-4. Fetch `rocm-libraries` if it is absent (see
+1. `Virtual environment`: create `<workspace>/.venv`, or reuse it. See
+   [Reusing a venv](#reusing-a-venv).
+2. `PyTorch (--torch-mode rocm)`: detect the GPU architecture and install the
+   matching ROCm PyTorch nightly (`torch[device-<arch>]`). Its ROCm SDK
+   libraries and toolchain are used for the build.
+3. `dnn-benchmarking package`: install dnn-benchmarking (editable unless
+   `--no-editable`).
+4. `rocm-libraries sources`: fetch `rocm-libraries` if it is absent (see
    [rocm-libraries source](#rocm-libraries-source)).
-5. Build hipDNN and the MIOpen, hipBLASLt and hip-kernel providers, and
-   install them into the ROCm SDK prefix.
-6. Build the hipDNN Python bindings (`hipdnn_frontend`) against that prefix.
-7. Install dnn-benchmarking in editable mode.
-8. Print the `Profiling sources:` block. See
-   [troubleshooting.md](troubleshooting.md#what-each-profiling-source-needs).
+5. `Build dependencies`: pip packages the source build needs. Skipped with
+   `--reuse-artifacts`.
+6. `hipDNN and provider plugins`: build hipDNN and the MIOpen, hipBLASLt and
+   hip-kernel providers, and install them into the ROCm SDK prefix.
+7. `hipDNN Python bindings`: build `hipdnn_frontend` against that prefix.
+8. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
+   and link the wheel rocprofiler libraries.
+9. `Verify installation`.
+
+Then setup prints the `Profiling sources:` block. See
+[troubleshooting.md](troubleshooting.md#what-each-profiling-source-needs).
+With `--torch-mode cuda` (or a venv that holds CUDA PyTorch), only stages 1,
+2, 3 and `Verify installation` run, and there is no `Profiling sources:`
+block.
 
 The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 
@@ -42,8 +53,8 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
 | `--reuse-artifacts` | Do not build hipDNN or the providers. Use what is installed in the selected prefix. Setup fails if hipDNN is absent there. |
-| `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. |
-| `--rocm-libraries-ref SHA` | `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. |
+| `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
+| `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
 | `-y`, `--yes` | Answer yes to every prompt. Required when stdin is not a terminal and a prompt would show. |
 
@@ -180,7 +191,17 @@ python3 setup_env.py --clean -y
 ```
 
 `--clean` deletes the venv (and its PyTorch) and the CMake build directories.
-Without `--clean`, setup keeps the venv and builds incrementally.
+
+### Reusing a venv
+
+Without `--clean`, setup keeps the venv and its PyTorch and builds
+incrementally. When setup installs PyTorch it records the index URL and GPU
+architecture in `<workspace>/.venv/dnn-bench-torch.json`. On a later run, an
+explicit `--gpu-arch` or `--torch-index-url` that differs from the record
+stops setup with an error that asks for `--clean`. A venv without the record
+(PyTorch installed another way) cannot be checked; setup shows a warning
+instead. A different `--torch-mode` than the one in the venv also asks for
+`--clean`.
 
 ## Manual install
 
@@ -218,6 +239,7 @@ entry point is `dnn-benchmark`, so arguments go straight to the tool:
 
 ```bash
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+  --group-add "$(getent group render | cut -d: -f3)" \
   dnn-benchmark-performance:gfx942 -g graphs/sample_conv_fwd.json
 ```
 

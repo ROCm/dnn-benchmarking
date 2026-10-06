@@ -570,13 +570,10 @@ def run_graph_all_providers(
         engine_ids = list(config.engine_filter)
     else:
         try:
-            discovery_handle = handle
-            if discovery_handle is None:
-                import hipdnn_frontend as hipdnn
-
-                discovery_handle = hipdnn.Handle()
             discovery = Executor(graph_json_str, config.timing_policy)
-            engine_ids = discovery.discover_engines(discovery_handle)
+            # SuiteConfig requires --engine with several plugin paths, so the
+            # shared handle exists whenever discovery runs.
+            engine_ids = discovery.discover_engines(handle)
         except UnsupportedGraphError as e:
             engine_ids = []
             graph.message = str(e)

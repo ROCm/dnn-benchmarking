@@ -36,7 +36,7 @@ the same output format.
 |---|---|---|
 | `-w`, `--warmup N` | 10 | Untimed launches per engine before the timed loop. The first launch is timed separately as `first_call_ms`. The other launches use the timed-iteration path (same mode and cache flush) and are discarded. At least one launch always runs. |
 | `-i`, `--iters N` | 100 | Minimum timed iterations per engine. |
-| `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of 10000 samples applies. |
+| `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of `max(10000, --iters)` samples applies. |
 | `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each warmup and timed iteration. |
 | `--timing-block N` | 1 | Launches per timed sample. `1` times each launch on its own. `N > 1` uses rocKE block timing: before each sample, `--warmup` untimed launches and a drain; then `N` back-to-back launches in one event pair, recorded as `elapsed / N`. The first sample is discarded. Requires `--cache-mode warm`. |
 | `-s`, `--seed SEED` | 0 | Random seed for the input data. |
@@ -95,7 +95,7 @@ profiler, after the timed row completes. The timed numbers do not change.
 | `--emit-trace {pftrace}` | off | Write a Perfetto kernel and memcpy trace with `rocprofv3`. |
 | `--perf`, `--no-perf` | off | Collect CPU cycles, instructions and IPC with `perf stat`. |
 | `--roofline`, `--no-roofline` | off | Collect HBM and compute ceilings with `rocprof-compute --roof-only` (about 3 extra runs). |
-| `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. The tool checks at startup that it can create files there. |
+| `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. With a profiling flag, the tool checks at startup that it can create files there. Without one, the option has no effect and the tool shows a warning. |
 | `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process. `0` disables the limit. |
 
 See [Profiling](#profiling) below.
@@ -162,8 +162,9 @@ A hipDNN engine selects a kernel in one of two ways:
   execute and caches the winner. The table then measures the best kernel in
   the kernel set.
 
-The tool always states the path on stderr, for example
+With the hipDNN backend the tool states the path on stderr, for example
 `kernel selection: heuristic; cache: shared per-user (~/.cache/hipdnn)`.
+This is an info line, so `-q` hides it.
 
 The winner cache is on disk. Its key is the graph content and the device, not
 the checkout or the session. Thus a run can report a ranking that an earlier
@@ -174,8 +175,8 @@ dnn-benchmark -g 'graphs/*.json' --cache-dir /tmp/cache-heuristic
 dnn-benchmark -g 'graphs/*.json' --autotune --cache-dir /tmp/cache-tuned
 ```
 
-The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set in the
-environment without `--autotune`, and when `--autotune` has no
+The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
+value in the environment without `--autotune`, and when `--autotune` has no
 `--cache-dir`.
 
 ## Oracle mode
@@ -187,7 +188,7 @@ engine with the plan that hipDNN tuning selects:
 |---|---|
 | `off` | Time the default plan only. |
 | `plan` | Also benchmark every plan that the backend generates, and time the fastest. |
-| `exhaustive` | `plan`, plus provider-level kernel search where the engine supports it. Much slower. Requires `--warmup 1` or more. |
+| `exhaustive` | `plan`, plus provider-level kernel search where the engine supports it. Much slower. |
 
 After the search, the tool times the default plan again and then the tuned
 plan, back to back. The `oracle` column shows `baseline median / tuned
@@ -206,13 +207,14 @@ object holds the plan counts and both measurements. See
 [results-schema.md](results-schema.md#oracle).
 
 Cache state changes the selection. For a cold heuristic baseline, set
-`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1`. The tool shows a warning when this
-variable or `HIPDNN_DISABLE_CACHE` is not set. MIOpen FindDb and performance
-database entries can still supply tuned selections. `environment.selection_env`
-records the relevant variables.
+`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` and `HIPDNN_DISABLE_CACHE=1`. The tool
+shows a warning when `HIPDNN_DISABLE_EXACT_ENGINE_CACHE` is not set, and,
+once that is set, when `HIPDNN_DISABLE_CACHE` is not set. MIOpen FindDb and
+performance database entries can still supply tuned selections.
+`environment.selection_env` records the relevant variables.
 
 ```bash
-HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 dnn-benchmark \
+HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 HIPDNN_DISABLE_CACHE=1 dnn-benchmark \
   -g graphs/sample_conv_fwd.json --oracle-mode exhaustive -v -o oracle.json
 ```
 
@@ -321,14 +323,16 @@ After Ctrl-C or SIGTERM the file holds every completed graph and has
 
 | Code | Meaning |
 |---|---|
-| 0 | All rows ran. No row failed validation. A run where every row is skipped also exits 0. |
-| 1 | A row error, a graph error, a result write failure, or a backend that is not available at startup (hipDNN, PyTorch or the reference provider). |
+| 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
+| 1 | An engine row error, a graph error, a result write failure, no graph files found, a tarball that cannot be read, or a backend that is not available at startup (hipDNN, PyTorch or the reference provider). |
 | 2 | Usage error: a bad flag, a bad config file, an option that the backend does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
-| 3 | At least one row failed validation. |
+| 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
 | 143 | Interrupted by SIGTERM. |
 
 When more than one condition applies, 3 wins over 1, and 1 wins over 0.
+Only `engine` rows count: the `reference` row that `--validate pytorch` adds
+never changes the exit code.
 
 ## compare
 
@@ -341,8 +345,8 @@ reads JSON only, not CSV.
 | `--metric {kernel,host}` | kernel | Compare kernel medians or submit medians. |
 | `--threshold PCT` | 5 | Regression threshold in percent. |
 | `--allow-mismatch` | off | Compare also when `run.config.cache_mode` is different. |
-| `--csv` | off | Write CSV to stdout. |
-| `--json` | off | Write JSON to stdout. |
+| `--csv` | off | Write CSV to stdout. Not with `--json`. |
+| `--json` | off | Write JSON to stdout. Not with `--csv`. |
 
 Rules:
 
@@ -350,14 +354,17 @@ Rules:
 - Graphs join on `graph_id` only. A graph that did not load has no
   `graph_id`, so it shows as `graph only in A` or `graph only in B`.
 - In `--by engine` mode, rows join on role, provider, engine ID and engine
-  name.
+  name. When a file has more than one row with the same key, the rows pair
+  in order of appearance.
 - `best` and `ref` select only rows with the verdict `passed`, `unchecked`
   or `reference`. In `engine` mode, a `failed` row gets a speedup with the
   label `A failed` or `B failed`, but it is not in the geometric mean. Rows
   with `error` or `skipped` get no speedup.
 - A pair is `within noise` when the relative change is not more than
-  `max(threshold, 2 * sqrt(cv_A^2 + cv_B^2))`. A slower B beyond that limit
-  is a `REGRESSION`. A faster B is `faster`.
+  `max(threshold, 2 * sqrt(r_A^2 + r_B^2))`, where `r` is `iqr_ms / median_ms`
+  of the compared metric in each file (`a_rel_iqr`, `b_rel_iqr` in the
+  `--json` and `--csv` output). A slower B beyond that limit is a
+  `REGRESSION`. A faster B is `faster`.
 - A different `run.config` value gives a warning on stderr. A different
   `cache_mode` stops the comparison, unless you give `--allow-mismatch`.
 

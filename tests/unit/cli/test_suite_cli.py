@@ -308,3 +308,109 @@ def test_hipdnn_handle_failure_exits_1(tmp_path, monkeypatch) -> None:
     code, text = _run(_args("--plugin-path", str(tmp_path)), _graphs(tmp_path, 1))
     assert code == 1
     assert "no GPU" in text
+
+
+def test_reference_row_error_does_not_set_exit_code(tmp_path, backend) -> None:
+    # Exit code counts engine rows only, like the summary.
+    ref = ProviderEngineResult.error_row("pytorch", None, "boom", role="reference")
+    backend(lambda path: _graph(path, [_passed(), ref]))
+    code, _ = _run(_args(), _graphs(tmp_path, 1))
+    assert code == 0
+
+
+def test_failed_final_write_reports_no_results_path(tmp_path, backend) -> None:
+    out = tmp_path / "out.json"
+
+    def run(path):
+        out.mkdir()
+        return _graph(path, [_passed()])
+
+    backend(run)
+    code, text = _run(_args("-o", str(out)), _graphs(tmp_path, 1))
+    assert code == 1
+    assert "Results:" not in text
+
+
+def test_interrupt_with_failed_write_claims_no_partial_file(tmp_path, backend) -> None:
+    out = tmp_path / "out.json"
+
+    def run(path):
+        out.mkdir()
+        raise KeyboardInterrupt
+
+    backend(run)
+    code, text = _run(_args("-o", str(out)), _graphs(tmp_path, 1))
+    assert code == 130
+    assert "partial results" not in text and "no results file written" in text
+
+
+def test_unavailable_reference_provider_fails_before_any_graph(
+    tmp_path, monkeypatch
+) -> None:
+    unavailable = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setattr(
+        backends.ReferenceProviderRegistry, "get_provider", lambda name: unavailable
+    )
+
+    def no_backend(config):
+        raise AssertionError("backend started despite the unavailable provider")
+
+    monkeypatch.setattr(backends, "_create_hipdnn_handle", no_backend)
+    code, text = _run(_args("--validate", "pytorch"), _graphs(tmp_path, 1))
+    assert code == 1
+    assert "--validate pytorch" in text
+
+
+def test_cli_flags_reach_suite_config() -> None:
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("--timing-block", "4", "--profiling-timeout", "99", "--perf")
+    )
+    assert config.timing_policy.timing_block == 4
+    assert config.metrics.profiling_timeout_s == 99
+
+
+def _warnings(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if "WARNING:" in line)
+
+
+@pytest.mark.parametrize(
+    "env, argv, expected",
+    [
+        ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
+        ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
+        (
+            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "1"},
+            ["--warmup", "0"],  # priming always runs untimed: nothing to warn
+            None,
+        ),
+    ],
+    ids=["exact-cache-on", "provider-cache-on", "cold"],
+)
+def test_oracle_warns_on_non_cold_baseline(
+    tmp_path, backend, monkeypatch, env, argv, expected
+) -> None:
+    for name in ("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "HIPDNN_DISABLE_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    backend(lambda path: _graph(path, [_passed()]))
+    _, text = _run(_args("--oracle-mode", "plan", *argv), _graphs(tmp_path, 1))
+    warnings = _warnings(text)
+    if expected is None:
+        assert warnings == ""
+    else:
+        assert expected in warnings
+
+
+@pytest.mark.parametrize(
+    "argv, expected",
+    [
+        (["--profiling-output-dir", "x"], "--profiling-output-dir"),
+        (["--pytorch-sdpa-backend", "math"], "--backend pytorch"),
+    ],
+    ids=["profiling-output-dir", "sdpa-without-pytorch"],
+)
+def test_ignored_options_warn(tmp_path, backend, argv, expected) -> None:
+    backend(lambda path: _graph(path, [_passed()]))
+    _, text = _run(_args(*argv), _graphs(tmp_path, 1))
+    assert expected in _warnings(text)

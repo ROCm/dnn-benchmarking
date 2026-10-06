@@ -89,9 +89,13 @@ kernel CV of 9.7 % and a maximum of 50.6 us (2 x median). Warmup through the
 timed path gave a CV of 0.95 % and a maximum of 26.2 us. The median did not
 change (25.4 to 25.6 us).
 
-`timing.warmup_iters` is the number of untimed launches, priming included:
-`max(priming launches, --warmup)`. It is 1 or more, also when `--warmup 0`
-is given. For the PyTorch backend it is 2 or more.
+`timing.warmup_iters` is the number of untimed launches that actually ran.
+Outside block mode it is `max(priming launches, --warmup)`: priming is 1
+launch for hipDNN, 2 for the PyTorch backend (the host-sync probe), and 3
+when the probe finds a host sync and runs the launch again. So it is 1 or
+more, also when `--warmup 0` is given. In block mode it is the priming
+launches plus `--warmup` for every sample, the discarded first sample
+included.
 
 ## Cache modes
 
@@ -128,7 +132,7 @@ The loop stops when both conditions are true:
 - The sum of the kernel times is `--min-time-ms` or more (default 0).
 
 With `--min-time-ms 0`, the loop runs exactly `--iters` iterations. A hard cap
-of 10000 samples (`TimingPolicy.max_iters`) stops the loop in all cases. If
+of `max(10000, --iters)` samples (`TimingPolicy.max_iters`) stops the loop in all cases. If
 the cap stops the loop before the time budget is reached,
 `timing.capped` is `true` and the row gets the warning `capped at max_iters`.
 
@@ -192,12 +196,12 @@ moved the mean and the standard deviation, but not the median.
 ## Clocks before and after
 
 With `--metrics-tier basic` (default) and amdsmi available, the runner reads
-the GPU clocks right before and right after the timed loop:
+the GPU clocks before priming and warmup, and right after the timed loop:
 `sclk_mhz`, `mclk_mhz`, `power_w`, `temp_hotspot_c` and `throttle_status`.
 The row gets the warning `throttled` when `throttle_status` after the loop is
-not 0. A lower `sclk` after the loop alone is not a warning: on an idle MI210
-the clock moved from 1700 MHz to 1430 MHz over a 3-iteration loop because of
-power management, not throttling. The tool does not set or lock clocks.
+not 0. The pair does not measure clock drift during the timed loop:
+`clocks_before` is often the idle clock, because warmup has not run yet. The
+tool does not set or lock clocks.
 
 ## Profiling child process
 
@@ -234,7 +238,7 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 | Feature | dnn-benchmarking | rocKE | PyTorch / Triton |
 |---|---|---|---|
 | Warmup | Fixed count (default 10) through the timed path, first call timed separately; per sample in block mode | Fixed count (default 5) per sample | do_bench: 25 ms time budget. Timer: block-size estimate. |
-| Iterations | `--iters` floor plus optional `--min-time-ms` budget, cap 10000 | Fixed (default 100) | do_bench: 100 ms budget. `blocked_autorange`: 0.2 s minimum. |
+| Iterations | `--iters` floor plus optional `--min-time-ms` budget, cap `max(10000, --iters)` | Fixed (default 100) | do_bench: 100 ms budget. `blocked_autorange`: 0.2 s minimum. |
 | Event granularity | One event pair per launch, stall-gated; `--timing-block N`: one pair around N launches | One event pair around N launches | do_bench: one pair per launch. Graph variant: one pair per replay. |
 | Sync | After each launch; block mode: after each block | One at the end | do_bench: one at the end. Timer: one per block. |
 | Host launch gaps removed | Yes (stall gate) | Amortized over N launches | Amortized (do_bench) |
@@ -247,7 +251,7 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 | Headline | Median | Median over attempts | do_bench: mean (default). Timer: median. |
 | TFLOP/s basis | Median | Median | User calculates |
 | Cross-process repeats | No | Yes (attempts, new process) | No |
-| Clock capture | Before and after the loop | Advice: lock clocks | None |
+| Clock capture | Before warmup and after the loop | Advice: lock clocks | None |
 
 ### Measured numbers (MI210, gfx90a)
 
@@ -280,10 +284,10 @@ Other methods on the same shapes:
 
 What the numbers show:
 
-- The tool agrees with `do_bench` to within 1 %. The stall gate removes the
-  host launch gap. Without the gate, an event pair per launch reads about
-  two times too high.
-- For kernels of 25 us or less, the tool reads 3 % to 16 % above the batched
+- The tool agrees with `do_bench` to within 1.3 % (25.44 against 25.76 us
+  on conv_fwd). The stall gate removes the host launch gap. Without the gate,
+  an event pair per launch reads about two times too high.
+- For kernels of 25 us or less, the tool reads about 1 % to 19 % above the batched
   and `blocked_autorange` values. Those methods launch back to back, so each
   kernel starts while the previous kernel ends. The tool measures one
   isolated launch.

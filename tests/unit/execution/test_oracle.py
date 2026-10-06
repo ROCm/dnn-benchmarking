@@ -76,12 +76,14 @@ class _TunedExecutor:
     kernel_ms = [0.5, 0.5, 0.5, 9.0]
     prepare_error = None
     env_at_prepare = None
+    prepared_on = None
 
     def __init__(self, graph_json_str, policy):
         self.init_time_ms = 3.0
 
     def prepare(self, handle, engine_id=None, for_autotune=False):
         type(self).env_at_prepare = {k: os.environ.get(k) for k in ENV}
+        type(self).prepared_on = handle
         if self.prepare_error is not None:
             raise self.prepare_error
 
@@ -105,7 +107,7 @@ def tuned(monkeypatch):
     return cls
 
 
-def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None):
+def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=None):
     row = ProviderEngineResult(
         provider="hipdnn", engine_id=5, status="success", correctness=correctness
     )
@@ -122,7 +124,7 @@ def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None):
     )
     oracle_mod.run_oracle_pass(
         row=row,
-        handle=_Handle(),
+        handle=handle or _Handle(),
         engine_id=5,
         graph_json_str="{}",
         graph_name="g",
@@ -147,6 +149,16 @@ def test_delta_compares_post_sweep_medians(tuned):
     assert row.oracle_delta.baseline_median_ms == pytest.approx(1.0)
     assert row.oracle_delta.oracle_median_ms == pytest.approx(0.5)
     assert row.oracle_delta.speedup == pytest.approx(2.0)
+
+
+def test_tuned_plan_gets_its_own_handle_on_the_row_stream(tuned):
+    """MIOpen's solver map is per handle; sharing it would let the sweep
+    change the heuristic baseline's plan."""
+    row_handle = _Handle()
+    _run(handle=row_handle)
+
+    assert tuned.prepared_on is not row_handle
+    assert tuned.prepared_on.stream == 7
 
 
 def test_tuned_and_warm_heuristic_report_median_tflops(tuned):

@@ -23,7 +23,7 @@ replay can't pollute the headline timing. Results land in
 
 from .analytical import compute_flops, compute_io_bytes, derive_throughputs
 from .gpu_smi import GpuSmiProbe
-from .host import host_memory_snapshot, is_psutil_available
+from .host import host_memory_snapshot
 from .machine_info import collect_environment_info
 
 __all__ = [
@@ -32,6 +32,5 @@ __all__ = [
     "derive_throughputs",
     "GpuSmiProbe",
     "host_memory_snapshot",
-    "is_psutil_available",
     "collect_environment_info",
 ]

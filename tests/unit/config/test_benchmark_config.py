@@ -66,6 +66,10 @@ id = 1
         assert suite.metrics.basic_enabled is False
         assert suite.validation.tolerance_override == (1e-3, 1e-3)
 
+    def test_default_seed_is_fixed(self) -> None:
+        """Inputs are reproducible without --seed (pre-fix default was random)."""
+        assert SuiteConfig.from_namespace(_namespace(["-g", "g.json"])).seed == 0
+
     def test_hipdnn_without_plugin_path_uses_rocm_path(self, monkeypatch) -> None:
         monkeypatch.setenv("ROCM_PATH", "/opt/rocm-x")
         suite = SuiteConfig.from_namespace(_namespace(["-g", "g.json"]))
@@ -107,6 +111,8 @@ class TestSuiteConfigValidation:
             ({"benchmark_iters": 0}, "--iters"),
             ({"min_time_ms": -1.0}, "--min-time-ms"),
             ({"cache_mode": "hot"}, "--cache-mode"),
+            ({"timing_block": 0}, "--timing-block"),
+            ({"cache_mode": "cold", "timing_block": 2}, "--timing-block"),
             ({"engine_filter": []}, "--engine"),
             ({"backend": "tensorflow"}, "--backend"),
             ({"oracle_mode": "full"}, "--oracle-mode"),
@@ -120,13 +126,6 @@ class TestSuiteConfigValidation:
     def test_invalid_values_name_the_flag(self, kwargs: dict, flag: str) -> None:
         with pytest.raises(ValueError, match=flag):
             SuiteConfig(**kwargs)
-
-    def test_exhaustive_oracle_requires_warmup(self) -> None:
-        with pytest.raises(
-            ValueError, match="--oracle-mode exhaustive requires --warmup"
-        ):
-            SuiteConfig(oracle_mode="exhaustive", warmup_iters=0)
-        assert SuiteConfig(oracle_mode="exhaustive", warmup_iters=1).oracle_exhaustive
 
     def test_iters_above_the_default_cap_raise_the_cap(self) -> None:
         policy = SuiteConfig(benchmark_iters=20_000).timing_policy

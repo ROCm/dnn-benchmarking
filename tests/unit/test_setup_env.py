@@ -7,6 +7,7 @@ setup_env.py is a top-level script, not a package, so it is imported by path.
 """
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -368,7 +369,10 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
 def test_failed_fetch_leaves_no_checkout_to_reuse(
     setup_env, tmp_path, rocm_libraries
 ) -> None:
-    setup = _setup(setup_env, tmp_path, "--rocm-libraries-ref", "no-such-ref")
+    setup = _setup(setup_env, tmp_path)
+    # Branch names bypass the --rocm-libraries-ref SHA check; the local
+    # origin has no fixed commit id to pin.
+    setup.rocm_libraries_ref = "no-such-ref"
 
     with pytest.raises(subprocess.CalledProcessError):
         setup.ensure_rocm_libraries_checkout()
@@ -390,9 +394,127 @@ def test_non_git_directory_is_kept_without_confirmation(
     rocm_libraries.mkdir()
     (rocm_libraries / "notes.txt").write_text("mine")
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
-    setup = _setup(setup_env, tmp_path, "--rocm-libraries-ref", "main")
+    setup = _setup(setup_env, tmp_path)
+    setup.rocm_libraries_ref = "main"
 
     with pytest.raises(SystemExit):
         setup.ensure_rocm_libraries_checkout()
 
     assert (rocm_libraries / "notes.txt").read_text() == "mine"
+
+
+def test_rocm_libraries_ref_must_be_a_full_sha(setup_env) -> None:
+    parser = setup_env.build_parser()
+    args = parser.parse_args(["--rocm-libraries-ref", "A" * 40])
+    assert args.rocm_libraries_ref == "a" * 40
+    for bad in ("a" * 12, "main"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--rocm-libraries-ref", bad])
+
+
+# --- venv reuse ----------------------------------------------------------------
+
+
+def _fake_venv(setup_env, venv_dir: Path) -> None:
+    python = setup_env.venv_python(venv_dir)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("")
+    (venv_dir / "bin").mkdir(exist_ok=True)
+    (venv_dir / "bin" / "activate").write_text("# venv activate\n")
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_setup_venv_reuses_unless_clean(
+    setup_env, tmp_path, monkeypatch, clean
+) -> None:
+    setup = _setup(setup_env, tmp_path, *(["--clean"] if clean else []))
+    _fake_venv(setup_env, setup.venv_dir)
+    marker = setup.venv_dir / "marker"
+    marker.write_text("old venv")
+    setup.installed_torch_mode = "rocm"
+    created = []
+
+    def fake_run(cmd, **kwargs):
+        created.append(cmd)
+        _fake_venv(setup_env, setup.venv_dir)
+
+    monkeypatch.setattr(setup_env, "run", fake_run)
+
+    setup.setup_venv()
+
+    assert marker.exists() is not clean
+    assert bool(created) is clean
+    assert setup.installed_torch_mode == ("missing" if clean else "rocm")
+
+
+def test_clean_with_existing_torch_mode_is_a_usage_error(setup_env) -> None:
+    with pytest.raises(SystemExit) as exc:
+        setup_env.main(["--clean", "--torch-mode", "existing"])
+    assert exc.value.code == 2
+
+
+def _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv):
+    """A Setup over a venv that setup filled with gfx90a ROCm torch."""
+    setup = _setup(setup_env, tmp_path, *argv)
+    setup.venv_dir.mkdir(parents=True)
+    (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
+        json.dumps(
+            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": "gfx90a"}
+        )
+    )
+    setup.installed_torch_mode = "rocm"
+    pip_calls = []
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: pip_calls.append(a))
+    return setup, pip_calls
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["--gpu-arch", "gfx90a"],
+        ["--torch-index-url", "https://nightly.repo.amd.com/rocm/whl-next/"],
+    ],
+    ids=["no-flags", "same-arch", "same-index"],
+)
+def test_reused_venv_keeps_torch_when_flags_match(
+    setup_env, tmp_path, monkeypatch, argv
+) -> None:
+    setup, pip_calls = _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv)
+    setup.install_torch()
+    assert pip_calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--gpu-arch", "gfx942"], ["--torch-index-url", "https://example.invalid/"]],
+    ids=["other-arch", "other-index"],
+)
+def test_reused_venv_refuses_a_different_explicit_torch_source(
+    setup_env, tmp_path, monkeypatch, capsys, argv
+) -> None:
+    setup, pip_calls = _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv)
+    with pytest.raises(SystemExit):
+        setup.install_torch()
+    assert pip_calls == []
+    assert "--clean" in capsys.readouterr().err
+
+
+def test_fresh_torch_install_records_its_source(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    setup = _setup(setup_env, tmp_path, "--gpu-arch", "gfx942")
+    setup.venv_dir.mkdir(parents=True)
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: None)
+    monkeypatch.setattr(setup, "get_torch_mode", lambda: "rocm")
+
+    setup.install_torch()
+
+    # The next run on this venv keeps torch for the same arch only.
+    same = _setup(setup_env, tmp_path, "--gpu-arch", "gfx942")
+    same.installed_torch_mode = "rocm"
+    same.install_torch()
+    other = _setup(setup_env, tmp_path, "--gpu-arch", "gfx90a")
+    other.installed_torch_mode = "rocm"
+    with pytest.raises(SystemExit):
+        other.install_torch()

@@ -266,6 +266,8 @@ def test_host_sync_in_torch_enqueue_falls_back_to_events(monkeypatch) -> None:
     assert "arm" not in log
     assert modes == ["error", 0]  # debug mode restored
     assert len(m.kernel_ms) == 2
+    # Priming, the failed checked call, and its unchecked rerun.
+    assert m.warmup_iters == 3 == log.count("enqueue") - len(m.kernel_ms)
 
 
 def test_async_torch_enqueue_stays_staged(monkeypatch) -> None:
@@ -365,11 +367,27 @@ def test_block_timing_follows_rocke_protocol(monkeypatch) -> None:
     assert log == priming + sample * 3
     assert m.kernel_ms == [2.0, 3.0]
     assert m.host_ms == [pytest.approx(0.5), pytest.approx(0.5)]
-    assert (m.mode, m.timing_block, m.warmup_iters) == ("block", 4, 2)
+    # One priming enqueue plus two untimed executions before each of 3 samples.
+    assert (m.mode, m.timing_block, m.warmup_iters) == ("block", 4, 7)
     assert m.fallback_reason is None
+
+
+def test_block_min_time_counts_every_execution_in_the_block(monkeypatch) -> None:
+    """The --min-time-ms budget is device time: a block of 4 that takes 8 ms
+    adds 8 ms, not its 2 ms per-execution average."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, kernel_ms=8.0)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=0, iters=1, min_time_ms=9.0, timing_block=4),
+    )
+
+    assert m.kernel_ms == [2.0, 2.0]
 
 
 def test_cold_cache_rejects_block_timing() -> None:
     """A flush before a block of N leaves only the first execution cold."""
-    with pytest.raises(ValueError, match="timing_block"):
+    with pytest.raises(ValueError, match="--timing-block"):
         TimingPolicy(cache_mode="cold", timing_block=2)

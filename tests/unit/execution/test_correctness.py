@@ -120,3 +120,33 @@ def test_device_reference_is_compared_without_host_copy():
     }
 
     assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
+
+
+def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
+    """An OOM in the device compare is not a verdict; the host data decides."""
+    torch = pytest.importorskip("torch")
+    from dnn_benchmarking.execution import correctness
+
+    host_compare = correctness.compare
+
+    def compare(actual, expected, **kw):
+        if isinstance(actual, torch.Tensor):
+            raise torch.cuda.OutOfMemoryError("device compare")
+        return host_compare(actual, expected, **kw)
+
+    monkeypatch.setattr(correctness, "compare", compare)
+
+    class DeviceBM:
+        def get_output_tensor(self, uid):
+            return torch.zeros(4)
+
+        def get_output_data(self, uid):
+            return np.ones(4, np.float32)
+
+    ref = {
+        1: ReferenceOutput(
+            data=np.ones(4, np.float32), tensor_uid=1, device_data=torch.zeros(4)
+        )
+    }
+
+    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed

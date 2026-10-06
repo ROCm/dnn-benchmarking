@@ -39,11 +39,16 @@ def torch_gpu():
 
 
 @pytest.fixture
-def hipdnn(plugin_paths: List[str], torch_gpu):
-    """hipdnn_frontend with the plugin paths loaded, or skip."""
+def hipdnn(plugin_paths: List[str]):
+    """hipdnn_frontend with the plugin paths loaded and a HIP device, or skip.
+
+    Does not need torch: tests that use PyTorch also request ``torch_gpu``.
+    """
     try:
         import hipdnn_frontend
 
+        if int(hipdnn_frontend.hip_get_device_count()) <= 0:
+            pytest.skip("hipdnn_frontend sees no HIP device")
         hipdnn_frontend.set_engine_plugin_paths(
             plugin_paths, hipdnn_frontend.PluginLoadingMode.ABSOLUTE
         )

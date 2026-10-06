@@ -111,25 +111,24 @@ class TimingPolicy:
     timing_block: int = 1
 
     def __post_init__(self) -> None:
-        """Validate loop bounds and the cache mode."""
+        """Validate loop bounds and the cache mode; messages name CLI flags."""
         if self.warmup_iters < 0:
-            raise ValueError("warmup_iters must be non-negative")
+            raise ValueError("--warmup must be >= 0")
         if self.iters <= 0:
-            raise ValueError("iters must be positive")
+            raise ValueError("--iters must be >= 1")
         if self.min_time_ms < 0:
-            raise ValueError("min_time_ms must be non-negative")
+            raise ValueError("--min-time-ms must be >= 0")
         if self.max_iters < self.iters:
             raise ValueError("max_iters must be >= iters")
         if self.cache_mode not in CACHE_MODE_CHOICES:
             raise ValueError(
-                f"cache_mode must be one of {CACHE_MODE_CHOICES}, "
-                f"got {self.cache_mode!r}"
+                "--cache-mode must be one of: " + ", ".join(CACHE_MODE_CHOICES)
             )
         if self.timing_block <= 0:
-            raise ValueError("timing_block must be positive")
+            raise ValueError("--timing-block must be >= 1")
         if self.timing_block > 1 and self.cache_mode == "cold":
             # A flush before a block of N leaves only the first execution cold.
-            raise ValueError("cache_mode cold requires timing_block 1")
+            raise ValueError("--cache-mode cold requires --timing-block 1")
 
 
 @dataclass
@@ -368,6 +367,8 @@ class SuiteConfig:
     timing_block: int = 1
     #: Suppress progress output; tables and the summary still print.
     quiet: bool = False
+    #: Timing loop policy built from the fields above in ``__post_init__``.
+    timing_policy: TimingPolicy = field(init=False, repr=False)
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "SuiteConfig":
@@ -415,18 +416,6 @@ class SuiteConfig:
         )
 
     @property
-    def timing_policy(self) -> TimingPolicy:
-        """Timing loop policy derived from this suite configuration."""
-        return TimingPolicy(
-            warmup_iters=self.warmup_iters,
-            iters=self.benchmark_iters,
-            min_time_ms=self.min_time_ms,
-            max_iters=max(TimingPolicy.max_iters, self.benchmark_iters),
-            cache_mode=self.cache_mode,
-            timing_block=self.timing_block,
-        )
-
-    @property
     def oracle_enabled(self) -> bool:
         """True when any oracle comparison should run."""
         return self.oracle_mode is not OracleMode.OFF
@@ -438,20 +427,14 @@ class SuiteConfig:
 
     def __post_init__(self) -> None:
         """Validate values and cross-field constraints; messages name CLI flags."""
-        if self.warmup_iters < 0:
-            raise ValueError("--warmup must be >= 0")
-        if self.benchmark_iters <= 0:
-            raise ValueError("--iters must be >= 1")
-        if self.min_time_ms < 0:
-            raise ValueError("--min-time-ms must be >= 0")
-        if self.cache_mode not in CACHE_MODE_CHOICES:
-            raise ValueError(
-                "--cache-mode must be one of: " + ", ".join(CACHE_MODE_CHOICES)
-            )
-        if self.timing_block <= 0:
-            raise ValueError("--timing-block must be >= 1")
-        if self.timing_block > 1 and self.cache_mode == "cold":
-            raise ValueError("--cache-mode cold requires --timing-block 1")
+        self.timing_policy = TimingPolicy(
+            warmup_iters=self.warmup_iters,
+            iters=self.benchmark_iters,
+            min_time_ms=self.min_time_ms,
+            max_iters=max(TimingPolicy.max_iters, self.benchmark_iters),
+            cache_mode=self.cache_mode,
+            timing_block=self.timing_block,
+        )
         if self.engine_filter is not None and len(self.engine_filter) == 0:
             raise ValueError("--engine must list at least one engine")
         if self.plugin_paths is not None:
@@ -483,13 +466,6 @@ class SuiteConfig:
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
         )
-        if self.oracle_exhaustive and self.warmup_iters == 0:
-            raise ValueError(
-                "--oracle-mode exhaustive requires --warmup >= 1: with "
-                "benchmarking forced, a plan's first execute() samples kernel "
-                "variants, and at zero warmup that sampling lands inside the "
-                "timed loop"
-            )
         if self.backend is ExecutionBackendName.PYTORCH:
             rejected = [
                 ("--engine", self.engine_filter is not None),

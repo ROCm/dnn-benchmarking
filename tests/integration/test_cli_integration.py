@@ -16,7 +16,9 @@ from tests.integration.conftest import GRAPHS_DIR, PROJECT_ROOT
 
 
 @pytest.mark.gpu
-def test_cli_smoke(hipdnn, plugin_path_cli_args: List[str], tmp_path: Path) -> None:
+def test_cli_smoke(
+    hipdnn, torch_gpu, plugin_path_cli_args: List[str], tmp_path: Path
+) -> None:
     """One good graph with --validate plus one broken graph.
 
     Pins the user-facing contract: results on stdout, progress on stderr,
