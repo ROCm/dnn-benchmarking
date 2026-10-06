@@ -36,7 +36,7 @@ class TestBuildInnerArgv:
             "dnn_benchmarking",
             "--internal-profiling-run",
             "--graph",
-            "/g/x.json",
+            str(Path("/g/x.json")),
             "--engine",
             "42",
             "--warmup",
@@ -46,7 +46,7 @@ class TestBuildInnerArgv:
             "--seed",
             "7",
             "--plugin-path",
-            "/p",
+            str(Path("/p")),
         ]
 
     def test_omits_plugin_path_when_unset(self):

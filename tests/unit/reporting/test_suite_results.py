@@ -186,6 +186,9 @@ class TestWriteLoad:
         assert SuiteResult.load(path) == json.loads(suite.to_json())
         assert [p.name for p in path.parent.iterdir()] == ["r.json"]
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX permission bits; Windows only has read-only"
+    )
     def test_written_file_follows_umask(self, tmp_path) -> None:
         path = tmp_path / "r.json"
         old = os.umask(0o022)

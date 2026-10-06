@@ -473,8 +473,8 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
     )
 
     assert [(r.status, r.plugin_path, r.error_message) for r in graph.results] == [
-        ("error", "/a", "RuntimeError: plugin load failed"),
-        ("error", "/b", "RuntimeError: plugin load failed"),
+        ("error", str(Path("/a")), "RuntimeError: plugin load failed"),
+        ("error", str(Path("/b")), "RuntimeError: plugin load failed"),
     ]
 
 
