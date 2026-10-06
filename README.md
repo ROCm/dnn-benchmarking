@@ -298,34 +298,36 @@ For every applicable engine the tool builds two plans through one timed path,
 | OOTB | none | `build_time_ms` on the engine row |
 | Tuned | `global.benchmarking=1` | `oracle.build_time_ms` |
 
-Build time covers only those three calls, so the two values are directly
-comparable. `cpu_build_time_ms` additionally includes graph setup and workspace
-allocation. A tuned build compiles every candidate the provider can sample, so
-it is expected to be much slower than the OOTB build. Providers that support the
-knob (today the kernel ingestor and MIOpen) sample their candidates on the
-tuned plan's first execute, which the warmup absorbs, and keep the fastest.
-MIOpen's search runs on that first execute, not in `build_plans()`, so its tuned
-build time does not include its search cost. Engines without the knob ignore
-it, report `tuning_available: false`, and show `no-search`.
+Build time covers only those three calls; graph deserialization, operation
+graph build, and workspace allocation are not timed. A tuned build compiles
+every candidate the provider can sample, so it is expected to be much slower
+than the OOTB build. Providers that support the knob (today the kernel ingestor
+and MIOpen) sample their candidates on the tuned plan's first execute, which
+runs before the warmup, and keep the fastest. Both plans then get the same
+`--warmup` iterations before their timed loops. MIOpen's search runs on that
+first execute, not in `build_plans()`, so its tuned build time does not include
+its search cost. Engines without the knob ignore it, report
+`tuning_available: false`, and show `no-search`.
 
-The mode is slower than a normal run. Use `--engine` to limit the work.
-It requires `--warmup >= 1`.
+The mode is slower than a normal run. Use `--engine` to limit the work. The
+OOTB plan is timed first, so use enough `--warmup` (the default 10 is fine) for
+both runs to reach steady state.
 
 The summary table shows:
 
-- `ootb_kernel_mean_ms`: the original OOTB measurement.
-- `warm_ootb_kernel_mean_ms`: the same OOTB plan re-measured after the tuned build.
+- `ootb_kernel_mean_ms`: the OOTB plan.
 - `oracle_kernel_mean_ms`: the tuned plan.
-- `oracle_speedup`: `warm_ootb_kernel_mean_ms / oracle_kernel_mean_ms`.
+- `oracle_speedup`: OOTB mean / tuned mean.
 - `ootb_build_ms` and `oracle_build_ms`: the two plan build times.
 
-The warm OOTB measurement is the comparison baseline because it has comparable
-device warmup. The oracle can be slower; `0.99x` is a valid measured result.
-Rows with `no-search` and timed reference rows stay outside the suite geometric
-mean.
+The speedup is not stored in the JSON; derive it from the row and its `oracle`:
+divide `gpu_kernel_stats.mean_ms` by `oracle.gpu_kernel_stats.mean_ms`, falling
+back to `host_stats` when either side has no kernel stats. Report no speedup
+when either `correctness` (row or `oracle`) failed, and keep rows with
+`tuning_available: false` and timed reference rows (`role: "reference"`) out of
+averages. The oracle can be slower; `0.99x` is a valid measured result.
 
 With `--validate`, the tool validates the OOTB and tuned plans independently.
-It reports no speedup if either plan fails.
 
 Cache state can affect selection. Set
 `HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold heuristic baseline.
@@ -412,10 +414,10 @@ executes in a child process with its own TunableOp results file and
 `MIOPEN_USER_DB_PATH`, both in a temporary directory deleted afterwards.
 PyTorch caches conv algorithm choices per process, with a key that ignores
 `cudnn.benchmark`, so a tuned run in the benchmark process would either reuse
-the OOTB choice or leak into it. The parent then re-times its OOTB run as the
-warm baseline, exactly as for hipDNN engines. Tuned PyTorch outputs are not
-validated. The child holds its own buffers, so peak VRAM roughly doubles while
-it runs.
+the OOTB choice or leak into it. The child gets one extra warmup iteration for
+its first-use tuning, then the same `--warmup` iterations as the OOTB run, and
+starts after the OOTB buffers are released. Tuned PyTorch outputs are not
+validated, and PyTorch rows have no plan build, so they report no build time.
 
 `MIOPEN_FIND_MODE` and `MIOPEN_FIND_ENFORCE` are not set: the hipDNN MIOpen
 plugin reads them too, so they would also change the hipDNN rows.

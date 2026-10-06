@@ -45,7 +45,6 @@ from ..reporting.suite_results import (
     GraphResult,
     OracleResult,
     ProviderEngineResult,
-    build_oracle_delta,
 )
 from ..validation.reference_provider import (
     ReferenceOutput,
@@ -496,7 +495,11 @@ def _compute_graph_analytical_metrics(
 def _pytorch_tuned_argv(
     graph_path: Path, config: SuiteConfig, output: Path
 ) -> List[str]:
-    """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle."""
+    """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle.
+
+    The child's first warmup call runs the tuning search, so it gets one extra
+    warmup iteration and the same ``warmup_iters`` ordinary ones as OOTB.
+    """
     argv = [
         sys.executable,
         "-m",
@@ -511,7 +514,7 @@ def _pytorch_tuned_argv(
         "--graph",
         str(graph_path),
         "--warmup",
-        str(config.warmup_iters),
+        str(config.warmup_iters + 1),
         "--iters",
         str(config.benchmark_iters),
         "--timing-block",
@@ -581,47 +584,24 @@ def _run_pytorch_oracle_pass(
     graph_path: Path,
     graph_name: str,
     config: SuiteConfig,
-    executor: Any,
-    tensors: Any,
-    buffer_manager: Any,
 ) -> None:
     """Attach tuned PyTorch timing without failing the OOTB row.
 
-    The tuned run happens in a child process; this process only re-times its
-    own OOTB executor afterwards as the warm baseline. Tuned outputs are not
+    The tuned run happens in a child process. Tuned outputs are not
     validated: they never enter this process.
     """
-    from ..common.pytorch_tuning import TUNED_SETTINGS
-
     try:
         tuned = _run_pytorch_tuned_child(graph_path, config)
-        # Re-time OOTB after the tuned run so both operands share device warmth.
-        buffer_manager.zero_outputs()
-        executor.warmup(tensors)
-        baseline = executor.benchmark(tensors, graph_name=graph_name)
         oracle = OracleResult(
-            plan_name="pytorch (tuned)",
-            knob_settings=[dict(setting) for setting in TUNED_SETTINGS],
             tuning_available=True,
-            cpu_build_time_ms=tuned.get("cpu_build_time_ms"),
             host_stats=_stats_from_dict(tuned.get("host_stats")),
             gpu_kernel_stats=_stats_from_dict(tuned.get("gpu_kernel_stats")),
-            warm_baseline_host_stats=BenchmarkStats.from_timings(baseline.host_timings),
-            warm_baseline_gpu_kernel_stats=(
-                BenchmarkStats.from_timings(baseline.kernel_timings)
-                if baseline.has_kernel_timings
-                else None
-            ),
         )
         # Same FLOPs and median denominator as the row's derived TFLOP/s.
         oracle.derived_tflops_per_s = _median_tflops(
             result.analytical_flops, oracle.gpu_kernel_stats
         )
-        oracle.warm_baseline_derived_tflops_per_s = _median_tflops(
-            result.analytical_flops, oracle.warm_baseline_gpu_kernel_stats
-        )
         result.oracle = oracle
-        result.oracle_delta = build_oracle_delta(oracle)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         result.oracle_error = error
@@ -685,7 +665,6 @@ def _run_timed_pytorch_row(
             )
             executor = PyTorchCudaExecutor(graph_json, bench_config)
             executor.prepare()
-            result.cpu_build_time_ms = executor.init_time_ms
 
             with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
                 buffer_manager.allocate_all()
@@ -725,17 +704,6 @@ def _run_timed_pytorch_row(
                         analytical_io_bytes=analytical_io_bytes,
                     )
 
-                if config.oracle_enabled:
-                    _run_pytorch_oracle_pass(
-                        result=result,
-                        graph_path=graph_path,
-                        graph_name=graph_name,
-                        config=config,
-                        executor=executor,
-                        tensors=tensors,
-                        buffer_manager=buffer_manager,
-                    )
-
                 if role == "reference":
                     buffer_manager.zero_outputs()
                     executor.execute_once(tensors)
@@ -761,6 +729,16 @@ def _run_timed_pytorch_row(
                     error_message="No reference provider requested",
                 )
             result.status = "success"
+
+            # After the OOTB buffers are released, so the child's allocations
+            # do not stack on top of them.
+            if config.oracle_enabled:
+                _run_pytorch_oracle_pass(
+                    result=result,
+                    graph_path=graph_path,
+                    graph_name=graph_name,
+                    config=config,
+                )
 
         except UnsupportedGraphError as e:
             msg = str(e)
@@ -1279,7 +1257,6 @@ def _run_oracle_pass(
     handle: Any,
     engine_id: int,
     bm: Any,
-    ootb_executor: Any,
     tensor_infos: list,
     graph_json: Dict[str, Any],
     reference_outputs: Optional[Dict[int, Any]],
@@ -1318,16 +1295,10 @@ def _run_oracle_pass(
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
-            # The first execute samples every candidate and keeps the fastest;
-            # the warmup absorbs that sweep (exhaustive requires warmup >= 1).
-            executor.warmup(oracle_handle, variant_pack)
-
-            # Re-time OOTB after the sweep so both operands share device warmth.
-            bm.zero_outputs()
-            ootb_executor.warmup(handle, variant_pack)
-            baseline_result = ootb_executor.benchmark(
-                handle, variant_pack, graph_name=graph_name
-            )
+            # The first execute samples every candidate and keeps the fastest.
+            # Run it outside the warmup so the tuned plan gets the same number
+            # of ordinary warmup iterations as the OOTB plan.
+            executor.execute_once(oracle_handle, variant_pack)
 
             bm.zero_outputs()
             executor.warmup(oracle_handle, variant_pack)
@@ -1336,35 +1307,18 @@ def _run_oracle_pass(
             )
 
             oracle = OracleResult(
-                plan_name=executor.plan_name(oracle_handle) or "",
-                knob_settings=[
-                    {"knob_id": knob_id, "value": value}
-                    for knob_id, value in knobs.items()
-                ],
                 tuning_available=tuning_available,
                 build_time_ms=executor.build_time_ms,
-                cpu_build_time_ms=executor.init_time_ms,
                 host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
                 gpu_kernel_stats=(
                     BenchmarkStats.from_timings(bench_result.kernel_timings)
                     if bench_result.has_kernel_timings
                     else None
                 ),
-                warm_baseline_host_stats=BenchmarkStats.from_timings(
-                    baseline_result.host_timings
-                ),
-                warm_baseline_gpu_kernel_stats=(
-                    BenchmarkStats.from_timings(baseline_result.kernel_timings)
-                    if baseline_result.has_kernel_timings
-                    else None
-                ),
             )
             # Same FLOPs and median denominator as the row's derived TFLOP/s.
             oracle.derived_tflops_per_s = _median_tflops(
                 result.analytical_flops, oracle.gpu_kernel_stats
-            )
-            oracle.warm_baseline_derived_tflops_per_s = _median_tflops(
-                result.analytical_flops, oracle.warm_baseline_gpu_kernel_stats
             )
 
             # Validate after timing; keep OOTB and tuned verdicts separate.
@@ -1379,27 +1333,14 @@ def _run_oracle_pass(
                     config.validation.provider.value,
                     config,
                 )
+                if oracle.correctness.explicitly_failed:
+                    warn_once(
+                        "oracle_correctness",
+                        f"tuned plan for {graph_name} engine {engine_id} failed "
+                        "validation; no speedup is reported",
+                    )
 
             result.oracle = oracle
-            # A speedup requires two valid operands.
-            invalid = [
-                side
-                for side, verdict in (
-                    ("baseline", result.correctness),
-                    ("tuned plan", oracle.correctness),
-                )
-                if verdict is not None and verdict.explicitly_failed
-            ]
-            if invalid:
-                # Preserve timing and verdict evidence, but refuse the ratio.
-                result.oracle_delta = None
-                warn_once(
-                    "oracle_correctness",
-                    f"oracle comparison for {graph_name} engine {engine_id} "
-                    f"suppressed: {' and '.join(invalid)} failed validation",
-                )
-            else:
-                result.oracle_delta = build_oracle_delta(oracle)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         result.oracle_error = error
@@ -1454,7 +1395,6 @@ def run_single_provider_engine(
             config=bench_config,
         )
         executor.prepare(handle, engine_id=engine_id)
-        result.cpu_build_time_ms = executor.init_time_ms
         result.build_time_ms = executor.build_time_ms
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
@@ -1546,7 +1486,6 @@ def run_single_provider_engine(
                     handle=handle,
                     engine_id=engine_id,
                     bm=bm,
-                    ootb_executor=executor,
                     tensor_infos=tensor_infos,
                     graph_json=graph_json,
                     reference_outputs=reference_outputs,
@@ -1602,7 +1541,7 @@ def run_single_provider_engine(
         return result
 
     except UnsupportedGraphError as e:
-        result.cpu_build_time_ms = None
+        result.build_time_ms = None
         result.gpu_kernel_stats = None
         result.host_stats = None
         result.status = "skipped"
@@ -1615,7 +1554,7 @@ def run_single_provider_engine(
 
     except ExecutionError as e:
         error_msg = str(e)
-        result.cpu_build_time_ms = None
+        result.build_time_ms = None
         result.gpu_kernel_stats = None
         result.host_stats = None
         result.status = "error"
@@ -1628,7 +1567,7 @@ def run_single_provider_engine(
 
     except (ValueError, RuntimeError, OSError) as e:
         error_msg = str(e)
-        result.cpu_build_time_ms = None
+        result.build_time_ms = None
         result.gpu_kernel_stats = None
         result.host_stats = None
         result.status = "error"

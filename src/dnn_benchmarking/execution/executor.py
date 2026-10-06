@@ -100,7 +100,6 @@ class Executor:
         self._workspace: Any = None
         self._workspace_ptr: int = 0
         self._workspace_size: int = 0
-        self._init_time_ms: float = 0.0
         self._build_time_ms: float = 0.0
         self._stream_sync_timer: Optional[HipGpuTimer] = None
         self._selected_engine_id: Optional[int] = None
@@ -214,9 +213,8 @@ class Executor:
     ) -> None:
         """Build the operation graph and one execution plan.
 
-        ``build_time_ms`` times only the plan build (create, support check,
-        compile), so OOTB and tuned builds of one engine are comparable.
-        ``init_time_ms`` also includes graph setup and workspace allocation.
+        ``build_time_ms`` times only the plan build: create, support check,
+        and compile. Graph setup and workspace allocation are not timed.
 
         Args:
             handle: hipdnn.Handle instance.
@@ -231,77 +229,56 @@ class Executor:
         """
         if knobs and engine_id is None:
             raise ValueError("knobs require an explicit engine_id")
-        with Timer() as t:
-            self._execution_stream = _get_handle_stream(handle)
-            hipdnn = self._build_through_operation_graph(handle)
+        self._execution_stream = _get_handle_stream(handle)
+        hipdnn = self._build_through_operation_graph(handle)
 
-            with Timer() as build_timer:
-                if engine_id is not None:
-                    # Hard engine selection: build the plan for exactly this
-                    # engine. create_execution_plan_ext reports a bad result if
-                    # the engine is not valid/applicable, so it never silently
-                    # falls back to a different engine.
-                    settings = [
-                        hipdnn.KnobSetting(knob_id, value)
-                        for knob_id, value in (knobs or {}).items()
-                    ]
-                    result = self._graph.create_execution_plan_ext(engine_id, settings)
-                    if result.is_bad():
-                        raise UnsupportedGraphError(
-                            f"Forced engine {engine_id} not applicable to this graph: "
-                            f"{result.get_message()}"
-                        )
-                else:
-                    result = self._graph.create_execution_plans()
-                    if result.is_bad():
-                        raise ExecutionError(
-                            f"Failed to create execution plans: {result.get_message()}"
-                        )
-
-                result = self._graph.check_support()
+        with Timer() as build_timer:
+            if engine_id is not None:
+                # Hard engine selection: build the plan for exactly this
+                # engine. create_execution_plan_ext reports a bad result if
+                # the engine is not valid/applicable, so it never silently
+                # falls back to a different engine.
+                settings = [
+                    hipdnn.KnobSetting(knob_id, value)
+                    for knob_id, value in (knobs or {}).items()
+                ]
+                result = self._graph.create_execution_plan_ext(engine_id, settings)
                 if result.is_bad():
                     raise UnsupportedGraphError(
-                        f"Backend support check failed: {result.get_message()}"
+                        f"Forced engine {engine_id} not applicable to this graph: "
+                        f"{result.get_message()}"
                     )
-
-                result = self._graph.build_plans()
+            else:
+                result = self._graph.create_execution_plans()
                 if result.is_bad():
                     raise ExecutionError(
-                        f"Failed to build plans: {result.get_message()}"
+                        f"Failed to create execution plans: {result.get_message()}"
                     )
-            self._build_time_ms = build_timer.elapsed_ms
 
-            self._record_selected_engine(engine_id)
+            result = self._graph.check_support()
+            if result.is_bad():
+                raise UnsupportedGraphError(
+                    f"Backend support check failed: {result.get_message()}"
+                )
 
-            workspace_size = self._graph.get_workspace_size()
-            self._workspace_size = int(workspace_size)
-            if workspace_size > 0:
-                self._workspace = hipdnn.DeviceBuffer(workspace_size)
-                self._workspace_ptr = self._workspace.ptr()
+            result = self._graph.build_plans()
+            if result.is_bad():
+                raise ExecutionError(f"Failed to build plans: {result.get_message()}")
+        self._build_time_ms = build_timer.elapsed_ms
 
-        self._init_time_ms = t.elapsed_ms
+        self._record_selected_engine(engine_id)
+
+        workspace_size = self._graph.get_workspace_size()
+        self._workspace_size = int(workspace_size)
+        if workspace_size > 0:
+            self._workspace = hipdnn.DeviceBuffer(workspace_size)
+            self._workspace_ptr = self._workspace.ptr()
 
     def engine_knob_ids(self, engine_id: int) -> List[str]:
         """Knob ids the engine exposes for this graph. Call after prepare()."""
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
         return [str(k.knob_id) for k in self._graph.get_knobs_for_engine(engine_id)]
-
-    def plan_name(self, handle: Any) -> Optional[str]:
-        """Name of the currently active execution plan, or None if unprepared.
-
-        Args:
-            handle: hipdnn.Handle instance the graph was built with. Required:
-                without it hipDNN consults only the built-in registry and
-                reports a hex engine ID for plugin-supplied engines, which is
-                the engine class this tool benchmarks.
-
-        Returns:
-            The active plan's engine name, or None when no graph is prepared.
-        """
-        if self._graph is None:
-            return None
-        return str(self._graph.get_plan_name(handle))
 
     @property
     def selected_engine_id(self) -> Optional[int]:
@@ -526,11 +503,6 @@ class Executor:
             kernel_timings=kernel_timings,
             metadata=metadata,
         )
-
-    @property
-    def init_time_ms(self) -> float:
-        """Get graph initialization time in milliseconds."""
-        return self._init_time_ms
 
     @property
     def build_time_ms(self) -> float:

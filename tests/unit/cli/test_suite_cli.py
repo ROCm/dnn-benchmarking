@@ -22,10 +22,10 @@ from dnn_benchmarking.cli.suite_runner_cli import (
 )
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.reporting.reporter import Reporter
+from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
-    OracleDelta,
     OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
@@ -1082,7 +1082,7 @@ class TestValidationStartupGate:
                     provider="MIOPEN_ENGINE",
                     engine_id=0,
                     status="success",
-                    cpu_build_time_ms=1.0,
+                    build_time_ms=1.0,
                     correctness=CorrectnessResult(
                         execution_success=True,
                         tolerance_match=True,
@@ -1504,9 +1504,10 @@ class TestOracleFlag:
         mock_benchmark.assert_called_once()
 
     @pytest.mark.parametrize("backend", ["hipdnn", "pytorch"])
-    def test_oracle_mode_exhaustive_with_zero_warmup_rejected(
+    def test_oracle_mode_exhaustive_with_zero_warmup_runs(
         self, backend: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Tuned sampling runs before the timed warmup, so zero warmup is valid."""
         from dnn_benchmarking.cli.main import main
 
         self._pytorch_env(monkeypatch)
@@ -1532,8 +1533,10 @@ class TestOracleFlag:
                     return_value=0,
                 ) as mock_benchmark,
             ):
-                assert main() == 1
-        mock_benchmark.assert_not_called()
+                assert main() == 0
+        config = mock_benchmark.call_args.kwargs["config"]
+        assert config.oracle_mode == "exhaustive"
+        assert config.warmup_iters == 0
 
     @staticmethod
     def _row(
@@ -1542,24 +1545,30 @@ class TestOracleFlag:
         *,
         searched: bool = True,
         role: str = "engine",
+        tuned_verdict: CorrectnessResult = None,
     ) -> ProviderEngineResult:
         """A tuned row whose engine did or did not expose a tuning knob."""
+
+        def stats(mean_ms: float) -> BenchmarkStats:
+            return BenchmarkStats(
+                mean_ms=mean_ms,
+                std_ms=0.0,
+                min_ms=mean_ms,
+                max_ms=mean_ms,
+                p95_ms=mean_ms,
+                p99_ms=mean_ms,
+            )
+
         return ProviderEngineResult(
             provider="p",
             engine_id=engine_id,
             status="success",
             role=role,
+            gpu_kernel_stats=stats(1.0),
             oracle=OracleResult(
-                plan_name="pl",
-                knob_settings=[],
                 tuning_available=searched,
-            ),
-            oracle_delta=OracleDelta(
-                basis="gpu_kernel",
-                baseline_mean_ms=1.0,
-                oracle_mean_ms=1.0 / speedup,
-                delta_ms=1.0 - 1.0 / speedup,
-                speedup=speedup,
+                gpu_kernel_stats=stats(1.0 / speedup),
+                correctness=tuned_verdict,
             ),
         )
 
@@ -1610,6 +1619,20 @@ class TestOracleFlag:
         assert "1 engine rows tuned" in out
         assert "geomean speedup 2.00x" in out
 
+    def test_footer_excludes_rows_whose_tuned_plan_failed_validation(self) -> None:
+        """A wrong tuned plan cannot claim a speedup in the suite mean."""
+        failed = CorrectnessResult(
+            execution_success=True, tolerance_match=False, rtol=1e-5, atol=1e-8
+        )
+        out = self._footer(
+            [
+                self._row(1, 2.0),
+                self._row(2, 8.0, tuned_verdict=failed),
+            ]
+        )
+        assert "1 engine rows tuned" in out
+        assert "geomean speedup 2.00x" in out
+
 
 class TestOracleStartupWarnings:
     """Startup caveats for the hipDNN oracle; the cache warning is driven by
@@ -1617,16 +1640,14 @@ class TestOracleStartupWarnings:
 
     _CACHE_WARNINGS = ("engine-ranking cache", "provider kernel caches")
 
-    def _warn(self, warmup_iters: int = 10, backend: str = "hipdnn") -> str:
+    def _warn(self, backend: str = "hipdnn") -> str:
         import io
 
         from dnn_benchmarking.cli.suite_runner_cli import _print_oracle_warnings
 
         buf = io.StringIO()
         _print_oracle_warnings(
-            SuiteConfig(
-                oracle_mode="exhaustive", warmup_iters=warmup_iters, backend=backend
-            ),
+            SuiteConfig(oracle_mode="exhaustive", backend=backend),
             Reporter(output=buf),
         )
         return buf.getvalue()
@@ -1663,18 +1684,6 @@ class TestOracleStartupWarnings:
         monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "0")
         monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
         assert "engine-ranking cache is enabled" in self._warn()
-
-    def test_zero_warmup_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
-        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
-        assert "--warmup 0" in self._warn(warmup_iters=0)
-
-    def test_no_zero_warmup_warning_with_warmup(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
-        monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
-        assert "--warmup 0" not in self._warn(warmup_iters=1)
 
     def test_exhaustive_warning_says_cached_tuning_may_be_reused(
         self, monkeypatch: pytest.MonkeyPatch

@@ -15,6 +15,7 @@ from .suite_results import (
     GraphResult,
     ProviderEngineResult,
     SuiteMetadata,
+    oracle_speedup,
 )
 
 
@@ -86,14 +87,14 @@ class Reporter:
             label += f" x {config.timing_block} executions per timed block"
         return label
 
-    def print_init_time(self, init_time_ms: float) -> None:
-        """Print initialization timing.
+    def print_build_time(self, build_time_ms: float) -> None:
+        """Print the plan build time (create, support check, compile).
 
         Args:
-            init_time_ms: Graph initialization time in milliseconds.
+            build_time_ms: Plan build time in milliseconds.
         """
         self._print("Initialization:")
-        self._print(f"  Graph build time:     {init_time_ms:.2f} ms")
+        self._print(f"  Plan build time:      {build_time_ms:.2f} ms")
         self._print("")
 
     def print_stats(self, stats: BenchmarkStats) -> None:
@@ -427,7 +428,6 @@ class Reporter:
         if include_oracle:
             headers.extend(
                 [
-                    "warm_ootb_kernel_mean_ms",
                     "oracle_kernel_mean_ms",
                     "oracle_speedup",
                     "ootb_build_ms",
@@ -450,18 +450,12 @@ class Reporter:
                 ]
             )
             if include_oracle:
-                # Show the warm OOTB operand used by oracle_speedup.
-                row.append(
-                    self._fmt_stat(pe.oracle.warm_baseline_gpu_kernel_stats, "mean_ms")
-                    if pe.oracle is not None
-                    else "n/a"
-                )
                 row.append(
                     self._fmt_stat(pe.oracle.gpu_kernel_stats, "mean_ms")
                     if pe.oracle is not None
                     else "n/a"
                 )
-                # A speedup requires two valid operands.
+                speedup = oracle_speedup(pe)
                 if any(
                     verdict is not None and verdict.explicitly_failed
                     for verdict in (
@@ -473,8 +467,8 @@ class Reporter:
                 elif pe.oracle is not None and not pe.oracle.tuning_available:
                     # A single fixed configuration produced only timing noise.
                     row.append("no-search")
-                elif pe.oracle_delta is not None:
-                    row.append(f"{pe.oracle_delta.speedup:.2f}x")
+                elif speedup is not None:
+                    row.append(f"{speedup:.2f}x")
                 elif pe.oracle_error is not None:
                     row.append("failed")
                 else:
@@ -553,10 +547,8 @@ class Reporter:
                     cfg_view, graph_result.graph_name, provider=pe.provider
                 )
 
-            if pe.cpu_build_time_ms is not None:
-                self.print_init_time(pe.cpu_build_time_ms)
             if pe.build_time_ms is not None:
-                self._print(f"  Plan build time:      {pe.build_time_ms:.2f} ms")
+                self.print_build_time(pe.build_time_ms)
 
             if pe.status == "success":
                 self._print_pe_stats(pe)
@@ -617,20 +609,16 @@ class Reporter:
 
         o = pe.oracle
         self._print("Oracle (tuned):")
-        self._print(f"  Plan:          {o.plan_name}")
-        self._print("  Knobs:")
-        for knob in o.knob_settings:
-            self._print(f"    {knob['knob_id']}={knob['value']}")
         if o.build_time_ms is not None:
             self._print(
                 f"  Plan build:    {o.build_time_ms:.2f} ms   "
-                "(compiles every candidate; OOTB plan build is reported above)"
+                "(global.benchmarking=1; compiles every candidate)"
             )
         if not o.tuning_available:
             self._print(
                 "  Tuning:        unavailable - the engine exposes no tuning "
                 "knob, so this pass re-measured the OOTB configuration; any "
-                "delta below is run-to-run noise"
+                "speedup below is run-to-run noise"
             )
         if o.correctness is not None:
             if o.correctness.passed:
@@ -647,21 +635,9 @@ class Reporter:
             self._print(f"  Host mean:     {o.host_stats.mean_ms:.3f} ms")
         if o.derived_tflops_per_s is not None:
             self._print(f"  Throughput:    {o.derived_tflops_per_s:.3f} TFLOP/s")
-        if pe.oracle_delta is not None:
-            d = pe.oracle_delta
-            self._print(
-                f"  Warm OOTB:     {d.baseline_mean_ms:.3f} ms   "
-                "(OOTB plan, re-timed after the tuned build)"
-            )
-            if o.warm_baseline_derived_tflops_per_s is not None:
-                self._print(
-                    "  Warm OOTB throughput: "
-                    f"{o.warm_baseline_derived_tflops_per_s:.3f} TFLOP/s"
-                )
-            self._print(
-                f"  Tuned vs warm OOTB: {d.delta_ms:+.3f} ms faster, "
-                f"{d.speedup:.2f}x  (basis: {d.basis})"
-            )
+        speedup = oracle_speedup(pe)
+        if speedup is not None:
+            self._print(f"  Speedup:       {speedup:.2f}x vs OOTB")
         self._print("")
 
     @staticmethod

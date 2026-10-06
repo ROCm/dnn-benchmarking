@@ -110,102 +110,38 @@ class CorrectnessResult:
 class OracleResult:
     """Tuned run for one engine row.
 
-    The tuned plan is built separately from the OOTB plan, for the same
-    engine, with ``knob_settings`` applied (``global.benchmarking=1`` for
-    hipDNN). ``build_time_ms`` is that plan build; the row's own
-    ``build_time_ms`` is the OOTB build. A benchmarking build compiles every
+    hipDNN: the tuned plan is built for the same engine as the OOTB plan, with
+    ``global.benchmarking=1``. ``build_time_ms`` is that plan build; the row's
+    own ``build_time_ms`` is the OOTB build. A benchmarking build compiles every
     candidate the provider can sample, so it is expected to be slower.
+    PyTorch: the tuned run comes from an isolated child process and has no
+    plan build.
 
     ``tuning_available`` is False when the engine exposes no tuning knob, so
-    the tuned run re-measured the OOTB configuration.
-
-    ``warm_baseline_*`` contains the OOTB plan re-timed after the tuned build.
-    The delta uses this warm measurement, not the row's earlier OOTB timing.
-    ``correctness`` is the tuned plan's verdict; the row retains the OOTB
-    verdict.
-
-    ``derived_tflops_per_s`` (tuned plan) and ``warm_baseline_derived_tflops_per_s``
-    (warm OOTB) use the row's ``analytical_flops`` and each side's GPU kernel
-    median, like the row's own ``derived_tflops_per_s``.
+    the tuned run re-measured the OOTB configuration. ``correctness`` is the
+    tuned plan's verdict; the row retains the OOTB verdict.
+    ``derived_tflops_per_s`` uses the row's ``analytical_flops`` and the tuned
+    GPU kernel median, like the row's own ``derived_tflops_per_s``.
     """
 
-    plan_name: str
-    knob_settings: List[Dict[str, Any]]
     tuning_available: bool
     build_time_ms: Optional[float] = None
-    cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
-    warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
-    warm_baseline_host_stats: Optional[BenchmarkStats] = None
     correctness: Optional[CorrectnessResult] = None
     derived_tflops_per_s: Optional[float] = None
-    warm_baseline_derived_tflops_per_s: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
-            "plan_name": self.plan_name,
-            "knob_settings": list(self.knob_settings),
             "tuning_available": self.tuning_available,
             "build_time_ms": self.build_time_ms,
-            "cpu_build_time_ms": self.cpu_build_time_ms,
             "gpu_kernel_stats": (
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
             ),
             "host_stats": self.host_stats.to_dict() if self.host_stats else None,
-            "warm_baseline_gpu_kernel_stats": (
-                self.warm_baseline_gpu_kernel_stats.to_dict()
-                if self.warm_baseline_gpu_kernel_stats
-                else None
-            ),
-            "warm_baseline_host_stats": (
-                self.warm_baseline_host_stats.to_dict()
-                if self.warm_baseline_host_stats
-                else None
-            ),
             "correctness": (self.correctness.to_dict() if self.correctness else None),
             "derived_tflops_per_s": self.derived_tflops_per_s,
-            "warm_baseline_derived_tflops_per_s": (
-                self.warm_baseline_derived_tflops_per_s
-            ),
-        }
-
-
-@dataclass
-class OracleDelta:
-    """Warm heuristic baseline vs tuned run for one engine row.
-
-    Both sides are measured after the tuned build, back to back on the same
-    buffers, so device warmth is common to them and the ratio isolates the
-    tuning change. This is deliberately not the row's headline OOTB timing:
-    that one is measured first and is the "what you get out of the box"
-    number, which at low ``--warmup`` can sit well above steady state and
-    would inflate the speedup.
-
-    Attributes:
-        basis: Which timing pair the comparison used.
-        baseline_mean_ms: Mean of the OOTB plan, re-timed after the tuned build.
-        oracle_mean_ms: Mean of the post-tuning run.
-        delta_ms: ``baseline_mean_ms - oracle_mean_ms``; positive means the
-            oracle is faster.
-        speedup: ``baseline_mean_ms / oracle_mean_ms``.
-    """
-
-    basis: Literal["gpu_kernel", "host"]
-    baseline_mean_ms: float
-    oracle_mean_ms: float
-    delta_ms: float
-    speedup: float
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "basis": self.basis,
-            "baseline_mean_ms": self.baseline_mean_ms,
-            "oracle_mean_ms": self.oracle_mean_ms,
-            "delta_ms": self.delta_ms,
-            "speedup": self.speedup,
         }
 
 
@@ -222,9 +158,9 @@ class ProviderEngineResult:
         role: ``engine`` for hipDNN engine rows, ``reference`` for timed
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
-        cpu_build_time_ms: CPU time for graph setup plus plan build.
-        build_time_ms: CPU time for the plan build only (create, support
-            check, compile) of this engine's OOTB plan. None for PyTorch rows.
+        build_time_ms: CPU time for the OOTB plan build only:
+            ``create_execution_plan_ext`` -> ``check_support`` ->
+            ``build_plans``. None for PyTorch rows, which have no plan build.
         gpu_kernel_stats: GPU kernel timing statistics.
         host_stats: Host-side submission timing statistics.
         correctness: Correctness comparison result.
@@ -263,8 +199,6 @@ class ProviderEngineResult:
             opt-in profiling flag was supplied.
         oracle: Tuned result for this engine row. Set only when
             ``--oracle-mode exhaustive`` was requested and tuning succeeded.
-        oracle_delta: OOTB-vs-oracle comparison. None when either side
-            lacks comparable statistics.
         oracle_error: Why tuning produced no result for this row.
             Mutually exclusive with ``oracle``.
 
@@ -290,7 +224,6 @@ class ProviderEngineResult:
     )
     role: Literal["engine", "reference"] = "engine"
     plugin_path: Optional[str] = None
-    cpu_build_time_ms: Optional[float] = None
     build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
@@ -313,7 +246,6 @@ class ProviderEngineResult:
     extra_metrics: Optional[Dict[str, Any]] = None
     # Opt-in oracle (auto-tuned) comparison payload.
     oracle: Optional[OracleResult] = None
-    oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -368,7 +300,6 @@ class ProviderEngineResult:
                 "success-gating in suite_runner.run_single_provider_engine"
             )
         if self.status == "success":
-            d["cpu_build_time_ms"] = self.cpu_build_time_ms
             if self.build_time_ms is not None:
                 d["build_time_ms"] = self.build_time_ms
             d["gpu_kernel_stats"] = (
@@ -400,8 +331,6 @@ class ProviderEngineResult:
                 d["extra_metrics"] = self.extra_metrics
             if self.oracle is not None:
                 d["oracle"] = self.oracle.to_dict()
-            if self.oracle_delta is not None:
-                d["oracle_delta"] = self.oracle_delta.to_dict()
             if self.oracle_error is not None:
                 d["oracle_error"] = self.oracle_error
         elif self.status == "error":
@@ -414,49 +343,29 @@ class ProviderEngineResult:
         return d
 
 
-def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
-    """Compare the warm heuristic baseline against the tuned run.
+def oracle_speedup(result: ProviderEngineResult) -> Optional[float]:
+    """Return OOTB mean / tuned mean for a row, or None when not comparable.
 
-    Both operands come from ``oracle``: the sweep-adjacent re-timing of the
-    heuristic plan and the post-tuning run. The row's own OOTB timing is
-    deliberately not used — it is measured before the sweep, so at low
-    ``--warmup`` it can sit above steady state and report a speedup that is
-    accumulated warmup rather than a better plan.
-
-    Prefers GPU kernel time; falls back to host time when either side has
-    no kernel statistics.
-
-    Args:
-        oracle: The post-tuning result, carrying its own warm baseline.
-
-        An OracleDelta, or None when no comparable statistics pair exists or
-        either mean is non-positive.
+    Uses GPU kernel means when both sides have them, otherwise host means.
+    None when there is no oracle, either side failed validation, or a mean is
+    missing or non-positive. Rows with ``tuning_available`` False still get a
+    ratio; callers report them as "no-search" and keep them out of averages.
     """
-    basis: Literal["gpu_kernel", "host"]
-    if (
-        oracle.warm_baseline_gpu_kernel_stats is not None
-        and oracle.gpu_kernel_stats is not None
+    oracle = result.oracle
+    if oracle is None or any(
+        verdict is not None and verdict.explicitly_failed
+        for verdict in (result.correctness, oracle.correctness)
     ):
-        basis = "gpu_kernel"
-        baseline_mean = oracle.warm_baseline_gpu_kernel_stats.mean_ms
-        oracle_mean = oracle.gpu_kernel_stats.mean_ms
-    elif oracle.warm_baseline_host_stats is not None and oracle.host_stats is not None:
-        basis = "host"
-        baseline_mean = oracle.warm_baseline_host_stats.mean_ms
-        oracle_mean = oracle.host_stats.mean_ms
+        return None
+    if result.gpu_kernel_stats is not None and oracle.gpu_kernel_stats is not None:
+        ootb, tuned = result.gpu_kernel_stats.mean_ms, oracle.gpu_kernel_stats.mean_ms
+    elif result.host_stats is not None and oracle.host_stats is not None:
+        ootb, tuned = result.host_stats.mean_ms, oracle.host_stats.mean_ms
     else:
         return None
-
-    if baseline_mean <= 0.0 or oracle_mean <= 0.0:
+    if ootb <= 0.0 or tuned <= 0.0:
         return None
-
-    return OracleDelta(
-        basis=basis,
-        baseline_mean_ms=baseline_mean,
-        oracle_mean_ms=oracle_mean,
-        delta_ms=baseline_mean - oracle_mean,
-        speedup=baseline_mean / oracle_mean,
-    )
+    return ootb / tuned
 
 
 class StatusCounts(NamedTuple):

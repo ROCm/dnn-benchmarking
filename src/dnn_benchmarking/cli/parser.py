@@ -271,7 +271,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "kernels, and reports its build time, timing, and speedup next to "
             "the OOTB row. PyTorch rows get a tuned run (MIOpen exhaustive "
             "conv search, TunableOp GEMM tuning) in an isolated subprocess. "
-            "Significantly slower; requires --warmup >= 1."
+            "Significantly slower."
         ),
         config_key="oracle_mode",
         config_kind=ConfigKind.CHOICE,

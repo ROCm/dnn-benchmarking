@@ -24,6 +24,7 @@ from ..reporting.suite_results import (
     GraphResult,
     ProviderEngineResult,
     SuiteResult,
+    oracle_speedup,
 )
 from ..validation.reference_provider import ReferenceProviderRegistry
 
@@ -112,12 +113,6 @@ def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
             f"{message} Cache root: HIPDNN_CACHE_DIR={cache_root}. "
             "Set HIPDNN_DISABLE_CACHE=1 to disable provider caches."
         )
-    if config.warmup_iters == 0:
-        reporter.print_warning(
-            "--oracle-mode with --warmup 0: a plan's first execute() may "
-            "sample candidate kernels, so that cost lands inside both timed "
-            "loops"
-        )
     reporter.print_warning(
         "--oracle-mode exhaustive: each engine gets a second plan built with "
         "global.benchmarking=1 (today the kernel ingestor and MIOpen sample "
@@ -150,14 +145,14 @@ def _print_oracle_comparison(
     # Rows where tuning had no alternative configuration re-measured the
     # heuristic pick. Averaging them in would dilute a real result with noise.
     # A timed reference row is a baseline, not an engine under test.
-    tuned = [
-        pe
+    compared = [
+        (pe, speedup)
         for gr in graph_results
         for pe in gr.results
-        if pe.oracle_delta is not None and pe.oracle is not None and pe.role == "engine"
+        if pe.role == "engine" and (speedup := oracle_speedup(pe)) is not None
     ]
-    speedups = [pe.oracle_delta.speedup for pe in tuned if pe.oracle.tuning_available]
-    reporter.print_oracle_summary(speedups, len(tuned) - len(speedups))
+    speedups = [speedup for pe, speedup in compared if pe.oracle.tuning_available]
+    reporter.print_oracle_summary(speedups, len(compared) - len(speedups))
 
 
 def _run_suite_graphs_after_startup(
@@ -336,14 +331,6 @@ def run_suite_cli(
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
             )
-        if oracle_mode == "exhaustive" and args.warmup == 0:
-            reporter.print_error(
-                "--oracle-mode exhaustive requires --warmup >= 1: a tuned "
-                "plan's first execute() samples candidate kernels (and tuned "
-                "PyTorch searches on first use), and at zero warmup that "
-                "sampling lands inside the timed loop"
-            )
-            return 1
         if (
             (
                 args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value

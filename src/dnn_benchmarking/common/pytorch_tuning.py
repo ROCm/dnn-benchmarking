@@ -17,7 +17,7 @@ hipDNN MIOpen plugin reads them too, so they would also change hipDNN rows.
 
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional
 
 from . import torch_support
 
@@ -32,12 +32,6 @@ _DEFAULT_ENV = {
 }
 
 ENV_NAMES = tuple(_DEFAULT_ENV)
-
-#: Reported as the tuned PyTorch run's knob settings.
-TUNED_SETTINGS: List[Dict[str, Any]] = [
-    {"knob_id": "torch.backends.cudnn.benchmark", "value": True},
-    {"knob_id": "PYTORCH_TUNABLEOP_ENABLED", "value": "1"},
-]
 
 
 def apply_pytorch_environment() -> Dict[str, str]:

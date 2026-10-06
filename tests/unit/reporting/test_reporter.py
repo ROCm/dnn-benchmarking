@@ -35,15 +35,16 @@ class TestReporter:
         assert "Warmup:     10 iterations" in result
         assert "Benchmark:  100 iterations" in result
 
-    def test_print_init_time(self) -> None:
-        """Test initialization time output."""
+    def test_print_build_time(self) -> None:
+        """Plan build time prints under the Initialization heading."""
         output = io.StringIO()
         reporter = Reporter(output=output)
 
-        reporter.print_init_time(45.23)
+        reporter.print_build_time(45.23)
 
         result = output.getvalue()
         assert "Initialization:" in result
+        assert "Plan build time:" in result
         assert "45.23 ms" in result
 
     def test_print_stats(self) -> None:

@@ -71,7 +71,7 @@ class TestExecution:
         handle = hipdnn.Handle()
         executor.prepare(handle)
 
-        assert executor.init_time_ms > 0
+        assert executor.build_time_ms > 0
         assert executor.graph is not None
 
     def test_buffer_manager_allocate(

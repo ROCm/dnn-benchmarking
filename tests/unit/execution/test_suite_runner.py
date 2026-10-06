@@ -48,6 +48,7 @@ from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
     ProviderEngineResult,
+    oracle_speedup,
 )
 from dnn_benchmarking.validation.reference_provider import ReferenceOutput
 
@@ -111,7 +112,7 @@ def test_resolve_engine_version_uses_loaded_plugin_metadata():
 
 def _make_exec_factory(
     engine_ids=None,
-    init_time_ms: float = 1.0,
+    build_time_ms: float = 1.0,
     has_kernel_timings: bool = False,
     prepare_side_effect=None,
     discover_side_effect=None,
@@ -126,7 +127,7 @@ def _make_exec_factory(
 
     def make_instance(*args, **kwargs):
         m = MagicMock()
-        m.init_time_ms = init_time_ms
+        m.build_time_ms = build_time_ms
         if discover_side_effect is not None:
             m.discover_engines.side_effect = discover_side_effect
         else:
@@ -232,7 +233,7 @@ class TestRunGraphAllProviders:
         r = result.results[0]
         assert r.status == "error"
         assert "build failed" in r.error_message
-        assert r.cpu_build_time_ms is None
+        assert r.build_time_ms is None
         assert r.gpu_kernel_stats is None
         assert r.host_stats is None
 
@@ -282,12 +283,12 @@ class TestRunGraphAllProviders:
         mock_get_ref,
         mock_resolve_name,
     ):
-        """Success: status='success' with separate cpu_build_time_ms / gpu_kernel_stats / host_stats."""
+        """Success: status='success' with separate build_time_ms / gpu_kernel_stats / host_stats."""
         mock_resolve_name.return_value = "engine_0"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0], init_time_ms=12.5, has_kernel_timings=True
+            engine_ids=[0], build_time_ms=12.5, has_kernel_timings=True
         )
         mock_bm_cls.return_value = _make_bm_mock()
 
@@ -301,39 +302,9 @@ class TestRunGraphAllProviders:
 
         r = result.results[0]
         assert r.status == "success"
-        assert r.cpu_build_time_ms == 12.5
+        assert r.build_time_ms == 12.5
         assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
         assert isinstance(r.host_stats, BenchmarkStats)
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_cpu_build_time_from_init_time_ms(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """cpu_build_time_ms comes from Executor.init_time_ms."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0], init_time_ms=42.0
-        )
-        mock_bm_cls.return_value = _make_bm_mock()
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        assert result.results[0].cpu_build_time_ms == 42.0
 
 
 class TestDiscoveryFailure:
@@ -1178,7 +1149,6 @@ class TestCorrectnessChecking:
     ):
         """PyTorch reference rows let the executor resolve timing from runtime."""
         executor = MagicMock()
-        executor.init_time_ms = 0.5
         bench_result = MagicMock()
         bench_result.host_timings = [1.0, 2.0]
         bench_result.kernel_timings = None
@@ -1246,7 +1216,6 @@ def test_timed_pytorch_reference_attaches_manual_reference_warnings(
         ],
     }
     executor = MagicMock()
-    executor.init_time_ms = 1.25
     executor.benchmark.return_value = MagicMock(
         host_timings=[2.0],
         kernel_timings=[],
@@ -1759,7 +1728,6 @@ class TestTimedPytorchRowEngineRole:
         mock_pytorch_executor_cls,
     ):
         executor = MagicMock()
-        executor.init_time_ms = 0.5
         bench_result = MagicMock()
         bench_result.host_timings = [1.0, 2.0]
         bench_result.kernel_timings = None
@@ -1850,7 +1818,6 @@ class TestTimedPytorchRowEngineRole:
         mock_buffer_manager_cls,
     ):
         executor = MagicMock()
-        executor.init_time_ms = 0.5
         executor.benchmark.return_value = BenchmarkResult(
             host_timings=[1.0],
             kernel_timings=[0.5],
@@ -1922,7 +1889,7 @@ def _make_oracle_exec_factory(
 
     Instance order inside run_graph_all_providers is discovery, OOTB, then
     oracle. The oracle instance reports half the OOTB kernel time so the
-    delta is unambiguous, and its own build times so a swap with the OOTB
+    speedup is unambiguous, and its own build time so a swap with the OOTB
     plan's shows.
 
     Args:
@@ -1946,11 +1913,9 @@ def _make_oracle_exec_factory(
             len(instances), f"extra{len(instances)}"
         )
         tuned = role == "oracle"
-        m.init_time_ms = 11.0 if tuned else 5.0
         m.build_time_ms = 7.0 if tuned else 3.0
         m.discover_engines.return_value = [0]
         m.engine_knob_ids.return_value = list(knob_ids)
-        m.plan_name.return_value = "tuned_plan"
         bench_result = MagicMock()
         bench_result.host_timings = [1.0]
         bench_result.kernel_timings = [0.25 if tuned else 0.5]
@@ -2012,9 +1977,6 @@ class TestOraclePass:
             "engine_id": 0,
             "knobs": {"global.benchmarking": 1},
         }
-        assert result.results[0].oracle.knob_settings == [
-            {"knob_id": "global.benchmarking", "value": 1}
-        ]
 
     def test_oracle_uses_an_isolated_handle_on_the_same_stream(self):
         class Handle:
@@ -2064,37 +2026,30 @@ class TestOraclePass:
         assert instances[1].benchmark.call_args_list[-1].args[0] is ootb_handle
         assert instances[2].benchmark.call_args.args[0] is oracle_handle
 
-    def test_delta_baseline_is_retimed_after_the_tuned_first_execute(self):
-        """The comparison operands must share the tuned sweep's warmup history.
+    def test_tuned_pass_samples_outside_its_warmup_and_never_retimes_ootb(self):
+        """The tuned plan's first execute samples every candidate kernel.
 
-        The tuned plan's first execute samples every candidate kernel, so
-        timing it straight afterwards measures a hotter device than the OOTB
-        pass ever saw. The OOTB plan is therefore re-timed between that sweep
-        and the tuned timed loop. Comparing against the row's pre-sweep OOTB
-        timing instead reports a speedup where tuning changed nothing.
+        It must run before the tuned warmup, so the tuned plan gets the same
+        number of ordinary warmup iterations as the OOTB plan; folding it into
+        the warmup leaves the tuned side one warmup short. The OOTB plan is
+        timed exactly once, so the speedup compares against the row's own run.
         """
         order = []
-        factory, instances = _make_oracle_exec_factory(order=order)
+        factory, _ = _make_oracle_exec_factory(order=order)
         result = self._run(factory)
 
         assert order == [
             "ootb.warmup",
             "ootb.benchmark",
-            "oracle.warmup",
-            "ootb.warmup",
-            "ootb.benchmark",
+            "oracle.execute_once",
             "oracle.warmup",
             "oracle.benchmark",
         ]
+        assert oracle_speedup(result.results[0]) == 2.0
 
-        oracle = result.results[0].oracle
-        assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
-        assert result.results[0].oracle_delta.baseline_mean_ms == 0.5
-        assert result.results[0].oracle_delta.speedup == 2.0
-
-    def test_tuned_and_warm_ootb_report_median_tflops(self):
-        """Both oracle operands get TFLOP/s from the row's FLOPs and their own
-        kernel median, so tuned and warm OOTB throughput compare directly."""
+    def test_tuned_plan_reports_median_tflops(self):
+        """The tuned plan gets TFLOP/s from the row's FLOPs and its own kernel
+        median, so tuned and OOTB throughput compare directly."""
         factory, _ = _make_oracle_exec_factory()
         with patch(
             "dnn_benchmarking.execution.suite_runner.compute_flops",
@@ -2103,13 +2058,10 @@ class TestOraclePass:
             result = self._run(factory)
 
         row = result.results[0]
-        # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB, warm OOTB); 0.25 ms -> 4 (tuned).
+        # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB); 0.25 ms -> 4 (tuned).
         assert row.derived_tflops_per_s == pytest.approx(2.0)
-        assert row.oracle.warm_baseline_derived_tflops_per_s == pytest.approx(2.0)
         assert row.oracle.derived_tflops_per_s == pytest.approx(4.0)
-        d = row.oracle.to_dict()
-        assert d["derived_tflops_per_s"] == pytest.approx(4.0)
-        assert d["warm_baseline_derived_tflops_per_s"] == pytest.approx(2.0)
+        assert row.oracle.to_dict()["derived_tflops_per_s"] == pytest.approx(4.0)
 
     def test_oracle_failure_leaves_ootb_row_intact(self):
         factory, _ = _make_oracle_exec_factory(
@@ -2121,7 +2073,6 @@ class TestOraclePass:
         assert r.status == "success"
         assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
         assert r.oracle is None
-        assert r.oracle_delta is None
         assert r.oracle_error == "ExecutionError: plan build failed"
 
     def test_no_oracle_pass_when_mode_is_off(self):
@@ -2130,7 +2081,6 @@ class TestOraclePass:
 
         r = result.results[0]
         assert r.oracle is None
-        assert r.oracle_delta is None
         assert r.oracle_error is None
         # discovery + OOTB only.
         assert len(instances) == 2
@@ -2157,9 +2107,7 @@ class TestOraclePass:
         r = self._run(factory).results[0]
 
         assert r.build_time_ms == 3.0
-        assert r.cpu_build_time_ms == 5.0
         assert r.oracle.build_time_ms == 7.0
-        assert r.oracle.cpu_build_time_ms == 11.0
 
 
 class TestOracleTunedPlanValidation:
@@ -2233,7 +2181,7 @@ class TestOracleTunedPlanValidation:
         assert r.oracle.correctness.passed is False
         # Timings survive as evidence; the comparison does not.
         assert r.oracle.gpu_kernel_stats is not None
-        assert r.oracle_delta is None
+        assert oracle_speedup(r) is None
 
     def test_failing_baseline_publishes_no_speedup(self):
         """Inverse fault injection: a wrong baseline cannot measure a gain.
@@ -2250,7 +2198,7 @@ class TestOracleTunedPlanValidation:
         assert r.oracle.correctness.passed is True
         # Both verdicts survive separately; only the comparison is refused.
         assert r.oracle.gpu_kernel_stats is not None
-        assert r.oracle_delta is None
+        assert oracle_speedup(r) is None
 
     def test_unchecked_correctness_does_not_suppress_the_comparison(self):
         """ "Not checked" is not "failed".
@@ -2268,16 +2216,14 @@ class TestOracleTunedPlanValidation:
         )
         r = self._run(factory, [unchecked, self._verdict(True)]).results[0]
 
-        assert r.oracle_delta is not None
-        assert r.oracle_delta.speedup == 2.0
+        assert oracle_speedup(r) == 2.0
 
     def test_passing_tuned_plan_still_reports_a_speedup(self):
         factory, _ = _make_oracle_exec_factory()
         r = self._run(factory, self._verdict(True)).results[0]
 
         assert r.oracle.correctness.passed is True
-        assert r.oracle_delta is not None
-        assert r.oracle_delta.speedup == 2.0
+        assert oracle_speedup(r) == 2.0
 
     def test_a_failing_tuned_plan_leaves_the_ootb_verdict_passing(self):
         """OOTB correctness is the row's; the tuned verdict is the oracle's.
@@ -2293,7 +2239,7 @@ class TestOracleTunedPlanValidation:
         assert r.correctness.passed is True
         assert r.oracle.correctness.passed is False
         assert r.status == "success"
-        assert r.oracle_delta is None
+        assert oracle_speedup(r) is None
 
     def test_tuned_plan_is_validated_after_its_timed_loop(self):
         """Validation must never land inside a measurement."""
@@ -2305,13 +2251,14 @@ class TestOracleTunedPlanValidation:
         assert tuned[-2:] == ["oracle.benchmark", "oracle.execute_once"]
 
     def test_without_a_reference_no_tuned_verdict_is_recorded(self):
-        """--validate off leaves the tuned check off too, and the delta stands."""
+        """--validate off leaves the tuned check off too, and the speedup stands."""
         factory, instances = _make_oracle_exec_factory()
         r = TestOraclePass()._run(factory).results[0]
 
         assert r.oracle.correctness is None
-        assert r.oracle_delta is not None
-        assert instances[2].execute_once.call_count == 0
+        assert oracle_speedup(r) == 2.0
+        # Only the sampling execute; no validation execute.
+        assert instances[2].execute_once.call_count == 1
 
 
 class TestOracleExhaustiveEnvGuard:
@@ -2385,14 +2332,13 @@ def _tuned_child_document(*rows):
 
 _TUNED_CHILD_ROW = {
     "status": "success",
-    "cpu_build_time_ms": 9.0,
     "gpu_kernel_stats": BenchmarkStats.from_timings([0.25]).to_dict(),
     "host_stats": BenchmarkStats.from_timings([0.75]).to_dict(),
 }
 
 
 class TestPytorchOracle:
-    """Tuned PyTorch runs in a child process; the parent only re-times OOTB."""
+    """Tuned PyTorch runs in a child process; the parent only attaches its stats."""
 
     @staticmethod
     def _parse_child(argv):
@@ -2419,7 +2365,9 @@ class TestPytorchOracle:
         assert args.backend == "pytorch"
         assert args.graph == ["g.json"]
         assert args.output == Path("out.json")
-        assert (args.warmup, args.iters, args.seed) == (2, 3, 42)
+        # One extra warmup absorbs the first-use tuning search, so the child
+        # still runs as many ordinary warmups as the OOTB row.
+        assert (args.warmup, args.iters, args.seed) == (3, 3, 42)
         # Both sides of the comparison must time the same block size.
         assert args.timing_block == 4
         assert args.pytorch_sdpa_backend == "flash"
@@ -2510,24 +2458,8 @@ class TestPytorchOracle:
     def _oracle_pass(child):
         """Run _run_pytorch_oracle_pass on a row whose OOTB kernel mean is 0.8.
 
-        ``child`` is the tuned child's row, or the exception it raises. The
-        parent's re-timed OOTB kernel mean is 0.5.
+        ``child`` is the tuned child's row, or the exception it raises.
         """
-        order = []
-
-        def fake_child(*args, **kwargs):
-            order.append("child")
-            if isinstance(child, Exception):
-                raise child
-            return child
-
-        def fake_benchmark(*args, **kwargs):
-            order.append("ootb.benchmark")
-            return BenchmarkResult(host_timings=[1.0], kernel_timings=[0.5])
-
-        executor = MagicMock()
-        executor.warmup.side_effect = lambda *a, **k: order.append("ootb.warmup")
-        executor.benchmark.side_effect = fake_benchmark
         result = ProviderEngineResult(
             provider="pytorch",
             engine_id=0,
@@ -2536,48 +2468,41 @@ class TestPytorchOracle:
             host_stats=BenchmarkStats.from_timings([1.5]),
             analytical_flops=10**9,
         )
+        kwargs = (
+            {"side_effect": child}
+            if isinstance(child, Exception)
+            else {"return_value": child}
+        )
         with patch(
             "dnn_benchmarking.execution.suite_runner._run_pytorch_tuned_child",
-            side_effect=fake_child,
+            **kwargs,
         ):
             _run_pytorch_oracle_pass(
                 result=result,
                 graph_path=Path("g.json"),
                 graph_name="g",
                 config=_make_config(oracle_mode="exhaustive"),
-                executor=executor,
-                tensors=MagicMock(),
-                buffer_manager=MagicMock(),
             )
-        return result, order
+        return result
 
-    def test_tuned_child_is_compared_with_ootb_retimed_after_it(self):
-        """The baseline is re-timed after the child so both sides are warm.
+    def test_tuned_child_stats_are_compared_with_the_rows_own_ootb_run(self):
+        """The tuned side is the child's; the OOTB side is the row, untouched."""
+        result = self._oracle_pass(_TUNED_CHILD_ROW)
 
-        Comparing against the row's own (pre-child) 0.8 ms would report 3.2x.
-        """
-        result, order = self._oracle_pass(_TUNED_CHILD_ROW)
-
-        assert order == ["child", "ootb.warmup", "ootb.benchmark"]
         oracle = result.oracle
-        assert oracle.cpu_build_time_ms == 9.0
+        assert oracle.tuning_available is True
         assert oracle.gpu_kernel_stats.mean_ms == 0.25
         assert oracle.host_stats.mean_ms == 0.75
-        assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
-        assert result.oracle_delta.speedup == 2.0
         assert result.oracle_error is None
         assert result.gpu_kernel_stats.mean_ms == 0.8
-        # Same TFLOP/s basis as hipDNN oracles: 1e9 FLOPs over each median.
+        assert oracle_speedup(result) == pytest.approx(3.2)
+        # Same TFLOP/s basis as hipDNN oracles: 1e9 FLOPs over the tuned median.
         assert oracle.derived_tflops_per_s == pytest.approx(4.0)
-        assert oracle.warm_baseline_derived_tflops_per_s == pytest.approx(2.0)
 
     def test_child_failure_leaves_ootb_row_intact(self):
-        result, _ = self._oracle_pass(
-            RuntimeError("tuned PyTorch child returned 0 rows")
-        )
+        result = self._oracle_pass(RuntimeError("tuned PyTorch child returned 0 rows"))
 
         assert result.oracle is None
-        assert result.oracle_delta is None
         assert (
             result.oracle_error == "RuntimeError: tuned PyTorch child returned 0 rows"
         )

@@ -15,7 +15,6 @@ from dnn_benchmarking.reporting.suite_results import (
     OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
-    build_oracle_delta,
 )
 
 
@@ -45,7 +44,7 @@ def _make_pe_success(
         provider=provider,
         engine_id=engine_id,
         status="success",
-        cpu_build_time_ms=45.23,
+        build_time_ms=45.23,
         host_stats=host,
         gpu_kernel_stats=kernel,
         correctness=correctness,
@@ -214,7 +213,7 @@ class TestVerboseReporter:
 
         assert "hipDNN Benchmark: conv1_fwd" in out
         assert "Engine ID:  1" in out
-        assert "Graph build time:" in out
+        assert "Plan build time:" in out
         assert "Host Submission Statistics:" in out
         assert "Kernel Execution Statistics:" in out
         assert "Mean:" in out
@@ -437,7 +436,6 @@ class TestVerboseReporter:
             provider="miopen",
             engine_id=1,
             status="success",
-            cpu_build_time_ms=12.3,
             host_stats=BenchmarkStats(
                 mean_ms=1.0,
                 std_ms=0.1,
@@ -511,7 +509,6 @@ class TestVerboseReporter:
             provider="miopen",
             engine_id=1,
             status="success",
-            cpu_build_time_ms=12.3,
             host_stats=BenchmarkStats(
                 mean_ms=1.0,
                 std_ms=0.1,
@@ -655,9 +652,8 @@ class TestMachineSummaryPlatformLabel:
 
 
 def _make_oracle(**overrides) -> OracleResult:
+    # Half the kernel mean of _make_pe_success, so the speedup is 2.00x.
     kwargs = dict(
-        plan_name="tuned_plan_7",
-        knob_settings=[{"knob_id": "global.benchmarking", "value": 1}],
         tuning_available=True,
         gpu_kernel_stats=BenchmarkStats(
             mean_ms=0.250,
@@ -666,16 +662,6 @@ def _make_oracle(**overrides) -> OracleResult:
             max_ms=0.26,
             p95_ms=0.255,
             p99_ms=0.258,
-        ),
-        # The OOTB plan re-timed after the tuned build; twice the tuned run,
-        # so the rendered speedup is 2.00x.
-        warm_baseline_gpu_kernel_stats=BenchmarkStats(
-            mean_ms=0.500,
-            std_ms=0.02,
-            min_ms=0.48,
-            max_ms=0.52,
-            p95_ms=0.510,
-            p99_ms=0.516,
         ),
     )
     kwargs.update(overrides)
@@ -702,7 +688,6 @@ class TestOracleReporting:
     def test_table_renders_oracle_columns(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -716,7 +701,6 @@ class TestOracleReporting:
         pe = _make_pe_success()
         pe.build_time_ms = 12.5
         pe.oracle = _make_oracle(build_time_ms=340.25)
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         lines = output.getvalue().splitlines()
@@ -737,7 +721,6 @@ class TestOracleReporting:
     def test_verbose_renders_oracle_block(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()
@@ -746,16 +729,15 @@ class TestOracleReporting:
         assert "Oracle (tuned):" in out
         # The engine is already in the row header; the block does not repeat it.
         assert "Engine:" not in out
-        assert "basis: gpu_kernel" in out
-        assert "Warm OOTB:     0.500 ms" in out
-        assert "Tuned vs warm OOTB:" in out
+        oracle_part = out.split("Oracle (tuned):")[1]
+        assert "Speedup:" in oracle_part
+        assert "2.00x" in oracle_part
 
     def test_table_marks_a_failed_baseline_invalid_too(self) -> None:
         """A wrong baseline cannot measure a gain; the row must say so."""
         pe = _make_pe_success()
         pe.correctness = self._verdict(False)
         pe.oracle = _make_oracle(correctness=self._verdict(True))
-        pe.oracle_delta = None
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -773,7 +755,6 @@ class TestOracleReporting:
             error_message="No reference provider requested",
         )
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -790,23 +771,19 @@ class TestOracleReporting:
             error_message=None if passed else "output mismatch",
         )
 
-    def test_table_shows_the_baseline_the_speedup_is_computed_from(self) -> None:
-        """The ratio must be checkable against numbers on the same line.
-
-        OOTB kernel_mean_ms is not the comparand; without the warm baseline
-        column the printed 2.00x looks wrong against the visible figures.
-        """
+    def test_table_speedup_is_ootb_mean_over_tuned_mean(self) -> None:
+        """The ratio must be checkable against numbers on the same line."""
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "warm_ootb_kernel_mean_ms" in out
-        # 0.500 baseline / 0.250 tuned = the printed 2.00x.
-        assert "0.500" in out
-        assert "0.250" in out
-        assert "2.00x" in out
+        lines = output.getvalue().splitlines()
+        header = lines[1].split()
+        row = dict(zip(header, lines[3].split()))
+        assert "warm_ootb_kernel_mean_ms" not in header
+        ootb = float(row["ootb_kernel_mean_ms"])
+        tuned = float(row["oracle_kernel_mean_ms"])
+        assert row["oracle_speedup"] == f"{ootb / tuned:.2f}x"
 
     def test_verbose_reports_ootb_and_tuned_plan_build_times_separately(self) -> None:
         pe = _make_pe_success()
@@ -825,7 +802,6 @@ class TestOracleReporting:
     def test_table_marks_a_tuned_plan_that_failed_validation(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle(correctness=self._verdict(False))
-        pe.oracle_delta = None
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -835,7 +811,6 @@ class TestOracleReporting:
     def test_table_keeps_the_speedup_when_the_tuned_plan_validates(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle(correctness=self._verdict(True))
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -853,6 +828,7 @@ class TestOracleReporting:
         assert "tuned plan FAILED" in out
         assert "output mismatch" in out
         assert "no speedup is reported" in out
+        assert "Speedup:" not in out
 
     def test_table_marks_row_without_a_tuning_search(self) -> None:
         """An engine without a tuning knob only re-measured its OOTB plan.
@@ -862,8 +838,7 @@ class TestOracleReporting:
         """
         pe = _make_pe_success()
         pe.oracle = _make_oracle(tuning_available=False)
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        assert pe.oracle_delta is not None
+        # The ratio itself exists; only its label changes.
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -873,7 +848,6 @@ class TestOracleReporting:
     def test_table_reports_speedup_when_tuning_was_available(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
         out = output.getvalue()
@@ -883,7 +857,6 @@ class TestOracleReporting:
     def test_verbose_explains_a_missing_tuning_search(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle(tuning_available=False)
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()
@@ -891,16 +864,6 @@ class TestOracleReporting:
         out = output.getvalue()
         assert "Tuning:        unavailable" in out
         assert "run-to-run noise" in out
-
-    def test_verbose_renders_knob_lines(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(knob_settings=[{"knob_id": "SPLIT_K", "value": 4}])
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "SPLIT_K=4" in out
 
     def test_verbose_renders_oracle_failure(self) -> None:
         pe = _make_pe_success()

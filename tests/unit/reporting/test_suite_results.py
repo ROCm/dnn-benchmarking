@@ -21,8 +21,8 @@ from dnn_benchmarking.reporting.suite_results import (
     SuiteMetadata,
     SuiteResult,
     _format_cudnn_version,
-    build_oracle_delta,
     collect_environment_info,
+    oracle_speedup,
 )
 
 
@@ -128,7 +128,7 @@ class TestProviderEngineResult:
 
     def test_success_serializes_with_timing_and_correctness(self):
         """ProviderEngineResult with status='success' serializes with
-        cpu_build_time_ms, gpu_kernel_stats, host_stats, correctness."""
+        build_time_ms, gpu_kernel_stats, host_stats, correctness."""
         stats = BenchmarkStats(
             mean_ms=1.0, std_ms=0.1, min_ms=0.5, max_ms=1.5, p95_ms=1.4, p99_ms=1.49
         )
@@ -139,14 +139,14 @@ class TestProviderEngineResult:
             provider="miopen",
             engine_id=1,
             status="success",
-            cpu_build_time_ms=10.5,
+            build_time_ms=10.5,
             gpu_kernel_stats=stats,
             host_stats=stats,
             correctness=corr,
         )
         d = pe.to_dict()
         assert d["status"] == "success"
-        assert d["cpu_build_time_ms"] == 10.5
+        assert d["build_time_ms"] == 10.5
         assert "gpu_kernel_stats" in d
         assert "host_stats" in d
         assert "correctness" in d
@@ -182,7 +182,6 @@ class TestProviderEngineResult:
             engine_id=1,
             status="success",
             plugin_path="/plugins/a",
-            cpu_build_time_ms=10.5,
             gpu_kernel_stats=stats,
             host_stats=stats,
         )
@@ -257,11 +256,12 @@ class TestProviderEngineResult:
             engine_id=1,
             status="error",
             error_message="build failed",
+            build_time_ms=3.0,
         )
         d = pe.to_dict()
         assert d["status"] == "error"
         assert d["error_message"] == "build failed"
-        assert "cpu_build_time_ms" not in d
+        assert "build_time_ms" not in d
         assert "gpu_kernel_stats" not in d
         assert "host_stats" not in d
 
@@ -277,7 +277,7 @@ class TestProviderEngineResult:
         d = pe.to_dict()
         assert d["status"] == "skipped"
         assert d["skip_reason"] == "not supported"
-        assert "cpu_build_time_ms" not in d
+        assert "build_time_ms" not in d
 
     def test_error_status_serializes_correctness(self):
         """C-01: error-status results with a populated correctness still
@@ -339,7 +339,7 @@ class TestGraphResult:
         """GraphResult contains graph_name, graph_path, list of
         ProviderEngineResult."""
         pe = ProviderEngineResult(
-            provider="miopen", engine_id=0, status="success", cpu_build_time_ms=5.0
+            provider="miopen", engine_id=0, status="success", build_time_ms=5.0
         )
         gr = GraphResult(
             graph_name="conv_fwd", graph_path="/path/to/conv.json", results=[pe]
@@ -462,7 +462,7 @@ class TestSuiteResult:
             provider="miopen",
             engine_id=0,
             status="success",
-            cpu_build_time_ms=5.0,
+            build_time_ms=5.0,
             gpu_kernel_stats=stats,
             host_stats=stats,
             correctness=corr,
@@ -632,13 +632,21 @@ def _stats(mean_ms: float) -> BenchmarkStats:
 
 
 def _oracle(**overrides) -> OracleResult:
-    kwargs = dict(
-        plan_name="plan_x",
-        knob_settings=[],
-        tuning_available=True,
-    )
+    kwargs = dict(tuning_available=True)
     kwargs.update(overrides)
     return OracleResult(**kwargs)
+
+
+def _verdict(tolerance_match) -> CorrectnessResult:
+    return CorrectnessResult(
+        execution_success=True, tolerance_match=tolerance_match, rtol=0.0, atol=0.0
+    )
+
+
+def _row(oracle=None, **overrides) -> ProviderEngineResult:
+    kwargs = dict(provider="p", engine_id=1, status="success", oracle=oracle)
+    kwargs.update(overrides)
+    return ProviderEngineResult(**kwargs)
 
 
 class TestOracleSerialization:
@@ -647,53 +655,27 @@ class TestOracleSerialization:
     def test_oracle_keys_absent_when_unset(self):
         pe = ProviderEngineResult(provider="p", engine_id=1, status="success")
         d = pe.to_dict()
-        assert not {"oracle", "oracle_delta", "oracle_error"} & set(d)
+        assert not {"oracle", "oracle_error"} & set(d)
 
-    def test_oracle_and_delta_serialize_under_success(self):
-        oracle = _oracle(
-            knob_settings=[{"knob_id": "global.benchmarking", "value": 1}],
-            build_time_ms=250.0,
-            gpu_kernel_stats=_stats(1.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
-        )
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="success",
-            gpu_kernel_stats=_stats(2.0),
-            oracle=oracle,
-        )
-        pe.oracle_delta = build_oracle_delta(oracle)
+    def test_oracle_serializes_under_success(self):
+        oracle = _oracle(build_time_ms=250.0, gpu_kernel_stats=_stats(1.0))
+        pe = _row(oracle, build_time_ms=3.5, gpu_kernel_stats=_stats(2.0))
         d = pe.to_dict()
-        assert d["oracle"]["plan_name"] == "plan_x"
-        # The engine is the row's own; it is deliberately not duplicated here.
         assert set(d["oracle"]) == {
-            "plan_name",
-            "knob_settings",
             "tuning_available",
             "build_time_ms",
-            "cpu_build_time_ms",
             "gpu_kernel_stats",
             "host_stats",
-            "warm_baseline_gpu_kernel_stats",
-            "warm_baseline_host_stats",
             "correctness",
             "derived_tflops_per_s",
-            "warm_baseline_derived_tflops_per_s",
         }
-        assert d["oracle"]["knob_settings"] == [
-            {"knob_id": "global.benchmarking", "value": 1}
-        ]
         assert d["oracle"]["tuning_available"] is True
         assert d["oracle"]["build_time_ms"] == 250.0
         assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
-        assert d["oracle_delta"]["basis"] == "gpu_kernel"
-        assert d["oracle_delta"]["speedup"] == 2.0
-        assert d["oracle"]["warm_baseline_gpu_kernel_stats"]["mean_ms"] == 2.0
-        assert d["oracle"]["warm_baseline_host_stats"] is None
-        # The comparand is the warm re-timing, not the row's own OOTB number.
-        assert d["oracle_delta"]["baseline_mean_ms"] == 2.0
-        assert "ootb_mean_ms" not in d["oracle_delta"]
+        # Speedup is derived at read time, never stored.
+        assert "oracle_delta" not in d
+        assert d["build_time_ms"] == 3.5
+        assert "cpu_build_time_ms" not in d
 
     def test_oracle_error_serializes_under_success(self):
         pe = ProviderEngineResult(
@@ -715,59 +697,71 @@ class TestOracleSerialization:
         assert "oracle_error" not in pe.to_dict()
 
 
-class TestBuildOracleDelta:
-    """Basis selection and guard rails for the warm-baseline comparison."""
+class TestOracleSpeedup:
+    """OOTB mean / tuned mean, and when no ratio is meaningful."""
 
     def test_prefers_gpu_kernel_basis(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(1.0),
-            host_stats=_stats(5.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
-            warm_baseline_host_stats=_stats(9.0),
+        pe = _row(
+            _oracle(gpu_kernel_stats=_stats(1.0), host_stats=_stats(5.0)),
+            gpu_kernel_stats=_stats(2.0),
+            host_stats=_stats(20.0),
         )
-        delta = build_oracle_delta(oracle)
-        assert delta is not None
-        assert delta.basis == "gpu_kernel"
-        assert delta.baseline_mean_ms == 2.0
-        assert delta.oracle_mean_ms == 1.0
-        assert delta.delta_ms == 1.0
-        assert delta.speedup == 2.0
+        assert oracle_speedup(pe) == 2.0
 
-    def test_falls_back_to_host_basis(self):
-        # No kernel stats on the tuned side, so the pair cannot be gpu_kernel
-        # even though a warm kernel baseline exists.
-        oracle = _oracle(
-            host_stats=_stats(4.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
-            warm_baseline_host_stats=_stats(8.0),
+    @pytest.mark.parametrize("kernel_side", ["row", "oracle"])
+    def test_falls_back_to_host_when_either_side_lacks_kernel_stats(self, kernel_side):
+        row_kernel = _stats(2.0) if kernel_side == "row" else None
+        oracle_kernel = _stats(1.0) if kernel_side == "oracle" else None
+        pe = _row(
+            _oracle(gpu_kernel_stats=oracle_kernel, host_stats=_stats(4.0)),
+            gpu_kernel_stats=row_kernel,
+            host_stats=_stats(12.0),
         )
-        delta = build_oracle_delta(oracle)
-        assert delta is not None
-        assert delta.basis == "host"
-        assert delta.speedup == 2.0
+        assert oracle_speedup(pe) == 3.0
 
-    def test_returns_none_without_comparable_stats(self):
-        assert build_oracle_delta(_oracle()) is None
-
-    def test_returns_none_without_a_warm_baseline(self):
-        # The row's own OOTB timing must never stand in for the baseline:
-        # it is measured before the sweep and would inflate the speedup.
-        oracle = _oracle(gpu_kernel_stats=_stats(1.0), host_stats=_stats(5.0))
-        assert build_oracle_delta(oracle) is None
-
-    def test_returns_none_when_oracle_mean_is_zero(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(0.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
+    @pytest.mark.parametrize("failed_side", ["row", "oracle"])
+    def test_none_when_either_verdict_failed(self, failed_side):
+        pe = _row(
+            _oracle(
+                gpu_kernel_stats=_stats(1.0),
+                correctness=_verdict(failed_side != "oracle"),
+            ),
+            gpu_kernel_stats=_stats(2.0),
+            correctness=_verdict(failed_side != "row"),
         )
-        assert build_oracle_delta(oracle) is None
+        assert oracle_speedup(pe) is None
 
-    def test_returns_none_when_baseline_mean_is_zero(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(1.0),
-            warm_baseline_gpu_kernel_stats=_stats(0.0),
+    def test_unchecked_verdict_still_yields_ratio(self):
+        # Validation that never compared anything is not a failure.
+        unchecked = _verdict(None)
+        pe = _row(
+            _oracle(gpu_kernel_stats=_stats(1.0), correctness=unchecked),
+            gpu_kernel_stats=_stats(2.0),
+            correctness=unchecked,
         )
-        assert build_oracle_delta(oracle) is None
+        assert oracle_speedup(pe) == 2.0
+
+    def test_none_without_oracle(self):
+        assert oracle_speedup(_row(gpu_kernel_stats=_stats(2.0))) is None
+
+    def test_none_without_comparable_stats(self):
+        # Kernel on one side, host on the other: no common basis.
+        pe = _row(_oracle(host_stats=_stats(1.0)), gpu_kernel_stats=_stats(2.0))
+        assert oracle_speedup(pe) is None
+
+    @pytest.mark.parametrize("ootb,tuned", [(0.0, 1.0), (2.0, 0.0), (-1.0, 1.0)])
+    def test_none_with_non_positive_mean(self, ootb, tuned):
+        pe = _row(
+            _oracle(gpu_kernel_stats=_stats(tuned)), gpu_kernel_stats=_stats(ootb)
+        )
+        assert oracle_speedup(pe) is None
+
+    def test_no_search_row_still_yields_ratio(self):
+        pe = _row(
+            _oracle(tuning_available=False, gpu_kernel_stats=_stats(1.0)),
+            gpu_kernel_stats=_stats(1.25),
+        )
+        assert oracle_speedup(pe) == 1.25
 
 
 class TestSuiteMetadataSelectionEnv:

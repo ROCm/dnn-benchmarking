@@ -93,7 +93,7 @@ class TestSuiteRunnerIntegration:
     def test_successful_result_has_separated_timing(
         self, hipdnn, conv_graph: Dict[str, Any]
     ) -> None:
-        """Successful results have separate cpu_build, gpu_kernel, and host timing."""
+        """Successful results have separate build, gpu_kernel, and host timing."""
         from dnn_benchmarking.config.benchmark_config import SuiteConfig
         from dnn_benchmarking.execution.suite_runner import run_graph_all_providers
         from dnn_benchmarking.graph.loader import GraphLoader
@@ -116,8 +116,8 @@ class TestSuiteRunnerIntegration:
             pytest.skip("No successful provider/engine combinations found")
 
         for r in successes:
-            assert r.cpu_build_time_ms is not None
-            assert r.cpu_build_time_ms > 0
+            assert r.build_time_ms is not None
+            assert r.build_time_ms > 0
             assert r.host_stats is not None
             assert r.host_stats.mean_ms > 0
             # gpu_kernel_stats may be None if torch GPU timing isn't available
@@ -239,7 +239,7 @@ class TestSuiteRunnerIntegration:
 
         for r in successes:
             # Legacy fields still populated even with metrics off.
-            assert r.cpu_build_time_ms is not None
+            assert r.build_time_ms is not None
             # Always-on fields stay None when tier=off.
             assert r.workspace_bytes is None
             assert r.analytical_flops is None
@@ -763,34 +763,24 @@ class TestOracleCLIIntegration:
         tuned = [row for row in rows if "oracle" in row]
         assert tuned, f"no row carried an oracle payload. stdout: {result.stdout}"
 
-        oracle = tuned[0]["oracle"]
-        # Not just truthy: the active plan must resolve to the row's own
-        # registered engine name, never the "0x..." hex fallback that an
-        # unregistered engine ID produces.
-        assert oracle["plan_name"] == tuned[0]["engine_name"]
-        assert not oracle["plan_name"].startswith("0x")
-        assert oracle["knob_settings"] == [
-            {"knob_id": "global.benchmarking", "value": 1}
-        ]
+        row = tuned[0]
+        oracle = row["oracle"]
+        # Condensed payload: no stored delta, warm re-timing, or plan metadata.
+        assert "oracle_delta" not in row
+        assert not {"plan_name", "knob_settings"} & set(oracle)
+        assert not [key for key in oracle if key.startswith("warm_baseline_")]
         assert isinstance(oracle["tuning_available"], bool)
         # OOTB and tuned plan builds are both reported for comparison.
-        assert tuned[0]["build_time_ms"] > 0
+        assert row["build_time_ms"] > 0
         assert oracle["build_time_ms"] > 0
-        delta = tuned[0]["oracle_delta"]
-        assert set(delta) == {
-            "basis",
-            "baseline_mean_ms",
-            "oracle_mean_ms",
-            "delta_ms",
-            "speedup",
-        }
-        # The baseline is the warm re-timing carried on the oracle payload,
-        # never the row's own cold OOTB number.
-        assert oracle["warm_baseline_gpu_kernel_stats"] is not None
-        assert (
-            delta["baseline_mean_ms"]
-            == oracle["warm_baseline_gpu_kernel_stats"]["mean_ms"]
+        # The speedup is derived from the row's own OOTB run and the tuned run.
+        basis = (
+            "gpu_kernel_stats"
+            if row.get("gpu_kernel_stats") and oracle.get("gpu_kernel_stats")
+            else "host_stats"
         )
+        speedup = row[basis]["mean_ms"] / oracle[basis]["mean_ms"]
+        assert speedup > 0
 
     def test_plain_run_has_no_oracle_keys(
         self, project_root: Path, tmp_path: Path, cli_plugin_args: List[str]
@@ -807,4 +797,4 @@ class TestOracleCLIIntegration:
         assert "hipdnn_selection_env" not in data["metadata"]
         for graph in data["graphs"]:
             for row in graph["results"]:
-                assert not {"oracle", "oracle_delta", "oracle_error"} & set(row)
+                assert not {"oracle", "oracle_error"} & set(row)

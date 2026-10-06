@@ -81,6 +81,7 @@ class _StubGraph:
         build_fails=False,
         engine_knobs=None,
         clock=None,
+        workspace_size=0,
     ):
         self._ranked = ranked
         self._selected = selected
@@ -91,10 +92,10 @@ class _StubGraph:
         self._build_fails = build_fails
         self._engine_knobs = engine_knobs or {}
         self._clock = clock
+        self._workspace_size = workspace_size
         self.plans_created = False
         self.hard_engine_id = None
         self.knob_settings = None
-        self.plan_name_handle = "unset"
 
     def _tick(self):
         if self._clock is not None:
@@ -144,19 +145,13 @@ class _StubGraph:
 
     def get_workspace_size(self):
         self._tick()
-        return 0
+        return self._workspace_size
 
     def get_knobs_for_engine(self, engine_id):
         return [
             types.SimpleNamespace(knob_id=k)
             for k in self._engine_knobs.get(engine_id, [])
         ]
-
-    def get_plan_name(self, handle):
-        # hipDNN needs the handle to name plugin-supplied engines; without it
-        # it consults only the built-in registry and reports a hex engine ID.
-        self.plan_name_handle = handle
-        return "winning_plan" if handle is not None else "0xdeadbeef"
 
 
 def _executor():
@@ -171,6 +166,12 @@ def _fake_module(graph):
     fake.KnobSetting = lambda knob_id, value: types.SimpleNamespace(
         knob_id=knob_id, value=value
     )
+
+    def device_buffer(_size):
+        graph._tick()  # workspace allocation costs time too
+        return types.SimpleNamespace(ptr=lambda: 0x1000)
+
+    fake.DeviceBuffer = device_buffer
     return fake
 
 
@@ -308,16 +309,18 @@ def test_prepare_knobs_without_engine_is_rejected_before_any_graph_work():
 
 
 def test_build_time_covers_only_plan_create_support_and_build():
-    """build_time_ms must exclude graph setup and workspace sizing so OOTB and
-    tuned builds of one engine are comparable; init_time_ms covers it all."""
+    """build_time_ms must exclude graph setup and workspace allocation so OOTB
+    and tuned builds of one engine are comparable."""
     clock = _FakeClock()
-    graph = _StubGraph(ranked=[999], selected=999, clock=clock)
+    graph = _StubGraph(ranked=[999], selected=999, clock=clock, workspace_size=64)
     with patch.object(executor_module, "Timer", clock.timer):
         executor = _prepared_executor(graph)
     # create_execution_plan_ext + check_support + build_plans, 1 ms each.
     assert executor.build_time_ms == 3.0
-    # Plus from_json, validate, build_operation_graph, engine read-back, workspace.
-    assert executor.init_time_ms == 8.0
+    # Control: from_json, validate, build_operation_graph, engine read-back,
+    # workspace query, and workspace allocation all ran (and cost time).
+    assert clock.now_ms == 9.0
+    assert executor.workspace_size == 64
 
 
 def test_engine_knob_ids_lists_the_requested_engines_knobs():
@@ -334,26 +337,3 @@ def test_engine_knob_ids_lists_the_requested_engines_knobs():
 def test_engine_knob_ids_without_prepare_raises():
     with pytest.raises(ExecutionError):
         _executor().engine_knob_ids(999)
-
-
-def test_plan_name_passes_the_handle_to_the_binding():
-    """Newer bindings need the handle to name plugin-supplied engines, which is
-    the engine class this tool benchmarks; without it they report a hex ID."""
-    handle = object()
-    graph = _StubGraph(ranked=[999], selected=999)
-    executor = _prepared_executor(graph)
-
-    assert executor.plan_name(handle) == "winning_plan"
-    assert graph.plan_name_handle is handle
-
-
-def test_plan_name_without_a_handle_gets_the_hex_fallback():
-    """Control: the handle is what makes the difference, so a caller that drops
-    it silently degrades to a hex engine ID."""
-    graph = _StubGraph(ranked=[999], selected=999)
-    executor = _prepared_executor(graph)
-    assert executor.plan_name(None) == "0xdeadbeef"
-
-
-def test_plan_name_without_prepare_is_none():
-    assert _executor().plan_name(object()) is None

@@ -69,7 +69,7 @@ profiling_timeout = 600
 # Tuned comparison: "off" or "exhaustive". "exhaustive" builds a second plan
 # per engine with the global.benchmarking knob, reports its build time and
 # timing beside the out-of-the-box row, and gives timed PyTorch rows a tuned
-# run in an isolated child process. Significantly slower; needs warmup >= 1.
+# run in an isolated child process. Significantly slower.
 # oracle_mode = "off"
 
 # Optional explicit engine matrix. Uncomment to run only specific engine IDs.

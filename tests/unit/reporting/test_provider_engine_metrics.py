@@ -33,7 +33,7 @@ class TestProviderEngineResultLegacyShape:
             provider="miopen",
             engine_id=1,
             status="success",
-            cpu_build_time_ms=12.3,
+            build_time_ms=12.3,
             gpu_kernel_stats=_bench_stats(),
             host_stats=_bench_stats(),
             elapsed_time_ms=200.0,
@@ -41,7 +41,7 @@ class TestProviderEngineResultLegacyShape:
         d = pe.to_dict()
         # Legacy keys still present
         assert d["status"] == "success"
-        assert d["cpu_build_time_ms"] == 12.3
+        assert d["build_time_ms"] == 12.3
         # No metric fields leaked into JSON when None
         for key in (
             "workspace_bytes",
@@ -96,7 +96,7 @@ class TestProviderEngineResultFullShape:
             provider="miopen",
             engine_id=1,
             status="success",
-            cpu_build_time_ms=10.0,
+            build_time_ms=10.0,
             gpu_kernel_stats=_bench_stats(0.5),
             host_stats=_bench_stats(1.0),
             elapsed_time_ms=200.0,
