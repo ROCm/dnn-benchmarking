@@ -122,6 +122,10 @@ class OracleResult:
     delta uses this warm measurement, not the row's earlier OOTB timing.
     ``correctness`` is the tuned plan's verdict; the row retains the OOTB
     verdict.
+
+    ``derived_tflops_per_s`` (tuned plan) and ``warm_baseline_derived_tflops_per_s``
+    (warm OOTB) use the row's ``analytical_flops`` and each side's GPU kernel
+    median, like the row's own ``derived_tflops_per_s``.
     """
 
     plan_name: str
@@ -140,6 +144,8 @@ class OracleResult:
     warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
     warm_baseline_host_stats: Optional[BenchmarkStats] = None
     correctness: Optional[CorrectnessResult] = None
+    derived_tflops_per_s: Optional[float] = None
+    warm_baseline_derived_tflops_per_s: Optional[float] = None
 
     @property
     def exhaustive_enabled(self) -> bool:
@@ -182,6 +188,10 @@ class OracleResult:
                 else None
             ),
             "correctness": (self.correctness.to_dict() if self.correctness else None),
+            "derived_tflops_per_s": self.derived_tflops_per_s,
+            "warm_baseline_derived_tflops_per_s": (
+                self.warm_baseline_derived_tflops_per_s
+            ),
         }
 
 

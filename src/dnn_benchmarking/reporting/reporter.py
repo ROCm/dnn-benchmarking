@@ -656,12 +656,19 @@ class Reporter:
             self._print(f"  Kernel mean:   {o.gpu_kernel_stats.mean_ms:.3f} ms")
         if o.host_stats is not None:
             self._print(f"  Host mean:     {o.host_stats.mean_ms:.3f} ms")
+        if o.derived_tflops_per_s is not None:
+            self._print(f"  Throughput:    {o.derived_tflops_per_s:.3f} TFLOP/s")
         if pe.oracle_delta is not None:
             d = pe.oracle_delta
             self._print(
                 f"  Warm OOTB:     {d.baseline_mean_ms:.3f} ms   "
                 "(heuristic plan, re-timed after the sweep)"
             )
+            if o.warm_baseline_derived_tflops_per_s is not None:
+                self._print(
+                    "  Warm OOTB throughput: "
+                    f"{o.warm_baseline_derived_tflops_per_s:.3f} TFLOP/s"
+                )
             self._print(
                 f"  Tuned vs warm OOTB: {d.delta_ms:+.3f} ms faster, "
                 f"{d.speedup:.2f}x  (basis: {d.basis})"

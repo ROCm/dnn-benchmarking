@@ -1093,6 +1093,16 @@ def _exhaustive_env(enabled: bool):
                 os.environ[name] = value
 
 
+def _median_tflops(
+    flops: Optional[int], stats: Optional[BenchmarkStats]
+) -> Optional[float]:
+    """TFLOP/s from analytical FLOPs and a kernel-stats median, or None."""
+    tflops, _ = derive_throughputs(
+        flops, None, stats.median_ms if stats is not None else None
+    )
+    return tflops
+
+
 def _run_oracle_pass(
     *,
     result: ProviderEngineResult,
@@ -1191,6 +1201,13 @@ def _run_oracle_pass(
                 exhaustive_supported=bool(
                     getattr(winner, "supports_exhaustive", False)
                 ),
+            )
+            # Same FLOPs and median denominator as the row's derived TFLOP/s.
+            oracle.derived_tflops_per_s = _median_tflops(
+                result.analytical_flops, oracle.gpu_kernel_stats
+            )
+            oracle.warm_baseline_derived_tflops_per_s = _median_tflops(
+                result.analytical_flops, oracle.warm_baseline_gpu_kernel_stats
             )
 
             # Validate after timing; keep OOTB and tuned verdicts separate.

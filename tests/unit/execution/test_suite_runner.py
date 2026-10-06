@@ -2029,6 +2029,25 @@ class TestOraclePass:
         assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
         assert result.results[0].oracle_delta.baseline_mean_ms == 0.5
 
+    def test_tuned_and_warm_ootb_report_median_tflops(self):
+        """Both oracle operands get TFLOP/s from the row's FLOPs and their own
+        kernel median, so tuned and warm OOTB throughput compare directly."""
+        factory, _ = _make_oracle_exec_factory()
+        with patch(
+            "dnn_benchmarking.execution.suite_runner.compute_flops",
+            return_value=(10**9, False),
+        ):
+            result = self._run(factory)
+
+        row = result.results[0]
+        # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB, warm OOTB); 0.25 ms -> 4 (tuned).
+        assert row.derived_tflops_per_s == pytest.approx(2.0)
+        assert row.oracle.warm_baseline_derived_tflops_per_s == pytest.approx(2.0)
+        assert row.oracle.derived_tflops_per_s == pytest.approx(4.0)
+        d = row.oracle.to_dict()
+        assert d["derived_tflops_per_s"] == pytest.approx(4.0)
+        assert d["warm_baseline_derived_tflops_per_s"] == pytest.approx(2.0)
+
     def test_oracle_failure_leaves_ootb_row_intact(self):
         factory, _ = _make_oracle_exec_factory(
             autotune_side_effect=ExecutionError("no candidate succeeded")
