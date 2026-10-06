@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from .. import __version__
 from .statistics import BenchmarkStats, TimingInfo
 
-SCHEMA_VERSION = 2
+SUITE_RESULT_SCHEMA_VERSION = 2
 
 # Keys of run.config / environment that are always emitted (null when the
 # producer did not supply them). Extra producer keys are kept as-is.
@@ -697,7 +697,7 @@ class SuiteResult:
         env = _with_keys(self.environment, ENVIRONMENT_KEYS)
         env["end_of_run"] = _with_keys(env["end_of_run"], END_OF_RUN_KEYS)
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": SUITE_RESULT_SCHEMA_VERSION,
             "tool": {"name": "dnn-benchmarking", "version": __version__},
             "run": self.run.to_dict(),
             "environment": env,
@@ -811,10 +811,10 @@ class SuiteResult:
                     "-o *.json output"
                 ) from None
         version = doc.get("schema_version") if isinstance(doc, dict) else None
-        if version != SCHEMA_VERSION:
+        if version != SUITE_RESULT_SCHEMA_VERSION:
             raise ValueError(
                 f"{path}: unsupported result schema_version {version!r} "
-                f"(expected {SCHEMA_VERSION}); regenerate it with this "
+                f"(expected {SUITE_RESULT_SCHEMA_VERSION}); regenerate it with this "
                 "version of dnn-benchmark"
             )
         if not doc["run"]["complete"]:
