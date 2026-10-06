@@ -967,10 +967,10 @@ class TestPyTorchProviderNewOps:
         k_t = torch.from_numpy(k)
         v_t = torch.from_numpy(v)
         expected = torch.nn.functional.scaled_dot_product_attention(
-            q_t, k_t, v_t, dropout_p=0.0
+            q_t, k_t, v_t, dropout_p=0.0, scale=1.0
         )
         expected_stats = torch.logsumexp(
-            torch.matmul(q_t, k_t.transpose(-2, -1)) / torch.sqrt(torch.tensor(2.0)),
+            torch.matmul(q_t, k_t.transpose(-2, -1)),
             dim=-1,
             keepdim=True,
         )
@@ -1007,11 +1007,9 @@ class TestPyTorchProviderNewOps:
         k_t = torch.from_numpy(k)
         v_t = torch.from_numpy(v)
         expected = torch.nn.functional.scaled_dot_product_attention(
-            q_t, k_t, v_t, dropout_p=0.0, is_causal=True
+            q_t, k_t, v_t, dropout_p=0.0, is_causal=True, scale=1.0
         )
-        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) / torch.sqrt(
-            torch.tensor(2.0)
-        )
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1))
         causal = torch.ones(3, 3, dtype=torch.bool).tril()
         expected_stats = torch.logsumexp(
             scores.masked_fill(~causal, float("-inf")), dim=-1, keepdim=True
@@ -1056,6 +1054,7 @@ class TestPyTorchProviderNewOps:
             torch.from_numpy(v),
             attn_mask=torch.from_numpy(mask),
             dropout_p=0.0,
+            scale=1.0,
         )
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
@@ -1088,6 +1087,7 @@ class TestPyTorchProviderNewOps:
             torch.from_numpy(k).repeat_interleave(2, dim=-3),
             torch.from_numpy(v).repeat_interleave(2, dim=-3),
             dropout_p=0.0,
+            scale=1.0,
         )
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
@@ -1212,6 +1212,7 @@ class TestPyTorchProviderNewOps:
             torch.from_numpy(k).to(torch.bfloat16),
             torch.from_numpy(v).to(torch.bfloat16),
             dropout_p=0.0,
+            scale=1.0,
         ).to(torch.float32)
 
         assert outputs[4].data.dtype == np.float32
