@@ -783,11 +783,12 @@ class SuiteResult:
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
-                # mkstemp creates 0600; give the result the mode open() would.
-                umask = os.umask(0)
-                os.umask(umask)
-                os.fchmod(f.fileno(), 0o666 & ~umask)
                 f.write(text)
+            # mkstemp creates 0600; give the result the mode open() would.
+            # os.chmod on the path, not os.fchmod: Windows lacks fchmod.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
             os.replace(tmp, p)
         except BaseException:
             os.unlink(tmp)

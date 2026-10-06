@@ -51,7 +51,9 @@ def test_storage_bytes_match_registry_size(name: str) -> None:
 
 @pytest.mark.parametrize("name", NAMES)
 def test_torch_dtype_has_registry_size(name: str) -> None:
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
+    if name in FP8 and not hasattr(torch, FP8[name]):
+        pytest.skip(f"torch {torch.__version__} has no {FP8[name]}")
     dtype = get_dtype(name)
 
     assert dtype.torch_dtype().itemsize == dtype.size
@@ -77,6 +79,8 @@ def test_unknown_dtype_raises_unsupported(name) -> None:
 @pytest.mark.parametrize("name", sorted(FP8))
 def test_fp8_decode_matches_torch_for_every_code(name: str) -> None:
     torch = pytest.importorskip("torch")
+    if not hasattr(torch, FP8[name]):
+        pytest.skip(f"torch {torch.__version__} has no {FP8[name]}")
     codes = torch.arange(256, dtype=torch.int32).to(torch.uint8)
     expected = codes.view(getattr(torch, FP8[name])).float().numpy()
 

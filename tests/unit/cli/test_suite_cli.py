@@ -166,7 +166,9 @@ def test_intermediate_write_is_a_loadable_partial_file(
     "interrupt, expected",
     [
         (lambda: (_ for _ in ()).throw(KeyboardInterrupt()), 130),
-        (lambda: os.kill(os.getpid(), signal.SIGTERM), 143),
+        # raise_signal runs the Python handler on every OS; os.kill(SIGTERM)
+        # terminates the whole process on Windows.
+        (lambda: signal.raise_signal(signal.SIGTERM), 143),
     ],
     ids=["sigint", "sigterm"],
 )

@@ -59,9 +59,10 @@ def test_orchestrator_argv_drives_one_engine_warm_fixed_count(stack):
 
 
 def test_plugin_path_replaces_default_plugin_loading(stack):
-    assert internal_profiling.run_internal_profiling(_child_args(Path("/p/x.so"))) == 0
+    plugin = Path("/p/x.so")
+    assert internal_profiling.run_internal_profiling(_child_args(plugin)) == 0
     stack["hipdnn"].set_engine_plugin_paths.assert_called_once_with(
-        ["/p/x.so"], "absolute"
+        [str(plugin)], "absolute"
     )
 
 
