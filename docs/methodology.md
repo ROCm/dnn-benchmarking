@@ -136,11 +136,31 @@ Use `--min-time-ms` for short kernels. For example, a 10 us kernel with
 `--iters 100` gives 1 ms of samples. With `--min-time-ms 100` it gives about
 10000 samples.
 
+## Block timing
+
+`--timing-block N` (N > 1) uses the rocKE block protocol (`time_launches`,
+Solera `measure()`), in `timing.mode = block`:
+
+1. Run the priming launch (timed as `first_call_ms`).
+2. For each sample: run `--warmup` untimed launches, then drain the device.
+3. Time `N` back-to-back launches in one event pair. Record `elapsed / N`.
+4. Discard the first sample.
+
+The stall gate is not used: `N` gated launches can fill the HIP queue and
+block the host before the gate opens. Block timing hides the launch gap
+between back-to-back kernels, so it reads lower than the per-launch modes
+for short kernels. On the MI210 conv sample, `--timing-block 50` read
+18.7 us against 25.6 us staged. Compare runs only with the same
+`timing_block`. `--cache-mode cold` requires `--timing-block 1`, because a
+flush before a block leaves only its first launch cold.
+
 ## Statistics
 
 For `kernel` and `host` the tool reports `n`, `mean_ms`, `std_ms` (ddof 1),
 `cv` (`std/mean`), `min_ms`, `p25_ms`, `median_ms`, `p75_ms`, `p95_ms`,
-`max_ms` and `iqr_ms`. Percentiles use linear interpolation. `p95_ms` is
+`max_ms` and `iqr_ms`. `median_ms` is the upper median `sorted(t)[n // 2]`,
+the rocKE / Solera definition, so it is always an observed sample. The other
+percentiles use linear interpolation. `p95_ms` is
 `null` below 20 samples, because it is then close to the maximum.
 
 The tool does not remove outliers. It adds warnings to the row:
@@ -213,16 +233,16 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 
 | Feature | dnn-benchmarking | rocKE | PyTorch / Triton |
 |---|---|---|---|
-| Warmup | Fixed count (default 10) through the timed path, first call timed separately | Fixed count (default 5) | do_bench: 25 ms time budget. Timer: block-size estimate. |
+| Warmup | Fixed count (default 10) through the timed path, first call timed separately; per sample in block mode | Fixed count (default 5) per sample | do_bench: 25 ms time budget. Timer: block-size estimate. |
 | Iterations | `--iters` floor plus optional `--min-time-ms` budget, cap 10000 | Fixed (default 100) | do_bench: 100 ms budget. `blocked_autorange`: 0.2 s minimum. |
-| Event granularity | One event pair per launch, stall-gated | One event pair around N launches | do_bench: one pair per launch. Graph variant: one pair per replay. |
-| Sync | After each launch | One at the end | do_bench: one at the end. Timer: one per block. |
+| Event granularity | One event pair per launch, stall-gated; `--timing-block N`: one pair around N launches | One event pair around N launches | do_bench: one pair per launch. Graph variant: one pair per replay. |
+| Sync | After each launch; block mode: after each block | One at the end | do_bench: one at the end. Timer: one per block. |
 | Host launch gaps removed | Yes (stall gate) | Amortized over N launches | Amortized (do_bench) |
 | Host submit time | Yes (`host`) | No | Timer: wall time only |
 | Cache flush | `--cache-mode cold`, 512 MiB | Documented only | do_bench: 256 MB zero before each launch |
 | Rotating buffers | No | Documented only | No |
 | Graph replay | No | Yes | `do_bench_cudagraph` |
-| Outliers | Flagged (IQR/median noise flag, max/median outlier flag), never removed | Discard first run | Timer: IQR warnings |
+| Outliers | Flagged (IQR/median noise flag, max/median outlier flag), never removed; block mode discards the first sample | Discard first run | Timer: IQR warnings |
 | Statistics | n, mean, std, CV, min, p25, median, p75, p95, max, IQR | median, min, max, mean, stdev, spread | do_bench: mean or quantiles. Timer: median, IQR. |
 | Headline | Median | Median over attempts | do_bench: mean (default). Timer: median. |
 | TFLOP/s basis | Median | Median | User calculates |
@@ -301,9 +321,8 @@ The tool does not do these things yet:
 - One buffer manager for both backends. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
-- Batched and graph-replay timing modes (back-to-back launches, HIP or CUDA
-  graph capture). These modes give the throughput-style numbers in the
-  parity table.
+- Graph-replay timing (HIP or CUDA graph capture). Back-to-back timing is
+  available with `--timing-block`.
 - Rotating input buffers. `--cache-mode cold` controls the cache state, but
   the rocKE runbook also advises rotating buffers for bandwidth work.
 - Signed input distribution. Floating-point inputs are uniform in [0, 1),

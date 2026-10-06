@@ -53,6 +53,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
 | `cache_mode` | string | `warm` or `cold`. |
+| `timing_block` | int | `--timing-block`. `1` = one launch per sample; `N > 1` = rocKE block timing. |
 | `seed` | int | Input data seed. |
 | `validate` | string or null | Reference provider (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol`. `null` means dtype-aware defaults. |
@@ -178,13 +179,14 @@ stores the ID as the hex form of its unsigned 64-bit value
 
 | Key | Type | Meaning |
 |---|---|---|
-| `mode` | string | `staged` (stall-gated device span) or `events` (event pair around each launch). |
+| `mode` | string | `staged` (stall-gated device span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
 | `backend` | string | Event backend: `hip` or `torch`. |
 | `cache_mode` | string | `warm` or `cold`. |
-| `warmup_iters` | int | Untimed launches that ran before the timed loop. Always 1 or more. |
+| `warmup_iters` | int | Untimed launches that ran before the timed loop. Always 1 or more. In `block` mode, the untimed launches that run before every sample. |
 | `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
 | `capped` | bool | `true` when the `max_iters` cap (10000) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. |
+| `timing_block` | int | Launches per timed sample. `1` except in `block` mode. |
 
 See [methodology.md](methodology.md) for the meaning of each mode.
 
@@ -201,7 +203,7 @@ See [methodology.md](methodology.md) for the meaning of each mode.
 | `cv` | Coefficient of variation, `std_ms / mean_ms` (fraction, not percent). |
 | `min_ms` | Minimum. |
 | `p25_ms` | 25th percentile. |
-| `median_ms` | Median. This is the headline value. |
+| `median_ms` | Upper median, `sorted(samples)[n // 2]` (the rocKE / Solera definition; always an observed sample). This is the headline value. |
 | `p75_ms` | 75th percentile. |
 | `p95_ms` | 95th percentile. `null` when `n` is less than 20. |
 | `max_ms` | Maximum. |
@@ -296,6 +298,8 @@ ran for the row.
 | `host` | stats or null | Tuned plan, host submit time. |
 | `baseline_kernel` | stats or null | Default (OOTB) plan timed again after the sweep, device time. |
 | `baseline_host` | stats or null | Default plan timed again after the sweep, host submit time. |
+| `tflops` | float or null | Tuned plan TFLOP/s: row `metrics.flops` / `kernel.median_ms`. |
+| `baseline_tflops` | float or null | Default plan TFLOP/s: row `metrics.flops` / `baseline_kernel.median_ms`. |
 | `correctness` | object or null | Correctness of the tuned plan. The row `correctness` is for the default plan. |
 | `delta` | object or null | Comparison by kernel median. See below. |
 
@@ -402,6 +406,7 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `n` | `row.kernel.n` |
 | `timing_mode` | `row.timing.mode` |
 | `cache_mode` | `row.timing.cache_mode` |
+| `timing_block` | `row.timing.timing_block` |
 | `seed` | `run.config.seed` |
 | `tflops` | `row.metrics.tflops` |
 | `gbps` | `row.metrics.gbps` |

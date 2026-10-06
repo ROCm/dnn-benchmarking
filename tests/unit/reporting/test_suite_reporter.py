@@ -160,7 +160,9 @@ class TestTableLayout:
 
     def test_iqr_column_is_iqr_over_median(self) -> None:
         pe = _row()
-        pe.gpu_kernel_stats = BenchmarkStats.from_timings([0.9] * 10 + [1.1] * 10)
+        pe.gpu_kernel_stats = BenchmarkStats.from_timings(
+            [0.9] * 10 + [1.0] + [1.1] * 10
+        )
         text = _table(pe)
         header = text.splitlines()[1].split()
         assert header[1:4] == ["verdict", "kernel_med", "iqr%"]

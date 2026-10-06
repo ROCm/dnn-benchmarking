@@ -262,6 +262,18 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "warm reuses caches; cold flushes L2/MALL before each timed iteration",
     ),
     CliOption(
+        flags=("--timing-block",),
+        dest="timing_block",
+        group="Run",
+        parser_type=_at_least(int, 1),
+        default=_default(SuiteConfig, "timing_block"),
+        metavar="N",
+        help="time N back-to-back launches per sample (rocKE block timing; 1 = per launch)",
+        config_key="timing_block",
+        config_kind=ConfigKind.SCALAR,
+        config_type=int,
+    ),
+    CliOption(
         flags=("--seed", "-s"),
         dest="seed",
         group="Run",

@@ -20,6 +20,7 @@ warmup = 10          # untimed warmup launches per engine
 iters = 100          # minimum timed iterations per engine
 min_time_ms = 0.0    # keep timing until summed kernel time reaches this (0 = exactly iters)
 cache_mode = "warm"  # "warm" or "cold" (flush L2/MALL before each timed iteration)
+timing_block = 1     # launches per timed sample; N > 1 = rocKE block timing (warm cache only)
 seed = 0             # random seed for input data
 
 # --- Backend / selection -----------------------------------------------------

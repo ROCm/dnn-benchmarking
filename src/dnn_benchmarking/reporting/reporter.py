@@ -20,7 +20,11 @@ from ..metrics import _diagnostic
 from .statistics import BenchmarkStats, noise_warnings
 from .suite_results import GraphResult, ProviderEngineResult, SuiteResult, engine_id_hex
 
-_TIMING_MODE_LABEL = {"staged": "staged stall-gate", "events": "per-launch events"}
+_TIMING_MODE_LABEL = {
+    "staged": "staged stall-gate",
+    "events": "per-launch events",
+    "block": "block mean of back-to-back launches",
+}
 _CLOCK_KEYS = (
     ("sclk_mhz", "sclk", "MHz"),
     ("mclk_mhz", "mclk", "MHz"),
@@ -274,10 +278,12 @@ class Reporter:
         else:
             self._print(f"ROCm:    {env.get('rocm_version') or 'unknown'}")
         rc = run_config
+        block = rc.get("timing_block") or 1
         self._print(
             f"Timing:  warmup {rc['warmup_iters']}, iters {rc['iters']} "
             f"(min-time {rc['min_time_ms']:g} ms), cache {rc['cache_mode']}, "
-            f"seed {rc['seed']}, backend {rc['backend']}"
+            + (f"block {block} launches/sample, " if block > 1 else "")
+            + f"seed {rc['seed']}, backend {rc['backend']}"
         )
         self._print()
 
@@ -669,6 +675,12 @@ class Reporter:
             lines.append(
                 f"{_fmt_time(d.baseline_median_ms)} warm heuristic -> "
                 f"{_fmt_time(d.oracle_median_ms)} tuned = {d.speedup:.2f}x (basis {d.basis})"
+            )
+        if o.derived_tflops_per_s is not None:
+            base = o.warm_baseline_derived_tflops_per_s
+            lines.append(
+                f"throughput {o.derived_tflops_per_s:.3f} TFLOP/s tuned"
+                + (f", {base:.3f} warm heuristic" if base is not None else "")
             )
         return lines
 

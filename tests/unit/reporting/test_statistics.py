@@ -35,10 +35,15 @@ class TestBenchmarkStats:
     def test_percentiles_and_iqr(self) -> None:
         stats = BenchmarkStats.from_timings(list(range(1, 101)))
         assert stats.p25_ms == pytest.approx(25.75)
-        assert stats.median_ms == pytest.approx(50.5)
+        assert stats.median_ms == 51.0  # upper median sorted[n // 2]
         assert stats.p75_ms == pytest.approx(75.25)
         assert stats.p95_ms == pytest.approx(95.05)
         assert stats.iqr_ms == pytest.approx(49.5)
+
+    def test_median_even_count_is_upper_middle_sample(self) -> None:
+        """Even counts take sorted[n // 2] like rocKE / Solera, not the mean of
+        the two middle values, so the median is always an observed sample."""
+        assert BenchmarkStats.from_timings([4.0, 1.0, 3.0, 2.0]).median_ms == 3.0
 
     def test_to_dict_nulls_p95_below_20_samples(self) -> None:
         assert BenchmarkStats.from_timings([1.0] * 19).to_dict()["p95_ms"] is None

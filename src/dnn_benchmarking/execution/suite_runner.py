@@ -165,6 +165,7 @@ def _measure_row(
         first_call_ms=m.first_call_ms,
         capped=m.capped,
         fallback_reason=m.fallback_reason,
+        timing_block=m.timing_block,
     )
     warnings = list(row.warnings or []) + noise_warnings(kernel)
     if m.capped:

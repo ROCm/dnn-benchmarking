@@ -39,13 +39,16 @@ class Measurement:
     """Samples and provenance of one timed loop (see ``measure``).
 
     Attributes:
-        kernel_ms: Device span per timed iteration.
-        host_ms: Host submit time (enqueue only) per timed iteration.
-        mode: ``staged`` (stall-gated gap-free span) or ``events``.
+        kernel_ms: Device time per execution for each timed sample (in
+            block mode, the block's elapsed time divided by its size).
+        host_ms: Host submit time (enqueue only) per execution, same shape.
+        mode: ``staged`` (stall-gated gap-free span), ``events``, or
+            ``block`` (rocKE block timing, ``timing_block > 1``).
         backend: Event backend, ``hip`` or ``torch``.
         cache_mode: ``warm`` or ``cold``.
         warmup_iters: Untimed enqueues actually run (always >= 1): the
-            priming enqueue(s) plus discarded measured-path warmups.
+            priming enqueue(s) plus discarded measured-path warmups. In
+            block mode, the untimed executions run before every sample.
         first_call_ms: Wall time of the first untimed enqueue plus sync;
             captures one-time plan compile / kernel find cost.
         capped: True when ``max_iters`` stopped the loop before the
@@ -62,6 +65,7 @@ class Measurement:
     first_call_ms: float
     capped: bool = False
     fallback_reason: Optional[str] = None
+    timing_block: int = 1
 
 
 _HIP_API = ("HipEvent", "hip_get_device_count", "hip_device_synchronize")
@@ -314,6 +318,9 @@ def measure(
     ``policy.max_iters`` (``capped``). In cold cache mode every warmup and
     timed iteration is preceded by a cache flush and device sync.
 
+    ``policy.timing_block > 1`` switches to rocKE block timing instead; see
+    ``_measure_blocks``.
+
     Args:
         enqueue: Submits one iteration of work to ``stream`` / ``torch_stream``.
             Torch callers must already be inside ``torch.cuda.stream(...)``.
@@ -338,6 +345,9 @@ def measure(
         reason = _probe_host_sync(enqueue)
         primed += 1
         device_sync(backend)
+
+    if policy.timing_block > 1:
+        return _measure_blocks(enqueue, events, policy, backend, first_call_ms)
 
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
@@ -392,6 +402,61 @@ def measure(
         first_call_ms=first_call_ms,
         capped=capped,
         fallback_reason=reason,
+    )
+
+
+def _measure_blocks(
+    enqueue: Callable[[], None],
+    events: EventTimer,
+    policy: TimingPolicy,
+    backend: str,
+    first_call_ms: float,
+) -> Measurement:
+    """rocKE block timing (``time_launches`` / Solera ``measure()``).
+
+    Each sample runs ``policy.warmup_iters`` untimed executions, drains the
+    device, then times ``policy.timing_block`` back-to-back executions in one
+    event pair and records the per-execution average. The first sample is
+    discarded. The stall gate is not used: N gated enqueues can fill the HIP
+    queue and block the host before the gate opens.
+    """
+    block = policy.timing_block
+    kernel_ms: List[float] = []
+    host_ms: List[float] = []
+    total_ms = 0.0
+    capped = False
+    discard_first = True
+    while len(kernel_ms) < policy.iters or total_ms < policy.min_time_ms:
+        if len(kernel_ms) >= policy.max_iters:
+            capped = True
+            break
+        for _ in range(policy.warmup_iters):
+            enqueue()
+        device_sync(backend)
+        events.start()
+        t0 = time.perf_counter()
+        for _ in range(block):
+            enqueue()
+        t1 = time.perf_counter()
+        events.stop()
+        kernel = events.elapsed_ms() / block
+        if discard_first:
+            discard_first = False
+            continue
+        kernel_ms.append(kernel)
+        host_ms.append((t1 - t0) * 1000.0 / block)
+        total_ms += kernel * block
+
+    return Measurement(
+        kernel_ms=kernel_ms,
+        host_ms=host_ms,
+        mode="block",
+        backend=backend,
+        cache_mode=policy.cache_mode,
+        warmup_iters=policy.warmup_iters,
+        first_call_ms=first_call_ms,
+        capped=capped,
+        timing_block=block,
     )
 
 

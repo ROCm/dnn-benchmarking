@@ -162,6 +162,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "iters": config.benchmark_iters,
         "min_time_ms": config.min_time_ms,
         "cache_mode": config.cache_mode,
+        "timing_block": config.timing_block,
         "seed": config.seed,
         "validate": (
             config.validation.provider.value if config.validation.enabled else None

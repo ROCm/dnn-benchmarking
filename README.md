@@ -81,6 +81,9 @@ dnn-benchmark -g graphs/sample_conv_fwd.json -e MIOPEN_ENGINE -v
 # Cold cache, at least 200 iterations and 100 ms of kernel time
 dnn-benchmark -g graphs/sample_conv_fwd.json -i 200 --min-time-ms 100 --cache-mode cold
 
+# rocKE block timing: each of 100 samples times 50 back-to-back launches
+dnn-benchmark -g 'graphs/*.json' --iters 100 --timing-block 50
+
 # Run every graph in a tarball (fetch it first, see Workload files)
 dnn-benchmark -g Workloads/headline/conv.tar.gz -o conv.json
 

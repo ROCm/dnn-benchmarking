@@ -23,7 +23,8 @@ class BenchmarkStats:
         cv: Coefficient of variation, ``std_ms / mean_ms``.
         min_ms: Minimum.
         p25_ms: 25th percentile.
-        median_ms: Median; the headline number.
+        median_ms: Upper median ``sorted(timings)[n // 2]`` (rocKE / Solera
+            definition; always an observed sample); the headline number.
         p75_ms: 75th percentile.
         p95_ms: 95th percentile (serialized as null when n < 20).
         max_ms: Maximum.
@@ -52,7 +53,8 @@ class BenchmarkStats:
         arr = np.asarray(timings, dtype=np.float64)
         mean = float(arr.mean())
         std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
-        p25, median, p75, p95 = (float(v) for v in np.percentile(arr, [25, 50, 75, 95]))
+        p25, p75, p95 = (float(v) for v in np.percentile(arr, [25, 75, 95]))
+        median = float(np.sort(arr)[arr.size // 2])
         return cls(
             n=int(arr.size),
             mean_ms=mean,
@@ -114,6 +116,7 @@ class TimingInfo:
     first_call_ms: float
     capped: bool = False
     fallback_reason: Optional[str] = None
+    timing_block: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-ready dict."""

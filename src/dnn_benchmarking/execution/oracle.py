@@ -11,6 +11,7 @@ from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
 from ..metrics._diagnostic import warn_once
+from ..metrics.analytical import derive_throughputs
 from ..reporting.statistics import BenchmarkStats
 from ..reporting.suite_results import (
     OracleResult,
@@ -113,6 +114,15 @@ def run_oracle_pass(
                 ),
                 exhaustive_requested=config.oracle_exhaustive,
                 exhaustive_supported=bool(winner.supports_exhaustive),
+            )
+            # Same FLOPs and median denominator as the row's own TFLOP/s.
+            oracle.derived_tflops_per_s, _ = derive_throughputs(
+                row.analytical_flops, None, oracle.gpu_kernel_stats.median_ms
+            )
+            oracle.warm_baseline_derived_tflops_per_s, _ = derive_throughputs(
+                row.analytical_flops,
+                None,
+                oracle.warm_baseline_gpu_kernel_stats.median_ms,
             )
 
             if reference_outputs is not None:

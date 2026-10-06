@@ -38,6 +38,7 @@ RUN_CONFIG_KEYS = (
     "iters",
     "min_time_ms",
     "cache_mode",
+    "timing_block",
     "seed",
     "validate",
     "rtol",
@@ -99,6 +100,7 @@ ROW_COLUMNS = (
     "n",
     "timing_mode",
     "cache_mode",
+    "timing_block",
     "seed",
     "tflops",
     "gbps",
@@ -221,6 +223,10 @@ class OracleResult:
     delta uses this warm measurement, not the row's earlier OOTB timing.
     ``correctness`` is the tuned plan's verdict; the row retains the OOTB
     verdict.
+
+    ``derived_tflops_per_s`` (tuned plan) and
+    ``warm_baseline_derived_tflops_per_s`` (warm OOTB) use the row's
+    analytical FLOPs and each side's kernel median, like the row's TFLOP/s.
     """
 
     plan_name: str
@@ -239,6 +245,8 @@ class OracleResult:
     warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
     warm_baseline_host_stats: Optional[BenchmarkStats] = None
     correctness: Optional[CorrectnessResult] = None
+    derived_tflops_per_s: Optional[float] = None
+    warm_baseline_derived_tflops_per_s: Optional[float] = None
 
     @property
     def exhaustive_enabled(self) -> bool:
@@ -270,6 +278,8 @@ class OracleResult:
             "host": _stats_dict(self.host_stats),
             "baseline_kernel": _stats_dict(self.warm_baseline_gpu_kernel_stats),
             "baseline_host": _stats_dict(self.warm_baseline_host_stats),
+            "tflops": self.derived_tflops_per_s,
+            "baseline_tflops": self.warm_baseline_derived_tflops_per_s,
             "correctness": (self.correctness.to_dict() if self.correctness else None),
         }
 
@@ -294,6 +304,8 @@ _ORACLE_KEYS = (
     "host",
     "baseline_kernel",
     "baseline_host",
+    "tflops",
+    "baseline_tflops",
     "correctness",
 )
 
@@ -754,6 +766,7 @@ class SuiteResult:
                         "n": kernel.get("n"),
                         "timing_mode": timing.get("mode"),
                         "cache_mode": timing.get("cache_mode"),
+                        "timing_block": timing.get("timing_block"),
                         "tflops": r["metrics"]["tflops"],
                         "gbps": r["metrics"]["gbps"],
                         "workspace_bytes": r["metrics"]["workspace_bytes"],

@@ -95,6 +95,12 @@ class TimingPolicy:
         max_iters: Hard cap on timed iterations.
         cache_mode: ``warm`` reuses caches between iterations; ``cold``
             flushes L2/MALL before every timed iteration.
+        timing_block: Executions per timed sample. ``1`` times each
+            execution on its own (stall-gated when available). ``N > 1``
+            follows rocKE's block timing: before every sample run
+            ``warmup_iters`` untimed executions and drain, then time ``N``
+            back-to-back executions in one event pair and record
+            ``elapsed / N``; the first sample is discarded.
     """
 
     warmup_iters: int = 10
@@ -102,6 +108,7 @@ class TimingPolicy:
     min_time_ms: float = 0.0
     max_iters: int = 10_000
     cache_mode: str = "warm"
+    timing_block: int = 1
 
     def __post_init__(self) -> None:
         """Validate loop bounds and the cache mode."""
@@ -118,6 +125,11 @@ class TimingPolicy:
                 f"cache_mode must be one of {CACHE_MODE_CHOICES}, "
                 f"got {self.cache_mode!r}"
             )
+        if self.timing_block <= 0:
+            raise ValueError("timing_block must be positive")
+        if self.timing_block > 1 and self.cache_mode == "cold":
+            # A flush before a block of N leaves only the first execution cold.
+            raise ValueError("cache_mode cold requires timing_block 1")
 
 
 @dataclass
@@ -352,6 +364,8 @@ class SuiteConfig:
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
     cache_mode: str = "warm"
+    #: Executions per timed sample (rocKE block timing when > 1).
+    timing_block: int = 1
     #: Suppress progress output; tables and the summary still print.
     quiet: bool = False
 
@@ -373,6 +387,7 @@ class SuiteConfig:
             benchmark_iters=args.iters,
             min_time_ms=args.min_time_ms,
             cache_mode=args.cache_mode,
+            timing_block=args.timing_block,
             seed=args.seed,
             engine_filter=args.engine,
             verbose=args.verbose,
@@ -408,6 +423,7 @@ class SuiteConfig:
             min_time_ms=self.min_time_ms,
             max_iters=max(TimingPolicy.max_iters, self.benchmark_iters),
             cache_mode=self.cache_mode,
+            timing_block=self.timing_block,
         )
 
     @property
@@ -432,6 +448,10 @@ class SuiteConfig:
             raise ValueError(
                 "--cache-mode must be one of: " + ", ".join(CACHE_MODE_CHOICES)
             )
+        if self.timing_block <= 0:
+            raise ValueError("--timing-block must be >= 1")
+        if self.timing_block > 1 and self.cache_mode == "cold":
+            raise ValueError("--cache-mode cold requires --timing-block 1")
         if self.engine_filter is not None and len(self.engine_filter) == 0:
             raise ValueError("--engine must list at least one engine")
         if self.plugin_paths is not None:

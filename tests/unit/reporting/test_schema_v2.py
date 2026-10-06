@@ -24,7 +24,7 @@ TOP_KEYS = {"schema_version", "tool", "run", "environment", "summary", "graphs"}
 RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
     "backend", "engine_filter", "plugin_paths", "warmup_iters", "iters",
-    "min_time_ms", "cache_mode", "seed", "validate", "rtol", "atol",
+    "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
     "oracle_mode", "autotune", "cache_dir", "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library", "metrics_tier", "profiling",
 }  # fmt: skip
@@ -72,7 +72,7 @@ STATS_KEYS = {
 }  # fmt: skip
 TIMING_KEYS = {
     "mode", "backend", "cache_mode", "warmup_iters", "first_call_ms", "capped",
-    "fallback_reason",
+    "fallback_reason", "timing_block",
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
@@ -84,7 +84,7 @@ ORACLE_KEYS = {
     "compiled_plans_failed", "tuning_available", "knob_settings",
     "exhaustive_requested", "exhaustive_enabled", "exhaustive_supported",
     "cpu_build_time_ms", "kernel", "host", "baseline_kernel", "baseline_host",
-    "correctness", "delta",
+    "tflops", "baseline_tflops", "correctness", "delta",
 }  # fmt: skip
 DELTA_KEYS = {"basis", "baseline_median_ms", "oracle_median_ms", "delta_ms", "speedup"}
 

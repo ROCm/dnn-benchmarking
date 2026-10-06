@@ -38,6 +38,7 @@ the same output format.
 | `-i`, `--iters N` | 100 | Minimum timed iterations per engine. |
 | `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of 10000 samples applies. |
 | `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each warmup and timed iteration. |
+| `--timing-block N` | 1 | Launches per timed sample. `1` times each launch on its own. `N > 1` uses rocKE block timing: before each sample, `--warmup` untimed launches and a drain; then `N` back-to-back launches in one event pair, recorded as `elapsed / N`. The first sample is discarded. Requires `--cache-mode warm`. |
 | `-s`, `--seed SEED` | 0 | Random seed for the input data. |
 
 [methodology.md](methodology.md) explains each value.

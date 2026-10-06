@@ -338,3 +338,38 @@ def test_missing_hipdnn_reports_hip_unavailable(monkeypatch) -> None:
     assert timing_module.is_hip_available() is False
     with pytest.raises(RuntimeError, match="not importable"):
         measure(lambda: None, stream=0, policy=TimingPolicy())
+
+
+def test_block_timing_follows_rocke_protocol(monkeypatch) -> None:
+    """timing_block=N follows rocKE time_launches / Solera measure(): every
+    sample runs warmup_iters untimed executions, drains, then times N
+    back-to-back executions in one event pair (elapsed / N); the first sample
+    is discarded. The stall gate is skipped even where staging is available,
+    because N gated enqueues can fill the HIP queue."""
+    log: List[str] = []
+    clock = FakeClock()
+    fake = _install_fake_hip(monkeypatch, log, staged=True, clock=clock)
+    elapsed = iter([40.0, 8.0, 12.0])
+    fake.HipEvent.elapsed_time = lambda self, other: next(elapsed)
+
+    m = measure(
+        _enqueue(log, clock, ms=0.5),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=2, iters=2, timing_block=4),
+    )
+
+    assert "arm" not in log
+    sample = ["enqueue"] * 2 + ["device_sync", "record"]
+    sample += ["enqueue"] * 4 + ["record", "event_sync"]
+    priming = ["enqueue", "device_sync"]
+    assert log == priming + sample * 3
+    assert m.kernel_ms == [2.0, 3.0]
+    assert m.host_ms == [pytest.approx(0.5), pytest.approx(0.5)]
+    assert (m.mode, m.timing_block, m.warmup_iters) == ("block", 4, 2)
+    assert m.fallback_reason is None
+
+
+def test_cold_cache_rejects_block_timing() -> None:
+    """A flush before a block of N leaves only the first execution cold."""
+    with pytest.raises(ValueError, match="timing_block"):
+        TimingPolicy(cache_mode="cold", timing_block=2)

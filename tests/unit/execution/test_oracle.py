@@ -105,10 +105,11 @@ def tuned(monkeypatch):
     return cls
 
 
-def _run(mode="plan", correctness=None, bm=None, refs=None):
+def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None):
     row = ProviderEngineResult(
         provider="hipdnn", engine_id=5, status="success", correctness=correctness
     )
+    row.analytical_flops = flops
     baseline = SimpleNamespace(benchmark=lambda h, vp: _m([1.0, 1.0, 1.0, 10.0]))
     out = TensorInfo(
         uid=1,
@@ -146,6 +147,16 @@ def test_delta_compares_post_sweep_medians(tuned):
     assert row.oracle_delta.baseline_median_ms == pytest.approx(1.0)
     assert row.oracle_delta.oracle_median_ms == pytest.approx(0.5)
     assert row.oracle_delta.speedup == pytest.approx(2.0)
+
+
+def test_tuned_and_warm_heuristic_report_median_tflops(tuned):
+    """Both oracle operands get TFLOP/s from the row's FLOPs and their own
+    kernel median, so the two throughputs compare directly."""
+    row = _run(flops=10**9)
+
+    # 1e9 FLOPs: 1.0 ms median -> 1 TFLOP/s (warm heuristic); 0.5 ms -> 2 (tuned).
+    assert row.oracle.warm_baseline_derived_tflops_per_s == pytest.approx(1.0)
+    assert row.oracle.derived_tflops_per_s == pytest.approx(2.0)
 
 
 def test_candidate_counts_ignore_caller_excluded_plans(tuned):
