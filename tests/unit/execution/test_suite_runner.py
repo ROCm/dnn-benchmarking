@@ -252,15 +252,17 @@ def test_one_hipdnn_row_per_engine_named_from_engine_info(fake):
 
 
 @pytest.mark.parametrize(
-    "info_name, registry_name, expected",
+    "info_name, handle_name, registry_name, expected",
     [
-        ("ENG_A", "REG", "ENG_A"),
-        ("", "REG", "REG"),
-        ("", "", "0x0000000000000001"),
+        ("ENG_A", "H", "REG", "ENG_A"),
+        # Plugin-supplied engines: only the handle knows the name.
+        ("", "hipkernel:Attn", "", "hipkernel:Attn"),
+        ("", IndexError, "REG", "REG"),
+        ("", "", "", "0x0000000000000001"),
     ],
 )
-def test_engine_name_falls_back_to_registry_then_hex(
-    fake, monkeypatch, info_name, registry_name, expected
+def test_engine_name_falls_back_through_handle_registry_then_hex(
+    fake, monkeypatch, info_name, handle_name, registry_name, expected
 ):
     monkeypatch.setitem(
         sys.modules,
@@ -268,10 +270,19 @@ def test_engine_name_falls_back_to_registry_then_hex(
         SimpleNamespace(engine_id_to_name=lambda eid: registry_name),
     )
     fake.discovered = [1]
+    handle = _handle({1: info_name})
 
-    graph, _ = _run(handle=_handle({1: info_name}))
+    def handle_lookup(eid):
+        if handle_name is IndexError:
+            raise IndexError(eid)
+        return handle_name
+
+    handle.engine_id_to_name = handle_lookup
+
+    graph, progress = _run(handle=handle)
 
     assert graph.results[0].engine_name == expected
+    assert "WARNING" not in progress
 
 
 @pytest.mark.parametrize(

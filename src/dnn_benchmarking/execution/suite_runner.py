@@ -66,8 +66,10 @@ def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
 def _engine_identity(handle: Any, engine_id: int) -> Tuple[str, str]:
     """(display name, plugin version) of a loaded engine.
 
-    The name comes from the handle's engine info, else the hipDNN name
-    registry, else the hex ID, so a row always has a printable label.
+    The name comes from the handle's engine info, else the handle's name
+    lookup (it asks the loaded plugins, so it also names plugin-supplied
+    ``hipkernel:*`` engines), else the built-in hipDNN registry, else the
+    hex ID, so a row always has a printable label.
     """
     name: Optional[str] = None
     version = "unavailable"
@@ -77,6 +79,15 @@ def _engine_identity(handle: Any, engine_id: int) -> Tuple[str, str]:
         version = str(info.version or "") or version
     except Exception as e:
         warn_once("suite_runner", f"engine info lookup failed for {engine_id:#x}: {e}")
+    if name is None:
+        try:
+            name = handle.engine_id_to_name(engine_id) or None
+        except IndexError:
+            pass  # the handle does not carry this ID
+        except Exception as e:
+            warn_once(
+                "suite_runner", f"handle name lookup failed for {engine_id:#x}: {e}"
+            )
     if name is None:
         try:
             import hipdnn_frontend as hipdnn
