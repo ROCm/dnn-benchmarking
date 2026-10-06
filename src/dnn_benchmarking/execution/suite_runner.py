@@ -538,6 +538,7 @@ def _run_timed_pytorch_row(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
+                timing_block=config.timing_block,
                 engine_id=0,
                 pytorch_sdpa_backend=config.pytorch_sdpa_backend,
                 pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
@@ -578,7 +579,7 @@ def _run_timed_pytorch_row(
                     _collect_basic_metrics_post_loop(
                         result=result,
                         cpu_time_probe=cpu_time_probe,
-                        benchmark_iters=config.benchmark_iters,
+                        timed_executions=_benchmark_executions(config),
                         analytical_flops=analytical_flops,
                         analytical_flops_partial=analytical_flops_partial,
                         analytical_io_bytes=analytical_io_bytes,
@@ -1008,10 +1009,22 @@ def run_graph_pytorch_backend(
     )
 
 
+def _benchmark_executions(config: Any) -> int:
+    """Graph executions inside ``benchmark()``, the CPU probe's region.
+
+    Block timing (``timing_block > 1``) also runs ``warmup_iters`` untimed
+    executions before every sample (rocKE / Solera protocol).
+    """
+    per_sample = config.timing_block
+    if config.timing_block > 1:
+        per_sample += config.warmup_iters
+    return config.benchmark_iters * per_sample
+
+
 def _collect_basic_metrics_post_loop(
     result: ProviderEngineResult,
     cpu_time_probe: Optional[CpuTimeProbe],
-    benchmark_iters: int,
+    timed_executions: int,
     analytical_flops: Optional[int],
     analytical_flops_partial: bool,
     analytical_io_bytes: Optional[int],
@@ -1025,11 +1038,12 @@ def _collect_basic_metrics_post_loop(
     intermediate results.
     """
     if cpu_time_probe is not None and cpu_time_probe.delta is not None:
-        # Per-iter microseconds is the interpretable unit: the loop
-        # total is dominated by Python dispatch cost, and per-iter
-        # lets users compare directly against the kernel mean (also
-        # reported per-iter).
-        iters = max(benchmark_iters, 1)
+        # Per-execution microseconds is the interpretable unit: the loop
+        # total is dominated by Python dispatch cost, and per-execution
+        # lets users compare directly against the kernel median (also
+        # reported per execution). The divisor counts every execution in
+        # benchmark(), see _benchmark_executions.
+        iters = max(timed_executions, 1)
         result.cpu_user_time_per_iter_us = (
             cpu_time_probe.delta.user_time_ms * 1000.0 / iters
         )
@@ -1044,15 +1058,16 @@ def _collect_basic_metrics_post_loop(
     result.analytical_flops_partial = analytical_flops_partial
     result.analytical_io_bytes = analytical_io_bytes
 
-    # Derived throughputs use the *arithmetic mean* of post-warmup kernel
-    # timings — no trimming, no outlier rejection. A single noisy iter
-    # (context switch, thermal throttle) skews the headline number; for
-    # tighter signal use gpu_kernel_stats.min_ms or p95_ms.
-    kernel_mean = (
-        result.gpu_kernel_stats.mean_ms if result.gpu_kernel_stats is not None else None
+    # Derived throughputs use the *median* post-warmup kernel time — the
+    # same denominator as the rocKE benchmark pipeline (Solera/Strata), and
+    # robust to a single noisy iteration (context switch, thermal throttle).
+    kernel_median = (
+        result.gpu_kernel_stats.median_ms
+        if result.gpu_kernel_stats is not None
+        else None
     )
     tflops, gbytes = derive_throughputs(
-        analytical_flops, analytical_io_bytes, kernel_mean
+        analytical_flops, analytical_io_bytes, kernel_median
     )
     result.derived_tflops_per_s = tflops
     result.derived_gbytes_per_s = gbytes
@@ -1095,6 +1110,16 @@ def _exhaustive_env(enabled: bool):
                 os.environ[name] = value
 
 
+def _median_tflops(
+    flops: Optional[int], stats: Optional[BenchmarkStats]
+) -> Optional[float]:
+    """TFLOP/s from analytical FLOPs and a kernel-stats median, or None."""
+    tflops, _ = derive_throughputs(
+        flops, None, stats.median_ms if stats is not None else None
+    )
+    return tflops
+
+
 def _run_oracle_pass(
     *,
     result: ProviderEngineResult,
@@ -1123,6 +1148,7 @@ def _run_oracle_pass(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
+                timing_block=config.timing_block,
                 engine_id=engine_id,
             )
             executor = Executor(
@@ -1192,6 +1218,13 @@ def _run_oracle_pass(
                 exhaustive_supported=bool(
                     getattr(winner, "supports_exhaustive", False)
                 ),
+            )
+            # Same FLOPs and median denominator as the row's derived TFLOP/s.
+            oracle.derived_tflops_per_s = _median_tflops(
+                result.analytical_flops, oracle.gpu_kernel_stats
+            )
+            oracle.warm_baseline_derived_tflops_per_s = _median_tflops(
+                result.analytical_flops, oracle.warm_baseline_gpu_kernel_stats
             )
 
             # Validate after timing; keep OOTB and tuned verdicts separate.
@@ -1272,6 +1305,7 @@ def run_single_provider_engine(
             graph_path=graph_path,
             warmup_iters=config.warmup_iters,
             benchmark_iters=config.benchmark_iters,
+            timing_block=config.timing_block,
             engine_id=engine_id,
         )
 
@@ -1321,7 +1355,7 @@ def run_single_provider_engine(
                 _collect_basic_metrics_post_loop(
                     result=result,
                     cpu_time_probe=cpu_time_probe,
-                    benchmark_iters=config.benchmark_iters,
+                    timed_executions=_benchmark_executions(config),
                     analytical_flops=analytical_flops,
                     analytical_flops_partial=analytical_flops_partial,
                     analytical_io_bytes=analytical_io_bytes,

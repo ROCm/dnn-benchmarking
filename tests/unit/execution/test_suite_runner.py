@@ -26,6 +26,7 @@ from dnn_benchmarking.execution.suite_runner import (
     _compute_reference_outputs_once,
     _hipdnn_buffer_device,
     set_plugin_path,
+    _collect_basic_metrics_post_loop,
 )
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -2111,6 +2112,25 @@ class TestOraclePass:
         assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
         assert result.results[0].oracle_delta.baseline_mean_ms == 0.5
 
+    def test_tuned_and_warm_ootb_report_median_tflops(self):
+        """Both oracle operands get TFLOP/s from the row's FLOPs and their own
+        kernel median, so tuned and warm OOTB throughput compare directly."""
+        factory, _ = _make_oracle_exec_factory()
+        with patch(
+            "dnn_benchmarking.execution.suite_runner.compute_flops",
+            return_value=(10**9, False),
+        ):
+            result = self._run(factory)
+
+        row = result.results[0]
+        # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB, warm OOTB); 0.25 ms -> 4 (tuned).
+        assert row.derived_tflops_per_s == pytest.approx(2.0)
+        assert row.oracle.warm_baseline_derived_tflops_per_s == pytest.approx(2.0)
+        assert row.oracle.derived_tflops_per_s == pytest.approx(4.0)
+        d = row.oracle.to_dict()
+        assert d["derived_tflops_per_s"] == pytest.approx(4.0)
+        assert d["warm_baseline_derived_tflops_per_s"] == pytest.approx(2.0)
+
     def test_oracle_failure_leaves_ootb_row_intact(self):
         factory, _ = _make_oracle_exec_factory(
             autotune_side_effect=ExecutionError("no candidate succeeded")
@@ -2488,3 +2508,28 @@ class TestOracleExhaustiveEnvGuard:
         )
         assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
         assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+
+def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
+    """derived_tflops_per_s divides by the kernel *median* (rocKE parity),
+    and CPU time is per timed execution (iters * timing_block)."""
+    result = ProviderEngineResult(provider="hipdnn", engine_id=1, status="success")
+    # Mean 4 ms, median 1 ms.
+    result.gpu_kernel_stats = BenchmarkStats.from_timings([1.0, 1.0, 10.0])
+    probe = SimpleNamespace(
+        delta=SimpleNamespace(user_time_ms=60.0, kernel_time_ms=6.0)
+    )
+
+    with patch("dnn_benchmarking.execution.suite_runner.GpuSmiProbe"):
+        _collect_basic_metrics_post_loop(
+            result=result,
+            cpu_time_probe=probe,
+            timed_executions=3 * 20,
+            analytical_flops=10**12,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+        )
+
+    assert result.derived_tflops_per_s == pytest.approx(1000.0)
+    assert result.cpu_user_time_per_iter_us == pytest.approx(1000.0)
+    assert result.cpu_kernel_time_per_iter_us == pytest.approx(100.0)
