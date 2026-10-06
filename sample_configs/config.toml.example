@@ -15,11 +15,16 @@ graphs = [
 ]
 
 # Benchmark loop controls.
+# iters: number of timed samples; statistics and TFLOP/s use their median.
+# timing_block: executions inside each sample.
+#   1 (default): each sample is one execution. warmup runs once, up front.
+#   N > 1: rocKE block timing. Each sample runs `warmup` untimed executions,
+#   then times N back-to-back executions between one GPU event pair and
+#   records elapsed/N. The first sample is discarded.
+#   rocKE settings: iters = BENCHMARK_ITERATIONS, warmup = WARMUP_EXECUTIONS,
+#   timing_block = TIMED_EXECUTIONS.
 warmup = 10
 iters = 100
-# Executions per timed sample. 1 times each execution on its own; N > 1 times
-# N back-to-back executions between one GPU event pair and records elapsed/N
-# (the block timing the rocKE benchmarks use).
 timing_block = 1
 
 # Optional seed for reproducible input data. Use an integer, or omit/null for no fixed seed.
