@@ -279,7 +279,7 @@ the following are rejected with `--backend pytorch`:
 - `--engine` / `--plugin-path` (no hipDNN engine plugins are loaded)
 - `--validate pytorch` (the backend would validate against itself)
 - `--pmc` / `--emit-trace` / `--perf` / `--roofline` (rocprofv3-based passes)
-- `--oracle-mode` (auto-tuning is a hipDNN engine feature)
+- `--oracle-mode plan` (plan search is a hipDNN engine feature; `exhaustive` and `off` are accepted)
 
 ### Oracle (Auto-Tuned) Comparison
 
