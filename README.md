@@ -279,65 +279,60 @@ the following are rejected with `--backend pytorch`:
 - `--engine` / `--plugin-path` (no hipDNN engine plugins are loaded)
 - `--validate pytorch` (the backend would validate against itself)
 - `--pmc` / `--emit-trace` / `--perf` / `--roofline` (rocprofv3-based passes)
-- `--oracle-mode plan` (plan search is a hipDNN engine feature; `exhaustive` and `off` are accepted)
 
-### Oracle (Auto-Tuned) Comparison
+`--oracle-mode exhaustive` is accepted: the PyTorch row gets a tuned run (see
+[PyTorch Kernel Selection](#pytorch-kernel-selection)).
 
-Use `--oracle-mode` to compare the normal out-of-the-box (OOTB) plan with
-hipDNN's tuned plan for each engine:
+### Oracle (Tuned) Comparison
 
-| Mode | Behavior |
-|---|---|
-| `off` | Run only the OOTB plan. This is the default. |
-| `plan` | Benchmark every backend-generated plan for the engine. |
-| `exhaustive` | Run `plan` mode and enable provider-managed kernel selection where supported. |
+Use `--oracle-mode exhaustive` to compare each engine's out-of-the-box (OOTB)
+plan with a tuned plan for the same engine. The default, `off`, runs only the
+OOTB plan.
 
-The exhaustive path keeps every plan returned by the backend. It does not
-generate a Cartesian product of public knob values. The kernel ingestor and
-MIOpen currently support provider-level selection; other engines, including
-hipBLASLt, remain at plan-level tuning. Providers can reuse cached selections,
-so exhaustive mode does not prove that every variant was measured during the
-current invocation.
+For every applicable engine the tool builds two plans through one timed path,
+`create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
+`build_plans()`:
 
-Both modes are slower than a normal run. Use `--engine` to limit the work.
-`exhaustive` requires `--warmup >= 1`.
+| Run | Knobs | Build time in JSON |
+|---|---|---|
+| OOTB | none | `build_time_ms` on the engine row |
+| Tuned | `global.benchmarking=1` | `oracle.build_time_ms` |
+
+Build time covers only those three calls, so the two values are directly
+comparable. `cpu_build_time_ms` additionally includes graph setup and workspace
+allocation. A tuned build compiles every candidate the provider can sample, so
+it is expected to be much slower than the OOTB build. Providers that support the
+knob (today the kernel ingestor and MIOpen) sample their candidates on the
+tuned plan's first execute, which the warmup absorbs, and keep the fastest.
+MIOpen's search runs on that first execute, not in `build_plans()`, so its tuned
+build time does not include its search cost. Engines without the knob ignore
+it, report `tuning_available: false`, and show `no-search`.
+
+The mode is slower than a normal run. Use `--engine` to limit the work.
+It requires `--warmup >= 1`.
 
 The summary table shows:
 
 - `ootb_kernel_mean_ms`: the original OOTB measurement.
-- `warm_ootb_kernel_mean_ms`: the same OOTB plan re-measured after tuning.
-- `oracle_kernel_mean_ms`: the selected plan measured after tuning.
+- `warm_ootb_kernel_mean_ms`: the same OOTB plan re-measured after the tuned build.
+- `oracle_kernel_mean_ms`: the tuned plan.
 - `oracle_speedup`: `warm_ootb_kernel_mean_ms / oracle_kernel_mean_ms`.
+- `ootb_build_ms` and `oracle_build_ms`: the two plan build times.
 
 The warm OOTB measurement is the comparison baseline because it has comparable
 device warmup. The oracle can be slower; `0.99x` is a valid measured result.
-An unsupported single-plan row prints `no-search` and stays outside the suite
-geometric mean.
-
-JSON records the candidate counts and the provider-level state:
-
-| Field | Meaning |
-|---|---|
-| `compiled_plans_benchmarked` | Compiled plans measured successfully. |
-| `compiled_plans_total` | Eligible compiled plans, including failures. |
-| `exhaustive_requested` | The run requested provider-level tuning. |
-| `exhaustive_supported` | The engine advertises `global.benchmarking`. |
-| `exhaustive_enabled` | Provider-level tuning was requested and supported. |
-| `tuning_available` | Multiple plans competed or provider-level tuning was enabled. |
-
-These counts do not include provider-internal kernel variants; hipDNN exposes
-no count for them. An empty `knob_settings` list means that no public plan knob
-was set explicitly.
+Rows with `no-search` and timed reference rows stay outside the suite geometric
+mean.
 
 With `--validate`, the tool validates the OOTB and tuned plans independently.
 It reports no speedup if either plan fails.
 
 Cache state can affect selection. Set
 `HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` for a cold heuristic baseline.
-Exhaustive mode disables hipDNN's provider caches during its oracle pass, but
-MIOpen FindDb and performance-database entries can still supply existing tuned
-selections. The output records the relevant cache and MIOpen database paths in
-`metadata.hipdnn_selection_env`.
+The tuned pass sets `HIPDNN_DISABLE_CACHE=1`, so its winner is never served to
+a later OOTB row, but MIOpen FindDb and performance-database entries can still
+supply existing tuned selections. The output records the relevant cache and
+MIOpen database paths in `metadata.hipdnn_selection_env`.
 
 ```bash
 HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 python -m dnn_benchmarking \
@@ -407,17 +402,23 @@ the environment wins, and the settings in effect are printed and recorded in
 |---|---|---|
 | `PYTORCH_MIOPEN_SUGGEST_NHWC=1` | always | Without it PyTorch's MIOpen conv path transposes NHWC graphs to NCHW inside the timed region. |
 | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` | always | AOTriton otherwise rejects architectures it marks experimental and SDPA falls back to a slower backend. |
-| `torch.backends.cudnn.benchmark=True` | `--oracle-mode exhaustive` | MIOpen exhaustive conv search for PyTorch convs only. |
-| `PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1` | `--oracle-mode exhaustive` | TunableOp GEMM tuning. Results go under `--cache-dir`, or a fresh temp directory. |
 
-With `--backend pytorch` there is no oracle pass: `--oracle-mode exhaustive`
-tunes PyTorch, `off` (default) does not, and `plan` is rejected. Tuning happens
-on first use, so `--warmup >= 1` is required.
+With `--oracle-mode exhaustive`, every timed PyTorch row (the `--backend
+pytorch` engine row and the `--validate pytorch` reference row) also gets an
+`oracle`: a tuned run with `torch.backends.cudnn.benchmark=True` (MIOpen
+exhaustive conv search) and TunableOp GEMM tuning
+(`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`). The tuned run
+executes in a child process with its own TunableOp results file and
+`MIOPEN_USER_DB_PATH`, both in a temporary directory deleted afterwards.
+PyTorch caches conv algorithm choices per process, with a key that ignores
+`cudnn.benchmark`, so a tuned run in the benchmark process would either reuse
+the OOTB choice or leak into it. The parent then re-times its OOTB run as the
+warm baseline, exactly as for hipDNN engines. Tuned PyTorch outputs are not
+validated. The child holds its own buffers, so peak VRAM roughly doubles while
+it runs.
 
 `MIOPEN_FIND_MODE` and `MIOPEN_FIND_ENFORCE` are not set: the hipDNN MIOpen
-plugin reads them too, so they would also change the hipDNN rows. Both MIOpen
-copies share `MIOPEN_USER_DB_PATH`, so PyTorch's exhaustive search can write
-perf-db entries that hipDNN's MIOpen later reads.
+plugin reads them too, so they would also change the hipDNN rows.
 
 ### Config Files
 

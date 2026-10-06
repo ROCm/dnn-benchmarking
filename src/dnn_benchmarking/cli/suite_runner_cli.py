@@ -82,6 +82,9 @@ _TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
 
 def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
     """Warn once about conditions that make the OOTB baseline non-cold."""
+    if config.backend is ExecutionBackendName.PYTORCH:
+        # These are hipDNN cache and knob caveats; PyTorch tunes in isolation.
+        return
     exact_cache_enabled = (
         os.environ.get("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "").strip().lower()
         not in _TRUTHY_ENV
@@ -115,15 +118,24 @@ def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
             "sample candidate kernels, so that cost lands inside both timed "
             "loops"
         )
-    if config.oracle_exhaustive:
+    reporter.print_warning(
+        "--oracle-mode exhaustive: each engine gets a second plan built with "
+        "global.benchmarking=1 (today the kernel ingestor and MIOpen sample "
+        "kernels; other engines re-measure their OOTB plan). MIOpen can "
+        "reuse existing FindDb and performance-database entries, so this "
+        "mode does not prove that the current invocation performed a fresh "
+        "search. Tuned builds compile every candidate and are expected to "
+        "be much slower than OOTB builds."
+    )
+    forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
+    if forced is not None:
+        # Providers apply the variable as override.value_or(knob): it wins over
+        # the tuned plan's knob and also reaches the OOTB plan.
         reporter.print_warning(
-            "--oracle-mode exhaustive: the tuned pass enables each provider's "
-            "global.benchmarking capability (today the kernel ingestor and "
-            "MIOpen). Other engines stay at plan-level tuning. Providers can "
-            "reuse existing tuned selections, including MIOpen FindDb and "
-            "performance-database entries; this mode does not prove that the "
-            "current invocation performed a fresh search. On a cache miss, "
-            "expect the sweep to take candidates x variants longer."
+            f"--oracle-mode exhaustive with HIPDNN_FORCE_BENCHMARKING={forced} "
+            "(set directly or by --autotune): it overrides the "
+            "global.benchmarking knob for both the OOTB and the tuned plan, so "
+            "the two runs may not differ"
         )
 
 
@@ -137,11 +149,12 @@ def _print_oracle_comparison(
         return
     # Rows where tuning had no alternative configuration re-measured the
     # heuristic pick. Averaging them in would dilute a real result with noise.
+    # A timed reference row is a baseline, not an engine under test.
     tuned = [
         pe
         for gr in graph_results
         for pe in gr.results
-        if pe.oracle_delta is not None and pe.oracle is not None
+        if pe.oracle_delta is not None and pe.oracle is not None and pe.role == "engine"
     ]
     speedups = [pe.oracle_delta.speedup for pe in tuned if pe.oracle.tuning_available]
     reporter.print_oracle_summary(speedups, len(tuned) - len(speedups))
@@ -280,10 +293,15 @@ def run_suite_cli(
             profiling_output_dir=args.profiling_output_dir,
             profiling_timeout_s=args.profiling_timeout,
         )
-        # --backend pytorch has no oracle pass: --oracle-mode only says whether
-        # PyTorch itself is tuned (exhaustive) or not (off, the default).
         oracle_mode = args.oracle_mode
-        pytorch_exhaustive = oracle_mode == "exhaustive"
+        if getattr(args, "internal_pytorch_tuned", False) and (
+            backend is not ExecutionBackendName.PYTORCH or oracle_mode != "off"
+        ):
+            reporter.print_error(
+                "--internal-pytorch-tuned requires --backend pytorch "
+                "--oracle-mode off"
+            )
+            return 1
         if backend is ExecutionBackendName.PYTORCH:
             if args.engine:
                 reporter.print_error("--engine is not supported with --backend pytorch")
@@ -305,14 +323,6 @@ def run_suite_cli(
                     "--roofline) are not supported with --backend pytorch"
                 )
                 return 1
-            if oracle_mode == "plan":
-                reporter.print_error(
-                    "--oracle-mode plan is not supported with --backend pytorch "
-                    "(plan search is a hipDNN engine feature); use exhaustive "
-                    "or off"
-                )
-                return 1
-            oracle_mode = "off"
         # --profiling-output-dir is only meaningful when at least one
         # opt-in profiling source fires. Passing it solo is a silent
         # no-op today; surface that as a soft warning so the user
@@ -326,12 +336,12 @@ def run_suite_cli(
                 "source requested (--pmc, --emit-trace, --perf, "
                 "--roofline); the directory will not be written to"
             )
-        if pytorch_exhaustive and args.warmup == 0:
+        if oracle_mode == "exhaustive" and args.warmup == 0:
             reporter.print_error(
-                "--oracle-mode exhaustive requires --warmup >= 1: with "
-                "benchmarking forced, a plan's first execute() samples kernel "
-                "variants, and at zero warmup that sampling lands inside the "
-                "timed loop"
+                "--oracle-mode exhaustive requires --warmup >= 1: a tuned "
+                "plan's first execute() samples candidate kernels (and tuned "
+                "PyTorch searches on first use), and at zero warmup that "
+                "sampling lands inside the timed loop"
             )
             return 1
         if (
@@ -357,7 +367,6 @@ def run_suite_cli(
             engine_filter=args.engine,
             verbose=args.verbose,
             oracle_mode=oracle_mode,
-            pytorch_exhaustive=pytorch_exhaustive,
             metrics=metrics_config,
             validation=validation,
             plugin_paths=plugin_paths,
@@ -373,6 +382,10 @@ def run_suite_cli(
 
     _apply_tuning_environment(config, reporter)
     _apply_pytorch_tuning(config, reporter)
+    if getattr(args, "internal_pytorch_tuned", False):
+        from ..common.pytorch_tuning import enable_tuned_pytorch
+
+        enable_tuned_pytorch()
 
     return run_suite_benchmark(
         graph_paths=graph_paths,
@@ -392,14 +405,10 @@ def _apply_pytorch_tuning(config: SuiteConfig, reporter) -> None:
         return
     from ..common.pytorch_tuning import apply_pytorch_environment
 
-    effective = apply_pytorch_environment(
-        exhaustive=config.pytorch_exhaustive, cache_dir=config.cache_dir
-    )
+    effective = apply_pytorch_environment()
     settings = ", ".join(f"{k}={v}" for k, v in effective.items())
-    reporter.print_warning(
-        f"PyTorch kernel selection: "
-        f"{'EXHAUSTIVE' if config.pytorch_exhaustive else 'DEFAULT'} ({settings})"
-    )
+    tuned = "; tuned runs use an isolated subprocess" if config.oracle_enabled else ""
+    reporter.print_warning(f"PyTorch kernel selection: {settings}{tuned}")
 
 
 def _apply_tuning_environment(config: SuiteConfig, reporter) -> None:

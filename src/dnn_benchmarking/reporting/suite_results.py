@@ -108,19 +108,19 @@ class CorrectnessResult:
 
 @dataclass
 class OracleResult:
-    """Post-tuning result for one engine row.
+    """Tuned run for one engine row.
 
-    ``sweep_min_time_ms`` is the fastest single selection-sweep iteration.
-    Reported timing comes from the later ``gpu_kernel_stats`` or ``host_stats``
-    benchmark.
+    The tuned plan is built separately from the OOTB plan, for the same
+    engine, with ``knob_settings`` applied (``global.benchmarking=1`` for
+    hipDNN). ``build_time_ms`` is that plan build; the row's own
+    ``build_time_ms`` is the OOTB build. A benchmarking build compiles every
+    candidate the provider can sample, so it is expected to be slower.
 
-    Candidate counts describe compiled plans, not provider-internal kernels.
-    ``exhaustive_enabled`` means the selected engine advertises
-    ``global.benchmarking`` and the run requested it. Providers can reuse
-    cached selections, so it does not prove a fresh search occurred.
+    ``tuning_available`` is False when the engine exposes no tuning knob, so
+    the tuned run re-measured the OOTB configuration.
 
-    ``warm_baseline_*`` contains the OOTB plan re-timed after selection. The
-    delta uses this warm measurement, not the row's earlier OOTB timing.
+    ``warm_baseline_*`` contains the OOTB plan re-timed after the tuned build.
+    The delta uses this warm measurement, not the row's earlier OOTB timing.
     ``correctness`` is the tuned plan's verdict; the row retains the OOTB
     verdict.
 
@@ -130,15 +130,9 @@ class OracleResult:
     """
 
     plan_name: str
-    compiled_plan_index: int
-    rank: int
-    sweep_min_time_ms: float
-    compiled_plans_benchmarked: int
-    compiled_plans_total: int
-    compiled_plans_failed: int
     knob_settings: List[Dict[str, Any]]
-    exhaustive_requested: bool = False
-    exhaustive_supported: bool = False
+    tuning_available: bool
+    build_time_ms: Optional[float] = None
     cpu_build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
@@ -148,31 +142,13 @@ class OracleResult:
     derived_tflops_per_s: Optional[float] = None
     warm_baseline_derived_tflops_per_s: Optional[float] = None
 
-    @property
-    def exhaustive_enabled(self) -> bool:
-        """True when a capable provider was built for exhaustive selection."""
-        return self.exhaustive_requested and self.exhaustive_supported
-
-    @property
-    def tuning_available(self) -> bool:
-        """Return whether this pass had a tuning alternative."""
-        return self.compiled_plans_total > 1 or self.exhaustive_enabled
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
             "plan_name": self.plan_name,
-            "compiled_plan_index": self.compiled_plan_index,
-            "rank": self.rank,
-            "sweep_min_time_ms": self.sweep_min_time_ms,
-            "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
-            "compiled_plans_total": self.compiled_plans_total,
-            "compiled_plans_failed": self.compiled_plans_failed,
-            "tuning_available": self.tuning_available,
             "knob_settings": list(self.knob_settings),
-            "exhaustive_requested": self.exhaustive_requested,
-            "exhaustive_enabled": self.exhaustive_enabled,
-            "exhaustive_supported": self.exhaustive_supported,
+            "tuning_available": self.tuning_available,
+            "build_time_ms": self.build_time_ms,
             "cpu_build_time_ms": self.cpu_build_time_ms,
             "gpu_kernel_stats": (
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
@@ -200,16 +176,16 @@ class OracleResult:
 class OracleDelta:
     """Warm heuristic baseline vs tuned run for one engine row.
 
-    Both sides are measured after the autotuning sweep, back to back on the
-    same buffers, so device warmth is common to them and the ratio isolates
-    the plan change. This is deliberately not the row's headline OOTB
-    timing: that one is measured before the sweep exists and is the
-    "what you get out of the box" number, which at low ``--warmup`` can sit
-    well above steady state and would inflate the speedup.
+    Both sides are measured after the tuned build, back to back on the same
+    buffers, so device warmth is common to them and the ratio isolates the
+    tuning change. This is deliberately not the row's headline OOTB timing:
+    that one is measured first and is the "what you get out of the box"
+    number, which at low ``--warmup`` can sit well above steady state and
+    would inflate the speedup.
 
     Attributes:
         basis: Which timing pair the comparison used.
-        baseline_mean_ms: Mean of the heuristic plan, re-timed post-sweep.
+        baseline_mean_ms: Mean of the OOTB plan, re-timed after the tuned build.
         oracle_mean_ms: Mean of the post-tuning run.
         delta_ms: ``baseline_mean_ms - oracle_mean_ms``; positive means the
             oracle is faster.
@@ -246,7 +222,9 @@ class ProviderEngineResult:
         role: ``engine`` for hipDNN engine rows, ``reference`` for timed
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
-        cpu_build_time_ms: CPU graph-build time.
+        cpu_build_time_ms: CPU time for graph setup plus plan build.
+        build_time_ms: CPU time for the plan build only (create, support
+            check, compile) of this engine's OOTB plan. None for PyTorch rows.
         gpu_kernel_stats: GPU kernel timing statistics.
         host_stats: Host-side submission timing statistics.
         correctness: Correctness comparison result.
@@ -283,8 +261,8 @@ class ProviderEngineResult:
         extra_metrics: Opt-in profiling payload from rocprofv3 PMC /
             traces, perf, and rocprof-compute roofline. None when no
             opt-in profiling flag was supplied.
-        oracle: Post-tuning result for this engine row. Set only when
-            ``--oracle-mode`` was requested and tuning succeeded.
+        oracle: Tuned result for this engine row. Set only when
+            ``--oracle-mode exhaustive`` was requested and tuning succeeded.
         oracle_delta: OOTB-vs-oracle comparison. None when either side
             lacks comparable statistics.
         oracle_error: Why tuning produced no result for this row.
@@ -313,6 +291,7 @@ class ProviderEngineResult:
     role: Literal["engine", "reference"] = "engine"
     plugin_path: Optional[str] = None
     cpu_build_time_ms: Optional[float] = None
+    build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
     elapsed_time_ms: float = 0.0
@@ -390,6 +369,8 @@ class ProviderEngineResult:
             )
         if self.status == "success":
             d["cpu_build_time_ms"] = self.cpu_build_time_ms
+            if self.build_time_ms is not None:
+                d["build_time_ms"] = self.build_time_ms
             d["gpu_kernel_stats"] = (
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
             )
@@ -608,12 +589,13 @@ class SuiteMetadata:
             suite end, via amdsmi. Reflects steady-state allocation, not
             per-kernel peak.
         vram_total_mb: Total VRAM on the GPU at suite end, via amdsmi.
-        pytorch_env: PyTorch kernel-selection settings in effect (NHWC,
-            AOTriton, TunableOp, cudnn.benchmark); None when none were set.
+        pytorch_env: Always-on PyTorch ROCm settings in effect (NHWC,
+            AOTriton); None when none were set. Tuned PyTorch settings live
+            only in the tuned child process and appear in ``oracle``.
         hipdnn_selection_env: hipDNN cache/benchmarking and MIOpen
             perf-db path environment variables sampled at suite end,
-            recorded only for oracle runs (``--oracle-mode plan`` or
-            ``exhaustive``). A ``None`` value means the variable was not
+            recorded only for oracle runs (``--oracle-mode
+            exhaustive``). A ``None`` value means the variable was not
             set, which is the load-bearing signal for cache-affected OOTB
             timings.
     """

@@ -1,17 +1,23 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Process-wide kernel-selection settings for the PyTorch path.
+"""Kernel-selection settings for the PyTorch path.
 
-Only PyTorch-private switches are used. ``MIOPEN_FIND_MODE`` and
-``MIOPEN_FIND_ENFORCE`` are deliberately NOT set: the hipDNN MIOpen plugin
-reads them too, so they would also change the hipDNN rows being compared.
+OOTB PyTorch runs in the benchmark process with layout and backend fixes only
+(:func:`apply_pytorch_environment`). Tuned PyTorch runs in a child process
+(:func:`tuned_subprocess_env`, :func:`enable_tuned_pytorch`) because PyTorch
+keeps conv algorithm choices in a process-wide cache whose key ignores
+``cudnn.benchmark``, and MIOpen persists search results in its user database.
+Running both in one process would let either measurement inherit the other's
+selection.
+
+``MIOPEN_FIND_MODE`` and ``MIOPEN_FIND_ENFORCE`` are deliberately NOT set: the
+hipDNN MIOpen plugin reads them too, so they would also change hipDNN rows.
 """
 
 import os
 import sys
-import tempfile
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import torch_support
 
@@ -25,51 +31,60 @@ _DEFAULT_ENV = {
     "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
 }
 
-# Only for exhaustive mode. TunableOp tunes GEMMs on first use per shape.
-_EXHAUSTIVE_ENV = {
-    "PYTORCH_TUNABLEOP_ENABLED": "1",
-    "PYTORCH_TUNABLEOP_TUNING": "1",
-}
+ENV_NAMES = tuple(_DEFAULT_ENV)
 
-ENV_NAMES = (*_DEFAULT_ENV, *_EXHAUSTIVE_ENV, "PYTORCH_TUNABLEOP_FILENAME")
-_CUDNN_BENCHMARK_KEY = "torch.backends.cudnn.benchmark"
+#: Reported as the tuned PyTorch run's knob settings.
+TUNED_SETTINGS: List[Dict[str, Any]] = [
+    {"knob_id": "torch.backends.cudnn.benchmark", "value": True},
+    {"knob_id": "PYTORCH_TUNABLEOP_ENABLED", "value": "1"},
+]
 
 
-def apply_pytorch_environment(
-    *, exhaustive: bool, cache_dir: Optional[str] = None
-) -> Dict[str, str]:
-    """Set PyTorch's ROCm kernel-selection controls and return what is in effect.
+def apply_pytorch_environment() -> Dict[str, str]:
+    """Set the always-on PyTorch ROCm controls and return what is in effect.
 
     Values already present in the environment win, so a caller can opt out.
-    Must run before the first GEMM or SDPA call, because PyTorch caches these.
-
-    Args:
-        exhaustive: Also enable MIOpen exhaustive conv search
-            (``torch.backends.cudnn.benchmark``) and TunableOp GEMM tuning.
-        cache_dir: Where TunableOp writes its results; a fresh temp directory
-            when None, so a stale CSV in the working directory is never read.
+    Must run before the first conv or SDPA call, because PyTorch caches these.
     """
-    env = dict(_DEFAULT_ENV)
-    if exhaustive:
-        env.update(_EXHAUSTIVE_ENV)
-        base = cache_dir or tempfile.mkdtemp(prefix="dnn-bench-tunableop-")
-        env["PYTORCH_TUNABLEOP_FILENAME"] = os.path.join(base, "tunableop_results.csv")
-    for name, value in env.items():
+    for name, value in _DEFAULT_ENV.items():
         os.environ.setdefault(name, value)
-    effective = {name: os.environ[name] for name in env}
-    if exhaustive and torch_support.module_available():
+    return {name: os.environ[name] for name in _DEFAULT_ENV}
+
+
+def tuned_subprocess_env(state_dir: str) -> Dict[str, str]:
+    """Return the environment for the isolated tuned-PyTorch child process.
+
+    TunableOp tunes GEMMs on first use. MIOpen's user database points at
+    ``state_dir``, so the exhaustive conv search neither reuses earlier tuning
+    nor leaves entries that a later OOTB run, PyTorch or hipDNN, would read.
+    These are forced, not defaulted: an inherited value would break isolation.
+    """
+    env = dict(os.environ)
+    env.update(
+        {
+            "PYTORCH_TUNABLEOP_ENABLED": "1",
+            "PYTORCH_TUNABLEOP_TUNING": "1",
+            "PYTORCH_TUNABLEOP_FILENAME": os.path.join(
+                state_dir, "tunableop_results.csv"
+            ),
+            "MIOPEN_USER_DB_PATH": state_dir,
+        }
+    )
+    return env
+
+
+def enable_tuned_pytorch() -> None:
+    """Make PyTorch's MIOpen Find run an exhaustive search (child process only)."""
+    if torch_support.module_available():
         import torch
 
-        # Passes exhaustiveSearch=true to MIOpen's Find for PyTorch convs only.
         torch.backends.cudnn.benchmark = True
-        effective[_CUDNN_BENCHMARK_KEY] = "True"
-    return effective
 
 
 def pytorch_environment_snapshot() -> Optional[Dict[str, Optional[str]]]:
-    """Return the settings in effect, or None when none were applied."""
+    """Return the always-on settings in effect, or None when none were set."""
     snapshot: Dict[str, Optional[str]] = {n: os.environ.get(n) for n in ENV_NAMES}
     torch = sys.modules.get("torch")
     if torch is not None and getattr(torch.backends.cudnn, "benchmark", False):
-        snapshot[_CUDNN_BENCHMARK_KEY] = "True"
+        snapshot["torch.backends.cudnn.benchmark"] = "True"
     return snapshot if any(v is not None for v in snapshot.values()) else None

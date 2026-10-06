@@ -657,13 +657,8 @@ class TestMachineSummaryPlatformLabel:
 def _make_oracle(**overrides) -> OracleResult:
     kwargs = dict(
         plan_name="tuned_plan_7",
-        compiled_plan_index=2,
-        rank=0,
-        sweep_min_time_ms=0.210,
-        compiled_plans_benchmarked=5,
-        compiled_plans_total=5,
-        compiled_plans_failed=0,
-        knob_settings=[],
+        knob_settings=[{"knob_id": "global.benchmarking", "value": 1}],
+        tuning_available=True,
         gpu_kernel_stats=BenchmarkStats(
             mean_ms=0.250,
             std_ms=0.01,
@@ -672,7 +667,7 @@ def _make_oracle(**overrides) -> OracleResult:
             p95_ms=0.255,
             p99_ms=0.258,
         ),
-        # The heuristic plan re-timed after the sweep; twice the tuned run,
+        # The OOTB plan re-timed after the tuned build; twice the tuned run,
         # so the rendered speedup is 2.00x.
         warm_baseline_gpu_kernel_stats=BenchmarkStats(
             mean_ms=0.500,
@@ -717,6 +712,19 @@ class TestOracleReporting:
         assert "2.00x" in out
         assert "ootb_kernel_mean_ms" in out
 
+    def test_table_reports_ootb_and_tuned_build_times_in_their_columns(self) -> None:
+        pe = _make_pe_success()
+        pe.build_time_ms = 12.5
+        pe.oracle = _make_oracle(build_time_ms=340.25)
+        pe.oracle_delta = build_oracle_delta(pe.oracle)
+        output = io.StringIO()
+        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
+        lines = output.getvalue().splitlines()
+        header = lines[1].split()
+        row = dict(zip(header, lines[3].split()))
+        assert row["ootb_build_ms"] == "12.500"
+        assert row["oracle_build_ms"] == "340.250"
+
     def test_table_marks_failed_oracle_row(self) -> None:
         pe = _make_pe_success()
         pe.oracle_error = "sweep exploded"
@@ -735,55 +743,12 @@ class TestOracleReporting:
             self._graph_with(pe), SuiteConfig()
         )
         out = output.getvalue()
-        assert "Oracle (auto-tuned):" in out
+        assert "Oracle (tuned):" in out
         # The engine is already in the row header; the block does not repeat it.
         assert "Engine:" not in out
-        assert "Compiled plans: 5 benchmarked successfully" in out
-        assert "5 total, 0 failed" in out
         assert "basis: gpu_kernel" in out
         assert "Warm OOTB:     0.500 ms" in out
         assert "Tuned vs warm OOTB:" in out
-
-    def test_verbose_reports_exhaustive_provider_selection(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(exhaustive_requested=True, exhaustive_supported=True)
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Exhaustive:    enabled for this provider" in out
-        assert "existing tuned selection may be reused" in out
-        assert "fresh search" not in out
-
-    def test_verbose_omits_the_exhaustive_line_by_default(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle()
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Exhaustive:" not in out
-
-    def test_verbose_reports_an_unsupported_exhaustive_provider(self) -> None:
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-            exhaustive_requested=True,
-            exhaustive_supported=False,
-        )
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "Exhaustive:    unsupported by this engine" in out
-        assert "tuned at plan level only" in out
-        assert "Tuning:        unavailable" in out
 
     def test_table_marks_a_failed_baseline_invalid_too(self) -> None:
         """A wrong baseline cannot measure a gain; the row must say so."""
@@ -843,6 +808,20 @@ class TestOracleReporting:
         assert "0.250" in out
         assert "2.00x" in out
 
+    def test_verbose_reports_ootb_and_tuned_plan_build_times_separately(self) -> None:
+        pe = _make_pe_success()
+        pe.build_time_ms = 12.5
+        pe.oracle = _make_oracle(build_time_ms=340.25)
+        output = io.StringIO()
+        Reporter(output=output).print_verbose_graph_result(
+            self._graph_with(pe), SuiteConfig()
+        )
+        engine_part, oracle_part = output.getvalue().split("Oracle (tuned):")
+        assert "Plan build time:      12.50 ms" in engine_part
+        assert "340.25" not in engine_part
+        assert "Plan build:    340.25 ms" in oracle_part
+        assert "12.50" not in oracle_part
+
     def test_table_marks_a_tuned_plan_that_failed_validation(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle(correctness=self._verdict(False))
@@ -876,16 +855,13 @@ class TestOracleReporting:
         assert "no speedup is reported" in out
 
     def test_table_marks_row_without_a_tuning_search(self) -> None:
-        """One compiled plan and no forced benchmarking is a remeasurement.
+        """An engine without a tuning knob only re-measured its OOTB plan.
 
         The ratio is real arithmetic but means nothing, so the table must not
         print it as a speedup.
         """
         pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-        )
+        pe.oracle = _make_oracle(tuning_available=False)
         pe.oracle_delta = build_oracle_delta(pe.oracle)
         assert pe.oracle_delta is not None
         output = io.StringIO()
@@ -894,7 +870,7 @@ class TestOracleReporting:
         assert "no-search" in out
         assert "2.00x" not in out
 
-    def test_table_reports_speedup_when_plans_competed(self) -> None:
+    def test_table_reports_speedup_when_tuning_was_available(self) -> None:
         pe = _make_pe_success()
         pe.oracle = _make_oracle()
         pe.oracle_delta = build_oracle_delta(pe.oracle)
@@ -904,28 +880,9 @@ class TestOracleReporting:
         assert "2.00x" in out
         assert "no-search" not in out
 
-    def test_table_reports_speedup_when_only_provider_variants_competed(self) -> None:
-        """Provider-level search counts even though one plan was compiled."""
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-            exhaustive_requested=True,
-            exhaustive_supported=True,
-        )
-        pe.oracle_delta = build_oracle_delta(pe.oracle)
-        output = io.StringIO()
-        Reporter(output=output).print_graph_result_table(self._graph_with(pe))
-        out = output.getvalue()
-        assert "2.00x" in out
-        assert "no-search" not in out
-
     def test_verbose_explains_a_missing_tuning_search(self) -> None:
         pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            compiled_plans_benchmarked=1,
-            compiled_plans_total=1,
-        )
+        pe.oracle = _make_oracle(tuning_available=False)
         pe.oracle_delta = build_oracle_delta(pe.oracle)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
@@ -934,22 +891,6 @@ class TestOracleReporting:
         out = output.getvalue()
         assert "Tuning:        unavailable" in out
         assert "run-to-run noise" in out
-
-    def test_verbose_empty_knobs_do_not_claim_no_variants_explored(self) -> None:
-        """``knob_settings: []`` means no explicit plan knobs, nothing more."""
-        pe = _make_pe_success()
-        pe.oracle = _make_oracle(
-            knob_settings=[],
-            exhaustive_requested=True,
-            exhaustive_supported=True,
-        )
-        output = io.StringIO()
-        Reporter(output=output).print_verbose_graph_result(
-            self._graph_with(pe), SuiteConfig()
-        )
-        out = output.getvalue()
-        assert "none set explicitly (engine defaults)" in out
-        assert "Exhaustive:    enabled for this provider" in out
 
     def test_verbose_renders_knob_lines(self) -> None:
         pe = _make_pe_success()
@@ -960,14 +901,13 @@ class TestOracleReporting:
         )
         out = output.getvalue()
         assert "SPLIT_K=4" in out
-        assert "engine defaults" not in out
 
     def test_verbose_renders_oracle_failure(self) -> None:
         pe = _make_pe_success()
-        pe.oracle_error = "no autotune candidate benchmarked successfully"
+        pe.oracle_error = "tuned plan build failed"
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(
             self._graph_with(pe), SuiteConfig()
         )
         out = output.getvalue()
-        assert "Oracle (auto-tuned): unavailable — no autotune candidate" in out
+        assert "Oracle (tuned): unavailable — tuned plan build failed" in out

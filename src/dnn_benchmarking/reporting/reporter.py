@@ -165,8 +165,8 @@ class Reporter:
             if no_search_rows:
                 self._print(
                     f"Oracle comparison: no tuning alternatives available on "
-                    f"any of {no_search_rows} engine rows (one compiled plan "
-                    f"each, provider tuning unavailable); no speedup reported"
+                    f"any of {no_search_rows} engine rows (no engine exposes "
+                    f"a tuning knob); no speedup reported"
                 )
             return
         suffix = (
@@ -430,6 +430,8 @@ class Reporter:
                     "warm_ootb_kernel_mean_ms",
                     "oracle_kernel_mean_ms",
                     "oracle_speedup",
+                    "ootb_build_ms",
+                    "oracle_build_ms",
                 ]
             )
         if include_warnings:
@@ -477,6 +479,8 @@ class Reporter:
                     row.append("failed")
                 else:
                     row.append("n/a")
+                row.append(self._fmt_ms(pe.build_time_ms))
+                row.append(self._fmt_ms(pe.oracle.build_time_ms if pe.oracle else None))
             if include_warnings:
                 row.append(self._fmt_warnings(pe.warnings))
             rows.append(row)
@@ -519,6 +523,10 @@ class Reporter:
         value = getattr(stats, name)
         return f"{value:.3f}"
 
+    @staticmethod
+    def _fmt_ms(value: Optional[float]) -> str:
+        return "n/a" if value is None else f"{value:.3f}"
+
     def print_verbose_graph_result(
         self, graph_result: GraphResult, suite_config: SuiteConfig
     ) -> None:
@@ -547,6 +555,8 @@ class Reporter:
 
             if pe.cpu_build_time_ms is not None:
                 self.print_init_time(pe.cpu_build_time_ms)
+            if pe.build_time_ms is not None:
+                self._print(f"  Plan build time:      {pe.build_time_ms:.2f} ms")
 
             if pe.status == "success":
                 self._print_pe_stats(pe)
@@ -598,46 +608,29 @@ class Reporter:
         self._print("")
 
     def _print_oracle_block(self, pe: ProviderEngineResult) -> None:
-        """Render the auto-tuned (oracle) comparison block in verbose mode."""
+        """Render the tuned (oracle) comparison block in verbose mode."""
         if pe.oracle is None:
             if pe.oracle_error is not None:
-                self._print(f"Oracle (auto-tuned): unavailable — {pe.oracle_error}")
+                self._print(f"Oracle (tuned): unavailable — {pe.oracle_error}")
                 self._print("")
             return
 
         o = pe.oracle
-        self._print("Oracle (auto-tuned):")
-        self._print(
-            f"  Plan:          {o.plan_name}  "
-            f"(compiled plan index {o.compiled_plan_index}, rank {o.rank})"
-        )
-        if o.knob_settings:
-            self._print("  Knobs:")
-            for knob in o.knob_settings:
-                self._print(f"    {knob['knob_id']}={knob['value']}")
-        else:
-            self._print("  Knobs:         none set explicitly (engine defaults)")
-        self._print(
-            f"  Compiled plans: {o.compiled_plans_benchmarked} benchmarked "
-            f"successfully ({o.compiled_plans_total} total, "
-            f"{o.compiled_plans_failed} failed)"
-        )
-        if o.exhaustive_requested:
-            if o.exhaustive_supported:
-                self._print(
-                    "  Exhaustive:    enabled for this provider "
-                    "(an existing tuned selection may be reused)"
-                )
-            else:
-                self._print(
-                    "  Exhaustive:    unsupported by this engine; "
-                    "this row was tuned at plan level only"
-                )
+        self._print("Oracle (tuned):")
+        self._print(f"  Plan:          {o.plan_name}")
+        self._print("  Knobs:")
+        for knob in o.knob_settings:
+            self._print(f"    {knob['knob_id']}={knob['value']}")
+        if o.build_time_ms is not None:
+            self._print(
+                f"  Plan build:    {o.build_time_ms:.2f} ms   "
+                "(compiles every candidate; OOTB plan build is reported above)"
+            )
         if not o.tuning_available:
             self._print(
-                "  Tuning:        unavailable - one compiled plan and no "
-                "provider-level tuning capability, so this pass re-measured "
-                "the heuristic configuration; any delta below is run-to-run noise"
+                "  Tuning:        unavailable - the engine exposes no tuning "
+                "knob, so this pass re-measured the OOTB configuration; any "
+                "delta below is run-to-run noise"
             )
         if o.correctness is not None:
             if o.correctness.passed:
@@ -648,10 +641,6 @@ class Reporter:
                     f"  Validation:    tuned plan FAILED - {detail}; "
                     "no speedup is reported for this row"
                 )
-        self._print(
-            f"  Sweep minimum: {o.sweep_min_time_ms:.3f} ms   "
-            "(fastest single iteration from the selection sweep)"
-        )
         if o.gpu_kernel_stats is not None:
             self._print(f"  Kernel mean:   {o.gpu_kernel_stats.mean_ms:.3f} ms")
         if o.host_stats is not None:
@@ -662,7 +651,7 @@ class Reporter:
             d = pe.oracle_delta
             self._print(
                 f"  Warm OOTB:     {d.baseline_mean_ms:.3f} ms   "
-                "(heuristic plan, re-timed after the sweep)"
+                "(OOTB plan, re-timed after the tuned build)"
             )
             if o.warm_baseline_derived_tflops_per_s is not None:
                 self._print(

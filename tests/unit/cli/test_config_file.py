@@ -132,9 +132,9 @@ oracle_mode = "exhaustive"
 """,
     )
 
-    args = _parse_with_config(["--config", str(config), "--oracle-mode", "plan"])
+    args = _parse_with_config(["--config", str(config), "--oracle-mode", "off"])
 
-    assert args.oracle_mode == "plan"
+    assert args.oracle_mode == "off"
 
 
 def test_pytorch_rocm_fa_library_config_and_cli_precedence(tmp_path: Path) -> None:

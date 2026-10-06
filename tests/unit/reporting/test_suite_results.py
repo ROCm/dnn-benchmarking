@@ -156,6 +156,17 @@ class TestProviderEngineResult:
         assert d["engine_version"] == "unavailable"
         assert d["started_at"].endswith("+00:00")
 
+    def test_success_serializes_plan_build_time_only_when_measured(self):
+        """PyTorch rows have no plan build; they must not emit a null one."""
+        measured = ProviderEngineResult(
+            provider="miopen", engine_id=1, status="success", build_time_ms=3.5
+        )
+        unmeasured = ProviderEngineResult(
+            provider="pytorch", engine_id=0, status="success"
+        )
+        assert measured.to_dict()["build_time_ms"] == 3.5
+        assert "build_time_ms" not in unmeasured.to_dict()
+
     def test_success_serializes_plugin_path(self):
         stats = BenchmarkStats(
             mean_ms=1.0,
@@ -623,13 +634,8 @@ def _stats(mean_ms: float) -> BenchmarkStats:
 def _oracle(**overrides) -> OracleResult:
     kwargs = dict(
         plan_name="plan_x",
-        compiled_plan_index=3,
-        rank=0,
-        sweep_min_time_ms=0.8,
-        compiled_plans_benchmarked=4,
-        compiled_plans_total=4,
-        compiled_plans_failed=0,
         knob_settings=[],
+        tuning_available=True,
     )
     kwargs.update(overrides)
     return OracleResult(**kwargs)
@@ -645,7 +651,10 @@ class TestOracleSerialization:
 
     def test_oracle_and_delta_serialize_under_success(self):
         oracle = _oracle(
-            gpu_kernel_stats=_stats(1.0), warm_baseline_gpu_kernel_stats=_stats(2.0)
+            knob_settings=[{"knob_id": "global.benchmarking", "value": 1}],
+            build_time_ms=250.0,
+            gpu_kernel_stats=_stats(1.0),
+            warm_baseline_gpu_kernel_stats=_stats(2.0),
         )
         pe = ProviderEngineResult(
             provider="p",
@@ -658,15 +667,25 @@ class TestOracleSerialization:
         d = pe.to_dict()
         assert d["oracle"]["plan_name"] == "plan_x"
         # The engine is the row's own; it is deliberately not duplicated here.
-        assert "engine_id" not in d["oracle"]
-        assert "engine_name" not in d["oracle"]
-        assert d["oracle"]["knob_settings"] == []
-        assert d["oracle"]["exhaustive_requested"] is False
-        assert d["oracle"]["exhaustive_enabled"] is False
+        assert set(d["oracle"]) == {
+            "plan_name",
+            "knob_settings",
+            "tuning_available",
+            "build_time_ms",
+            "cpu_build_time_ms",
+            "gpu_kernel_stats",
+            "host_stats",
+            "warm_baseline_gpu_kernel_stats",
+            "warm_baseline_host_stats",
+            "correctness",
+            "derived_tflops_per_s",
+            "warm_baseline_derived_tflops_per_s",
+        }
+        assert d["oracle"]["knob_settings"] == [
+            {"knob_id": "global.benchmarking", "value": 1}
+        ]
         assert d["oracle"]["tuning_available"] is True
-        assert d["oracle"]["compiled_plans_benchmarked"] == 4
-        assert d["oracle"]["compiled_plans_total"] == 4
-        assert d["oracle"]["compiled_plans_failed"] == 0
+        assert d["oracle"]["build_time_ms"] == 250.0
         assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
         assert d["oracle_delta"]["basis"] == "gpu_kernel"
         assert d["oracle_delta"]["speedup"] == 2.0

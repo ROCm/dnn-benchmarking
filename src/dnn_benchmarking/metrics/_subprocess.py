@@ -19,7 +19,7 @@ group, so the pipes close and ``TimeoutExpired`` actually propagates.
 import os
 import signal
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # Grace period for reaping the killed process group. Bounded so a
 # grandchild that escaped the group (its own session) can't hold the
@@ -66,7 +66,9 @@ def _kill_tree(proc: "subprocess.Popen[str]") -> None:
 
 
 def run_capped(
-    argv: List[str], timeout_s: Optional[int]
+    argv: List[str],
+    timeout_s: Optional[int],
+    env: Optional[Dict[str, str]] = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run ``argv``, capturing text output, under a real wall-clock cap.
 
@@ -79,6 +81,7 @@ def run_capped(
     Args:
         argv: Command to run.
         timeout_s: Wall-clock budget in seconds; ``None`` disables it.
+        env: Child environment; ``None`` inherits this process's.
 
     Returns:
         The completed process with ``stdout``/``stderr`` as text.
@@ -94,6 +97,7 @@ def run_capped(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        env=env,
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout_s)

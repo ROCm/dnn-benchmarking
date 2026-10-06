@@ -101,6 +101,7 @@ class Executor:
         self._workspace_ptr: int = 0
         self._workspace_size: int = 0
         self._init_time_ms: float = 0.0
+        self._build_time_ms: float = 0.0
         self._stream_sync_timer: Optional[HipGpuTimer] = None
         self._selected_engine_id: Optional[int] = None
 
@@ -209,76 +210,70 @@ class Executor:
         self,
         handle: Any,
         engine_id: Optional[int] = None,
-        for_autotune: bool = False,
+        knobs: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Build the operation graph and prepare for execution.
+        """Build the operation graph and one execution plan.
+
+        ``build_time_ms`` times only the plan build (create, support check,
+        compile), so OOTB and tuned builds of one engine are comparable.
+        ``init_time_ms`` also includes graph setup and workspace allocation.
 
         Args:
             handle: hipdnn.Handle instance.
-            engine_id: Optional engine ID to use. If specified, overrides
-                       any engine ID in the graph JSON.
-            for_autotune: When True, build every candidate plan
-                (``BuildPlanPolicy.ALL``) instead of hard-selecting one
-                engine, and size the workspace for the largest candidate.
-                No engine is pinned; :meth:`autotune` picks the winner and
-                restricts candidates with ``engine_id_filter``.
+            engine_id: Build the plan for exactly this engine. When None, the
+                backend heuristic picks the engine.
+            knobs: Knob settings applied to the ``engine_id`` plan, keyed by
+                knob id. Knobs the engine does not expose are ignored by hipDNN.
 
         Raises:
+            ValueError: If ``knobs`` is given without ``engine_id``.
             ExecutionError: If graph building fails.
         """
+        if knobs and engine_id is None:
+            raise ValueError("knobs require an explicit engine_id")
         with Timer() as t:
             self._execution_stream = _get_handle_stream(handle)
             hipdnn = self._build_through_operation_graph(handle)
 
-            if engine_id is not None and not for_autotune:
-                # Hard engine selection: build the plan for exactly this engine.
-                # create_execution_plan_ext reports a bad result if the engine is
-                # not valid/applicable, so it can never silently fall back to a
-                # different engine the way the soft preferred-engine path could.
-                result = self._graph.create_execution_plan_ext(engine_id)
+            with Timer() as build_timer:
+                if engine_id is not None:
+                    # Hard engine selection: build the plan for exactly this
+                    # engine. create_execution_plan_ext reports a bad result if
+                    # the engine is not valid/applicable, so it never silently
+                    # falls back to a different engine.
+                    settings = [
+                        hipdnn.KnobSetting(knob_id, value)
+                        for knob_id, value in (knobs or {}).items()
+                    ]
+                    result = self._graph.create_execution_plan_ext(engine_id, settings)
+                    if result.is_bad():
+                        raise UnsupportedGraphError(
+                            f"Forced engine {engine_id} not applicable to this graph: "
+                            f"{result.get_message()}"
+                        )
+                else:
+                    result = self._graph.create_execution_plans()
+                    if result.is_bad():
+                        raise ExecutionError(
+                            f"Failed to create execution plans: {result.get_message()}"
+                        )
+
+                result = self._graph.check_support()
                 if result.is_bad():
                     raise UnsupportedGraphError(
-                        f"Forced engine {engine_id} not applicable to this graph: "
-                        f"{result.get_message()}"
+                        f"Backend support check failed: {result.get_message()}"
                     )
-            else:
-                result = self._graph.create_execution_plans()
+
+                result = self._graph.build_plans()
                 if result.is_bad():
                     raise ExecutionError(
-                        f"Failed to create execution plans: {result.get_message()}"
+                        f"Failed to build plans: {result.get_message()}"
                     )
+            self._build_time_ms = build_timer.elapsed_ms
 
-            result = self._graph.check_support()
-            if result.is_bad():
-                raise UnsupportedGraphError(
-                    f"Backend support check failed: {result.get_message()}"
-                )
+            self._record_selected_engine(engine_id)
 
-            if for_autotune and engine_id is not None:
-                # Compile only this engine's plans. The engine filter controls
-                # measurement; barring also avoids unrelated compile/workspace cost.
-                others = [
-                    int(eid)
-                    for eid in self._graph.get_ranked_engine_ids()
-                    if int(eid) != engine_id
-                ]
-                if others:
-                    self._graph.deselect_engines(others)
-
-            if for_autotune:
-                result = self._graph.build_plans(hipdnn.BuildPlanPolicy.ALL)
-            else:
-                result = self._graph.build_plans()
-            if result.is_bad():
-                raise ExecutionError(f"Failed to build plans: {result.get_message()}")
-
-            if not for_autotune:
-                self._record_selected_engine(engine_id)
-
-            if for_autotune:
-                workspace_size = self._graph.get_autotune_workspace_size()
-            else:
-                workspace_size = self._graph.get_workspace_size()
+            workspace_size = self._graph.get_workspace_size()
             self._workspace_size = int(workspace_size)
             if workspace_size > 0:
                 self._workspace = hipdnn.DeviceBuffer(workspace_size)
@@ -286,71 +281,11 @@ class Executor:
 
         self._init_time_ms = t.elapsed_ms
 
-    def autotune(
-        self,
-        handle: Any,
-        variant_pack: Dict[int, int],
-        engine_id: int,
-    ) -> List[Any]:
-        """Benchmark this engine's compiled plans and activate the winner.
-
-        Provider benchmarking can be enabled while the plans are built. Keep
-        this compiled-plan sweep in STANDARD mode because hipDNN rejects
-        ``TuneMode.EXHAUSTIVE`` here.
-        """
+    def engine_knob_ids(self, engine_id: int) -> List[str]:
+        """Knob ids the engine exposes for this graph. Call after prepare()."""
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
-
-        try:
-            import hipdnn_frontend as hipdnn
-        except ImportError as e:
-            raise ExecutionError(
-                "hipdnn_frontend not available. Install hipDNN Python bindings."
-            ) from e
-
-        cfg = hipdnn.AutotuneConfig()
-        cfg.engine_id_filter = [engine_id]
-        # At least one warmup keeps first-execute provider setup out of the
-        # candidate timing. The later reported benchmark keeps the user's
-        # configured warmup count.
-        cfg.warmup_iterations = max(1, self._config.warmup_iters)
-        # Precompiled plans preserve the backend's candidate set. A default
-        # plan spec narrows it; add_engine_sweep() invents knob combinations.
-        try:
-            # Omitting workspace_size selects the compiled-plan overload.
-            results = self._graph.autotune(
-                handle, variant_pack, self._workspace_ptr, config=cfg
-            )
-        except RuntimeError as e:
-            raise ExecutionError(f"Autotuning failed: {e}") from e
-
-        # hipDNN returns successes first in rank order.
-        winners = [r for r in results if r.succeeded]
-        if not winners:
-            # Ignore candidates excluded by caller filters when choosing the
-            # actionable failure message.
-            message = next(
-                (
-                    r.error_message
-                    for r in results
-                    if not r.excluded_by_caller and r.error_message
-                ),
-                "",
-            )
-            raise ExecutionError(
-                message or "no autotune candidate benchmarked successfully"
-            )
-
-        winner = winners[0]
-        if int(winner.engine_id) != engine_id:
-            # A mismatch would attach timing to the wrong engine row.
-            raise ExecutionError(
-                f"Autotune winner is engine {int(winner.engine_id)}, but "
-                f"candidates were filtered to engine {engine_id}"
-            )
-
-        self._record_selected_engine(None)
-        return results
+        return [str(k.knob_id) for k in self._graph.get_knobs_for_engine(engine_id)]
 
     def plan_name(self, handle: Any) -> Optional[str]:
         """Name of the currently active execution plan, or None if unprepared.
@@ -596,6 +531,11 @@ class Executor:
     def init_time_ms(self) -> float:
         """Get graph initialization time in milliseconds."""
         return self._init_time_ms
+
+    @property
+    def build_time_ms(self) -> float:
+        """Plan create, support check, and compile time in milliseconds."""
+        return self._build_time_ms
 
     @property
     def workspace_size(self) -> int:

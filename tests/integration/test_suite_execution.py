@@ -742,7 +742,7 @@ class TestOracleCLIIntegration:
     ) -> None:
         output_file = tmp_path / "oracle.json"
         result = self._run(
-            project_root, output_file, cli_plugin_args, ["--oracle-mode", "plan"]
+            project_root, output_file, cli_plugin_args, ["--oracle-mode", "exhaustive"]
         )
 
         assert result.returncode in (
@@ -769,9 +769,13 @@ class TestOracleCLIIntegration:
         # unregistered engine ID produces.
         assert oracle["plan_name"] == tuned[0]["engine_name"]
         assert not oracle["plan_name"].startswith("0x")
-        assert oracle["rank"] == 0
-        assert oracle["compiled_plan_index"] >= 0
-        assert oracle["compiled_plans_benchmarked"] >= 1
+        assert oracle["knob_settings"] == [
+            {"knob_id": "global.benchmarking", "value": 1}
+        ]
+        assert isinstance(oracle["tuning_available"], bool)
+        # OOTB and tuned plan builds are both reported for comparison.
+        assert tuned[0]["build_time_ms"] > 0
+        assert oracle["build_time_ms"] > 0
         delta = tuned[0]["oracle_delta"]
         assert set(delta) == {
             "basis",
@@ -780,8 +784,8 @@ class TestOracleCLIIntegration:
             "delta_ms",
             "speedup",
         }
-        # The baseline is the post-sweep re-timing carried on the oracle
-        # payload, never the row's own pre-sweep OOTB number.
+        # The baseline is the warm re-timing carried on the oracle payload,
+        # never the row's own cold OOTB number.
         assert oracle["warm_baseline_gpu_kernel_stats"] is not None
         assert (
             delta["baseline_mean_ms"]

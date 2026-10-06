@@ -109,7 +109,7 @@ _PYTORCH_SDPA_BACKEND_HELP = ", ".join(sorted(PYTORCH_SDPA_BACKEND_CHOICES))
 _METRICS_TIER_CHOICES = frozenset({"basic", "off"})
 _EMIT_TRACE_CHOICES = frozenset({"pftrace"})
 _PMC_CHOICES = frozenset({"basic", "memory", "flops", "all"})
-_ORACLE_MODE_CHOICES = frozenset({"off", "plan", "exhaustive"})
+_ORACLE_MODE_CHOICES = frozenset({"off", "exhaustive"})
 
 CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
@@ -265,15 +265,13 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         metavar="MODE",
         group="Output",
         help=(
-            "Oracle comparison depth (default: off). 'plan' also times the "
-            "plan hipDNN auto-tuning picks for each engine and reports the "
-            "delta against the heuristic plan. 'exhaustive' additionally "
-            "forces provider kernel benchmarking so providers sample kernel "
-            "variants; both run one tuning sweep per engine and are "
-            "significantly slower, 'exhaustive' much more so. 'exhaustive' "
-            "also tunes PyTorch (MIOpen exhaustive conv search, TunableOp "
-            "GEMM tuning) when PyTorch is timed; with --backend pytorch only "
-            "'exhaustive' and 'off' apply."
+            "Tuned comparison (default: off). 'exhaustive' builds a second "
+            "plan per engine with global.benchmarking=1, so providers that "
+            "support it (kernel ingestor, MIOpen) sample their candidate "
+            "kernels, and reports its build time, timing, and speedup next to "
+            "the OOTB row. PyTorch rows get a tuned run (MIOpen exhaustive "
+            "conv search, TunableOp GEMM tuning) in an isolated subprocess. "
+            "Significantly slower; requires --warmup >= 1."
         ),
         config_key="oracle_mode",
         config_kind=ConfigKind.CHOICE,
@@ -652,6 +650,14 @@ Tarball Input:
         "--internal-profiling-graph",
         type=Path,
         default=None,
+        help=argparse.SUPPRESS,
+    )
+    # Hidden child mode for the tuned PyTorch run: the parent re-execs the CLI
+    # with --backend pytorch so tuning state stays out of its own process.
+    parser.add_argument(
+        "--internal-pytorch-tuned",
+        action="store_true",
+        default=False,
         help=argparse.SUPPRESS,
     )
 

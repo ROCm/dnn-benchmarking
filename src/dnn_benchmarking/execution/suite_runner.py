@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -36,6 +37,7 @@ from ..metrics import (
     derive_throughputs,
 )
 from ..metrics._diagnostic import warn_once
+from ..metrics._subprocess import run_capped
 from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats
 from ..reporting.suite_results import (
@@ -491,6 +493,141 @@ def _compute_graph_analytical_metrics(
     return analytical_flops, analytical_flops_partial, analytical_io_bytes
 
 
+def _pytorch_tuned_argv(
+    graph_path: Path, config: SuiteConfig, output: Path
+) -> List[str]:
+    """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle."""
+    argv = [
+        sys.executable,
+        "-m",
+        "dnn_benchmarking",
+        "--internal-pytorch-tuned",
+        "--backend",
+        "pytorch",
+        "--oracle-mode",
+        "off",
+        "--metrics-tier",
+        "off",
+        "--graph",
+        str(graph_path),
+        "--warmup",
+        str(config.warmup_iters),
+        "--iters",
+        str(config.benchmark_iters),
+        "--timing-block",
+        str(config.timing_block),
+        "--pytorch-sdpa-backend",
+        config.pytorch_sdpa_backend.value,
+        "--output",
+        str(output),
+    ]
+    if config.seed is not None:
+        argv += ["--seed", str(config.seed)]
+    if config.pytorch_rocm_fa_library is not None:
+        argv += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
+    return argv
+
+
+def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str, Any]:
+    """Time tuned PyTorch in a fresh process and return its result row.
+
+    The child owns every piece of tuning state (conv algorithm cache,
+    TunableOp results, MIOpen user database), and the temporary directory
+    holding it is deleted afterwards, so no OOTB run can observe it.
+
+    Raises:
+        RuntimeError: If the child fails or reports no successful row.
+    """
+    from ..common.pytorch_tuning import tuned_subprocess_env
+
+    with tempfile.TemporaryDirectory(prefix="dnn-bench-pytorch-tuned-") as state_dir:
+        output = Path(state_dir) / "result.json"
+        proc = run_capped(
+            _pytorch_tuned_argv(graph_path, config, output),
+            None,
+            env=tuned_subprocess_env(state_dir),
+        )
+        if not output.is_file():
+            # The CLI reports fatal errors on stdout and warnings on stderr.
+            lines = [
+                line.strip()
+                for line in f"{proc.stdout or ''}\n{proc.stderr or ''}".splitlines()
+                if line.strip()
+            ]
+            errors = [line for line in lines if "error" in line.lower()]
+            detail = (errors or lines or ["no output"])[-1]
+            raise RuntimeError(
+                f"tuned PyTorch child exited {proc.returncode}: {detail}"
+            )
+        document = json.loads(output.read_text())
+    rows = [row for graph in document["graphs"] for row in graph["results"]]
+    if len(rows) != 1:
+        raise RuntimeError(f"tuned PyTorch child returned {len(rows)} rows")
+    row = rows[0]
+    if row["status"] != "success":
+        raise RuntimeError(
+            row.get("error_message") or row.get("skip_reason") or row["status"]
+        )
+    return row
+
+
+def _stats_from_dict(data: Optional[Dict[str, float]]) -> Optional[BenchmarkStats]:
+    return BenchmarkStats(**data) if data else None
+
+
+def _run_pytorch_oracle_pass(
+    *,
+    result: ProviderEngineResult,
+    graph_path: Path,
+    graph_name: str,
+    config: SuiteConfig,
+    executor: Any,
+    tensors: Any,
+    buffer_manager: Any,
+) -> None:
+    """Attach tuned PyTorch timing without failing the OOTB row.
+
+    The tuned run happens in a child process; this process only re-times its
+    own OOTB executor afterwards as the warm baseline. Tuned outputs are not
+    validated: they never enter this process.
+    """
+    from ..common.pytorch_tuning import TUNED_SETTINGS
+
+    try:
+        tuned = _run_pytorch_tuned_child(graph_path, config)
+        # Re-time OOTB after the tuned run so both operands share device warmth.
+        buffer_manager.zero_outputs()
+        executor.warmup(tensors)
+        baseline = executor.benchmark(tensors, graph_name=graph_name)
+        oracle = OracleResult(
+            plan_name="pytorch (tuned)",
+            knob_settings=[dict(setting) for setting in TUNED_SETTINGS],
+            tuning_available=True,
+            cpu_build_time_ms=tuned.get("cpu_build_time_ms"),
+            host_stats=_stats_from_dict(tuned.get("host_stats")),
+            gpu_kernel_stats=_stats_from_dict(tuned.get("gpu_kernel_stats")),
+            warm_baseline_host_stats=BenchmarkStats.from_timings(baseline.host_timings),
+            warm_baseline_gpu_kernel_stats=(
+                BenchmarkStats.from_timings(baseline.kernel_timings)
+                if baseline.has_kernel_timings
+                else None
+            ),
+        )
+        # Same FLOPs and median denominator as the row's derived TFLOP/s.
+        oracle.derived_tflops_per_s = _median_tflops(
+            result.analytical_flops, oracle.gpu_kernel_stats
+        )
+        oracle.warm_baseline_derived_tflops_per_s = _median_tflops(
+            result.analytical_flops, oracle.warm_baseline_gpu_kernel_stats
+        )
+        result.oracle = oracle
+        result.oracle_delta = build_oracle_delta(oracle)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        result.oracle_error = error
+        warn_once("oracle", f"tuned PyTorch run failed for {graph_name}: {error}")
+
+
 def _run_timed_pytorch_row(
     graph_path: Path,
     graph_json: Dict[str, Any],
@@ -510,6 +647,9 @@ def _run_timed_pytorch_row(
     default-dispatch references are skipped; failed strict selections are
     errors because their requested native SDPA path was not fulfilled. With
     ``role="engine"`` (the ``--backend pytorch`` path), failures are errors.
+
+    With ``--oracle-mode exhaustive`` a tuned run is attached as the row's
+    oracle, measured in an isolated child process.
     """
     from . import pytorch_ops
 
@@ -583,6 +723,17 @@ def _run_timed_pytorch_row(
                         analytical_flops=analytical_flops,
                         analytical_flops_partial=analytical_flops_partial,
                         analytical_io_bytes=analytical_io_bytes,
+                    )
+
+                if config.oracle_enabled:
+                    _run_pytorch_oracle_pass(
+                        result=result,
+                        graph_path=graph_path,
+                        graph_name=graph_name,
+                        config=config,
+                        executor=executor,
+                        tensors=tensors,
+                        buffer_manager=buffer_manager,
                     )
 
                 if role == "reference":
@@ -1083,23 +1234,21 @@ def _collect_basic_metrics_post_loop(
         warn_once("gpu_smi", f"vram snapshot failed: {e}")
 
 
-# Benchmarking is latched when oracle plans are built. Disable hipDNN disk
-# caches so the selected provider variant cannot affect later runs.
+#: hipDNN knob that makes a provider sample its candidate kernels on the first
+#: execute() and keep the fastest (kernel ingestor, MIOpen).
+BENCHMARKING_KNOB = "global.benchmarking"
+
+# A benchmarking plan writes its winner to the hipDNN disk cache, and cache
+# reads are not gated on benchmarking, so a later OOTB row would serve it.
 # ponytail: process-global guard; concurrent execution needs process isolation.
-_EXHAUSTIVE_ENV = {
-    "HIPDNN_FORCE_BENCHMARKING": "1",
-    "HIPDNN_DISABLE_CACHE": "1",
-}
+_TUNED_ENV = {"HIPDNN_DISABLE_CACHE": "1"}
 
 
 @contextmanager
-def _exhaustive_env(enabled: bool):
-    """Set provider benchmarking controls and restore the prior environment."""
-    if not enabled:
-        yield
-        return
-    previous = {name: os.environ.get(name) for name in _EXHAUSTIVE_ENV}
-    os.environ.update(_EXHAUSTIVE_ENV)
+def _tuned_env():
+    """Disable hipDNN disk caches and restore the prior environment."""
+    previous = {name: os.environ.get(name) for name in _TUNED_ENV}
+    os.environ.update(_TUNED_ENV)
     try:
         yield
     finally:
@@ -1135,9 +1284,14 @@ def _run_oracle_pass(
     graph_json: Dict[str, Any],
     reference_outputs: Optional[Dict[int, Any]],
 ) -> None:
-    """Tune one engine and attach its result without failing the OOTB row."""
+    """Build and time this engine's tuned plan without failing the OOTB row.
+
+    The tuned plan goes through the same timed build as the OOTB plan, for
+    the same engine, with ``global.benchmarking=1``.
+    """
+    knobs = {BENCHMARKING_KNOB: 1}
     try:
-        with _exhaustive_env(config.oracle_exhaustive):
+        with _tuned_env():
             # Isolate MIOpen's mutable per-handle solver map from the baseline.
             oracle_handle = type(handle)()
             get_stream = getattr(handle, "get_stream", None)
@@ -1155,22 +1309,18 @@ def _run_oracle_pass(
                 graph_json_str=graph_json_str,
                 config=bench_config,
             )
-            executor.prepare(oracle_handle, engine_id=engine_id, for_autotune=True)
+            executor.prepare(oracle_handle, engine_id=engine_id, knobs=knobs)
+            # hipDNN ignores a knob the engine does not expose; such a tuned
+            # run re-measures the OOTB configuration.
+            tuning_available = BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id)
 
             # Restore outputs; inputs remain valid across executions.
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
 
-            candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
-            eligible_candidates = [
-                candidate
-                for candidate in candidates
-                if not getattr(candidate, "excluded_by_caller", False)
-            ]
-            successful_candidates = [
-                candidate for candidate in eligible_candidates if candidate.succeeded
-            ]
-            winner = successful_candidates[0]
+            # The first execute samples every candidate and keeps the fastest;
+            # the warmup absorbs that sweep (exhaustive requires warmup >= 1).
+            executor.warmup(oracle_handle, variant_pack)
 
             # Re-time OOTB after the sweep so both operands share device warmth.
             bm.zero_outputs()
@@ -1187,18 +1337,12 @@ def _run_oracle_pass(
 
             oracle = OracleResult(
                 plan_name=executor.plan_name(oracle_handle) or "",
-                compiled_plan_index=int(winner.compiled_plan_index),
-                rank=int(winner.rank),
-                sweep_min_time_ms=float(winner.min_time_ms),
-                compiled_plans_benchmarked=len(successful_candidates),
-                compiled_plans_total=len(eligible_candidates),
-                compiled_plans_failed=(
-                    len(eligible_candidates) - len(successful_candidates)
-                ),
                 knob_settings=[
-                    {"knob_id": str(k.knob_id), "value": k.value}
-                    for k in winner.knob_settings
+                    {"knob_id": knob_id, "value": value}
+                    for knob_id, value in knobs.items()
                 ],
+                tuning_available=tuning_available,
+                build_time_ms=executor.build_time_ms,
                 cpu_build_time_ms=executor.init_time_ms,
                 host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
                 gpu_kernel_stats=(
@@ -1213,10 +1357,6 @@ def _run_oracle_pass(
                     BenchmarkStats.from_timings(baseline_result.kernel_timings)
                     if baseline_result.has_kernel_timings
                     else None
-                ),
-                exhaustive_requested=config.oracle_exhaustive,
-                exhaustive_supported=bool(
-                    getattr(winner, "supports_exhaustive", False)
                 ),
             )
             # Same FLOPs and median denominator as the row's derived TFLOP/s.
@@ -1315,6 +1455,7 @@ def run_single_provider_engine(
         )
         executor.prepare(handle, engine_id=engine_id)
         result.cpu_build_time_ms = executor.init_time_ms
+        result.build_time_ms = executor.build_time_ms
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
 

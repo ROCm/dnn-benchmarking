@@ -66,10 +66,10 @@ roofline = false
 # Timeout in seconds for each external profiler subprocess. Use 0 to disable the timeout.
 profiling_timeout = 600
 
-# Oracle comparison depth: "off", "plan", or "exhaustive".
-# "plan" adds one hipDNN auto-tuning sweep per engine row and reports the
-# tuned timing beside the out-of-the-box timing. "exhaustive" additionally
-# forces provider kernel benchmarking. Both are significantly slower.
+# Tuned comparison: "off" or "exhaustive". "exhaustive" builds a second plan
+# per engine with the global.benchmarking knob, reports its build time and
+# timing beside the out-of-the-box row, and gives timed PyTorch rows a tuned
+# run in an isolated child process. Significantly slower; needs warmup >= 1.
 # oracle_mode = "off"
 
 # Optional explicit engine matrix. Uncomment to run only specific engine IDs.

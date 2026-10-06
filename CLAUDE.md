@@ -46,6 +46,13 @@ the active path is always printed. `--cache-dir` sets `HIPDNN_CACHE_DIR`; the wi
 is keyed by graph and device, not by checkout or session, so give each phase its own empty
 root or a concurrent/previous run's rankings leak into this one's results.
 
+`--oracle-mode exhaustive` builds a second plan per engine through the same timed path as
+OOTB (`create_execution_plan_ext(engine_id, knobs)` -> `check_support()` -> `build_plans()`)
+with the `global.benchmarking=1` knob, so each engine reports `build_time_ms` (OOTB) and
+`oracle.build_time_ms` (tuned). Timed PyTorch rows get their tuned run in a child process
+(`--internal-pytorch-tuned`) because PyTorch's conv algorithm cache and MIOpen's user DB
+would otherwise carry tuning into the OOTB measurement.
+
 ### ROCm PyTorch Setup
 
 `setup_env.py` auto-detects the GPU architecture and installs PyTorch from the

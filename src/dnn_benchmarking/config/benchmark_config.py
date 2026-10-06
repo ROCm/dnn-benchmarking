@@ -350,10 +350,10 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
-        oracle_mode: Oracle comparison depth. "off" runs no comparison;
-            "plan" times the auto-tuner's chosen plan against the heuristic
-            plan; "exhaustive" additionally forces provider kernel
-            benchmarking so providers sample kernel variants.
+        oracle_mode: "off" runs no comparison. "exhaustive" builds a second
+            plan per engine with ``global.benchmarking=1`` so providers sample
+            their candidate kernels, and times it against the OOTB plan.
+            PyTorch rows get a tuned run in an isolated subprocess.
         metrics: Metric collection configuration. Defaults to ``basic`` tier
             (always-on probes, no extra runs).
         backend: Execution backend (``hipdnn`` runs discovered engine plugins,
@@ -383,9 +383,6 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Tune PyTorch's own kernel selection (MIOpen exhaustive search, TunableOp
-    #: GEMM tuning) when PyTorch is timed. Applied by the CLI, not by this class.
-    pytorch_exhaustive: bool = False
     #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
@@ -393,12 +390,7 @@ class SuiteConfig:
 
     @property
     def oracle_enabled(self) -> bool:
-        """True when any oracle comparison should run."""
-        return self.oracle_mode != "off"
-
-    @property
-    def oracle_exhaustive(self) -> bool:
-        """True when the oracle pass must force provider kernel benchmarking."""
+        """True when the tuned (oracle) comparison should run."""
         return self.oracle_mode == "exhaustive"
 
     def __post_init__(self) -> None:
@@ -409,6 +401,11 @@ class SuiteConfig:
             raise ValueError("benchmark_iters must be positive")
         if self.timing_block <= 0:
             raise ValueError("timing_block must be positive")
+        if self.oracle_mode not in ("off", "exhaustive"):
+            raise ValueError(
+                f"Invalid oracle_mode: '{self.oracle_mode}'. "
+                "Must be 'off' or 'exhaustive'"
+            )
         if self.engine_filter is not None:
             if len(self.engine_filter) == 0:
                 raise ValueError("engine_filter must be non-empty when set")
