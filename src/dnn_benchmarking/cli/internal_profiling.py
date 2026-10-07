@@ -27,6 +27,7 @@ from ..config.benchmark_config import TimingPolicy
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
 from ..execution.suite_runner import set_plugin_path
+from ..execution.timing import device_sync
 from ..graph.loader import GraphLoader
 
 
@@ -78,9 +79,12 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
             bm.load_input_data(generate_input_data(tensor_infos, args.seed, graph_json))
             vp = bm.create_variant_pack()
             # No Executor.benchmark(): rocprofv3 --pmc serializes dispatches
-            # and deadlocks on the staged timer's stall gate.
+            # and deadlocks on the staged timer's stall gate. No execute_once()
+            # either: its workspace reset would add a memset dispatch to every
+            # profiled iteration. Same submissions as the timed loop, one drain.
             for _ in range(policy.warmup_iters + policy.iters):
-                executor.execute_once(handle, vp)
+                executor.enqueue(handle, vp)
+            device_sync("hip")
     except Exception as e:
         return _fail(f"engine {engine_id}: {type(e).__name__}: {e}")
     return 0

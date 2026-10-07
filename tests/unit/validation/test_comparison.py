@@ -73,6 +73,16 @@ def test_max_rel_diff_is_zero_when_every_reference_is_near_zero() -> None:
     assert result.max_rel_diff == 0.0
 
 
+def test_failure_against_near_zero_reference_counts_mismatch() -> None:
+    """max_rel_diff skips |e| <= atol, so only n_mismatch reports the failure."""
+    result = compare(np.array([5.0]), np.array([0.0]), rtol=1e-5, atol=1e-6)
+
+    assert not result.passed
+    assert result.n_mismatch == 1
+    assert result.max_abs_diff == 5.0
+    assert result.max_rel_diff == 0.0
+
+
 @pytest.mark.parametrize("side", ["actual", "expected"])
 @pytest.mark.parametrize("bad", [np.nan, np.inf])
 def test_non_finite_values_fail(side: str, bad: float) -> None:
@@ -85,12 +95,15 @@ def test_non_finite_values_fail(side: str, bad: float) -> None:
         assert not result.passed
         assert result.max_abs_diff == float("inf")
         assert result.n_mismatch == result.n_total == 3
+        name = "output" if side == "actual" else "reference"
+        assert result.message == f"{name} contains NaN or Inf values"
 
 
 def test_shape_mismatch_fails() -> None:
     for result in _both(np.zeros((2, 3)), np.zeros((3, 2)), rtol=1.0, atol=1.0):
         assert not result.passed
         assert result.max_abs_diff == float("inf")
+        assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"
 
 
 def test_empty_and_scalar_arrays() -> None:
@@ -153,3 +166,23 @@ def test_torch_actual_accepts_numpy_expected() -> None:
 
     assert not result.passed
     assert result.worst_index == (1,)
+
+
+@pytest.mark.parametrize(
+    "name", ["float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"]
+)
+def test_torch_fp8_actual_is_compared(name: str) -> None:
+    """torch has no isfinite/abs for float8, so compare() must upcast it."""
+    torch = pytest.importorskip("torch")
+    fp8 = getattr(torch, name, None)
+    if fp8 is None:
+        pytest.skip(f"torch has no {name}")
+    expected = np.array([1.0, 2.0, 0.5], dtype=np.float32)
+    actual = torch.tensor([1.0, 2.0, 0.75]).to(fp8)
+
+    result = compare(actual, expected, rtol=0.0, atol=0.1)
+
+    assert not result.passed
+    assert result.n_mismatch == 1 and result.worst_index == (2,)
+    assert result.max_abs_diff == 0.25
+    assert compare(actual[:2], expected[:2], rtol=0.0, atol=0.0).passed

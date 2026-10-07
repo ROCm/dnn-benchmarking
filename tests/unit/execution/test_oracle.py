@@ -23,10 +23,10 @@ from dnn_benchmarking.validation import ReferenceOutput
 ENV = ("HIPDNN_FORCE_BENCHMARKING", "HIPDNN_DISABLE_CACHE")
 
 
-def _m(kernel_ms):
+def _m(kernel_ms, host_ms=0.01):
     return Measurement(
         kernel_ms=list(kernel_ms),
-        host_ms=[0.01] * len(kernel_ms),
+        host_ms=[host_ms] * len(kernel_ms),
         mode="staged",
         backend="hip",
         cache_mode="warm",
@@ -91,7 +91,7 @@ class _TunedExecutor:
         return self.candidates
 
     def benchmark(self, handle, variant_pack):
-        return _m(self.kernel_ms)
+        return _m(self.kernel_ms, host_ms=0.2)
 
     def execute_once(self, handle, variant_pack):
         pass
@@ -217,14 +217,60 @@ def test_failing_tuned_plan_suppresses_speedup_but_keeps_row_verdict(tuned):
     assert row.verdict == "passed"
 
 
-@pytest.mark.parametrize("mode, forced", [("plan", None), ("exhaustive", "1")])
-def test_exhaustive_env_is_scoped_to_the_oracle_build(tuned, monkeypatch, mode, forced):
+@pytest.mark.parametrize(
+    "tolerance_match, has_delta",
+    [(False, False), (None, True), (True, True)],
+    ids=["failed", "unchecked", "passed"],
+)
+def test_failing_baseline_suppresses_speedup(tuned, tolerance_match, has_delta):
+    """A speedup needs two valid operands: a heuristic plan that failed
+    validation is not a baseline."""
+    verdict = CorrectnessResult(tolerance_match=tolerance_match, rtol=1e-5, atol=1e-6)
+
+    row = _run(correctness=verdict)
+
+    assert row.oracle is not None
+    assert (row.oracle_delta is not None) is has_delta
+
+
+@pytest.mark.parametrize("mode", ["plan", "exhaustive"])
+@pytest.mark.parametrize("supports", [True, False])
+def test_exhaustive_flags_follow_mode_and_winner(tuned, mode, supports):
+    winner = _candidate()
+    winner.supports_exhaustive = supports
+    tuned.candidates = [winner]
+
+    o = _run(mode=mode).oracle
+
+    assert (o.exhaustive_requested, o.exhaustive_supported) == (
+        mode == "exhaustive",
+        supports,
+    )
+
+
+def test_host_stats_split_tuned_from_warm_baseline(tuned):
+    o = _run().oracle
+
+    assert o.host_stats.median_ms == pytest.approx(0.2)
+    assert o.warm_baseline_host_stats.median_ms == pytest.approx(0.01)
+
+
+@pytest.mark.parametrize(
+    "mode, forced, cache_off", [("plan", None, "0"), ("exhaustive", "1", "1")]
+)
+def test_exhaustive_env_is_scoped_to_the_oracle_build(
+    tuned, monkeypatch, mode, forced, cache_off
+):
     monkeypatch.delenv("HIPDNN_FORCE_BENCHMARKING", raising=False)
     monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
 
     _run(mode=mode)
 
-    assert tuned.env_at_prepare["HIPDNN_FORCE_BENCHMARKING"] == forced
+    # Exhaustive also disables hipDNN disk caches while the plans are built.
+    assert tuned.env_at_prepare == {
+        "HIPDNN_FORCE_BENCHMARKING": forced,
+        "HIPDNN_DISABLE_CACHE": cache_off,
+    }
     assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
     assert os.environ["HIPDNN_DISABLE_CACHE"] == "0"
 

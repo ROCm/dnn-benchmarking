@@ -68,6 +68,12 @@ sets `ROCM_PATH`.
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 
+The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
+1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (0.25, 0.25), fp8 e5m2 (0.5, 0.5), fp8
+e8m0 (2.0, 2.0), any other dtype (1e-5, 1e-6). Each fp8 value is 2 ULP of
+the format at 1.0; the fnuz variants use the same values. The source is
+`TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
+
 ### Comparison
 
 | Option | Default | Description |
@@ -110,7 +116,10 @@ See [Profiling](#profiling) below.
 | Hex ID | `0xA258541A6DAA1DE3` | The `engine.id` format of the result file. Values above `0x7FFF...` wrap to a negative signed ID. |
 | Decimal ID | `-6748551569128940061` | Signed 64-bit ID. |
 
-The three examples select the same engine.
+The three examples select the same engine. A list that starts with a negative
+decimal ID needs the `=` form, `--engine=-6748551569128940061,0x1A`: argparse
+reads `-e -6748551569128940061,0x1A` as an option and rejects it. A single
+negative ID (`-e -6748551569128940061`) works without `=`.
 
 The tool keeps the list order and duplicate entries. Use duplicates to time
 the same engine from two plugin builds:
@@ -122,8 +131,10 @@ dnn-benchmark -g graphs/sample_conv_fwd.json \
 ```
 
 If no loaded plugin provides an engine in `--engine`, the run stops with exit
-code 2 and names the engine. To list the engine names and IDs of a plugin
-directory, run `hipdnn_list_engines --plugin-dir <dir>`.
+code 2 and names the engine. With a comma list in `--plugin-path`, the tool
+checks each engine against its own plugin directory before the first graph.
+To list the engine names and IDs of a plugin directory, run
+`hipdnn_list_engines --plugin-dir <dir>`.
 
 The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 
@@ -197,7 +208,7 @@ instead of a speedup when no speedup applies:
 
 | Label | Meaning |
 |---|---|
-| `no-search` | Only one plan was available. |
+| `no-search` | No tuning alternative: one compiled plan, and no provider-level kernel search (mode is not `exhaustive`, or the engine does not support it). |
 | `invalid` | The default or the tuned plan failed validation. |
 | `failed` | Tuning did not produce a result. |
 | `n/a` | No comparison is available. |
@@ -358,11 +369,12 @@ Rules:
   in order of appearance.
 - `best` and `ref` select only rows with the verdict `passed`, `unchecked`
   or `reference`. In `engine` mode, a `failed` row gets a speedup with the
-  label `A failed` or `B failed`, but it is not in the geometric mean. Rows
-  with `error` or `skipped` get no speedup.
+  label `A failed`, `B failed` or `A+B failed`, but it is not in the
+  geometric mean. Rows with `error` or `skipped` get no speedup.
 - A pair is `within noise` when the relative change is not more than
-  `max(threshold, 2 * sqrt(r_A^2 + r_B^2))`, where `r` is `iqr_ms / median_ms`
-  of the compared metric in each file (`a_rel_iqr`, `b_rel_iqr` in the
+  `max(threshold / 100, 2 * sqrt(r_A^2 + r_B^2))`, where `threshold` is the
+  `--threshold` percent and `r` is `iqr_ms / median_ms` of the compared
+  metric in each file (`a_rel_iqr`, `b_rel_iqr` in the
   `--json` and `--csv` output). A slower B beyond that limit is a
   `REGRESSION`. A faster B is `faster`.
 - A different `run.config` value gives a warning on stderr. A different
@@ -371,8 +383,9 @@ Rules:
   tool writes `warning: no timings were compared` on stderr. The exit code
   stays 0.
 
-Exit codes: 0 no regression, 1 one or more regressions, 2 usage error or a
-file that cannot be read or has a different schema version.
+Exit codes: 0 no regression, 1 one or more regressions, 2 usage error, a
+file that cannot be read or has a different schema version, or a different
+`cache_mode` without `--allow-mismatch`.
 
 ```bash
 dnn-benchmark -g 'graphs/*.json' -o base.json

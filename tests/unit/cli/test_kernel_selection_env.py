@@ -16,11 +16,16 @@ from dnn_benchmarking.config.benchmark_config import SuiteConfig
 from dnn_benchmarking.reporting.reporter import Reporter
 
 
-def _warnings(**kwargs):
-    """The WARNING lines _apply_tuning_environment reports."""
+def _lines(**kwargs):
+    """The lines _apply_tuning_environment reports."""
     out = io.StringIO()
     _apply_tuning_environment(SuiteConfig(**kwargs), Reporter(output=out))
-    return [line for line in out.getvalue().splitlines() if line.startswith("WARNING")]
+    return out.getvalue().splitlines()
+
+
+def _warnings(**kwargs):
+    """The WARNING lines _apply_tuning_environment reports."""
+    return [line for line in _lines(**kwargs) if line.startswith("WARNING")]
 
 
 def test_default_stays_on_the_heuristic_path() -> None:
@@ -45,10 +50,13 @@ def test_autotune_with_cache_dir_is_isolated() -> None:
 def test_leaked_force_benchmarking(monkeypatch, value, warned) -> None:
     """hipDNN treats "0" as off, so only a truthy inherited value is a hazard."""
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", value)
-    warnings = _warnings()
+    lines = _lines()
+    warnings = [line for line in lines if line.startswith("WARNING")]
     assert [("HIPDNN_FORCE_BENCHMARKING" in w) for w in warnings] == (
         [True] if warned else []
     )
+    path = "autotune" if warned else "heuristic"
+    assert any(f"kernel selection: {path};" in line for line in lines)
 
 
 def test_pytorch_backend_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) -> None:

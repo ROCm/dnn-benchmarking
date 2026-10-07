@@ -4,7 +4,7 @@
 """Backend startup: check the selected runtime once, return a per-graph runner."""
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from ..common import torch_support
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
@@ -86,7 +86,16 @@ def _create_hipdnn_handle(config: SuiteConfig) -> Any:
         import hipdnn_frontend as hipdnn
 
         if config.plugin_paths is not None and len(config.plugin_paths) > 1:
-            # The runner creates one handle per engine/plugin pair.
+            # The runner creates one handle per engine/plugin pair; check each
+            # pair now so a bad engine or directory fails before any graph.
+            for selection in config.engine_selections_for(config.engine_filter):
+                set_plugin_path(hipdnn, selection.plugin_path)
+                _check_engines_loaded(
+                    hipdnn,
+                    hipdnn.Handle(),
+                    [selection.engine_id],
+                    selection.plugin_path,
+                )
             return None
         set_plugin_path(hipdnn, config.plugin_path)
         handle = hipdnn.Handle()
@@ -102,7 +111,9 @@ def _create_hipdnn_handle(config: SuiteConfig) -> Any:
     return handle
 
 
-def _check_engines_loaded(hipdnn: Any, handle: Any, engine_ids: List[int]) -> None:
+def _check_engines_loaded(
+    hipdnn: Any, handle: Any, engine_ids: List[int], plugin_path: Optional[Path] = None
+) -> None:
     """Reject explicit ``--engine`` IDs that no loaded plugin provides."""
     get_info = getattr(handle, "get_engine_info", None)
     if get_info is None:
@@ -115,7 +126,9 @@ def _check_engines_loaded(hipdnn: Any, handle: Any, engine_ids: List[int]) -> No
             unknown.append(engine_id)
     if unknown:
         raise BackendStartupError(
-            "--engine: not provided by any loaded plugin: "
+            "--engine: not provided by any "
+            + (f"plugin loaded from {plugin_path}" if plugin_path else "loaded plugin")
+            + ": "
             + ", ".join(_engine_label(hipdnn, e) for e in unknown),
             exit_code=2,
         )

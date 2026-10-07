@@ -72,8 +72,12 @@ def run_suite_cli(
     graph_paths: List[Path],
     reporter: Reporter,
     tarball_source: Optional[str] = None,
+    argv: Optional[List[str]] = None,
 ) -> int:
-    """Build the config, run startup checks, run the suite; return the exit code."""
+    """Build the config, run startup checks, run the suite; return the exit code.
+
+    ``argv`` is the command line recorded as ``run.argv`` (default ``sys.argv``).
+    """
     try:
         config = SuiteConfig.from_namespace(args)
     except ValueError as e:
@@ -118,7 +122,9 @@ def run_suite_cli(
         reporter.info(
             f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) per engine"
         )
-    return _run_suite(graph_paths, config, run_graph, output_path, reporter)
+    if argv is None:
+        argv = list(sys.argv)
+    return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
 
 
 def _output_problem(path: Path) -> Optional[str]:
@@ -210,6 +216,7 @@ def _run_suite(
     run_graph: GraphRunner,
     output_path: Optional[Path],
     reporter: Reporter,
+    argv: List[str],
 ) -> int:
     """Run every graph, writing results as it goes; return the exit code."""
     environment = collect_environment_info()
@@ -219,7 +226,7 @@ def _run_suite(
     total = len(graph_paths)
     reporter.print_suite_header(environment, run_config, total)
     suite = SuiteResult(
-        run=RunInfo(started_at=_now(), argv=list(sys.argv), config=run_config),
+        run=RunInfo(started_at=_now(), argv=argv, config=run_config),
         environment=environment,
         graphs=[],
     )
@@ -253,12 +260,20 @@ def _run_suite(
     except _Terminated:
         interrupted = 143
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        environment["end_of_run"] = {
-            **host_memory_snapshot(),
-            **GpuSmiProbe().snapshot(),
-        }
-        write_ok = write()
+        # A second Ctrl-C or SIGTERM must not lose the results on disk.
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            try:
+                end_of_run = {**host_memory_snapshot(), **GpuSmiProbe().snapshot()}
+            except Exception as e:
+                reporter.warning(f"end-of-run snapshot failed: {e}")
+                end_of_run = {}
+            environment["end_of_run"] = end_of_run
+            write_ok = write()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
     if interrupted is not None:
         where = (

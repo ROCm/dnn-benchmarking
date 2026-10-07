@@ -340,6 +340,19 @@ def test_genuine_enqueue_error_during_sync_probe_propagates(monkeypatch) -> None
         )
 
 
+def test_staged_measure_success_path_ordering(monkeypatch) -> None:
+    """The work is enqueued behind the armed gate, between the two records, and
+    the gate is released before waiting on the stop event (else it hangs)."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, kernel_ms=2.5)
+    timer = StalledRegionTimer(stream=7)
+
+    _, kernel_ms = timer.measure(_enqueue(log))
+
+    assert log == ["arm", "record", "enqueue", "record", "release", "event_sync"]
+    assert kernel_ms == 2.5
+
+
 def test_staged_measure_releases_gate_when_enqueue_raises(monkeypatch) -> None:
     log: List[str] = []
     _install_fake_hip(monkeypatch, log)

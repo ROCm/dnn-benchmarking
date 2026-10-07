@@ -60,6 +60,27 @@ def test_tolerance_by_dtype_and_override(data_type, rtol, atol, expected):
     assert tolerance_for(_config(rtol, atol), _out(1, data_type)) == expected
 
 
+@pytest.mark.parametrize(
+    "data_type, one_ulp_up",
+    [
+        ("fp8_e4m3", [1.125, 2.25, 0.5625, 4.5]),
+        ("fp8_e4m3_fnuz", [1.125, 2.25, 0.5625, 4.5]),
+        ("fp8_e5m2", [1.25, 2.5, 0.625, 5.0]),
+        ("fp8_e5m2_fnuz", [1.25, 2.5, 0.625, 5.0]),
+        ("fp8_e8m0", [2.0, 4.0, 1.0, 8.0]),
+    ],
+)
+def test_fp8_output_one_ulp_apart_passes(data_type, one_ulp_up):
+    """The two sides round different fp32 accumulators to fp8; one element
+    landing on the neighbouring fp8 value is not a defect."""
+    ref = {1: _ref([1.0, 2.0, 0.5, 4.0])}
+    bm = _HostBM({1: np.array(one_ulp_up, np.float32)})
+
+    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
+
+    assert c.tolerance_match is True
+
+
 def test_aggregates_over_outputs_and_names_the_failing_output():
     ref = {1: _ref([1, 2, 3, 4]), 2: _ref([1, 1, 1, 1])}
     bm = _HostBM(

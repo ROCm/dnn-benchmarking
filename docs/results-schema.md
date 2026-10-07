@@ -10,7 +10,9 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 ## General rules
 
 - Every key in this page is always present. A key that does not apply is
-  `null`. Do not test for key presence.
+  `null`. Do not test for key presence. The exception is the inside of
+  `extra_metrics` objects, where the [extra_metrics](#extra_metrics) table
+  marks the keys that can be absent.
 - The file is strict JSON. The writer maps `NaN` and infinity to `null`.
 - Times are in milliseconds (`_ms`) unless the key name gives another unit.
 - `MB` and `GB` in environment key names are binary units: MiB (2^20 bytes)
@@ -250,7 +252,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | `rtol` | float | Relative tolerance used. |
 | `atol` | float | Absolute tolerance used. |
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
-| `max_rel_diff` | float or null | Largest relative difference over all outputs. |
+| `max_rel_diff` | float or null | Largest `\|actual - expected\| / \|expected\|` over all outputs, taken only over elements with `\|expected\| > atol`. `0.0` when no element qualifies, so a mismatch against a near-zero reference can show `0.0` with `n_mismatch > 0`. Use `match` and `n_mismatch` for pass or fail. |
 | `n_mismatch` | int or null | Elements outside tolerance, summed over outputs. |
 | `n_total` | int or null | Elements compared, summed over outputs. |
 | `worst_output_uid` | int or null | Tensor UID of the output with the largest difference. |
@@ -333,8 +335,8 @@ lines of tool output), `warnings`, `unexpected_error`.
 |---|---|
 | `pmc` | `set`, `arch`, `counters_requested`, `db_path`, `per_kernel`. `arch_narrowed_to_fallback` is `true` when `--pmc all` used the fallback set. |
 | `trace` | `format` (`pftrace`), `path`. |
-| `perf` | `scope` (always `process_total`), `cycles_user`, `instructions_user`, `ipc_user`, `cycles_kernel`, `instructions_kernel`, `task_clock_ms`, `context_switches`, `page_faults`, `kernel_perf_paranoid`, `binary`, `csv_path`. Optional: `binary_substituted`, `kernel_events_skipped_reason`. |
-| `roofline` | `roofline_csv`, `workload_path`, `sysinfo_csv`. |
+| `perf` | `scope` (always `process_total`), `cycles_user`, `instructions_user`, `ipc_user`, `cycles_kernel`, `instructions_kernel`, `task_clock_ms`, `context_switches`, `page_faults`, `kernel_perf_paranoid`, `binary`. Optional: `csv_path` (only when perf wrote its CSV), `binary_substituted`, `kernel_events_skipped_reason`. |
+| `roofline` | `roofline_csv` and `workload_path` only when `roofline.csv` was produced; `sysinfo_csv` only when `sysinfo.csv` was produced. At least one of the two is present. |
 
 `pmc.per_kernel` maps each kernel name to one object:
 
@@ -386,7 +388,9 @@ Only a failed last write gives exit code 1.
 
 A file from steps 2 and 3 of an unfinished run has `run.complete = false` and
 `run.finished_at = null`. It holds every graph that completed. After SIGINT
-(Ctrl-C) the exit code is 130. After SIGTERM the exit code is 143.
+(Ctrl-C) the exit code is 130. After SIGTERM the exit code is 143. A second
+Ctrl-C or SIGTERM during the last write is ignored, so the file is not cut
+short.
 
 A CSV file uses the same schedule, but it has no `complete` column. Use JSON
 when you must detect a partial run.

@@ -12,26 +12,18 @@ records ``amdsmi_available`` in the environment block.
 
 ``GpuSmiProbe`` targets the GPU the workload runs on: device indices are
 HIP (torch) logical indices, mapped to the amdsmi handle by PCI bus
-address. When that address is unknown (torch missing or seeing no GPU) or
-matches no amdsmi device, the HIP index is used as the amdsmi index; under
+address when torch is already imported (this module never imports it, so a
+hipDNN run stays torch-free). Otherwise, or when the address matches no
+amdsmi device, the HIP index is used as the amdsmi index; under
 ``HIP_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` remapping that can be
 another physical GPU.
 """
 
 import functools
-import os
 import sys
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..common import torch_support
-
-# Set when the HIP device list is a remapped subset of the physical GPUs.
-_VISIBILITY_ENV = (
-    "HIP_VISIBLE_DEVICES",
-    "ROCR_VISIBLE_DEVICES",
-    "CUDA_VISIBLE_DEVICES",
-    "GPU_DEVICE_ORDINAL",
-)
 
 _UNAVAILABLE_VALUES = {"", "N/A", "NA", "NONE", "NULL", "UNSUPPORTED"}
 
@@ -75,14 +67,12 @@ def is_amdsmi_available() -> bool:
 def _hip_device_bdf(device_index: Optional[int]) -> Optional[str]:
     """``dddd:bb:dd`` PCI address of a HIP device (None = current), via torch.
 
-    Importing torch takes seconds, so it is imported only when device
-    visibility is remapped. Otherwise the caller maps the HIP index directly.
+    None unless torch is already imported: importing it takes seconds and
+    starts a second HIP runtime context in a hipDNN run.
     """
-    # ponytail: assumes HIP and amdsmi both list unmasked GPUs in PCI order
-    # (true on MI210/MI300 nodes); query the HIP runtime if that ever breaks.
-    if "torch" not in sys.modules and not any(map(os.environ.get, _VISIBILITY_ENV)):
-        return None
-    if not torch_support.module_available() or not torch_support.gpu_available():
+    # ponytail: unmapped HIP index under *_VISIBLE_DEVICES without torch; ask
+    # the HIP runtime (hipDeviceGetPCIBusId) if hipdnn_frontend ever binds it.
+    if "torch" not in sys.modules or not torch_support.gpu_available():
         return None
     try:
         import torch

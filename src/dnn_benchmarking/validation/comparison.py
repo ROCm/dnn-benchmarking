@@ -82,6 +82,9 @@ def compare(
         a = actual.detach()
         ref = xp.as_tensor(expected, device=a.device)
         dtype = getattr(xp, _compare_dtype_name(a.dtype, ref.dtype))
+        # torch implements no isfinite/abs/sub for float8; upcast first.
+        if a.is_floating_point() and a.element_size() == 1:
+            a = a.to(dtype)
         e = ref.to(dtype)
     else:
         xp = np

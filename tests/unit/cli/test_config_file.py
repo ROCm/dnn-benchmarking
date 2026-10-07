@@ -74,6 +74,14 @@ def test_engine_list_keeps_order_and_duplicates() -> None:
     assert args.engine == [3, 1, 3, MIOPEN_ENGINE_ID]
 
 
+def test_plugin_path_is_a_comma_list() -> None:
+    args = create_parser().parse_args(["--plugin-path", "/a, /b,"])
+    assert args.plugin_path == [Path("/a"), Path("/b")]
+    with pytest.raises(SystemExit) as exc:
+        create_parser().parse_args(["--plugin-path", " , "])
+    assert exc.value.code == 2
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -81,7 +89,11 @@ def test_engine_list_keeps_order_and_duplicates() -> None:
         ["--warmup", "-1"],
         ["--min-time-ms", "-0.5"],
         ["--profiling-timeout", "-1"],
-        ["--rtol", "-1e-3"],
+        ["--rtol=-1e-3"],  # "--rtol -1e-3" fails in argparse, not the bound
+        ["--atol=-1"],
+        ["--rtol", "nan"],  # NaN would pass every comparison
+        ["--atol", "inf"],
+        ["--min-time-ms", "nan"],
         ["--cache-mode", "lukewarm"],
         ["--iter", "5"],  # abbreviations are rejected (allow_abbrev=False)
     ],

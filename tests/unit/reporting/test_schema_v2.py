@@ -236,6 +236,29 @@ def test_full_document_has_exact_key_sets() -> None:
     assert doc["schema_version"] == 2
 
 
+def test_full_row_values() -> None:
+    row = json.loads(full_suite().to_json())["graphs"][0]["results"][0]
+    assert row["engine"] == {
+        "id": "0x15B46865C717A122",
+        "name": "MIOPEN_ENGINE",
+        "version": "1.0",
+        "plugin_path": "/opt/lib/plugin.so",
+    }
+    assert row["metrics"] == {
+        "flops": 10**9,
+        "flops_partial": True,
+        "io_bytes": 10**6,
+        "tflops": 2.0,
+        "gbps": 2000.0,
+        "workspace_bytes": 1024,
+        "vram_mb": 512.0,
+        "clocks_before": {"sclk_mhz": 1700},
+        "clocks_after": {"sclk_mhz": 1700},
+    }
+    assert row["warnings"] == ["noisy: CV 6.0%"]
+    assert (row["elapsed_s"], row["build_ms"]) == (1.5, 3.0)
+
+
 def test_minimal_document_has_the_same_key_sets() -> None:
     full = _key_sets(json.loads(full_suite().to_json()))
     minimal = _key_sets(json.loads(minimal_suite().to_json()))

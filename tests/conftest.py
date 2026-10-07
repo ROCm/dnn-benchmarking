@@ -43,18 +43,22 @@ def pytest_collection_modifyitems(config, items):
 
 
 def expected_timing_backend() -> str:
-    """Return the GPU timing backend the executor selects on this host.
+    """Return the GPU timing backend the executor must select on this host.
 
-    Mirrors PyTorchCudaExecutor: ROCm torch with a usable hipdnn_frontend
-    uses direct HIP events ("hip"); anything else (CUDA, or ROCm without the
-    HIP bindings) uses torch.cuda events ("torch"). Lets GPU-generic tests
-    assert the right backend without pinning to one platform.
+    ROCm torch times with direct HIP events ("hip"); CUDA uses torch.cuda
+    events ("torch"). Deliberately not the executor's own predicate, so a ROCm
+    host that loses HIP event timing fails. Skips on ROCm torch without
+    hipdnn_frontend, where "torch" is the documented fallback.
     """
-    from dnn_benchmarking.common import torch_support
-    from dnn_benchmarking.execution.timing import is_hip_available
+    import importlib.util
 
-    rocm_hip = torch_support.is_rocm_build() and is_hip_available()
-    return "hip" if rocm_hip else "torch"
+    import torch
+
+    if torch.version.hip is None:
+        return "torch"
+    if importlib.util.find_spec("hipdnn_frontend") is None:
+        pytest.skip("hipdnn_frontend not installed: no HIP event timing to check")
+    return "hip"
 
 
 def skip_if_no_gpu_torch() -> None:

@@ -161,6 +161,25 @@ def test_intermediate_write_is_a_loadable_partial_file(
     assert SuiteResult.load(out)["run"]["complete"] is True
 
 
+_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _sentinel_handler(signum, frame) -> None:
+    raise AssertionError(f"signal {signum} reached the caller's handler")
+
+
+@pytest.fixture
+def caller_handlers():
+    """Install known SIGINT/SIGTERM handlers; the run must hand them back.
+
+    Comparing against whatever was installed before would let a leaked
+    handler from an earlier test pass as "restored"."""
+    saved = {s: signal.signal(s, _sentinel_handler) for s in _SIGNALS}
+    yield
+    for s, handler in saved.items():
+        signal.signal(s, handler)
+
+
 @pytest.mark.parametrize(
     "interrupt, expected",
     [
@@ -171,10 +190,11 @@ def test_intermediate_write_is_a_loadable_partial_file(
     ],
     ids=["sigint", "sigterm"],
 )
-def test_interrupt_writes_partial_file(tmp_path, backend, interrupt, expected) -> None:
+def test_interrupt_writes_partial_file(
+    tmp_path, backend, caller_handlers, interrupt, expected
+) -> None:
     g0, g1, g2 = _graphs(tmp_path, 3)
     out = tmp_path / "out.json"
-    before = signal.getsignal(signal.SIGTERM)
 
     def run(path):
         if path == g1:
@@ -189,7 +209,7 @@ def test_interrupt_writes_partial_file(tmp_path, backend, interrupt, expected) -
     assert doc["run"]["complete"] is False and doc["run"]["finished_at"] is None
     assert [g["graph_name"] for g in doc["graphs"]] == ["g0"]
     assert str(out) in text
-    assert signal.getsignal(signal.SIGTERM) is before
+    assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 
 def test_final_write_failure_exits_1(tmp_path, backend) -> None:
@@ -285,6 +305,72 @@ def test_main_without_matching_graphs_exits_1(tmp_path, monkeypatch, capsys) -> 
     assert "No graph files found" in capsys.readouterr().err
 
 
+def test_main_records_its_argv_and_wires_verbose(
+    tmp_path, backend, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    backend(lambda path: _graph(path, [_passed()]))
+    out = tmp_path / "out.json"
+    argv = ["--graph", str(_graphs(tmp_path, 1)[0]), "-o", str(out), "-v"]
+
+    assert cli_main(argv) == 0
+
+    assert SuiteResult.load(out)["run"]["argv"] == [sys.argv[0], *argv]
+    assert "correctness passed" in capsys.readouterr().out  # verbose block
+
+
+def test_run_config_records_effective_values_that_compare_checks(
+    tmp_path, backend, capsys
+) -> None:
+    backend(lambda path: _graph(path, [_passed()]))
+    warm, cold = tmp_path / "warm.json", tmp_path / "cold.json"
+    _run(_args("-o", str(warm), "--timing-block", "4"), _graphs(tmp_path, 1))
+    _run(
+        _args(
+            *("-o", str(cold), "--cache-mode", "cold", "--seed", "7"),
+            *("--iters", "11", "--warmup", "3", "--min-time-ms", "5"),
+            *("--validate", "pytorch", "--pytorch-sdpa-backend", "flash"),
+            *("--pytorch-rocm-fa-library", "aotriton"),
+        ),
+        _graphs(tmp_path, 1),
+    )
+
+    warm_config = SuiteResult.load(warm)["run"]["config"]
+    assert warm_config["timing_block"] == 4
+    assert warm_config["pytorch_sdpa_backend"] is None  # PyTorch not used
+    assert warm_config["pytorch_rocm_fa_library"] is None
+    config = SuiteResult.load(cold)["run"]["config"]
+    del config["plugin_paths"]  # the default depends on the installed ROCm
+    assert config == {
+        "backend": "hipdnn",
+        "engine_filter": None,
+        "warmup_iters": 3,
+        "iters": 11,
+        "min_time_ms": 5.0,
+        "cache_mode": "cold",
+        "timing_block": 1,
+        "seed": 7,
+        "validate": "pytorch",
+        "rtol": None,
+        "atol": None,
+        "oracle_mode": "off",
+        "autotune": False,
+        "cache_dir": None,
+        "pytorch_sdpa_backend": "flash",
+        "pytorch_rocm_fa_library": "aotriton",
+        "metrics_tier": "basic",
+        "profiling": {
+            "pmc": None,
+            "emit_trace": None,
+            "perf": False,
+            "roofline": False,
+        },
+    }
+    capsys.readouterr()
+    assert compare.main([str(warm), str(cold)]) == 2
+    assert "cache_mode differs" in capsys.readouterr().err
+
+
 def test_selection_env_recorded_only_for_autotune(tmp_path, backend) -> None:
     backend(lambda path: _graph(path, [_passed()]))
     plain, tuned = tmp_path / "plain.json", tmp_path / "tuned.json"
@@ -296,16 +382,21 @@ def test_selection_env_recorded_only_for_autotune(tmp_path, backend) -> None:
     assert env["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
-def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None):
-    """Install a fake hipdnn_frontend whose handle knows only ``loaded`` IDs."""
+def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
+    """Install a fake hipdnn_frontend whose handle knows only ``loaded`` IDs
+    (or ``loaded[plugin_path]``); return the plugin-path/Handle call log."""
+    calls: list = []
 
     class Handle:
         def __init__(self):
+            calls.append("Handle")
             if handle_error is not None:
                 raise handle_error
+            paths = [c for c in calls if isinstance(c, list)]
+            self.loaded = loaded[paths[-1][0]] if isinstance(loaded, dict) else loaded
 
         def get_engine_info(self, engine_id):
-            if engine_id not in loaded:
+            if engine_id not in self.loaded:
                 raise IndexError("Engine ID is not loaded")
             return object()
 
@@ -313,11 +404,45 @@ def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None):
     module = types.SimpleNamespace(
         Handle=Handle,
         PluginLoadingMode=types.SimpleNamespace(ABSOLUTE="abs"),
-        set_engine_plugin_paths=lambda paths, mode: None,
+        set_engine_plugin_paths=lambda paths, mode: calls.append(paths),
         engine_id_to_name=lambda engine_id: names.get(engine_id, ""),
     )
     monkeypatch.setitem(sys.modules, "hipdnn_frontend", module)
     monkeypatch.setattr(backends, "initialize_pip_rocm_runtime", lambda: None)
+    return calls
+
+
+def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
+    monkeypatch,
+) -> None:
+    a, b = str(Path("/a")), str(Path("/b"))
+    calls = _fake_hipdnn(monkeypatch, loaded={a: {1}, b: {1}})
+    handles = []
+    monkeypatch.setattr(
+        backends, "run_graph_all_providers", lambda *args: handles.append(args[4])
+    )
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("-e", "1,1", "--plugin-path", "/a,/b")
+    )
+
+    backends.start_backend(config, Reporter(output=io.StringIO()))(None, {}, [])
+
+    assert calls == [[a], "Handle", [b], "Handle"]
+    assert handles == [None]  # the runner creates one handle per pair
+    selections = config.engine_selections_for(config.engine_filter)
+    assert [str(s.plugin_path) for s in selections] == [a, b]
+
+
+def test_unknown_engine_in_one_plugin_path_is_usage_error(
+    tmp_path, monkeypatch
+) -> None:
+    b = str(Path("/b"))
+    _fake_hipdnn(monkeypatch, loaded={str(Path("/a")): {1}, b: set()})
+    code, text = _run(
+        _args("-e", "1,1", "--plugin-path", "/a,/b"), _graphs(tmp_path, 1)
+    )
+    assert code == 2
+    assert f"plugin loaded from {b}: 0x0000000000000001" in text
 
 
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
@@ -414,13 +539,18 @@ def _warnings(text: str) -> str:
     [
         ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
         ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
+        (  # hipDNN reads "0" as off
+            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "0"},
+            [],
+            "HIPDNN_DISABLE_CACHE=1",
+        ),
         (
             {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "1"},
             ["--warmup", "0"],  # priming always runs untimed: nothing to warn
             None,
         ),
     ],
-    ids=["exact-cache-on", "provider-cache-on", "cold"],
+    ids=["exact-cache-on", "provider-cache-on", "provider-cache-zero", "cold"],
 )
 def test_oracle_warns_on_non_cold_baseline(
     tmp_path, backend, monkeypatch, env, argv, expected
@@ -436,6 +566,32 @@ def test_oracle_warns_on_non_cold_baseline(
         assert warnings == ""
     else:
         assert expected in warnings
+
+
+def test_final_write_survives_second_signal_and_snapshot_error(
+    tmp_path, backend, monkeypatch, caller_handlers
+) -> None:
+    def probe():
+        signal.raise_signal(signal.SIGTERM)
+        signal.raise_signal(signal.SIGINT)
+        raise RuntimeError("amdsmi gone")
+
+    monkeypatch.setattr(suite_runner_cli, "GpuSmiProbe", probe)
+    backend(lambda path: (_ for _ in ()).throw(KeyboardInterrupt()))
+    out = tmp_path / "out.json"
+
+    code, text = _run(_args("-o", str(out)), _graphs(tmp_path, 1))
+
+    assert code == 130
+    assert SuiteResult.load(out)["run"]["complete"] is False
+    assert "end-of-run snapshot failed: amdsmi gone" in text
+    assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
+
+
+def test_exhaustive_oracle_states_the_provider_cache_cost(tmp_path, backend) -> None:
+    backend(lambda path: _graph(path, [_passed()]))
+    _, text = _run(_args("--oracle-mode", "exhaustive"), _graphs(tmp_path, 1))
+    assert "--oracle-mode exhaustive: providers may reuse tuned selections" in text
 
 
 @pytest.mark.parametrize(

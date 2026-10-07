@@ -206,10 +206,11 @@ instead. A different `--torch-mode` than the one in the venv also asks for
 The CMake build directories live in the checkout (`rocm-libraries/build`,
 `rocm-libraries/projects/hipdnn/python/build`), so every workspace shares
 them. Each records the install and toolchain prefixes it was configured for,
-in `dnn-bench-prefixes.json`. A run with other prefixes (another
-`--workspace` or `--rocm-prefix`) wipes that directory and rebuilds it from
-zero, so one workspace never builds with another workspace's compiler or
-ROCm SDK.
+in `dnn-bench-prefixes.json`; the hipDNN and provider directory also records
+the `--cmake-arg` defines. A run with other prefixes (another `--workspace` or
+`--rocm-prefix`) or other defines wipes that directory and rebuilds it from
+zero. So one workspace never builds with another workspace's compiler or ROCm
+SDK, and a define you drop does not stay in the CMake cache.
 
 ## Manual install
 

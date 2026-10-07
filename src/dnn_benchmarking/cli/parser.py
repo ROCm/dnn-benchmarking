@@ -5,6 +5,7 @@
 
 import argparse
 import importlib.metadata
+import math
 import re
 from dataclasses import dataclass, fields
 from enum import Enum
@@ -84,7 +85,11 @@ def _values(enum_cls: type[Enum]) -> tuple[str, ...]:
 
 
 def _at_least(kind: type, minimum: float) -> Callable[[Any], Any]:
-    """argparse ``type=`` converter that rejects values below ``minimum``."""
+    """argparse ``type=`` converter that rejects values below ``minimum``.
+
+    NaN and inf are rejected too: ``diff > nan`` is never true, so a NaN
+    tolerance would pass every comparison.
+    """
 
     def convert(text: Any) -> Any:
         try:
@@ -93,7 +98,7 @@ def _at_least(kind: type, minimum: float) -> Callable[[Any], Any]:
             raise argparse.ArgumentTypeError(
                 f"expected {kind.__name__}, got {text!r}"
             ) from None
-        if value < minimum:
+        if not (math.isfinite(value) and value >= minimum):
             raise argparse.ArgumentTypeError(f"must be >= {minimum}, got {value}")
         return value
 

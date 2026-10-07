@@ -332,13 +332,17 @@ class Executor:
             self._workspace.zeros()
 
         self._get_execution_stream(handle)
-        result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
-        if result.is_bad():
-            raise ExecutionError(f"Graph execution failed: {result.get_message()}")
+        self.enqueue(handle, variant_pack)
         try:
             device_sync("hip")
         except RuntimeError as e:
             raise ExecutionError(str(e)) from e
+
+    def enqueue(self, handle: Any, variant_pack: Dict[int, int]) -> None:
+        """Submit one graph execution: no workspace reset, no device sync."""
+        result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
+        if result.is_bad():
+            raise ExecutionError(f"Graph execution failed: {result.get_message()}")
 
     def benchmark(self, handle: Any, variant_pack: Dict[int, int]) -> Measurement:
         """Prime and time the prepared graph per the executor's policy.
@@ -354,16 +358,13 @@ class Executor:
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
         stream = self._get_execution_stream(handle)
-
-        def enqueue() -> None:
-            result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
-            if result.is_bad():
-                raise ExecutionError(
-                    f"Benchmark execution failed: {result.get_message()}"
-                )
-
         try:
-            return measure(enqueue, stream=stream, policy=self._policy, backend="hip")
+            return measure(
+                lambda: self.enqueue(handle, variant_pack),
+                stream=stream,
+                policy=self._policy,
+                backend="hip",
+            )
         except RuntimeError as e:
             raise ExecutionError(str(e)) from e
 

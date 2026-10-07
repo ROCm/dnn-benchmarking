@@ -221,8 +221,9 @@ python -m dnn_benchmarking --internal-profiling-run --graph G --engine E \
 ```
 
 The child builds one engine, fills the inputs with the same seed as the timed
-run, and calls `execute_once` `W + 5` times. It does not use the timed loop,
-for two reasons:
+run, and runs `W + 5` plain graph executes: the same submissions as the timed
+loop, with no workspace reset and no sync between them. Then it drains the
+device once. It does not use the timed loop, for two reasons:
 
 - `rocprofv3 --pmc` serializes dispatches. A stalled stream then never
   starts, and the stall gate would deadlock.
@@ -231,8 +232,9 @@ for two reasons:
 
 Before each child starts, the parent frees the engine buffers. The child thus
 has the same free VRAM as the timed run. Counter values come from this child,
-not from the timed loop. Each `execute_once` can also launch reset kernels.
-Use `pmc.per_kernel[...].dispatches` to find the engine kernel.
+not from the timed loop. The child also launches input-fill kernels, and a
+graph can launch more than one kernel. Use `pmc.per_kernel[...].dispatches`
+and the kernel name to find the engine kernel.
 
 ## Parity with other harnesses
 

@@ -240,6 +240,17 @@ def test_join_on_graph_id(tmp_path, capsys):
     assert report["only_in_b"] == ["same_name"]
 
 
+def test_duplicate_graph_id_pairs_each_b_graph_once(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("a1", "d", [_row("E", 1.0)]),
+                                    ("a2", "d", [_row("E", 1.0)])])  # fmt: skip
+    b = _write(tmp_path, "b.json", [("b1", "d", [_row("E", 1.0)]),
+                                    ("b2", "d", [_row("E", 1.0)])])  # fmt: skip
+    _, report = _json(capsys, [a, b])
+    assert [p["graph"] for p in report["pairs"]] == ["a1"]
+    assert report["only_in_a"] == ["a2"]
+    assert len(report["only_in_b"]) == 1
+
+
 def test_config_mismatch_warns(tmp_path, capsys):
     a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
     b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])], iters=50)

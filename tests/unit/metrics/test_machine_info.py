@@ -5,7 +5,7 @@
 
 import importlib.util
 import sys
-from unittest.mock import mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
@@ -123,7 +123,8 @@ class TestCollectEnvironmentInfo:
         assert capsys.readouterr().err.count("amdsmi not available") == 1
 
     def test_does_not_import_torch(self, monkeypatch):
-        """Importing torch costs seconds at startup on the hipDNN backend."""
+        """Importing torch costs seconds at startup on the hipDNN backend,
+        also when device visibility is remapped and amdsmi sees a GPU."""
         attempts = []
 
         class _RecordTorchImport:
@@ -145,14 +146,19 @@ class TestCollectEnvironmentInfo:
 
         monkeypatch.delitem(sys.modules, "torch", raising=False)
         monkeypatch.setattr(sys, "meta_path", [_RecordTorchImport(), *sys.meta_path])
-        for var in gpu_smi._VISIBILITY_ENV:
-            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+        smi = MagicMock()
+        smi.amdsmi_get_processor_handles.return_value = ["gpu0"]
         arch.detect_gpu.cache_clear()
         gpu_smi._handle_for.cache_clear()
         try:
-            with patch.object(arch, "resolve_rocm_tool", return_value=None):
+            with (
+                patch.object(arch, "resolve_rocm_tool", return_value=None),
+                patch.object(gpu_smi, "_amdsmi", return_value=smi),
+            ):
                 machine_info.collect_environment_info()
         finally:
             arch.detect_gpu.cache_clear()
             gpu_smi._handle_for.cache_clear()
+        smi.amdsmi_get_processor_handles.assert_called()
         assert attempts == []

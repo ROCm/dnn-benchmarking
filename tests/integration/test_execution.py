@@ -111,8 +111,12 @@ def test_benchmark_measures_and_writes_output(
     assert m.cache_mode == policy.cache_mode
     assert m.warmup_iters == policy.warmup_iters
     assert m.first_call_ms > 0
-    # Events mode is only legitimate with a recorded reason.
-    assert m.mode == "staged" or m.fallback_reason, m
+    # The default stall-gated mode must engage where the device supports it;
+    # elsewhere events mode is legitimate only with a recorded reason.
+    if hipdnn.hip_can_use_stream_wait_value():
+        assert m.mode == "staged", m
+    else:
+        assert m.fallback_reason, m
     assert output.shape == (16, 16, 16, 16)
     assert not np.allclose(output, 0)
 
@@ -138,7 +142,10 @@ def test_compare_matches_pytorch_reference(
         output = bm.get_output_data(0)
 
     reference = provider.compute_reference(sample_conv_fwd_json, inputs)[0].data
-    result = compare(output, reference, rtol=1e-3, atol=1e-5)
+    # The product gate: the dtype tolerance `--validate pytorch` applies.
+    output_info = next(t for t in tensor_infos if t.is_output)
+    rtol, atol = correctness.tolerance_for(SuiteConfig(), output_info)
+    result = compare(output, reference, rtol=rtol, atol=atol)
     assert result.passed, result.message
 
 

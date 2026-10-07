@@ -78,12 +78,19 @@ def test_cmake_arg_without_a_value_is_rejected(setup_env, bad) -> None:
 
 
 @pytest.mark.parametrize(
-    "clean, recorded_prefix, build_dir_kept",
-    [(False, "prefix", True), (True, "prefix", False), (False, "other", False)],
-    ids=["same-prefix", "clean", "other-prefix"],
+    "clean, recorded, build_dir_kept",
+    [
+        (False, {}, True),
+        (True, {}, False),
+        (False, {"install_prefix": "other"}, False),
+        # CMakeCache keeps a -D define after the flag is dropped, so a dir
+        # configured with other defines is not reused.
+        (False, {"cmake_args": []}, False),
+    ],
+    ids=["same-config", "clean", "other-prefix", "other-defines"],
 )
 def test_superbuild_configure_lets_extra_defines_override_defaults(
-    setup_env, tmp_path, monkeypatch, clean, recorded_prefix, build_dir_kept
+    setup_env, tmp_path, monkeypatch, clean, recorded, build_dir_kept
 ) -> None:
     rocm_libraries = tmp_path / "rocm-libraries"
     cache = rocm_libraries / "build" / "CMakeCache.txt"
@@ -95,11 +102,12 @@ def test_superbuild_configure_lets_extra_defines_override_defaults(
     record = {
         "install_prefix": str(tmp_path / "prefix"),
         "toolchain_prefix": str(toolchain),
+        "cmake_args": ["-DHIPDNN_ENABLE_SDPA=OFF"],
     }
     # A build dir configured by another workspace keeps that workspace's
     # compiler in its CMakeCache, so it must not be reused.
     (cache.parent / setup_env.BUILD_RECORD).write_text(
-        json.dumps({**record, "install_prefix": str(tmp_path / recorded_prefix)})
+        json.dumps({**record, **recorded})
     )
     commands = []
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
@@ -119,9 +127,10 @@ def test_superbuild_configure_lets_extra_defines_override_defaults(
     assert configure.index("-DHIPDNN_ENABLE_SDPA=ON") < configure.index(
         "-DHIPDNN_ENABLE_SDPA=OFF"
     )
-    # Incremental by default; --clean or other prefixes start the build over.
+    # Incremental by default; --clean, other prefixes or other defines start
+    # the build over.
     assert cache.exists() == build_dir_kept
-    # The next run with these prefixes reuses the directory.
+    # The next run with this configuration reuses the directory.
     assert json.loads((cache.parent / setup_env.BUILD_RECORD).read_text()) == record
 
 

@@ -342,7 +342,7 @@ class Reporter:
         self._print(title + (f"  [{gr.graph_id}]" if gr.graph_id else ""))
         if gr.error:
             self._print(_clip(f"  graph error: {_one_line(gr.error)}", _width()))
-        elif not gr.results:
+        elif gr.status == "no_engines":
             msg = f": {_one_line(gr.message)}" if gr.message else ""
             self._print(_clip(f"  no engines applicable{msg}", _width()))
         if not gr.results:

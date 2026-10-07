@@ -65,6 +65,7 @@ class TestNoiseWarnings:
     @pytest.mark.parametrize(
         "timings, flag, expected",
         [
+            ([19.0] * 10 + [20.0] * 10, "noisy:", False),  # IQR exactly 5%
             ([0.951] * 10 + [1.0] * 10, "noisy:", False),  # IQR 4.9% of median
             ([0.949] * 10 + [1.0] * 10, "noisy:", True),  # IQR 5.1% of median
             ([0.9] * 5 + [1.0] * 4, "noisy:", False),  # wide, but 9 samples

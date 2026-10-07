@@ -196,6 +196,21 @@ class TestTableLayout:
         )
         assert "No engine configurations available" in out.getvalue()
 
+    def test_no_engine_graph_with_reference_row_still_shows_why(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_table(
+            GraphResult(
+                "g",
+                "/tmp/g.json",
+                [_row(role="reference")],
+                engine_ids=[],
+                message="No engine configurations available",
+            )
+        )
+        assert "no engines applicable: No engine configurations available" in (
+            out.getvalue()
+        )
+
     def test_graph_error_is_shown_instead_of_rows(self) -> None:
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_table(
@@ -325,3 +340,59 @@ class TestVerboseBlock:
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
         assert "output mismatch" in out.getvalue()
+
+    @pytest.mark.parametrize(
+        "pe, expected",
+        [
+            (
+                _row(oracle_error="sweep exploded"),
+                "oracle      unavailable: sweep exploded",
+            ),
+            (
+                _oracle_row(exhaustive_requested=True, exhaustive_supported=True),
+                "exhaustive search enabled (a cached selection may be reused)",
+            ),
+            (
+                _oracle_row(exhaustive_requested=True),
+                "exhaustive unsupported by this engine; plan-level tuning only",
+            ),
+            (
+                _oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1),
+                "no tuning alternative: re-measured the heuristic plan; delta is noise",
+            ),
+            (_row(correctness=_verdict(True)), "passed (rtol 1e-05, atol 1e-06)"),
+            (
+                _row(correctness=CorrectnessResult(None, 1e-5, 1e-6)),
+                "unchecked (no comparison performed)",
+            ),
+            (_row(role="reference", warnings=["math SDPA"]), "warning     math SDPA"),
+        ],
+        ids=[
+            "oracle-error",
+            "exhaustive",
+            "exhaustive-unsupported",
+            "single-plan",
+            "passed",
+            "unchecked",
+            "reference-warning",
+        ],
+    )
+    def test_detail_line(self, pe, expected) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
+        assert expected in out.getvalue()
+
+    def test_reference_row_has_no_correctness_line(self) -> None:
+        out = io.StringIO()
+        pe = _row(role="reference", correctness=_verdict(False))
+        Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
+        assert "[reference]" in out.getvalue()
+        assert "correctness" not in out.getvalue()
+
+    def test_oracle_summary_without_reportable_speedup(self) -> None:
+        out = io.StringIO()
+        pe = _oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1)
+        Reporter(out, io.StringIO()).print_oracle_summary([_graph(pe)])
+        assert out.getvalue().startswith(
+            "Oracle: no reportable speedup on any of 1 tuned row(s)"
+        )

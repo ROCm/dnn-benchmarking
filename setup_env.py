@@ -69,9 +69,10 @@ DETECT_TIMEOUT_S = 30
 TORCH_RECORD = "dnn-bench-torch.json"
 
 # Written into each reused CMake build dir: the install and toolchain prefixes
-# it was configured for. The build dirs live in the checkout, shared by every
-# --workspace, and a CMakeCache keeps its compiler and <Pkg>_DIR paths when the
-# prefixes change, so a dir configured for other prefixes is wiped.
+# and the --cmake-arg defines it was configured with. The build dirs live in
+# the checkout, shared by every --workspace. A CMakeCache keeps its compiler and
+# <Pkg>_DIR paths when the prefixes change, and keeps a -D define after the
+# flag is dropped, so a dir configured differently is wiped.
 BUILD_RECORD = "dnn-bench-prefixes.json"
 
 
@@ -493,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
             "changing its --torch-mode, --gpu-arch or --torch-index-url then "
             "requires --clean. A build directory configured for another "
             "install or toolchain prefix (another --workspace or --rocm-prefix) "
-            "is wiped without --clean."
+            "or other --cmake-arg defines is wiped without --clean."
         ),
     )
     parser.add_argument(
@@ -1271,13 +1272,19 @@ class Setup:
         return libs[0] if libs else None
 
     def _reset_build_dir(
-        self, build_dir: Path, install_prefix: str, toolchain_prefix: str
+        self,
+        build_dir: Path,
+        install_prefix: str,
+        toolchain_prefix: str,
+        cmake_args=(),
     ) -> None:
         """Keep build_dir for an incremental build only when it was configured
-        for these prefixes (see BUILD_RECORD); wipe it otherwise or on --clean."""
+        with these prefixes and defines (see BUILD_RECORD); wipe it otherwise or
+        on --clean."""
         wanted = {
             "install_prefix": install_prefix,
             "toolchain_prefix": toolchain_prefix,
+            "cmake_args": list(cmake_args),
         }
         record = build_dir / BUILD_RECORD
         if build_dir.exists():
@@ -1286,7 +1293,9 @@ class Setup:
             except (OSError, ValueError):
                 same = False
             if not same and not self.clean:
-                print(f"Removing {build_dir}: configured for other ROCm prefixes.")
+                print(
+                    f"Removing {build_dir}: configured for other prefixes or defines."
+                )
             if self.clean or not same:
                 rmtree(build_dir)
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -1298,7 +1307,9 @@ class Setup:
             fail("ninja not found on PATH.")
 
         build_dir = ROCM_LIBRARIES_DIR / "build"
-        self._reset_build_dir(build_dir, install_prefix, toolchain_prefix)
+        self._reset_build_dir(
+            build_dir, install_prefix, toolchain_prefix, self.extra_cmake_args
+        )
         prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
         print(f"Building hipDNN and providers to {install_prefix}...")
         run(

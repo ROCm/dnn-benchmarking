@@ -14,6 +14,7 @@ import pytest
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
+    PyTorchSdpaBackendName,
     SuiteConfig,
     ValidationConfig,
 )
@@ -70,6 +71,7 @@ class Fake:
         self.torch_error = None
         self.clocks = []
         self.events = []
+        self.torch_options = []
 
 
 @pytest.fixture
@@ -169,6 +171,7 @@ def fake_torch(fake, monkeypatch):
             pytorch_sdpa_backend,
             pytorch_rocm_fa_library=None,
         ):
+            fake.torch_options.append((pytorch_sdpa_backend, pytorch_rocm_fa_library))
             self.init_time_ms = 1.0
 
         def prepare(self):
@@ -495,6 +498,80 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
         ("error", str(Path("/a")), "RuntimeError: plugin load failed"),
         ("error", str(Path("/b")), "RuntimeError: plugin load failed"),
     ]
+
+
+def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
+    """-e 1,1 --plugin-path /a,/b: each row gets a fresh handle created after
+    its own plugin path is set, so an A/B row is not silently the default set."""
+    calls = []
+
+    def make_handle():
+        calls.append("Handle")
+        return _handle({1: f"ENG_{len(calls)}"})
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hipdnn_frontend",
+        SimpleNamespace(
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE="abs"),
+            set_engine_plugin_paths=lambda paths, mode: calls.append((paths, mode)),
+            Handle=make_handle,
+        ),
+    )
+    a, b = Path("/a"), Path("/b")
+
+    graph, _ = _run(handle=None, engine_filter=[1, 1], plugin_paths=[a, b])
+
+    assert calls == [([str(a)], "abs"), "Handle", ([str(b)], "abs"), "Handle"]
+    assert [(r.status, r.plugin_path, r.engine_name) for r in graph.results] == [
+        ("success", str(a), "ENG_2"),
+        ("success", str(b), "ENG_4"),
+    ]
+
+
+def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
+    """Without --oracle-mode or a profiling flag, no engine is autotuned and no
+    profiler child is spawned."""
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    called = []
+    monkeypatch.setattr(
+        suite_runner, "run_oracle_pass", lambda **kw: called.append("oracle")
+    )
+    monkeypatch.setattr(
+        profiling_orchestrator,
+        "run_profiling_passes",
+        lambda **kw: called.append("profile"),
+    )
+
+    graph, _ = _run()
+
+    assert called == []
+    assert [(r.status, r.oracle, r.extra_metrics) for r in graph.results] == [
+        ("success", None, None)
+    ] * 2
+
+
+def test_pytorch_sdpa_options_reach_the_timed_executor(fake_torch):
+    fake_torch.discovered = [1]
+
+    _validate(pytorch_sdpa_backend="flash", pytorch_rocm_fa_library="aotriton")
+
+    assert fake_torch.torch_options == [(PyTorchSdpaBackendName.FLASH, "aotriton")]
+
+
+def test_reference_warnings_go_on_the_reference_row_only(fake_torch, monkeypatch):
+    from dnn_benchmarking.execution import pytorch_ops
+
+    monkeypatch.setattr(
+        pytorch_ops, "get_reference_warnings", lambda graph_json: ["manual op"]
+    )
+    fake_torch.discovered = [1]
+
+    reference, engine = _validate()[0].results
+
+    assert "manual op" in reference.warnings
+    assert "manual op" not in (engine.warnings or [])
 
 
 def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):

@@ -18,9 +18,19 @@ DEFAULT_TOLERANCE = (1e-5, 1e-6)
 # kernels hipDNN and PyTorch select round 2-3 ULP apart even when they pick the
 # same solver. A 1% (~1.3 ULP) rtol flags that legitimate bf16 drift as a
 # failure; 3% (~3.8 ULP) keeps validation meaningful while tolerating it.
+# fp8 outputs: hipDNN and the reference round slightly different fp32
+# accumulators to the same fp8 grid, so one element rounding the other way is
+# a full ULP apart. Each fp8 entry is 2 ULP at 1.0 for both rtol and atol: e4m3
+# has 3 mantissa bits (ULP 2^-3), e5m2 has 2 (ULP 2^-2), e8m0 is powers of two
+# only (ULP 1). The fnuz variants share their mantissa width.
 TOLERANCES = {
     "bfloat16": (3e-2, 1e-3),
     "half": (1e-3, 1e-3),
+    "fp8_e4m3": (0.25, 0.25),
+    "fp8_e4m3_fnuz": (0.25, 0.25),
+    "fp8_e5m2": (0.5, 0.5),
+    "fp8_e5m2_fnuz": (0.5, 0.5),
+    "fp8_e8m0": (2.0, 2.0),
 }
 
 

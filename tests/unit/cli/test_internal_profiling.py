@@ -24,6 +24,11 @@ def _child_args(plugin_path=None):
 def stack(monkeypatch):
     """Hermetic hipdnn / loader / executor / buffers; returns the mocks."""
     mocks = {"hipdnn": MagicMock(), "executor": MagicMock(), "inputs": MagicMock()}
+    calls = mocks["calls"] = []
+    mocks["executor"].enqueue.side_effect = lambda *a: calls.append("enqueue")
+    monkeypatch.setattr(
+        internal_profiling, "device_sync", lambda backend: calls.append(backend)
+    )
     mocks["hipdnn"].PluginLoadingMode.ABSOLUTE = "absolute"
     monkeypatch.setitem(sys.modules, "hipdnn_frontend", mocks["hipdnn"])
     monkeypatch.setattr(internal_profiling, "initialize_pip_rocm_runtime", lambda: None)
@@ -47,8 +52,10 @@ def test_orchestrator_argv_drives_one_engine_warm_fixed_count(stack):
 
     stack["executor"].prepare.assert_called_once()
     assert stack["executor"].prepare.call_args.kwargs["engine_id"] == 42
-    # warmup + iters plain dispatches; no timing loop under the profiler.
-    assert stack["executor"].execute_once.call_count == 3 + 7
+    # warmup + iters plain graph executes, then one drain: no timing loop
+    # (stall-gate deadlock) and no execute_once (per-iteration workspace memset).
+    assert stack["calls"] == ["enqueue"] * (3 + 7) + ["hip"]
+    stack["executor"].execute_once.assert_not_called()
     stack["executor"].benchmark.assert_not_called()
     policy = stack["policy"]
     assert (policy.min_time_ms, policy.cache_mode) == (0.0, "warm")
@@ -87,3 +94,19 @@ def test_multiple_plugin_paths_are_rejected(stack, capsys):
     args.plugin_path = [Path("/a"), Path("/b")]
     assert internal_profiling.run_internal_profiling(args) == 1
     assert "--plugin-path" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "field, value, flag",
+    [
+        ("graph", [], "--graph"),
+        ("graph", [Path("/a.json"), Path("/b.json")], "--graph"),
+        ("engine", [1, 2], "--engine"),
+    ],
+)
+def test_exactly_one_graph_and_engine_are_required(stack, capsys, field, value, flag):
+    args = _child_args()
+    setattr(args, field, value)
+    assert internal_profiling.run_internal_profiling(args) == 1
+    assert flag in capsys.readouterr().err
+    stack["executor"].prepare.assert_not_called()

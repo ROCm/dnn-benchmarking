@@ -111,6 +111,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             graph_paths=[Path(p) for p in resolved_files],
             reporter=reporter,
             tarball_source=tarball_source,
+            argv=[sys.argv[0], *argv],
         )
     finally:
         for td in tmpdirs:

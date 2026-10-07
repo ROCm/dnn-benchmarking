@@ -3,6 +3,8 @@
 
 """Tests for the GPU identity detection chain."""
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,3 +75,23 @@ def test_rocminfo_reports_the_first_gpu_agent_not_the_cpu():
 def test_rocminfo_missing_reports_nothing():
     with patch.object(_arch, "resolve_rocm_tool", return_value=None):
         assert _arch._detect_via_rocminfo() == (None, None)
+
+
+@pytest.mark.parametrize(
+    "props, expected",
+    [
+        (
+            SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-", name="MI300X"),
+            ("gfx942", "MI300X"),
+        ),
+        (SimpleNamespace(name="MI300X"), (None, "MI300X")),  # CUDA: no gcnArchName
+    ],
+    ids=["rocm", "cuda"],
+)
+def test_torch_source_reads_device_properties(monkeypatch, props, expected):
+    cuda = SimpleNamespace(
+        current_device=lambda: 0, get_device_properties=lambda i: props
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(_arch.torch_support, "gpu_available", lambda: True)
+    assert _arch._detect_via_torch() == expected

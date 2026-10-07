@@ -318,3 +318,18 @@ def test_benchmark_before_prepare_raises(rocm_module) -> None:
 
     with pytest.raises(ExecutionError, match="not prepared"):
         executor.benchmark({})
+
+
+def test_prepare_rejects_unsupported_operations(rocm_module, monkeypatch) -> None:
+    monkeypatch.setattr(
+        rocm_module.pytorch_ops, "get_unsupported_operations", lambda g: ["X"]
+    )
+    compiled = []
+    monkeypatch.setattr(rocm_module.pytorch_ops, "compile_graph", compiled.append)
+    executor = rocm_module.PyTorchCudaExecutor(
+        {"nodes": []}, TimingPolicy(), pytorch_sdpa_backend="default"
+    )
+
+    with pytest.raises(ExecutionError, match=r"unsupported operations: \['X'\]"):
+        executor.prepare()
+    assert compiled == []

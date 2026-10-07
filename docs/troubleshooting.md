@@ -243,7 +243,7 @@ The recorded artefacts:
 | `arch_narrowed_to_fallback` | Set when `--pmc all` couldn't find your arch in the CDNA table and fell back to the 2-counter fallback group |
 
 There is no suite-wide aggregate. The profiled child also launches
-input-fill and reset kernels, so a sum over every kernel would mix
+input-fill kernels, so a sum over every kernel would mix
 unrelated work. Each `per_kernel` entry holds:
 
 - `dispatches`: how many times the kernel ran in the child. Each engine

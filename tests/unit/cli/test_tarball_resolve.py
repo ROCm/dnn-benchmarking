@@ -204,6 +204,14 @@ class TestResolveGraphFilesMulti:
         assert files[0] == g2
         assert tmpdirs == []
 
+    def test_double_star_glob_recurses(self, tmp_path: Path) -> None:
+        nested = tmp_path / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "g.json").write_text("{}")
+
+        _, files, _ = resolve_graph_files_multi([str(tmp_path / "**" / "*.json")])
+        assert files == [str(nested / "g.json")]
+
     def test_mixed_json_and_tarball(self, tmp_path: Path) -> None:
         loose = tmp_path / "loose.json"
         loose.write_text(json.dumps({"name": "loose", "nodes": [], "tensors": []}))

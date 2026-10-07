@@ -58,7 +58,14 @@ def _fake_amdsmi(handles=("h0",), bdfs=None, fail=()):
     q("amdsmi_get_temp_metric", 65)
     q("amdsmi_get_gpu_metrics_info", {"throttle_status": False})
     q("amdsmi_get_gpu_vram_usage", {"vram_used": 1024, "vram_total": 65536})
-    q("amdsmi_get_gpu_asic_info", {"num_of_compute_units": 104})
+    q(
+        "amdsmi_get_gpu_asic_info",
+        {
+            "num_of_compute_units": 104,
+            "target_graphics_version": "gfx90a",
+            "market_name": "MI210",
+        },
+    )
     q("amdsmi_get_gpu_vram_info", {"vram_size": 65536})
     q("amdsmi_get_pcie_info", {"pcie_metric": {"pcie_speed": 16000, "pcie_width": 16}})
     q("amdsmi_get_gpu_driver_info", {"driver_version": "6.8.5"})
@@ -137,6 +144,11 @@ def test_snapshot_reports_vram_only(monkeypatch):
         "vram_used_mb": 1024.0,
         "vram_total_mb": 65536.0,
     }
+
+
+def test_identity_reports_target_then_market_name(monkeypatch):
+    _install(monkeypatch, _fake_amdsmi())
+    assert gpu_smi.GpuSmiProbe().identity() == ("gfx90a", "MI210")
 
 
 def test_static_info_units(monkeypatch):
