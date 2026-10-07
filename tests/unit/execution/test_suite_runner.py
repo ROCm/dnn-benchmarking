@@ -2070,13 +2070,15 @@ class TestOraclePass:
         assert instances[2].benchmark.call_args_list[-1].args[0] is ootb_handle
         assert instances[3].benchmark.call_args.args[0] is oracle_handle
 
-    def test_tuned_pass_samples_outside_its_warmup_and_never_retimes_ootb(self):
-        """The tuned plan's first execute samples every candidate kernel.
+    def test_builds_are_back_to_back_and_tuned_samples_outside_its_warmup(self):
+        """Both timed builds run before anything executes: work in between
+        (the OOTB timed loop, PyTorch validation) slows a later build, which
+        would bias the tuned build time.
 
-        It must run before the tuned warmup, so the tuned plan gets the same
-        number of ordinary warmup iterations as the OOTB plan; folding it into
-        the warmup leaves the tuned side one warmup short. The OOTB plan is
-        timed exactly once, so the speedup compares against the row's own run.
+        The tuned plan's first execute samples every candidate kernel. It must
+        run before the tuned warmup, so the tuned plan gets the same number of
+        ordinary warmup iterations as the OOTB plan. The OOTB plan is timed
+        exactly once, so the speedup compares against the row's own run.
         """
         order = []
         factory, _ = _make_oracle_exec_factory(order=order)
@@ -2085,9 +2087,9 @@ class TestOraclePass:
         assert order == [
             "prime.prime",
             "ootb.prepare",
+            "oracle.prepare",
             "ootb.warmup",
             "ootb.benchmark",
-            "oracle.prepare",
             "oracle.execute_once",
             "oracle.warmup",
             "oracle.benchmark",
@@ -2324,31 +2326,38 @@ class TestOracleExhaustiveEnvGuard:
     def _snapshot(self):
         return {name: os.environ.get(name) for name in self._NAMES}
 
-    def test_tuned_build_and_first_execute_run_with_the_cache_disabled(self):
+    def test_cache_is_disabled_for_tuned_work_only(self):
         """A tuned winner written to the disk cache would serve later OOTB rows.
 
-        Provider benchmarking comes from the plan's knob, so the process-wide
-        HIPDNN_FORCE_BENCHMARKING must stay unset: it would also tune the OOTB
-        plan.
+        The tuned plan is built before the OOTB plan executes, so the guard
+        must close after the tuned build: the OOTB run keeps the caller's
+        cache settings. Provider benchmarking comes from the plan's knob, so
+        the process-wide HIPDNN_FORCE_BENCHMARKING must stay unset: it would
+        also tune the OOTB plan.
         """
         seen = {}
         factory, instances = _make_oracle_exec_factory()
 
+        def capture(label):
+            return lambda *a, **k: seen.setdefault(label, self._snapshot())
+
         def make_instance_with_capture(*args, **kwargs):
             m = factory(*args, **kwargs)
+            if len(instances) == 3:
+                m.warmup.side_effect = capture("ootb_run")
             if len(instances) == 4:
-                m.prepare.side_effect = lambda *a, **k: seen.setdefault(
-                    "build", self._snapshot()
-                )
-                m.warmup.side_effect = lambda *a, **k: seen.setdefault(
-                    "first_execute", self._snapshot()
-                )
+                m.prepare.side_effect = capture("tuned_build")
+                m.execute_once.side_effect = capture("tuned_first_execute")
             return m
 
         self._run(make_instance_with_capture)
 
         tuned_env = {"HIPDNN_DISABLE_CACHE": "1", "HIPDNN_FORCE_BENCHMARKING": None}
-        assert seen == {"build": tuned_env, "first_execute": tuned_env}
+        assert seen == {
+            "tuned_build": tuned_env,
+            "ootb_run": {name: None for name in self._NAMES},
+            "tuned_first_execute": tuned_env,
+        }
 
     def test_env_is_restored_after_run(self) -> None:
         factory, _ = _make_oracle_exec_factory()

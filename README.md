@@ -306,7 +306,9 @@ pays one-time costs, such as provider setup and, on a cold page cache, reading
 the plugin and kernel files, which can inflate it several times over. Without
 that untimed build those costs would land in the OOTB time, and the
 `build_time_ms` values of the two plans would not be comparable. The untimed
-build is never executed, so no provider tuning runs. A tuned build prepares
+build is never executed, so no provider tuning runs. The tuned plan is built
+right after the OOTB plan, before either executes, because work in between (the
+OOTB timed loop, PyTorch validation) slows a later build. A tuned build prepares
 every candidate the provider can sample, so it is expected to be slower than
 the OOTB build. Providers that support the knob (today the kernel ingestor
 and MIOpen) sample their candidates on the tuned plan's first execute, which

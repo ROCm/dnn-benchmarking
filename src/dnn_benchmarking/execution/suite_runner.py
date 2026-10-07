@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import (
@@ -1247,26 +1247,37 @@ def _median_tflops(
     return tflops
 
 
-def _run_oracle_pass(
+def _record_oracle_error(
+    result: ProviderEngineResult, graph_name: str, engine_id: int, e: Exception
+) -> None:
+    error = f"{type(e).__name__}: {e}"
+    result.oracle_error = error
+    warn_once(
+        "oracle",
+        f"oracle tuning failed for {graph_name} engine {engine_id}: {error}",
+    )
+
+
+def _build_tuned_plan(
     *,
     result: ProviderEngineResult,
-    graph_path: Path,
-    graph_json_str: str,
     graph_name: str,
-    config: SuiteConfig,
+    graph_json_str: str,
+    bench_config: BenchmarkConfig,
     handle: Any,
     engine_id: int,
-    bm: Any,
-    tensor_infos: list,
-    graph_json: Dict[str, Any],
-    reference_outputs: Optional[Dict[int, Any]],
-) -> None:
-    """Build and time this engine's tuned plan without failing the OOTB row.
+) -> Optional[Tuple[Executor, Any, bool]]:
+    """Build and time this engine's tuned plan right after the OOTB build.
 
     The tuned plan goes through the same timed build as the OOTB plan, for
-    the same engine, with ``global.benchmarking=1``.
+    the same engine, with ``global.benchmarking=1``. Building it before
+    anything executes keeps both build times in the same process state; work
+    in between (the OOTB timed loop, PyTorch validation) slows a later build.
+
+    Returns:
+        ``(executor, handle, tuning_available)`` for ``_run_tuned_plan``, or
+        None after recording ``oracle_error``. Never fails the OOTB row.
     """
-    knobs = {BENCHMARKING_KNOB: 1}
     try:
         with _tuned_env():
             # Isolate MIOpen's mutable per-handle solver map from the baseline.
@@ -1275,22 +1286,35 @@ def _run_oracle_pass(
             set_stream = getattr(oracle_handle, "set_stream", None)
             if callable(get_stream) and callable(set_stream):
                 set_stream(get_stream())
-            bench_config = BenchmarkConfig(
-                graph_path=graph_path,
-                warmup_iters=config.warmup_iters,
-                benchmark_iters=config.benchmark_iters,
-                timing_block=config.timing_block,
-                engine_id=engine_id,
+            executor = Executor(graph_json_str=graph_json_str, config=bench_config)
+            executor.prepare(
+                oracle_handle, engine_id=engine_id, knobs={BENCHMARKING_KNOB: 1}
             )
-            executor = Executor(
-                graph_json_str=graph_json_str,
-                config=bench_config,
-            )
-            executor.prepare(oracle_handle, engine_id=engine_id, knobs=knobs)
             # hipDNN ignores a knob the engine does not expose; such a tuned
             # run re-measures the OOTB configuration.
             tuning_available = BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id)
+        return executor, oracle_handle, tuning_available
+    except Exception as e:
+        _record_oracle_error(result, graph_name, engine_id, e)
+        return None
 
+
+def _run_tuned_plan(
+    *,
+    tuned: Tuple[Executor, Any, bool],
+    result: ProviderEngineResult,
+    graph_name: str,
+    config: SuiteConfig,
+    engine_id: int,
+    bm: Any,
+    tensor_infos: list,
+    graph_json: Dict[str, Any],
+    reference_outputs: Optional[Dict[int, Any]],
+) -> None:
+    """Time and validate the tuned plan without failing the OOTB row."""
+    executor, oracle_handle, tuning_available = tuned
+    try:
+        with _tuned_env():
             # Restore outputs; inputs remain valid across executions.
             bm.zero_outputs()
             variant_pack = bm.create_variant_pack()
@@ -1342,12 +1366,7 @@ def _run_oracle_pass(
 
             result.oracle = oracle
     except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-        result.oracle_error = error
-        warn_once(
-            "oracle",
-            f"oracle tuning failed for {graph_name} engine {engine_id}: {error}",
-        )
+        _record_oracle_error(result, graph_name, engine_id, e)
 
 
 def run_single_provider_engine(
@@ -1404,6 +1423,18 @@ def run_single_provider_engine(
         result.build_time_ms = executor.build_time_ms
         if metrics_basic:
             result.workspace_bytes = executor.workspace_size
+        tuned = (
+            _build_tuned_plan(
+                result=result,
+                graph_name=graph_name,
+                graph_json_str=graph_json_str,
+                bench_config=bench_config,
+                handle=handle,
+                engine_id=engine_id,
+            )
+            if config.oracle_enabled
+            else None
+        )
 
         with BufferManager(
             tensor_infos, device=_hipdnn_buffer_device(reference_outputs)
@@ -1482,20 +1513,19 @@ def run_single_provider_engine(
             # Reaching here means the OOTB timed pass succeeded (any
             # failure raised out of this try block already), so the row
             # is eligible for an oracle comparison.
-            if config.oracle_enabled:
-                _run_oracle_pass(
+            if tuned is not None:
+                _run_tuned_plan(
+                    tuned=tuned,
                     result=result,
-                    graph_path=graph_path,
-                    graph_json_str=graph_json_str,
                     graph_name=graph_name,
                     config=config,
-                    handle=handle,
                     engine_id=engine_id,
                     bm=bm,
                     tensor_infos=tensor_infos,
                     graph_json=graph_json,
                     reference_outputs=reference_outputs,
                 )
+                del tuned
 
         # BufferManager context has exited — I/O buffers are freed.
         # Drop the executor reference too so its workspace allocation

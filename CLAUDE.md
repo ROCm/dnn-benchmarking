@@ -51,7 +51,8 @@ OOTB (`create_execution_plan_ext(engine_id, knobs)` -> `check_support()` -> `bui
 with the `global.benchmarking=1` knob, so each engine reports `build_time_ms` (OOTB) and
 `oracle.build_time_ms` (tuned). Each engine's OOTB plan is first built once untimed
 (`Executor.prime`) so the first-build costs (provider setup, cold page cache) stay out of
-both timings. Timed PyTorch rows get their tuned run in a child process
+both timings, and the tuned plan is built right after the OOTB plan, before anything
+executes, so both builds see the same process state. Timed PyTorch rows get their tuned run in a child process
 (`--internal-pytorch-tuned`) because PyTorch's conv algorithm cache and MIOpen's user DB
 would otherwise carry tuning into the OOTB measurement.
 
