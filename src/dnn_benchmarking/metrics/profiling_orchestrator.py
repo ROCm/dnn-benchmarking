@@ -8,7 +8,7 @@ When the user passes ``--pmc``, ``--emit-trace``, ``--perf``, or
 After it succeeds, this orchestrator runs the workload again — once per
 requested source — under the corresponding external profiler (rocprofv3,
 perf, rocprof-compute). The results are merged into a single dict that
-populates ``ProviderEngineResult.extra_metrics``.
+populates ``OotbResult.extra_metrics``.
 
 Architecture: the orchestrator builds a hidden re-exec argv that
 re-invokes ``python -m dnn_benchmarking`` with the

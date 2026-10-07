@@ -18,7 +18,7 @@ Opt-in profiling sources (separate workload re-run, orchestrated via
 
 Each opt-in source runs after the timed pass so PMC sampling and roof
 replay can't pollute the headline timing. Results land in
-``ProviderEngineResult.extra_metrics`` under per-source keys.
+``OotbResult.extra_metrics`` under per-source keys.
 """
 
 from .analytical import (

@@ -12,6 +12,7 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OotbResult,
     OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
@@ -44,10 +45,12 @@ def _make_pe_success(
         provider=provider,
         engine_id=engine_id,
         status="success",
-        build_time_ms=45.23,
-        host_stats=host,
-        gpu_kernel_stats=kernel,
-        correctness=correctness,
+        ootb=OotbResult(
+            build_time_ms=45.23,
+            host_stats=host,
+            gpu_kernel_stats=kernel,
+            correctness=correctness,
+        ),
     )
 
 
@@ -436,31 +439,33 @@ class TestVerboseReporter:
             provider="miopen",
             engine_id=1,
             status="success",
-            host_stats=BenchmarkStats(
-                mean_ms=1.0,
-                std_ms=0.1,
-                min_ms=0.9,
-                max_ms=1.1,
-                p95_ms=1.05,
-                p99_ms=1.09,
+            ootb=OotbResult(
+                host_stats=BenchmarkStats(
+                    mean_ms=1.0,
+                    std_ms=0.1,
+                    min_ms=0.9,
+                    max_ms=1.1,
+                    p95_ms=1.05,
+                    p99_ms=1.09,
+                ),
+                gpu_kernel_stats=BenchmarkStats(
+                    mean_ms=0.5,
+                    std_ms=0.05,
+                    min_ms=0.45,
+                    max_ms=0.55,
+                    p95_ms=0.52,
+                    p99_ms=0.54,
+                ),
+                extra_metrics={
+                    "pmc": {
+                        "set": "basic",
+                        "arch": "gfx942",
+                        "counters": {
+                            "GRBM_GUI_ACTIVE": {"sum": 999, "mean_per_kernel": 1.0}
+                        },
+                    }
+                },
             ),
-            gpu_kernel_stats=BenchmarkStats(
-                mean_ms=0.5,
-                std_ms=0.05,
-                min_ms=0.45,
-                max_ms=0.55,
-                p95_ms=0.52,
-                p99_ms=0.54,
-            ),
-            extra_metrics={
-                "pmc": {
-                    "set": "basic",
-                    "arch": "gfx942",
-                    "counters": {
-                        "GRBM_GUI_ACTIVE": {"sum": 999, "mean_per_kernel": 1.0}
-                    },
-                }
-            },
         )
         gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
         reporter.print_verbose_graph_result(gr, SuiteConfig())
@@ -479,16 +484,18 @@ class TestVerboseReporter:
             provider="miopen",
             engine_id=1,
             status="success",
-            analytical_flops=None,
             analytical_flops_partial=True,
             analytical_io_bytes=4096,
-            gpu_kernel_stats=BenchmarkStats(
-                mean_ms=0.5,
-                std_ms=0.05,
-                min_ms=0.45,
-                max_ms=0.55,
-                p95_ms=0.52,
-                p99_ms=0.54,
+            ootb=OotbResult(
+                analytical_flops=None,
+                gpu_kernel_stats=BenchmarkStats(
+                    mean_ms=0.5,
+                    std_ms=0.05,
+                    min_ms=0.45,
+                    max_ms=0.55,
+                    p95_ms=0.52,
+                    p99_ms=0.54,
+                ),
             ),
         )
         gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
@@ -509,27 +516,33 @@ class TestVerboseReporter:
             provider="miopen",
             engine_id=1,
             status="success",
-            host_stats=BenchmarkStats(
-                mean_ms=1.0,
-                std_ms=0.1,
-                min_ms=0.9,
-                max_ms=1.1,
-                p95_ms=1.05,
-                p99_ms=1.09,
+            ootb=OotbResult(
+                host_stats=BenchmarkStats(
+                    mean_ms=1.0,
+                    std_ms=0.1,
+                    min_ms=0.9,
+                    max_ms=1.1,
+                    p95_ms=1.05,
+                    p99_ms=1.09,
+                ),
+                gpu_kernel_stats=BenchmarkStats(
+                    mean_ms=0.5,
+                    std_ms=0.05,
+                    min_ms=0.45,
+                    max_ms=0.55,
+                    p95_ms=0.52,
+                    p99_ms=0.54,
+                ),
+                extra_metrics={
+                    "trace": {
+                        "format": "pftrace",
+                        "error_tail": "boom",
+                        "returncode": 3,
+                    },
+                    "perf": {"error_tail": "perf: bad event", "returncode": 2},
+                    "roofline": {"error_tail": "workload failed", "returncode": 1},
+                },
             ),
-            gpu_kernel_stats=BenchmarkStats(
-                mean_ms=0.5,
-                std_ms=0.05,
-                min_ms=0.45,
-                max_ms=0.55,
-                p95_ms=0.52,
-                p99_ms=0.54,
-            ),
-            extra_metrics={
-                "trace": {"format": "pftrace", "error_tail": "boom", "returncode": 3},
-                "perf": {"error_tail": "perf: bad event", "returncode": 2},
-                "roofline": {"error_tail": "workload failed", "returncode": 1},
-            },
         )
         gr = GraphResult(graph_name="g", graph_path="/tmp/g.json", results=[pe])
         reporter.print_verbose_graph_result(gr, SuiteConfig())
@@ -589,14 +602,16 @@ class TestPrintHeader:
                     engine_id=0,
                     status="success",
                     role="reference",
-                    host_stats=BenchmarkStats(
-                        mean_ms=2.0,
-                        median_ms=2.0,
-                        std_ms=0.0,
-                        min_ms=2.0,
-                        max_ms=2.0,
-                        p95_ms=2.0,
-                        p99_ms=2.0,
+                    ootb=OotbResult(
+                        host_stats=BenchmarkStats(
+                            mean_ms=2.0,
+                            median_ms=2.0,
+                            std_ms=0.0,
+                            min_ms=2.0,
+                            max_ms=2.0,
+                            p95_ms=2.0,
+                            p99_ms=2.0,
+                        ),
                     ),
                 )
             ],
@@ -699,7 +714,7 @@ class TestOracleReporting:
 
     def test_table_reports_ootb_and_tuned_build_times_in_their_columns(self) -> None:
         pe = _make_pe_success()
-        pe.build_time_ms = 12.5
+        pe.ootb.build_time_ms = 12.5
         pe.oracle = _make_oracle(build_time_ms=340.25)
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
@@ -736,7 +751,7 @@ class TestOracleReporting:
     def test_table_marks_a_failed_baseline_invalid_too(self) -> None:
         """A wrong baseline cannot measure a gain; the row must say so."""
         pe = _make_pe_success()
-        pe.correctness = self._verdict(False)
+        pe.ootb.correctness = self._verdict(False)
         pe.oracle = _make_oracle(correctness=self._verdict(True))
         output = io.StringIO()
         Reporter(output=output).print_graph_result_table(self._graph_with(pe))
@@ -747,7 +762,7 @@ class TestOracleReporting:
     def test_table_speedup_survives_an_unchecked_verdict(self) -> None:
         """ "Not checked" is not "failed" and must not blank the ratio."""
         pe = _make_pe_success()
-        pe.correctness = CorrectnessResult(
+        pe.ootb.correctness = CorrectnessResult(
             execution_success=True,
             tolerance_match=None,
             rtol=1e-5,
@@ -787,7 +802,7 @@ class TestOracleReporting:
 
     def test_verbose_reports_ootb_and_tuned_plan_build_times_separately(self) -> None:
         pe = _make_pe_success()
-        pe.build_time_ms = 12.5
+        pe.ootb.build_time_ms = 12.5
         pe.oracle = _make_oracle(build_time_ms=340.25)
         output = io.StringIO()
         Reporter(output=output).print_verbose_graph_result(

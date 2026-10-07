@@ -116,10 +116,10 @@ class TestSuiteRunnerIntegration:
             pytest.skip("No successful provider/engine combinations found")
 
         for r in successes:
-            assert r.build_time_ms is not None
-            assert r.build_time_ms > 0
-            assert r.host_stats is not None
-            assert r.host_stats.mean_ms > 0
+            assert r.ootb.build_time_ms is not None
+            assert r.ootb.build_time_ms > 0
+            assert r.ootb.host_stats is not None
+            assert r.ootb.host_stats.mean_ms > 0
             # gpu_kernel_stats may be None if torch GPU timing isn't available
 
     def test_successful_result_has_correctness(
@@ -148,8 +148,8 @@ class TestSuiteRunnerIntegration:
             pytest.skip("No successful provider/engine combinations found")
 
         for r in successes:
-            assert r.correctness is not None
-            assert r.correctness.execution_success is True
+            assert r.ootb.correctness is not None
+            assert r.ootb.correctness.execution_success is True
 
     def test_basic_metrics_populated_by_default(
         self, hipdnn, conv_graph: Dict[str, Any]
@@ -184,10 +184,10 @@ class TestSuiteRunnerIntegration:
 
         for r in successes:
             # workspace_bytes is non-negative (zero is valid for some engines).
-            assert r.workspace_bytes is not None
-            assert r.workspace_bytes >= 0
+            assert r.ootb.workspace_bytes is not None
+            assert r.ootb.workspace_bytes >= 0
             # Conv graph has compute nodes → analytical_flops > 0.
-            assert r.analytical_flops is not None and r.analytical_flops > 0
+            assert r.ootb.analytical_flops is not None and r.ootb.analytical_flops > 0
             assert r.analytical_io_bytes is not None and r.analytical_io_bytes > 0
             # rusage probe populated user CPU time per iter (kernel may be 0).
             assert (
@@ -195,9 +195,9 @@ class TestSuiteRunnerIntegration:
                 and r.cpu_user_time_per_iter_us >= 0
             )
             # Derived throughputs follow when kernel timing is available.
-            if r.gpu_kernel_stats is not None:
-                assert r.derived_tflops_per_s is not None
-                assert r.derived_tflops_per_s >= 0
+            if r.ootb.gpu_kernel_stats is not None:
+                assert r.ootb.derived_tflops_per_s is not None
+                assert r.ootb.derived_tflops_per_s >= 0
                 assert r.derived_gbytes_per_s is not None
                 assert r.derived_gbytes_per_s >= 0
             # VRAM is populated when amdsmi is available; allow None on
@@ -239,12 +239,12 @@ class TestSuiteRunnerIntegration:
 
         for r in successes:
             # Legacy fields still populated even with metrics off.
-            assert r.build_time_ms is not None
+            assert r.ootb.build_time_ms is not None
             # Always-on fields stay None when tier=off.
-            assert r.workspace_bytes is None
-            assert r.analytical_flops is None
+            assert r.ootb.workspace_bytes is None
+            assert r.ootb.analytical_flops is None
             assert r.analytical_io_bytes is None
-            assert r.derived_tflops_per_s is None
+            assert r.ootb.derived_tflops_per_s is None
             assert r.cpu_user_time_per_iter_us is None
             assert r.cpu_kernel_time_per_iter_us is None
             assert r.vram_used_mb is None
@@ -599,10 +599,10 @@ class TestPyTorchBackendCLIIntegration:
             assert providers == {"pytorch"}
             for row in graph["results"]:
                 assert row["status"] == "success", row
-                assert row["host_stats"], row
+                assert row["ootb"]["host_stats"], row
                 # "auto" timing yields HIP events on ROCm and torch.cuda
                 # events on CUDA, so kernel stats exist on both.
-                assert row["gpu_kernel_stats"], row
+                assert row["ootb"]["gpu_kernel_stats"], row
                 assert "pytorch_sdpa_backend_requested" not in row
 
     def test_flash_rocm_preference_serializes_suite_metadata(
@@ -687,13 +687,13 @@ class TestPyTorchBackendCLIIntegration:
             assert row["status"] == "error"
             assert "native forward SDPA call" in row["error_message"]
             assert "pytorch_sdpa_backend_requested" not in row
-            assert "host_stats" not in row
-            assert "gpu_kernel_stats" not in row
+            assert row["ootb"] is None
+            assert row["oracle"] is None
 
 
 @pytest.mark.gpu
 class TestOracleCLIIntegration:
-    """--oracle-mode adds the tuned payload; its absence leaves the JSON unchanged."""
+    """--oracle-mode adds the tuned payload; without it every row's oracle is null."""
 
     @pytest.fixture(autouse=True)
     def check_deps(self, plugin_paths: List[str]):
@@ -760,7 +760,7 @@ class TestOracleCLIIntegration:
             if row["status"] == "success"
         ]
         assert rows, "no successful engine row to compare"
-        tuned = [row for row in rows if "oracle" in row]
+        tuned = [row for row in rows if row["oracle"] is not None]
         assert tuned, f"no row carried an oracle payload. stdout: {result.stdout}"
 
         row = tuned[0]
@@ -771,18 +771,19 @@ class TestOracleCLIIntegration:
         assert not [key for key in oracle if key.startswith("warm_baseline_")]
         assert isinstance(oracle["tuning_available"], bool)
         # OOTB and tuned plan builds are both reported for comparison.
-        assert row["build_time_ms"] > 0
+        assert row["ootb"]["build_time_ms"] > 0
         assert oracle["build_time_ms"] > 0
         # The speedup is derived from the row's own OOTB run and the tuned run.
+        ootb = row["ootb"]
         basis = (
             "gpu_kernel_stats"
-            if row.get("gpu_kernel_stats") and oracle.get("gpu_kernel_stats")
+            if ootb["gpu_kernel_stats"] and oracle["gpu_kernel_stats"]
             else "host_stats"
         )
-        speedup = row[basis]["mean_ms"] / oracle[basis]["mean_ms"]
+        speedup = ootb[basis]["mean_ms"] / oracle[basis]["mean_ms"]
         assert speedup > 0
 
-    def test_plain_run_has_no_oracle_keys(
+    def test_plain_run_has_no_oracle_payload(
         self, project_root: Path, tmp_path: Path, cli_plugin_args: List[str]
     ) -> None:
         output_file = tmp_path / "plain.json"
@@ -797,4 +798,5 @@ class TestOracleCLIIntegration:
         assert "hipdnn_selection_env" not in data["metadata"]
         for graph in data["graphs"]:
             for row in graph["results"]:
-                assert not {"oracle", "oracle_error"} & set(row)
+                assert row["oracle"] is None
+                assert "oracle_error" not in row

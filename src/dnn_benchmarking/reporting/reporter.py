@@ -13,6 +13,7 @@ from .statistics import BenchmarkStats
 from .suite_results import (
     CorrectnessResult,
     GraphResult,
+    OotbResult,
     ProviderEngineResult,
     SuiteMetadata,
     oracle_speedup,
@@ -369,31 +370,22 @@ class Reporter:
     @staticmethod
     def _pe_outcome(pe: ProviderEngineResult) -> str:
         """Derive a short outcome label for a ProviderEngineResult."""
-        if pe.role == "reference" and pe.status == "success":
-            label = "reference"
-            timing = (
-                pe.gpu_kernel_stats
-                if pe.gpu_kernel_stats is not None
-                else pe.host_stats
-            )
-            if timing is not None:
-                exec_s = timing.total_ms / 1000
-                wall_s = pe.elapsed_time_ms / 1000
-                return f"{label} (exec {exec_s:.2f}s, elapsed {wall_s:.2f}s)"
-            return label
         if pe.status == "success":
-            label = (
-                "failed"
-                if (
-                    pe.correctness is not None
-                    and pe.correctness.tolerance_match is False
-                )
-                else "passed"
-            )
+            if pe.role == "reference":
+                label = "reference"
+            elif pe.failed_validation:
+                label = "failed"
+            else:
+                label = "passed"
+            ootb = pe.ootb
             timing = (
-                pe.gpu_kernel_stats
-                if pe.gpu_kernel_stats is not None
-                else pe.host_stats
+                None
+                if ootb is None
+                else (
+                    ootb.gpu_kernel_stats
+                    if ootb.gpu_kernel_stats is not None
+                    else ootb.host_stats
+                )
             )
             if timing is not None:
                 exec_s = timing.total_ms / 1000
@@ -438,15 +430,18 @@ class Reporter:
             headers.append("warnings")
         rows: List[List[str]] = []
         for pe in graph_result.results:
+            ootb = pe.ootb
+            kernel_stats = ootb.gpu_kernel_stats if ootb is not None else None
+            host_stats = ootb.host_stats if ootb is not None else None
             row = [pe.provider, self._pe_status(pe)]
             if include_plugin:
                 row.append(pe.plugin_path or "")
             row.extend(
                 [
-                    self._fmt_stat(pe.gpu_kernel_stats, "mean_ms"),
-                    self._fmt_stat(pe.gpu_kernel_stats, "median_ms"),
-                    self._fmt_stat(pe.host_stats, "mean_ms"),
-                    self._fmt_stat(pe.host_stats, "median_ms"),
+                    self._fmt_stat(kernel_stats, "mean_ms"),
+                    self._fmt_stat(kernel_stats, "median_ms"),
+                    self._fmt_stat(host_stats, "mean_ms"),
+                    self._fmt_stat(host_stats, "median_ms"),
                 ]
             )
             if include_oracle:
@@ -459,7 +454,7 @@ class Reporter:
                 if any(
                     verdict is not None and verdict.explicitly_failed
                     for verdict in (
-                        pe.correctness,
+                        ootb.correctness if ootb is not None else None,
                         pe.oracle.correctness if pe.oracle else None,
                     )
                 ):
@@ -473,7 +468,9 @@ class Reporter:
                     row.append("failed")
                 else:
                     row.append("n/a")
-                row.append(self._fmt_ms(pe.build_time_ms))
+                row.append(
+                    self._fmt_ms(ootb.build_time_ms if ootb is not None else None)
+                )
                 row.append(self._fmt_ms(pe.oracle.build_time_ms if pe.oracle else None))
             if include_warnings:
                 row.append(self._fmt_warnings(pe.warnings))
@@ -498,7 +495,7 @@ class Reporter:
             return "reference"
         if pe.status != "success":
             return pe.status
-        if pe.correctness is not None and pe.correctness.tolerance_match is False:
+        if pe.failed_validation:
             return "failed"
         return "passed"
 
@@ -547,26 +544,27 @@ class Reporter:
                     cfg_view, graph_result.graph_name, provider=pe.provider
                 )
 
-            if pe.build_time_ms is not None:
-                self.print_build_time(pe.build_time_ms)
-
             if pe.status == "success":
-                self._print_pe_stats(pe)
-                self._print_pe_metrics(pe)
+                ootb = pe.ootb
+                assert ootb is not None, "successful rows carry an OOTB run"
+                if ootb.build_time_ms is not None:
+                    self.print_build_time(ootb.build_time_ms)
+                self._print_pe_stats(ootb)
+                self._print_pe_metrics(pe, ootb)
                 self._print_oracle_block(pe)
                 # Profiling artefacts render independently of the always-on
                 # metrics block — opt-in profiling is valid under
                 # --metrics-tier off, and the user should still see where
                 # their artefacts landed plus any tool-failure detail.
-                self._print_profiling_block(pe)
+                self._print_profiling_block(ootb)
                 self._print_pe_warnings(pe)
                 if pe.role == "reference":
                     self._print(
                         "Reference: timing baseline (no correctness comparison)"
                     )
                     self._print("")
-                elif pe.correctness is not None:
-                    self._print_pe_correctness(pe.correctness, suite_config)
+                elif ootb.correctness is not None:
+                    self._print_pe_correctness(ootb.correctness, suite_config)
             elif pe.status == "skipped":
                 self._print(f"Status: SKIPPED ({pe.skip_reason or 'no reason given'})")
                 self._print("")
@@ -577,17 +575,17 @@ class Reporter:
             self.print_footer()
             self._print("")
 
-    def _print_pe_stats(self, pe: ProviderEngineResult) -> None:
-        """Print host + kernel stats from a ProviderEngineResult."""
-        if pe.host_stats is not None:
+    def _print_pe_stats(self, ootb: OotbResult) -> None:
+        """Print host + kernel stats from the OOTB run."""
+        if ootb.host_stats is not None:
             self._print("Host Submission Statistics:")
-            self._print_stats_block(pe.host_stats)
+            self._print_stats_block(ootb.host_stats)
             self._print("")
-        if pe.gpu_kernel_stats is not None:
+        if ootb.gpu_kernel_stats is not None:
             self._print("Kernel Execution Statistics:")
-            self._print_stats_block(pe.gpu_kernel_stats)
+            self._print_stats_block(ootb.gpu_kernel_stats)
             self._print("")
-        elif pe.host_stats is not None:
+        elif ootb.host_stats is not None:
             self._print("Kernel Timing: Not available")
             self._print("")
 
@@ -647,7 +645,7 @@ class Reporter:
             return f"{mib / 1024:.2f} GiB"
         return f"{mib:.1f} MiB"
 
-    def _print_pe_metrics(self, pe: ProviderEngineResult) -> None:
+    def _print_pe_metrics(self, pe: ProviderEngineResult, ootb: OotbResult) -> None:
         """Render the always-on metrics block in verbose mode.
 
         Suppresses the entire section when no metric fields are
@@ -657,10 +655,10 @@ class Reporter:
         any_present = any(
             v is not None
             for v in (
-                pe.workspace_bytes,
-                pe.analytical_flops,
+                ootb.workspace_bytes,
+                ootb.analytical_flops,
                 pe.analytical_io_bytes,
-                pe.derived_tflops_per_s,
+                ootb.derived_tflops_per_s,
                 pe.derived_gbytes_per_s,
                 pe.cpu_user_time_per_iter_us,
                 pe.cpu_kernel_time_per_iter_us,
@@ -675,7 +673,9 @@ class Reporter:
         # truth — without it, the user can't multiply the rounded median
         # back through the FLOPs total to recover the printed TFLOPs.
         kernel_median_ms = (
-            pe.gpu_kernel_stats.median_ms if pe.gpu_kernel_stats is not None else None
+            ootb.gpu_kernel_stats.median_ms
+            if ootb.gpu_kernel_stats is not None
+            else None
         )
         derivation_suffix = (
             f"  (kernel median {kernel_median_ms:.4f} ms)"
@@ -684,16 +684,16 @@ class Reporter:
         )
 
         self._print("Derived Metrics:")
-        if pe.workspace_bytes is not None:
+        if ootb.workspace_bytes is not None:
             self._print(
-                f"  Workspace:            {self._fmt_mib(pe.workspace_bytes / 1024 / 1024)}"
+                f"  Workspace:            {self._fmt_mib(ootb.workspace_bytes / 1024 / 1024)}"
             )
-        if pe.analytical_flops is not None:
+        if ootb.analytical_flops is not None:
             partial = " (partial)" if pe.analytical_flops_partial else ""
-            self._print(f"  Analytical FLOPs:     {pe.analytical_flops:,}{partial}")
-            if pe.derived_tflops_per_s is not None:
+            self._print(f"  Analytical FLOPs:     {ootb.analytical_flops:,}{partial}")
+            if ootb.derived_tflops_per_s is not None:
                 self._print(
-                    f"  Throughput:           {pe.derived_tflops_per_s:.3f} TFLOP/s"
+                    f"  Throughput:           {ootb.derived_tflops_per_s:.3f} TFLOP/s"
                     f"{derivation_suffix}"
                 )
         elif pe.analytical_flops_partial:
@@ -729,7 +729,7 @@ class Reporter:
             self._print(f"  VRAM used:            {self._fmt_mib(pe.vram_used_mb)}")
         self._print("")
 
-    def _print_profiling_block(self, pe: ProviderEngineResult) -> None:
+    def _print_profiling_block(self, ootb: OotbResult) -> None:
         """Render the opt-in profiling artefacts when extra_metrics is set.
 
         Each line is conditional: a user who runs only --pmc sees one
@@ -737,7 +737,7 @@ class Reporter:
         counter lists fold to ``[N more, see JSON]`` so the console
         block stays compact — full nested data is always in the JSON.
         """
-        extra = pe.extra_metrics
+        extra = ootb.extra_metrics
         if not extra:
             return
         any_present = any(

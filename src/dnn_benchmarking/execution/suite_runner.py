@@ -43,7 +43,9 @@ from ..reporting.statistics import BenchmarkStats
 from ..reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OotbResult,
     OracleResult,
+    PlanRunResult,
     ProviderEngineResult,
 )
 from ..validation.reference_provider import (
@@ -213,20 +215,15 @@ def _engine_setup_error_result(
     provider: str,
     engine_id: int,
     plugin_path: Optional[Path],
-    config: SuiteConfig,
     error_message: str,
 ) -> ProviderEngineResult:
     """Build a per-engine error row for plugin-path/handle setup failures."""
-    rtol, atol = _fallback_tolerance_for_config(config)
     return ProviderEngineResult(
         provider=provider,
         engine_id=engine_id,
         status="error",
         plugin_path=str(plugin_path) if plugin_path is not None else None,
         error_message=error_message,
-        correctness=CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=error_message
-        ),
     )
 
 
@@ -581,6 +578,7 @@ def _stats_from_dict(data: Optional[Dict[str, float]]) -> Optional[BenchmarkStat
 def _run_pytorch_oracle_pass(
     *,
     result: ProviderEngineResult,
+    ootb: PlanRunResult,
     graph_path: Path,
     graph_name: str,
     config: SuiteConfig,
@@ -591,15 +589,16 @@ def _run_pytorch_oracle_pass(
     validated: they never enter this process.
     """
     try:
-        tuned = _run_pytorch_tuned_child(graph_path, config)
+        tuned = _run_pytorch_tuned_child(graph_path, config)["ootb"]
         oracle = OracleResult(
             tuning_available=True,
-            host_stats=_stats_from_dict(tuned.get("host_stats")),
-            gpu_kernel_stats=_stats_from_dict(tuned.get("gpu_kernel_stats")),
+            host_stats=_stats_from_dict(tuned["host_stats"]),
+            gpu_kernel_stats=_stats_from_dict(tuned["gpu_kernel_stats"]),
+            analytical_flops=ootb.analytical_flops,
         )
-        # Same FLOPs and median denominator as the row's derived TFLOP/s.
+        # Same FLOPs and median denominator as the OOTB derived TFLOP/s.
         oracle.derived_tflops_per_s = _median_tflops(
-            result.analytical_flops, oracle.gpu_kernel_stats
+            oracle.analytical_flops, oracle.gpu_kernel_stats
         )
         result.oracle = oracle
     except Exception as e:
@@ -646,6 +645,7 @@ def _run_timed_pytorch_row(
         role=role,
         engine_version=engine_version,
     )
+    ootb = OotbResult()
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
 
@@ -685,11 +685,9 @@ def _run_timed_pytorch_row(
                     if cpu_time_probe is not None:
                         cpu_time_probe.__exit__(None, None, None)
 
-                result.host_stats = BenchmarkStats.from_timings(
-                    bench_result.host_timings
-                )
+                ootb.host_stats = BenchmarkStats.from_timings(bench_result.host_timings)
                 if bench_result.has_kernel_timings:
-                    result.gpu_kernel_stats = BenchmarkStats.from_timings(
+                    ootb.gpu_kernel_stats = BenchmarkStats.from_timings(
                         bench_result.kernel_timings
                     )
                 assert bench_result.metadata is not None
@@ -697,6 +695,7 @@ def _run_timed_pytorch_row(
                 if config.metrics.basic_enabled:
                     _collect_basic_metrics_post_loop(
                         result=result,
+                        ootb=ootb,
                         cpu_time_probe=cpu_time_probe,
                         timed_executions=_benchmark_executions(config),
                         analytical_flops=analytical_flops,
@@ -715,19 +714,20 @@ def _run_timed_pytorch_row(
                     )
 
             if role == "reference":
-                result.correctness = _reference_row_correctness(config)
+                ootb.correctness = _reference_row_correctness(config)
                 warnings = pytorch_ops.get_reference_warnings(graph_json)
                 if warnings:
                     result.warnings = warnings
             else:
                 rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult(
+                ootb.correctness = CorrectnessResult(
                     execution_success=True,
                     tolerance_match=None,
                     rtol=rtol,
                     atol=atol,
                     error_message="No reference provider requested",
                 )
+            result.ootb = ootb
             result.status = "success"
 
             # After the OOTB buffers are released, so the child's allocations
@@ -735,6 +735,7 @@ def _run_timed_pytorch_row(
             if config.oracle_enabled:
                 _run_pytorch_oracle_pass(
                     result=result,
+                    ootb=ootb,
                     graph_path=graph_path,
                     graph_name=graph_name,
                     config=config,
@@ -748,21 +749,11 @@ def _run_timed_pytorch_row(
             else:
                 result.status = "skipped"
                 result.skip_reason = msg
-            if role == "engine":
-                rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult.failed(
-                    rtol=rtol, atol=atol, error_message=msg
-                )
         except Exception as e:
             msg = str(e)
             if role == "engine" or strict_selection:
                 result.status = "error"
                 result.error_message = msg
-                if role == "engine":
-                    rtol, atol = _fallback_tolerance_for_config(config)
-                    result.correctness = CorrectnessResult.failed(
-                        rtol=rtol, atol=atol, error_message=msg
-                    )
             else:
                 result.skip_reason = msg
     result.elapsed_time_ms = elapsed_timer.elapsed_ms
@@ -825,7 +816,6 @@ def run_graph_all_providers(
             )
             engine_ids = discovery_executor.discover_engines(handle)
         except UnsupportedGraphError as e:
-            rtol, atol = _fallback_tolerance_for_config(config)
             return GraphResult(
                 graph_name=graph_name,
                 graph_path=str(graph_path),
@@ -835,15 +825,11 @@ def run_graph_all_providers(
                         engine_id=0,
                         status="skipped",
                         skip_reason=str(e),
-                        correctness=CorrectnessResult.failed(
-                            rtol=rtol, atol=atol, error_message=str(e)
-                        ),
                     )
                 ],
             )
         except (ExecutionError, RuntimeError) as e:
             msg = str(e)
-            rtol, atol = _fallback_tolerance_for_config(config)
             return GraphResult(
                 graph_name=graph_name,
                 graph_path=str(graph_path),
@@ -853,9 +839,6 @@ def run_graph_all_providers(
                         engine_id=0,
                         status="error",
                         error_message=f"Engine discovery failed: {msg}",
-                        correctness=CorrectnessResult.failed(
-                            rtol=rtol, atol=atol, error_message=msg
-                        ),
                     )
                 ],
             )
@@ -883,7 +866,6 @@ def run_graph_all_providers(
         graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
     except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
         msg = f"Input data generation failed: {e}"
-        rtol, atol = _fallback_tolerance_for_config(config)
         return GraphResult(
             graph_name=graph_name,
             graph_path=str(graph_path),
@@ -893,9 +875,6 @@ def run_graph_all_providers(
                     engine_id=0,
                     status="error",
                     error_message=msg,
-                    correctness=CorrectnessResult.failed(
-                        rtol=rtol, atol=atol, error_message=msg
-                    ),
                 )
             ],
             engine_ids=engine_ids,
@@ -980,7 +959,6 @@ def run_graph_all_providers(
                         provider=engine_name,
                         engine_id=engine_id,
                         plugin_path=engine_plugin_path,
-                        config=config,
                         error_message=str(e),
                     )
                     pe_result.elapsed_time_ms = t.elapsed_ms
@@ -1045,7 +1023,6 @@ def run_graph_pytorch_backend(
     """
     graph_name = graph_json.get("name", graph_path.stem)
     provider = ReferenceProviderName.PYTORCH.value
-    rtol, atol = _fallback_tolerance_for_config(config)
 
     # Unsupported operations are an unsupported-graph signal (mirrors the
     # hipDNN UnsupportedGraphError path), not an execution error. Checked
@@ -1072,9 +1049,6 @@ def run_graph_pytorch_backend(
             status="error" if strict_selection else "skipped",
             error_message=msg if strict_selection else None,
             skip_reason=None if strict_selection else msg,
-            correctness=CorrectnessResult.failed(
-                rtol=rtol, atol=atol, error_message=msg
-            ),
         )
         if reporter is not None:
             reporter.print_engine_start(provider)
@@ -1099,9 +1073,6 @@ def run_graph_pytorch_backend(
                     engine_id=0,
                     status="error",
                     error_message=msg,
-                    correctness=CorrectnessResult.failed(
-                        rtol=rtol, atol=atol, error_message=msg
-                    ),
                 )
             ],
             engine_ids=[0],
@@ -1152,13 +1123,14 @@ def _benchmark_executions(config: Any) -> int:
 
 def _collect_basic_metrics_post_loop(
     result: ProviderEngineResult,
+    ootb: PlanRunResult,
     cpu_time_probe: Optional[CpuTimeProbe],
     timed_executions: int,
     analytical_flops: Optional[int],
     analytical_flops_partial: bool,
     analytical_io_bytes: Optional[int],
 ) -> None:
-    """Populate the basic always-on metric fields on ``result``.
+    """Populate the basic always-on metric fields on ``result`` and ``ootb``.
 
     Called once after the timed loop when ``metrics.tier == "basic"``.
     Pulled out of :func:`run_single_provider_engine` to keep that
@@ -1181,9 +1153,9 @@ def _collect_basic_metrics_post_loop(
         )
 
     # Analytical totals were computed once at the graph level; propagate
-    # them onto every engine's result so JSON consumers don't have to
-    # look up across structures.
-    result.analytical_flops = analytical_flops
+    # them onto every engine's run so JSON consumers don't have to look up
+    # across structures.
+    ootb.analytical_flops = analytical_flops
     result.analytical_flops_partial = analytical_flops_partial
     result.analytical_io_bytes = analytical_io_bytes
 
@@ -1191,14 +1163,12 @@ def _collect_basic_metrics_post_loop(
     # same denominator as the rocKE benchmark pipeline (Solera/Strata), and
     # robust to a single noisy iteration (context switch, thermal throttle).
     kernel_median = (
-        result.gpu_kernel_stats.median_ms
-        if result.gpu_kernel_stats is not None
-        else None
+        ootb.gpu_kernel_stats.median_ms if ootb.gpu_kernel_stats is not None else None
     )
     tflops, gbytes = derive_throughputs(
         analytical_flops, analytical_io_bytes, kernel_median
     )
-    result.derived_tflops_per_s = tflops
+    ootb.derived_tflops_per_s = tflops
     result.derived_gbytes_per_s = gbytes
 
     # VRAM is sampled here (still inside the BufferManager context, so
@@ -1303,6 +1273,7 @@ def _run_tuned_plan(
     *,
     tuned: Tuple[Executor, Any, bool],
     result: ProviderEngineResult,
+    ootb: PlanRunResult,
     graph_name: str,
     config: SuiteConfig,
     engine_id: int,
@@ -1311,7 +1282,11 @@ def _run_tuned_plan(
     graph_json: Dict[str, Any],
     reference_outputs: Optional[Dict[int, Any]],
 ) -> None:
-    """Time and validate the tuned plan without failing the OOTB row."""
+    """Time and validate the tuned plan without failing the OOTB row.
+
+    ``ootb`` supplies the graph's analytical FLOPs, so tuned and OOTB
+    throughput share one numerator.
+    """
     executor, oracle_handle, tuning_available = tuned
     try:
         with _tuned_env():
@@ -1339,10 +1314,16 @@ def _run_tuned_plan(
                     if bench_result.has_kernel_timings
                     else None
                 ),
+                # The benchmarking plan may pick a kernel with a different
+                # scratchpad, so report its own request, not the OOTB one.
+                workspace_bytes=(
+                    executor.workspace_size if config.metrics.basic_enabled else None
+                ),
+                analytical_flops=ootb.analytical_flops,
             )
-            # Same FLOPs and median denominator as the row's derived TFLOP/s.
+            # Same FLOPs and median denominator as the OOTB derived TFLOP/s.
             oracle.derived_tflops_per_s = _median_tflops(
-                result.analytical_flops, oracle.gpu_kernel_stats
+                oracle.analytical_flops, oracle.gpu_kernel_stats
             )
 
             # Validate after timing; keep OOTB and tuned verdicts separate.
@@ -1389,14 +1370,16 @@ def run_single_provider_engine(
     analytical_io_bytes: Optional[int] = None,
 ) -> ProviderEngineResult:
     """Execute a single engine for a graph (single attempt)."""
-    # Initialise the result conservatively as an error and mutate fields as
-    # the run progresses; on success, status flips to "success" at the end.
+    # Initialise the result conservatively as an error and fill ``ootb`` as
+    # the run progresses; on success, it is attached and status flips to
+    # "success" at the end.
     result = ProviderEngineResult(
         provider=provider,
         engine_id=engine_id,
         status="error",
         engine_version=_resolve_engine_version(handle, engine_id),
     )
+    ootb = OotbResult()
 
     metrics_basic = config.metrics.basic_enabled
 
@@ -1420,9 +1403,9 @@ def run_single_provider_engine(
             config=bench_config,
         )
         executor.prepare(handle, engine_id=engine_id)
-        result.build_time_ms = executor.build_time_ms
+        ootb.build_time_ms = executor.build_time_ms
         if metrics_basic:
-            result.workspace_bytes = executor.workspace_size
+            ootb.workspace_bytes = executor.workspace_size
         tuned = (
             _build_tuned_plan(
                 result=result,
@@ -1463,15 +1446,16 @@ def run_single_provider_engine(
                 if cpu_time_probe is not None:
                     cpu_time_probe.__exit__(None, None, None)
 
-            result.host_stats = BenchmarkStats.from_timings(bench_result.host_timings)
+            ootb.host_stats = BenchmarkStats.from_timings(bench_result.host_timings)
             if bench_result.has_kernel_timings:
-                result.gpu_kernel_stats = BenchmarkStats.from_timings(
+                ootb.gpu_kernel_stats = BenchmarkStats.from_timings(
                     bench_result.kernel_timings
                 )
 
             if metrics_basic:
                 _collect_basic_metrics_post_loop(
                     result=result,
+                    ootb=ootb,
                     cpu_time_probe=cpu_time_probe,
                     timed_executions=_benchmark_executions(config),
                     analytical_flops=analytical_flops,
@@ -1482,7 +1466,7 @@ def run_single_provider_engine(
             if reference_outputs is not None:
                 bm.zero_outputs()
                 executor.execute_once(handle, variant_pack)
-                result.correctness = _check_correctness(
+                ootb.correctness = _check_correctness(
                     bm,
                     tensor_infos,
                     graph_json,
@@ -1497,12 +1481,12 @@ def run_single_provider_engine(
                 )
                 # User asked for validation but no reference output was usable.
                 # Treat as a correctness failure so --validate stays a hard gate.
-                result.correctness = _reference_unavailable_correctness(
+                ootb.correctness = _reference_unavailable_correctness(
                     config, error_message
                 )
             else:
                 rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult(
+                ootb.correctness = CorrectnessResult(
                     execution_success=True,
                     tolerance_match=None,
                     rtol=rtol,
@@ -1517,6 +1501,7 @@ def run_single_provider_engine(
                 _run_tuned_plan(
                     tuned=tuned,
                     result=result,
+                    ootb=ootb,
                     graph_name=graph_name,
                     config=config,
                     engine_id=engine_id,
@@ -1566,50 +1551,28 @@ def run_single_provider_engine(
                     plugin_path=plugin_path,
                 )
                 if extra:
-                    result.extra_metrics = extra
+                    ootb.extra_metrics = extra
             except Exception as e:
                 warn_once(
                     "profiling_orchestrator",
                     f"profiling pass failed: {type(e).__name__}: {e}",
                 )
 
+        result.ootb = ootb
         result.status = "success"
         return result
 
     except UnsupportedGraphError as e:
-        result.build_time_ms = None
-        result.gpu_kernel_stats = None
-        result.host_stats = None
         result.status = "skipped"
         result.skip_reason = str(e)
-        rtol, atol = _fallback_tolerance_for_config(config)
-        result.correctness = CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=str(e)
-        )
         return result
 
     except ExecutionError as e:
-        error_msg = str(e)
-        result.build_time_ms = None
-        result.gpu_kernel_stats = None
-        result.host_stats = None
         result.status = "error"
-        result.error_message = error_msg
-        rtol, atol = _fallback_tolerance_for_config(config)
-        result.correctness = CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=error_msg
-        )
+        result.error_message = str(e)
         return result
 
     except (ValueError, RuntimeError, OSError) as e:
-        error_msg = str(e)
-        result.build_time_ms = None
-        result.gpu_kernel_stats = None
-        result.host_stats = None
         result.status = "error"
-        result.error_message = error_msg
-        rtol, atol = _fallback_tolerance_for_config(config)
-        result.correctness = CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=error_msg
-        )
+        result.error_message = str(e)
         return result

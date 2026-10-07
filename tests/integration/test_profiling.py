@@ -131,7 +131,7 @@ def _first_pe_extra(data: dict) -> dict:
     for graph in data.get("graphs", []):
         for pe in graph.get("results", []):
             if pe.get("status") == "success":
-                return pe.get("extra_metrics") or {}
+                return pe["ootb"]["extra_metrics"] or {}
     pytest.fail("no successful provider/engine result in output JSON")
 
 

@@ -15,6 +15,7 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OotbResult,
     OracleResult,
     ProviderEngineResult,
     StatusCounts,
@@ -126,9 +127,9 @@ class TestCorrectnessResult:
 class TestProviderEngineResult:
     """Tests for ProviderEngineResult dataclass."""
 
-    def test_success_serializes_with_timing_and_correctness(self):
-        """ProviderEngineResult with status='success' serializes with
-        build_time_ms, gpu_kernel_stats, host_stats, correctness."""
+    def test_success_serializes_ootb_timing_and_correctness(self):
+        """A successful row nests build time, stats, and correctness under
+        ``ootb``."""
         stats = BenchmarkStats(
             mean_ms=1.0, std_ms=0.1, min_ms=0.5, max_ms=1.5, p95_ms=1.4, p99_ms=1.49
         )
@@ -139,33 +140,23 @@ class TestProviderEngineResult:
             provider="miopen",
             engine_id=1,
             status="success",
-            build_time_ms=10.5,
-            gpu_kernel_stats=stats,
-            host_stats=stats,
-            correctness=corr,
+            ootb=OotbResult(
+                build_time_ms=10.5,
+                gpu_kernel_stats=stats,
+                host_stats=stats,
+                correctness=corr,
+            ),
         )
         d = pe.to_dict()
         assert d["status"] == "success"
-        assert d["build_time_ms"] == 10.5
-        assert "gpu_kernel_stats" in d
-        assert "host_stats" in d
-        assert "correctness" in d
-        assert d["gpu_kernel_stats"]["mean_ms"] == 1.0
+        assert d["ootb"]["build_time_ms"] == 10.5
+        assert d["ootb"]["gpu_kernel_stats"]["mean_ms"] == 1.0
+        assert d["ootb"]["host_stats"]["mean_ms"] == 1.0
+        assert d["ootb"]["correctness"]["passed"] is True
         assert d["engine_id"] == 1
         assert d["engine_name"] == "miopen"
         assert d["engine_version"] == "unavailable"
         assert d["started_at"].endswith("+00:00")
-
-    def test_success_serializes_plan_build_time_only_when_measured(self):
-        """PyTorch rows have no plan build; they must not emit a null one."""
-        measured = ProviderEngineResult(
-            provider="miopen", engine_id=1, status="success", build_time_ms=3.5
-        )
-        unmeasured = ProviderEngineResult(
-            provider="pytorch", engine_id=0, status="success"
-        )
-        assert measured.to_dict()["build_time_ms"] == 3.5
-        assert "build_time_ms" not in unmeasured.to_dict()
 
     def test_success_serializes_plugin_path(self):
         stats = BenchmarkStats(
@@ -182,8 +173,7 @@ class TestProviderEngineResult:
             engine_id=1,
             status="success",
             plugin_path="/plugins/a",
-            gpu_kernel_stats=stats,
-            host_stats=stats,
+            ootb=OotbResult(gpu_kernel_stats=stats, host_stats=stats),
         )
 
         d = pe.to_dict()
@@ -206,8 +196,7 @@ class TestProviderEngineResult:
             engine_id=0,
             status="success",
             role="reference",
-            host_stats=stats,
-            gpu_kernel_stats=stats,
+            ootb=OotbResult(host_stats=stats, gpu_kernel_stats=stats),
         )
 
         d = pe.to_dict()
@@ -218,7 +207,7 @@ class TestProviderEngineResult:
 
     @pytest.mark.parametrize("status", ["success", "skipped", "error"])
     def test_rows_do_not_repeat_suite_sdpa_selection(self, status):
-        kwargs = {}
+        kwargs = {"ootb": OotbResult()} if status == "success" else {}
         if status == "skipped":
             kwargs["skip_reason"] = "requested category unavailable"
         elif status == "error":
@@ -238,6 +227,7 @@ class TestProviderEngineResult:
             engine_id=0,
             status="success",
             role="reference",
+            ootb=OotbResult(),
             warnings=[
                 "RMSNormBackwardAttributes uses a manual formula; "
                 "PyTorch reference timing is not solely built-in PyTorch operator time."
@@ -248,89 +238,6 @@ class TestProviderEngineResult:
 
         assert d["warnings"] == pe.warnings
 
-    def test_error_serializes_without_timing(self):
-        """ProviderEngineResult with status='error' serializes with
-        status, error_message, no timing data."""
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="error",
-            error_message="build failed",
-            build_time_ms=3.0,
-        )
-        d = pe.to_dict()
-        assert d["status"] == "error"
-        assert d["error_message"] == "build failed"
-        assert "build_time_ms" not in d
-        assert "gpu_kernel_stats" not in d
-        assert "host_stats" not in d
-
-    def test_skipped_serializes_with_reason(self):
-        """ProviderEngineResult with status='skipped' serializes with
-        status, skip_reason."""
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="skipped",
-            skip_reason="not supported",
-        )
-        d = pe.to_dict()
-        assert d["status"] == "skipped"
-        assert d["skip_reason"] == "not supported"
-        assert "build_time_ms" not in d
-
-    def test_error_status_serializes_correctness(self):
-        """C-01: error-status results with a populated correctness still
-        emit the correctness block in to_dict()."""
-        corr = CorrectnessResult.failed(
-            rtol=1e-5, atol=1e-8, error_message="build failed"
-        )
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=2,
-            status="error",
-            error_message="build failed",
-            correctness=corr,
-        )
-        d = pe.to_dict()
-        assert d["status"] == "error"
-        assert d["error_message"] == "build failed"
-        assert "correctness" in d
-        assert d["correctness"]["execution_success"] is False
-        assert d["correctness"]["tolerance_match"] is None
-        assert d["correctness"]["error_message"] == "build failed"
-
-    def test_skipped_status_serializes_correctness(self):
-        """C-01: skipped-status results with correctness still emit correctness."""
-        corr = CorrectnessResult.failed(
-            rtol=1e-5, atol=1e-8, error_message="not supported"
-        )
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=3,
-            status="skipped",
-            skip_reason="not supported",
-            correctness=corr,
-        )
-        d = pe.to_dict()
-        assert d["status"] == "skipped"
-        assert d["skip_reason"] == "not supported"
-        assert "correctness" in d
-        assert d["correctness"]["execution_success"] is False
-
-
-class TestCorrectnessFailed:
-    """Tests for CorrectnessResult.failed factory (S-01)."""
-
-    def test_failed_factory_sets_expected_fields(self):
-        cr = CorrectnessResult.failed(rtol=1e-3, atol=1e-6, error_message="boom")
-        assert cr.execution_success is False
-        assert cr.tolerance_match is None
-        assert cr.rtol == 1e-3
-        assert cr.atol == 1e-6
-        assert cr.error_message == "boom"
-        assert cr.passed is False
-
 
 class TestGraphResult:
     """Tests for GraphResult dataclass."""
@@ -339,7 +246,10 @@ class TestGraphResult:
         """GraphResult contains graph_name, graph_path, list of
         ProviderEngineResult."""
         pe = ProviderEngineResult(
-            provider="miopen", engine_id=0, status="success", build_time_ms=5.0
+            provider="miopen",
+            engine_id=0,
+            status="success",
+            ootb=OotbResult(build_time_ms=5.0),
         )
         gr = GraphResult(
             graph_name="conv_fwd", graph_path="/path/to/conv.json", results=[pe]
@@ -374,14 +284,23 @@ class TestGraphResult:
         results = [
             # 2 passes (one with explicit pass, one with no comparison)
             ProviderEngineResult(
-                provider="p", engine_id=0, status="success", correctness=pass_corr
+                provider="p",
+                engine_id=0,
+                status="success",
+                ootb=OotbResult(correctness=pass_corr),
             ),
             ProviderEngineResult(
-                provider="p", engine_id=1, status="success", correctness=none_corr
+                provider="p",
+                engine_id=1,
+                status="success",
+                ootb=OotbResult(correctness=none_corr),
             ),
             # 1 fail
             ProviderEngineResult(
-                provider="p", engine_id=2, status="success", correctness=fail_corr
+                provider="p",
+                engine_id=2,
+                status="success",
+                ootb=OotbResult(correctness=fail_corr),
             ),
             # 1 skipped
             ProviderEngineResult(
@@ -402,7 +321,7 @@ class TestGraphResult:
     def test_count_by_status_success_without_correctness_counts_as_passed(self):
         """A success with correctness=None counts as passed."""
         pe = ProviderEngineResult(
-            provider="p", engine_id=0, status="success", correctness=None
+            provider="p", engine_id=0, status="success", ootb=OotbResult()
         )
         gr = GraphResult(graph_name="g", graph_path="/p.json", results=[pe])
         counts = gr.count_by_status()
@@ -415,8 +334,11 @@ class TestGraphResult:
             engine_id=0,
             status="success",
             role="reference",
+            ootb=OotbResult(),
         )
-        engine = ProviderEngineResult(provider="miopen", engine_id=1, status="success")
+        engine = ProviderEngineResult(
+            provider="miopen", engine_id=1, status="success", ootb=OotbResult()
+        )
         gr = GraphResult(
             graph_name="g", graph_path="/p.json", results=[reference, engine]
         )
@@ -462,10 +384,12 @@ class TestSuiteResult:
             provider="miopen",
             engine_id=0,
             status="success",
-            build_time_ms=5.0,
-            gpu_kernel_stats=stats,
-            host_stats=stats,
-            correctness=corr,
+            ootb=OotbResult(
+                build_time_ms=5.0,
+                gpu_kernel_stats=stats,
+                host_stats=stats,
+                correctness=corr,
+            ),
         )
         pe2 = ProviderEngineResult(
             provider="miopen",
@@ -537,8 +461,8 @@ class TestSuiteResult:
         # Get the first successful result
         first_graph = d["graphs"][0]
         first_result = first_graph["results"][0]
-        gpu_stats = first_result["gpu_kernel_stats"]
-        host_stats = first_result["host_stats"]
+        gpu_stats = first_result["ootb"]["gpu_kernel_stats"]
+        host_stats = first_result["ootb"]["host_stats"]
 
         for stats in [gpu_stats, host_stats]:
             assert "mean_ms" in stats
@@ -643,22 +567,28 @@ def _verdict(tolerance_match) -> CorrectnessResult:
     )
 
 
-def _row(oracle=None, **overrides) -> ProviderEngineResult:
-    kwargs = dict(provider="p", engine_id=1, status="success", oracle=oracle)
-    kwargs.update(overrides)
-    return ProviderEngineResult(**kwargs)
+def _row(oracle=None, **ootb_fields) -> ProviderEngineResult:
+    return ProviderEngineResult(
+        provider="p",
+        engine_id=1,
+        status="success",
+        ootb=OotbResult(**ootb_fields),
+        oracle=oracle,
+    )
 
 
 class TestOracleSerialization:
     """Oracle payload emission on ProviderEngineResult."""
 
-    def test_oracle_keys_absent_when_unset(self):
-        pe = ProviderEngineResult(provider="p", engine_id=1, status="success")
-        d = pe.to_dict()
-        assert not {"oracle", "oracle_error"} & set(d)
+    def test_oracle_null_when_unset(self):
+        d = _row().to_dict()
+        assert d["oracle"] is None
+        assert "oracle_error" not in d
 
     def test_oracle_serializes_under_success(self):
-        oracle = _oracle(build_time_ms=250.0, gpu_kernel_stats=_stats(1.0))
+        oracle = _oracle(
+            build_time_ms=250.0, gpu_kernel_stats=_stats(1.0), workspace_bytes=64
+        )
         pe = _row(oracle, build_time_ms=3.5, gpu_kernel_stats=_stats(2.0))
         d = pe.to_dict()
         assert set(d["oracle"]) == {
@@ -666,35 +596,48 @@ class TestOracleSerialization:
             "build_time_ms",
             "gpu_kernel_stats",
             "host_stats",
-            "correctness",
+            "workspace_bytes",
+            "analytical_flops",
             "derived_tflops_per_s",
+            "correctness",
         }
         assert d["oracle"]["tuning_available"] is True
         assert d["oracle"]["build_time_ms"] == 250.0
         assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
-        # Speedup is derived at read time, never stored.
-        assert "oracle_delta" not in d
-        assert d["build_time_ms"] == 3.5
-        assert "cpu_build_time_ms" not in d
+        assert d["oracle"]["workspace_bytes"] == 64
+        assert d["oracle"]["host_stats"] is None
+        assert d["oracle"]["analytical_flops"] is None
+        assert d["ootb"]["build_time_ms"] == 3.5
 
     def test_oracle_error_serializes_under_success(self):
         pe = ProviderEngineResult(
             provider="p",
             engine_id=1,
             status="success",
+            ootb=OotbResult(),
             oracle_error="tuning failed",
         )
-        assert pe.to_dict()["oracle_error"] == "tuning failed"
+        d = pe.to_dict()
+        assert d["oracle_error"] == "tuning failed"
+        assert d["oracle"] is None
 
-    def test_oracle_keys_absent_on_error_status(self):
+    @pytest.mark.parametrize(
+        "status,message",
+        [("error", {"error_message": "boom"}), ("skipped", {"skip_reason": "n/a"})],
+    )
+    def test_oracle_dropped_on_non_success_status(self, status, message):
+        # A tuned plan can finish before a later step fails the row.
         pe = ProviderEngineResult(
             provider="p",
             engine_id=1,
-            status="error",
-            error_message="boom",
+            status=status,
+            oracle=_oracle(gpu_kernel_stats=_stats(1.0)),
             oracle_error="tuning failed",
+            **message,
         )
-        assert "oracle_error" not in pe.to_dict()
+        d = pe.to_dict()
+        assert d["oracle"] is None
+        assert "oracle_error" not in d
 
 
 class TestOracleSpeedup:
@@ -743,6 +686,15 @@ class TestOracleSpeedup:
 
     def test_none_without_oracle(self):
         assert oracle_speedup(_row(gpu_kernel_stats=_stats(2.0))) is None
+
+    def test_none_without_ootb(self):
+        pe = ProviderEngineResult(
+            provider="p",
+            engine_id=1,
+            status="success",
+            oracle=_oracle(gpu_kernel_stats=_stats(1.0)),
+        )
+        assert oracle_speedup(pe) is None
 
     def test_none_without_comparable_stats(self):
         # Kernel on one side, host on the other: no common basis.

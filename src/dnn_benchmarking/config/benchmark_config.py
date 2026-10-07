@@ -202,7 +202,7 @@ class MetricsConfig:
             trace file.
         pmc_set: ``basic`` | ``memory`` | ``flops`` | ``all`` — re-run
             under ``rocprofv3 --pmc <set>`` and fold per-kernel counter
-            aggregates into ``extra_metrics["pmc"]``. ``all`` requires
+            aggregates into ``ootb.extra_metrics["pmc"]``. ``all`` requires
             ``pmc_allow_multipass`` because the union of sets crosses the
             single-pass replay budget on most arches.
         perf: Re-run wrapped in ``perf stat -x,`` to collect CPU cycles
@@ -212,7 +212,7 @@ class MetricsConfig:
             to capture empirical HBM/compute ceilings at rocprof-
             compute's default datatype (FP32). The CSV outputs
             (``roofline.csv``, ``sysinfo.csv``) and the workload
-            directory land in ``extra_metrics["roofline"]`` as
+            directory land in ``ootb.extra_metrics["roofline"]`` as
             ``roofline_csv`` / ``sysinfo_csv`` / ``workload_path``. The
             PDF/HTML plot is rendered post-hoc by the user via
             ``rocprof-compute analyze --path <workload_path>

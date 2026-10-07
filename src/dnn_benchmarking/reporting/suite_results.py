@@ -4,8 +4,9 @@
 """Suite result data model with JSON serialization.
 
 Top-level structure is graph-first: SuiteResult contains metadata plus a
-list of GraphResult, each holding ProviderEngineResult entries with timing
-statistics and correctness data. Error entries carry status + message only.
+list of GraphResult, each holding ProviderEngineResult entries. A successful
+entry nests its out-of-the-box run under ``ootb`` and its tuned run under
+``oracle``; error and skipped entries carry status + message only.
 """
 
 import json
@@ -62,32 +63,6 @@ class CorrectnessResult:
         """
         return not self.execution_success or self.tolerance_match is False
 
-    @classmethod
-    def failed(
-        cls, rtol: float, atol: float, error_message: str
-    ) -> "CorrectnessResult":
-        """Build a CorrectnessResult representing an execution failure.
-
-        Used at error/skip sites where the GPU run did not complete and no
-        comparison was performed.
-
-        Args:
-            rtol: Relative tolerance configured for comparison.
-            atol: Absolute tolerance configured for comparison.
-            error_message: Explanation of the failure.
-
-        Returns:
-            CorrectnessResult with execution_success=False and
-            tolerance_match=None.
-        """
-        return cls(
-            execution_success=False,
-            tolerance_match=None,
-            rtol=rtol,
-            atol=atol,
-            error_message=error_message,
-        )
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         d: Dict[str, Any] = {
@@ -106,43 +81,90 @@ class CorrectnessResult:
         return d
 
 
-@dataclass
-class OracleResult:
-    """Tuned run for one engine row.
+@dataclass(kw_only=True)
+class PlanRunResult:
+    """Measurements of one timed plan run (OOTB or tuned) for an engine row.
 
-    hipDNN: the tuned plan is built for the same engine as the OOTB plan, with
-    ``global.benchmarking=1``. ``build_time_ms`` is that plan build; the row's
-    own ``build_time_ms`` is the OOTB build. A benchmarking build compiles every
-    candidate the provider can sample, so it is expected to be slower.
-    PyTorch: the tuned run comes from an isolated child process and has no
-    plan build.
-
-    ``tuning_available`` is False when the engine exposes no tuning knob, so
-    the tuned run re-measured the OOTB configuration. ``correctness`` is the
-    tuned plan's verdict; the row retains the OOTB verdict.
-    ``derived_tflops_per_s`` uses the row's ``analytical_flops`` and the tuned
-    GPU kernel median, like the row's own ``derived_tflops_per_s``.
+    Attributes:
+        build_time_ms: CPU time for this plan's build:
+            ``create_execution_plan_ext`` -> ``check_support`` ->
+            ``build_plans``. None for PyTorch rows, which have no plan build.
+        gpu_kernel_stats: GPU kernel timing statistics.
+        host_stats: Host-side submission timing statistics.
+        workspace_bytes: Workspace size this plan requested, in bytes.
+        analytical_flops: Total analytical FLOPs across the graph's compute
+            nodes (None for purely bandwidth-bound graphs). A graph
+            property, so OOTB and tuned runs carry the same value.
+        derived_tflops_per_s: Throughput derived from ``analytical_flops``
+            and the GPU kernel median time.
+        correctness: This plan's correctness verdict.
     """
 
-    tuning_available: bool
     build_time_ms: Optional[float] = None
     gpu_kernel_stats: Optional[BenchmarkStats] = None
     host_stats: Optional[BenchmarkStats] = None
-    correctness: Optional[CorrectnessResult] = None
+    workspace_bytes: Optional[int] = None
+    analytical_flops: Optional[int] = None
     derived_tflops_per_s: Optional[float] = None
+    correctness: Optional[CorrectnessResult] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
+        """Convert to dictionary for JSON serialization.
+
+        Every key is always present so OOTB and tuned runs share one shape;
+        an unmeasured value is null.
+        """
         return {
-            "tuning_available": self.tuning_available,
             "build_time_ms": self.build_time_ms,
             "gpu_kernel_stats": (
                 self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
             ),
             "host_stats": self.host_stats.to_dict() if self.host_stats else None,
-            "correctness": (self.correctness.to_dict() if self.correctness else None),
+            "workspace_bytes": self.workspace_bytes,
+            "analytical_flops": self.analytical_flops,
             "derived_tflops_per_s": self.derived_tflops_per_s,
+            "correctness": self.correctness.to_dict() if self.correctness else None,
         }
+
+
+@dataclass(kw_only=True)
+class OotbResult(PlanRunResult):
+    """Out-of-the-box run: the engine's default plan, as a user gets it.
+
+    Attributes:
+        extra_metrics: Opt-in profiling payload from rocprofv3 PMC /
+            traces, perf, and rocprof-compute roofline. Profiling re-runs
+            the OOTB plan. None when no opt-in profiling flag was supplied.
+    """
+
+    extra_metrics: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {**super().to_dict(), "extra_metrics": self.extra_metrics}
+
+
+@dataclass(kw_only=True)
+class OracleResult(PlanRunResult):
+    """Tuned run for one engine row.
+
+    hipDNN: the tuned plan is built for the same engine as the OOTB plan, with
+    ``global.benchmarking=1``. A benchmarking build compiles every candidate
+    the provider can sample, so its ``build_time_ms`` is expected to exceed
+    the OOTB build. PyTorch: the tuned run comes from an isolated child
+    process and has no plan build.
+
+    ``tuning_available`` is False when the engine exposes no tuning knob, so
+    the tuned run re-measured the OOTB configuration.
+    ``derived_tflops_per_s`` uses the same ``analytical_flops`` as the OOTB
+    run and the tuned GPU kernel median.
+    """
+
+    tuning_available: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {"tuning_available": self.tuning_available, **super().to_dict()}
 
 
 @dataclass
@@ -158,27 +180,17 @@ class ProviderEngineResult:
         role: ``engine`` for hipDNN engine rows, ``reference`` for timed
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
-        build_time_ms: CPU time for the OOTB plan build only:
-            ``create_execution_plan_ext`` -> ``check_support`` ->
-            ``build_plans``. None for PyTorch rows, which have no plan build.
-        gpu_kernel_stats: GPU kernel timing statistics.
-        host_stats: Host-side submission timing statistics.
-        correctness: Correctness comparison result.
+        elapsed_time_ms: Wall time for the whole row, including setup.
         error_message: Error message only (no partial timing on error).
         skip_reason: Reason this combination was skipped.
         warnings: Non-fatal warnings for this row, such as reference timing
             paths that are not solely built-in PyTorch operators.
-        workspace_bytes: hipDNN-reserved workspace size in bytes.
-        analytical_flops: Total analytical FLOPs across compute nodes
-            (None for purely bandwidth-bound graphs).
         analytical_flops_partial: True when at least one node type was
-            unrecognised — ``analytical_flops`` then reflects only the
+            unrecognised — ``ootb.analytical_flops`` then reflects only the
             recognised compute nodes.
         analytical_io_bytes: Sum of non-virtual tensor sizes (bytes).
-        derived_tflops_per_s: Throughput derived from analytical_flops
-            and the GPU kernel median time.
         derived_gbytes_per_s: Bandwidth derived from analytical_io_bytes
-            and the GPU kernel median time.
+            and the OOTB GPU kernel median time.
         cpu_user_time_per_iter_us: User-space CPU time per timed
             execution in microseconds (rusage delta over the loop,
             divided by ``benchmark_iters * timing_block``). Mostly Python
@@ -190,17 +202,19 @@ class ProviderEngineResult:
         vram_used_mb: Total process-wide GPU VRAM allocated at the
             end of this engine's benchmark loop, sampled via amdsmi.
             Workspace + I/O buffers + any allocator cache. Distinct
-            from ``workspace_bytes`` which is only the engine's
+            from ``ootb.workspace_bytes`` which is only the engine's
             scratchpad request. Note this is process-wide and may
             include cached allocations from previous engines on the
             same graph.
-        extra_metrics: Opt-in profiling payload from rocprofv3 PMC /
-            traces, perf, and rocprof-compute roofline. None when no
-            opt-in profiling flag was supplied.
-        oracle: Tuned result for this engine row. Set only when
+        ootb: Out-of-the-box run. Set only on success.
+        oracle: Tuned run for this engine row. Set only when
             ``--oracle-mode exhaustive`` was requested and tuning succeeded.
         oracle_error: Why tuning produced no result for this row.
             Mutually exclusive with ``oracle``.
+
+        ``elapsed_time_ms``, ``analytical_flops_partial``,
+        ``analytical_io_bytes``, ``derived_gbytes_per_s``, the CPU times, and
+        ``vram_used_mb`` feed console output only; they are not serialized.
 
     Note:
         Process RSS, host RAM availability, and the volatile parts of
@@ -224,26 +238,18 @@ class ProviderEngineResult:
     )
     role: Literal["engine", "reference"] = "engine"
     plugin_path: Optional[str] = None
-    build_time_ms: Optional[float] = None
-    gpu_kernel_stats: Optional[BenchmarkStats] = None
-    host_stats: Optional[BenchmarkStats] = None
     elapsed_time_ms: float = 0.0
-    correctness: Optional[CorrectnessResult] = None
     error_message: Optional[str] = None
     skip_reason: Optional[str] = None
     warnings: Optional[List[str]] = None
-    # Always-on metrics (None when collection failed or skipped)
-    workspace_bytes: Optional[int] = None
-    analytical_flops: Optional[int] = None
+    # Always-on console metrics (None when collection failed or skipped)
     analytical_flops_partial: bool = False
     analytical_io_bytes: Optional[int] = None
-    derived_tflops_per_s: Optional[float] = None
     derived_gbytes_per_s: Optional[float] = None
     cpu_user_time_per_iter_us: Optional[float] = None
     cpu_kernel_time_per_iter_us: Optional[float] = None
     vram_used_mb: Optional[float] = None
-    # Opt-in profiling payload (rocprofv3 PMC / trace, perf, roofline).
-    extra_metrics: Optional[Dict[str, Any]] = None
+    ootb: Optional[OotbResult] = None
     # Opt-in oracle (auto-tuned) comparison payload.
     oracle: Optional[OracleResult] = None
     oracle_error: Optional[str] = None
@@ -263,13 +269,10 @@ class ProviderEngineResult:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization.
 
-        Error entries serialize status + error_message only, no timing.
-        Correctness, when present, is always serialized regardless of status
-        so that error/skip entries can carry their failure context.
-
-        Always-on metrics are emitted only inside the ``success`` branch
-        and only when non-None, so the JSON shape stays compact for
-        runs where probes were unavailable.
+        ``ootb`` and ``oracle`` are always present. Both are null unless the
+        row succeeded; ``oracle`` is also null when tuning was not requested
+        or failed (``oracle_error`` then says why). Error and skipped entries
+        add only their message.
         """
         d: Dict[str, Any] = {
             "provider": self.provider,
@@ -285,62 +288,37 @@ class ProviderEngineResult:
             d["plugin_path"] = self.plugin_path
         if self.warnings:
             d["warnings"] = list(self.warnings)
-        # extra_metrics is exclusively populated by the opt-in
-        # profiling orchestrator, which the suite runner only fires on
-        # the success path. Asserting the invariant here makes it
-        # load-bearing: if a future caller routes profiling onto a
-        # non-success status, the assertion fires and forces a
-        # decision (emit always when present, or gate explicitly)
-        # rather than silently dropping the slice from the JSON.
-        if self.status != "success":
-            assert self.extra_metrics is None, (
-                f"extra_metrics is set on status={self.status!r}; "
-                "the orchestrator only runs on success today, so this "
-                "indicates either a new caller or a regression in the "
-                "success-gating in suite_runner.run_single_provider_engine"
-            )
-        if self.status == "success":
-            if self.build_time_ms is not None:
-                d["build_time_ms"] = self.build_time_ms
-            d["gpu_kernel_stats"] = (
-                self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
-            )
-            d["host_stats"] = self.host_stats.to_dict() if self.host_stats else None
-            d["elapsed_time_ms"] = self.elapsed_time_ms
-
-            # Always-on metric fields — emit only when populated.
-            if self.workspace_bytes is not None:
-                d["workspace_bytes"] = self.workspace_bytes
-            if self.analytical_flops is not None:
-                d["analytical_flops"] = self.analytical_flops
-            if self.analytical_flops_partial:
-                d["analytical_flops_partial"] = True
-            if self.analytical_io_bytes is not None:
-                d["analytical_io_bytes"] = self.analytical_io_bytes
-            if self.derived_tflops_per_s is not None:
-                d["derived_tflops_per_s"] = self.derived_tflops_per_s
-            if self.derived_gbytes_per_s is not None:
-                d["derived_gbytes_per_s"] = self.derived_gbytes_per_s
-            if self.cpu_user_time_per_iter_us is not None:
-                d["cpu_user_time_per_iter_us"] = self.cpu_user_time_per_iter_us
-            if self.cpu_kernel_time_per_iter_us is not None:
-                d["cpu_kernel_time_per_iter_us"] = self.cpu_kernel_time_per_iter_us
-            if self.vram_used_mb is not None:
-                d["vram_used_mb"] = self.vram_used_mb
-            if self.extra_metrics is not None:
-                d["extra_metrics"] = self.extra_metrics
-            if self.oracle is not None:
-                d["oracle"] = self.oracle.to_dict()
-            if self.oracle_error is not None:
-                d["oracle_error"] = self.oracle_error
-        elif self.status == "error":
+        if self.status == "error":
             d["error_message"] = self.error_message
         elif self.status == "skipped":
             d["skip_reason"] = self.skip_reason
 
-        if self.correctness is not None:
-            d["correctness"] = self.correctness.to_dict()
+        succeeded = self.status == "success"
+        # The runner attaches ootb only once the row succeeds. An ootb on a
+        # failed row means a caller broke that invariant; fail loudly rather
+        # than drop its measurements from the JSON.
+        assert succeeded or self.ootb is None, (
+            f"ootb is set on status={self.status!r}; only successful rows "
+            "carry an out-of-the-box run"
+        )
+        d["ootb"] = self.ootb.to_dict() if self.ootb is not None else None
+        # A tuned plan can finish before a later step fails the row; the
+        # comparison is meaningless without the OOTB run, so drop it.
+        d["oracle"] = (
+            self.oracle.to_dict() if succeeded and self.oracle is not None else None
+        )
+        if succeeded and self.oracle_error is not None:
+            d["oracle_error"] = self.oracle_error
         return d
+
+    @property
+    def failed_validation(self) -> bool:
+        """True when the OOTB run's output explicitly mismatched the reference.
+
+        Unchecked runs (``tolerance_match`` None) are not failures.
+        """
+        correctness = self.ootb.correctness if self.ootb is not None else None
+        return correctness is not None and correctness.tolerance_match is False
 
 
 def oracle_speedup(result: ProviderEngineResult) -> Optional[float]:
@@ -352,20 +330,25 @@ def oracle_speedup(result: ProviderEngineResult) -> Optional[float]:
     ratio; callers report them as "no-search" and keep them out of averages.
     """
     oracle = result.oracle
-    if oracle is None or any(
-        verdict is not None and verdict.explicitly_failed
-        for verdict in (result.correctness, oracle.correctness)
+    ootb = result.ootb
+    if (
+        oracle is None
+        or ootb is None
+        or any(
+            verdict is not None and verdict.explicitly_failed
+            for verdict in (ootb.correctness, oracle.correctness)
+        )
     ):
         return None
-    if result.gpu_kernel_stats is not None and oracle.gpu_kernel_stats is not None:
-        ootb, tuned = result.gpu_kernel_stats.mean_ms, oracle.gpu_kernel_stats.mean_ms
-    elif result.host_stats is not None and oracle.host_stats is not None:
-        ootb, tuned = result.host_stats.mean_ms, oracle.host_stats.mean_ms
+    if ootb.gpu_kernel_stats is not None and oracle.gpu_kernel_stats is not None:
+        base, tuned = ootb.gpu_kernel_stats.mean_ms, oracle.gpu_kernel_stats.mean_ms
+    elif ootb.host_stats is not None and oracle.host_stats is not None:
+        base, tuned = ootb.host_stats.mean_ms, oracle.host_stats.mean_ms
     else:
         return None
-    if ootb <= 0.0 or tuned <= 0.0:
+    if base <= 0.0 or tuned <= 0.0:
         return None
-    return ootb / tuned
+    return base / tuned
 
 
 class StatusCounts(NamedTuple):
@@ -417,19 +400,9 @@ class GraphResult:
             StatusCounts with the four bucket counts.
         """
         engine_results = [r for r in self.results if r.role == "engine"]
-        passed = sum(
-            1
-            for r in engine_results
-            if r.status == "success"
-            and (r.correctness is None or r.correctness.tolerance_match is not False)
-        )
-        failed = sum(
-            1
-            for r in engine_results
-            if r.status == "success"
-            and r.correctness is not None
-            and r.correctness.tolerance_match is False
-        )
+        successes = [r for r in engine_results if r.status == "success"]
+        failed = sum(1 for r in successes if r.failed_validation)
+        passed = len(successes) - failed
         skipped = sum(1 for r in engine_results if r.status == "skipped")
         errored = sum(1 for r in engine_results if r.status == "error")
         return StatusCounts(

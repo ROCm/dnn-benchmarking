@@ -26,6 +26,7 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OotbResult,
     OracleResult,
     ProviderEngineResult,
     SuiteMetadata,
@@ -471,17 +472,21 @@ class TestRunSuiteWorkflow:
 
     def _make_graph_result(self, name: str, status: str = "success") -> GraphResult:
         """Helper to create a GraphResult with one ProviderEngineResult."""
-        correctness = CorrectnessResult(
-            execution_success=status == "success",
-            tolerance_match=True if status == "success" else None,
-            rtol=1e-5,
-            atol=1e-8,
-        )
+        ootb = None
+        if status == "success":
+            ootb = OotbResult(
+                correctness=CorrectnessResult(
+                    execution_success=True,
+                    tolerance_match=True,
+                    rtol=1e-5,
+                    atol=1e-8,
+                )
+            )
         pe = ProviderEngineResult(
             provider="miopen",
             engine_id=0,
             status=status,
-            correctness=correctness,
+            ootb=ootb,
             error_message="some error" if status == "error" else None,
         )
         return GraphResult(
@@ -633,7 +638,7 @@ class TestRunSuiteWorkflow:
             provider="miopen",
             engine_id=0,
             status="success",
-            correctness=correctness_fail,
+            ootb=OotbResult(correctness=correctness_fail),
         )
         fail_result = GraphResult(
             graph_name="g0",
@@ -1082,12 +1087,14 @@ class TestValidationStartupGate:
                     provider="MIOPEN_ENGINE",
                     engine_id=0,
                     status="success",
-                    build_time_ms=1.0,
-                    correctness=CorrectnessResult(
-                        execution_success=True,
-                        tolerance_match=True,
-                        rtol=1e-5,
-                        atol=1e-8,
+                    ootb=OotbResult(
+                        build_time_ms=1.0,
+                        correctness=CorrectnessResult(
+                            execution_success=True,
+                            tolerance_match=True,
+                            rtol=1e-5,
+                            atol=1e-8,
+                        ),
                     ),
                 )
             ],
@@ -1564,7 +1571,7 @@ class TestOracleFlag:
             engine_id=engine_id,
             status="success",
             role=role,
-            gpu_kernel_stats=stats(1.0),
+            ootb=OotbResult(gpu_kernel_stats=stats(1.0)),
             oracle=OracleResult(
                 tuning_available=searched,
                 gpu_kernel_stats=stats(1.0 / speedup),

@@ -37,7 +37,7 @@ a run; the table is what it is checking and how to close each gap.
 | `--roofline` | `rocprof-compute` **paired with the ROCm whose `rocprofv3` it drives** | The `rocprofiler-compute` system package. Deliberately absent from the wheel-only Docker image: pulling it in means adding a second ROCm install, which is the mismatch above. A hand-installed copy is not a shortcut — rocprofiler-compute 3.3.0 against ROCm 7.15 dies on `$ROCM_PATH/share/rocprofiler-sdk/counter_defs.yaml`, which that ROCm does not ship. Note it also clears the whole `-p` directory it is given, so never point it at a directory holding other artefacts |
 
 A source that can't run is never fatal — it records a `skipped` entry
-with the reason in `extra_metrics` and the benchmark continues.
+with the reason in `ootb.extra_metrics` and the benchmark continues.
 
 ## Profiling integration tests
 
@@ -92,7 +92,7 @@ follow-up work, not a blocker.
 Every external profiler invocation (rocprofv3 PMC, rocprofv3 trace,
 perf stat, rocprof-compute) is capped at a per-process
 wall-clock budget. A wedged child surfaces as
-`extra_metrics["<source>"]["skipped"] == "timed out after Ns"`
+`ootb.extra_metrics["<source>"]["skipped"] == "timed out after Ns"`
 instead of blocking the entire suite.
 
 Default is **600 s (10 min)** per subprocess. Override via
@@ -128,7 +128,7 @@ device buffers); reduce `--iters` or run sources one at a time.
 
 The opt-in profiling sources don't render their own visualisations —
 they capture raw artefacts (CSVs, sqlite dbs, pftrace files) and
-record paths in `extra_metrics["<source>"]` of the result JSON. The
+record paths in `ootb.extra_metrics["<source>"]` of the result JSON. The
 console reporter prints the open-it-with hint next to each path. The
 recipes below cover everything beyond the one-liner hint.
 
@@ -210,7 +210,7 @@ rocprof-compute analyze --path <workload_path> --roofline-data-type FP16
 
 ### Kernel + memcpy trace (`--emit-trace pftrace`)
 
-The `path` field under `extra_metrics["trace"]` points to the generated
+The `path` field under `ootb.extra_metrics["trace"]` points to the generated
 `.pftrace` file. Open it at:
 
 ```text
@@ -234,7 +234,7 @@ The recorded artefacts:
 | `set` / `arch` | Which counter set was collected and on which arch |
 | `arch_narrowed_to_fallback` | Set when `--pmc all` couldn't find your arch in `PMC_SETS` and fell back to the 2-counter fallback group |
 
-For aggregates, just read `extra_metrics["pmc"]["counters"]` directly
+For aggregates, just read `ootb.extra_metrics["pmc"]["counters"]` directly
 from the result JSON — they're already summarised.
 
 #### Full speed-of-light dashboard via rocprof-compute

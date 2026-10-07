@@ -524,7 +524,7 @@ class TestPyTorchReferenceValidation:
             )
 
         assert any(
-            row.correctness is not None and row.correctness.passed
+            row.ootb.correctness is not None and row.ootb.correctness.passed
             for row in successful_rows
         )
 
@@ -568,7 +568,7 @@ class TestPyTorchReferenceValidation:
         assert len(reference_rows) == 1
         assert reference_rows[0].status == "success"
         assert any(
-            row.correctness is not None and row.correctness.passed
+            row.ootb.correctness is not None and row.ootb.correctness.passed
             for row in successful_rows
         )
 
@@ -602,8 +602,8 @@ class TestPyTorchReferenceValidation:
         assert len(reference_rows) == 1
         assert reference_rows[0].provider == "pytorch"
         assert reference_rows[0].status == "success"
-        assert reference_rows[0].host_stats is not None
-        assert reference_rows[0].gpu_kernel_stats is not None
+        assert reference_rows[0].ootb.host_stats is not None
+        assert reference_rows[0].ootb.gpu_kernel_stats is not None
         assert engine_rows
         assert any(row.status == "success" for row in engine_rows)
 
@@ -816,8 +816,8 @@ class TestGpuValidationPath:
         successes = [r for r in engine_rows if r.status == "success"]
         if not successes:
             pytest.skip("No hipDNN engine supports the conv graph")
-        assert all(r.correctness.tolerance_match is True for r in successes), [
-            r.correctness.error_message for r in successes
+        assert all(r.ootb.correctness.tolerance_match is True for r in successes), [
+            r.ootb.correctness.error_message for r in successes
         ]
         assert devices and set(devices) == {"cuda"}
         assert calls["device"] >= len(successes)

@@ -47,6 +47,7 @@ from dnn_benchmarking.reporting.statistics import (
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    OotbResult,
     ProviderEngineResult,
     oracle_speedup,
 )
@@ -233,9 +234,7 @@ class TestRunGraphAllProviders:
         r = result.results[0]
         assert r.status == "error"
         assert "build failed" in r.error_message
-        assert r.build_time_ms is None
-        assert r.gpu_kernel_stats is None
-        assert r.host_stats is None
+        assert r.ootb is None
 
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
     @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
@@ -302,9 +301,9 @@ class TestRunGraphAllProviders:
 
         r = result.results[0]
         assert r.status == "success"
-        assert r.build_time_ms == 12.5
-        assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
-        assert isinstance(r.host_stats, BenchmarkStats)
+        assert r.ootb.build_time_ms == 12.5
+        assert isinstance(r.ootb.gpu_kernel_stats, BenchmarkStats)
+        assert isinstance(r.ootb.host_stats, BenchmarkStats)
 
 
 class TestDiscoveryFailure:
@@ -377,8 +376,7 @@ class TestDiscoveryFailure:
         assert r.provider == "unknown"
         assert "Input data generation failed" in r.error_message
         assert "bad tensor strides" in r.error_message
-        assert r.correctness is not None
-        assert r.correctness.passed is False
+        assert r.ootb is None
         assert result.engine_ids == [7]
 
     @patch("dnn_benchmarking.execution.suite_runner.Executor")
@@ -684,8 +682,7 @@ class TestEngineFilter:
         assert result.results[0].plugin_path == str(Path("/plugins/a"))
         assert result.results[1].plugin_path == str(Path("/plugins/b"))
         assert "bad plugin" in (result.results[1].error_message or "")
-        assert result.results[1].correctness is not None
-        assert result.results[1].correctness.execution_success is False
+        assert result.results[1].ootb is None
 
 
 class TestNoRetryOnFailure:
@@ -765,9 +762,8 @@ class TestCorrectnessChecking:
         )
 
         r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.tolerance_match is True
-        assert r.correctness.execution_success is True
+        assert r.ootb.correctness.tolerance_match is True
+        assert r.ootb.correctness.execution_success is True
 
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
     @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
@@ -796,9 +792,8 @@ class TestCorrectnessChecking:
         )
 
         r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.tolerance_match is None
-        assert r.correctness.execution_success is True
+        assert r.ootb.correctness.tolerance_match is None
+        assert r.ootb.correctness.execution_success is True
 
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
     @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
@@ -827,43 +822,9 @@ class TestCorrectnessChecking:
         )
 
         r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.tolerance_match is False
-        assert r.correctness.execution_success is True
-        assert "does not support" in (r.correctness.error_message or "")
-
-    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
-    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
-    @patch("dnn_benchmarking.execution.suite_runner.Executor")
-    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
-    def test_execution_success_false_on_error(
-        self,
-        mock_bm_cls,
-        mock_exec_cls,
-        mock_get_ref,
-        mock_resolve_name,
-    ):
-        """correctness.execution_success is False when benchmark errors."""
-        mock_resolve_name.return_value = "engine_0"
-        mock_get_ref.return_value = None
-
-        mock_exec_cls.side_effect = _make_exec_factory(
-            engine_ids=[0],
-            prepare_side_effect=ExecutionError("boom"),
-        )
-
-        result = run_graph_all_providers(
-            graph_path=Path("test.json"),
-            graph_json=_make_graph_json(),
-            tensor_infos=[_make_tensor_info(1)],
-            config=_make_config(),
-            handle=MagicMock(),
-        )
-
-        r = result.results[0]
-        assert r.correctness is not None
-        assert r.correctness.execution_success is False
-        assert r.correctness.tolerance_match is None
+        assert r.ootb.correctness.tolerance_match is False
+        assert r.ootb.correctness.execution_success is True
+        assert "does not support" in (r.ootb.correctness.error_message or "")
 
     @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
@@ -893,8 +854,10 @@ class TestCorrectnessChecking:
             engine_id=0,
             status="success",
             role="reference",
-            host_stats=BenchmarkStats.from_timings([2.0]),
-            gpu_kernel_stats=BenchmarkStats.from_timings([1.0]),
+            ootb=OotbResult(
+                host_stats=BenchmarkStats.from_timings([2.0]),
+                gpu_kernel_stats=BenchmarkStats.from_timings([1.0]),
+            ),
         )
         mock_timed_reference.return_value = MagicMock(
             result=timed_result,
@@ -1180,8 +1143,8 @@ class TestCorrectnessChecking:
         )
 
         mock_pytorch_executor_cls.assert_called_once()
-        assert result.result.host_stats is not None
-        assert result.result.gpu_kernel_stats is None
+        assert result.result.ootb.host_stats is not None
+        assert result.result.ootb.gpu_kernel_stats is None
         assert result.result.status == "success"
         benchmark_config = mock_pytorch_executor_cls.call_args.args[1]
         assert benchmark_config.pytorch_sdpa_backend.value == "flash"
@@ -1476,7 +1439,7 @@ class TestResolveEngineName:
 class TestProfilingPassInvocation:
     """suite_runner.py:521-542 calls the profiling orchestrator after the
     timed pass when any opt-in metric is requested. The orchestrator's
-    payload lands on result.extra_metrics; orchestrator exceptions must
+    payload lands on result.ootb.extra_metrics; orchestrator exceptions must
     not bubble out as engine errors."""
 
     def _setup_mocks(self, mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name):
@@ -1520,7 +1483,7 @@ class TestProfilingPassInvocation:
         # commit 196a0fb33ca.
         assert mock_orch.call_count == 1
         assert len(result.results) == 1
-        assert result.results[0].extra_metrics == payload
+        assert result.results[0].ootb.extra_metrics == payload
 
     @patch("dnn_benchmarking.metrics.profiling_orchestrator.run_profiling_passes")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
@@ -1548,7 +1511,7 @@ class TestProfilingPassInvocation:
         )
 
         mock_orch.assert_not_called()
-        assert result.results[0].extra_metrics is None
+        assert result.results[0].ootb.extra_metrics is None
 
     @patch("dnn_benchmarking.metrics.profiling_orchestrator.run_profiling_passes")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
@@ -1581,7 +1544,7 @@ class TestProfilingPassInvocation:
 
         # Engine still passes; extra_metrics stays None.
         assert result.results[0].status == "success"
-        assert result.results[0].extra_metrics is None
+        assert result.results[0].ootb.extra_metrics is None
         # warn_once writes to stderr.
         captured = capsys.readouterr()
         assert "profiling pass failed" in captured.err
@@ -1652,7 +1615,7 @@ class TestRunGraphPytorchBackend:
             provider="pytorch",
             engine_id=0,
             status="success",
-            host_stats=BenchmarkStats.from_timings([2.0]),
+            ootb=OotbResult(host_stats=BenchmarkStats.from_timings([2.0])),
         )
         mock_timed_row.return_value = MagicMock(result=row, outputs=None)
 
@@ -1758,10 +1721,9 @@ class TestTimedPytorchRowEngineRole:
         assert row.outputs is None
         # Engine rows never run the extra reference-output extraction pass.
         executor.execute_once.assert_not_called()
-        assert row.result.correctness is not None
-        assert row.result.correctness.tolerance_match is None
+        assert row.result.ootb.correctness.tolerance_match is None
         assert "No reference provider requested" in (
-            row.result.correctness.error_message or ""
+            row.result.ootb.correctness.error_message or ""
         )
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
@@ -1844,6 +1806,9 @@ class TestTimedPytorchRowEngineRole:
         )
 
         assert row.result.status == "error"
+        # The timed loop finished, but its measurements must not survive the
+        # failed output pass.
+        assert row.result.ootb is None
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_reference_role_strict_backend_unavailable_is_marked_for_no_fallback(
@@ -1890,7 +1855,7 @@ def _make_oracle_exec_factory(
     Instance order inside run_graph_all_providers is discovery, the untimed
     OOTB prime, the timed OOTB build, then oracle. The oracle instance reports
     half the OOTB kernel time so the speedup is unambiguous, and its own build
-    time so a swap with the OOTB plan's shows.
+    time and workspace size so a swap with the OOTB plan's shows.
 
     Args:
         prepare_side_effect: Side effect of the tuned plan build, if any.
@@ -1915,6 +1880,7 @@ def _make_oracle_exec_factory(
         tuned = role == "oracle"
         # The prime's (untimed) value must never surface as a build time.
         m.build_time_ms = {"oracle": 7.0, "prime": 99.0}.get(role, 3.0)
+        m.workspace_size = {"oracle": 4096}.get(role, 1024)
         m.discover_engines.return_value = [0]
         m.engine_knob_ids.return_value = list(knob_ids)
         bench_result = MagicMock()
@@ -2020,7 +1986,7 @@ class TestOraclePass:
         assert instances[1].prime.call_args.args == (handle, 0)
         assert instances[2].prepare.call_args.args[0] is handle
         # The reported OOTB build time is the timed build's, not the prime's.
-        assert result.results[0].build_time_ms == instances[2].build_time_ms
+        assert result.results[0].ootb.build_time_ms == instances[2].build_time_ms
 
     def test_oracle_uses_an_isolated_handle_on_the_same_stream(self):
         class Handle:
@@ -2108,9 +2074,11 @@ class TestOraclePass:
 
         row = result.results[0]
         # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB); 0.25 ms -> 4 (tuned).
-        assert row.derived_tflops_per_s == pytest.approx(2.0)
+        assert row.ootb.derived_tflops_per_s == pytest.approx(2.0)
         assert row.oracle.derived_tflops_per_s == pytest.approx(4.0)
         assert row.oracle.to_dict()["derived_tflops_per_s"] == pytest.approx(4.0)
+        # FLOPs are a graph property: the tuned run reports the OOTB count.
+        assert row.oracle.analytical_flops == row.ootb.analytical_flops == 10**9
 
     def test_oracle_failure_leaves_ootb_row_intact(self):
         factory, _ = _make_oracle_exec_factory(
@@ -2120,7 +2088,7 @@ class TestOraclePass:
 
         r = result.results[0]
         assert r.status == "success"
-        assert isinstance(r.gpu_kernel_stats, BenchmarkStats)
+        assert isinstance(r.ootb.gpu_kernel_stats, BenchmarkStats)
         assert r.oracle is None
         assert r.oracle_error == "ExecutionError: plan build failed"
 
@@ -2150,13 +2118,16 @@ class TestOraclePass:
 
         assert oracle.tuning_available is available
 
-    def test_build_times_are_reported_per_plan(self):
-        """The row carries the OOTB build; the oracle carries the tuned build."""
-        factory, _ = _make_oracle_exec_factory()
+    def test_build_times_and_workspaces_are_reported_per_plan(self):
+        """The OOTB run carries the OOTB plan's build time and workspace; the
+        oracle carries the tuned plan's."""
+        factory, instances = _make_oracle_exec_factory()
         r = self._run(factory).results[0]
 
-        assert r.build_time_ms == 3.0
+        assert r.ootb.build_time_ms == 3.0
         assert r.oracle.build_time_ms == 7.0
+        assert r.ootb.workspace_bytes == instances[2].workspace_size == 1024
+        assert r.oracle.workspace_bytes == instances[3].workspace_size == 4096
 
 
 class TestOracleTunedPlanValidation:
@@ -2243,7 +2214,7 @@ class TestOracleTunedPlanValidation:
         # OOTB check first, tuned check second.
         r = self._run(factory, [self._verdict(False), self._verdict(True)]).results[0]
 
-        assert r.correctness.passed is False
+        assert r.ootb.correctness.passed is False
         assert r.oracle.correctness.passed is True
         # Both verdicts survive separately; only the comparison is refused.
         assert r.oracle.gpu_kernel_stats is not None
@@ -2275,7 +2246,7 @@ class TestOracleTunedPlanValidation:
         assert oracle_speedup(r) == 2.0
 
     def test_a_failing_tuned_plan_leaves_the_ootb_verdict_passing(self):
-        """OOTB correctness is the row's; the tuned verdict is the oracle's.
+        """OOTB correctness is the OOTB run's; the tuned verdict is the oracle's.
 
         The OOTB plan is correct and the tuned plan is not, so the two must
         disagree. A row that reports the tuned failure as its own would fail
@@ -2285,7 +2256,7 @@ class TestOracleTunedPlanValidation:
         # First call is the OOTB check, second is the tuned check.
         r = self._run(factory, [self._verdict(True), self._verdict(False)]).results[0]
 
-        assert r.correctness.passed is True
+        assert r.ootb.correctness.passed is True
         assert r.oracle.correctness.passed is False
         assert r.status == "success"
         assert oracle_speedup(r) is None
@@ -2388,8 +2359,10 @@ def _tuned_child_document(*rows):
 
 _TUNED_CHILD_ROW = {
     "status": "success",
-    "gpu_kernel_stats": BenchmarkStats.from_timings([0.25]).to_dict(),
-    "host_stats": BenchmarkStats.from_timings([0.75]).to_dict(),
+    "ootb": {
+        "gpu_kernel_stats": BenchmarkStats.from_timings([0.25]).to_dict(),
+        "host_stats": BenchmarkStats.from_timings([0.75]).to_dict(),
+    },
 }
 
 
@@ -2520,9 +2493,11 @@ class TestPytorchOracle:
             provider="pytorch",
             engine_id=0,
             status="success",
-            gpu_kernel_stats=BenchmarkStats.from_timings([0.8]),
-            host_stats=BenchmarkStats.from_timings([1.5]),
-            analytical_flops=10**9,
+            ootb=OotbResult(
+                gpu_kernel_stats=BenchmarkStats.from_timings([0.8]),
+                host_stats=BenchmarkStats.from_timings([1.5]),
+                analytical_flops=10**9,
+            ),
         )
         kwargs = (
             {"side_effect": child}
@@ -2535,6 +2510,7 @@ class TestPytorchOracle:
         ):
             _run_pytorch_oracle_pass(
                 result=result,
+                ootb=result.ootb,
                 graph_path=Path("g.json"),
                 graph_name="g",
                 config=_make_config(oracle_mode="exhaustive"),
@@ -2550,7 +2526,7 @@ class TestPytorchOracle:
         assert oracle.gpu_kernel_stats.mean_ms == 0.25
         assert oracle.host_stats.mean_ms == 0.75
         assert result.oracle_error is None
-        assert result.gpu_kernel_stats.mean_ms == 0.8
+        assert result.ootb.gpu_kernel_stats.mean_ms == 0.8
         assert oracle_speedup(result) == pytest.approx(3.2)
         # Same TFLOP/s basis as hipDNN oracles: 1e9 FLOPs over the tuned median.
         assert oracle.derived_tflops_per_s == pytest.approx(4.0)
@@ -2563,16 +2539,16 @@ class TestPytorchOracle:
             result.oracle_error == "RuntimeError: tuned PyTorch child returned 0 rows"
         )
         assert result.status == "success"
-        assert result.gpu_kernel_stats.mean_ms == 0.8
-        assert result.host_stats.mean_ms == 1.5
+        assert result.ootb.gpu_kernel_stats.mean_ms == 0.8
+        assert result.ootb.host_stats.mean_ms == 1.5
 
 
 def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
-    """derived_tflops_per_s divides by the kernel *median* (rocKE parity),
+    """ootb.derived_tflops_per_s divides by the kernel *median* (rocKE parity),
     and CPU time is per timed execution (iters * timing_block)."""
     result = ProviderEngineResult(provider="hipdnn", engine_id=1, status="success")
     # Mean 4 ms, median 1 ms.
-    result.gpu_kernel_stats = BenchmarkStats.from_timings([1.0, 1.0, 10.0])
+    ootb = OotbResult(gpu_kernel_stats=BenchmarkStats.from_timings([1.0, 1.0, 10.0]))
     probe = SimpleNamespace(
         delta=SimpleNamespace(user_time_ms=60.0, kernel_time_ms=6.0)
     )
@@ -2580,6 +2556,7 @@ def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
     with patch("dnn_benchmarking.execution.suite_runner.GpuSmiProbe"):
         _collect_basic_metrics_post_loop(
             result=result,
+            ootb=ootb,
             cpu_time_probe=probe,
             timed_executions=3 * 20,
             analytical_flops=10**12,
@@ -2587,6 +2564,6 @@ def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
             analytical_io_bytes=None,
         )
 
-    assert result.derived_tflops_per_s == pytest.approx(1000.0)
+    assert ootb.derived_tflops_per_s == pytest.approx(1000.0)
     assert result.cpu_user_time_per_iter_us == pytest.approx(1000.0)
     assert result.cpu_kernel_time_per_iter_us == pytest.approx(100.0)

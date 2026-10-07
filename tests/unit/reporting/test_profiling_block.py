@@ -12,27 +12,22 @@ import io
 from pathlib import Path
 
 from dnn_benchmarking.reporting import Reporter
-from dnn_benchmarking.reporting.suite_results import ProviderEngineResult
+from dnn_benchmarking.reporting.suite_results import OotbResult
 
 
-def _make_pe(extra_metrics):
-    return ProviderEngineResult(
-        provider="miopen",
-        engine_id=1,
-        status="success",
-        extra_metrics=extra_metrics,
-    )
+def _make_ootb(extra_metrics):
+    return OotbResult(extra_metrics=extra_metrics)
 
 
 class TestNoProfilingDataSuppressesBlock:
     def test_none_extra_metrics_emits_nothing(self):
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(None))
+        Reporter(output=out)._print_profiling_block(_make_ootb(None))
         assert out.getvalue() == ""
 
     def test_empty_dict_emits_nothing(self):
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe({}))
+        Reporter(output=out)._print_profiling_block(_make_ootb({}))
         assert out.getvalue() == ""
 
 
@@ -51,7 +46,7 @@ class TestPmcRendering:
             }
         }
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         text = out.getvalue()
         assert "Profiling:" in text
         assert "PMC (basic, gfx942)" in text
@@ -65,7 +60,7 @@ class TestPmcRendering:
             "pmc": {"set": "basic", "arch": "gfx942", "skipped": "no counters defined"}
         }
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         assert "PMC (basic, gfx942):  skipped — no counters defined" in out.getvalue()
 
     def test_db_path_renders_with_analyze_hint(self):
@@ -82,7 +77,7 @@ class TestPmcRendering:
             }
         }
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         rendered = out.getvalue()
         assert "PMC db:" in rendered
         assert "/tmp/prof/sample/MIOPEN_ENGINE/pmc_basic/results.db" in rendered
@@ -99,7 +94,7 @@ class TestTraceRendering:
     def test_pftrace_path_renders_with_perfetto_hint(self):
         extra = {"trace": {"format": "pftrace", "path": "/tmp/out/results.pftrace"}}
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         text = out.getvalue()
         assert "Trace (pftrace)" in text
         assert "/tmp/out/results.pftrace" in text
@@ -117,7 +112,7 @@ class TestPerfRendering:
             }
         }
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         text = out.getvalue()
         assert "CPU (perf)" in text
         assert "IPC=0.80" in text
@@ -126,7 +121,7 @@ class TestPerfRendering:
     def test_perf_skipped_renders_reason(self):
         extra = {"perf": {"skipped": "perf binary not found on PATH"}}
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         assert "skipped — perf binary not found on PATH" in out.getvalue()
 
 
@@ -143,7 +138,7 @@ class TestRooflineRendering:
             }
         }
         out = io.StringIO()
-        Reporter(output=out)._print_profiling_block(_make_pe(extra))
+        Reporter(output=out)._print_profiling_block(_make_ootb(extra))
         rendered = out.getvalue()
         assert "Roofline CSV:" in rendered
         assert "/tmp/r/workload/gfx90a/roofline.csv" in rendered

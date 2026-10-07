@@ -8,7 +8,11 @@ from pathlib import Path
 
 from dnn_benchmarking.config import BenchmarkConfig
 from dnn_benchmarking.reporting import BenchmarkStats, Reporter
-from dnn_benchmarking.reporting.suite_results import GraphResult, ProviderEngineResult
+from dnn_benchmarking.reporting.suite_results import (
+    GraphResult,
+    OotbResult,
+    ProviderEngineResult,
+)
 
 
 class TestReporter:
@@ -137,23 +141,25 @@ class TestReporterEngineTable:
                     provider="engine_1",
                     engine_id=1,
                     status="success",
-                    gpu_kernel_stats=BenchmarkStats(
-                        mean_ms=1.0,
-                        median_ms=0.9,
-                        std_ms=0.1,
-                        min_ms=0.8,
-                        max_ms=1.2,
-                        p95_ms=1.1,
-                        p99_ms=1.2,
-                    ),
-                    host_stats=BenchmarkStats(
-                        mean_ms=2.0,
-                        median_ms=1.8,
-                        std_ms=0.2,
-                        min_ms=1.6,
-                        max_ms=2.4,
-                        p95_ms=2.2,
-                        p99_ms=2.4,
+                    ootb=OotbResult(
+                        gpu_kernel_stats=BenchmarkStats(
+                            mean_ms=1.0,
+                            median_ms=0.9,
+                            std_ms=0.1,
+                            min_ms=0.8,
+                            max_ms=1.2,
+                            p95_ms=1.1,
+                            p99_ms=1.2,
+                        ),
+                        host_stats=BenchmarkStats(
+                            mean_ms=2.0,
+                            median_ms=1.8,
+                            std_ms=0.2,
+                            min_ms=1.6,
+                            max_ms=2.4,
+                            p95_ms=2.2,
+                            p99_ms=2.4,
+                        ),
                     ),
                 )
             ],
@@ -180,23 +186,25 @@ class TestReporterEngineTable:
                     engine_id=2,
                     status="success",
                     plugin_path="/plugins/b",
-                    gpu_kernel_stats=BenchmarkStats(
-                        mean_ms=1.0,
-                        median_ms=0.9,
-                        std_ms=0.1,
-                        min_ms=0.8,
-                        max_ms=1.2,
-                        p95_ms=1.1,
-                        p99_ms=1.2,
-                    ),
-                    host_stats=BenchmarkStats(
-                        mean_ms=2.0,
-                        median_ms=1.8,
-                        std_ms=0.2,
-                        min_ms=1.6,
-                        max_ms=2.4,
-                        p95_ms=2.2,
-                        p99_ms=2.4,
+                    ootb=OotbResult(
+                        gpu_kernel_stats=BenchmarkStats(
+                            mean_ms=1.0,
+                            median_ms=0.9,
+                            std_ms=0.1,
+                            min_ms=0.8,
+                            max_ms=1.2,
+                            p95_ms=1.1,
+                            p99_ms=1.2,
+                        ),
+                        host_stats=BenchmarkStats(
+                            mean_ms=2.0,
+                            median_ms=1.8,
+                            std_ms=0.2,
+                            min_ms=1.6,
+                            max_ms=2.4,
+                            p95_ms=2.2,
+                            p99_ms=2.4,
+                        ),
                     ),
                 )
             ],

@@ -295,7 +295,7 @@ For every applicable engine the tool builds two plans through one timed path,
 
 | Run | Knobs | Build time in JSON |
 |---|---|---|
-| OOTB | none | `build_time_ms` on the engine row |
+| OOTB | none | `ootb.build_time_ms` |
 | Tuned | `global.benchmarking=1` | `oracle.build_time_ms` |
 
 Build time covers only those three calls; graph deserialization, operation
@@ -329,12 +329,13 @@ The summary table shows:
 - `oracle_speedup`: OOTB mean / tuned mean.
 - `ootb_build_ms` and `oracle_build_ms`: the two plan build times.
 
-The speedup is not stored in the JSON; derive it from the row and its `oracle`:
-divide `gpu_kernel_stats.mean_ms` by `oracle.gpu_kernel_stats.mean_ms`, falling
-back to `host_stats` when either side has no kernel stats. Report no speedup
-when either `correctness` (row or `oracle`) failed, and keep rows with
-`tuning_available: false` and timed reference rows (`role: "reference"`) out of
-averages. The oracle can be slower; `0.99x` is a valid measured result.
+The speedup is not stored in the JSON; derive it from the row's `ootb` and
+`oracle` objects: divide `ootb.gpu_kernel_stats.mean_ms` by
+`oracle.gpu_kernel_stats.mean_ms`, falling back to `host_stats` when either side
+has no kernel stats. Report no speedup when either `correctness` (`ootb` or
+`oracle`) failed, and keep rows with `tuning_available: false` and timed
+reference rows (`role: "reference"`) out of averages. The oracle can be slower;
+`0.99x` is a valid measured result.
 
 With `--validate`, the tool validates the OOTB and tuned plans independently.
 
@@ -477,6 +478,59 @@ Suite Summary:
   Errors:       0
 ================================================================================
 ```
+
+### JSON Result Rows
+
+Each entry in `graphs[].results` describes one provider/engine run. The
+out-of-the-box plan's measurements are under `ootb`, and the tuned plan's are
+under `oracle`:
+
+```json
+{
+  "provider": "MIOPEN_ENGINE",
+  "engine_id": 1234567,
+  "engine_name": "MIOPEN_ENGINE",
+  "engine_version": "1.0.0",
+  "started_at": "2026-10-07T12:00:00+00:00",
+  "status": "success",
+  "ootb": {
+    "build_time_ms": 12.5,
+    "gpu_kernel_stats": { "mean_ms": 0.50, "median_ms": 0.49 },
+    "host_stats": { "mean_ms": 0.62, "median_ms": 0.61 },
+    "workspace_bytes": 1048576,
+    "analytical_flops": 98000000,
+    "derived_tflops_per_s": 200.0,
+    "correctness": { "passed": true, "execution_success": true, "tolerance_match": true, "rtol": 0.02, "atol": 0.02 },
+    "extra_metrics": null
+  },
+  "oracle": {
+    "tuning_available": true,
+    "build_time_ms": 340.25,
+    "gpu_kernel_stats": { "mean_ms": 0.25, "median_ms": 0.25 },
+    "host_stats": { "mean_ms": 0.37, "median_ms": 0.36 },
+    "workspace_bytes": 2097152,
+    "analytical_flops": 98000000,
+    "derived_tflops_per_s": 392.0,
+    "correctness": { "passed": true, "execution_success": true, "tolerance_match": true, "rtol": 0.02, "atol": 0.02 }
+  }
+}
+```
+
+- `ootb` and `oracle` always contain every key; a value that was not measured is
+  `null` (for example, `build_time_ms` on PyTorch rows, or the metric fields
+  under `--metrics-tier off`).
+- `gpu_kernel_stats` and `host_stats` also carry `std_ms`, `min_ms`, `max_ms`,
+  `p95_ms`, `p99_ms`, and `total_ms`; the example omits them.
+- `ootb` is `null` on `error` and `skipped` rows, which carry `error_message` or
+  `skip_reason` instead.
+- `oracle` is `null` unless `--oracle-mode exhaustive` ran and tuning
+  succeeded. When tuning fails, `oracle_error` explains why.
+- `analytical_flops` is a property of the graph, so both runs report the same
+  value. `workspace_bytes` is each plan's own request.
+- `extra_metrics` holds the opt-in profiling payload (`--pmc`, `--emit-trace`,
+  `--perf`, `--roofline`), which re-runs the OOTB plan.
+- `role` (`"reference"` for timed validation rows), `plugin_path`, and
+  `warnings` appear only when they apply.
 
 ### Verbose Output (`-v`)
 

@@ -421,7 +421,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Metrics",
         help=(
             "Re-run benchmark under rocprofv3 with the named PMC counter "
-            "set. Per-kernel aggregates land in extra_metrics['pmc']. "
+            "set. Per-kernel aggregates land in ootb.extra_metrics['pmc']. "
             "'all' requires --pmc-allow-multipass. Adds ~1 extra workload "
             "run (~30%% wallclock overhead)."
         ),
@@ -472,7 +472,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "Re-run under 'rocprof-compute profile --roof-only' to "
             "capture HBM/compute ceilings. The CSV artefacts "
             "(roofline.csv, sysinfo.csv) and the workload directory "
-            "path land in extra_metrics['roofline'] — render the PDF "
+            "path land in ootb.extra_metrics['roofline'] — render the PDF "
             "post-hoc via 'rocprof-compute analyze --path <workload>'. "
             "Adds ~3 extra workload runs."
         ),
@@ -505,7 +505,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
             "Wall-clock budget for each external profiler subprocess "
             "(rocprofv3, perf, rocprof-compute). Default "
             "600 s. A wedged child surfaces as 'timed out after Ns' in "
-            "extra_metrics['<source>']['skipped'] instead of hanging the "
+            "ootb.extra_metrics['<source>']['skipped'] instead of hanging the "
             "suite. Bump for known-long workloads (heavy graph under "
             "multi-pass PMC replay). Pass 0 to disable the timeout."
         ),

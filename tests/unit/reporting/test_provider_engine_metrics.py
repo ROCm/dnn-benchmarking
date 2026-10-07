@@ -1,19 +1,45 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for the always-on metric fields on ProviderEngineResult.to_dict.
+"""Tests for the JSON shape of ProviderEngineResult.to_dict.
 
-The legacy success-path JSON shape must stay backward-compatible: new
-metric fields appear only when populated, never as null sentinels.
+A row nests its plan-run measurements under ``ootb`` (and ``oracle``); both
+keys are always present and null when not measured. Row-level console
+metrics never reach the JSON.
 """
 
 import json
 
+import pytest
+
 from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
+    CorrectnessResult,
+    OotbResult,
     ProviderEngineResult,
     SuiteMetadata,
 )
+
+_ROW_KEYS = {
+    "provider",
+    "engine_id",
+    "engine_name",
+    "engine_version",
+    "started_at",
+    "status",
+    "ootb",
+    "oracle",
+}
+
+_PLAN_RUN_KEYS = {
+    "build_time_ms",
+    "gpu_kernel_stats",
+    "host_stats",
+    "workspace_bytes",
+    "analytical_flops",
+    "derived_tflops_per_s",
+    "correctness",
+}
 
 
 def _bench_stats(mean: float = 1.0) -> BenchmarkStats:
@@ -27,129 +53,107 @@ def _bench_stats(mean: float = 1.0) -> BenchmarkStats:
     )
 
 
-class TestProviderEngineResultLegacyShape:
-    def test_no_new_fields_when_metrics_unset(self):
+class TestSuccessRowShape:
+    def test_top_level_keys(self):
         pe = ProviderEngineResult(
             provider="miopen",
             engine_id=1,
             status="success",
-            build_time_ms=12.3,
-            gpu_kernel_stats=_bench_stats(),
-            host_stats=_bench_stats(),
-            elapsed_time_ms=200.0,
+            ootb=OotbResult(build_time_ms=12.3),
         )
-        d = pe.to_dict()
-        # Legacy keys still present
-        assert d["status"] == "success"
-        assert d["build_time_ms"] == 12.3
-        # No metric fields leaked into JSON when None
+        assert set(pe.to_dict()) == _ROW_KEYS
+
+    def test_ootb_emits_every_key_with_null_for_unmeasured(self):
+        pe = ProviderEngineResult(
+            provider="miopen",
+            engine_id=1,
+            status="success",
+            ootb=OotbResult(build_time_ms=12.3, gpu_kernel_stats=_bench_stats(0.5)),
+        )
+        ootb = pe.to_dict()["ootb"]
+        assert set(ootb) == _PLAN_RUN_KEYS | {"extra_metrics"}
+        assert ootb["build_time_ms"] == 12.3
+        assert ootb["gpu_kernel_stats"]["mean_ms"] == 0.5
         for key in (
+            "host_stats",
             "workspace_bytes",
             "analytical_flops",
-            "analytical_io_bytes",
             "derived_tflops_per_s",
-            "derived_gbytes_per_s",
-            "cpu_user_time_per_iter_us",
-            "cpu_kernel_time_per_iter_us",
-            "vram_used_mb",
+            "correctness",
             "extra_metrics",
         ):
-            assert key not in d
-        # Fields removed from per-engine in the suite-scope cleanup must
-        # never appear, even by accident (no setattr leak).
-        for removed in (
-            "host_rss_mb",
-            "host_ram_available_mb",
-            "gpu_smi_snapshot",
-            "cpu_user_time_ms",
-            "cpu_kernel_time_ms",
-        ):
-            assert removed not in d
+            assert ootb[key] is None
 
-    def test_partial_flag_emitted_only_when_true(self):
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            analytical_flops=42,
-            analytical_flops_partial=False,
+    def test_ootb_serializes_all_measurements(self):
+        corr = CorrectnessResult(
+            execution_success=True, tolerance_match=True, rtol=1e-5, atol=1e-8
         )
-        d = pe.to_dict()
-        assert d["analytical_flops"] == 42
-        assert "analytical_flops_partial" not in d
-
-    def test_partial_flag_serialised_when_true(self):
         pe = ProviderEngineResult(
             provider="miopen",
             engine_id=1,
             status="success",
-            analytical_flops=42,
-            analytical_flops_partial=True,
+            ootb=OotbResult(
+                build_time_ms=10.0,
+                gpu_kernel_stats=_bench_stats(0.5),
+                host_stats=_bench_stats(1.0),
+                workspace_bytes=4096,
+                analytical_flops=10**9,
+                derived_tflops_per_s=2.0,
+                correctness=corr,
+            ),
         )
-        d = pe.to_dict()
-        assert d["analytical_flops_partial"] is True
+        ootb = pe.to_dict()["ootb"]
+        assert ootb["build_time_ms"] == 10.0
+        assert ootb["gpu_kernel_stats"]["mean_ms"] == 0.5
+        assert ootb["host_stats"]["mean_ms"] == 1.0
+        assert ootb["workspace_bytes"] == 4096
+        assert ootb["analytical_flops"] == 10**9
+        assert ootb["derived_tflops_per_s"] == 2.0
+        assert ootb["correctness"] == corr.to_dict()
 
-
-class TestProviderEngineResultFullShape:
-    def test_all_metric_fields_serialise(self):
+    def test_console_only_fields_not_serialized(self):
         pe = ProviderEngineResult(
             provider="miopen",
             engine_id=1,
             status="success",
-            build_time_ms=10.0,
-            gpu_kernel_stats=_bench_stats(0.5),
-            host_stats=_bench_stats(1.0),
             elapsed_time_ms=200.0,
-            workspace_bytes=4096,
-            analytical_flops=10**9,
+            analytical_flops_partial=True,
             analytical_io_bytes=10**6,
-            derived_tflops_per_s=2.0,
             derived_gbytes_per_s=2.0,
             cpu_user_time_per_iter_us=40.0,
             cpu_kernel_time_per_iter_us=2.5,
             vram_used_mb=4096.0,
+            ootb=OotbResult(analytical_flops=42),
         )
         d = pe.to_dict()
-        assert d["workspace_bytes"] == 4096
-        assert d["analytical_flops"] == 10**9
-        assert d["analytical_io_bytes"] == 10**6
-        assert d["derived_tflops_per_s"] == 2.0
-        assert d["derived_gbytes_per_s"] == 2.0
-        assert d["cpu_user_time_per_iter_us"] == 40.0
-        assert d["cpu_kernel_time_per_iter_us"] == 2.5
-        assert d["vram_used_mb"] == 4096.0
+        assert set(d) == _ROW_KEYS
+        for key in (
+            "elapsed_time_ms",
+            "analytical_flops_partial",
+            "analytical_io_bytes",
+            "derived_gbytes_per_s",
+            "cpu_user_time_per_iter_us",
+            "cpu_kernel_time_per_iter_us",
+            "vram_used_mb",
+        ):
+            assert key not in d["ootb"]
 
-    def test_extra_metrics_on_non_success_status_asserts(self):
-        """The orchestrator only fires on the success path, so any
-        non-success ProviderEngineResult that carries extra_metrics is
-        either a regression in the success-gating in suite_runner or a
-        new caller wiring profiling to a different path. Either way we
-        want a loud AssertionError at serialization time rather than
-        silently dropping the slice from the JSON."""
-        import pytest
 
+class TestExtraMetrics:
+    def test_ootb_on_non_success_status_asserts(self):
+        """The runner attaches ootb only on the success path, so a
+        non-success row carrying one is a regression in that gating.
+        Serialization must fail loudly rather than silently drop the
+        measurements from the JSON."""
         pe = ProviderEngineResult(
             provider="miopen",
             engine_id=1,
             status="error",
             error_message="boom",
-            extra_metrics={"pmc": {"set": "basic"}},
+            ootb=OotbResult(extra_metrics={"pmc": {"set": "basic"}}),
         )
-        with pytest.raises(AssertionError, match="extra_metrics is set"):
+        with pytest.raises(AssertionError, match="ootb is set"):
             pe.to_dict()
-
-    def test_extra_metrics_passthrough(self):
-        # Always-on collection never populates this; the schema must
-        # still round-trip an arbitrary dict so opt-in profiling
-        # payloads land cleanly.
-        payload = {"pmc": {"GRBM_GUI_ACTIVE": 12345}}
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            extra_metrics=payload,
-        )
-        assert pe.to_dict()["extra_metrics"] == payload
 
     def test_extra_metrics_combined_payload_round_trips_through_json(self):
         """Regression check: the realistic shape produced by the
@@ -200,30 +204,31 @@ class TestProviderEngineResultFullShape:
             provider="miopen",
             engine_id=1,
             status="success",
-            extra_metrics=payload,
+            ootb=OotbResult(extra_metrics=payload),
         )
         d = pe.to_dict()
         # JSON round-trip: any non-serializable nested value would raise.
         round_tripped = json.loads(json.dumps(d))
-        assert round_tripped["extra_metrics"] == payload
+        assert round_tripped["ootb"]["extra_metrics"] == payload
 
 
-class TestErrorAndSkipPathsUnaffected:
+class TestErrorAndSkipRows:
     def test_error_status_emits_only_error_message(self):
         pe = ProviderEngineResult(
             provider="miopen",
             engine_id=1,
             status="error",
             error_message="boom",
-            # Setting metric fields on an error path must NOT leak to JSON.
-            workspace_bytes=999,
-            analytical_flops=999,
+            # Console metrics set on an error path must NOT leak to JSON.
+            analytical_io_bytes=999,
+            vram_used_mb=1.0,
         )
         d = pe.to_dict()
+        assert set(d) == _ROW_KEYS | {"error_message"}
         assert d["status"] == "error"
         assert d["error_message"] == "boom"
-        assert "workspace_bytes" not in d
-        assert "analytical_flops" not in d
+        assert d["ootb"] is None
+        assert d["oracle"] is None
 
     def test_skipped_status_emits_only_skip_reason(self):
         pe = ProviderEngineResult(
@@ -231,12 +236,14 @@ class TestErrorAndSkipPathsUnaffected:
             engine_id=1,
             status="skipped",
             skip_reason="unsupported",
-            workspace_bytes=999,
+            analytical_io_bytes=999,
         )
         d = pe.to_dict()
+        assert set(d) == _ROW_KEYS | {"skip_reason"}
         assert d["status"] == "skipped"
         assert d["skip_reason"] == "unsupported"
-        assert "workspace_bytes" not in d
+        assert d["ootb"] is None
+        assert d["oracle"] is None
 
 
 class TestSuiteMetadataMachineFields:
