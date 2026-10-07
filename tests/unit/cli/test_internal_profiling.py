@@ -33,7 +33,7 @@ def stack(monkeypatch):
     monkeypatch.setitem(sys.modules, "hipdnn_frontend", mocks["hipdnn"])
     monkeypatch.setattr(internal_profiling, "initialize_pip_rocm_runtime", lambda: None)
 
-    loader = MagicMock()
+    loader = mocks["loader"] = MagicMock()
     loader.return_value.load_json.return_value = {"name": "g", "nodes": []}
     monkeypatch.setattr(internal_profiling, "GraphLoader", loader)
 
@@ -42,7 +42,13 @@ def stack(monkeypatch):
         return mocks["executor"]
 
     monkeypatch.setattr(internal_profiling, "Executor", make_executor)
-    monkeypatch.setattr(internal_profiling, "BufferManager", MagicMock())
+    bm = MagicMock()
+    bm.allocate_all.side_effect = lambda: calls.append("allocate_all")
+    bm.load_input_data.side_effect = lambda data: calls.append(("load", data))
+    bm.create_variant_pack.side_effect = lambda: calls.append("variant_pack")
+    buffer_manager = MagicMock()
+    buffer_manager.return_value.__enter__.return_value = bm
+    monkeypatch.setattr(internal_profiling, "BufferManager", buffer_manager)
     monkeypatch.setattr(internal_profiling, "generate_input_data", mocks["inputs"])
     return mocks
 
@@ -52,17 +58,22 @@ def test_orchestrator_argv_drives_one_engine_warm_fixed_count(stack):
 
     stack["executor"].prepare.assert_called_once()
     assert stack["executor"].prepare.call_args.kwargs["engine_id"] == 42
-    # warmup + iters plain graph executes, then one drain: no timing loop
-    # (stall-gate deadlock) and no execute_once (per-iteration workspace memset).
-    assert stack["calls"] == ["enqueue"] * (3 + 7) + ["hip"]
+    # Buffers allocated and loaded with the seeded inputs before the first
+    # enqueue; then warmup + iters plain graph executes and one drain: no
+    # timing loop (stall-gate deadlock) and no execute_once (per-iteration
+    # workspace memset).
+    setup = ["allocate_all", ("load", stack["inputs"].return_value), "variant_pack"]
+    assert stack["calls"] == setup + ["enqueue"] * (3 + 7) + ["hip"]
+    graph_json = {"name": "g", "nodes": []}
+    stack["loader"].return_value.validate.assert_called_once_with(graph_json)
     stack["executor"].execute_once.assert_not_called()
     stack["executor"].benchmark.assert_not_called()
     policy = stack["policy"]
     assert (policy.min_time_ms, policy.cache_mode) == (0.0, "warm")
     # Same inputs as the timed pass: seed forwarded, and graph_json passed
     # so paged-SDPA page tables are valid.
-    _, seed, graph_json = stack["inputs"].call_args.args
-    assert seed == 11 and graph_json == {"name": "g", "nodes": []}
+    _, seed, inputs_graph_json = stack["inputs"].call_args.args
+    assert seed == 11 and inputs_graph_json == graph_json
 
 
 def test_plugin_path_replaces_default_plugin_loading(stack):

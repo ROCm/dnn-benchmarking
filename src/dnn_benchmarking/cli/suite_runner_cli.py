@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
     ExecutionBackendName,
     PyTorchSdpaBackendName,
@@ -228,7 +229,10 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
 
 
 def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
-    """Load and run one graph; any failure becomes a graph-level error."""
+    """Load and run one graph; any failure becomes a graph-level error.
+
+    An unsupported graph (e.g. a tensor data type this tool cannot allocate)
+    becomes ``no_engines`` like a graph no engine applies to, not an error."""
     graph_id = None
     try:
         loader = GraphLoader()
@@ -237,6 +241,14 @@ def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
         loader.validate(graph_json)
         tensor_infos = loader.extract_tensor_info(graph_json)
         return run_graph(graph_path, graph_json, tensor_infos)
+    except UnsupportedGraphError as e:
+        return GraphResult(
+            graph_name=graph_path.stem,
+            graph_path=str(graph_path),
+            results=[],
+            graph_id=graph_id,
+            message=str(e),
+        )
     except Exception as e:
         return GraphResult(
             graph_name=graph_path.stem,

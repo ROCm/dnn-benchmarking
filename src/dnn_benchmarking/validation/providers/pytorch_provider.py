@@ -15,7 +15,7 @@ from ...common import torch_support
 from ...common.dtypes import get_dtype
 from ...common.exceptions import UnsupportedGraphError
 from ...config.benchmark_config import ReferenceProviderName
-from ...graph import output_uids
+from ...graph.loader import output_uids, tensor_data_type
 
 from ..reference_provider import (
     ReferenceOutput,
@@ -139,10 +139,7 @@ class PyTorchReferenceProvider(ReferenceProvider):
         tensors: Dict[int, torch.Tensor] = {}
         for uid, data in input_data.items():
             tensor = torch.from_numpy(data.copy())
-            data_type = tensor_json_by_uid.get(uid, {}).get("data_type")
-            if data_type == "unset":
-                # Same fill as GraphLoader; get_dtype("unset") raises if both unset.
-                data_type = graph_json.get("io_data_type") or data_type
+            data_type = tensor_data_type(tensor_json_by_uid.get(uid, {}), graph_json)
             if data_type is not None:
                 tensor = tensor.to(get_dtype(data_type).torch_dtype())
             tensors[uid] = tensor

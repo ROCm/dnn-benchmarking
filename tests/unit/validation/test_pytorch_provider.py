@@ -175,14 +175,21 @@ class TestPyTorchProviderMatmul:
         # A @ I = A
         assert np.allclose(outputs[3].data, a)
 
-    def test_matmul_bfloat16_uses_graph_dtype_and_returns_float32(self) -> None:
+    @pytest.mark.parametrize(
+        "tensor_dtype, io_data_type",
+        [("bfloat16", None), ("unset", "bfloat16")],  # hipDNN fill_from_context
+    )
+    def test_matmul_bfloat16_uses_graph_dtype_and_returns_float32(
+        self, tensor_dtype, io_data_type
+    ) -> None:
         torch = pytest.importorskip("torch")
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph_json = {
+            "io_data_type": io_data_type,
             "tensors": [
-                {"uid": 1, "name": "a", "dims": [2, 3], "data_type": "bfloat16"},
-                {"uid": 2, "name": "b", "dims": [3, 2], "data_type": "bfloat16"},
-                {"uid": 3, "name": "c", "dims": [2, 2], "data_type": "bfloat16"},
+                {"uid": 1, "name": "a", "dims": [2, 3], "data_type": tensor_dtype},
+                {"uid": 2, "name": "b", "dims": [3, 2], "data_type": tensor_dtype},
+                {"uid": 3, "name": "c", "dims": [2, 2], "data_type": tensor_dtype},
             ],
             "nodes": [
                 {

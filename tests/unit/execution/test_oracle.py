@@ -10,7 +10,11 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.common.exceptions import ExecutionError
-from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
+from dnn_benchmarking.config.benchmark_config import (
+    SuiteConfig,
+    TimingPolicy,
+    ValidationConfig,
+)
 from dnn_benchmarking.execution import oracle as oracle_mod
 from dnn_benchmarking.execution.timing import Measurement
 from dnn_benchmarking.graph.tensor_info import TensorInfo
@@ -80,13 +84,17 @@ class _TunedExecutor:
     autotune_error = None
     env_at_prepare = None
     prepared_on = None
+    policy = None
+    for_autotune = None
 
     def __init__(self, graph_json_str, policy):
         self.init_time_ms = 3.0
+        type(self).policy = policy
 
     def prepare(self, handle, engine_id=None, for_autotune=False):
         type(self).env_at_prepare = {k: os.environ.get(k) for k in ENV}
         type(self).prepared_on = handle
+        type(self).for_autotune = for_autotune
         if self.prepare_error is not None:
             raise self.prepare_error
 
@@ -115,7 +123,9 @@ def tuned(monkeypatch):
     return cls
 
 
-def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=None):
+def _run(
+    mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=None, **config
+):
     row = ProviderEngineResult(
         provider="hipdnn", engine_id=5, status="success", correctness=correctness
     )
@@ -142,7 +152,7 @@ def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=N
         graph_json_str="{}",
         graph_name="g",
         config=SuiteConfig(
-            oracle_mode=mode, validation=ValidationConfig(provider="pytorch")
+            oracle_mode=mode, validation=ValidationConfig(provider="pytorch"), **config
         ),
         bm=bm or _BM(),
         variant_pack={},
@@ -172,6 +182,13 @@ def test_tuned_plan_gets_its_own_handle_on_the_row_stream(tuned):
 
     assert tuned.prepared_on is not row_handle
     assert tuned.prepared_on.stream == 7
+
+
+def test_tuned_plan_is_built_for_autotune_with_the_run_policy(tuned):
+    _run(warmup_iters=3, benchmark_iters=5, min_time_ms=2.0)
+
+    assert tuned.for_autotune is True
+    assert tuned.policy == TimingPolicy(warmup_iters=3, iters=5, min_time_ms=2.0)
 
 
 def test_baseline_times_on_row_handle_then_tuned_plan_validates_once(tuned):

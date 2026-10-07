@@ -5,7 +5,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from ..common.exceptions import GraphLoadError
 from .tensor_info import TensorInfo
@@ -20,6 +20,17 @@ def output_uids(graph_json: Dict[str, Any]) -> Set[int]:
                 if isinstance(uid, int) and not isinstance(uid, bool):
                     uids.add(uid)
     return uids
+
+
+def tensor_data_type(
+    tensor_json: Dict[str, Any], graph_json: Dict[str, Any]
+) -> Optional[str]:
+    """``data_type`` after hipDNN's fill: "unset" takes the graph's io_data_type
+    (TensorAttributes::fill_from_context); it stays "unset" only if both are."""
+    data_type = tensor_json.get("data_type")
+    if data_type == "unset":
+        return graph_json.get("io_data_type") or data_type
+    return data_type
 
 
 class GraphLoader:
@@ -89,15 +100,9 @@ class GraphLoader:
             if isinstance(tensor_json, dict):
                 if tensor_json.get("virtual"):
                     continue
-                # hipDNN fills an "unset" physical tensor from io_data_type
-                # (TensorAttributes::fill_from_context); only both unset raises.
-                if tensor_json.get("data_type") == "unset" and graph_json.get(
-                    "io_data_type"
-                ):
-                    tensor_json = {
-                        **tensor_json,
-                        "data_type": graph_json["io_data_type"],
-                    }
+                data_type = tensor_data_type(tensor_json, graph_json)
+                if data_type != tensor_json.get("data_type"):
+                    tensor_json = {**tensor_json, "data_type": data_type}
             tensor_info = TensorInfo.from_json(tensor_json)
             tensor_info.is_output = tensor_info.uid in outputs
             result.append(tensor_info)

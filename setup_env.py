@@ -68,11 +68,12 @@ DETECT_TIMEOUT_S = 30
 # --torch-index-url instead of silently mixing builds.
 TORCH_RECORD = "dnn-bench-torch.json"
 
-# Written into each reused CMake build dir: the install and toolchain prefixes
-# and the --cmake-arg defines it was configured with. The build dirs live in
-# the checkout, shared by every --workspace. A CMakeCache keeps its compiler and
-# <Pkg>_DIR paths when the prefixes change, and keeps a -D define after the
-# flag is dropped, so a dir configured differently is wiped.
+# Written into each reused CMake build dir: the full configure argument list it
+# was configured with (prefixes, defaults, detected arch, --cmake-arg). The
+# build dirs live in the checkout, shared by every --workspace. A CMakeCache
+# keeps its compiler and <Pkg>_DIR paths when the prefixes change, and keeps a
+# -D define after it drops off the configure line, so a dir configured
+# differently is wiped.
 BUILD_RECORD = "dnn-bench-prefixes.json"
 
 
@@ -492,9 +493,9 @@ def build_parser() -> argparse.ArgumentParser:
             "provider and binding CMake build directories. By default setup "
             "reuses the existing venv (and its torch) and rebuilds incrementally; "
             "changing its --torch-mode, --gpu-arch or --torch-index-url then "
-            "requires --clean. A build directory configured for another "
-            "install or toolchain prefix (another --workspace or --rocm-prefix) "
-            "or other --cmake-arg defines is wiped without --clean."
+            "requires --clean. A build directory configured with other CMake "
+            "arguments (another --workspace, --rocm-prefix, GPU arch or "
+            "--cmake-arg) is wiped without --clean."
         ),
     )
     parser.add_argument(
@@ -1282,21 +1283,11 @@ class Setup:
                 libs = sorted((Path(core_prefix) / "lib").glob("libamd_comgr.so*"))
         return libs[0] if libs else None
 
-    def _reset_build_dir(
-        self,
-        build_dir: Path,
-        install_prefix: str,
-        toolchain_prefix: str,
-        cmake_args=(),
-    ) -> None:
+    def _reset_build_dir(self, build_dir: Path, configure_args: list) -> None:
         """Keep build_dir for an incremental build only when it was configured
-        with these prefixes and defines (see BUILD_RECORD); wipe it otherwise or
+        with exactly ``configure_args`` (see BUILD_RECORD); wipe it otherwise or
         on --clean."""
-        wanted = {
-            "install_prefix": install_prefix,
-            "toolchain_prefix": toolchain_prefix,
-            "cmake_args": list(cmake_args),
-        }
+        wanted = {"configure_args": list(configure_args)}
         record = build_dir / BUILD_RECORD
         if build_dir.exists():
             try:
@@ -1304,9 +1295,7 @@ class Setup:
             except (OSError, ValueError):
                 same = False
             if not same and not self.clean:
-                print(
-                    f"Removing {build_dir}: configured for other prefixes or defines."
-                )
+                print(f"Removing {build_dir}: configured with other arguments.")
             if self.clean or not same:
                 rmtree(build_dir)
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -1318,36 +1307,34 @@ class Setup:
             fail("ninja not found on PATH.")
 
         build_dir = ROCM_LIBRARIES_DIR / "build"
-        self._reset_build_dir(
-            build_dir, install_prefix, toolchain_prefix, self.extra_cmake_args
-        )
         prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
+        configure_args = [
+            "--preset",
+            "hipdnn-providers-all",
+            "-GNinja",
+            f"-DROCM_PATH={toolchain_prefix}",
+            f"-DCMAKE_PREFIX_PATH={prefix_path}",
+            f"-DCMAKE_PROGRAM_PATH={program_path}",
+            f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+            "-DROCM_LIBS_ENABLE_COMPONENTS=hipdnn;miopen-provider;"
+            "hipblaslt-provider;hip-kernel-provider",
+            *self.hip_arch_args,
+            "-DHIPDNN_SKIP_TESTS=ON",
+            "-DHIPDNN_ENABLE_SDPA=ON",
+            "-DMIOPENPROVIDER_SKIP_TESTS=ON",
+            "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
+            "-DENABLE_ASM_SDPA_ENGINE=ON",
+            *self.rocke_args(toolchain_prefix),
+            "-DENABLE_CLANG_FORMAT=OFF",
+            "-DENABLE_CLANG_TIDY=OFF",
+            # LAST, so a caller's -D overrides a default above rather than
+            # being silently overridden by it.
+            *self.extra_cmake_args,
+        ]
+        self._reset_build_dir(build_dir, configure_args)
         print(f"Building hipDNN and providers to {install_prefix}...")
         run(
-            [
-                cmake,
-                "--preset",
-                "hipdnn-providers-all",
-                "-GNinja",
-                f"-DROCM_PATH={toolchain_prefix}",
-                f"-DCMAKE_PREFIX_PATH={prefix_path}",
-                f"-DCMAKE_PROGRAM_PATH={program_path}",
-                f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
-                "-DROCM_LIBS_ENABLE_COMPONENTS=hipdnn;miopen-provider;"
-                "hipblaslt-provider;hip-kernel-provider",
-                *self.hip_arch_args,
-                "-DHIPDNN_SKIP_TESTS=ON",
-                "-DHIPDNN_ENABLE_SDPA=ON",
-                "-DMIOPENPROVIDER_SKIP_TESTS=ON",
-                "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
-                "-DENABLE_ASM_SDPA_ENGINE=ON",
-                *self.rocke_args(toolchain_prefix),
-                "-DENABLE_CLANG_FORMAT=OFF",
-                "-DENABLE_CLANG_TIDY=OFF",
-                # LAST, so a caller's -D overrides a default above rather than
-                # being silently overridden by it.
-                *self.extra_cmake_args,
-            ],
+            [cmake, *configure_args],
             cwd=ROCM_LIBRARIES_DIR,
             env=self._build_env(),
         )
@@ -1371,30 +1358,27 @@ class Setup:
         build_root = python_dir / "build"
         bindings_build = build_root / "frontend_bindings"
         wheel_dir = build_root / "wheel_package"
-        self._reset_build_dir(bindings_build, install_prefix, toolchain_prefix)
+        prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
+        configure_args = [
+            "-S",
+            str(bindings_source),
+            "-B",
+            str(bindings_build),
+            "-GNinja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DCMAKE_TOOLCHAIN_FILE={ROCM_LIBRARIES_DIR / 'cmake/toolchains/rocm-clang.cmake'}",
+            f"-DROCM_PATH={toolchain_prefix}",
+            f"-DCMAKE_PREFIX_PATH={prefix_path}",
+            f"-DCMAKE_PROGRAM_PATH={program_path}",
+            f"-DPython_EXECUTABLE={self.py}",
+        ]
+        self._reset_build_dir(bindings_build, configure_args)
         # The packer's output, not a build cache: a wheel left by an earlier
         # run would make the pick below ambiguous or stale.
         if wheel_dir.exists():
             rmtree(wheel_dir)
 
-        prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
-        run(
-            [
-                cmake,
-                "-S",
-                str(bindings_source),
-                "-B",
-                str(bindings_build),
-                "-GNinja",
-                "-DCMAKE_BUILD_TYPE=Release",
-                f"-DCMAKE_TOOLCHAIN_FILE={ROCM_LIBRARIES_DIR / 'cmake/toolchains/rocm-clang.cmake'}",
-                f"-DROCM_PATH={toolchain_prefix}",
-                f"-DCMAKE_PREFIX_PATH={prefix_path}",
-                f"-DCMAKE_PROGRAM_PATH={program_path}",
-                f"-DPython_EXECUTABLE={self.py}",
-            ],
-            env=self._build_env(),
-        )
+        run([cmake, *configure_args], env=self._build_env())
         run([cmake, "--build", str(bindings_build)], env=self._build_env())
         run(
             [

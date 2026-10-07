@@ -131,11 +131,19 @@ class TestDeviceMapping:
         _install(monkeypatch, fake, hip_bdf="0000:09:00")
         assert gpu_smi.GpuSmiProbe()._handle == "h1"
 
+    def test_pci_address_match_ignores_case(self, monkeypatch):
+        fake = _fake_amdsmi(
+            handles=("h0", "h1"), bdfs={"h0": "0000:03:00.0", "h1": "0000:0C:00.0"}
+        )
+        _install(monkeypatch, fake, hip_bdf="0000:0c:00")
+        assert gpu_smi.GpuSmiProbe()._handle == "h1"
+
     def test_falls_back_to_index_when_address_unknown(self, monkeypatch):
         _install(monkeypatch, _fake_amdsmi(handles=("h0", "h1")))
         assert gpu_smi.GpuSmiProbe()._handle == "h0"
         assert gpu_smi.GpuSmiProbe(1)._handle == "h1"
         assert gpu_smi.GpuSmiProbe(5).clocks() is None
+        assert gpu_smi.GpuSmiProbe(2)._handle is None  # index == len(handles)
 
 
 def test_snapshot_reports_vram_only(monkeypatch):

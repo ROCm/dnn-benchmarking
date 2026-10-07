@@ -154,7 +154,9 @@ def test_graph_id_is_order_independent_and_content_sensitive() -> None:
     a = graph_id_for({"nodes": [1, 2], "name": "g"})
     assert a == graph_id_for({"name": "g", "nodes": [1, 2]})
     assert a != graph_id_for({"name": "g", "nodes": [2, 1]})
-    assert len(a) == 12
+    # Golden value: sha256 of the compact sorted JSON '{"name":"g","nodes":[1,2]}'.
+    # It must not change, or old and new result files stop joining in compare.
+    assert a == "b01a1b729a95"
 
 
 def _sample_suite(complete=True) -> SuiteResult:
@@ -304,3 +306,14 @@ class TestWriteLoad:
         assert graph_error["message"] == "parse failed"
         assert no_engines["status"] == "no_engines"
         assert no_engines["message"] == "no engine configs"
+
+    def test_csv_writes_non_finite_statistics_as_empty_cells(self, tmp_path) -> None:
+        suite = _sample_suite()
+        suite.graphs[0].results[0].gpu_kernel_stats = BenchmarkStats.from_timings(
+            [float("nan")] * 3
+        )
+        path = tmp_path / "r.csv"
+        suite.write(path)
+        with open(path) as f:
+            row = next(csv.DictReader(f))
+        assert row["kernel_median_ms"] == ""

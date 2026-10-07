@@ -119,9 +119,23 @@ def test_handle_stream_change_after_prepare_raises(hip_log) -> None:
         executor.benchmark(_Handle(456), {})
 
 
-def test_execute_once_drains_the_device(hip_log) -> None:
+def test_execute_once_resets_the_workspace_then_drains_the_device(hip_log) -> None:
+    """A validation run must not read workspace left over from the timed loop."""
     executor = _executor(hip_log)
+    executor._workspace = types.SimpleNamespace(
+        zeros=lambda: hip_log.append("workspace_zeros")
+    )
 
     executor.execute_once(_Handle(99), {})
 
-    assert hip_log == ["execute", "device_sync"]
+    assert hip_log == ["workspace_zeros", "execute", "device_sync"]
+
+
+def test_execute_once_sync_failure_is_execution_error(hip_log, monkeypatch) -> None:
+    def failing_sync() -> None:
+        raise RuntimeError("hipDeviceSynchronize: illegal address")
+
+    monkeypatch.setattr(timing_module.hipdnn, "hip_device_synchronize", failing_sync)
+
+    with pytest.raises(ExecutionError, match="illegal address"):
+        _executor(hip_log).execute_once(_Handle(99), {})

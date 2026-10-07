@@ -38,8 +38,14 @@ def _install_fake_hip(
     clock: FakeClock = None,
 ):
     class FakeEvent:
+        # With a clock, elapsed_time is the span between the two record()
+        # calls, so a missing or misplaced record changes kernel_ms.
+        recorded_at = None
+
         def record(self, stream: int) -> None:
             log.append("record")
+            if clock is not None:
+                self.recorded_at = clock.now
 
         def synchronize(self) -> None:
             log.append("event_sync")
@@ -47,7 +53,9 @@ def _install_fake_hip(
                 clock.advance_ms(50.0)  # waiting on the GPU is not submit time
 
         def elapsed_time(self, other) -> float:
-            return kernel_ms
+            if clock is None:
+                return kernel_ms
+            return (other.recorded_at - self.recorded_at) * 1000.0
 
     class FakeGate:
         def arm(self, stream: int) -> None:
@@ -192,12 +200,13 @@ def test_fixed_count_reaching_iters_is_not_capped(monkeypatch) -> None:
     assert m.capped is False
 
 
-def test_events_mode_host_time_brackets_only_enqueue(monkeypatch) -> None:
-    """Without staging, host_ms is submit time: waiting for the stop event
-    (50 ms on the fake clock) must not leak into it."""
+def test_events_mode_times_exactly_one_enqueue(monkeypatch) -> None:
+    """Without staging, each sample is one event pair around one enqueue:
+    kernel_ms is stop minus start, and host_ms is submit time. Waiting for the
+    stop event (50 ms on the fake clock) leaks into neither."""
     log: List[str] = []
     clock = FakeClock()
-    _install_fake_hip(monkeypatch, log, kernel_ms=0.25, staged=False, clock=clock)
+    _install_fake_hip(monkeypatch, log, staged=False, clock=clock)
 
     m = measure(
         _enqueue(log, clock, ms=2.0),
@@ -207,9 +216,65 @@ def test_events_mode_host_time_brackets_only_enqueue(monkeypatch) -> None:
 
     assert m.mode == "events"
     assert m.fallback_reason == "device does not support hipStreamWaitValue32"
+    sample = ["record", "enqueue", "record", "event_sync"]
+    assert log == ["enqueue", "device_sync"] + sample * 3
     assert m.host_ms == pytest.approx([2.0, 2.0, 2.0])
-    assert m.kernel_ms == [0.25, 0.25, 0.25]
-    assert "arm" not in log
+    assert m.kernel_ms == pytest.approx([2.0, 2.0, 2.0])
+
+
+def _install_fake_torch_cuda(monkeypatch, log: List[str]) -> None:
+    """torch with just what the torch event backend and its flush use."""
+
+    class Event:
+        def __init__(self, enable_timing: bool = False) -> None:
+            pass
+
+        def record(self, stream) -> None:
+            log.append("record")
+
+        def synchronize(self) -> None:
+            log.append("event_sync")
+
+        def elapsed_time(self, other) -> float:
+            return 1.0
+
+    class Buffer:
+        def zero_(self) -> None:
+            log.append("flush")
+
+    cuda = types.SimpleNamespace(
+        Event=Event,
+        current_stream=lambda: "torch-stream",
+        synchronize=lambda: log.append("device_sync"),
+    )
+    torch = types.SimpleNamespace(
+        cuda=cuda, uint8="uint8", empty=lambda *a, **kw: Buffer()
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+
+@pytest.mark.parametrize("backend", ["hip", "torch"])
+def test_cold_flushes_before_every_events_mode_iteration(monkeypatch, backend) -> None:
+    """Cold mode flushes and drains before every warmup and timed sample in
+    events mode too (CUDA rows, hosts without stream-wait-value)."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, staged=backend == "torch")
+    if backend == "torch":
+        _install_fake_torch_cuda(monkeypatch, log)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=3, iters=2, cache_mode="cold"),
+        backend=backend,
+    )
+
+    assert m.mode == "events"
+    sample = ["flush", "device_sync", "record", "enqueue", "record", "event_sync"]
+    # Priming (never flushed), then 2 warmups and 2 timed samples.
+    steps = [e for e in log if not e.startswith("alloc")]
+    assert steps == ["enqueue", "device_sync"] + sample * 4
+    assert len(m.kernel_ms) == 2
 
 
 def test_first_call_ms_covers_first_enqueue_and_its_sync(monkeypatch) -> None:
@@ -318,6 +383,8 @@ def test_async_torch_enqueue_stays_staged(monkeypatch) -> None:
     assert m.fallback_reason is None
     # First call populates host caches unchecked; one more checked call.
     assert m.warmup_iters == 2
+    # The probe's work drains before the first gated iteration is armed.
+    assert log[:5] == ["enqueue", "device_sync", "enqueue", "device_sync", "arm"]
 
 
 def test_genuine_enqueue_error_during_sync_probe_propagates(monkeypatch) -> None:

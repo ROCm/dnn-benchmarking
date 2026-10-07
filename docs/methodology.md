@@ -122,7 +122,7 @@ Notes for `cold`:
   time budget (`--min-time-ms`) does not count the flush.
 
 `dnn-benchmark compare` refuses to compare files with different
-`cache_mode` values unless you give `--allow-mismatch`.
+`cache_mode` or `timing_block` values unless you give `--allow-mismatch`.
 
 ## Stop rule
 

@@ -81,6 +81,45 @@ def test_fp8_output_one_ulp_apart_passes(data_type, one_ulp_up):
     assert c.tolerance_match is True
 
 
+@pytest.mark.parametrize(
+    "data_type, actual",
+    [
+        # Two ULP up from each reference element.
+        ("fp8_e4m3", [1.25, 2.5, 0.625, 5.0]),
+        ("fp8_e4m3_fnuz", [1.25, 2.5, 0.625, 5.0]),
+        ("fp8_e5m2", [1.5, 3.0, 0.75, 6.0]),
+        ("fp8_e5m2_fnuz", [1.5, 3.0, 0.75, 6.0]),
+        # Two code steps down (4x smaller) and up (4x larger).
+        ("fp8_e8m0", [0.25, 0.5, 0.125, 1.0]),
+        ("fp8_e8m0", [4.0, 8.0, 2.0, 16.0]),
+    ],
+)
+def test_fp8_output_two_ulp_apart_fails(data_type, actual):
+    ref = {1: _ref([1.0, 2.0, 0.5, 4.0])}
+    bm = _HostBM({1: np.array(actual, np.float32)})
+
+    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
+
+    assert c.tolerance_match is False
+    assert c.n_mismatch == 4
+
+
+@pytest.mark.parametrize(
+    "data_type, smallest_subnormal",
+    [("fp8_e4m3", 2**-9), ("fp8_e5m2_fnuz", 2**-17)],
+)
+def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
+    data_type, smallest_subnormal
+):
+    ref = {1: _ref([0.0, 0.0, 0.0, 0.0])}
+    actual = [smallest_subnormal, -smallest_subnormal, 2 * smallest_subnormal, 0.0]
+    bm = _HostBM({1: np.array(actual, np.float32)})
+
+    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
+
+    assert c.n_mismatch == 1
+
+
 def test_aggregates_over_outputs_and_names_the_failing_output():
     ref = {1: _ref([1, 2, 3, 4]), 2: _ref([1, 1, 1, 1])}
     bm = _HostBM(
@@ -175,6 +214,31 @@ def test_device_reference_is_compared_without_host_copy():
     }
 
     assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
+
+
+def test_device_e8m0_compares_code_steps():
+    torch = pytest.importorskip("torch")
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is None:
+        pytest.skip("torch has no float8_e8m0fnu")
+    expected = [1.0, 2.0, 0.5, 4.0]
+
+    class DeviceBM:
+        def get_output_tensor(self, uid):
+            # One step down on two elements, two steps down on the others.
+            return torch.tensor([0.5, 1.0, 0.125, 1.0]).to(e8m0)
+
+    ref = {
+        1: ReferenceOutput(
+            data=np.asarray(expected, np.float32),
+            tensor_uid=1,
+            device_data=torch.tensor(expected).to(e8m0),
+        )
+    }
+
+    c = check_correctness(DeviceBM(), [_out(1, "fp8_e8m0")], ref, "pytorch", _config())
+
+    assert c.n_mismatch == 2
 
 
 def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):

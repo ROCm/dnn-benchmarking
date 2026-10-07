@@ -46,6 +46,10 @@ def _config_error(tmp_path: Path, body: str) -> str:
         # Unsigned hex/decimal above 2**63 wraps to hipDNN's signed int64 IDs.
         ("0xFFFFFFFFFFFFFFFF", -1),
         (str(2**64 - 2), -2),
+        ("0x8000000000000000", -(1 << 63)),
+        # FNV-1a-64("HIP_MLOPS_ENGINE") = 0xDD993EF5525F7BF9, above 2**63; hipDNN's
+        # engineNameToId casts it to int64.
+        ("HIP_MLOPS_ENGINE", 0xDD993EF5525F7BF9 - (1 << 64)),
     ],
 )
 def test_engine_tokens_resolve_identically_from_cli_and_config(

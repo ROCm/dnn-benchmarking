@@ -147,6 +147,10 @@ class TestSuiteConfigValidation:
         with pytest.raises(ValueError, match=flag):
             SuiteConfig(**kwargs)
 
+    def test_max_iters_below_iters_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_iters must be >= iters"):
+            TimingPolicy(iters=5, max_iters=4)
+
     def test_iters_above_the_default_cap_raise_the_cap(self) -> None:
         policy = SuiteConfig(benchmark_iters=20_000).timing_policy
         assert policy.max_iters >= policy.iters == 20_000

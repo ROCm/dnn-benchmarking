@@ -58,7 +58,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `timing_block` | int | `--timing-block`. `1` = one launch per sample; `N > 1` = rocKE block timing. |
 | `seed` | int | Input data seed. |
 | `validate` | string or null | Reference provider (`pytorch`), or `null` when validation is off. |
-| `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the applied values. |
+| `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle_mode` | string | `off`, `plan` or `exhaustive`. |
 | `autotune` | bool | `--autotune`. |
@@ -126,8 +126,8 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `graph_path` | string | Path of the graph file. |
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
 | `error` | string or null | Graph-level failure, as `ExceptionType: message`. A failure before any row runs has the prefix `Engine discovery failed: ` or `Input data generation failed: `. |
-| `message` | string or null | Why no engine applies, when `status` is `no_engines` and hipDNN gave a reason. The console shows `no engines applicable: <message>`. |
-| `results` | array | One [row](#row) per engine or provider. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran. |
+| `message` | string or null | Why no engine applies, when `status` is `no_engines`: hipDNN's reason, or the unsupported tensor data type. The console shows `no engines applicable: <message>`. |
+| `results` | array | One [row](#row) per engine or provider. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. |
 
 ### graph_id
 
@@ -249,8 +249,8 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | Key | Type | Meaning |
 |---|---|---|
 | `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch, or when validation was requested but no usable reference exists (`message` gives the reason). `null` when no comparison ran. |
-| `rtol` | float | Relative tolerance used. |
-| `atol` | float | Absolute tolerance used. |
+| `rtol` | float | Relative tolerance applied, the largest over outputs. For `fp8_e8m0` outputs it applies to log2 values. When no comparison ran (`match` is `false`, `message` is set and `n_total` is `null`), this is `--rtol` when given, else the fp32 default 1e-5, not the tolerance of the output dtype. |
+| `atol` | float | Absolute tolerance applied, with the same rules as `rtol`. When no comparison ran, this is `--atol` when given, else 1e-6. |
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
 | `max_rel_diff` | float or null | Largest `\|actual - expected\| / \|expected\|` over all outputs, taken only over elements with `\|expected\| > atol`. `0.0` when no element qualifies, so a mismatch against a near-zero reference can show `0.0` with `n_mismatch > 0`. Use `match` and `n_mismatch` for pass or fail. |
 | `n_mismatch` | int or null | Elements outside tolerance, summed over outputs. |
@@ -428,8 +428,9 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 A graph with no rows (status `error`, or `no_engines` without `--validate`)
 gives one line. That line has the graph status in `status`, and the graph
 `error` or `message` in `message`. A `no_engines` graph with `--validate
-pytorch` gives only its `reference` row; the graph status is then not in the
-CSV.
+pytorch` gives only its `reference` row when PyTorch supports the graph; the
+graph status is then not in the CSV. When PyTorch does not support it, the
+graph has no rows and gives the one status line.
 
 `dnn-benchmark compare` reads JSON only. It stops with exit code 2 on a CSV
 file.

@@ -83,13 +83,15 @@ def test_output_uids_reads_int_and_list_outputs() -> None:
 
 def test_extract_marks_list_outputs_and_drops_virtual(tmp_path: Path) -> None:
     # hipDNN serialises an unset virtual tensor's type as "unset"; it gets no
-    # buffer, so it must be dropped before its dtype is resolved.
+    # buffer, so it must be dropped before its dtype is resolved. A virtual
+    # tensor with a concrete dtype gets no buffer either.
     graph = {
         "nodes": [{"inputs": {"x": 1}, "outputs": {"y": [2]}}],
         "tensors": [
             _tensor(1),
             _tensor(2, "BFLOAT16"),
             _tensor(9, "unset", virtual=True),
+            _tensor(10, "float", virtual=True),
         ],
     }
     path = tmp_path / "g.json"

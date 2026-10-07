@@ -122,6 +122,15 @@ def test_noise_band_is_twice_the_combined_relative_iqr(tmp_path, capsys):
     assert (code, report["pairs"][0]["label"]) == (0, "within noise")
 
 
+def test_noise_band_uses_twice_the_hypot_not_a_wider_band(tmp_path, capsys):
+    # Band 0.566 (2 * hypot(0.2, 0.2)); a 70% slowdown exceeds it but lies
+    # inside 3 * hypot (0.849) and inside summed spreads 2 * (0.2 + 0.2) (0.8).
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0, cv=0.1)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.7, cv=0.1)])])
+    code, report = _json(capsys, [a, b])
+    assert (code, report["pairs"][0]["label"]) == (1, "REGRESSION")
+
+
 def test_change_equal_to_threshold_is_within_noise(tmp_path, capsys):
     # 1.25 / 1.0 - 1 == 25 / 100 exactly in binary floating point.
     a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
@@ -268,10 +277,13 @@ def test_config_mismatch_warns(tmp_path, capsys):
     assert "iters" in capsys.readouterr().err
 
 
-def test_cache_mode_mismatch_is_an_error_unless_allowed(tmp_path, capsys):
-    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
-    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])], cache_mode="cold")
+@pytest.mark.parametrize("key, value", [("cache_mode", "cold"), ("timing_block", 8)])
+def test_timed_config_mismatch_is_an_error_unless_allowed(tmp_path, capsys, key, value):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])], timing_block=1)
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])],
+               **{"timing_block": 1, key: value})  # fmt: skip
     assert main([a, b]) == 2
+    assert key in capsys.readouterr().err
     assert main([a, b, "--allow-mismatch"]) == 0
 
 
@@ -314,6 +326,26 @@ def test_missing_ref_on_both_sides_is_one_label(tmp_path, capsys):
     b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])])
     _, report = _json(capsys, [a, b, "--by", "ref"])
     assert report["pairs"][0]["label"] == "no ref row in either"
+
+
+def test_by_ref_compares_reference_rows(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0), _row("R", 4.0, role="reference")])])  # fmt: skip
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0), _row("R", 2.0, role="reference")])])  # fmt: skip
+    code, report = _json(capsys, [a, b, "--by", "ref"])
+    (pair,) = report["pairs"]
+    assert (code, pair["engine_b"], pair["speedup"], pair["label"]) == (
+        0,
+        "R",
+        2.0,
+        "faster",
+    )
+
+
+def test_zero_median_is_unusable_not_a_division_error(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 0.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])])
+    code, report = _json(capsys, [a, b])
+    assert (code, report["pairs"][0]["label"]) == (0, "A no time")
 
 
 @pytest.mark.parametrize("columns", [80, 100, 200])

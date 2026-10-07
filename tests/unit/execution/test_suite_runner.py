@@ -72,6 +72,9 @@ class Fake:
         self.clocks = []
         self.events = []
         self.torch_options = []
+        self.torch_outputs_written = False
+        self.policies = []
+        self.for_autotune = []
 
 
 @pytest.fixture
@@ -81,6 +84,7 @@ def fake(monkeypatch):
 
     class Executor:
         def __init__(self, graph_json_str, policy):
+            f.policies.append(policy)
             self.init_time_ms, self.workspace_size = 2.0, 64
 
         def discover_engines(self, handle):
@@ -90,6 +94,7 @@ def fake(monkeypatch):
             return list(f.discovered)
 
         def prepare(self, handle, engine_id=None, for_autotune=False):
+            f.for_autotune.append(for_autotune)
             self.engine_id = engine_id
             if engine_id in f.prepare_errors:
                 raise f.prepare_errors[engine_id]
@@ -179,10 +184,11 @@ def fake_torch(fake, monkeypatch):
                 raise fake.torch_error
 
         def benchmark(self, tensors):
+            fake.torch_outputs_written = True
             return _measurement()
 
         def execute_once(self, tensors):
-            pass
+            fake.torch_outputs_written = True
 
     class TorchBuffers:
         def __init__(self, tensor_infos):
@@ -194,7 +200,10 @@ def fake_torch(fake, monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        allocate_all = load_input_data = zero_outputs = lambda self, *a: None
+        allocate_all = load_input_data = lambda self, *a: None
+
+        def zero_outputs(self):
+            fake.torch_outputs_written = False
 
         def get_tensors(self):
             return {t.uid: SimpleNamespace(is_cuda=False) for t in self._outputs}
@@ -203,7 +212,8 @@ def fake_torch(fake, monkeypatch):
             return self._outputs
 
         def get_output_data(self, uid):
-            return REF.copy()
+            # Zeros unless the graph ran since the last zero_outputs().
+            return REF.copy() if fake.torch_outputs_written else np.zeros_like(REF)
 
     class CpuReference:
         def compute_reference(self, graph_json, input_data):
@@ -323,10 +333,16 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
     fake.discovered = [1]
     # Median 1 ms, mean 1.4 ms: throughput must come from the median.
+    # Every timing field off its default, so a row cannot claim a cache mode,
+    # block size or cap its measurement did not use.
     fake.measurement = dict(
         kernel_ms=[1.0] * 9 + [5.0],
         capped=True,
         mode="events",
+        backend="torch",
+        cache_mode="cold",
+        warmup_iters=7,
+        timing_block=4,
         fallback_reason="no stream wait",
     )
 
@@ -336,7 +352,16 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     assert row.host_stats.median_ms == pytest.approx(0.01)
     assert row.derived_tflops_per_s == pytest.approx(2.0)
     assert row.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
-    assert row.timing.mode == "events" and row.timing.first_call_ms == 5.0
+    assert row.to_dict()["timing"] == {
+        "mode": "events",
+        "backend": "torch",
+        "cache_mode": "cold",
+        "warmup_iters": 7,
+        "first_call_ms": 5.0,
+        "capped": True,
+        "fallback_reason": "no stream wait",
+        "timing_block": 4,
+    }
     assert row.workspace_bytes == 64 and row.vram_used_mb == 12.0
     warnings = " | ".join(row.warnings)
     for expected in (
@@ -345,6 +370,16 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "events timing: no stream wait",
     ):
         assert expected in warnings
+
+
+def test_every_executor_gets_the_run_policy_and_a_heuristic_plan(fake):
+    config = dict(warmup_iters=3, benchmark_iters=5, cache_mode="cold")
+
+    _run(**config)
+
+    # Discovery plus one executor per engine; only the oracle autotunes.
+    assert fake.policies == [SuiteConfig(**config).timing_policy] * 3
+    assert fake.for_autotune == [False, False]
 
 
 def test_metrics_tier_off_skips_probes_and_throughput(fake, monkeypatch):

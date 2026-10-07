@@ -77,61 +77,70 @@ def test_cmake_arg_without_a_value_is_rejected(setup_env, bad) -> None:
         setup_env.build_parser().parse_args(["--cmake-arg", bad])
 
 
+_BASE_ARGV = ["--gpu-arch", "gfx942", "--cmake-arg", "HIPDNN_ENABLE_SDPA=OFF"]
+
+
 @pytest.mark.parametrize(
-    "clean, recorded, build_dir_kept",
+    "rerun_argv, rerun_prefix, build_dir_kept",
     [
-        (False, {}, True),
-        (True, {}, False),
-        (False, {"install_prefix": "other"}, False),
-        # CMakeCache keeps a -D define after the flag is dropped, so a dir
-        # configured with other defines is not reused.
-        (False, {"cmake_args": []}, False),
+        (_BASE_ARGV, "prefix", True),
+        ([*_BASE_ARGV, "--clean"], "prefix", False),
+        # A build dir configured by another workspace keeps that workspace's
+        # compiler in its CMakeCache, so it must not be reused.
+        (_BASE_ARGV, "other", False),
+        # CMakeCache keeps a -D define after it drops off the configure line,
+        # whether it came from --cmake-arg or from setup's own defines (here
+        # GPU_TARGETS, gone when no --gpu-arch is given and none is detected).
+        (_BASE_ARGV[:2], "prefix", False),
+        (_BASE_ARGV[2:], "prefix", False),
     ],
-    ids=["same-config", "clean", "other-prefix", "other-defines"],
+    ids=["same-config", "clean", "other-prefix", "other-extra", "other-default"],
 )
-def test_superbuild_configure_lets_extra_defines_override_defaults(
-    setup_env, tmp_path, monkeypatch, clean, recorded, build_dir_kept
+def test_superbuild_reuses_its_build_dir_only_for_the_same_configure_line(
+    setup_env, tmp_path, monkeypatch, rerun_argv, rerun_prefix, build_dir_kept
 ) -> None:
     rocm_libraries = tmp_path / "rocm-libraries"
     cache = rocm_libraries / "build" / "CMakeCache.txt"
-    cache.parent.mkdir(parents=True)
-    cache.write_text("")
     toolchain = tmp_path / "toolchain"
     (toolchain / "lib").mkdir(parents=True)
     (toolchain / "lib" / "libamd_comgr.so.3").write_text("")
-    record = {
-        "install_prefix": str(tmp_path / "prefix"),
-        "toolchain_prefix": str(toolchain),
-        "cmake_args": ["-DHIPDNN_ENABLE_SDPA=OFF"],
-    }
-    # A build dir configured by another workspace keeps that workspace's
-    # compiler in its CMakeCache, so it must not be reused.
-    (cache.parent / setup_env.BUILD_RECORD).write_text(
-        json.dumps({**record, **recorded})
-    )
     commands = []
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
+    monkeypatch.setattr(setup_env.Setup, "_detect_gpu_arch", staticmethod(lambda: ""))
     monkeypatch.setattr(
         setup_env, "run", lambda cmd, **kwargs: commands.append(list(cmd))
     )
     monkeypatch.setattr(setup_env, "require_working_cmake", lambda: "cmake")
     monkeypatch.setattr(setup_env.shutil, "which", lambda name: name)
-    argv = ["--cmake-arg", "HIPDNN_ENABLE_SDPA=OFF"] + (["--clean"] if clean else [])
-    setup = _setup(setup_env, tmp_path, *argv)
-    monkeypatch.setattr(setup, "_build_env", lambda: {})
 
-    setup.build_superbuild(record["install_prefix"], record["toolchain_prefix"])
+    def build(*argv, prefix="prefix"):
+        # Not _setup: it always passes --gpu-arch.
+        args = setup_env.build_parser().parse_args(
+            ["--workspace", str(tmp_path / "ws"), *argv]
+        )
+        setup = setup_env.Setup(args)
+        monkeypatch.setattr(setup, "_build_env", lambda: {})
+        commands.clear()
+        setup.build_superbuild(str(tmp_path / prefix), str(toolchain))
+        return commands[0]
 
-    configure = commands[0]
+    configure = build(*_BASE_ARGV)
+    # --cmake-arg defines come LAST so they override setup's defaults.
     assert configure[-1] == "-DHIPDNN_ENABLE_SDPA=OFF"
     assert configure.index("-DHIPDNN_ENABLE_SDPA=ON") < configure.index(
         "-DHIPDNN_ENABLE_SDPA=OFF"
     )
-    # Incremental by default; --clean, other prefixes or other defines start
+    cache.write_text("")
+
+    configure = build(*rerun_argv, prefix=rerun_prefix)
+
+    # Incremental by default; --clean or any other configure argument starts
     # the build over.
     assert cache.exists() == build_dir_kept
-    # The next run with this configuration reuses the directory.
-    assert json.loads((cache.parent / setup_env.BUILD_RECORD).read_text()) == record
+    # The record is the configure line just run, so the next identical run
+    # reuses the directory.
+    record = json.loads((cache.parent / setup_env.BUILD_RECORD).read_text())
+    assert record == {"configure_args": configure[1:]}
 
 
 # --- confirmation ------------------------------------------------------------
@@ -513,16 +522,23 @@ def test_clean_with_existing_torch_mode_is_a_usage_error(setup_env) -> None:
     assert exc.value.code == 2
 
 
-def _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv):
-    """A Setup over a venv that setup filled with gfx90a ROCm torch."""
-    setup = _setup(setup_env, tmp_path, *argv)
+def _reused_venv(setup_env, tmp_path, monkeypatch, mode, *argv, record=True):
+    """A Setup over a venv that setup filled with ``mode`` torch from its
+    default index (gfx90a for rocm). ``record=False`` drops the TORCH_RECORD,
+    as on a venv set up before setup wrote one."""
+    setup = _setup(setup_env, tmp_path, "--torch-mode", mode, *argv)
     setup.venv_dir.mkdir(parents=True)
-    (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
-        json.dumps(
-            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": "gfx90a"}
+    if record:
+        index_url = {
+            "rocm": setup_env.ROCM_TORCH_INDEX_URL,
+            "cpu": "https://download.pytorch.org/whl/cpu",
+            "cuda": "",
+        }[mode]
+        arch = "gfx90a" if mode == "rocm" else ""
+        (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
+            json.dumps({"torch_index_url": index_url, "gpu_arch": arch})
         )
-    )
-    setup.installed_torch_mode = "rocm"
+    setup.installed_torch_mode = mode
     pip_calls = []
     monkeypatch.setattr(setup, "pip", lambda *a, **kw: pip_calls.append(a))
     return setup, pip_calls
@@ -540,24 +556,49 @@ def _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv):
 def test_reused_venv_keeps_torch_when_flags_match(
     setup_env, tmp_path, monkeypatch, argv
 ) -> None:
-    setup, pip_calls = _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv)
+    setup, pip_calls = _reused_venv(setup_env, tmp_path, monkeypatch, "rocm", *argv)
     setup.install_torch()
     assert pip_calls == []
 
 
 @pytest.mark.parametrize(
-    "argv",
-    [["--gpu-arch", "gfx942"], ["--torch-index-url", "https://example.invalid/"]],
-    ids=["other-arch", "other-index"],
+    "mode, argv",
+    [
+        ("rocm", ["--gpu-arch", "gfx942"]),
+        ("rocm", ["--torch-index-url", "https://example.invalid/"]),
+        ("cpu", ["--torch-index-url", "https://example.invalid/"]),
+        ("cuda", ["--torch-index-url", "https://example.invalid/"]),
+    ],
+    ids=["rocm-other-arch", "rocm-other-index", "cpu-other-index", "cuda-other-index"],
 )
 def test_reused_venv_refuses_a_different_explicit_torch_source(
-    setup_env, tmp_path, monkeypatch, capsys, argv
+    setup_env, tmp_path, monkeypatch, capsys, mode, argv
 ) -> None:
-    setup, pip_calls = _reused_rocm_venv(setup_env, tmp_path, monkeypatch, *argv)
+    setup, pip_calls = _reused_venv(setup_env, tmp_path, monkeypatch, mode, *argv)
     with pytest.raises(SystemExit):
         setup.install_torch()
     assert pip_calls == []
     assert "--clean" in capsys.readouterr().err
+
+
+def test_reused_venv_without_a_record_warns_and_keeps_torch(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    # Every venv set up before TORCH_RECORD existed takes this path on rerun.
+    setup, pip_calls = _reused_venv(
+        setup_env,
+        tmp_path,
+        monkeypatch,
+        "rocm",
+        "--torch-index-url",
+        "https://example.invalid/",
+        record=False,
+    )
+    setup.install_torch()
+    assert pip_calls == []
+    err = capsys.readouterr().err
+    assert f"no {setup_env.TORCH_RECORD}" in err
+    assert "--torch-index-url https://example.invalid/" in err
 
 
 def test_fresh_torch_install_records_its_source(

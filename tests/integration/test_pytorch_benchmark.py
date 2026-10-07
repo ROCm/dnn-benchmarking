@@ -22,11 +22,11 @@ pytestmark = pytest.mark.gpu
 POLICY = TimingPolicy(warmup_iters=1, iters=2)
 
 
-def _benchmark(graph_name: str, **executor_kwargs):
+def _benchmark(graph_name: str, policy: TimingPolicy = POLICY, **executor_kwargs):
     """Prepare, load seeded inputs, and time one sample graph."""
     _, graph_json, tensor_infos = load_graph(graph_name)
     executor_kwargs.setdefault("pytorch_sdpa_backend", PyTorchSdpaBackendName.DEFAULT)
-    executor = PyTorchCudaExecutor(graph_json, POLICY, **executor_kwargs)
+    executor = PyTorchCudaExecutor(graph_json, policy, **executor_kwargs)
     executor.prepare()
     assert executor.init_time_ms > 0
 
@@ -78,14 +78,21 @@ def test_load_input_data_copies_inputs_to_device(torch_gpu) -> None:
         "sample_resample_fwd.json",
     ],
 )
-def test_benchmark_times_every_iteration(torch_gpu, graph_name: str) -> None:
+# Cold runs the cache flush beside the PyTorch executor's stream: the HIP
+# flush buffer on ROCm, the torch one on CUDA.
+@pytest.mark.parametrize("cache_mode", ["warm", "cold"])
+def test_benchmark_times_every_iteration(
+    torch_gpu, graph_name: str, cache_mode: str
+) -> None:
     """Every supported sample graph yields one positive timing per iteration."""
-    m = _benchmark(graph_name)
-    assert len(m.kernel_ms) == len(m.host_ms) == POLICY.iters
+    policy = TimingPolicy(warmup_iters=1, iters=2, cache_mode=cache_mode)
+    m = _benchmark(graph_name, policy)
+    assert len(m.kernel_ms) == len(m.host_ms) == policy.iters
     assert all(t > 0 for t in m.kernel_ms + m.host_ms)
     # The host-sync probe may add one priming enqueue; it is counted honestly.
-    assert m.warmup_iters >= POLICY.warmup_iters
+    assert m.warmup_iters >= policy.warmup_iters
     assert m.backend == expected_timing_backend()
+    assert m.cache_mode == cache_mode
     assert m.mode == "staged" or m.fallback_reason, m
 
 

@@ -10,7 +10,8 @@ side, robust to a few outlier samples); a regression is B
 slower than that. Failed/error rows never enter the geomean.
 
 Exit codes: 0 no regression (stderr warns when no timings were compared),
-1 regression beyond threshold, 2 usage error, unreadable or incompatible input.
+1 regression beyond threshold, 2 usage error, unreadable or incompatible input
+(run.config cache_mode or timing_block differs, unless ``--allow-mismatch``).
 """
 
 import argparse
@@ -29,6 +30,8 @@ from .suite_results import SuiteResult
 
 CONVENTION = "speedup = A_median / B_median (B speedup vs A; >1 means B is faster)"
 _USABLE = ("passed", "unchecked", "reference")
+# Config keys that change what is timed; a difference blocks the comparison.
+_GATED = ("cache_mode", "timing_block")
 
 
 @dataclass
@@ -75,7 +78,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--allow-mismatch",
         action="store_true",
-        help="compare even when run.config.cache_mode differs",
+        help="compare even when run.config cache_mode or timing_block differs",
     )
     fmt = p.add_mutually_exclusive_group()
     fmt.add_argument("--csv", action="store_true", help="CSV on stdout")
@@ -316,14 +319,15 @@ def main(argv: List[str]) -> int:
         return 2
     for w in _config_warnings(a, b):
         print(f"warning: {w}", file=sys.stderr)
-    if a["run"]["config"].get("cache_mode") != b["run"]["config"].get("cache_mode"):
-        if not args.allow_mismatch:
-            print(
-                "error: cache_mode differs between A and B; timings are not "
-                "comparable (pass --allow-mismatch to compare anyway)",
-                file=sys.stderr,
-            )
-            return 2
+    ca, cb = a["run"]["config"], b["run"]["config"]
+    gated = [k for k in _GATED if ca.get(k) != cb.get(k)]
+    if gated and not args.allow_mismatch:
+        print(
+            f"error: run.config differs in {', '.join(gated)}; timings are not "
+            "comparable (pass --allow-mismatch to compare anyway)",
+            file=sys.stderr,
+        )
+        return 2
     try:
         report = compare(a, b, by=args.by, metric=args.metric, threshold=args.threshold)
         if all(p["speedup"] is None for p in report["pairs"]):

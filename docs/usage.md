@@ -69,10 +69,16 @@ sets `ROCM_PATH`.
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 
 The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
-1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (0.25, 0.25), fp8 e5m2 (0.5, 0.5), fp8
-e8m0 (2.0, 2.0), any other dtype (1e-5, 1e-6). Each fp8 value is 2 ULP of
-the format at 1.0; the fnuz variants use the same values. The source is
-`TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
+1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3,
+2^-10), fp8 e5m2 (2^-2, 2^-16), fp8 e5m2 fnuz (2^-2, 2^-17), any other dtype
+(1e-5, 1e-6). An element passes when `|actual - expected| <= atol + rtol *
+|expected|`. For fp8, rtol is one ULP at the bottom of the binade of
+`|expected|` and atol is the smallest subnormal of the format, so an element
+that rounds one ULP the other way still passes. fp8 e8m0 holds only powers of
+two, so it compares log2 values (the code distance) with (0, 1): at most one
+code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
+log2 values of e8m0 outputs. The source is `TOLERANCES` in
+`src/dnn_benchmarking/execution/correctness.py`.
 
 ### Comparison
 
@@ -357,7 +363,7 @@ reads JSON only, not CSV.
 | `--by {best,ref,engine}` | best | `best`: the fastest usable engine row of each graph. `ref`: the reference rows. `engine`: the same engine in both files. |
 | `--metric {kernel,host}` | kernel | Compare kernel medians or submit medians. |
 | `--threshold PCT` | 5 | Regression threshold in percent. |
-| `--allow-mismatch` | off | Compare also when `run.config.cache_mode` is different. |
+| `--allow-mismatch` | off | Compare also when `run.config.cache_mode` or `run.config.timing_block` is different. |
 | `--csv` | off | Write CSV to stdout. Not with `--json`. |
 | `--json` | off | Write JSON to stdout. Not with `--csv`. |
 
@@ -384,15 +390,16 @@ Rules:
   `--json` and `--csv` output). A slower B beyond that limit is a
   `REGRESSION`. A faster B is `faster`.
 - A different `run.config` value gives a warning on stderr. A different
-  `cache_mode` stops the comparison, unless you give `--allow-mismatch`.
+  `cache_mode` or `timing_block` stops the comparison, unless you give
+  `--allow-mismatch`. The error names the keys that differ.
 - When no pair gets a speedup (for example, the files share no graph), the
   tool writes `warning: no timings were compared` on stderr. The exit code
   stays 0.
 
 Exit codes: 0 no regression, 1 one or more regressions, 2 usage error, a
 file that cannot be read, has a different schema version or has malformed
-rows (missing keys, wrong types), or a different `cache_mode` without
-`--allow-mismatch`.
+rows (missing keys, wrong types), or a different `cache_mode` or
+`timing_block` without `--allow-mismatch`.
 
 ```bash
 dnn-benchmark -g 'graphs/*.json' -o base.json

@@ -210,6 +210,39 @@ class TestRunHappyPath:
         fill = pmc["per_kernel"]["fill_kernel"]
         assert fill == {"dispatches": 1, "counters": {"GRBM_GUI_ACTIVE": 7.0}}
 
+    def test_multi_pass_counters_average_per_dispatch(self, tmp_path):
+        """Each --pmc pass replays the kernel, so counters from different
+        passes sit on different dispatch rows, and one dispatch can carry
+        several rows for one counter (one per instance)."""
+        db = tmp_path / "multi.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE rocpd_pmc_event_x (event_id INTEGER, pmc_id INTEGER, value REAL);
+                CREATE TABLE rocpd_kernel_dispatch_x (id INTEGER, kernel_id INTEGER, dispatch_id INTEGER);
+                CREATE TABLE rocpd_info_kernel_symbol_x (id INTEGER, kernel_name TEXT);
+                CREATE TABLE rocpd_info_pmc_x (id INTEGER, name TEXT);
+                INSERT INTO rocpd_info_pmc_x VALUES (1, 'GRBM_GUI_ACTIVE'), (2, 'SQ_WAVES');
+                INSERT INTO rocpd_info_kernel_symbol_x VALUES (100, 'k');
+                -- pass 1: dispatches 10, 12; pass 2: dispatches 20, 21, 22
+                INSERT INTO rocpd_kernel_dispatch_x VALUES
+                    (1, 100, 10), (2, 100, 12), (3, 100, 20), (4, 100, 21), (5, 100, 22);
+                -- dispatch 10 reports GRBM_GUI_ACTIVE as two instance rows
+                INSERT INTO rocpd_pmc_event_x VALUES
+                    (10, 1, 400), (10, 1, 600), (12, 1, 3000),
+                    (20, 2, 30), (21, 2, 30), (22, 2, 30);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        k = rocprof_pmc._parse_rocpd_db(db)["per_kernel"]["k"]
+        assert k == {
+            "dispatches": 3,
+            "counters": {"GRBM_GUI_ACTIVE": 2000.0, "SQ_WAVES": 30.0},
+        }
+
     def test_missing_info_kernel_symbol_returns_warning(self, tmp_path, monkeypatch):
         """If the rocpd db omits info_kernel_symbol, the parser must not
         fall back to a broken SQL path — it should report the missing

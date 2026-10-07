@@ -215,6 +215,18 @@ def test_interrupt_writes_partial_file(
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 
+def test_interrupt_without_output_claims_no_partial_file(
+    tmp_path, backend, caller_handlers
+) -> None:
+    def run(path):
+        raise KeyboardInterrupt
+
+    backend(run)
+    code, text = _run(_args(), _graphs(tmp_path, 1))
+    assert code == 130
+    assert "no results file written" in text and "partial results" not in text
+
+
 _NATIVE_BLOCK_RUN = """
 import ctypes, io, sys
 from pathlib import Path
@@ -273,6 +285,27 @@ def test_final_write_failure_exits_1(tmp_path, backend) -> None:
     assert code == 1
 
 
+def test_non_os_write_error_is_reported_and_exits_1(
+    tmp_path, backend, monkeypatch
+) -> None:
+    def bad_write(self, path):
+        raise ValueError("Out of range float values are not JSON compliant")
+
+    monkeypatch.setattr(SuiteResult, "write", bad_write)
+    backend(lambda path: _graph(path, [_passed()]))
+    code, text = _run(_args("-o", str(tmp_path / "out.json")), _graphs(tmp_path, 1))
+    assert code == 1
+    assert "not JSON compliant" in text
+
+
+def test_intermediate_writes_are_throttled(tmp_path, backend, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(SuiteResult, "write", lambda self, path: calls.append(path))
+    backend(lambda path: _graph(path, [_passed()]))
+    _run(_args("-o", str(tmp_path / "out.json")), _graphs(tmp_path, 3))
+    assert len(calls) == 1  # well inside WRITE_INTERVAL_S: only the final write
+
+
 def test_failed_intermediate_write_does_not_override_final_write(
     tmp_path, backend, monkeypatch
 ) -> None:
@@ -319,6 +352,42 @@ def test_unwritable_output_is_usage_error(
     assert code == 2
     assert f"ERROR: {flag} " in text
     assert backend.calls == []
+
+
+def test_output_that_is_a_directory_is_usage_error(tmp_path, backend) -> None:
+    backend(lambda path: _graph(path, [_passed()]))
+    code, text = _run(_args("-o", str(tmp_path)), _graphs(tmp_path, 1))
+    assert code == 2
+    assert "is a directory" in text
+    assert backend.calls == []
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="POSIX mode bits as non-root"
+)
+def test_read_only_profiling_dir_is_usage_error(tmp_path, backend, monkeypatch) -> None:
+    monkeypatch.setattr(suite_runner_cli, "check_requested_tools", lambda m: [])
+    ro = tmp_path / "ro"
+    ro.mkdir(mode=0o500)
+    backend(lambda path: _graph(path, [_passed()]))
+    try:
+        code, text = _run(
+            _args("--perf", "--profiling-output-dir", str(ro)), _graphs(tmp_path, 1)
+        )
+    finally:
+        ro.chmod(0o700)
+    assert code == 2
+    assert "is not writable" in text
+
+
+def test_plain_run_creates_no_profiling_directory(
+    tmp_path, backend, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    backend(lambda path: _graph(path, [_passed()]))
+    graphs = _graphs(tmp_path, 1)
+    assert _run(_args(), graphs)[0] == 0
+    assert not (tmp_path / "profiling-output").exists()
 
 
 def test_config_error_is_usage_error(tmp_path, backend) -> None:
@@ -418,6 +487,32 @@ def test_run_config_records_effective_values_that_compare_checks(
     capsys.readouterr()
     assert compare.main([str(warm), str(cold)]) == 2
     assert "cache_mode differs" in capsys.readouterr().err
+
+
+def test_run_config_records_non_default_selection_and_validation(
+    tmp_path, backend, monkeypatch
+) -> None:
+    # The run sets these process-wide; register them so teardown restores them.
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "")
+    monkeypatch.setenv("HIPDNN_CACHE_DIR", "")
+    backend(lambda path: _graph(path, [_passed()]))
+    out, cache = tmp_path / "out.json", str(tmp_path / "cache")
+    _run(
+        _args(
+            *("-o", str(out), "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
+            *("--validate", "pytorch", "--rtol", "1e-3", "--oracle-mode", "plan"),
+            *("--autotune", "--cache-dir", cache),
+        ),
+        _graphs(tmp_path, 1),
+    )
+    config = SuiteResult.load(out)["run"]["config"]
+    picked = {k: config[k] for k in ("engine_filter", "rtol", "oracle_mode")}
+    assert picked == {
+        "engine_filter": ["0x15B46865C717A122"],
+        "rtol": 1e-3,
+        "oracle_mode": "plan",
+    }
+    assert (config["autotune"], config["cache_dir"]) == (True, cache)
 
 
 def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, backend) -> None:
@@ -681,6 +776,19 @@ def test_empty_nodes_graph_is_a_graph_error(tmp_path, backend) -> None:
     assert code == 1 and graph["status"] == "error" and graph["error"]
 
 
+def test_unsupported_tensor_dtype_is_no_engines_not_an_error(tmp_path, backend) -> None:
+    (graph_path,) = _graphs(tmp_path, 1)
+    doc = json.loads(graph_path.read_text())
+    doc["tensors"][0]["data_type"] = "int3"
+    graph_path.write_text(json.dumps(doc))
+    out = tmp_path / "out.json"
+    backend(lambda path: _graph(path, [_passed()]))
+    code, _ = _run(_args("-o", str(out)), [graph_path])
+    (graph,) = SuiteResult.load(out)["graphs"]
+    assert (code, graph["status"], graph["results"]) == (0, "no_engines", [])
+    assert "int3" in graph["message"] and graph["graph_id"]
+
+
 def test_internal_profiling_flag_is_hidden_from_help() -> None:
     assert "--internal-profiling-run" not in create_parser().format_help()
 
@@ -690,10 +798,20 @@ def test_internal_profiling_flag_is_hidden_from_help() -> None:
     [
         (["--profiling-output-dir", "x"], "--profiling-output-dir"),
         (["--pytorch-sdpa-backend", "math"], "--backend pytorch"),
+        (["--pytorch-sdpa-backend", "math", "--validate", "pytorch"], None),
+        (["--pytorch-sdpa-backend", "math", "-b", "pytorch"], None),
     ],
-    ids=["profiling-output-dir", "sdpa-without-pytorch"],
+    ids=[
+        "profiling-output-dir",
+        "sdpa-without-pytorch",
+        "sdpa-validate",
+        "sdpa-backend",
+    ],
 )
 def test_ignored_options_warn(tmp_path, backend, argv, expected) -> None:
     backend(lambda path: _graph(path, [_passed()]))
     _, text = _run(_args(*argv), _graphs(tmp_path, 1))
-    assert expected in _warnings(text)
+    if expected is None:
+        assert "SDPA" not in _warnings(text)
+    else:
+        assert expected in _warnings(text)

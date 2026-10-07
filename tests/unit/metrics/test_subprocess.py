@@ -179,6 +179,19 @@ class TestRunTool:
         )
         assert fields == {"returncode": 3}
 
+    def test_nonzero_exit_prefers_stderr_over_stdout(self, tmp_path):
+        script = "import sys; print('out'); print('err', file=sys.stderr); sys.exit(4)"
+        _, fields = run_tool("src", sys.executable, ["-c", script], tmp_path, 60, "g/E")
+        assert fields == {"returncode": 4, "error_tail": "err"}
+
+    def test_zero_timeout_disables_the_cap(self, tmp_path):
+        # --profiling-timeout 0 is documented as "no cap", not "time out now".
+        script = "import time; time.sleep(0.5); print('done')"
+        proc, fields = run_tool(
+            "src", sys.executable, ["-c", script], tmp_path, 0, "g/E"
+        )
+        assert fields == {} and proc.stdout.strip() == "done"
+
     def test_timeout_is_skipped_with_tail(self, tmp_path):
         script = "import sys, time; print('stuck here', file=sys.stderr, flush=True); time.sleep(30)"
         proc, fields = run_tool(
