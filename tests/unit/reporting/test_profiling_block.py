@@ -74,6 +74,12 @@ def test_failed_pass_shows_return_code_and_last_three_stderr_lines(source) -> No
         assert f"| stderr line {i}" in text
 
 
+def test_silent_failure_shows_return_code_without_tail() -> None:
+    text = _render({"perf": {"returncode": 1}})
+    assert "perf: failed (rc=1)" in text
+    assert "|" not in text
+
+
 def test_timeout_shows_reason_and_stderr_tail() -> None:
     text = _render(
         {"perf": {"skipped": "timed out after 600 s", "error_tail": "last words"}}

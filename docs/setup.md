@@ -28,17 +28,19 @@ stages are:
 5. `Build dependencies`: pip packages the source build needs. Skipped with
    `--reuse-artifacts`.
 6. `hipDNN and provider plugins`: build hipDNN and the MIOpen, hipBLASLt and
-   hip-kernel providers, and install them into the ROCm SDK prefix.
+   hip-kernel providers, and install them into the ROCm SDK prefix. With
+   `--reuse-artifacts`, only check that hipDNN is in the prefix.
 7. `hipDNN Python bindings`: build `hipdnn_frontend` against that prefix.
+   With `--reuse-artifacts`, only warn if it does not import.
 8. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
    and link the wheel rocprofiler libraries.
 9. `Verify installation`.
 
 Then setup prints the `Profiling sources:` block. See
 [troubleshooting.md](troubleshooting.md#what-each-profiling-source-needs).
-With `--torch-mode cuda` (or a venv that holds CUDA PyTorch), only stages 1,
-2, 3 and `Verify installation` run, and there is no `Profiling sources:`
-block.
+With `--torch-mode cuda`, or `--torch-mode existing` on a venv that holds
+CUDA PyTorch, only stages 1, 2, 3 and `Verify installation` run, and there is
+no `Profiling sources:` block.
 
 The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 
@@ -52,7 +54,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--torch-index-url URL` | pip index URL for PyTorch. |
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
-| `--reuse-artifacts` | Do not build hipDNN or the providers. Use what is installed in the selected prefix. Setup fails if hipDNN is absent there. |
+| `--reuse-artifacts` | Do not build hipDNN, the providers or the `hipdnn_frontend` bindings. Use what is installed in the selected prefix and venv. Setup fails if hipDNN is absent from the prefix. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
 | `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
@@ -94,18 +96,21 @@ dnn-benchmarking finds the engine plugins in
 |---|---|---|---|
 | `rocm` (default) | ROCm nightly for the detected architecture | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
 | `cuda` | CUDA PyTorch from PyPI, or `--torch-index-url` | Not built. No bindings, no amdsmi, no `ROCM_PATH` | `--backend pytorch` on NVIDIA GPUs. |
-| `cpu` | CPU-only PyTorch | Bindings built against the installed ROCm and hipDNN | CI and `--validate pytorch` with a system ROCm. |
+| `cpu` | CPU-only PyTorch | Built from source and installed into `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm`. With `--reuse-artifacts`, uses the hipDNN installed there. | CI and `--validate pytorch` with a system ROCm. |
 | `existing` | Keep the PyTorch in the venv | ROCm PyTorch: its SDK libraries. CUDA PyTorch: the `cuda` path. CPU PyTorch: the installed ROCm. | Reuse a venv. |
-| `none` | Not installed | Bindings built against the installed ROCm and hipDNN | hipDNN backend without PyTorch. |
+| `none` | Not installed | Same as `cpu` | hipDNN backend without PyTorch. |
 
 A CPU-only PyTorch never enables `--backend pytorch`. It is only for
 `--validate pytorch`. `--backend pytorch` needs a ROCm or CUDA build.
 
-The modes `cpu`, `existing` (with CPU PyTorch) and `none` build against
-`--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm`:
+The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
+`--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
+`--reuse-artifacts` they build hipDNN and the providers from source and
+install them into that prefix, over any hipDNN it already holds. To use the
+hipDNN of a system ROCm, pass `--reuse-artifacts`:
 
 ```bash
-python3 setup_env.py --torch-mode cpu --rocm-prefix /opt/rocm
+python3 setup_env.py --torch-mode cpu --rocm-prefix /opt/rocm --reuse-artifacts
 ```
 
 ## CUDA hosts

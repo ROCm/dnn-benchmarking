@@ -12,6 +12,7 @@ from typing import List
 
 import pytest
 
+from tests.conftest import expected_timing_backend
 from tests.integration.conftest import GRAPHS_DIR, PROJECT_ROOT
 
 
@@ -89,3 +90,41 @@ def test_cli_smoke(
         assert row["correctness"]["match"] is True
         assert row["kernel"]["n"] == row["host"]["n"] == 3
         assert row["timing"]["warmup_iters"] == 1
+
+
+@pytest.mark.gpu
+def test_cli_pytorch_backend(torch_gpu, tmp_path: Path) -> None:
+    """--backend pytorch reaches the PyTorch runner: one timed pytorch row."""
+    output = tmp_path / "results.json"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dnn_benchmarking",
+            "--backend",
+            "pytorch",
+            "-g",
+            str(GRAPHS_DIR / "sample_relu.json"),
+            "--warmup",
+            "1",
+            "--iters",
+            "3",
+            "-o",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=PROJECT_ROOT,
+        timeout=600,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+    [graph] = json.loads(output.read_text())["graphs"]
+    [row] = graph["results"]
+    assert (row["provider"], row["role"], row["status"]) == (
+        "pytorch",
+        "engine",
+        "success",
+    ), row
+    assert row["kernel"]["n"] == 3
+    assert row["timing"]["backend"] == expected_timing_backend()

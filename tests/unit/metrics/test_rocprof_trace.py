@@ -3,7 +3,6 @@
 
 """Tests for rocprofv3 trace export."""
 
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -53,24 +52,3 @@ def test_nonzero_returncode_records_error_tail(tmp_path):
     assert trace["returncode"] == 2
     assert "failed" in trace["error_tail"]
     assert "path" not in trace
-
-
-def test_rocprofv3_binary_missing_returns_skipped(tmp_path, monkeypatch):
-    monkeypatch.setattr(rocprof_trace, "resolve_rocm_tool", lambda name: None)
-    assert _run(tmp_path)["trace"]["skipped"] == "profiling tool not found"
-
-
-def test_timeout_returns_skipped(tmp_path):
-    """A wedged rocprofv3 surfaces as skipped; --profiling-timeout reaches the cap."""
-    seen = []
-
-    def wedge(argv, timeout_s):
-        seen.append(timeout_s)
-        raise subprocess.TimeoutExpired(argv, timeout_s)
-
-    with patch.object(_subprocess, "run_capped", side_effect=wedge):
-        trace = rocprof_trace.run(
-            inner_argv=["python"], out_dir=tmp_path, timeout_s=123, context="g/E"
-        )["trace"]
-    assert seen == [123]
-    assert "timed out after 123s" in trace["skipped"]

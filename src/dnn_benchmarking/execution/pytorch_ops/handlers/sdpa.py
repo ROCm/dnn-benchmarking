@@ -199,7 +199,6 @@ def _call_sdpa(
     scale: Optional[float],
     rep_k: int,
     rep_v: int,
-    window: Optional[int] = None,
 ) -> torch.Tensor:
     # Expand K and V independently to the query head count. PyTorch's
     # enable_gqa only models equal K/V head counts, so explicit repeat is the
@@ -208,13 +207,6 @@ def _call_sdpa(
         k = k.repeat_interleave(rep_k, dim=-3)
     if rep_v > 1:
         v = v.repeat_interleave(rep_v, dim=-3)
-    if window is not None:
-        # A sliding window has no boolean spelling in torch's SDPA, so it is
-        # expressed as the additive mask it actually is. is_causal is already
-        # False here: a window is derived only when causal_mask is unset.
-        attn_mask = _sliding_window_mask(
-            int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
-        )
     return execute_selected_sdpa(
         q,
         k,
@@ -329,18 +321,19 @@ def _run_paged_sdpa(
             v_seq = v_seq.unsqueeze(0)
         q_start += q_len
 
+        # A sliding window has no boolean spelling in torch's SDPA, so it is
+        # expressed as the additive mask it actually is. is_causal is already
+        # False here: a window is derived only when causal_mask is unset.
+        seq_mask = (
+            None
+            if window is None
+            else _sliding_window_mask(
+                int(q_seq.shape[-2]), kv_len, window, q.device, q.dtype
+            )
+        )
         outputs.append(
             _call_sdpa(
-                q_seq,
-                k_seq,
-                v_seq,
-                None,
-                dropout_p,
-                is_causal,
-                scale,
-                rep_k,
-                rep_v,
-                window,
+                q_seq, k_seq, v_seq, seq_mask, dropout_p, is_causal, scale, rep_k, rep_v
             )
         )
 

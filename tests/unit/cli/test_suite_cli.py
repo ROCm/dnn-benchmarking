@@ -371,13 +371,17 @@ def test_run_config_records_effective_values_that_compare_checks(
     assert "cache_mode differs" in capsys.readouterr().err
 
 
-def test_selection_env_recorded_only_for_autotune(tmp_path, backend) -> None:
+def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, backend) -> None:
     backend(lambda path: _graph(path, [_passed()]))
-    plain, tuned = tmp_path / "plain.json", tmp_path / "tuned.json"
+    plain, oracle = tmp_path / "plain.json", tmp_path / "oracle.json"
+    tuned = tmp_path / "tuned.json"
     _run(_args("-o", str(plain)), _graphs(tmp_path, 1))
+    _run(_args("-o", str(oracle), "--oracle-mode", "plan"), _graphs(tmp_path, 1))
     _run(_args("-o", str(tuned), "--autotune"), _graphs(tmp_path, 1))
 
     assert SuiteResult.load(plain)["environment"]["selection_env"] is None
+    env = SuiteResult.load(oracle)["environment"]["selection_env"]
+    assert set(env) == set(suite_runner_cli._SELECTION_ENV)
     env = SuiteResult.load(tuned)["environment"]["selection_env"]
     assert env["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
@@ -520,6 +524,22 @@ def test_unavailable_reference_provider_fails_before_any_graph(
     code, text = _run(_args("--validate", "pytorch"), _graphs(tmp_path, 1))
     assert code == 1
     assert "--validate pytorch" in text
+
+
+def test_available_reference_provider_passes_startup(tmp_path, monkeypatch) -> None:
+    _fake_hipdnn(monkeypatch)
+    asked = []
+    available = types.SimpleNamespace(is_available=lambda: True)
+    monkeypatch.setattr(
+        backends.ReferenceProviderRegistry,
+        "get_provider",
+        lambda name: asked.append(name) or available,
+    )
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("--validate", "pytorch", "--plugin-path", str(tmp_path))
+    )
+    assert callable(backends.start_backend(config, Reporter(output=io.StringIO())))
+    assert asked == ["pytorch"]
 
 
 def test_cli_flags_reach_suite_config() -> None:

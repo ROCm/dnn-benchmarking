@@ -14,11 +14,13 @@ import ctypes
 import subprocess
 import sys
 import time
+from unittest.mock import Mock
 
 import psutil
 import pytest
 
 from dnn_benchmarking.metrics import _subprocess as _subprocess_mod
+from dnn_benchmarking.metrics import perf, rocprof_pmc, rocprof_trace, roofline
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warn_once
 from dnn_benchmarking.metrics._subprocess import run_capped, run_tool
 
@@ -165,6 +167,18 @@ class TestRunTool:
         )
         assert fields == {"returncode": 4, "error_tail": "only stdout"}
 
+    def test_silent_nonzero_exit_has_no_tail(self, tmp_path):
+        # A signal death (rc=-6 abort) prints nothing; no `error_tail: null`.
+        _, fields = run_tool(
+            "src",
+            sys.executable,
+            ["-c", "import sys; sys.exit(3)"],
+            tmp_path,
+            60,
+            "g/E",
+        )
+        assert fields == {"returncode": 3}
+
     def test_timeout_is_skipped_with_tail(self, tmp_path):
         script = "import sys, time; print('stuck here', file=sys.stderr, flush=True); time.sleep(30)"
         proc, fields = run_tool(
@@ -199,6 +213,87 @@ class TestRunTool:
             )
         err = capsys.readouterr().err
         assert "g/A" in err and "g/B" in err
+
+
+def _resolve_pmc(mp, binary):
+    mp.setattr(rocprof_pmc, "detect_arch", lambda: "gfx942")
+    mp.setattr(rocprof_pmc, "resolve_rocm_tool", lambda name: binary)
+
+
+def _resolve_perf(mp, binary):
+    mp.setattr(perf, "_resolve_perf", lambda: binary and (binary, None))
+    mp.setattr(perf, "_read_perf_paranoid", lambda: 1)
+
+
+_SOURCES = [
+    pytest.param(rocprof_pmc, "pmc", _resolve_pmc, {"pmc_set": "basic"}, id="pmc"),
+    pytest.param(
+        rocprof_trace,
+        "trace",
+        lambda mp, b: mp.setattr(rocprof_trace, "resolve_rocm_tool", lambda n: b),
+        {},
+        id="trace",
+    ),
+    pytest.param(perf, "perf", _resolve_perf, {}, id="perf"),
+    pytest.param(
+        roofline,
+        "roofline",
+        lambda mp, b: mp.setattr(roofline, "resolve_rocm_tool", lambda n: b),
+        {},
+        id="roofline",
+    ),
+]
+
+
+@pytest.mark.parametrize("module, key, resolve, kwargs", _SOURCES)
+class TestSourceFailureModes:
+    """Each source's ``run`` hands its binary, ``timeout_s`` and ``context``
+    to run_tool; a missing, unlaunchable or wedged tool skips the pass."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        reset_warn_once()
+
+    def _run(self, module, key, kwargs, tmp_path):
+        return module.run(
+            inner_argv=["python"],
+            out_dir=tmp_path,
+            timeout_s=123,
+            context="graph-x/ENG",
+            **kwargs,
+        )[key]
+
+    def test_missing_binary_skips(
+        self, monkeypatch, tmp_path, module, key, resolve, kwargs
+    ):
+        resolve(monkeypatch, None)
+        slc = self._run(module, key, kwargs, tmp_path)
+        assert slc["skipped"] == "profiling tool not found"
+
+    def test_spawn_failure_skips(
+        self, monkeypatch, tmp_path, module, key, resolve, kwargs
+    ):
+        resolve(monkeypatch, "tool")
+        monkeypatch.setattr(
+            _subprocess_mod, "run_capped", Mock(side_effect=OSError("boom"))
+        )
+        assert "boom" in self._run(module, key, kwargs, tmp_path)["skipped"]
+
+    def test_timeout_reaches_the_cap_and_names_the_engine(
+        self, monkeypatch, tmp_path, capsys, module, key, resolve, kwargs
+    ):
+        resolve(monkeypatch, "tool")
+        seen = []
+
+        def wedge(argv, timeout_s):
+            seen.append(timeout_s)
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+
+        monkeypatch.setattr(_subprocess_mod, "run_capped", wedge)
+        slc = self._run(module, key, kwargs, tmp_path)
+        assert seen == [123]
+        assert "timed out after 123s" in slc["skipped"]
+        assert "graph-x/ENG" in capsys.readouterr().err
 
 
 class TestKillTree:

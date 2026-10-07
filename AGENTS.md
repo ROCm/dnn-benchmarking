@@ -134,28 +134,31 @@ Rules that keep the design intact:
 
 | Tier | Location / marker | Needs |
 |---|---|---|
-| Unit | `tests/unit/`, no marker | Any host. Fake torch. No GPU. CI runs this tier. |
-| GPU-generic | `gpu` | Any live GPU (ROCm or CUDA). `expected_timing_backend()` adapts the assertions. |
-| Platform-specific | `gpu` + `rocm`, or `gpu` + `cuda` | One platform. |
+| Unit | `tests/unit/`, no marker | Any host. Fake torch. No GPU. |
+| GPU-generic | `gpu` | Any live GPU (ROCm or CUDA). `expected_timing_backend()` adapts the assertions. ROCm-only tests skip through the `hipdnn` and `plugin_paths` fixtures. |
+| CUDA-only | `gpu` + `cuda` | A CUDA PyTorch build and GPU. |
 | Profiling | `rocprofv3`, `perf`, `rocprof_compute` | The profiler binary. See `docs/troubleshooting.md`. |
 | Strict profiling | `profiling_strict` | Real profiler artefacts. Runs only with `--profiling-strict`. |
 
-Other markers: `slow` (slow integration tests).
-
 ```bash
-pytest tests/unit -m "not gpu" -q                    # what CI runs
-pytest -m "not cuda"                                 # ROCm host: unit + GPU
-pytest -m "not rocm"                                 # CUDA host: unit + GPU
+pytest -m "not gpu"                                  # unit tests, any host
+pytest                                               # GPU host (ROCm or CUDA): unit + GPU
 pytest tests/unit/execution/test_timing.py           # one file
 pytest -m gpu --dnn-plugin-paths /path/to/engines    # custom plugin builds
 pytest --profiling-strict -m profiling_strict        # known-good profiling host
 ```
 
+CI runs `pytest tests/unit -m "not gpu"` (unit-tests.yml, Linux and
+Windows), `pytest -m "not gpu"` after the CUDA-path install (setup.yml), and
+`pytest` on a gfx950 runner (setup.yml `gpu-test`).
+
 Every GPU test skips itself on the wrong platform, so a bare `pytest` is safe
-on any host. GPU tests need the ROCm libraries on `LD_LIBRARY_PATH`; the
-`setup_env.py` activation script sets it. The integration fixture `hipdnn`
-needs only `hipdnn_frontend` and a HIP device; request `torch_gpu` too only
-in tests that use PyTorch (`--backend pytorch`, `--validate pytorch`).
+on any host. The `-ra` in pyproject.toml prints the reason of every skip;
+read them on a GPU host. GPU tests need the ROCm libraries on
+`LD_LIBRARY_PATH`; the `setup_env.py` activation script sets it. The
+integration fixture `hipdnn` needs only `hipdnn_frontend` and a HIP device;
+request `torch_gpu` too only in tests that use PyTorch (`--backend pytorch`,
+`--validate pytorch`).
 
 Test rules:
 

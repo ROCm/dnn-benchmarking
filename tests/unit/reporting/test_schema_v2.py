@@ -94,17 +94,24 @@ def _stats(median: float = 1.0) -> BenchmarkStats:
 
 
 def _oracle() -> OracleResult:
+    # Distinct values, so a field swap in to_dict changes the output.
     return OracleResult(
         plan_name="plan",
-        compiled_plan_index=1,
-        rank=0,
+        compiled_plan_index=4,
+        rank=2,
         sweep_min_time_ms=0.5,
-        compiled_plans_benchmarked=2,
-        compiled_plans_total=2,
-        compiled_plans_failed=0,
-        knob_settings=[],
+        compiled_plans_benchmarked=3,
+        compiled_plans_total=6,
+        compiled_plans_failed=1,
+        knob_settings=[{"knob": "k", "value": 8}],
+        exhaustive_requested=True,
+        exhaustive_supported=False,
+        cpu_build_time_ms=7.0,
         gpu_kernel_stats=_stats(1.0),
         warm_baseline_gpu_kernel_stats=_stats(2.0),
+        correctness=CorrectnessResult(False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9),
+        derived_tflops_per_s=4.0,
+        warm_baseline_derived_tflops_per_s=2.5,
     )
 
 
@@ -128,6 +135,7 @@ def full_suite() -> SuiteResult:
             atol=1e-5,
             max_abs_diff=1e-6,
             max_rel_diff=1e-4,
+            error_message="note",
             n_mismatch=0,
             n_total=4096,
             worst_output_uid=7,
@@ -150,7 +158,7 @@ def full_suite() -> SuiteResult:
         oracle_delta=build_oracle_delta(oracle),
         timing=TimingInfo("staged", "hip", "warm", 10, 12.5),
         clocks_before={"sclk_mhz": 1700},
-        clocks_after={"sclk_mhz": 1700},
+        clocks_after={"sclk_mhz": 1650},
     )
     env = {k: "x" for k in ENV_KEYS}
     env["end_of_run"] = {k: 1.0 for k in END_OF_RUN_KEYS}
@@ -253,7 +261,49 @@ def test_full_row_values() -> None:
         "workspace_bytes": 1024,
         "vram_mb": 512.0,
         "clocks_before": {"sclk_mhz": 1700},
-        "clocks_after": {"sclk_mhz": 1700},
+        "clocks_after": {"sclk_mhz": 1650},
+    }
+    assert row["correctness"] == {
+        "match": True,
+        "rtol": 1e-3,
+        "atol": 1e-5,
+        "max_abs_diff": 1e-6,
+        "max_rel_diff": 1e-4,
+        "n_mismatch": 0,
+        "n_total": 4096,
+        "worst_output_uid": 7,
+        "message": "note",
+    }
+    stats_keys = {"kernel", "host", "baseline_kernel", "baseline_host", "delta"}
+    assert {k: v for k, v in row["oracle"].items() if k not in stats_keys} == {
+        "status": "ok",
+        "error": None,
+        "plan_name": "plan",
+        "compiled_plan_index": 4,
+        "rank": 2,
+        "sweep_min_time_ms": 0.5,
+        "compiled_plans_benchmarked": 3,
+        "compiled_plans_total": 6,
+        "compiled_plans_failed": 1,
+        "tuning_available": True,
+        "knob_settings": [{"knob": "k", "value": 8}],
+        "exhaustive_requested": True,
+        "exhaustive_enabled": False,
+        "exhaustive_supported": False,
+        "cpu_build_time_ms": 7.0,
+        "tflops": 4.0,
+        "baseline_tflops": 2.5,
+        "correctness": {
+            "match": False,
+            "rtol": 2e-3,
+            "atol": 3e-5,
+            "max_abs_diff": 0.25,
+            "max_rel_diff": 0.75,
+            "n_mismatch": 5,
+            "n_total": 64,
+            "worst_output_uid": 9,
+            "message": "off",
+        },
     }
     assert row["warnings"] == ["noisy: CV 6.0%"]
     assert (row["elapsed_s"], row["build_ms"]) == (1.5, 3.0)

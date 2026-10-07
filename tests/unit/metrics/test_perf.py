@@ -3,7 +3,6 @@
 
 """Tests for the perf stat wrapper."""
 
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -186,32 +185,3 @@ class TestResultSlice:
         perf, _ = _run(tmp_path, returncode=2, stderr="perf: x\n", write_csv=False)
         assert "csv_path" not in perf
         assert perf["returncode"] == 2
-
-
-class TestSubprocessFailureModes:
-    """A perf that cannot launch or wedges must surface in the slice
-    without crashing or blocking the run."""
-
-    def test_oserror_returns_skipped(self, tmp_path):
-        with patch.object(
-            _subprocess, "run_capped", side_effect=OSError("perf killed")
-        ):
-            extra = perf_mod.run(
-                inner_argv=["python"], out_dir=tmp_path, timeout_s=60, context="g/E"
-            )
-        assert "perf killed" in extra["perf"]["skipped"]
-
-    def test_timeout_returns_skipped(self, tmp_path):
-        """--profiling-timeout must reach the cap, or a wedged child hangs."""
-        seen = []
-
-        def wedge(argv, timeout_s):
-            seen.append(timeout_s)
-            raise subprocess.TimeoutExpired(argv, timeout_s)
-
-        with patch.object(_subprocess, "run_capped", side_effect=wedge):
-            extra = perf_mod.run(
-                inner_argv=["python"], out_dir=tmp_path, timeout_s=123, context="g/E"
-            )
-        assert seen == [123]
-        assert "timed out after 123s" in extra["perf"]["skipped"]

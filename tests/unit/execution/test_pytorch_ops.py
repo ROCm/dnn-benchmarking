@@ -2261,6 +2261,23 @@ class TestPyTorchSdpaPaged:
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
 
+    def test_paged_sliding_window_masks_each_sequence(self) -> None:
+        """A width-1 band (left/right bound 0) lets query i of each sequence see
+        only that sequence's key i, so O is V's first q_len rows per sequence."""
+        q, k_pages, v_pages, page_table, _, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(left_bound=0, right_bound=0), tensors)
+
+        rep = self.HQ // self.HKV
+        expected = torch.cat(
+            [
+                v[:, :q_len, :].repeat_interleave(rep, dim=0)
+                for v, q_len in zip(dense_v, self.Q_LENS)
+            ],
+            dim=-2,
+        ).unsqueeze(0)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+
     def test_replay_reads_seq_lens_from_host_once(self, monkeypatch) -> None:
         """A seq_len .tolist() on every replay syncs the stream inside the staged
         timer's gated region and hangs; ReplayTensors must read each once."""

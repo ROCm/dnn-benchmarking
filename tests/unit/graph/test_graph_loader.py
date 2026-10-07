@@ -55,6 +55,20 @@ def test_unknown_dtype_is_unsupported_not_a_crash() -> None:
         GraphLoader().extract_tensor_info(graph)
 
 
+def test_unset_physical_dtype_resolves_from_io_data_type() -> None:
+    # hipDNN's fill_from_context fills an unset non-virtual tensor from
+    # io_data_type; the buffer must be sized for that type.
+    graph = {"nodes": [{"type": "X"}], "io_data_type": "half"}
+    graph["tensors"] = [_tensor(1, "unset")]
+
+    (info,) = GraphLoader().extract_tensor_info(graph)
+    assert (info.data_type, info.element_size) == ("half", 2)
+
+    del graph["io_data_type"]
+    with pytest.raises(UnsupportedGraphError, match="unset"):
+        GraphLoader().extract_tensor_info(graph)
+
+
 def test_output_uids_reads_int_and_list_outputs() -> None:
     graph = {
         "nodes": [

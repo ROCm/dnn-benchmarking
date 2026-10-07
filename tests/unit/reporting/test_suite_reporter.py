@@ -366,6 +366,37 @@ class TestVerboseBlock:
                 "unchecked (no comparison performed)",
             ),
             (_row(role="reference", warnings=["math SDPA"]), "warning     math SDPA"),
+            (
+                ProviderEngineResult.error_row(
+                    "hipdnn", 8, "HIP error: bad", engine_name="BROKEN"
+                ),
+                "error       HIP error: bad",
+            ),
+            (
+                ProviderEngineResult.skipped_row(
+                    "hipdnn", 7, "no configs", engine_name="SKIPPER"
+                ),
+                "skipped     no configs",
+            ),
+            (
+                _row(analytical_flops_partial=True),
+                "metrics     flops n/a (no analytical model)",
+            ),
+            (_oracle_row(), "rank 0); knobs engine defaults"),
+            (
+                _oracle_row(compiled_plans_benchmarked=4, compiled_plans_failed=1),
+                "4/5 compiled plans benchmarked (1 failed); sweep min 210.00 µs",
+            ),
+            (
+                _oracle_row(),
+                "500.00 µs warm heuristic -> 250.00 µs tuned = 2.00x (basis kernel)",
+            ),
+            (
+                _oracle_row(
+                    derived_tflops_per_s=1.5, warm_baseline_derived_tflops_per_s=0.75
+                ),
+                "throughput 1.500 TFLOP/s tuned, 0.750 warm heuristic",
+            ),
         ],
         ids=[
             "oracle-error",
@@ -375,6 +406,13 @@ class TestVerboseBlock:
             "passed",
             "unchecked",
             "reference-warning",
+            "error-row",
+            "skipped-row",
+            "flops-no-model",
+            "default-knobs",
+            "plan-counts",
+            "delta",
+            "throughput",
         ],
     )
     def test_detail_line(self, pe, expected) -> None:

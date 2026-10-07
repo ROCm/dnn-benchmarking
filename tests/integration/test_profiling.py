@@ -79,6 +79,8 @@ _HELPER_TIMEOUT_S = 300
 
 
 def _run_dnn_bench(extra_args, tmp_path) -> dict:
+    # The run uses the hipDNN backend; skip on a CUDA host without bindings.
+    pytest.importorskip("hipdnn_frontend")
     out_path = tmp_path / "results.json"
     # run_capped, not subprocess.run: the profiler front-ends exec the
     # workload as a grandchild that survives a plain timeout kill and

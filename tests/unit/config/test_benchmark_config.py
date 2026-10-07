@@ -80,6 +80,11 @@ id = 1
         suite = SuiteConfig.from_namespace(_namespace(["-b", "pytorch"]))
         assert suite.plugin_paths is None
 
+    def test_pmc_all_with_multipass_reaches_metrics_config(self) -> None:
+        args = _namespace(["-g", "g.json", "--pmc", "all", "--pmc-allow-multipass"])
+        metrics = SuiteConfig.from_namespace(args).metrics
+        assert (metrics.pmc_set, metrics.pmc_allow_multipass) == ("all", True)
+
     @pytest.mark.parametrize(
         ("argv", "flag"),
         [

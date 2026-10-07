@@ -139,8 +139,7 @@ Keep credentials in `.dvc/config.local`, which git ignores.
 
 ```bash
 pytest -m "not gpu"        # unit tests, any host
-pytest -m "not cuda"       # ROCm host: unit + GPU tests
-pytest -m "not rocm"       # CUDA host: unit + GPU tests
+pytest                     # GPU host (ROCm or CUDA): unit + GPU tests
 ```
 
 See [AGENTS.md](AGENTS.md#tests) for the test tiers and markers.

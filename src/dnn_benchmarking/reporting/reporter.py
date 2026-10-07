@@ -45,6 +45,25 @@ def _clip(text: str, width: int) -> str:
     return text[: max(width - 1, 0)] + "…" if width > 0 else ""
 
 
+def _render_table(
+    columns: Sequence[Tuple[str, bool, List[str]]],
+    widths: Sequence[int],
+    width: int,
+    indent: str = "",
+) -> List[str]:
+    """Header plus one line per row; ``columns`` is (header, right-aligned, cells)."""
+
+    def render(cells: Sequence[str]) -> str:
+        parts = []
+        for (_, right, _), w, cell in zip(columns, widths, cells):
+            cell = _clip(cell, w)
+            parts.append(cell.rjust(w) if right else cell.ljust(w))
+        return _clip((indent + "  ".join(parts)).rstrip(), width)
+
+    rows = zip(*(cells for _, _, cells in columns))
+    return [render([h for h, _, _ in columns]), *map(render, rows)]
+
+
 def _one_line(text: str) -> str:
     return " ".join(text.split())
 
@@ -425,16 +444,8 @@ class Reporter:
         else:
             natural[0] = min(natural[0], max(16, budget))
 
-        def render(cells: List[str]) -> str:
-            parts = []
-            for (_, right, _), w, cell in zip(columns, natural, cells):
-                cell = _clip(cell, w)
-                parts.append(cell.rjust(w) if right else cell.ljust(w))
-            return _clip(("  " + "  ".join(parts)).rstrip(), width)
-
-        self._print(render([h for h, _, _ in columns]))
-        for i in range(len(rows)):
-            self._print(render([cells[i] for _, _, cells in columns]))
+        for line in _render_table(columns, natural, width, indent="  "):
+            self._print(line)
         if not self._legend_done:
             self._legend_done = True
             for line in textwrap.wrap(
@@ -694,9 +705,9 @@ class Reporter:
                 lines.append(f"{name}: skipped — {slc['skipped']}")
             if "unexpected_error" in slc:
                 lines.append(f"{name}: unexpected error — {slc['unexpected_error']}")
-            if "error_tail" in slc:
-                if "skipped" not in slc:
-                    lines.append(f"{name}: failed (rc={slc.get('returncode', '?')})")
+            if "returncode" in slc:
+                lines.append(f"{name}: failed (rc={slc['returncode']})")
+            if slc.get("error_tail"):
                 lines.extend(
                     f"  | {t}" for t in str(slc["error_tail"]).splitlines()[-3:]
                 )

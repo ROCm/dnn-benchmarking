@@ -140,6 +140,9 @@ class PyTorchReferenceProvider(ReferenceProvider):
         for uid, data in input_data.items():
             tensor = torch.from_numpy(data.copy())
             data_type = tensor_json_by_uid.get(uid, {}).get("data_type")
+            if data_type == "unset":
+                # Same fill as GraphLoader; get_dtype("unset") raises if both unset.
+                data_type = graph_json.get("io_data_type") or data_type
             if data_type is not None:
                 tensor = tensor.to(get_dtype(data_type).torch_dtype())
             tensors[uid] = tensor

@@ -435,3 +435,16 @@ def test_cold_cache_rejects_block_timing() -> None:
     """A flush before a block of N leaves only the first execution cold."""
     with pytest.raises(ValueError, match="--timing-block"):
         TimingPolicy(cache_mode="cold", timing_block=2)
+
+
+def test_timer_measures_the_with_block(monkeypatch) -> None:
+    clock = FakeClock()
+    clock.advance_ms(100.0)  # elapsed is relative to entry, not the epoch
+    monkeypatch.setattr(timing_module, "time", clock)
+
+    with timing_module.Timer() as timer:
+        clock.advance_ms(250.0)
+    clock.advance_ms(1000.0)  # after exit: not counted
+
+    assert timer.elapsed_ms == pytest.approx(250.0)
+    assert timer.elapsed_s == pytest.approx(0.25)

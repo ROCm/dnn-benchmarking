@@ -591,3 +591,75 @@ def test_torch_mode_none_refuses_a_venv_with_torch(
     with pytest.raises(SystemExit):
         setup.install_torch()
     assert "--clean" in capsys.readouterr().err
+
+
+# --- run() stage plan and main() failure reporting ---------------------------
+
+_STAGE_METHODS = (
+    "setup_venv",
+    "install_torch",
+    "install_package",
+    "ensure_rocm_libraries_checkout",
+    "install_build_deps",
+    "build_hipdnn",
+    "install_bindings",
+    "install_runtime_extras",
+    "verify",
+)
+_CUDA_PLAN = ["setup_venv", "install_torch", "install_package", "verify"]
+_FULL_PLAN = list(_STAGE_METHODS)
+_REUSE_PLAN = [m for m in _STAGE_METHODS if m != "install_build_deps"]
+
+
+@pytest.mark.parametrize(
+    "argv, installed, expected",
+    [
+        ((), "missing", _FULL_PLAN),
+        (("--torch-mode", "cuda"), "missing", _CUDA_PLAN),
+        (("--torch-mode", "existing"), "cuda", _CUDA_PLAN),
+        (("--torch-mode", "existing"), "rocm", _FULL_PLAN),
+        (("--torch-mode", "cpu"), "missing", _FULL_PLAN),
+        (("--torch-mode", "cpu", "--reuse-artifacts"), "missing", _REUSE_PLAN),
+    ],
+)
+def test_run_stage_plan_follows_torch_mode(
+    setup_env, tmp_path, monkeypatch, argv, installed, expected
+) -> None:
+    setup = _setup(setup_env, tmp_path, "-y", *argv)
+    if installed != "missing":
+        _fake_venv(setup_env, setup.venv_dir)
+    monkeypatch.setattr(setup, "get_torch_mode", lambda: installed)
+    monkeypatch.setattr(setup, "report_profiling_sources", lambda: None)
+    ran = []
+    for method in _STAGE_METHODS:
+        monkeypatch.setattr(setup, method, lambda m=method: ran.append(m))
+
+    assert setup.run() == 0
+    assert ran == expected
+
+
+@pytest.mark.parametrize(
+    "error, rc",
+    [
+        (subprocess.CalledProcessError(3, ["pip", "install", "torch"]), 1),
+        (OSError("disk full"), 1),
+        (KeyboardInterrupt(), 130),
+    ],
+)
+def test_main_names_the_failed_stage(
+    setup_env, tmp_path, monkeypatch, capsys, error, rc
+) -> None:
+    def fail_torch(self):
+        raise error
+
+    monkeypatch.setattr(setup_env.Setup, "setup_venv", lambda self: None)
+    monkeypatch.setattr(setup_env.Setup, "install_torch", fail_torch)
+
+    assert (
+        setup_env.main(["--workspace", str(tmp_path / "ws"), "--torch-mode", "cuda"])
+        == rc
+    )
+    err = capsys.readouterr().err
+    assert "PyTorch (--torch-mode cuda)" in err
+    if isinstance(error, subprocess.CalledProcessError):
+        assert "pip install torch" in err

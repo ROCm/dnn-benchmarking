@@ -54,6 +54,10 @@ def test_mismatch_count_and_worst_index() -> None:
         assert result.n_total == 12
         assert result.worst_index == (2, 3)
         assert result.max_abs_diff == 2.0
+        assert result.message == (
+            "Mismatch: 2/12 elements outside tolerance, max_abs_diff=2.00e+00 "
+            "at (2, 3), max_rel_diff=0.00e+00 (rtol=0.0, atol=0.1)"
+        )
 
 
 def test_max_rel_diff_ignores_near_zero_references() -> None:

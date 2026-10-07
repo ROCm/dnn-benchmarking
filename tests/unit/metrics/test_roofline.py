@@ -3,7 +3,6 @@
 
 """Tests for the rocprof-compute roofline wrapper."""
 
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -90,28 +89,3 @@ def test_success_with_other_csv_but_no_named_files(tmp_path):
 
     rl, _ = _run(tmp_path, side_effect=write_other)
     assert rl["warnings"] == ["no roofline.csv or sysinfo.csv produced"]
-
-
-def test_missing_binary_returns_skipped(tmp_path, monkeypatch):
-    monkeypatch.setattr(roofline_mod, "resolve_rocm_tool", lambda name: None)
-    extra = roofline_mod.run(
-        inner_argv=["python"], out_dir=tmp_path, timeout_s=60, context="g/E"
-    )
-    assert extra == {"roofline": {"skipped": "profiling tool not found"}}
-
-
-def test_timeout_returns_skipped(tmp_path):
-    """rocprof-compute replays the workload several times, so it is the
-    pass most likely to wedge; --profiling-timeout must reach the cap."""
-    seen = []
-
-    def wedge(argv, timeout_s):
-        seen.append(timeout_s)
-        raise subprocess.TimeoutExpired(argv, timeout_s)
-
-    with patch.object(_subprocess, "run_capped", side_effect=wedge):
-        rl = roofline_mod.run(
-            inner_argv=["python"], out_dir=tmp_path, timeout_s=123, context="g/E"
-        )["roofline"]
-    assert seen == [123]
-    assert "timed out after 123s" in rl["skipped"]

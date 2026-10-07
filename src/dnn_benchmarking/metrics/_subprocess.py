@@ -154,9 +154,9 @@ def run_tool(
 
     Returns ``(proc, fields)``. ``proc`` is None when the tool never
     completed (missing binary, spawn failure, timeout); ``fields`` then
-    carries ``skipped`` (and ``error_tail`` when the tool printed
-    anything). On a nonzero exit ``proc`` is returned and ``fields``
-    carries ``returncode`` / ``error_tail``; on success it is empty.
+    carries ``skipped``; on a nonzero exit ``proc`` is returned and
+    ``fields`` carries ``returncode``; on success it is empty. A timeout
+    or nonzero exit adds ``error_tail`` when the tool printed anything.
 
     ``timeout_s`` of 0 disables the cap. ``context`` (``graph/engine``)
     goes into every warning so per-engine failures are not deduplicated
@@ -184,8 +184,9 @@ def run_tool(
         return None, {"skipped": msg}
     if proc.returncode != 0:
         warn_once(source, f"{context}: {name} exited {proc.returncode}")
-        return proc, {
-            "returncode": proc.returncode,
-            "error_tail": _tail(proc.stderr, proc.stdout),
-        }
+        fields = {"returncode": proc.returncode}
+        tail = _tail(proc.stderr, proc.stdout)
+        if tail:
+            fields["error_tail"] = tail
+        return proc, fields
     return proc, {}

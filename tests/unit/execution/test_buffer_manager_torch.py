@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from dnn_benchmarking.common.exceptions import ExecutionError
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
     _encode_to_storage_bytes,
@@ -93,3 +94,18 @@ class TestDeviceBufferBackend:
 
         assert bm.get_output_tensor(y.uid) is None
         assert bm.create_variant_pack() == {y.uid: 1234}
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda bm: bm.create_variant_pack(),
+            lambda bm: bm.load_input_data({}),
+            lambda bm: bm.zero_outputs(),
+        ],
+        ids=["create_variant_pack", "load_input_data", "zero_outputs"],
+    )
+    def test_use_before_allocate_all_raises(self, call) -> None:
+        bm = BufferManager([_strided(1, "float", is_output=True)])
+
+        with pytest.raises(ExecutionError, match="Buffers not allocated"):
+            call(bm)

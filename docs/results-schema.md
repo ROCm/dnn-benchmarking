@@ -384,7 +384,8 @@ With `-o`, the CLI writes the file while the suite runs:
 
 A failed write in step 2 prints an `ERROR` line on stderr, and the run goes
 on. When the last write succeeds, the exit code still follows the verdicts.
-Only a failed last write gives exit code 1.
+A failed last write gives exit code 1, unless an engine row failed
+validation, which gives 3 (see [usage.md](usage.md#exit-codes)).
 
 A file from steps 2 and 3 of an unfinished run has `run.complete = false` and
 `run.finished_at = null`. It holds every graph that completed. After SIGINT

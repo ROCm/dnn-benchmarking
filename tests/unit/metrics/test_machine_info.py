@@ -115,6 +115,17 @@ class TestCollectEnvironmentInfo:
             info = machine_info.collect_environment_info()
         assert set(info) == _ENVIRONMENT_KEYS
 
+    def test_broken_hipdnn_import_does_not_raise(self, tmp_path, monkeypatch, capsys):
+        package = tmp_path / "hipdnn_frontend"
+        package.mkdir()
+        (package / "__init__.py").write_text("raise RuntimeError('no HIP device')\n")
+        monkeypatch.delitem(sys.modules, "hipdnn_frontend", raising=False)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        with patch.object(machine_info, "is_amdsmi_available", return_value=False):
+            info = machine_info.collect_environment_info()
+        assert info["hipdnn_version"] is None
+        assert "no HIP device" in capsys.readouterr().err
+
     def test_missing_amdsmi_is_recorded_and_warned_once(self, capsys):
         with patch.object(machine_info, "is_amdsmi_available", return_value=False):
             first = machine_info.collect_environment_info()

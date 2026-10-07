@@ -124,6 +124,9 @@ def _hipdnn_version() -> Optional[str]:
         import hipdnn_frontend
     except ImportError:
         return None
+    except Exception as e:  # a broken native install can fail any way on import
+        warn_once("machine_info", f"hipdnn_frontend import failed: {e}")
+        return None
     return getattr(hipdnn_frontend, "__version__", None)
 
 

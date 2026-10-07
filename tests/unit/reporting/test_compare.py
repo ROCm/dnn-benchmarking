@@ -27,7 +27,7 @@ def _stats(median: float, cv: float = 0.0) -> BenchmarkStats:
 
 
 def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
-         timings=None, plugin_path=None, host=None):  # fmt: skip
+         timings=None, plugin_path=None, host=None, validated=True):  # fmt: skip
     stats = BenchmarkStats.from_timings(timings) if timings else _stats(median, cv)
     return ProviderEngineResult(
         "hipdnn",
@@ -38,7 +38,7 @@ def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
         gpu_kernel_stats=stats if status == "success" else None,
         host_stats=_stats(host) if host else None,
         engine_name=name,
-        correctness=CorrectnessResult(match, 1e-3, 1e-5),
+        correctness=CorrectnessResult(match, 1e-3, 1e-5) if validated else None,
     )
 
 
@@ -86,6 +86,16 @@ def test_regression_exits_1(tmp_path, capsys):
     assert code == 1
     assert report["pairs"][0]["label"] == "REGRESSION"
     assert report["regressions"] == 1
+
+
+def test_unchecked_rows_are_compared(tmp_path, capsys):
+    # A default run has no --validate, so every row's verdict is 'unchecked'.
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0, validated=False)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.2, validated=False)])])
+    code, report = _json(capsys, [a, b])
+    assert code == 1
+    (pair,) = report["pairs"]
+    assert (pair["label"], pair["in_geomean"]) == ("REGRESSION", True)
 
 
 def test_changes_within_threshold_or_noise_are_not_regressions(tmp_path, capsys):
@@ -273,6 +283,8 @@ def test_unreadable_or_incompatible_input_exits_2(tmp_path, capsys):
     assert main([a, str(v1)]) == 2
     assert main([a]) == 2
     assert main([a, a, "--by", "nope"]) == 2
+    assert main([a, a, "--threshold", "nan"]) == 2
+    assert main([a, a, "--threshold", "-1"]) == 2
 
 
 def test_missing_ref_on_both_sides_is_one_label(tmp_path, capsys):

@@ -21,6 +21,8 @@ from dnn_benchmarking.reporting.suite_results import (
 from dnn_benchmarking.validation import ReferenceOutput
 
 ENV = ("HIPDNN_FORCE_BENCHMARKING", "HIPDNN_DISABLE_CACHE")
+# (call, handle) for every fake call; cleared by the ``tuned`` fixture.
+CALLS = []
 
 
 def _m(kernel_ms, host_ms=0.01):
@@ -60,7 +62,7 @@ class _BM:
         self.outputs = outputs or {}
 
     def zero_outputs(self):
-        pass
+        CALLS.append(("zero_outputs", None))
 
     def get_output_tensor(self, uid):
         return None
@@ -88,13 +90,15 @@ class _TunedExecutor:
             raise self.prepare_error
 
     def autotune(self, handle, variant_pack, engine_id):
+        CALLS.append(("tuned.autotune", handle))
         return self.candidates
 
     def benchmark(self, handle, variant_pack):
+        CALLS.append(("tuned.benchmark", handle))
         return _m(self.kernel_ms, host_ms=0.2)
 
     def execute_once(self, handle, variant_pack):
-        pass
+        CALLS.append(("tuned.execute_once", handle))
 
     def plan_name(self, handle):
         return "tuned"
@@ -104,6 +108,7 @@ class _TunedExecutor:
 def tuned(monkeypatch):
     cls = type("Tuned", (_TunedExecutor,), {})
     monkeypatch.setattr(oracle_mod, "Executor", cls)
+    CALLS.clear()
     return cls
 
 
@@ -112,7 +117,12 @@ def _run(mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=N
         provider="hipdnn", engine_id=5, status="success", correctness=correctness
     )
     row.analytical_flops = flops
-    baseline = SimpleNamespace(benchmark=lambda h, vp: _m([1.0, 1.0, 1.0, 10.0]))
+
+    def baseline_benchmark(h, vp):
+        CALLS.append(("baseline.benchmark", h))
+        return _m([1.0, 1.0, 1.0, 10.0])
+
+    baseline = SimpleNamespace(benchmark=baseline_benchmark)
     out = TensorInfo(
         uid=1,
         name="y",
@@ -159,6 +169,29 @@ def test_tuned_plan_gets_its_own_handle_on_the_row_stream(tuned):
 
     assert tuned.prepared_on is not row_handle
     assert tuned.prepared_on.stream == 7
+
+
+def test_baseline_times_on_row_handle_then_tuned_plan_validates_once(tuned):
+    """The heuristic plan must keep the row handle (the tuned handle's solver
+    map would hide the speedup), and validation must re-run the tuned plan on
+    freshly zeroed outputs."""
+    row_handle = _Handle()
+    refs = {1: ReferenceOutput(data=np.zeros(2, np.float32), tensor_uid=1)}
+
+    row = _run(handle=row_handle, refs=refs, bm=_BM({1: np.zeros(2, np.float32)}))
+
+    tuned_handle = tuned.prepared_on
+    assert CALLS == [
+        ("zero_outputs", None),
+        ("tuned.autotune", tuned_handle),
+        ("zero_outputs", None),
+        ("baseline.benchmark", row_handle),
+        ("zero_outputs", None),
+        ("tuned.benchmark", tuned_handle),
+        ("zero_outputs", None),
+        ("tuned.execute_once", tuned_handle),
+    ]
+    assert row.oracle.correctness.tolerance_match
 
 
 def test_tuned_and_warm_heuristic_report_median_tflops(tuned):
@@ -246,6 +279,7 @@ def test_exhaustive_flags_follow_mode_and_winner(tuned, mode, supports):
         mode == "exhaustive",
         supports,
     )
+    assert o.exhaustive_enabled == (mode == "exhaustive" and supports)
 
 
 def test_host_stats_split_tuned_from_warm_baseline(tuned):

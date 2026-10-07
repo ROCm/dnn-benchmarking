@@ -23,7 +23,8 @@ from dataclasses import asdict, dataclass
 from statistics import geometric_mean
 from typing import Any, Dict, List, Optional, Tuple
 
-from .reporter import _clip, _fmt_time, _width
+from ..cli.parser import _at_least
+from .reporter import _clip, _fmt_time, _render_table, _width
 from .suite_results import SuiteResult
 
 CONVENTION = "speedup = A_median / B_median (B speedup vs A; >1 means B is faster)"
@@ -66,7 +67,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--metric", choices=("kernel", "host"), default="kernel")
     p.add_argument(
         "--threshold",
-        type=float,
+        type=_at_least(float, 0),
         default=5.0,
         metavar="PCT",
         help="regression threshold in percent (default: 5)",
@@ -278,16 +279,8 @@ def _print_table(
         widths[i] = min(widths[i], max(8, avail // (len(flex) - n)))
         avail -= widths[i]
 
-    def render(cells: List[str]) -> str:
-        parts = []
-        for (_, right, _), w, cell in zip(columns, widths, cells):
-            cell = _clip(cell, w)
-            parts.append(cell.rjust(w) if right else cell.ljust(w))
-        return _clip("  ".join(parts).rstrip(), width)
-
-    print(render([h for h, _, _ in columns]), file=out)
-    for i in range(len(pairs)):
-        print(render([cells[i] for _, _, cells in columns]), file=out)
+    for line in _render_table(columns, widths, width):
+        print(line, file=out)
     for side, names in (("A", report["only_in_a"]), ("B", report["only_in_b"])):
         for name in names:
             print(_clip(f"graph only in {side}: {name}", width), file=out)

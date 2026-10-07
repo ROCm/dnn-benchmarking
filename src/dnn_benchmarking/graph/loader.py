@@ -86,8 +86,18 @@ class GraphLoader:
             # Virtual tensors get no buffer, and hipDNN may leave their
             # data_type "unset" (filled from intermediate_data_type), so skip
             # them before resolving the dtype.
-            if isinstance(tensor_json, dict) and tensor_json.get("virtual"):
-                continue
+            if isinstance(tensor_json, dict):
+                if tensor_json.get("virtual"):
+                    continue
+                # hipDNN fills an "unset" physical tensor from io_data_type
+                # (TensorAttributes::fill_from_context); only both unset raises.
+                if tensor_json.get("data_type") == "unset" and graph_json.get(
+                    "io_data_type"
+                ):
+                    tensor_json = {
+                        **tensor_json,
+                        "data_type": graph_json["io_data_type"],
+                    }
             tensor_info = TensorInfo.from_json(tensor_json)
             tensor_info.is_output = tensor_info.uid in outputs
             result.append(tensor_info)
