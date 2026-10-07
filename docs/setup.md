@@ -201,7 +201,15 @@ explicit `--gpu-arch` or `--torch-index-url` that differs from the record
 stops setup with an error that asks for `--clean`. A venv without the record
 (PyTorch installed another way) cannot be checked; setup shows a warning
 instead. A different `--torch-mode` than the one in the venv also asks for
-`--clean`.
+`--clean`, including `--torch-mode none` on a venv that has PyTorch.
+
+The CMake build directories live in the checkout (`rocm-libraries/build`,
+`rocm-libraries/projects/hipdnn/python/build`), so every workspace shares
+them. Each records the install and toolchain prefixes it was configured for,
+in `dnn-bench-prefixes.json`. A run with other prefixes (another
+`--workspace` or `--rocm-prefix`) wipes that directory and rebuilds it from
+zero, so one workspace never builds with another workspace's compiler or
+ROCm SDK.
 
 ## Manual install
 

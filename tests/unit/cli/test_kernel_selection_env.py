@@ -16,13 +16,6 @@ from dnn_benchmarking.config.benchmark_config import SuiteConfig
 from dnn_benchmarking.reporting.reporter import Reporter
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    # Process-wide variables; monkeypatch restores them after each test.
-    monkeypatch.delenv("HIPDNN_FORCE_BENCHMARKING", raising=False)
-    monkeypatch.delenv("HIPDNN_CACHE_DIR", raising=False)
-
-
 def _warnings(**kwargs):
     """The WARNING lines _apply_tuning_environment reports."""
     out = io.StringIO()

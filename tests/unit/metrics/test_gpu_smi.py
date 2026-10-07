@@ -89,6 +89,14 @@ class TestClocks:
             "throttle_status": 0,
         }
 
+    @pytest.mark.parametrize("raw, expected", [(4, 4), ("N/A", None)])
+    def test_throttle_status_value(self, monkeypatch, raw, expected):
+        """Nonzero throttle_status puts the 'throttled' warning on the row."""
+        fake = _fake_amdsmi()
+        fake.amdsmi_get_gpu_metrics_info = lambda h: {"throttle_status": raw}
+        _install(monkeypatch, fake)
+        assert gpu_smi.GpuSmiProbe().clocks()["throttle_status"] == expected
+
     def test_unsupported_readings_are_none_not_errors(self, monkeypatch, capsys):
         _install(monkeypatch, _fake_amdsmi(fail={"amdsmi_get_temp_metric"}))
         clocks = gpu_smi.GpuSmiProbe().clocks()

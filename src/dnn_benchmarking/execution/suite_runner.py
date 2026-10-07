@@ -171,12 +171,11 @@ def _measure_row(
     if m.capped:
         warnings.append("capped at max_iters")
     if m.fallback_reason:
-        warn_once(
-            "timing",
-            f"staged timing unavailable, using per-iteration events: "
-            f"{m.fallback_reason}",
-        )
-        warnings.append(f"events timing: {m.fallback_reason}")
+        # events mode: why staged timing was not used; block mode: a host
+        # sync inside the timed span.
+        text = f"{m.mode} timing: {m.fallback_reason}"
+        warn_once("timing", text)
+        warnings.append(text)
     if _throttled(row.clocks_after):
         warnings.append("throttled")
     row.warnings = warnings

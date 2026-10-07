@@ -3,6 +3,8 @@
 
 """Tests for ``dnn-benchmark compare`` on small synthetic result files."""
 
+import csv
+import io
 import json
 
 import pytest
@@ -25,7 +27,7 @@ def _stats(median: float, cv: float = 0.0) -> BenchmarkStats:
 
 
 def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
-         timings=None, plugin_path=None):  # fmt: skip
+         timings=None, plugin_path=None, host=None):  # fmt: skip
     stats = BenchmarkStats.from_timings(timings) if timings else _stats(median, cv)
     return ProviderEngineResult(
         "hipdnn",
@@ -34,6 +36,7 @@ def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
         role=role,
         plugin_path=plugin_path,
         gpu_kernel_stats=stats if status == "success" else None,
+        host_stats=_stats(host) if host else None,
         engine_name=name,
         correctness=CorrectnessResult(match, 1e-3, 1e-5),
     )
@@ -98,6 +101,75 @@ def test_changes_within_threshold_or_noise_are_not_regressions(tmp_path, capsys)
     code, report = _json(capsys, [a, b, "--threshold", "1"])
     assert code == 1
     assert [p["label"] for p in report["pairs"]] == ["REGRESSION", "within noise"]
+
+
+def test_noise_band_is_twice_the_combined_relative_iqr(tmp_path, capsys):
+    # Each side has relative IQR 0.2, so hypot = 0.283 and the band is 0.566.
+    # A 40% slowdown lies between the two: noise at 2x, a regression at 1x.
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0, cv=0.1)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.4, cv=0.1)])])
+    code, report = _json(capsys, [a, b])
+    assert (code, report["pairs"][0]["label"]) == (0, "within noise")
+
+
+def test_change_equal_to_threshold_is_within_noise(tmp_path, capsys):
+    # 1.25 / 1.0 - 1 == 25 / 100 exactly in binary floating point.
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.25)])])
+    code, report = _json(capsys, [a, b, "--threshold", "25"])
+    assert (code, report["pairs"][0]["label"]) == (0, "within noise")
+
+
+def test_best_skips_faster_failed_row(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E1", 1.0)])])
+    b = _write(tmp_path, "b.json",
+               [("g", "id", [_row("E1", 1.0), _row("E2", 0.1, match=False)])])  # fmt: skip
+    _, report = _json(capsys, [a, b])
+    assert (report["pairs"][0]["engine_b"], report["pairs"][0]["label"]) == (
+        "E1",
+        "within noise",
+    )
+
+
+def test_metric_host_compares_host_medians(tmp_path, capsys):
+    # Kernel and host times rank the B engines in opposite orders.
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E1", 3.0, host=1.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E1", 3.0, host=2.0),
+                                                 _row("E2", 1.0, host=4.0)])])  # fmt: skip
+    code, report = _json(capsys, [a, b, "--metric", "host"])
+    pair = report["pairs"][0]
+    assert (code, pair["engine_b"], pair["speedup"]) == (1, "E1", 0.5)
+    assert main([a, b]) == 0  # by kernel time, B's E2 is faster
+
+
+def test_csv_output(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 2.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])])
+    assert main([a, b, "--csv"]) == 0
+    rows = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+    assert rows == [
+        {
+            "graph": "g",
+            "engine_a": "E",
+            "engine_b": "E",
+            "a_ms": "2.0",
+            "b_ms": "1.0",
+            "a_rel_iqr": "0.0",
+            "b_rel_iqr": "0.0",
+            "speedup": "2.0",
+            "label": "faster",
+            "in_geomean": "True",
+        }
+    ]
+
+
+def test_no_shared_graphs_prints_table_and_warns(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("ga", "aaa", [_row("E", 1.0)])])
+    b = _write(tmp_path, "b.json", [("gb", "bbb", [_row("E", 1.0)])])
+    assert main([a, b]) == 0
+    out, err = capsys.readouterr()
+    assert "graph only in A: ga" in out and "0 pairs" in out
+    assert "no timings were compared" in err
 
 
 def test_one_outlier_sample_does_not_hide_a_regression(tmp_path, capsys):

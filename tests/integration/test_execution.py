@@ -44,8 +44,15 @@ def _validate_config() -> SuiteConfig:
     )
 
 
-def _assert_engines_match_reference(result: GraphResult) -> None:
-    """One timed reference row; every engine row passes or is skipped."""
+def _assert_engines_match_reference(
+    result: GraphResult, require_engine: bool = False
+) -> None:
+    """One timed reference row; every engine row passes or is skipped.
+
+    An engine error always fails. No engine running the graph skips, unless
+    ``require_engine`` (a graph the sample plugins are known to run).
+    """
+    assert result.error is None, result.error
     reference = [r for r in result.results if r.role == "reference"]
     assert [r.verdict for r in reference] == ["reference"], reference
     assert reference[0].provider == "pytorch"
@@ -53,11 +60,15 @@ def _assert_engines_match_reference(result: GraphResult) -> None:
     assert reference[0].host_stats is not None
 
     engines = [r for r in result.results if r.role == "engine"]
+    errors = [(r.engine_name, r.error_message) for r in engines if r.status == "error"]
+    assert not errors, errors
     if not any(r.status == "success" for r in engines):
-        pytest.skip(
-            f"no hipDNN engine runs {result.graph_name}: "
-            + "; ".join(r.skip_reason or r.error_message or "" for r in engines)
+        reason = f"no hipDNN engine runs {result.graph_name}: " + "; ".join(
+            [result.message or ""] + [r.skip_reason or "" for r in engines]
         )
+        if require_engine:
+            pytest.fail(reason)
+        pytest.skip(reason)
     verdicts = {r.verdict for r in engines}
     assert "passed" in verdicts
     assert verdicts <= {"passed", "skipped"}, [
@@ -132,18 +143,20 @@ def test_compare_matches_pytorch_reference(
 
 
 @pytest.mark.parametrize(
-    "graph_name",
+    "graph_name, require_engine",
     [
-        "sample_conv_fwd.json",
-        "sample_batchnorm.json",
-        "sample_matmul.json",
-        "sample_relu.json",
-        "sample_add.json",
-        "sample_sdpa.json",
-        "sample_mha_sdpa.json",
+        ("sample_conv_fwd.json", True),
+        ("sample_batchnorm.json", True),
+        ("sample_matmul.json", False),
+        ("sample_relu.json", False),
+        ("sample_add.json", False),
+        ("sample_sdpa.json", False),
+        ("sample_mha_sdpa.json", False),
     ],
 )
-def test_engines_validate_against_pytorch(hipdnn, torch_gpu, graph_name: str) -> None:
+def test_engines_validate_against_pytorch(
+    hipdnn, torch_gpu, graph_name: str, require_engine: bool
+) -> None:
     """--validate pytorch: every engine that runs a sample graph passes."""
     path, graph_json, tensor_infos = load_graph(graph_name)
     result = run_graph_all_providers(
@@ -154,7 +167,7 @@ def test_engines_validate_against_pytorch(hipdnn, torch_gpu, graph_name: str) ->
         hipdnn.Handle(),
         Reporter(output=io.StringIO()),
     )
-    _assert_engines_match_reference(result)
+    _assert_engines_match_reference(result, require_engine)
 
 
 def test_paged_sdpa_sample_passes_hipdnn_graph_validation(hipdnn) -> None:
@@ -226,7 +239,7 @@ def test_validation_compares_on_device(
         Reporter(output=io.StringIO()),
     )
 
-    _assert_engines_match_reference(result)
+    _assert_engines_match_reference(result, require_engine=True)
     assert set(devices) == {"cuda"}
     assert compared and set(compared) == {"torch"}
 

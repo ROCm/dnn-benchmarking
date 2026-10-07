@@ -16,7 +16,9 @@ import pytest
 
 from dnn_benchmarking.cli import backends, suite_runner_cli
 from dnn_benchmarking.cli.config_file import apply_config_file
+from dnn_benchmarking.cli.main import main as cli_main
 from dnn_benchmarking.cli.parser import create_parser
+from dnn_benchmarking.reporting import compare
 from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
@@ -69,9 +71,6 @@ def _graph(path: Path, rows: List[ProviderEngineResult]) -> GraphResult:
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
-    # Kernel-selection variables are process-wide; monkeypatch restores them.
-    for name in ("HIPDNN_FORCE_BENCHMARKING", "HIPDNN_CACHE_DIR"):
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(suite_runner_cli, "collect_environment_info", lambda: {})
 
 
@@ -205,6 +204,30 @@ def test_final_write_failure_exits_1(tmp_path, backend) -> None:
     assert code == 1
 
 
+def test_failed_intermediate_write_does_not_override_final_write(
+    tmp_path, backend, monkeypatch
+) -> None:
+    monkeypatch.setattr(suite_runner_cli, "WRITE_INTERVAL_S", 0.0)
+    real_write = SuiteResult.write
+    calls = []
+
+    def flaky_write(self, path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise OSError(28, "No space left on device")
+        real_write(self, path)
+
+    monkeypatch.setattr(SuiteResult, "write", flaky_write)
+    out = tmp_path / "out.json"
+    backend(lambda path: _graph(path, [_passed()]))
+    code, text = _run(_args("-o", str(out)), _graphs(tmp_path, 2))
+
+    assert code == 0
+    assert "No space left on device" in text  # the transient failure is reported
+    assert SuiteResult.load(out)["run"]["complete"] is True
+    assert f"Results: {out}" in text
+
+
 @pytest.mark.parametrize(
     "flag, argv",
     [
@@ -247,6 +270,19 @@ def test_missing_profiling_tool_exits_2_before_backend(
     assert code == 2
     assert "--perf needs perf" in text
     assert backend.calls == []
+
+
+def test_main_routes_compare_subcommand(monkeypatch) -> None:
+    seen = []
+    monkeypatch.setattr(compare, "main", lambda argv: seen.append(argv) or 7)
+    assert cli_main(["compare", "a.json", "b.json"]) == 7
+    assert seen == [["a.json", "b.json"]]
+
+
+def test_main_without_matching_graphs_exits_1(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    assert cli_main(["--graph", str(tmp_path / "none*.json")]) == 1
+    assert "No graph files found" in capsys.readouterr().err
 
 
 def test_selection_env_recorded_only_for_autotune(tmp_path, backend) -> None:

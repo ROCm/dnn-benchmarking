@@ -324,7 +324,7 @@ After Ctrl-C or SIGTERM the file holds every completed graph and has
 | Code | Meaning |
 |---|---|
 | 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
-| 1 | An engine row error, a graph error, a result write failure, no graph files found, a tarball that cannot be read, or a backend that is not available at startup (hipDNN, PyTorch or the reference provider). |
+| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a backend that is not available at startup (hipDNN, PyTorch or the reference provider). |
 | 2 | Usage error: a bad flag, a bad config file, an option that the backend does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
@@ -367,6 +367,9 @@ Rules:
   `REGRESSION`. A faster B is `faster`.
 - A different `run.config` value gives a warning on stderr. A different
   `cache_mode` stops the comparison, unless you give `--allow-mismatch`.
+- When no pair gets a speedup (for example, the files share no graph), the
+  tool writes `warning: no timings were compared` on stderr. The exit code
+  stays 0.
 
 Exit codes: 0 no regression, 1 one or more regressions, 2 usage error or a
 file that cannot be read or has a different schema version.

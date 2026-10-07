@@ -64,6 +64,8 @@ _DTYPES = {
         DType("fp8_e4m3", 1, _F32, "float8_e4m3fn"),
         DType("fp8_e5m2", 1, _F32, "float8_e5m2"),
         DType("fp8_e8m0", 1, _F32, "float8_e8m0fnu"),
+        DType("fp8_e4m3_fnuz", 1, _F32, "float8_e4m3fnuz"),
+        DType("fp8_e5m2_fnuz", 1, _F32, "float8_e5m2fnuz"),
     )
 }
 

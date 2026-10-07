@@ -171,11 +171,15 @@ def test_tuned_and_warm_heuristic_report_median_tflops(tuned):
     assert row.oracle.derived_tflops_per_s == pytest.approx(2.0)
 
 
-def test_candidate_counts_ignore_caller_excluded_plans(tuned):
+def test_first_eligible_success_wins_and_counts_ignore_excluded_plans(tuned):
+    # hipDNN returns candidates in rank order; the first eligible success wins.
+    winner = _candidate(rank=1)
+    winner.knob_settings = [SimpleNamespace(knob_id=4, value=8)]
     tuned.candidates = [
-        _candidate(rank=0),
-        _candidate(succeeded=False, rank=1),
-        _candidate(excluded=True, rank=2),
+        _candidate(excluded=True, rank=0),
+        winner,
+        _candidate(succeeded=False, rank=2),
+        _candidate(rank=3),
     ]
     o = _run().oracle
 
@@ -183,8 +187,9 @@ def test_candidate_counts_ignore_caller_excluded_plans(tuned):
         o.compiled_plans_total,
         o.compiled_plans_benchmarked,
         o.compiled_plans_failed,
-    ) == (2, 1, 1)
-    assert o.rank == 0
+    ) == (3, 2, 1)
+    assert (o.rank, o.compiled_plan_index) == (1, 1)
+    assert o.knob_settings == [{"knob_id": "4", "value": 8}]
 
 
 @pytest.mark.parametrize(

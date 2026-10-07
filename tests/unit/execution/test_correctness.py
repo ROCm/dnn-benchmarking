@@ -78,6 +78,26 @@ def test_aggregates_over_outputs_and_names_the_failing_output():
     assert "output 2" in c.error_message
 
 
+def test_failing_output_outranks_a_passing_output_with_a_larger_diff():
+    # SDPA-like mix: a bf16 O passes at a large diff, a float stat fails at a
+    # small one. The verdict must name the failing output, not the largest diff.
+    ref = {1: _ref([100, 100, 100, 100]), 2: _ref([1, 1, 1, 1])}
+    bm = _HostBM(
+        {
+            1: np.array([100.5, 100, 100, 100], np.float32),
+            2: np.array([1.01, 1, 1, 1], np.float32),
+        }
+    )
+
+    c = check_correctness(bm, [_out(1, "bfloat16"), _out(2)], ref, "pytorch", _config())
+
+    assert c.tolerance_match is False
+    assert c.worst_output_uid == 2
+    assert c.error_message.startswith("output 2:")
+    assert c.max_abs_diff == pytest.approx(0.5)
+    assert (c.rtol, c.atol) == (3e-2, 1e-3)
+
+
 def test_passing_outputs_report_diffs_without_message():
     ref = {1: _ref([1, 2, 3, 4])}
     bm = _HostBM({1: np.array([1, 2, 3, 4.00001], np.float32)})

@@ -68,6 +68,12 @@ DETECT_TIMEOUT_S = 30
 # --torch-index-url instead of silently mixing builds.
 TORCH_RECORD = "dnn-bench-torch.json"
 
+# Written into each reused CMake build dir: the install and toolchain prefixes
+# it was configured for. The build dirs live in the checkout, shared by every
+# --workspace, and a CMakeCache keeps its compiler and <Pkg>_DIR paths when the
+# prefixes change, so a dir configured for other prefixes is wiped.
+BUILD_RECORD = "dnn-bench-prefixes.json"
+
 
 # --- Small process helpers -------------------------------------------------
 
@@ -485,7 +491,9 @@ def build_parser() -> argparse.ArgumentParser:
             "provider and binding CMake build directories. By default setup "
             "reuses the existing venv (and its torch) and rebuilds incrementally; "
             "changing its --torch-mode, --gpu-arch or --torch-index-url then "
-            "requires --clean."
+            "requires --clean. A build directory configured for another "
+            "install or toolchain prefix (another --workspace or --rocm-prefix) "
+            "is wiped without --clean."
         ),
     )
     parser.add_argument(
@@ -1034,6 +1042,9 @@ class Setup:
     def install_torch(self) -> None:
         mode = self.torch_mode
         if mode == "none":
+            # A reused venv keeps its torch; "none" must not build against it.
+            if self.installed_torch_mode != "missing":
+                self.require_torch_mode("none")
             print("Leaving torch uninstalled.")
             return
 
@@ -1259,14 +1270,35 @@ class Setup:
                 libs = sorted((Path(core_prefix) / "lib").glob("libamd_comgr.so*"))
         return libs[0] if libs else None
 
+    def _reset_build_dir(
+        self, build_dir: Path, install_prefix: str, toolchain_prefix: str
+    ) -> None:
+        """Keep build_dir for an incremental build only when it was configured
+        for these prefixes (see BUILD_RECORD); wipe it otherwise or on --clean."""
+        wanted = {
+            "install_prefix": install_prefix,
+            "toolchain_prefix": toolchain_prefix,
+        }
+        record = build_dir / BUILD_RECORD
+        if build_dir.exists():
+            try:
+                same = json.loads(record.read_text()) == wanted
+            except (OSError, ValueError):
+                same = False
+            if not same and not self.clean:
+                print(f"Removing {build_dir}: configured for other ROCm prefixes.")
+            if self.clean or not same:
+                rmtree(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps(wanted) + "\n")
+
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
         cmake = require_working_cmake()
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
         build_dir = ROCM_LIBRARIES_DIR / "build"
-        if self.clean and build_dir.exists():
-            rmtree(build_dir)
+        self._reset_build_dir(build_dir, install_prefix, toolchain_prefix)
         prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
         print(f"Building hipDNN and providers to {install_prefix}...")
         run(
@@ -1317,8 +1349,7 @@ class Setup:
         build_root = python_dir / "build"
         bindings_build = build_root / "frontend_bindings"
         wheel_dir = build_root / "wheel_package"
-        if self.clean and build_root.exists():
-            rmtree(build_root)
+        self._reset_build_dir(bindings_build, install_prefix, toolchain_prefix)
         # The packer's output, not a build cache: a wheel left by an earlier
         # run would make the pick below ambiguous or stale.
         if wheel_dir.exists():
@@ -1571,7 +1602,9 @@ class Setup:
             )
         # CUDA torch supports only the PyTorch execution backend: no hipDNN
         # Python bindings, engine plugins, amdsmi, or ROCm prefix.
-        cuda = self.torch_mode == "cuda" or self.installed_torch_mode == "cuda"
+        cuda = self.torch_mode == "cuda" or (
+            self.torch_mode == "existing" and self.installed_torch_mode == "cuda"
+        )
         if cuda:
             self.do_build = False
         self.confirm_build()

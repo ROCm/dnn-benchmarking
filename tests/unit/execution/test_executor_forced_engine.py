@@ -253,6 +253,25 @@ def test_prepare_discovery_uses_heuristic_plan_creation():
     assert graph.hard_engine_id is None  # hard selection not used
 
 
+def test_graph_data_types_reach_the_hipdnn_setters():
+    """Stated graph types are set on the hipDNN graph; "unset" (no DataType
+    member) is left for hipDNN inference."""
+    graph = _StubGraph(ranked=[111], selected=111)
+    calls = []
+    for key in ("io_data_type", "intermediate_data_type", "compute_data_type"):
+        setattr(graph, f"set_{key}", lambda dt, key=key: calls.append((key, dt)))
+    fake = _fake_module(graph)
+    fake.DataType = types.SimpleNamespace(HALF="HALF", FLOAT="FLOAT", NOT_SET="NOT_SET")
+    graph_json = (
+        '{"io_data_type": "half", "intermediate_data_type": "unset",'
+        ' "compute_data_type": "float"}'
+    )
+    executor = executor_module.Executor(graph_json, TimingPolicy())
+    with patch.dict(sys.modules, {"hipdnn_frontend": fake}):
+        executor.prepare(handle=object(), engine_id=None)
+    assert calls == [("io_data_type", "HALF"), ("compute_data_type", "FLOAT")]
+
+
 def test_discover_engines_ranking_runtime_error_becomes_unsupported():
     """A backend RuntimeError while ranking surfaces as an unsupported-graph
     skip, not a hard error."""

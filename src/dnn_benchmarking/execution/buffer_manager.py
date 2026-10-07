@@ -20,7 +20,13 @@ from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
 
 # fp8 formats as (exponent bits, mantissa bits); E8M0 is a special case.
-_FP8_FORMATS = {"fp8_e4m3": (4, 3), "fp8_e5m2": (5, 2), "fp8_e8m0": (8, 0)}
+_FP8_FORMATS = {
+    "fp8_e4m3": (4, 3),
+    "fp8_e5m2": (5, 2),
+    "fp8_e8m0": (8, 0),
+    "fp8_e4m3_fnuz": (4, 3),
+    "fp8_e5m2_fnuz": (5, 2),
+}
 
 
 def _f32_to_bf16(data_f32: np.ndarray) -> np.ndarray:
@@ -52,14 +58,19 @@ def _fp8_values(name: str) -> np.ndarray:
         values[0xFF] = np.nan
         return values.astype(np.float32)
     exp_bits, man_bits = _FP8_FORMATS[name]
-    bias = (1 << (exp_bits - 1)) - 1
+    fnuz = name.endswith("_fnuz")
+    # FNUZ exponent bias is 2^(e-1), one more than the OCP formats.
+    bias = (1 << (exp_bits - 1)) - (0 if fnuz else 1)
     exp = (codes >> man_bits) & ((1 << exp_bits) - 1)
     man = (codes & ((1 << man_bits) - 1)) / (1 << man_bits)
     magnitude = np.where(
         exp == 0, man * 2.0 ** (1 - bias), (1.0 + man) * np.exp2(exp - bias)
     )
     values = np.where(codes & 0x80, -magnitude, magnitude)
-    if name == "fp8_e4m3":
+    if fnuz:
+        # No infinities and no -0: 0x80 is the only NaN.
+        values[0x80] = np.nan
+    elif name == "fp8_e4m3":
         # OCP E4M3 ("fn"): no infinities; S.1111.111 is NaN.
         values[(codes & 0x7F) == 0x7F] = np.nan
     else:

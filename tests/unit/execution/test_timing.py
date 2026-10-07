@@ -157,14 +157,21 @@ def test_min_time_extends_sample_count(monkeypatch) -> None:
     assert m.capped is False
 
 
-def test_max_iters_caps_loop_and_flags_it(monkeypatch) -> None:
+@pytest.mark.parametrize("timing_block", [1, 4])  # block mode has its own loop
+def test_max_iters_caps_loop_and_flags_it(monkeypatch, timing_block) -> None:
     log: List[str] = []
     _install_fake_hip(monkeypatch, log, kernel_ms=1.0)
 
     m = measure(
         _enqueue(log),
         stream=7,
-        policy=TimingPolicy(warmup_iters=1, iters=2, min_time_ms=100.0, max_iters=3),
+        policy=TimingPolicy(
+            warmup_iters=1,
+            iters=2,
+            min_time_ms=100.0,
+            max_iters=3,
+            timing_block=timing_block,
+        ),
     )
 
     assert len(m.kernel_ms) == len(m.host_ms) == 3
@@ -268,6 +275,30 @@ def test_host_sync_in_torch_enqueue_falls_back_to_events(monkeypatch) -> None:
     assert len(m.kernel_ms) == 2
     # Priming, the failed checked call, and its unchecked rerun.
     assert m.warmup_iters == 3 == log.count("enqueue") - len(m.kernel_ms)
+
+
+def test_host_sync_in_torch_enqueue_is_recorded_in_block_mode(monkeypatch) -> None:
+    """Block mode does not stall the stream, so a syncing enqueue still runs,
+    but its host round-trips fall inside the block's event span: the probe's
+    finding must stay on the measurement as in per-launch mode."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    modes: List[str] = []
+    _install_fake_torch_sync_debug(monkeypatch, modes)
+
+    def enqueue() -> None:
+        if modes and modes[-1] == "error":
+            raise RuntimeError("called a synchronizing CUDA operation")
+
+    m = measure(
+        enqueue,
+        stream=7,
+        policy=TimingPolicy(warmup_iters=0, iters=2, timing_block=4),
+        torch_stream=object(),
+    )
+
+    assert m.mode == "block"
+    assert m.fallback_reason.startswith("host sync in enqueue: ")
 
 
 def test_async_torch_enqueue_stays_staged(monkeypatch) -> None:

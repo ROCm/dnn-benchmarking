@@ -16,26 +16,26 @@ from dnn_benchmarking.execution.buffer_manager import (
 )
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 
-# Every data type hipDNN graphs use that the executor and buffers must handle.
-NAMES = [
-    "float",
-    "half",
-    "bfloat16",
-    "double",
-    "int8",
-    "uint8",
-    "int32",
-    "int64",
-    "boolean",
-    "fp8_e4m3",
-    "fp8_e5m2",
-    "fp8_e8m0",
-]
-FP8 = {
-    "fp8_e4m3": "float8_e4m3fn",
-    "fp8_e5m2": "float8_e5m2",
-    "fp8_e8m0": "float8_e8m0fnu",
+# Every data type hipDNN graphs use that the executor and buffers must handle,
+# as graph name -> (torch dtype name, host numpy dtype).
+EXPECTED = {
+    "float": ("float32", np.float32),
+    "half": ("float16", np.float16),
+    "bfloat16": ("bfloat16", np.float32),
+    "double": ("float64", np.float64),
+    "int8": ("int8", np.int8),
+    "uint8": ("uint8", np.uint8),
+    "int32": ("int32", np.int32),
+    "int64": ("int64", np.int64),
+    "boolean": ("bool", np.bool_),
+    "fp8_e4m3": ("float8_e4m3fn", np.float32),
+    "fp8_e5m2": ("float8_e5m2", np.float32),
+    "fp8_e8m0": ("float8_e8m0fnu", np.float32),
+    "fp8_e4m3_fnuz": ("float8_e4m3fnuz", np.float32),
+    "fp8_e5m2_fnuz": ("float8_e5m2fnuz", np.float32),
 }
+NAMES = list(EXPECTED)
+FP8 = {name: torch_name for name, (torch_name, _) in EXPECTED.items() if "fp8" in name}
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -50,12 +50,17 @@ def test_storage_bytes_match_registry_size(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", NAMES)
-def test_torch_dtype_has_registry_size(name: str) -> None:
-    torch = pytest.importorskip("torch")
-    if name in FP8 and not hasattr(torch, FP8[name]):
-        pytest.skip(f"torch {torch.__version__} has no {FP8[name]}")
+def test_registry_maps_to_the_matching_torch_and_numpy_dtypes(name: str) -> None:
+    """A swapped mapping (e.g. half -> bfloat16) would silently compute the
+    PyTorch reference in the wrong precision."""
+    torch_name, numpy_dtype = EXPECTED[name]
     dtype = get_dtype(name)
+    assert dtype.numpy == np.dtype(numpy_dtype)
 
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, torch_name):
+        pytest.skip(f"torch {torch.__version__} has no {torch_name}")
+    assert dtype.torch_dtype() is getattr(torch, torch_name)
     assert dtype.torch_dtype().itemsize == dtype.size
 
 

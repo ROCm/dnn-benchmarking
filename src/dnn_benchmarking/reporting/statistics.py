@@ -82,6 +82,10 @@ class BenchmarkStats:
         return d
 
 
+# Heuristic thresholds. NOISY_IQR: quiet MI210 runs show IQR 1-2 % of the
+# median (docs/usage.md example), so 5 % marks a disturbed run, not normal
+# spread. OUTLIER_RATIO: launch jitter and clock ramp on a quiet GPU stay well
+# under 2x (the slowest sample in the docs/methodology.md matmul run is 1.3x).
 NOISY_IQR = 0.05
 OUTLIER_RATIO = 2.0
 

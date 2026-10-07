@@ -63,6 +63,21 @@ class TestReadCpuModel:
             assert machine_info._read_cpu_model() is None
 
 
+class TestReadTotalRam:
+    def test_psutil_bytes_to_gib(self, monkeypatch):
+        import psutil
+
+        total = type("VM", (), {"total": 48 * 1024**3})
+        monkeypatch.setattr(psutil, "virtual_memory", lambda: total)
+        assert machine_info._read_total_ram_gb() == 48.0
+
+    def test_meminfo_fallback_kib_to_gib(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "psutil", None)  # import fails
+        meminfo = "MemTotal:       50331648 kB\nMemFree:        1024 kB\n"
+        with patch("builtins.open", mock_open(read_data=meminfo)):
+            assert machine_info._read_total_ram_gb() == 48.0
+
+
 @pytest.mark.parametrize(
     "raw, expected",
     [(None, None), (0, None), (8902, "8.9.2"), (90100, "9.1.0")],

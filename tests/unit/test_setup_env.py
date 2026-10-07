@@ -77,9 +77,13 @@ def test_cmake_arg_without_a_value_is_rejected(setup_env, bad) -> None:
         setup_env.build_parser().parse_args(["--cmake-arg", bad])
 
 
-@pytest.mark.parametrize("clean, build_dir_kept", [(False, True), (True, False)])
+@pytest.mark.parametrize(
+    "clean, recorded_prefix, build_dir_kept",
+    [(False, "prefix", True), (True, "prefix", False), (False, "other", False)],
+    ids=["same-prefix", "clean", "other-prefix"],
+)
 def test_superbuild_configure_lets_extra_defines_override_defaults(
-    setup_env, tmp_path, monkeypatch, clean, build_dir_kept
+    setup_env, tmp_path, monkeypatch, clean, recorded_prefix, build_dir_kept
 ) -> None:
     rocm_libraries = tmp_path / "rocm-libraries"
     cache = rocm_libraries / "build" / "CMakeCache.txt"
@@ -88,6 +92,15 @@ def test_superbuild_configure_lets_extra_defines_override_defaults(
     toolchain = tmp_path / "toolchain"
     (toolchain / "lib").mkdir(parents=True)
     (toolchain / "lib" / "libamd_comgr.so.3").write_text("")
+    record = {
+        "install_prefix": str(tmp_path / "prefix"),
+        "toolchain_prefix": str(toolchain),
+    }
+    # A build dir configured by another workspace keeps that workspace's
+    # compiler in its CMakeCache, so it must not be reused.
+    (cache.parent / setup_env.BUILD_RECORD).write_text(
+        json.dumps({**record, "install_prefix": str(tmp_path / recorded_prefix)})
+    )
     commands = []
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
     monkeypatch.setattr(
@@ -99,15 +112,17 @@ def test_superbuild_configure_lets_extra_defines_override_defaults(
     setup = _setup(setup_env, tmp_path, *argv)
     monkeypatch.setattr(setup, "_build_env", lambda: {})
 
-    setup.build_superbuild(str(tmp_path / "prefix"), str(toolchain))
+    setup.build_superbuild(record["install_prefix"], record["toolchain_prefix"])
 
     configure = commands[0]
     assert configure[-1] == "-DHIPDNN_ENABLE_SDPA=OFF"
     assert configure.index("-DHIPDNN_ENABLE_SDPA=ON") < configure.index(
         "-DHIPDNN_ENABLE_SDPA=OFF"
     )
-    # Incremental by default; --clean starts the CMake build over.
+    # Incremental by default; --clean or other prefixes start the build over.
     assert cache.exists() == build_dir_kept
+    # The next run with these prefixes reuses the directory.
+    assert json.loads((cache.parent / setup_env.BUILD_RECORD).read_text()) == record
 
 
 # --- confirmation ------------------------------------------------------------
@@ -412,6 +427,42 @@ def test_rocm_libraries_ref_must_be_a_full_sha(setup_env) -> None:
             parser.parse_args(["--rocm-libraries-ref", bad])
 
 
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_rocm_libraries_ref_pins_the_fetched_commit(
+    setup_env, tmp_path, capsys, rocm_libraries
+) -> None:
+    src = tmp_path / "src"
+    pinned = _head(src)
+    # Move the origin branch past the pin: only the SHA fetches `pinned`.
+    (src / "projects/hipdnn/new.txt").write_text("new")
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", "next", cwd=src)
+    _git("fetch", "-q", str(src), "main:main", cwd=tmp_path / "origin.git")
+    tip = _head(src)
+
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", pinned
+    ).ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == pinned
+    assert "WARNING" not in capsys.readouterr().err
+
+    # A reused checkout is not refetched, but one off the pin is reported.
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", tip
+    ).ensure_rocm_libraries_checkout()
+    assert _head(rocm_libraries) == pinned
+    assert f"not the pinned {tip[:12]}" in capsys.readouterr().err
+
+
 # --- venv reuse ----------------------------------------------------------------
 
 
@@ -518,3 +569,16 @@ def test_fresh_torch_install_records_its_source(
     other.installed_torch_mode = "rocm"
     with pytest.raises(SystemExit):
         other.install_torch()
+
+
+@pytest.mark.parametrize("installed", ["rocm", "cuda", "cpu"])
+def test_torch_mode_none_refuses_a_venv_with_torch(
+    setup_env, tmp_path, capsys, installed
+) -> None:
+    # Building for "none" on a venv with ROCm wheel torch would mix the wheel
+    # and system ROCm; with CUDA torch it would skip the hipDNN build.
+    setup = _setup(setup_env, tmp_path, "--torch-mode", "none")
+    setup.installed_torch_mode = installed
+    with pytest.raises(SystemExit):
+        setup.install_torch()
+    assert "--clean" in capsys.readouterr().err

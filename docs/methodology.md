@@ -158,6 +158,10 @@ for short kernels. On the MI210 conv sample, `--timing-block 50` read
 `timing_block`. `--cache-mode cold` requires `--timing-block 1`, because a
 flush before a block leaves only its first launch cold.
 
+A PyTorch graph that reads a device value on the host inside `enqueue()`
+sets the same `host sync in enqueue: ...` reason in `timing.fallback_reason`
+in block mode. The row warning is then `block timing: <reason>`.
+
 ## Statistics
 
 For `kernel` and `host` the tool reports `n`, `mean_ms`, `std_ms` (ddof 1),
@@ -186,7 +190,9 @@ moved the mean and the standard deviation, but not the median.
 `tflops = flops / median` and `gbps = io_bytes / median`:
 
 - `flops` is an analytical count from the graph JSON (FMA = 2 FLOPs). The
-  formulas are in `metrics/analytical/__init__.py`. When the graph has a node
+  dispatch table is in `metrics/analytical/__init__.py`; the per-op formulas
+  are in its sibling modules (`conv.py`, `matmul.py`, `elementwise.py`,
+  `normalization.py`, `reduction.py`, `sdpa.py`). When the graph has a node
   type with no formula, `flops_partial` is `true` and the table shows `~`.
 - `io_bytes` is the sum of the sizes of all non-virtual tensors. It is a
   lower bound of the real memory traffic.
@@ -310,8 +316,25 @@ hipDNN and `--backend pytorch` on the same graphs, kernel median in ms:
 
 The tables above come from the review before this overhaul. The timed loop
 was already stall-gated then, but the warmup ran back to back, so the
-minimum-to-maximum ranges can include clock-ramp outliers. The current loop gave
-the same conv_fwd medians (25.44 and 25.60 us) with a maximum of 26.4 us.
+minimum-to-maximum ranges can include clock-ramp outliers.
+
+### Change against the previous loop (MI210, gfx90a)
+
+Every `graphs/*.json` ran on both backends with `--warmup 10 --iters 100`,
+once with the previous loop (`main` at 2af0454) and once with this loop,
+back to back, in two repeats (92 median pairs):
+
+- 85 of 92 medians agree within 2 %. On kernels near 14 us, 1 % is one
+  0.16 us step of the event timer.
+- The other pairs are bimodal kernels (CV 0.1 to 0.3), where the median moves
+  between the two modes. `conv_dgrad` on the PyTorch backend read 26 % and
+  36 % lower; its mean moved less (43.1 to 43.0 us, 44.3 to 39.7 us).
+  `conv_dgrad` on `MIOPEN_ENGINE_DETERMINISTIC` read 5.4 % lower in both
+  repeats. Two other rows moved in one repeat only.
+- CV fell where the previous warmup left clock-ramp samples in the loop, for
+  example `conv_wgrad` 0.16 to 0.01 and `rmsnorm` on PyTorch 0.14 to 0.02.
+
+A time series that crosses this change can show a step on bimodal rows.
 Measure again after a timing change.
 
 ## Not yet
@@ -322,6 +345,11 @@ The tool does not do these things yet:
   the dtype of the graph. For fp16 and bf16 graphs the reference then has the
   same precision as the result under test, and the tolerances must be loose.
   An fp32 reference needs new tolerances for all workloads.
+- SDPA reference for every mask. The PyTorch reference follows hipDNN mask
+  semantics: the deprecated `causal_mask` wins over left and right bounds
+  (top-left causal). A bounded left window is supported only with
+  `right_bound = 0`. Other masks make the reference decline the graph as
+  unsupported.
 - One buffer manager for both backends. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.

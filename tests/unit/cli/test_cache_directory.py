@@ -36,7 +36,6 @@ def test_configure_cache_env_only_fills_unset_variables(
     monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
     for var in ("XDG_CACHE_HOME", "MIOPEN_USER_DB_PATH", "MIOPEN_CUSTOM_CACHE_DIR"):
         monkeypatch.setenv(var, "/preset")
-    monkeypatch.delenv("AMD_COMGR_CACHE_DIR", raising=False)
 
     assert _configure_cache_env() is None  # workspace given: no temp dir
     assert os.environ["XDG_CACHE_HOME"] == "/preset"

@@ -234,7 +234,6 @@ def _run_suite(
             reporter.error(f"writing {output_path} failed: {e}")
             return False
 
-    write_ok = True
     interrupted: Optional[int] = None
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_terminated)
     try:
@@ -245,7 +244,7 @@ def _run_suite(
             suite.graphs.append(gr)
             reporter.print_graph_table(gr)
             if time.monotonic() - last_write >= WRITE_INTERVAL_S:
-                write_ok = write() and write_ok
+                write()  # a failure is reported; the final write decides
                 last_write = time.monotonic()
         suite.run.finished_at = _now()
         suite.run.complete = True
@@ -259,7 +258,7 @@ def _run_suite(
             **host_memory_snapshot(),
             **GpuSmiProbe().snapshot(),
         }
-        write_ok = write() and write_ok
+        write_ok = write()
 
     if interrupted is not None:
         where = (

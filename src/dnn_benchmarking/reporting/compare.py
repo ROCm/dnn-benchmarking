@@ -9,8 +9,8 @@ at most ``max(threshold, 2 * sqrt(iqr_A**2 + iqr_B**2))`` (IQR / median per
 side, robust to a few outlier samples); a regression is B
 slower than that. Failed/error rows never enter the geomean.
 
-Exit codes: 0 no regression, 1 regression beyond threshold, 2 usage error,
-unreadable or incompatible input.
+Exit codes: 0 no regression (stderr warns when no timings were compared),
+1 regression beyond threshold, 2 usage error, unreadable or incompatible input.
 """
 
 import argparse
@@ -156,6 +156,8 @@ def _pair(
         pair.label = f"{'+'.join(failed)} failed"
         return pair
     pair.in_geomean = True
+    # hypot: the two runs' spreads are independent. 2x: heuristic margin so a
+    # median shift inside the combined IQR (ordinary run-to-run drift) is noise.
     band = max(threshold / 100.0, 2.0 * math.hypot(a_iqr or 0.0, b_iqr or 0.0))
     change = b_ms / a_ms - 1.0  # positive = B slower
     if abs(change) <= band:
@@ -263,7 +265,7 @@ def _print_table(
         ),
         ("note", False, [p["label"] for p in pairs]),
     ]
-    widths = [max(len(h), *(len(c) for c in cells)) for h, _, cells in columns]
+    widths = [max(len(h), *map(len, cells), 0) for h, _, cells in columns]
     # Graph and engine names share the squeeze; narrowest first so a short
     # column hands its unused share to the others.
     flex = sorted((0, 1, 3), key=lambda i: widths[i])
@@ -324,6 +326,8 @@ def main(argv: List[str]) -> int:
             )
             return 2
     report = compare(a, b, by=args.by, metric=args.metric, threshold=args.threshold)
+    if all(p["speedup"] is None for p in report["pairs"]):
+        print("warning: no timings were compared", file=sys.stderr)
     if args.json:
         json.dump(report, sys.stdout, indent=2, allow_nan=False)
         print()

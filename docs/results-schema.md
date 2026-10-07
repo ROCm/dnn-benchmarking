@@ -56,8 +56,8 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `timing_block` | int | `--timing-block`. `1` = one launch per sample; `N > 1` = rocKE block timing. |
 | `seed` | int | Input data seed. |
 | `validate` | string or null | Reference provider (`pytorch`), or `null` when validation is off. |
-| `rtol` | float or null | `--rtol`. `null` means dtype-aware defaults. |
-| `atol` | float or null | `--atol`. `null` means dtype-aware defaults. |
+| `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the applied values. |
+| `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle_mode` | string | `off`, `plan` or `exhaustive`. |
 | `autotune` | bool | `--autotune`. |
 | `cache_dir` | string or null | `--cache-dir`. |
@@ -185,7 +185,7 @@ stores the ID as the hex form of its unsigned 64-bit value
 | `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
 | `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
-| `fallback_reason` | string or null | Why `staged` mode was not used. |
+| `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the PyTorch `enqueue()` syncs with the host. |
 | `timing_block` | int | Launches per timed sample. `1` except in `block` mode. |
 
 See [methodology.md](methodology.md) for the meaning of each mode.
@@ -266,7 +266,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | `noisy: IQR x% of median` | `kernel.iqr_ms / kernel.median_ms` is more than 0.05 and `kernel.n` is 10 or more. |
 | `outlier: max Nx median` | `kernel.max_ms` is more than 2 x `kernel.median_ms`. |
 | `capped at max_iters` | `timing.capped` is `true`. |
-| `events timing: <reason>` | `timing.fallback_reason` is set. stderr also shows the reason one time per process. |
+| `<mode> timing: <reason>` | `timing.fallback_reason` is set. `<mode>` is `events` or `block` (`timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
 
@@ -379,6 +379,10 @@ With `-o`, the CLI writes the file while the suite runs:
    passed since the last write.
 3. It writes the file one last time when the run ends, also on an error or an
    interrupt.
+
+A failed write in step 2 prints an `ERROR` line on stderr, and the run goes
+on. When the last write succeeds, the exit code still follows the verdicts.
+Only a failed last write gives exit code 1.
 
 A file from steps 2 and 3 of an unfinished run has `run.complete = false` and
 `run.finished_at = null`. It holds every graph that completed. After SIGINT

@@ -10,6 +10,7 @@ the parser exercises its real SQL path against an in-test sqlite db.
 
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -255,6 +256,40 @@ class TestRunFailureModes:
         monkeypatch.setattr(rocprof_pmc, "detect_arch", lambda: "gfx-mystery")
         # Fallback table only defines 'basic'.
         assert _run(tmp_path, "memory")["pmc"]["skipped"] == "no counters defined"
+
+    def test_invocation_raises_oserror_returns_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rocprof_pmc, "detect_arch", lambda: "gfx942")
+        monkeypatch.setattr(rocprof_pmc, "resolve_rocm_tool", lambda name: "rocprofv3")
+        with patch.object(_subprocess, "run_capped", side_effect=OSError("boom")):
+            pmc = _run(tmp_path)["pmc"]
+        assert "boom" in pmc["skipped"]
+
+    def test_rocprofv3_binary_missing_returns_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rocprof_pmc, "detect_arch", lambda: "gfx942")
+        monkeypatch.setattr(rocprof_pmc, "resolve_rocm_tool", lambda name: None)
+        assert _run(tmp_path)["pmc"]["skipped"] == "profiling tool not found"
+
+    def test_timeout_returns_skipped(self, tmp_path, monkeypatch):
+        """A wedged rocprofv3 surfaces as skipped; --profiling-timeout
+        reaches the cap."""
+        monkeypatch.setattr(rocprof_pmc, "detect_arch", lambda: "gfx942")
+        monkeypatch.setattr(rocprof_pmc, "resolve_rocm_tool", lambda name: "rocprofv3")
+        seen = []
+
+        def wedge(argv, timeout_s):
+            seen.append(timeout_s)
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+
+        with patch.object(_subprocess, "run_capped", side_effect=wedge):
+            pmc = rocprof_pmc.run(
+                inner_argv=["python"],
+                out_dir=tmp_path,
+                timeout_s=123,
+                context="g/E",
+                pmc_set="basic",
+            )["pmc"]
+        assert seen == [123]
+        assert "timed out after 123s" in pmc["skipped"]
 
 
 class TestArchNarrowing:

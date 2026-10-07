@@ -58,7 +58,7 @@ package, run `PYTHONPATH=src python -m dnn_benchmarking ...`.
 | Code | Meaning |
 |---|---|
 | 0 | Success. An all-skipped run is also 0. |
-| 1 | Engine row error, graph error, result write failure, no graph files, or backend not available at startup. |
+| 1 | Engine row error, graph error, failed final result write (not a periodic one), no graph files, or backend not available at startup. |
 | 2 | Usage error: argparse, config file, backend-incompatible option, unknown `--engine`, unwritable `-o` or `--profiling-output-dir`, missing profiler tool. |
 | 3 | At least one engine row failed validation. 3 wins over 1, and 1 wins over 0. Only `role == "engine"` rows count, as in `summary()`. |
 | 130 / 143 | SIGINT / SIGTERM. The result file is partial (`run.complete = false`). |

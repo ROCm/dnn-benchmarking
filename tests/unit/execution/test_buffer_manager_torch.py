@@ -69,6 +69,19 @@ class TestTorchBackend:
 
         assert not bm._buffers[y.uid].any()
 
+    def test_zero_outputs_syncs_torch_before_hipdnn_runs(self, monkeypatch) -> None:
+        """zero_() runs on torch's stream and hipDNN on the handle stream; the
+        device sync is the only ordering between them."""
+        y = _strided(2, "float", is_output=True)
+        bm = BufferManager([y], device="cuda")
+        calls = []
+        bm._buffers[y.uid] = MagicMock(zero_=lambda: calls.append("zero_"))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+
+        bm.zero_outputs()
+
+        assert calls == ["zero_", "sync"]
+
 
 class TestDeviceBufferBackend:
     def test_get_output_tensor_is_none(self) -> None:

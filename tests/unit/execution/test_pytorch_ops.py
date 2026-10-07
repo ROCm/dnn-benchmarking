@@ -1909,14 +1909,70 @@ class TestReplayTensorsScalarCache:
         assert _scalar_value(tensors, 1, {}) == 9.0
 
 
-@pytest.mark.parametrize("rocm_build, expected", [(True, True), (False, False)])
-def test_miopen_batchnorm_only_on_rocm_builds(rocm_build, expected) -> None:
-    """CUDA torch has no aten.miopen_batch_norm, even for GPU tensors."""
-    from types import SimpleNamespace
+class _GpuTensor(torch.Tensor):
+    """CPU tensor that reports ``is_cuda`` so CPU torch reaches the GPU branch."""
 
-    from dnn_benchmarking.execution.pytorch_ops.handlers.batchnorm import _use_miopen
+    @property
+    def is_cuda(self) -> bool:
+        return True
 
-    assert _use_miopen(SimpleNamespace(is_cuda=True), rocm_build) is expected
+
+_BN_NODES = {
+    "miopen_batch_norm": {
+        "type": "BatchnormAttributes",
+        "inputs": {
+            "x_tensor_uid": 1,
+            "scale_tensor_uid": 2,
+            "bias_tensor_uid": 3,
+            "epsilon_tensor_uid": 4,
+        },
+        "outputs": {"y_tensor_uid": 5},
+    },
+    "miopen_batch_norm_backward": {
+        "type": "BatchnormBackwardAttributes",
+        "inputs": {"dy_tensor_uid": 3, "x_tensor_uid": 1, "scale_tensor_uid": 2},
+        "outputs": {
+            "dx_tensor_uid": 5,
+            "dscale_tensor_uid": 6,
+            "dbias_tensor_uid": 7,
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("miopen_op", sorted(_BN_NODES))
+@pytest.mark.parametrize("rocm_build", [True, False])
+def test_gpu_batchnorm_uses_miopen_only_on_rocm_builds(
+    monkeypatch, miopen_op, rocm_build
+) -> None:
+    """CUDA torch has no aten.miopen_batch_norm*, even for GPU tensors; ROCm
+    torch must use it so the reference runs the engine's MIOpen primitive."""
+    from dnn_benchmarking.execution.pytorch_ops.handlers import batchnorm
+
+    native_fwd = torch.native_batch_norm
+    native_bwd = torch.ops.aten.native_batch_norm_backward
+    calls = []
+
+    def miopen(*args):
+        calls.append(miopen_op)
+        if miopen_op == "miopen_batch_norm":
+            return native_fwd(*args)
+        x, dy, w, rm, rv, sm, si, eps = args
+        return native_bwd(dy, x, w, rm, rv, sm, si, True, eps, [True] * 3)
+
+    monkeypatch.setattr(torch.ops.aten, miopen_op, miopen)
+    monkeypatch.setattr(batchnorm.torch_support, "is_rocm_build", lambda: rocm_build)
+    tensors = {
+        1: torch.randn(4, 3, 2, 2).as_subclass(_GpuTensor),
+        2: torch.randn(3),
+        3: torch.randn(4, 3, 2, 2) if "backward" in miopen_op else torch.randn(3),
+        4: torch.tensor([1e-5]),
+    }
+
+    pytorch_ops.execute_graph({"nodes": [_BN_NODES[miopen_op]]}, tensors)
+
+    assert calls == ([miopen_op] if rocm_build else [])
+    assert 5 in tensors
 
 
 class TestStorePlanned:
@@ -2299,8 +2355,8 @@ class TestPyTorchSdpaPaged:
 
 
 class TestPyTorchSdpaMaskDerivation:
-    """The mask a graph is asking for, derived the way the engine derives it
-    (Gfx950AttentionTiledNative.cpp::maskTypeFor)."""
+    """The mask a graph is asking for, derived the way hipDNN derives it
+    (PlanUtils.hpp::extractDiagonalBandParams, CpuFpReferenceSdpa::isMasked)."""
 
     @staticmethod
     def _node(**attributes):
@@ -2335,14 +2391,24 @@ class TestPyTorchSdpaMaskDerivation:
 
         assert _sdpa_derive_mask(self._node()) == (False, None)
 
-    def test_a_real_bound_wins_over_the_boolean(self) -> None:
-        """causal_mask + a left bound is a WINDOW. Reading the boolean first
-        discards the window and serves the wrong triangle."""
+    def test_the_deprecated_boolean_wins_over_bounds(self) -> None:
+        """hipDNN: causal_mask means top-left causal and the bounds are
+        ignored, so a left bound must not turn it into a window."""
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sdpa_derive_mask,
         )
 
         assert _sdpa_derive_mask(self._node(causal_mask=True, left_bound=127)) == (
+            True,
+            None,
+        )
+
+    def test_left_bound_with_causal_right_bound_is_a_window(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(self._node(left_bound=127, right_bound=0)) == (
             False,
             128,
         )
@@ -2376,6 +2442,10 @@ class TestPyTorchSdpaMaskDerivation:
         [
             ({"left_bound": -5}, "neither unbounded nor a width"),
             ({"right_bound": 3}, "forward-looking band"),
+            # hipDNN keeps k <= q + right_bound; an unbounded or positive right
+            # edge is not the causal band the reference builds.
+            ({"left_bound": 2}, "forward-looking band"),
+            ({"left_bound": 2, "right_bound": 1}, "forward-looking band"),
         ],
     )
     def test_illegal_bounds_are_declined(self, attributes, match) -> None:

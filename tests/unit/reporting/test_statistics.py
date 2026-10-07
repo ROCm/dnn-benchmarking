@@ -62,9 +62,20 @@ class TestNoiseWarnings:
         stats = BenchmarkStats.from_timings([1.0, 1.3] * 10)
         assert any(w.startswith("noisy:") for w in noise_warnings(stats))
 
-    def test_wide_iqr_not_flagged_below_10_samples(self) -> None:
-        stats = BenchmarkStats.from_timings([1.0, 1.3] * 4)
-        assert not any(w.startswith("noisy:") for w in noise_warnings(stats))
+    @pytest.mark.parametrize(
+        "timings, flag, expected",
+        [
+            ([0.951] * 10 + [1.0] * 10, "noisy:", False),  # IQR 4.9% of median
+            ([0.949] * 10 + [1.0] * 10, "noisy:", True),  # IQR 5.1% of median
+            ([0.9] * 5 + [1.0] * 4, "noisy:", False),  # wide, but 9 samples
+            ([0.9] * 5 + [1.0] * 5, "noisy:", True),  # wide, 10 samples
+            ([1.0] * 9 + [1.9], "outlier:", False),
+            ([1.0] * 9 + [2.1], "outlier:", True),
+        ],
+    )
+    def test_thresholds(self, timings, flag, expected) -> None:
+        warnings = noise_warnings(BenchmarkStats.from_timings(timings))
+        assert any(w.startswith(flag) for w in warnings) == expected
 
     def test_few_slow_samples_do_not_make_a_tight_core_noisy(self) -> None:
         """High CV from two slow samples; the robust spread stays zero."""

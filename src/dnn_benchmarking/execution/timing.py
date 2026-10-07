@@ -348,7 +348,9 @@ def measure(
         device_sync(backend)
 
     if policy.timing_block > 1:
-        return _measure_blocks(enqueue, events, policy, backend, first_call_ms, primed)
+        return _measure_blocks(
+            enqueue, events, policy, backend, first_call_ms, primed, reason
+        )
 
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
@@ -413,6 +415,7 @@ def _measure_blocks(
     backend: str,
     first_call_ms: float,
     untimed: int,
+    host_sync: Optional[str],
 ) -> Measurement:
     """rocKE block timing (``time_launches`` / Solera ``measure()``).
 
@@ -424,6 +427,8 @@ def _measure_blocks(
 
     ``untimed`` counts the priming enqueues already run; every per-sample
     untimed execution is added to it for ``Measurement.warmup_iters``.
+    ``host_sync`` (the priming probe's finding) is kept as the fallback
+    reason: the block's event span then includes host round-trips.
     """
     block = policy.timing_block
     kernel_ms: List[float] = []
@@ -462,6 +467,7 @@ def _measure_blocks(
         warmup_iters=untimed,
         first_call_ms=first_call_ms,
         capped=capped,
+        fallback_reason=host_sync,
         timing_block=block,
     )
 

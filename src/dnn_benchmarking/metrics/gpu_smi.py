@@ -12,8 +12,10 @@ records ``amdsmi_available`` in the environment block.
 
 ``GpuSmiProbe`` targets the GPU the workload runs on: device indices are
 HIP (torch) logical indices, mapped to the amdsmi handle by PCI bus
-address so ``HIP_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` remapping
-does not silently point the probe at another GPU.
+address. When that address is unknown (torch missing or seeing no GPU) or
+matches no amdsmi device, the HIP index is used as the amdsmi index; under
+``HIP_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` remapping that can be
+another physical GPU.
 """
 
 import functools

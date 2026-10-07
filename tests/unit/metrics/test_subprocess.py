@@ -80,10 +80,13 @@ class TestRunCapped:
         assert proc.stdout.strip() == "ok"
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setenv")
-    def test_child_env_drops_natively_set_variables(self):
+    def test_child_env_drops_natively_set_variables(self, monkeypatch):
         """HIP setenv()s variables during init that make rocprofv3 abort
         (rc=-6) in the profiled child; run_capped passes ``os.environ``
-        (the Python snapshot) instead of inheriting the C-level environ."""
+        (the Python snapshot) instead of inheriting the C-level environ.
+        Variables set through ``os.environ`` (PATH, HIPDNN_CACHE_DIR, ...)
+        must still reach the child."""
+        monkeypatch.setenv("DNN_BENCH_PY_SET", "1")
         libc = ctypes.CDLL(None)
         libc.setenv(b"DNN_BENCH_NATIVE_ONLY", b"1", 1)
         try:
@@ -91,13 +94,14 @@ class TestRunCapped:
                 [
                     sys.executable,
                     "-c",
-                    "import os; print(os.environ.get('DNN_BENCH_NATIVE_ONLY'))",
+                    "import os; print(os.environ.get('DNN_BENCH_NATIVE_ONLY'), "
+                    "os.environ.get('DNN_BENCH_PY_SET'))",
                 ],
                 60,
             )
         finally:
             libc.unsetenv(b"DNN_BENCH_NATIVE_ONLY")
-        assert proc.stdout.strip() == "None"
+        assert proc.stdout.split() == ["None", "1"]
 
     def test_missing_binary_raises_oserror(self, tmp_path):
         with pytest.raises(OSError):
@@ -173,6 +177,14 @@ class TestRunTool:
     def test_missing_binary_is_skipped(self, tmp_path):
         proc, fields = run_tool("src", None, [], tmp_path, 60, "g/E")
         assert proc is None and "skipped" in fields
+
+    def test_spawn_failure_is_skipped(self, tmp_path):
+        """Profiling is never fatal: a binary that cannot be executed skips."""
+        proc, fields = run_tool(
+            "src", str(tmp_path / "no-such-tool"), [], tmp_path, 60, "g/E"
+        )
+        assert proc is None
+        assert "no-such-tool invocation failed" in fields["skipped"]
 
     def test_failure_warning_names_graph_and_engine_each_time(self, tmp_path, capsys):
         """Per-engine failures must not collapse into one deduplicated line."""

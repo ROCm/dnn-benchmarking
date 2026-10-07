@@ -83,9 +83,12 @@ class GraphLoader:
         outputs = output_uids(graph_json)
         result = []
         for tensor_json in graph_json.get("tensors", []):
+            # Virtual tensors get no buffer, and hipDNN may leave their
+            # data_type "unset" (filled from intermediate_data_type), so skip
+            # them before resolving the dtype.
+            if isinstance(tensor_json, dict) and tensor_json.get("virtual"):
+                continue
             tensor_info = TensorInfo.from_json(tensor_json)
             tensor_info.is_output = tensor_info.uid in outputs
-            # Skip virtual tensors - they don't need buffers
-            if not tensor_info.is_virtual:
-                result.append(tensor_info)
+            result.append(tensor_info)
         return result

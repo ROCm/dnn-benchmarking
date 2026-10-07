@@ -96,7 +96,7 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | Engine row error, graph error, write failure, no graph files, or backend not available. |
+| 1 | Engine row error, graph error, failed final result write, no graph files, or backend not available. |
 | 2 | Usage or config error. |
 | 3 | An engine row failed validation. |
 | 130 / 143 | Interrupted by SIGINT / SIGTERM. A partial result file has `run.complete = false`. |

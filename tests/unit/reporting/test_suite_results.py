@@ -139,11 +139,12 @@ class TestBuildOracleDelta:
         tuned = BenchmarkStats.from_timings([1.0])
         assert build_oracle_delta(_oracle(gpu_kernel_stats=tuned)) is None
 
-    def test_non_positive_median_means_no_delta(self) -> None:
+    @pytest.mark.parametrize("baseline, tuned", [(2.0, 0.0), (0.0, 2.0)])
+    def test_non_positive_median_means_no_delta(self, baseline, tuned) -> None:
         delta = build_oracle_delta(
             _oracle(
-                gpu_kernel_stats=BenchmarkStats.from_timings([0.0]),
-                warm_baseline_gpu_kernel_stats=BenchmarkStats.from_timings([2.0]),
+                gpu_kernel_stats=BenchmarkStats.from_timings([tuned]),
+                warm_baseline_gpu_kernel_stats=BenchmarkStats.from_timings([baseline]),
             )
         )
         assert delta is None
@@ -157,16 +158,21 @@ def test_graph_id_is_order_independent_and_content_sensitive() -> None:
 
 
 def _sample_suite(complete=True) -> SuiteResult:
+    # Skewed samples so mean != median; every value-carrying field distinct.
     row = ProviderEngineResult(
         "hipdnn",
         -1,
         "success",
         engine_name="MIOPEN_ENGINE",
-        gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 30),
-        host_stats=BenchmarkStats.from_timings([0.01] * 30),
+        gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 29 + [5.0]),
+        host_stats=BenchmarkStats.from_timings([0.01] * 29 + [1.0]),
         correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
-        timing=TimingInfo("staged", "hip", "cold", 10, 3.0),
+        timing=TimingInfo("staged", "hip", "cold", 10, 3.0, timing_block=4),
+        elapsed_time_ms=2500.0,
+        cpu_build_time_ms=12.0,
+        workspace_bytes=4096,
         derived_tflops_per_s=1.5,
+        derived_gbytes_per_s=20.0,
     )
     return _suite(
         [
@@ -245,6 +251,21 @@ class TestWriteLoad:
         SuiteResult.load(path)
         assert "partial" in capsys.readouterr().err
 
+    def test_json_row_values(self, tmp_path) -> None:
+        path = tmp_path / "r.json"
+        _sample_suite().write(path)
+        row = SuiteResult.load(path)["graphs"][0]["results"][0]
+        assert (row["elapsed_s"], row["build_ms"]) == (2.5, 12.0)
+        assert (row["kernel"]["median_ms"], row["kernel"]["mean_ms"]) == (0.5, 0.65)
+        assert row["host"]["median_ms"] == 0.01
+        assert row["timing"]["timing_block"] == 4
+        metrics = row["metrics"]
+        assert (metrics["tflops"], metrics["gbps"], metrics["workspace_bytes"]) == (
+            1.5,
+            20.0,
+            4096,
+        )
+
     def test_csv_rows(self, tmp_path) -> None:
         path = tmp_path / "r.csv"
         _sample_suite().write(path)
@@ -253,19 +274,32 @@ class TestWriteLoad:
             rows = list(reader)
         assert tuple(reader.fieldnames) == ROW_COLUMNS
         row, graph_error, no_engines = rows
-        assert row["gpu_arch"] == "gfx90a"
-        assert row["graph_id"] == "0123456789ab"
-        assert row["engine_id"] == "0xFFFFFFFFFFFFFFFF"
-        assert row["verdict"] == "passed"
-        assert float(row["kernel_median_ms"]) == 0.5
-        assert float(row["host_median_ms"]) == 0.01
-        assert float(row["max_abs_diff"]) == 2e-6
-        assert (row["n"], row["timing_mode"], row["cache_mode"]) == (
-            "30",
-            "staged",
-            "cold",
-        )
-        assert row["seed"] == no_engines["seed"] == "7"
+        # Sample std 0.8216 over mean 0.65.
+        assert float(row.pop("kernel_cv")) == pytest.approx(1.264, abs=1e-3)
+        assert row == {
+            "gpu_arch": "gfx90a",
+            "graph_name": "g",
+            "graph_id": "0123456789ab",
+            "provider": "hipdnn",
+            "role": "engine",
+            "engine_id": "0xFFFFFFFFFFFFFFFF",
+            "engine_name": "MIOPEN_ENGINE",
+            "status": "success",
+            "verdict": "passed",
+            "kernel_median_ms": "0.5",
+            "host_median_ms": "0.01",
+            "n": "30",
+            "timing_mode": "staged",
+            "cache_mode": "cold",
+            "timing_block": "4",
+            "seed": "7",
+            "tflops": "1.5",
+            "gbps": "20.0",
+            "workspace_bytes": "4096",
+            "max_abs_diff": "2e-06",
+            "message": "",
+        }
+        assert no_engines["seed"] == "7"
         assert (graph_error["graph_name"], graph_error["status"]) == ("bad", "error")
         assert graph_error["message"] == "parse failed"
         assert no_engines["status"] == "no_engines"

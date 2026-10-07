@@ -114,45 +114,42 @@ def _plan_sdpa_common(
 
 
 def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
-    """Resolve (is_causal, sliding_window_width) the way the engine does.
+    """Resolve (is_causal, sliding_window_width) the way hipDNN does.
 
-    Mirrors ``Gfx950AttentionTiledNative.cpp::maskTypeFor``. Two things there are
-    easy to get wrong and both produce a wrong answer rather than an error:
+    Mirrors hipDNN's ``extractDiagonalBandParams`` (CPU reference) and the
+    ASM SDPA engine's ``getMaskType``:
 
-      * **A real bound wins over the deprecated booleans.** They can only say
-        top-left vs bottom-right, so a graph that sets ``causal_mask`` *and*
-        carries ``left_bound`` is asking for a window; reading the boolean first
-        silently discards it.
-      * **Both spellings occur in this repo.** The shipped ``quick/SdpaFwd``
-        bundles leave the booleans false and express causality as
-        ``left_bound=-1, right_bound=0``, while the model traces set
-        ``causal_mask: true``. Reading only one convention passes one population
-        and mis-serves the other.
+      * **The deprecated ``causal_mask`` wins**: it means top-left causal and
+        the bounds are ignored.
+      * Otherwise row ``q`` keeps ``q - left_bound <= k <= q + right_bound``,
+        an unset or ``-1`` bound being unbounded. The shipped ``quick/SdpaFwd``
+        bundles spell causality as ``left_bound=-1, right_bound=0``, while the
+        model traces set ``causal_mask: true``; both must resolve the same.
 
-    The window WIDTH is ``left_bound + 1``: hipDNN's left bound counts tokens
-    strictly before the current one, the band includes it.
+    The window WIDTH is ``left_bound + 1`` (the band includes the current
+    token). Only causal bands (``right_bound == 0``) are expressible here.
     """
+    if _sdpa_bool(node, "causal_mask"):
+        return True, None
+
     unbounded = -1
     left = _node_param(node, "left_bound", unbounded)
     right = _node_param(node, "right_bound", unbounded)
     left = unbounded if left is None else int(left)
     right = unbounded if right is None else int(right)
 
-    if left != unbounded:
-        if left < 0:
-            raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
-        return False, left + 1
-
-    if _sdpa_bool(node, "causal_mask"):
+    if left < unbounded:
+        raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+    if right != 0:
+        if right == unbounded and left == unbounded:
+            return False, None
+        raise ValueError(
+            f"SDPA right_bound {right} is a forward-looking band the reference "
+            "cannot express"
+        )
+    if left == unbounded:
         return True, None
-    if right == unbounded:
-        return False, None
-    if right == 0:
-        return True, None
-    raise ValueError(
-        f"SDPA right_bound {right} is a forward-looking band the reference "
-        "cannot express"
-    )
+    return False, left + 1
 
 
 def _sdpa_resolve(
@@ -214,7 +211,7 @@ def _call_sdpa(
     if window is not None:
         # A sliding window has no boolean spelling in torch's SDPA, so it is
         # expressed as the additive mask it actually is. is_causal is already
-        # False here: a bounded left edge wins over the deprecated booleans.
+        # False here: a window is derived only when causal_mask is unset.
         attn_mask = _sliding_window_mask(
             int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
         )
@@ -468,7 +465,7 @@ def compile_sdpa(
         if window is not None:
             # A sliding window has no boolean spelling in torch's SDPA; build
             # the additive band mask once so O and stats see the same mask.
-            # is_causal is already False: a bounded left edge wins.
+            # is_causal is already False: windows exclude causal_mask.
             attn_mask = _sliding_window_mask(
                 int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
             )

@@ -69,6 +69,7 @@ class Fake:
         self.engine_output = REF.copy()
         self.torch_error = None
         self.clocks = []
+        self.events = []
 
 
 @pytest.fixture
@@ -81,6 +82,7 @@ def fake(monkeypatch):
             self.init_time_ms, self.workspace_size = 2.0, 64
 
         def discover_engines(self, handle):
+            f.events.append("discover")
             if f.discover_error:
                 raise f.discover_error
             return list(f.discovered)
@@ -91,12 +93,16 @@ def fake(monkeypatch):
                 raise f.prepare_errors[engine_id]
 
         def benchmark(self, handle, variant_pack):
+            f.events.append("benchmark")
             if self.engine_id in f.bench_errors:
                 raise f.bench_errors[self.engine_id]
             return _measurement(**f.measurement)
 
         def execute_once(self, handle, variant_pack):
-            pass
+            f.events.append("execute_once")
+
+        def __del__(self):
+            f.events.append("executor_freed")
 
     class BufferManager:
         def __init__(self, tensor_infos, device=None):
@@ -106,6 +112,7 @@ def fake(monkeypatch):
             return self
 
         def __exit__(self, *exc):
+            f.events.append("buffers_freed")
             return False
 
         def allocate_all(self):
@@ -115,7 +122,7 @@ def fake(monkeypatch):
             pass
 
         def zero_outputs(self):
-            pass
+            f.events.append("zero_outputs")
 
         def create_variant_pack(self):
             return {}
@@ -124,6 +131,7 @@ def fake(monkeypatch):
             return None
 
         def get_output_data(self, uid):
+            f.events.append("read_output")
             return f.engine_output
 
     class Probe:
@@ -489,29 +497,69 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
     ]
 
 
-def test_profiling_payload_lands_on_the_row(fake, monkeypatch):
-    """The child gets the timed run's seed (same inputs) and metric flags."""
+def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):
+    """The child gets the row's engine, plugin, seed (same inputs), warmup and
+    metric flags, and runs only after the row's buffers and workspace are
+    released (holding them would roughly double peak VRAM)."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
     calls = []
 
     def run_profiling_passes(**kw):
+        fake.events.append("profile")
         calls.append(kw)
         return {"perf": {"cycles": kw["engine_name"]}}
 
     monkeypatch.setattr(
         profiling_orchestrator, "run_profiling_passes", run_profiling_passes
     )
-    fake.discovered = [1]
     metrics = MetricsConfig(perf=True, pmc_set="basic", profiling_timeout_s=42.0)
 
-    graph, progress = _run(seed=7, metrics=metrics)
+    graph, progress = _run(
+        seed=7,
+        warmup_iters=3,
+        metrics=metrics,
+        engine_filter=[2],
+        plugin_paths=[Path("/a")],
+    )
 
-    assert graph.results[0].extra_metrics == {"perf": {"cycles": "ENG_A"}}
-    assert "profiling ENG_A" in progress
-    [kw] = calls
-    assert kw["seed"] == 7
-    assert kw["metrics_config"] == metrics
+    assert graph.results[0].extra_metrics == {"perf": {"cycles": "ENG_B"}}
+    assert "profiling ENG_B" in progress
+    assert calls == [
+        dict(
+            graph_path=PATH,
+            engine_id=2,
+            engine_name="ENG_B",
+            seed=7,
+            warmup_iters=3,
+            metrics_config=metrics,
+            plugin_path=Path("/a"),
+        )
+    ]
+    assert fake.events[-3:] == ["buffers_freed", "executor_freed", "profile"]
+
+
+def test_validation_reads_outputs_zeroed_after_the_timed_loop(fake_torch):
+    """Outputs left by the timed loop must not satisfy the reference check."""
+    _validate(engine_filter=[1])
+
+    assert fake_torch.events[:5] == [
+        "zero_outputs",
+        "benchmark",
+        "zero_outputs",
+        "execute_once",
+        "read_output",
+    ]
+
+
+def test_explicit_engines_run_in_caller_order_without_discovery(fake):
+    fake.discovered = [1, 2]
+
+    graph, _ = _run(engine_filter=[2, 9, 1])
+
+    assert graph.engine_ids == [2, 9, 1]
+    assert [r.engine_id for r in graph.results] == [2, 9, 1]
+    assert "discover" not in fake.events
 
 
 def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
@@ -534,6 +582,43 @@ def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
     # Every profiling progress line is completed.
     assert progress.count("profiling ENG_A ... done") == 1
     assert progress.count("profiling ENG_B ... done") == 1
+
+
+@pytest.mark.parametrize(
+    "provider, reason",
+    [
+        (None, "not registered"),
+        (SimpleNamespace(is_available=lambda: False), "not available"),
+        (
+            SimpleNamespace(is_available=lambda: True, supports_graph=lambda g: False),
+            "does not support this graph",
+        ),
+        (
+            SimpleNamespace(is_available=lambda: True, supports_graph=lambda g: True),
+            None,
+        ),
+    ],
+)
+def test_reference_provider_is_usable_or_says_why_not(monkeypatch, provider, reason):
+    def get_provider(name):
+        assert name == "pytorch"
+        if provider is None:
+            raise ValueError(name)
+        return provider
+
+    monkeypatch.setattr(
+        suite_runner.ReferenceProviderRegistry, "get_provider", get_provider
+    )
+    config = SuiteConfig(validation=ValidationConfig(provider="pytorch"))
+
+    got = suite_runner._reference_provider(config, GRAPH)
+
+    expected = (
+        (provider, None)
+        if reason is None
+        else (None, f"Reference provider 'pytorch' {reason}")
+    )
+    assert got == expected
 
 
 class TestPytorchBackend:
