@@ -333,6 +333,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     row = _run()[0].results[0]
 
     assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
+    assert row.host_stats.median_ms == pytest.approx(0.01)
     assert row.derived_tflops_per_s == pytest.approx(2.0)
     assert row.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
     assert row.timing.mode == "events" and row.timing.first_call_ms == 5.0
@@ -730,6 +731,18 @@ class TestPytorchBackend:
 
         assert row.status == "error"
         assert row.error_message == "ExecutionError: PyTorch GPU not available"
+
+    def test_engine_row_gets_no_reference_warnings(self, fake_torch, monkeypatch):
+        from dnn_benchmarking.execution import pytorch_ops
+
+        monkeypatch.setattr(
+            pytorch_ops, "get_reference_warnings", lambda graph_json: ["manual op"]
+        )
+
+        (row,) = self._run().results
+
+        assert row.role == "engine"
+        assert "manual op" not in (row.warnings or [])
 
     @pytest.mark.parametrize(
         "sdpa_backend, status", [("default", "skipped"), ("math", "error")]

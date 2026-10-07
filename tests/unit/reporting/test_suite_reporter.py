@@ -109,14 +109,15 @@ class TestTableLayout:
             _row("FAST", 0.020),
             _row("MID", 0.025),
             _row("SLOW", 0.040),
-            # A wrong answer is not a "best" and the reference is not an engine.
+            # A wrong answer is not a "best", so it gets no ratio either; the
+            # reference is not an engine.
             _row("WRONG", 0.005, correctness=_verdict(False)),
             _row("pytorch", 0.010, role="reference"),
         )
         assert _cells(text, "FAST")[-1] == "1.00x"
         assert _cells(text, "MID")[-1] == "0.80x"
         assert _cells(text, "SLOW")[-1] == "0.50x"
-        assert _cells(text, "WRONG")[-1] == "4.00x"
+        assert _cells(text, "WRONG")[-1] == "-"
         assert _cells(text, "pytorch")[-1] == "ref"
 
     def test_skipped_and_error_rows_show_their_reason(self) -> None:
@@ -340,6 +341,19 @@ class TestVerboseBlock:
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
         assert "output mismatch" in out.getvalue()
+
+    def test_every_row_gets_a_detail_block(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_verbose(
+            _graph(_row("FIRST"), _row("SECOND"))
+        )
+        assert "FIRST (0x" in out.getvalue() and "SECOND (0x" in out.getvalue()
+
+    def test_plan_mode_oracle_claims_no_exhaustive_search(self) -> None:
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_verbose(_graph(_oracle_row()))
+        assert "tuned_plan_7" in out.getvalue()
+        assert "exhaustive" not in out.getvalue()
 
     @pytest.mark.parametrize(
         "pe, expected",

@@ -7,7 +7,6 @@ import os
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
-from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
 from ..metrics._diagnostic import warn_once
@@ -81,11 +80,10 @@ def run_oracle_pass(
             executor.prepare(oracle_handle, engine_id=engine_id, for_autotune=True)
 
             bm.zero_outputs()
+            # Raises unless a filtered-engine candidate succeeded.
             candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
             eligible = [c for c in candidates if not c.excluded_by_caller]
             successful = [c for c in eligible if c.succeeded]
-            if not successful:
-                raise ExecutionError("autotune produced no successful candidate")
             winner = successful[0]  # hipDNN returns successes in rank order.
 
             bm.zero_outputs()

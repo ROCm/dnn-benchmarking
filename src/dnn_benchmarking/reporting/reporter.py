@@ -492,7 +492,7 @@ class Reporter:
         stats = pe.gpu_kernel_stats
         if (
             best is None
-            or pe.status != "success"
+            or pe.verdict not in ("passed", "unchecked")  # best_candidates' rule
             or stats is None
             or stats.median_ms <= 0
         ):

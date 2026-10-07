@@ -199,6 +199,7 @@ class TestRunHappyPath:
 
         with patch.object(_subprocess, "run_capped", side_effect=fake_run):
             pmc = _run(out_dir)["pmc"]
+        assert (pmc["set"], pmc["arch"]) == ("basic", "gfx942")
         assert pmc["db_path"] == str(out_dir / "results.db")
         # No cross-kernel aggregate: fills and warmups would pollute it.
         assert "counters" not in pmc

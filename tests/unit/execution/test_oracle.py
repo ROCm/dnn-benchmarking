@@ -77,6 +77,7 @@ class _TunedExecutor:
     candidates = [_candidate()]
     kernel_ms = [0.5, 0.5, 0.5, 9.0]
     prepare_error = None
+    autotune_error = None
     env_at_prepare = None
     prepared_on = None
 
@@ -91,6 +92,8 @@ class _TunedExecutor:
 
     def autotune(self, handle, variant_pack, engine_id):
         CALLS.append(("tuned.autotune", handle))
+        if self.autotune_error is not None:
+            raise self.autotune_error
         return self.candidates
 
     def benchmark(self, handle, variant_pack):
@@ -225,16 +228,15 @@ def test_first_eligible_success_wins_and_counts_ignore_excluded_plans(tuned):
     assert o.knob_settings == [{"knob_id": "4", "value": 8}]
 
 
-@pytest.mark.parametrize(
-    "candidates",
-    [[], [_candidate(succeeded=False)], [_candidate(excluded=True)]],
-)
-def test_no_successful_candidate_is_an_oracle_error(tuned, candidates):
-    tuned.candidates = candidates
+def test_failed_sweep_is_an_oracle_error_and_skips_timing(tuned):
+    """Executor.autotune raises when no candidate succeeded; the oracle keeps
+    its message, times nothing, and leaves the row verdict alone."""
+    tuned.autotune_error = ExecutionError("workspace exceeds limit")
     row = _run()
 
     assert row.oracle is None and row.oracle_delta is None
-    assert "no successful candidate" in row.oracle_error
+    assert row.oracle_error == "ExecutionError: workspace exceeds limit"
+    assert [c for c, _ in CALLS] == ["zero_outputs", "tuned.autotune"]
     assert row.status == "success"
 
 

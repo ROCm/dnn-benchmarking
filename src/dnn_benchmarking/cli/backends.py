@@ -17,6 +17,7 @@ from ..execution.suite_runner import (
 from ..reporting.reporter import Reporter
 from ..reporting.suite_results import GraphResult, engine_id_hex
 from ..validation.reference_provider import ReferenceProviderRegistry
+from .parser import TYPED_ENGINE_NAMES
 
 #: ``run_graph(graph_path, graph_json, tensor_infos) -> GraphResult``
 GraphRunner = Callable[[Path, Dict[str, Any], list], GraphResult]
@@ -135,10 +136,11 @@ def _check_engines_loaded(
 
 
 def _engine_label(hipdnn: Any, engine_id: int) -> str:
-    """``NAME/0xHEX`` when the ID has a registered name, else ``0xHEX``."""
+    """``NAME/0xHEX`` when the ID has a registered or typed name, else ``0xHEX``."""
     try:
         name = hipdnn.engine_id_to_name(engine_id)
     except Exception:
         name = ""
+    name = name or TYPED_ENGINE_NAMES.get(engine_id, "")
     hex_id = engine_id_hex(engine_id)
     return f"{name}/{hex_id}" if name else hex_id

@@ -85,7 +85,7 @@ def test_aggregates_over_outputs_and_names_the_failing_output():
     ref = {1: _ref([1, 2, 3, 4]), 2: _ref([1, 1, 1, 1])}
     bm = _HostBM(
         {
-            1: np.array([1, 2, 3, 4], np.float32),
+            1: np.array([1, 2, 3, 5], np.float32),
             2: np.array([1, 1, 9, 5], np.float32),
         }
     )
@@ -93,7 +93,7 @@ def test_aggregates_over_outputs_and_names_the_failing_output():
     c = check_correctness(bm, [_out(1), _out(2)], ref, "pytorch", _config())
 
     assert c.tolerance_match is False
-    assert (c.n_mismatch, c.n_total) == (2, 8)
+    assert (c.n_mismatch, c.n_total) == (3, 8)
     assert c.worst_output_uid == 2
     assert c.max_abs_diff == pytest.approx(8.0)
     assert "output 2" in c.error_message
@@ -138,10 +138,24 @@ def test_passing_outputs_report_diffs_without_message():
     ],
 )
 def test_missing_side_is_a_failure_not_a_pass(refs, outputs, reason):
-    c = check_correctness(_HostBM(outputs), [_out(1)], refs, "pytorch", _config())
+    config = _config(rtol=0.1, atol=0.2)
+    c = check_correctness(_HostBM(outputs), [_out(1)], refs, "pytorch", config)
 
     assert c.explicitly_failed
     assert reason in c.error_message
+    # The verdict reports the --rtol/--atol the run asked for.
+    assert (c.rtol, c.atol) == (0.1, 0.2)
+
+
+def test_read_failure_is_a_failure_not_a_crash():
+    class FailingBM:
+        def get_output_data(self, uid):
+            raise RuntimeError("hipMemcpy failed")
+
+    c = check_correctness(FailingBM(), [_out(1)], {1: _ref([0])}, "pytorch", _config())
+
+    assert c.explicitly_failed
+    assert c.error_message == "hipMemcpy failed"
 
 
 def test_device_reference_is_compared_without_host_copy():

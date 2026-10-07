@@ -13,6 +13,7 @@ import pytest
 
 import dnn_benchmarking.execution.timing as timing_module
 from dnn_benchmarking.common.exceptions import ExecutionError
+from dnn_benchmarking.config import PyTorchSdpaBackendName
 from dnn_benchmarking.config.benchmark_config import TimingPolicy
 
 # Import the reference handlers under real (CPU) torch so their module-level
@@ -177,10 +178,14 @@ def rocm_module(monkeypatch, fake_cuda):
     yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=True)
 
 
-@pytest.fixture
-def cuda_module(monkeypatch, fake_cuda):
-    monkeypatch.setattr(timing_module, "hipdnn", None)
-    monkeypatch.setitem(sys.modules, "hipdnn_frontend", None)  # not importable
+@pytest.fixture(params=[False, True], ids=["no-hip-runtime", "hip-runtime"])
+def cuda_module(request, monkeypatch, fake_cuda):
+    # CUDA torch cannot share HIP events even when a HIP runtime is importable.
+    if request.param:
+        _install_fake_hip(monkeypatch, fake_cuda.log)
+    else:
+        monkeypatch.setattr(timing_module, "hipdnn", None)
+        monkeypatch.setitem(sys.modules, "hipdnn_frontend", None)  # not importable
     yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=False)
 
 
@@ -309,6 +314,30 @@ def test_execute_once_runs_on_stream_and_drains_it(
 
     assert compiled.seen == [{2: "y"}]
     assert fake_cuda.log == ["stream_sync"]
+
+
+def test_sdpa_options_reach_the_replay(rocm_module, monkeypatch, fake_cuda) -> None:
+    ops = rocm_module.pytorch_ops
+    seen = []
+
+    @contextmanager
+    def use_backend(state):
+        seen.append((state.selection, state.rocm_fa_library))
+        yield
+
+    monkeypatch.setattr(ops, "use_pytorch_sdpa_backend", use_backend)
+    monkeypatch.setattr(ops, "compile_graph", lambda g: RecordingCompiled(fake_cuda))
+    executor = rocm_module.PyTorchCudaExecutor(
+        {"nodes": []},
+        TimingPolicy(),
+        pytorch_sdpa_backend="flash",
+        pytorch_rocm_fa_library="aotriton",
+    )
+    executor.prepare()
+
+    executor.execute_once({})
+
+    assert seen == [(PyTorchSdpaBackendName.FLASH, "aotriton")]
 
 
 def test_benchmark_before_prepare_raises(rocm_module) -> None:

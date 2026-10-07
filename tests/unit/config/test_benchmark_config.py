@@ -70,6 +70,21 @@ id = 1
         """Inputs are reproducible without --seed (pre-fix default was random)."""
         assert SuiteConfig.from_namespace(_namespace(["-g", "g.json"])).seed == 0
 
+    def test_shipped_run_defaults(self) -> None:
+        """docs/usage.md documents these; default-path trend numbers depend on them."""
+        suite = SuiteConfig.from_namespace(_namespace(["-g", "g.json"]))
+
+        policy = suite.timing_policy
+        assert (
+            policy.warmup_iters,
+            policy.iters,
+            policy.min_time_ms,
+            policy.max_iters,
+            policy.cache_mode,
+            policy.timing_block,
+        ) == (10, 100, 0.0, 10_000, "warm", 1)
+        assert suite.metrics.profiling_timeout_s == 600
+
     def test_hipdnn_without_plugin_path_uses_rocm_path(self, monkeypatch) -> None:
         monkeypatch.setenv("ROCM_PATH", "/opt/rocm-x")
         suite = SuiteConfig.from_namespace(_namespace(["-g", "g.json"]))
@@ -162,19 +177,19 @@ class TestSuiteConfigPluginPaths:
         assert [s.plugin_path for s in selections] == [Path("/plugins/a")] * 2
         assert config.plugin_path == Path("/plugins/a")
 
-    def test_repeated_engine_ids_keep_distinct_plugin_paths_in_order(self) -> None:
-        config = SuiteConfig(
-            engine_filter=[1, 1],
-            plugin_paths=[Path("/plugins/a"), Path("/plugins/b")],
-        )
+    @pytest.mark.parametrize(
+        "engines, paths", [([1, 1], ["a", "b"]), ([2, 1], ["b", "a"])]
+    )
+    def test_plugin_paths_pair_with_engines_in_caller_order(
+        self, engines: list[int], paths: list[str]
+    ) -> None:
+        plugin_paths = [Path("/plugins") / p for p in paths]
+        config = SuiteConfig(engine_filter=engines, plugin_paths=plugin_paths)
 
-        selections = config.engine_selections_for([1, 1])
+        selections = config.engine_selections_for(engines)
 
-        assert [s.engine_id for s in selections] == [1, 1]
-        assert [s.plugin_path for s in selections] == [
-            Path("/plugins/a"),
-            Path("/plugins/b"),
-        ]
+        assert [s.engine_id for s in selections] == engines
+        assert [s.plugin_path for s in selections] == plugin_paths
         assert config.plugin_path is None
 
     def test_multiple_plugin_paths_require_engine_filter(self) -> None:

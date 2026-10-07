@@ -7,10 +7,11 @@ import argparse
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config.benchmark_config import (
     ExecutionBackendName,
@@ -36,6 +37,9 @@ from .backends import BackendStartupError, GraphRunner, start_backend
 #: Minimum seconds between intermediate result writes.
 WRITE_INTERVAL_S = 10.0
 
+#: Seconds a SIGTERM'd run gets to write its partial file before a forced exit.
+SIGTERM_GRACE_S = 30.0
+
 # Match hipDNN's documented truthy values. Notably, "0" leaves a switch off.
 _TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
 
@@ -57,6 +61,39 @@ class _Terminated(BaseException):
 
 def _raise_terminated(signum: int, frame: Any) -> None:
     raise _Terminated()
+
+
+def _arm_sigterm_watchdog() -> Callable[[], None]:
+    """Force exit 143 if a SIGTERM is not handled within SIGTERM_GRACE_S.
+
+    A Python handler runs only between bytecodes, so it never runs while the
+    main thread waits in native GPU code (a hung kernel). The C-level handler
+    still writes the signal number to the wakeup fd, which wakes this thread.
+    Returns the function that disarms it once the run has handled the signal."""
+    if sys.platform == "win32":  # no wakeup-fd pipe; os.kill(SIGTERM) ends it
+        return lambda: None
+    handled = threading.Event()
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)  # required by set_wakeup_fd
+    previous_fd = signal.set_wakeup_fd(write_fd)
+    grace_s = SIGTERM_GRACE_S
+
+    def watch() -> None:
+        try:
+            while data := os.read(read_fd, 64):  # b"" once disarmed
+                if signal.SIGTERM in data and not handled.wait(grace_s):
+                    os._exit(143)
+        finally:
+            os.close(read_fd)
+
+    threading.Thread(target=watch, name="sigterm-watchdog", daemon=True).start()
+
+    def disarm() -> None:
+        handled.set()
+        signal.set_wakeup_fd(previous_fd)
+        os.close(write_fd)
+
+    return disarm
 
 
 def _truthy_env(name: str) -> bool:
@@ -243,6 +280,7 @@ def _run_suite(
 
     interrupted: Optional[int] = None
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_terminated)
+    disarm_watchdog = _arm_sigterm_watchdog()
     try:
         last_write = time.monotonic()
         for i, graph_path in enumerate(graph_paths, start=1):
@@ -272,6 +310,7 @@ def _run_suite(
             environment["end_of_run"] = end_of_run
             write_ok = write()
         finally:
+            disarm_watchdog()
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
 

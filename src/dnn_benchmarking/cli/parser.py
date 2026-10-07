@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
@@ -125,6 +125,11 @@ def _signed64(value: int, token: str) -> int:
     return value - _UINT64 if value >= 1 << 63 else value
 
 
+#: Engine names parse_engine_id hashed, by ID, so an error about an engine no
+#: plugin provides can show the name the user typed.
+TYPED_ENGINE_NAMES: Dict[int, str] = {}
+
+
 def parse_engine_id(token: str) -> int:
     """Parse one engine as a decimal ID, a 0x hex ID, or an engine name.
 
@@ -137,7 +142,9 @@ def parse_engine_id(token: str) -> int:
     if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
         return _signed64(int(text, 16), token)
     if _ENGINE_NAME.fullmatch(text):
-        return _signed64(_fnv1a64(text), token)
+        engine_id = _signed64(_fnv1a64(text), token)
+        TYPED_ENGINE_NAMES[engine_id] = text
+        return engine_id
     raise argparse.ArgumentTypeError(
         f"invalid engine {token!r}: expected a name, decimal ID or 0x hex ID"
     )

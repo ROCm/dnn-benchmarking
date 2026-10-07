@@ -580,6 +580,51 @@ def test_fresh_torch_install_records_its_source(
         other.install_torch()
 
 
+def test_reused_venv_without_gpu_arch_builds_for_the_recorded_arch(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    args = setup_env.build_parser().parse_args(["--workspace", str(tmp_path / "ws")])
+    setup = setup_env.Setup(args)
+    setup.venv_dir.mkdir(parents=True)
+    (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
+        json.dumps(
+            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": "gfx1201"}
+        )
+    )
+    setup.installed_torch_mode = "rocm"
+    monkeypatch.setattr(setup, "_detect_gpu_arch", lambda: "gfx942")
+
+    setup.install_torch()
+
+    assert setup.hip_arch_args == [
+        "-DGPU_TARGETS=gfx1201",
+        "-DAMDGPU_TARGETS=gfx1201",
+    ]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="activate.local is written on Linux only"
+)
+def test_rejected_rerun_keeps_the_venv_activate_local(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    setup = _setup(setup_env, tmp_path, "--gpu-arch", "gfx942", "-y")
+    _fake_venv(setup_env, setup.venv_dir)
+    (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
+        json.dumps(
+            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": "gfx90a"}
+        )
+    )
+    activate_local = setup.venv_dir / "bin" / "activate.local"
+    activate_local.write_text("export ROCM_PATH=/wheel/prefix\n")
+    monkeypatch.setattr(setup, "get_torch_mode", lambda: "rocm")
+
+    with pytest.raises(SystemExit):
+        setup.run()
+
+    assert activate_local.read_text() == "export ROCM_PATH=/wheel/prefix\n"
+
+
 @pytest.mark.parametrize("installed", ["rocm", "cuda", "cpu"])
 def test_torch_mode_none_refuses_a_venv_with_torch(
     setup_env, tmp_path, capsys, installed

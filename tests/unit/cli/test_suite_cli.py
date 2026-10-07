@@ -4,10 +4,13 @@
 """Suite CLI: startup checks, per-graph isolation, result writes, exit codes."""
 
 import io
+import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Callable, List
@@ -210,6 +213,52 @@ def test_interrupt_writes_partial_file(
     assert [g["graph_name"] for g in doc["graphs"]] == ["g0"]
     assert str(out) in text
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
+
+
+_NATIVE_BLOCK_RUN = """
+import ctypes, io, sys
+from pathlib import Path
+from dnn_benchmarking.cli import suite_runner_cli as cli
+from dnn_benchmarking.cli.config_file import apply_config_file
+from dnn_benchmarking.cli.parser import create_parser
+from dnn_benchmarking.reporting.reporter import Reporter
+
+def run_graph(path, graph_json, infos):
+    print("blocked", flush=True)
+    mutex = ctypes.create_string_buffer(64)  # zeroed: a default pthread mutex
+    libc = ctypes.CDLL(None)
+    libc.pthread_mutex_lock(mutex)
+    libc.pthread_mutex_lock(mutex)  # self-deadlock; futex waits survive signals
+
+cli.SIGTERM_GRACE_S = 0.5
+cli.collect_environment_info = lambda: {}
+cli.start_backend = lambda config, reporter: run_graph
+args = create_parser(suppress_defaults=True).parse_args(["-g", "unused"])
+apply_config_file(args)
+code = cli.run_suite_cli(args, [Path(sys.argv[1])], Reporter(output=io.StringIO()))
+sys.exit(code)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal delivery")
+def test_sigterm_ends_a_run_blocked_in_native_code(tmp_path) -> None:
+    """The Python handler cannot run while native code holds the main thread."""
+    src = str(Path(suite_runner_cli.__file__).parents[2])
+    env = {**os.environ, "PYTHONPATH": src}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _NATIVE_BLOCK_RUN, str(_graphs(tmp_path, 1)[0])],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert proc.stdout.readline().strip() == "blocked"
+        time.sleep(0.3)  # let it enter the native wait
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=4) == 143
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_final_write_failure_exits_1(tmp_path, backend) -> None:
@@ -452,12 +501,14 @@ def test_unknown_engine_in_one_plugin_path_is_usage_error(
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
     _fake_hipdnn(monkeypatch, loaded=())
     code, text = _run(
-        _args("-e", "MIOPEN_ENGINE,0x63", "--plugin-path", str(tmp_path)),
+        _args("-e", "MIOPEN_ENGINE,0x63,NOT_AN_ENGINE", "--plugin-path", str(tmp_path)),
         _graphs(tmp_path, 1),
     )
     assert code == 2
     assert "MIOPEN_ENGINE/0x15B46865C717A122" in text
-    assert "0x0000000000000063" in text
+    assert ", 0x0000000000000063," in text  # an ID typed as an ID stays bare
+    # Not registered, so only the parser knows the name the user typed.
+    assert "NOT_AN_ENGINE/0x" in text
 
 
 def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
@@ -608,10 +659,30 @@ def test_final_write_survives_second_signal_and_snapshot_error(
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 
-def test_exhaustive_oracle_states_the_provider_cache_cost(tmp_path, backend) -> None:
+@pytest.mark.parametrize("mode", ["exhaustive", "plan"])
+def test_only_exhaustive_oracle_states_the_provider_cache_cost(
+    tmp_path, backend, mode
+) -> None:
     backend(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle-mode", "exhaustive"), _graphs(tmp_path, 1))
-    assert "--oracle-mode exhaustive: providers may reuse tuned selections" in text
+    _, text = _run(_args("--oracle-mode", mode), _graphs(tmp_path, 1))
+    notice = "--oracle-mode exhaustive: providers may reuse tuned selections"
+    assert (notice in text) == (mode == "exhaustive")
+
+
+def test_empty_nodes_graph_is_a_graph_error(tmp_path, backend) -> None:
+    (empty,) = _graphs(tmp_path, 1)
+    doc = json.loads(empty.read_text())
+    doc["nodes"] = []
+    empty.write_text(json.dumps(doc))
+    out = tmp_path / "out.json"
+    backend(lambda path: _graph(path, [_passed()]))
+    code, _ = _run(_args("-o", str(out)), [empty])
+    (graph,) = SuiteResult.load(out)["graphs"]
+    assert code == 1 and graph["status"] == "error" and graph["error"]
+
+
+def test_internal_profiling_flag_is_hidden_from_help() -> None:
+    assert "--internal-profiling-run" not in create_parser().format_help()
 
 
 @pytest.mark.parametrize(

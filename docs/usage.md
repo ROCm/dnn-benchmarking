@@ -328,7 +328,9 @@ writes one line per row with the main columns. See
 The tool checks the output path before the first graph runs. During the run it
 writes the file again at most every 10 seconds, and one last time at the end.
 After Ctrl-C or SIGTERM the file holds every completed graph and has
-`run.complete = false`.
+`run.complete = false`. On Linux, a run that has not finished this last write
+30 seconds after SIGTERM (for example, blocked in a hung GPU kernel) exits
+with code 143 without it. The file then holds the last periodic write.
 
 ## Exit codes
 
@@ -339,7 +341,7 @@ After Ctrl-C or SIGTERM the file holds every completed graph and has
 | 2 | Usage error: a bad flag, a bad config file, an option that the backend does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
-| 143 | Interrupted by SIGTERM. |
+| 143 | Interrupted by SIGTERM. On Linux the run ends within 30 seconds, also when it is blocked in GPU code. |
 
 When more than one condition applies, 3 wins over 1, and 1 wins over 0.
 Only `engine` rows count: the `reference` row that `--validate pytorch` adds
@@ -371,6 +373,10 @@ Rules:
   or `reference`. In `engine` mode, a `failed` row gets a speedup with the
   label `A failed`, `B failed` or `A+B failed`, but it is not in the
   geometric mean. Rows with `error` or `skipped` get no speedup.
+- A row with a `null` median (the writer stores NaN and infinity as `null`)
+  gets no speedup and is not in the geometric mean. In `engine` mode the
+  pair label is `A no time` or `B no time`. `best` and `ref` skip the row;
+  when no row is left, the label is `no A row` or `no B row`.
 - A pair is `within noise` when the relative change is not more than
   `max(threshold / 100, 2 * sqrt(r_A^2 + r_B^2))`, where `threshold` is the
   `--threshold` percent and `r` is `iqr_ms / median_ms` of the compared
@@ -384,8 +390,9 @@ Rules:
   stays 0.
 
 Exit codes: 0 no regression, 1 one or more regressions, 2 usage error, a
-file that cannot be read or has a different schema version, or a different
-`cache_mode` without `--allow-mismatch`.
+file that cannot be read, has a different schema version or has malformed
+rows (missing keys, wrong types), or a different `cache_mode` without
+`--allow-mismatch`.
 
 ```bash
 dnn-benchmark -g 'graphs/*.json' -o base.json
@@ -430,10 +437,10 @@ plan build or a kernel launch:
 
 ```bash
 # Pure-Python loader only (no hipDNN build required)
-python tools/check_deserialize.py --level json --src src 'Workloads/**/*.json'
+python tools/check_deserialize.py --level json --src src graphs
 
 # Full deserialize and operation graph build (needs a built hipDNN)
-python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+python tools/check_deserialize.py --level opgraph graphs
 ```
 
 The script accepts globs, directories and extracted tarball trees. It exits

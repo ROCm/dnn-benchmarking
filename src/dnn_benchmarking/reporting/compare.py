@@ -92,9 +92,9 @@ def _stat(row: Dict[str, Any], metric: str) -> Tuple[Optional[float], Optional[f
     s = row[metric]
     if row["verdict"] in ("error", "skipped") or not s:
         return None, None
-    return s["median_ms"], (
-        s["iqr_ms"] / s["median_ms"] if s["median_ms"] > 0 else None
-    )
+    # The writer stores NaN/inf as null; a null median leaves the pair unusable.
+    median, iqr = s["median_ms"], s["iqr_ms"]
+    return median, (iqr / median if iqr is not None and median > 0 else None)
 
 
 def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any]]:
@@ -103,7 +103,10 @@ def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any
     usable = [
         r
         for r in graph["results"]
-        if r["role"] == role and r["verdict"] in _USABLE and r[metric]
+        if r["role"] == role
+        and r["verdict"] in _USABLE
+        and r[metric]
+        and r[metric]["median_ms"] is not None
     ]
     return min(usable, key=lambda r: r[metric]["median_ms"], default=None)
 
@@ -148,7 +151,10 @@ def _pair(
         if row is None:
             pair.label = pair.label or f"no {side} row"
         elif ms is None or ms <= 0:
-            pair.label = pair.label or f"{side} {row['verdict']}"
+            why = (
+                row["verdict"] if row["verdict"] in ("error", "skipped") else "no time"
+            )
+            pair.label = pair.label or f"{side} {why}"
     if pair.label:
         return pair
     pair.speedup = a_ms / b_ms
@@ -318,16 +324,22 @@ def main(argv: List[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-    report = compare(a, b, by=args.by, metric=args.metric, threshold=args.threshold)
-    if all(p["speedup"] is None for p in report["pairs"]):
-        print("warning: no timings were compared", file=sys.stderr)
-    if args.json:
-        json.dump(report, sys.stdout, indent=2, allow_nan=False)
-        print()
-    elif args.csv:
-        writer = csv.DictWriter(sys.stdout, fieldnames=list(Pair.__dataclass_fields__))
-        writer.writeheader()
-        writer.writerows(report["pairs"])
-    else:
-        _print_table(report, (args.a, a), (args.b, b))
+    try:
+        report = compare(a, b, by=args.by, metric=args.metric, threshold=args.threshold)
+        if all(p["speedup"] is None for p in report["pairs"]):
+            print("warning: no timings were compared", file=sys.stderr)
+        if args.json:
+            json.dump(report, sys.stdout, indent=2, allow_nan=False)
+            print()
+        elif args.csv:
+            writer = csv.DictWriter(
+                sys.stdout, fieldnames=list(Pair.__dataclass_fields__)
+            )
+            writer.writeheader()
+            writer.writerows(report["pairs"])
+        else:
+            _print_table(report, (args.a, a), (args.b, b))
+    except (KeyError, TypeError, ValueError) as e:  # malformed input, not a regression
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     return 1 if report["regressions"] else 0

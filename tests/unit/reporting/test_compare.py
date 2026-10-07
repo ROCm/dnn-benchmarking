@@ -287,6 +287,28 @@ def test_unreadable_or_incompatible_input_exits_2(tmp_path, capsys):
     assert main([a, a, "--threshold", "-1"]) == 2
 
 
+@pytest.mark.parametrize("by", ["best", "engine"])
+def test_null_median_written_for_nan_timings_is_unusable(tmp_path, capsys, by):
+    nan = float("nan")
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 0, timings=[nan] * 3)])])
+    assert SuiteResult.load(b)["graphs"][0]["results"][0]["kernel"]["median_ms"] is None
+    code, report = _json(capsys, [a, b, "--by", by])
+    (pair,) = report["pairs"]
+    assert code == 0 and pair["speedup"] is None
+    assert pair["label"] == ("no B row" if by == "best" else "B no time")
+
+
+def test_malformed_row_exits_2_not_regression(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
+    doc = json.loads(open(a).read())
+    del doc["graphs"][0]["results"][0]["verdict"]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(doc))
+    assert main([a, str(bad)]) == 2
+    assert "error:" in capsys.readouterr().err
+
+
 def test_missing_ref_on_both_sides_is_one_label(tmp_path, capsys):
     a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
     b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])])

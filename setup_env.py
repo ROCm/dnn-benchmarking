@@ -739,7 +739,9 @@ class Setup:
         else:
             print(f"Creating virtual environment at {self.venv_dir}...")
             run([sys.executable, "-m", "venv", str(self.venv_dir)])
-        if not IS_WINDOWS:
+        # build_hipdnn rewrites it with ROCM_PATH and LD_LIBRARY_PATH; a reused
+        # venv keeps the full file even when a later stage fails.
+        if not IS_WINDOWS and not (self.venv_dir / "bin" / "activate.local").exists():
             self.write_activate_local()
 
     def write_activate_local(
@@ -1119,12 +1121,21 @@ class Setup:
 
         Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
         the TORCH_RECORD written when setup installed torch. A venv without
-        the record (torch installed some other way) cannot be checked.
+        the record (torch installed some other way) cannot be checked. With
+        ``check_arch`` and no --gpu-arch, the build uses the recorded arch.
         """
         try:
             record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
         except (OSError, ValueError):
             record = None
+        if (
+            check_arch
+            and not self.gpu_arch_override
+            and record
+            and record.get("gpu_arch")
+        ):
+            self.gpu_arch = record["gpu_arch"]
+            print(f"GPU arch: {self.gpu_arch} (recorded in {self.venv_dir})")
         checks = [("--torch-index-url", self.torch_index_url, "torch_index_url")]
         if check_arch:
             checks.append(("--gpu-arch", self.gpu_arch_override, "gpu_arch"))

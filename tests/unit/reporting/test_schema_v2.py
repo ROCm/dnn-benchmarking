@@ -109,6 +109,8 @@ def _oracle() -> OracleResult:
         cpu_build_time_ms=7.0,
         gpu_kernel_stats=_stats(1.0),
         warm_baseline_gpu_kernel_stats=_stats(2.0),
+        host_stats=_stats(3.0),
+        warm_baseline_host_stats=_stats(4.0),
         correctness=CorrectnessResult(False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9),
         derived_tflops_per_s=4.0,
         warm_baseline_derived_tflops_per_s=2.5,
@@ -305,6 +307,14 @@ def test_full_row_values() -> None:
             "message": "off",
         },
     }
+    medians = {k: row["oracle"][k]["median_ms"] for k in stats_keys - {"delta"}}
+    assert medians == {
+        "kernel": 1.0,
+        "baseline_kernel": 2.0,
+        "host": 3.0,
+        "baseline_host": 4.0,
+    }
+    assert row["oracle"]["delta"]["speedup"] == 2.0
     assert row["warnings"] == ["noisy: CV 6.0%"]
     assert (row["elapsed_s"], row["build_ms"]) == (1.5, 3.0)
 
