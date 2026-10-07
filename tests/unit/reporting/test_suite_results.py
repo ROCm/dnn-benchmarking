@@ -241,9 +241,12 @@ class TestWriteLoad:
         assert path.read_text() == before
         assert [p.name for p in tmp_path.iterdir()] == ["r.json"]
 
-    def test_load_refuses_other_schema_versions(self, tmp_path) -> None:
-        path = tmp_path / "v1.json"
-        path.write_text(json.dumps({"metadata": {}, "graphs": []}))
+    @pytest.mark.parametrize(
+        "version", [{}, {"schema_version": 1}, {"schema_version": 3}]
+    )
+    def test_load_refuses_other_schema_versions(self, tmp_path, version) -> None:
+        path = tmp_path / "other.json"
+        path.write_text(json.dumps({**version, "metadata": {}, "graphs": []}))
         with pytest.raises(ValueError, match="schema_version"):
             SuiteResult.load(path)
 

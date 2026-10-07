@@ -178,15 +178,20 @@ def rocm_module(monkeypatch, fake_cuda):
     yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=True)
 
 
-@pytest.fixture(params=[False, True], ids=["no-hip-runtime", "hip-runtime"])
-def cuda_module(request, monkeypatch, fake_cuda):
-    # CUDA torch cannot share HIP events even when a HIP runtime is importable.
-    if request.param:
+@pytest.fixture(
+    params=[(False, False), (False, True), (True, False)],
+    ids=["cuda-no-hip-runtime", "cuda-hip-runtime", "rocm-no-hip-runtime"],
+)
+def torch_events_module(request, monkeypatch, fake_cuda):
+    # CUDA torch cannot share HIP events even when a HIP runtime is importable;
+    # ROCm torch without hipdnn_frontend falls back to torch events.
+    is_rocm, hip = request.param
+    if hip:
         _install_fake_hip(monkeypatch, fake_cuda.log)
     else:
         monkeypatch.setattr(timing_module, "hipdnn", None)
         monkeypatch.setitem(sys.modules, "hipdnn_frontend", None)  # not importable
-    yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=False)
+    yield from _load_executor_module(monkeypatch, fake_cuda, is_rocm=is_rocm)
 
 
 def _prepared(module, monkeypatch, fake_cuda, sdpa="default", **policy):
@@ -260,10 +265,10 @@ def test_host_sync_during_priming_selects_events_mode(
     assert not any(e[0] == "arm" for e in fake_cuda.log if isinstance(e, tuple))
 
 
-def test_cuda_build_times_with_torch_events(
-    cuda_module, monkeypatch, fake_cuda
+def test_times_with_torch_events_without_a_shared_hip_runtime(
+    torch_events_module, monkeypatch, fake_cuda
 ) -> None:
-    executor, _ = _prepared(cuda_module, monkeypatch, fake_cuda)
+    executor, _ = _prepared(torch_events_module, monkeypatch, fake_cuda)
 
     m = executor.benchmark({})
 

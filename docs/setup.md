@@ -82,7 +82,7 @@ On Linux the venv activation script exports these variables:
 | Variable | Value |
 |---|---|
 | `ROCM_PATH` | The selected ROCm prefix. |
-| `LD_LIBRARY_PATH` | `$ROCM_PATH/lib` added at the start. |
+| `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
 | `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts MIOpen, comgr and XDG caches under it when those variables are not set. |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
 
@@ -203,7 +203,9 @@ Without `--clean`, setup keeps the venv and its PyTorch and builds
 incrementally. When setup installs PyTorch it records the index URL and GPU
 architecture in `<workspace>/.venv/dnn-bench-torch.json`. On a later run, an
 explicit `--gpu-arch` or `--torch-index-url` that differs from the record
-stops setup with an error that asks for `--clean`. A venv without the record
+stops setup with an error that asks for `--clean`. Without them, a
+`--torch-mode rocm` run builds for the recorded GPU architecture and installs
+a missing rocm-sdk-devel from the recorded index. A venv without the record
 (PyTorch installed another way) cannot be checked; setup shows a warning
 instead. A different `--torch-mode` than the one in the venv also asks for
 `--clean`, including `--torch-mode none` on a venv that has PyTorch.

@@ -608,10 +608,22 @@ def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
 
 def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    seen = []
+    monkeypatch.setattr(
+        backends, "run_graph_all_providers", lambda *args: seen.append(args) or "ran"
+    )
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path))
     )
-    assert callable(backends.start_backend(config, Reporter(output=io.StringIO())))
+    runner = backends.start_backend(config, Reporter(output=io.StringIO()))
+    assert runner("g.json", {}, []) == "ran"
+    # The hipDNN runner, bound to the handle that startup created and checked.
+    ((path, _, _, run_config, handle, _),) = seen
+    assert (path, run_config, handle.loaded) == (
+        "g.json",
+        config,
+        (0x15B46865C717A122,),
+    )
 
 
 def test_hipdnn_handle_failure_exits_1(tmp_path, monkeypatch) -> None:
@@ -696,6 +708,12 @@ def test_cli_flags_reach_suite_config() -> None:
     assert config.metrics.profiling_timeout_s == 99
 
 
+@pytest.mark.parametrize("pmc_set", ["basic", "memory", "flops"])
+def test_single_pass_pmc_sets_are_accepted(pmc_set) -> None:
+    config = suite_runner_cli.SuiteConfig.from_namespace(_args("--pmc", pmc_set))
+    assert config.metrics.pmc_set == pmc_set
+
+
 def _warnings(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if "WARNING:" in line)
 
@@ -704,6 +722,11 @@ def _warnings(text: str) -> str:
     "env, argv, expected",
     [
         ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
+        (  # hipDNN reads "0" as off
+            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "0"},
+            [],
+            "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
+        ),
         ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
         (  # hipDNN reads "0" as off
             {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "0"},
@@ -716,7 +739,13 @@ def _warnings(text: str) -> str:
             None,
         ),
     ],
-    ids=["exact-cache-on", "provider-cache-on", "provider-cache-zero", "cold"],
+    ids=[
+        "exact-cache-on",
+        "exact-cache-zero",
+        "provider-cache-on",
+        "provider-cache-zero",
+        "cold",
+    ],
 )
 def test_oracle_warns_on_non_cold_baseline(
     tmp_path, backend, monkeypatch, env, argv, expected

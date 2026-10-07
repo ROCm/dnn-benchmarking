@@ -643,6 +643,25 @@ def test_reused_venv_without_gpu_arch_builds_for_the_recorded_arch(
     ]
 
 
+def test_reused_venv_without_index_url_takes_the_toolchain_from_the_recorded_index(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    # rocm-sdk-devel must come from the index the venv's ROCm wheels came from.
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
+        json.dumps(
+            {"torch_index_url": "https://example.invalid/", "gpu_arch": "gfx90a"}
+        )
+    )
+    setup.installed_torch_mode = "rocm"
+    monkeypatch.setattr(setup, "ensure_rocm_wheel_devel_prefix", lambda url: url)
+
+    setup.install_torch()
+
+    assert setup.toolchain_prefix == "https://example.invalid/"
+
+
 @pytest.mark.skipif(
     sys.platform == "win32", reason="activate.local is written on Linux only"
 )

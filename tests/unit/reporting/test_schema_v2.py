@@ -162,8 +162,9 @@ def full_suite() -> SuiteResult:
         clocks_before={"sclk_mhz": 1700},
         clocks_after={"sclk_mhz": 1650},
     )
-    env = {k: "x" for k in ENV_KEYS}
-    env["end_of_run"] = {k: 1.0 for k in END_OF_RUN_KEYS}
+    # Distinct values, so a dropped or swapped value changes the output.
+    env = {k: f"env_{k}" for k in ENV_KEYS}
+    env["end_of_run"] = {k: float(i) for i, k in enumerate(sorted(END_OF_RUN_KEYS))}
     config = {k: "x" for k in CONFIG_KEYS}
     config["profiling"] = {k: False for k in PROFILING_KEYS}
     return SuiteResult(
@@ -244,6 +245,7 @@ def test_full_document_has_exact_key_sets() -> None:
     assert set(row["oracle"]["delta"]) == DELTA_KEYS
     assert row["oracle"]["delta"]["basis"] == "kernel"
     assert doc["schema_version"] == 2
+    assert doc["environment"] == full_suite().environment  # values unchanged
 
 
 def test_full_row_values() -> None:

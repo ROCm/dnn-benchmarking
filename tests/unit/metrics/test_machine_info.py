@@ -115,6 +115,14 @@ class TestCollectEnvironmentInfo:
             info = machine_info.collect_environment_info()
         assert set(info) == _ENVIRONMENT_KEYS
 
+    def test_gpu_arch_and_model_come_from_detect_gpu(self):
+        with (
+            patch.object(machine_info, "is_amdsmi_available", return_value=False),
+            patch.object(machine_info, "detect_gpu", return_value=("gfx942", "X")),
+        ):
+            info = machine_info.collect_environment_info()
+        assert (info["gpu_arch"], info["gpu_model"]) == ("gfx942", "X")
+
     def test_broken_hipdnn_import_does_not_raise(self, tmp_path, monkeypatch, capsys):
         package = tmp_path / "hipdnn_frontend"
         package.mkdir()

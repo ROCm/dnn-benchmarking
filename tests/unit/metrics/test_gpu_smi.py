@@ -86,12 +86,23 @@ def _cached(fn):
 
 
 class TestClocks:
-    def test_reports_clock_power_temp_throttle(self, monkeypatch):
-        _install(monkeypatch, _fake_amdsmi())
+    @pytest.mark.parametrize(
+        "power, watts",
+        [
+            # Only the current reading is reported: fall back to it.
+            ({"average_socket_power": "N/A", "current_socket_power": 250}, 250.0),
+            # MI200 (gfx90a) shape: average set, current N/A.
+            ({"average_socket_power": 42, "current_socket_power": "N/A"}, 42.0),
+        ],
+    )
+    def test_reports_clock_power_temp_throttle(self, monkeypatch, power, watts):
+        fake = _fake_amdsmi()
+        fake.amdsmi_get_power_info = lambda h: power
+        _install(monkeypatch, fake)
         assert gpu_smi.GpuSmiProbe().clocks() == {
             "sclk_mhz": 1700.0,
             "mclk_mhz": 1600.0,
-            "power_w": 250.0,
+            "power_w": watts,
             "temp_hotspot_c": 65.0,
             "throttle_status": 0,
         }

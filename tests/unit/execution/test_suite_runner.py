@@ -176,6 +176,7 @@ def fake_torch(fake, monkeypatch):
             pytorch_sdpa_backend,
             pytorch_rocm_fa_library=None,
         ):
+            fake.policies.append(policy)
             fake.torch_options.append((pytorch_sdpa_backend, pytorch_rocm_fa_library))
             self.init_time_ms = 1.0
 
@@ -363,6 +364,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "timing_block": 4,
     }
     assert row.workspace_bytes == 64 and row.vram_used_mb == 12.0
+    assert row.cpu_build_time_ms == 2.0
     warnings = " | ".join(row.warnings)
     for expected in (
         "outlier: max 5.0x median",
@@ -491,14 +493,16 @@ def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "sdpa_backend, reference_status, engine_verdict",
+    "sdpa_backend, reference_status, engine_verdict, engine_reason",
     [
-        ("default", "skipped", "passed"),  # CPU reference serves as fallback
-        ("math", "error", "failed"),  # strict selection never falls back
+        # CPU reference serves as fallback
+        ("default", "skipped", "passed", None),
+        # strict selection never falls back, and says why
+        ("math", "error", "failed", "ExecutionError: PyTorch GPU not available"),
     ],
 )
 def test_failed_timed_reference(
-    fake_torch, sdpa_backend, reference_status, engine_verdict
+    fake_torch, sdpa_backend, reference_status, engine_verdict, engine_reason
 ):
     fake_torch.discovered = [1]
     fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
@@ -510,6 +514,60 @@ def test_failed_timed_reference(
         "ExecutionError: PyTorch GPU not available"
     )
     assert engine.verdict == engine_verdict
+    assert engine.correctness.error_message == engine_reason
+
+
+def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
+    fake_torch, monkeypatch
+):
+    class FailingReference:
+        def compute_reference(self, graph_json, input_data):
+            raise RuntimeError("cpu reference exploded")
+
+    monkeypatch.setattr(
+        suite_runner, "_reference_provider", lambda c, g: (FailingReference(), None)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+
+    graph, _ = _validate()
+
+    assert graph.error is None
+    reference, *engines = graph.results
+    assert reference.status == "skipped"
+    assert [(e.engine_id, e.verdict, e.correctness.error_message) for e in engines] == [
+        (1, "failed", "cpu reference exploded"),
+        (2, "failed", "cpu reference exploded"),
+    ]
+
+
+def test_hipdnn_buffers_use_torch_storage_only_with_a_device_reference():
+    host = suite_runner.ReferenceOutput(data=REF, tensor_uid=2)
+    device = suite_runner.ReferenceOutput(data=REF, tensor_uid=3, device_data=REF)
+
+    assert suite_runner._hipdnn_buffer_device(None) is None
+    assert suite_runner._hipdnn_buffer_device({2: host}) is None
+    assert suite_runner._hipdnn_buffer_device({2: host, 3: device}) == "cuda"
+
+
+def test_oracle_validates_the_tuned_plan_against_the_graph_reference(
+    fake_torch, monkeypatch
+):
+    """--oracle-mode plan --validate: each engine's oracle pass gets the
+    graph's reference outputs and the row's prepared heuristic executor, so a
+    wrong-but-fast tuned plan cannot publish a speedup."""
+    calls = []
+    monkeypatch.setattr(suite_runner, "run_oracle_pass", lambda **kw: calls.append(kw))
+
+    graph, _ = _validate(oracle_mode="plan")
+
+    engines = graph.results[1:]
+    assert [kw["row"] for kw in calls] == engines
+    assert [kw["engine_id"] for kw in calls] == [1, 2]
+    for kw in calls:
+        assert getattr(kw["ootb_executor"], "engine_id", None) == kw["engine_id"]
+        refs = kw["reference_outputs"]
+        assert refs is not None and list(refs) == [2]
+        np.testing.assert_array_equal(refs[2].data, REF)
 
 
 def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
@@ -588,12 +646,17 @@ def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
     ] * 2
 
 
-def test_pytorch_sdpa_options_reach_the_timed_executor(fake_torch):
+def test_pytorch_run_options_reach_the_timed_executor(fake_torch):
     fake_torch.discovered = [1]
+    config = dict(warmup_iters=3, benchmark_iters=5, cache_mode="cold")
 
-    _validate(pytorch_sdpa_backend="flash", pytorch_rocm_fa_library="aotriton")
+    _validate(
+        pytorch_sdpa_backend="flash", pytorch_rocm_fa_library="aotriton", **config
+    )
 
     assert fake_torch.torch_options == [(PyTorchSdpaBackendName.FLASH, "aotriton")]
+    # Discovery, the PyTorch reference row, then the engine row.
+    assert fake_torch.policies == [SuiteConfig(**config).timing_policy] * 3
 
 
 def test_reference_warnings_go_on_the_reference_row_only(fake_torch, monkeypatch):

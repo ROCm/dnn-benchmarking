@@ -300,9 +300,11 @@ def _run_pytorch_row(
     """Time the graph through PyTorch as one row.
 
     ``role="reference"`` additionally extracts reference outputs for the
-    engine comparison. A failed default-dispatch reference is skipped (the
-    CPU reference may still serve); a failed strict SDPA selection, or any
-    failure of the ``--backend pytorch`` engine row, is an error.
+    engine comparison. Unsupported graphs are skipped unless the SDPA
+    selection is strict. Any other failure of a default-dispatch reference
+    is skipped (the CPU reference may still serve); any other failure of a
+    strict SDPA selection or of the ``--backend pytorch`` engine row is an
+    error.
     """
     config = ctx.config
     strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT

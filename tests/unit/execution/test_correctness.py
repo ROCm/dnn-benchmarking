@@ -106,7 +106,12 @@ def test_fp8_output_two_ulp_apart_fails(data_type, actual):
 
 @pytest.mark.parametrize(
     "data_type, smallest_subnormal",
-    [("fp8_e4m3", 2**-9), ("fp8_e5m2_fnuz", 2**-17)],
+    [
+        ("fp8_e4m3", 2**-9),
+        ("fp8_e4m3_fnuz", 2**-10),
+        ("fp8_e5m2", 2**-16),
+        ("fp8_e5m2_fnuz", 2**-17),
+    ],
 )
 def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
     data_type, smallest_subnormal

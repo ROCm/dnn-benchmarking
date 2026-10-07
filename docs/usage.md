@@ -372,6 +372,9 @@ Rules:
 - `speedup = A_median / B_median`. A value more than 1 means B is faster.
 - Graphs join on `graph_id` only. A graph that did not load has no
   `graph_id`, so it shows as `graph only in A` or `graph only in B`.
+- When a file has more than one graph with the same `graph_id`, the graphs
+  pair in order of appearance. A graph with no partner shows as
+  `graph only in A` or `graph only in B`.
 - In `--by engine` mode, rows join on role, provider, engine ID and engine
   name. When a file has more than one row with the same key, the rows pair
   in order of appearance.

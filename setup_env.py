@@ -1123,7 +1123,8 @@ class Setup:
         Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
         the TORCH_RECORD written when setup installed torch. A venv without
         the record (torch installed some other way) cannot be checked. With
-        ``check_arch`` and no --gpu-arch, the build uses the recorded arch.
+        ``check_arch`` and no --gpu-arch, the build uses the recorded arch;
+        with no --torch-index-url, the toolchain uses the recorded index.
         """
         try:
             record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
@@ -1137,6 +1138,10 @@ class Setup:
         ):
             self.gpu_arch = record["gpu_arch"]
             print(f"GPU arch: {self.gpu_arch} (recorded in {self.venv_dir})")
+        if check_arch and not self.torch_index_url and record:
+            self.resolved_torch_index_url = record.get(
+                "torch_index_url", self.resolved_torch_index_url
+            )
         checks = [("--torch-index-url", self.torch_index_url, "torch_index_url")]
         if check_arch:
             checks.append(("--gpu-arch", self.gpu_arch_override, "gpu_arch"))

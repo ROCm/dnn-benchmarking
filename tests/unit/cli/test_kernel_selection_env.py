@@ -40,7 +40,9 @@ def test_autotune_without_cache_dir_is_a_hazard() -> None:
 
 
 def test_autotune_with_cache_dir_is_isolated() -> None:
-    assert _warnings(autotune=True, cache_dir="/tmp/phase-x") == []
+    lines = _lines(autotune=True, cache_dir="/tmp/phase-x")
+    assert [line for line in lines if line.startswith("WARNING")] == []
+    assert any("kernel selection: autotune;" in line for line in lines)
     assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
 
 

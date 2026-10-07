@@ -180,16 +180,20 @@ def _pair(
 def _match_graphs(
     a: Dict[str, Any], b: Dict[str, Any]
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[str], List[str]]:
-    """Join on graph_id (null only for graphs that failed to load: no rows)."""
-    by_id = {g["graph_id"]: g for g in b["graphs"] if g["graph_id"]}
-    matched, only_a, used = [], [], set()
+    """Join on graph_id (null only for graphs that failed to load: no rows).
+    Duplicate ids pair in order of appearance, like ``_keyed`` rows."""
+    by_id: Dict[str, List[Dict[str, Any]]] = {}
+    for g in b["graphs"]:
+        if g["graph_id"]:
+            by_id.setdefault(g["graph_id"], []).append(g)
+    matched, only_a = [], []
     for ga in a["graphs"]:
-        gb = by_id.get(ga["graph_id"]) if ga["graph_id"] else None
-        if gb is None or id(gb) in used:
+        queue = by_id.get(ga["graph_id"]) if ga["graph_id"] else None
+        if not queue:
             only_a.append(ga["graph_name"])
             continue
-        used.add(id(gb))
-        matched.append((ga, gb))
+        matched.append((ga, queue.pop(0)))
+    used = {id(gb) for _, gb in matched}
     only_b = [g["graph_name"] for g in b["graphs"] if id(g) not in used]
     return matched, only_a, only_b
 

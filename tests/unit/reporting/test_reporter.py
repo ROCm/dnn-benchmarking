@@ -249,6 +249,20 @@ class TestSummaries:
         assert "1 graph error(s)" in text
         assert "Results: out.json" in text
 
+    def test_graph_table_verdict_column_shows_verdicts(self) -> None:
+        failed = _passed_row("F")
+        failed.correctness = CorrectnessResult(False, 1e-5, 1e-6)
+        reference = _passed_row("R")
+        reference.role = "reference"
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_table(
+            _graph(_passed_row("P"), failed, reference)
+        )
+        lines = out.getvalue().splitlines()
+        header = next(i for i, line in enumerate(lines) if "verdict" in line)
+        cells = [line.split()[1] for line in lines[header + 1 : header + 4]]
+        assert cells == ["passed", "failed", "reference"]
+
     def test_oracle_summary_geomean_excludes_rows_without_a_real_search(self) -> None:
         from dnn_benchmarking.reporting.suite_results import OracleDelta, OracleResult
 
