@@ -719,8 +719,8 @@ class TestNoRetryOnFailure:
             handle=MagicMock(),
         )
 
-        # One Executor for discovery + one for the single failed engine.
-        assert mock_exec_cls.call_count == 2
+        # Discovery, the untimed prime, and the single failed timed build.
+        assert mock_exec_cls.call_count == 3
         assert result.results[0].status == "error"
 
 
@@ -1885,17 +1885,17 @@ class TestTimedPytorchRowEngineRole:
 def _make_oracle_exec_factory(
     prepare_side_effect=None, order=None, knob_ids=("global.benchmarking",)
 ):
-    """Executor factory whose third instance is the tuned (oracle) pass.
+    """Executor factory whose fourth instance is the tuned (oracle) pass.
 
-    Instance order inside run_graph_all_providers is discovery, OOTB, then
-    oracle. The oracle instance reports half the OOTB kernel time so the
-    speedup is unambiguous, and its own build time so a swap with the OOTB
-    plan's shows.
+    Instance order inside run_graph_all_providers is discovery, the untimed
+    OOTB prime, the timed OOTB build, then oracle. The oracle instance reports
+    half the OOTB kernel time so the speedup is unambiguous, and its own build
+    time so a swap with the OOTB plan's shows.
 
     Args:
         prepare_side_effect: Side effect of the tuned plan build, if any.
         order: When given, receives ``"<role>.<method>"`` labels in call
-            order for warmup, benchmark and execute_once.
+            order for prime, prepare, warmup, benchmark and execute_once.
         knob_ids: Knobs the engine exposes, as reported by engine_knob_ids.
     """
     instances = []
@@ -1909,11 +1909,12 @@ def _make_oracle_exec_factory(
 
     def make_instance(*args, **kwargs):
         m = MagicMock()
-        role = {0: "discovery", 1: "ootb", 2: "oracle"}.get(
+        role = {0: "discovery", 1: "prime", 2: "ootb", 3: "oracle"}.get(
             len(instances), f"extra{len(instances)}"
         )
         tuned = role == "oracle"
-        m.build_time_ms = 7.0 if tuned else 3.0
+        # The prime's (untimed) value must never surface as a build time.
+        m.build_time_ms = {"oracle": 7.0, "prime": 99.0}.get(role, 3.0)
         m.discover_engines.return_value = [0]
         m.engine_knob_ids.return_value = list(knob_ids)
         bench_result = MagicMock()
@@ -1923,8 +1924,11 @@ def _make_oracle_exec_factory(
         m.benchmark.return_value = bench_result
         if tuned and prepare_side_effect is not None:
             m.prepare.side_effect = prepare_side_effect
+        elif order is not None:
+            m.prepare.side_effect = _recorder(f"{role}.prepare")
 
         if order is not None:
+            m.prime.side_effect = _recorder(f"{role}.prime")
             m.warmup.side_effect = _recorder(f"{role}.warmup")
             m.benchmark.side_effect = _recorder(f"{role}.benchmark", bench_result)
             m.execute_once.side_effect = _recorder(f"{role}.execute_once")
@@ -1969,14 +1973,54 @@ class TestOraclePass:
         factory, instances = _make_oracle_exec_factory()
         result = self._run(factory)
 
-        # discovery, OOTB, oracle
-        assert len(instances) == 3
-        ootb, oracle = instances[1], instances[2]
+        # discovery, untimed OOTB prime, timed OOTB, oracle
+        assert len(instances) == 4
+        ootb, oracle = instances[2], instances[3]
         assert ootb.prepare.call_args.kwargs == {"engine_id": 0}
         assert oracle.prepare.call_args.kwargs == {
             "engine_id": 0,
             "knobs": {"global.benchmarking": 1},
         }
+
+    def test_engine_is_primed_untimed_before_ootb_and_never_before_tuned(self):
+        """The first build of an engine also pays one-time costs (provider
+        setup, cold plugin/kernel file reads). Without an untimed prime, the
+        OOTB build absorbs them and looks slower than an identical tuned
+        rebuild; priming the tuned build would hide its candidate loading."""
+        order = []
+        factory, instances = _make_oracle_exec_factory(order=order)
+        handle = MagicMock()
+        with (
+            patch(
+                "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner._get_reference_provider",
+                return_value=None,
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.Executor", side_effect=factory
+            ),
+            patch(
+                "dnn_benchmarking.execution.suite_runner.BufferManager",
+                return_value=_make_bm_mock(),
+            ),
+        ):
+            result = run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(oracle_mode="exhaustive"),
+                handle=handle,
+            )
+
+        assert order[:2] == ["prime.prime", "ootb.prepare"]
+        assert [label for label in order if label.endswith(".prime")] == ["prime.prime"]
+        assert instances[1].prime.call_args.args == (handle, 0)
+        assert instances[2].prepare.call_args.args[0] is handle
+        # The reported OOTB build time is the timed build's, not the prime's.
+        assert result.results[0].build_time_ms == instances[2].build_time_ms
 
     def test_oracle_uses_an_isolated_handle_on_the_same_stream(self):
         class Handle:
@@ -2020,11 +2064,11 @@ class TestOraclePass:
                 handle=ootb_handle,
             )
 
-        oracle_handle = instances[2].prepare.call_args.args[0]
+        oracle_handle = instances[3].prepare.call_args.args[0]
         assert oracle_handle is not ootb_handle
         assert oracle_handle.stream == 17
-        assert instances[1].benchmark.call_args_list[-1].args[0] is ootb_handle
-        assert instances[2].benchmark.call_args.args[0] is oracle_handle
+        assert instances[2].benchmark.call_args_list[-1].args[0] is ootb_handle
+        assert instances[3].benchmark.call_args.args[0] is oracle_handle
 
     def test_tuned_pass_samples_outside_its_warmup_and_never_retimes_ootb(self):
         """The tuned plan's first execute samples every candidate kernel.
@@ -2039,8 +2083,11 @@ class TestOraclePass:
         result = self._run(factory)
 
         assert order == [
+            "prime.prime",
+            "ootb.prepare",
             "ootb.warmup",
             "ootb.benchmark",
+            "oracle.prepare",
             "oracle.execute_once",
             "oracle.warmup",
             "oracle.benchmark",
@@ -2082,8 +2129,8 @@ class TestOraclePass:
         r = result.results[0]
         assert r.oracle is None
         assert r.oracle_error is None
-        # discovery + OOTB only.
-        assert len(instances) == 2
+        # discovery, untimed prime, and the timed OOTB build only.
+        assert len(instances) == 3
 
     @pytest.mark.parametrize(
         "knob_ids, available",
@@ -2258,7 +2305,7 @@ class TestOracleTunedPlanValidation:
         assert r.oracle.correctness is None
         assert oracle_speedup(r) == 2.0
         # Only the sampling execute; no validation execute.
-        assert instances[2].execute_once.call_count == 1
+        assert instances[3].execute_once.call_count == 1
 
 
 class TestOracleExhaustiveEnvGuard:
@@ -2282,14 +2329,14 @@ class TestOracleExhaustiveEnvGuard:
 
         Provider benchmarking comes from the plan's knob, so the process-wide
         HIPDNN_FORCE_BENCHMARKING must stay unset: it would also tune the OOTB
-        re-time inside the same window.
+        plan.
         """
         seen = {}
         factory, instances = _make_oracle_exec_factory()
 
         def make_instance_with_capture(*args, **kwargs):
             m = factory(*args, **kwargs)
-            if len(instances) == 3:
+            if len(instances) == 4:
                 m.prepare.side_effect = lambda *a, **k: seen.setdefault(
                     "build", self._snapshot()
                 )

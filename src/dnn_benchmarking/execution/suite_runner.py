@@ -1390,6 +1390,12 @@ def run_single_provider_engine(
             engine_id=engine_id,
         )
 
+        # Absorb the engine's one-time build costs (provider setup, cold
+        # plugin/kernel file reads) before timing, so the OOTB and tuned
+        # build_time_ms start from the same state.
+        Executor(graph_json_str=graph_json_str, config=bench_config).prime(
+            handle, engine_id
+        )
         executor = Executor(
             graph_json_str=graph_json_str,
             config=bench_config,

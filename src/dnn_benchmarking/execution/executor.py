@@ -205,6 +205,60 @@ class Executor:
         except RuntimeError as e:
             raise UnsupportedGraphError(str(e)) from e
 
+    def prime(self, handle: Any, engine_id: int) -> None:
+        """Build this engine's OOTB plan once, untimed, and discard it.
+
+        The first plan build of an engine in a process also pays one-time
+        costs: provider setup and, on a cold page cache, reading the plugin
+        and kernel files. Whichever build comes first absorbs them, so call
+        this before the timed OOTB ``prepare`` to keep OOTB and tuned
+        ``build_time_ms`` comparable. The plan is never executed, so no
+        provider tuning (MIOpen find, kernel sampling) runs.
+
+        Raises:
+            ExecutionError: If graph building fails.
+            UnsupportedGraphError: If the engine cannot build this graph.
+        """
+        hipdnn = self._build_through_operation_graph(handle)
+        self._build_plan(hipdnn, engine_id, None)
+        self._graph = None
+
+    def _build_plan(
+        self, hipdnn: Any, engine_id: Optional[int], knobs: Optional[Dict[str, Any]]
+    ) -> None:
+        """Create, support-check, and compile the execution plan."""
+        if engine_id is not None:
+            # Hard engine selection: build the plan for exactly this
+            # engine. create_execution_plan_ext reports a bad result if
+            # the engine is not valid/applicable, so it never silently
+            # falls back to a different engine.
+            settings = [
+                hipdnn.KnobSetting(knob_id, value)
+                for knob_id, value in (knobs or {}).items()
+            ]
+            result = self._graph.create_execution_plan_ext(engine_id, settings)
+            if result.is_bad():
+                raise UnsupportedGraphError(
+                    f"Forced engine {engine_id} not applicable to this graph: "
+                    f"{result.get_message()}"
+                )
+        else:
+            result = self._graph.create_execution_plans()
+            if result.is_bad():
+                raise ExecutionError(
+                    f"Failed to create execution plans: {result.get_message()}"
+                )
+
+        result = self._graph.check_support()
+        if result.is_bad():
+            raise UnsupportedGraphError(
+                f"Backend support check failed: {result.get_message()}"
+            )
+
+        result = self._graph.build_plans()
+        if result.is_bad():
+            raise ExecutionError(f"Failed to build plans: {result.get_message()}")
+
     def prepare(
         self,
         handle: Any,
@@ -233,37 +287,7 @@ class Executor:
         hipdnn = self._build_through_operation_graph(handle)
 
         with Timer() as build_timer:
-            if engine_id is not None:
-                # Hard engine selection: build the plan for exactly this
-                # engine. create_execution_plan_ext reports a bad result if
-                # the engine is not valid/applicable, so it never silently
-                # falls back to a different engine.
-                settings = [
-                    hipdnn.KnobSetting(knob_id, value)
-                    for knob_id, value in (knobs or {}).items()
-                ]
-                result = self._graph.create_execution_plan_ext(engine_id, settings)
-                if result.is_bad():
-                    raise UnsupportedGraphError(
-                        f"Forced engine {engine_id} not applicable to this graph: "
-                        f"{result.get_message()}"
-                    )
-            else:
-                result = self._graph.create_execution_plans()
-                if result.is_bad():
-                    raise ExecutionError(
-                        f"Failed to create execution plans: {result.get_message()}"
-                    )
-
-            result = self._graph.check_support()
-            if result.is_bad():
-                raise UnsupportedGraphError(
-                    f"Backend support check failed: {result.get_message()}"
-                )
-
-            result = self._graph.build_plans()
-            if result.is_bad():
-                raise ExecutionError(f"Failed to build plans: {result.get_message()}")
+            self._build_plan(hipdnn, engine_id, knobs)
         self._build_time_ms = build_timer.elapsed_ms
 
         self._record_selected_engine(engine_id)

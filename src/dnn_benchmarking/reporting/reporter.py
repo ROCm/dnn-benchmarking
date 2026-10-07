@@ -612,7 +612,7 @@ class Reporter:
         if o.build_time_ms is not None:
             self._print(
                 f"  Plan build:    {o.build_time_ms:.2f} ms   "
-                "(global.benchmarking=1; compiles every candidate)"
+                "(global.benchmarking=1; prepares every candidate)"
             )
         if not o.tuning_available:
             self._print(

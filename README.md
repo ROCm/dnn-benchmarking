@@ -299,9 +299,16 @@ For every applicable engine the tool builds two plans through one timed path,
 | Tuned | `global.benchmarking=1` | `oracle.build_time_ms` |
 
 Build time covers only those three calls; graph deserialization, operation
-graph build, and workspace allocation are not timed. A tuned build compiles
-every candidate the provider can sample, so it is expected to be much slower
-than the OOTB build. Providers that support the knob (today the kernel ingestor
+graph build, and workspace allocation are not timed. Before the timed OOTB
+build, every run (with or without `--oracle-mode`) builds the engine's OOTB plan
+once untimed and discards it. The first build of an engine in a process also
+pays one-time costs, such as provider setup and, on a cold page cache, reading
+the plugin and kernel files, which can inflate it several times over. Without
+that untimed build those costs would land in the OOTB time, and the
+`build_time_ms` values of the two plans would not be comparable. The untimed
+build is never executed, so no provider tuning runs. A tuned build prepares
+every candidate the provider can sample, so it is expected to be slower than
+the OOTB build. Providers that support the knob (today the kernel ingestor
 and MIOpen) sample their candidates on the tuned plan's first execute, which
 runs before the warmup, and keep the fastest. Both plans then get the same
 `--warmup` iterations before their timed loops. MIOpen's search runs on that
