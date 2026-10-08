@@ -145,7 +145,7 @@ def test_pmc_basic_populates_counters(tmp_path):
 def test_trace_records_pftrace_artifact(tmp_path):
     skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
-    data = _run_dnn_bench(["--trace", "pftrace"], tmp_path)
+    data = _run_dnn_bench(["--trace"], tmp_path)
     extra = _first_pe_extra(data)
     assert "trace" in extra
     trace = extra["trace"]
@@ -295,7 +295,7 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     _require_perf_kernel_events()
 
     data = _run_dnn_bench(
-        ["--pmc", "basic", "--trace", "pftrace", "--perf", "--roofline"], tmp_path
+        ["--pmc", "basic", "--trace", "--perf", "--roofline"], tmp_path
     )
     extra = _first_pe_extra(data)
 
