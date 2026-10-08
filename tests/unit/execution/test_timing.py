@@ -1,652 +1,605 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for Timer and GPU timing utilities."""
+"""CPU-only tests for ``timing.measure`` driven through a fake HIP runtime."""
 
 import sys
-import time
 import types
+from typing import List
 
 import pytest
 
 import dnn_benchmarking.execution.timing as timing_module
-from dnn_benchmarking.config.benchmark_config import TimingBackendName
+from dnn_benchmarking.common.exceptions import ExecutionError
+from dnn_benchmarking.config.benchmark_config import TimingPolicy
 from dnn_benchmarking.execution.timing import (
-    GpuTimer,
-    GpuTimerInterface,
-    HipGpuTimer,
     StalledRegionTimer,
-    Timer,
-    TorchGpuTimer,
-    create_gpu_timer,
-    get_available_backends,
-    is_gpu_timing_available,
-    run_staged_iterations,
+    StallFallbackError,
+    measure,
 )
 
-# Import shared test fixture
-from tests.conftest import DummyHipTimer
+
+class FakeClock:
+    """Deterministic perf_counter: only explicit advances move time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def advance_ms(self, ms: float) -> None:
+        self.now += ms / 1000.0
 
 
-class FakeTorchEvent:
-    """torch.cuda.Event stand-in that records its interactions."""
+def _install_fake_hip(
+    monkeypatch,
+    log: List[str],
+    *,
+    kernel_ms: float = 1.0,
+    staged: bool = True,
+    buffer_error: Exception = None,
+    clock: FakeClock = None,
+):
+    class FakeEvent:
+        # With a clock, elapsed_time is the span between the two record()
+        # calls, so a missing or misplaced record changes kernel_ms.
+        recorded_at = None
 
-    def __init__(self, enable_timing: bool = False) -> None:
-        self.enable_timing = enable_timing
-        self.recorded_streams: list = []
-        self.synchronize_calls = 0
+        def record(self, stream: int) -> None:
+            log.append("record")
+            if clock is not None:
+                self.recorded_at = clock.now
 
-    def record(self, stream) -> None:
-        self.recorded_streams.append(stream)
+        def synchronize(self) -> None:
+            log.append("event_sync")
+            if clock is not None:
+                clock.advance_ms(50.0)  # waiting on the GPU is not submit time
 
-    def synchronize(self) -> None:
-        self.synchronize_calls += 1
+        def elapsed_time(self, other) -> float:
+            if clock is None:
+                return kernel_ms
+            return (other.recorded_at - self.recorded_at) * 1000.0
 
-    def elapsed_time(self, other) -> float:
-        return 2.5
+    class FakeGate:
+        # Class-level knobs so a test can make every gate fail.
+        arm_error: Exception = None
+        watchdog_fired = False
 
+        def arm(self, stream: int) -> None:
+            if self.arm_error is not None:
+                raise self.arm_error
+            log.append("arm")
 
-def _install_fake_torch(monkeypatch, gpu_available: bool = True):
-    """Install a minimal fake torch module with CUDA event support."""
-    fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(
-            is_available=lambda: gpu_available,
-            Event=FakeTorchEvent,
-            default_stream=lambda: "default-stream",
-        )
+        def release(self) -> None:
+            log.append("release")
+
+        def timed_out(self) -> bool:
+            return self.watchdog_fired
+
+    class FakeBuffer:
+        def __init__(self, size: int) -> None:
+            if buffer_error is not None:
+                raise buffer_error
+            log.append(f"alloc:{size}")
+
+        def zeros(self) -> None:
+            log.append("flush")
+
+    fake = types.SimpleNamespace(
+        HipEvent=FakeEvent,
+        HipStallGate=FakeGate,
+        DeviceBuffer=FakeBuffer,
+        hip_get_device_count=lambda: 1,
+        hip_device_synchronize=lambda: log.append("device_sync"),
+        hip_can_use_stream_wait_value=lambda: staged,
     )
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    return fake_torch
-
-
-class TestTimer:
-    """Tests for Timer context manager."""
-
-    def test_timer_measures_elapsed_time(self) -> None:
-        """Test that timer measures elapsed time correctly."""
-        with Timer() as t:
-            time.sleep(0.01)  # 10ms sleep
-
-        # Should be at least 10ms, allow for some variance
-        assert t.elapsed_ms >= 10.0
-        assert t.elapsed_ms < 100.0  # Sanity check
-
-    def test_timer_elapsed_seconds(self) -> None:
-        """Test elapsed_s property."""
-        with Timer() as t:
-            time.sleep(0.01)  # 10ms sleep
-
-        assert t.elapsed_s >= 0.01
-        assert t.elapsed_s < 0.1
-
-    def test_timer_zero_when_not_started(self) -> None:
-        """Test timer returns zero before use."""
-        t = Timer()
-        assert t.elapsed_ms == 0.0
-        assert t.elapsed_s == 0.0
-
-    def test_timer_reusable(self) -> None:
-        """Test that timer can be reused."""
-        t = Timer()
-
-        with t:
-            time.sleep(0.005)  # 5ms
-        first_elapsed = t.elapsed_ms
-
-        with t:
-            time.sleep(0.01)  # 10ms
-        second_elapsed = t.elapsed_ms
-
-        # Second measurement should be longer
-        assert second_elapsed > first_elapsed
-
-    def test_timer_with_exception(self) -> None:
-        """Test that timer still records time when exception occurs."""
-        t = Timer()
-
-        with pytest.raises(ValueError):
-            with t:
-                time.sleep(0.005)
-                raise ValueError("test error")
-
-        # Time should still be recorded
-        assert t.elapsed_ms >= 5.0
-
-
-class TestGpuTimerInterface:
-    """Tests for the unified GPU timer interface."""
-
-    def test_interface_is_abstract(self) -> None:
-        """Verify GpuTimerInterface cannot be instantiated directly."""
-        with pytest.raises(TypeError):
-            GpuTimerInterface()  # type: ignore
-
-    def test_interface_defines_required_methods(self) -> None:
-        """Verify interface defines required abstract methods."""
-        assert hasattr(GpuTimerInterface, "start")
-        assert hasattr(GpuTimerInterface, "stop")
-        assert hasattr(GpuTimerInterface, "elapsed_ms")
-        assert hasattr(GpuTimerInterface, "synchronize")
-        assert hasattr(GpuTimerInterface, "backend_name")
-
-    def test_interface_has_context_manager_protocol(self) -> None:
-        """Verify interface supports context manager."""
-        assert hasattr(GpuTimerInterface, "__enter__")
-        assert hasattr(GpuTimerInterface, "__exit__")
-
-
-class TestBackendDetection:
-    """Tests for backend availability detection."""
-
-    def test_get_available_backends_returns_list(self) -> None:
-        """Test that get_available_backends returns a list."""
-        backends = get_available_backends()
-        assert isinstance(backends, list)
-
-    def test_get_available_backends_only_valid_values(self, monkeypatch) -> None:
-        """Test that only valid backend names are returned."""
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: True)
-        monkeypatch.setattr(timing_module.torch_support, "gpu_available", lambda: False)
-        backends = get_available_backends()
-        assert backends == ["hip"]
+    monkeypatch.setattr(timing_module, "hipdnn", fake)
+    monkeypatch.setattr(timing_module, "_flush_buffers", {})
+    if clock is not None:
+        monkeypatch.setattr(timing_module, "time", clock)
+    return fake
+
+
+def _enqueue(log: List[str], clock: FakeClock = None, ms: float = 0.0):
+    def enqueue() -> None:
+        log.append("enqueue")
+        if clock is not None:
+            clock.advance_ms(ms)
+
+    return enqueue
+
+
+def test_zero_warmup_still_primes_before_first_gated_enqueue(monkeypatch) -> None:
+    """A first-call compile inside a stalled region never drains; measure()
+    must run and drain one untimed enqueue even with warmup_iters=0."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+
+    m = measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=0, iters=2))
+
+    first_arm = log.index("arm")
+    assert log.index("enqueue") < first_arm
+    assert "device_sync" in log[log.index("enqueue") : first_arm]
+    assert m.mode == "staged"
+    assert m.warmup_iters == 1
+    assert log.count("enqueue") == 3
+
+
+def test_warmups_run_the_timed_path_and_are_discarded(monkeypatch) -> None:
+    """After one priming enqueue (never flushed), the remaining warmups use
+    the same flush + stall-gated path as timed iterations, so clocks and
+    caches are in steady state when sampling starts; only timed ones are kept."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=3, iters=2, cache_mode="cold"),
+    )
+
+    priming = log.index("enqueue")
+    assert log[priming + 1] == "device_sync"
+    assert "flush" not in log[: priming + 2]
+    arms = [i for i, e in enumerate(log) if e == "arm"]
+    assert len(arms) == 2 + 2  # 2 warmups after priming, 2 timed
+    for arm in arms:
+        # flush, then a full device drain, then the gate is armed.
+        assert log[arm - 2 : arm] == ["flush", "device_sync"]
+    assert log.count("enqueue") == 1 + 2 + 2
+    assert len(m.kernel_ms) == len(m.host_ms) == 2
+    assert m.warmup_iters == 3
+    assert log.count(f"alloc:{timing_module._FLUSH_BYTES}") == 1
+    assert m.cache_mode == "cold"
+
+
+def test_warm_mode_never_flushes(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+
+    measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=3))
+
+    assert "flush" not in log
+    assert not any(e.startswith("alloc") for e in log)
+
+
+def test_min_time_extends_sample_count(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, kernel_ms=1.0)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=1, iters=2, min_time_ms=5.0),
+    )
+
+    assert len(m.kernel_ms) == 5
+    assert m.capped is False
+
+
+@pytest.mark.parametrize("timing_block", [1, 4])  # block mode has its own loop
+def test_max_iters_caps_loop_and_flags_it(monkeypatch, timing_block) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, kernel_ms=1.0)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(
+            warmup_iters=1,
+            iters=2,
+            min_time_ms=100.0,
+            max_iters=3,
+            timing_block=timing_block,
+        ),
+    )
+
+    assert len(m.kernel_ms) == len(m.host_ms) == 3
+    assert m.capped is True
 
-    def test_get_available_backends_includes_torch(self, monkeypatch) -> None:
-        """Torch GPU availability adds the torch backend."""
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: False)
-        monkeypatch.setattr(timing_module.torch_support, "gpu_available", lambda: True)
-        assert get_available_backends() == ["torch"]
 
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: True)
-        assert get_available_backends() == ["hip", "torch"]
+def test_fixed_count_reaching_iters_is_not_capped(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
 
-    def test_is_gpu_timing_available_matches_backends(self, monkeypatch) -> None:
-        """Test consistency between availability functions."""
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: True)
-        monkeypatch.setattr(timing_module.torch_support, "gpu_available", lambda: False)
-        backends = get_available_backends()
-        assert is_gpu_timing_available() == (len(backends) > 0)
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=1, iters=3, max_iters=3),
+    )
 
-    def test_cpu_only_torch_does_not_enable_gpu_timing(self, monkeypatch) -> None:
-        """CPU-only torch is importable but must not enable GPU timers."""
-        fake_torch = types.SimpleNamespace(
-            cuda=types.SimpleNamespace(is_available=lambda: False)
-        )
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: False)
+    assert len(m.kernel_ms) == 3
+    assert m.capped is False
 
-        assert timing_module.torch_support.module_available() is True
-        assert timing_module.torch_support.gpu_available() is False
-        assert get_available_backends() == []
-        assert is_gpu_timing_available() is False
 
+def test_events_mode_times_exactly_one_enqueue(monkeypatch) -> None:
+    """Without staging, each sample is one event pair around one enqueue:
+    kernel_ms is stop minus start, and host_ms is submit time. Waiting for the
+    stop event (50 ms on the fake clock) leaks into neither."""
+    log: List[str] = []
+    clock = FakeClock()
+    _install_fake_hip(monkeypatch, log, staged=False, clock=clock)
 
-class TestFactoryFunction:
-    """Tests for create_gpu_timer factory."""
+    m = measure(
+        _enqueue(log, clock, ms=2.0),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=1, iters=3),
+    )
 
-    def test_string_backend_raises_type_error(self) -> None:
-        """Timer factory requires TimingBackendName values."""
-        with pytest.raises(TypeError, match="TimingBackendName"):
-            create_gpu_timer("hip")  # type: ignore[arg-type]
+    assert m.mode == "events"
+    assert m.fallback_reason == "device does not support hipStreamWaitValue32"
+    sample = ["record", "enqueue", "record", "event_sync"]
+    assert log == ["enqueue", "device_sync"] + sample * 3
+    assert m.host_ms == pytest.approx([2.0, 2.0, 2.0])
+    assert m.kernel_ms == pytest.approx([2.0, 2.0, 2.0])
 
-    def test_hip_backend_unavailable_raises_error(self, monkeypatch) -> None:
-        """Test that requesting unavailable HIP backend raises RuntimeError."""
 
-        def raise_unavailable():
-            raise RuntimeError("HIP GPU timing not available")
+def _install_fake_torch_cuda(monkeypatch, log: List[str]) -> None:
+    """torch with just what the torch timer and its flush use."""
 
-        monkeypatch.setattr(timing_module, "_require_hip_runtime", raise_unavailable)
-        with pytest.raises(RuntimeError, match="HIP GPU timing not available"):
-            create_gpu_timer(TimingBackendName.HIP)
-
-    def test_auto_no_backend_returns_none(self, monkeypatch) -> None:
-        """Test that auto with no backends returns None (graceful fallback)."""
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: False)
-        assert create_gpu_timer(TimingBackendName.AUTO) is None
-
-    def test_auto_creates_timer_when_available(self, monkeypatch) -> None:
-        """Test auto-detection creates a timer when available."""
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: True)
-        monkeypatch.setattr(timing_module, "HipGpuTimer", DummyHipTimer)
-        timer = create_gpu_timer(TimingBackendName.AUTO)
-        assert isinstance(timer, GpuTimerInterface)
-        assert timer.backend_name == "hip"
-
-    def test_auto_falls_back_to_torch_with_torch_stream(self, monkeypatch) -> None:
-        """Auto uses torch events when HIP is unavailable and a stream is given."""
-        _install_fake_torch(monkeypatch)
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: False)
-
-        timer = create_gpu_timer(TimingBackendName.AUTO, torch_stream="graph-stream")
-
-        assert isinstance(timer, TorchGpuTimer)
-        assert timer.backend_name == "torch"
-
-    def test_auto_without_torch_stream_does_not_fall_back(self, monkeypatch) -> None:
-        """Auto never picks torch timing without a torch stream to bracket."""
-        _install_fake_torch(monkeypatch)
-        monkeypatch.setattr(timing_module, "_is_hip_available", lambda: False)
-
-        assert create_gpu_timer(TimingBackendName.AUTO) is None
-
-    def test_torch_backend_unavailable_raises_error(self, monkeypatch) -> None:
-        """Requesting torch timing without a usable GPU raises RuntimeError."""
-        _install_fake_torch(monkeypatch, gpu_available=False)
-
-        with pytest.raises(RuntimeError, match="Torch GPU timing not available"):
-            create_gpu_timer(TimingBackendName.TORCH)
-
-
-class TestHipGpuTimerBackwardCompat:
-    """Tests for backward compatibility aliases."""
-
-    def test_gputimer_alias(self) -> None:
-        """Test that GpuTimer is alias for HipGpuTimer."""
-        assert GpuTimer is HipGpuTimer
-
-
-class TestGpuTimerContextManager:
-    """Tests for GPU timer context manager behavior."""
-
-    def test_context_manager_calls_start_and_stop(self) -> None:
-        """Test that context manager calls start on enter and stop on exit."""
-        call_order = []
-
-        class TrackingTimer(GpuTimerInterface):
-            @property
-            def backend_name(self) -> str:
-                return "tracking"
-
-            def start(self) -> None:
-                call_order.append("start")
-
-            def stop(self) -> None:
-                call_order.append("stop")
-
-            def synchronize(self) -> None:
-                pass
-
-            def elapsed_ms(self) -> float:
-                return 1.0
-
-        timer = TrackingTimer()
-        with timer:
-            call_order.append("inside")
-
-        assert call_order == ["start", "inside", "stop"]
-
-    def test_context_manager_stop_called_on_exception(self) -> None:
-        """Test that stop is called even when exception occurs."""
-        stop_called = False
-
-        class ExceptionTimer(GpuTimerInterface):
-            @property
-            def backend_name(self) -> str:
-                return "exception"
-
-            def start(self) -> None:
-                pass
-
-            def stop(self) -> None:
-                nonlocal stop_called
-                stop_called = True
-
-            def synchronize(self) -> None:
-                pass
-
-            def elapsed_ms(self) -> float:
-                return 1.0
-
-        timer = ExceptionTimer()
-        with pytest.raises(RuntimeError):
-            with timer:
-                raise RuntimeError("test error")
-
-        assert stop_called is True
-
-
-class TestDirectHipTimers:
-    """Tests for direct hipdnn_frontend HIP API usage."""
-
-    def test_hip_gpu_timer_uses_bound_hip_events(self, monkeypatch) -> None:
-        calls = []
-        events = []
-
-        class FakeEvent:
-            def __init__(self) -> None:
-                events.append(self)
-                calls.append(("create", self))
-
-            def record(self, stream: int) -> None:
-                calls.append(("record", self, stream))
-
-            def synchronize(self) -> None:
-                calls.append(("synchronize", self))
-
-            def elapsed_time(self, stop) -> float:
-                calls.append(("elapsed", self, stop))
-                return 1.25
-
-        class FakeHipdnn:
-            @staticmethod
-            def hip_get_device_count() -> int:
-                return 1
-
-            HipEvent = FakeEvent
-
-        monkeypatch.setattr(timing_module, "hipdnn", FakeHipdnn)
-
-        timer = HipGpuTimer(stream=123)
-        timer.start()
-        timer.stop()
-        timer.synchronize()
-
-        assert timer.elapsed_ms() == 1.25
-        assert len(events) == 2
-        assert calls == [
-            ("create", events[0]),
-            ("create", events[1]),
-            ("record", events[0], 123),
-            ("record", events[1], 123),
-            ("synchronize", events[1]),
-            ("synchronize", events[1]),
-            ("elapsed", events[0], events[1]),
-        ]
-
-    def test_hip_gpu_timer_synchronize_stream_records_event_on_stream(
-        self, monkeypatch
-    ) -> None:
-        calls = []
-        events = []
-
-        class FakeEvent:
-            def __init__(self) -> None:
-                events.append(self)
-                calls.append(("create", self))
-
-            def record(self, stream: int) -> None:
-                calls.append(("record", self, stream))
-
-            def synchronize(self) -> None:
-                calls.append(("synchronize", self))
-
-            def elapsed_time(self, stop) -> float:
-                return 0.0
-
-        class FakeHipdnn:
-            @staticmethod
-            def hip_get_device_count() -> int:
-                return 1
-
-            HipEvent = FakeEvent
-
-        monkeypatch.setattr(timing_module, "hipdnn", FakeHipdnn)
-
-        timer = HipGpuTimer(stream=456)
-        timer.synchronize_stream()
-
-        assert len(events) == 2
-        assert calls == [
-            ("create", events[0]),
-            ("create", events[1]),
-            ("record", events[1], 456),
-            ("synchronize", events[1]),
-        ]
-
-
-class TestStalledRegionTimer:
-    """Tests for the stalled-queue staged region timer (CPU-only via fakes)."""
-
-    @staticmethod
-    def _install_fake(monkeypatch, calls, events):
-        class FakeEvent:
-            def __init__(self) -> None:
-                events.append(self)
-
-            def record(self, stream: int) -> None:
-                calls.append(("record", self, stream))
-
-            def synchronize(self) -> None:
-                calls.append(("synchronize", self))
-
-            def elapsed_time(self, stop) -> float:
-                calls.append(("elapsed", self, stop))
-                return 1.25
-
-        class FakeGate:
-            def arm(self, stream: int) -> None:
-                calls.append(("arm", stream))
-
-            def release(self) -> None:
-                calls.append(("release",))
-
-            def timed_out(self) -> bool:
-                return False
-
-        class FakeHipdnn:
-            @staticmethod
-            def hip_get_device_count() -> int:
-                return 1
-
-            @staticmethod
-            def hip_device_synchronize() -> None:
-                calls.append(("device_sync",))
-
-            HipEvent = FakeEvent
-            HipStallGate = FakeGate
-
-        monkeypatch.setattr(timing_module, "hipdnn", FakeHipdnn)
-
-    def test_barrier_syncs_device_once(self, monkeypatch) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-
-        timer = StalledRegionTimer(stream=7)
-        timer.barrier()
-
-        assert calls.count(("device_sync",)) == 1
-
-    def test_measure_orders_staging_sequence(self, monkeypatch) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-
-        timer = StalledRegionTimer(stream=7)
-
-        def enqueue() -> None:
-            calls.append(("enqueue",))
-
-        cpu_ms, kernel_ms = timer.measure(enqueue)
-
-        # Fixed kernel span from the fake start->stop elapsed_time.
-        assert kernel_ms == 1.25
-        # Host bracket measures real perf_counter time around enqueue.
-        assert cpu_ms >= 0.0
-
-        start, stop = events[0], events[1]
-        # The full staging order: arm, start.record, enqueue, stop.record,
-        # release, stop.synchronize, elapsed -- with no device sync inside.
-        assert calls == [
-            ("arm", 7),
-            ("record", start, 7),
-            ("enqueue",),
-            ("record", stop, 7),
-            ("release",),
-            ("synchronize", stop),
-            ("elapsed", start, stop),
-        ]
-        assert ("device_sync",) not in calls
-
-    def test_measure_rejects_watchdog_invalidated_timing(self, monkeypatch) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-        timer = StalledRegionTimer(stream=7)
-        timer._gate.timed_out = lambda: True
-
-        with pytest.raises(
-            timing_module.StallFallbackError, match="watchdog invalidated"
-        ):
-            timer.measure(lambda: calls.append(("enqueue",)))
-
-        assert not any(call[0] == "elapsed" for call in calls)
-
-    def test_measure_requests_fallback_when_gate_cannot_arm(self, monkeypatch) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-        timer = StalledRegionTimer(stream=7)
-
-        def fail_arm(stream: int) -> None:
-            raise RuntimeError("unsupported stream")
-
-        timer._gate.arm = fail_arm
-        with pytest.raises(timing_module.StallFallbackError, match="could not arm"):
-            timer.measure(lambda: calls.append(("enqueue",)))
-
-        assert not calls
-
-    def test_measure_releases_gate_when_enqueue_raises(self, monkeypatch) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-
-        timer = StalledRegionTimer(stream=7)
-
-        def boom() -> None:
-            calls.append(("enqueue",))
-            raise RuntimeError("enqueue failed")
-
-        with pytest.raises(RuntimeError, match="enqueue failed"):
-            timer.measure(boom)
-
-        start, stop = events[0], events[1]
-        # The gate was armed then released even though enqueue raised, so the
-        # stalled work stream never stays blocked.
-        assert ("arm", 7) in calls
-        assert ("release",) in calls
-        assert calls.index(("release",)) > calls.index(("arm", 7))
-        # The device is drained on the failure path so no pending wait still
-        # references the signal memory at teardown.
-        assert ("device_sync",) in calls
-        # stop was never recorded, so it must not be synchronized or measured.
-        assert ("record", stop, 7) not in calls
-        assert ("synchronize", stop) not in calls
-        assert ("elapsed", start, stop) not in calls
-
-    def test_run_staged_iterations_collects_parallel_timings(self, monkeypatch) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-
-        timer = StalledRegionTimer(stream=7)
-
-        def enqueue() -> None:
-            calls.append(("enqueue",))
-
-        host_timings, kernel_timings = run_staged_iterations(timer, 3, enqueue)
-
-        # One barrier (device sync) before the loop, then exactly N measures.
-        assert calls.count(("device_sync",)) == 1
-        assert calls.count(("arm", 7)) == 3
-        assert calls.count(("enqueue",)) == 3
-        # Parallel lists, one entry per iteration; kernel span from the fake.
-        assert len(host_timings) == 3
-        assert kernel_timings == [1.25, 1.25, 1.25]
-        assert all(h >= 0.0 for h in host_timings)
-
-    def test_run_staged_iterations_zero_iterations_only_barriers(
-        self, monkeypatch
-    ) -> None:
-        calls: list = []
-        events: list = []
-        self._install_fake(monkeypatch, calls, events)
-
-        timer = StalledRegionTimer(stream=7)
-        host_timings, kernel_timings = run_staged_iterations(timer, 0, lambda: None)
-
-        assert host_timings == []
-        assert kernel_timings == []
-        assert calls == [("device_sync",)]
-
-
-class TestTorchGpuTimer:
-    """Tests for torch.cuda event timing."""
-
-    def test_records_events_on_provided_stream(self, monkeypatch) -> None:
-        _install_fake_torch(monkeypatch)
-
-        timer = TorchGpuTimer(stream="graph-stream")
-        timer.start()
-        timer.stop()
-
-        assert timer.elapsed_ms() == 2.5
-        assert timer._start_event.recorded_streams == ["graph-stream"]
-        assert timer._stop_event.recorded_streams == ["graph-stream"]
-        assert timer._stop_event.synchronize_calls == 1
-
-    def test_defaults_to_default_stream(self, monkeypatch) -> None:
-        _install_fake_torch(monkeypatch)
-
-        timer = TorchGpuTimer()
-        timer.start()
-
-        assert timer._start_event.recorded_streams == ["default-stream"]
-
-    def test_synchronize_before_stop_raises(self, monkeypatch) -> None:
-        _install_fake_torch(monkeypatch)
-
-        timer = TorchGpuTimer(stream="graph-stream")
-        timer.start()
-
-        with pytest.raises(RuntimeError, match="stop event has not been recorded"):
-            timer.synchronize()
-
-    def test_requires_gpu(self, monkeypatch) -> None:
-        _install_fake_torch(monkeypatch, gpu_available=False)
-
-        with pytest.raises(RuntimeError, match="Torch GPU timing not available"):
-            TorchGpuTimer()
-
-
-class TestLazyHipdnnImport:
-    """timing must be importable and degrade gracefully without hipdnn_frontend."""
-
-    def test_missing_hipdnn_reports_hip_unavailable(self, monkeypatch) -> None:
-        import builtins
-
-        monkeypatch.setattr(timing_module, "hipdnn", None)
-        real_import = builtins.__import__
-
-        def blocking_import(name, *args, **kwargs):
-            if name == "hipdnn_frontend":
-                raise ImportError("blocked hipdnn_frontend")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", blocking_import)
-
-        assert timing_module._is_hip_available() is False
-        with pytest.raises(RuntimeError, match="not importable"):
-            HipGpuTimer()
-
-
-class TestTimingSanity:
-    """Sanity tests for timing behavior."""
-
-    def test_dummy_timer_implements_interface(self) -> None:
-        """Test that DummyHipTimer properly implements the interface."""
-        timer = DummyHipTimer()
-
-        # Verify all interface methods work
-        assert timer.backend_name == "hip"
-        timer.start()
-        timer.stop()
-        timer.synchronize()
-        assert timer.elapsed_ms() == 0.0
-
-    def test_dummy_timer_context_manager(self) -> None:
-        """Test that DummyHipTimer works as context manager."""
-        timer = DummyHipTimer()
-        with timer:
+    class Event:
+        def __init__(self, enable_timing: bool = False) -> None:
             pass
-        assert timer.elapsed_ms() == 0.0
+
+        def record(self, stream) -> None:
+            log.append("record")
+
+        def synchronize(self) -> None:
+            log.append("event_sync")
+
+        def elapsed_time(self, other) -> float:
+            return 1.0
+
+    class Buffer:
+        def zero_(self) -> None:
+            log.append("flush")
+
+    cuda = types.SimpleNamespace(
+        Event=Event,
+        current_stream=lambda: "torch-stream",
+        synchronize=lambda: log.append("device_sync"),
+    )
+    torch = types.SimpleNamespace(
+        cuda=cuda, uint8="uint8", empty=lambda *a, **kw: Buffer()
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+
+@pytest.mark.parametrize("backend", ["hip", "torch"])
+def test_cold_flushes_before_every_events_mode_iteration(monkeypatch, backend) -> None:
+    """Cold mode flushes and drains before every warmup and timed sample in
+    events mode too (CUDA rows, hosts without stream-wait-value)."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, staged=backend == "torch")
+    if backend == "torch":
+        _install_fake_torch_cuda(monkeypatch, log)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=3, iters=2, cache_mode="cold"),
+        timer=backend,
+    )
+
+    assert m.mode == "events"
+    sample = ["flush", "device_sync", "record", "enqueue", "record", "event_sync"]
+    # Priming (never flushed), then 2 warmups and 2 timed samples.
+    steps = [e for e in log if not e.startswith("alloc")]
+    assert steps == ["enqueue", "device_sync"] + sample * 4
+    assert len(m.kernel_ms) == 2
+
+
+def test_first_call_ms_covers_first_enqueue_and_its_sync(monkeypatch) -> None:
+    log: List[str] = []
+    clock = FakeClock()
+    _install_fake_hip(monkeypatch, log, clock=clock)
+    calls = []
+
+    def enqueue() -> None:
+        calls.append(1)
+        clock.advance_ms(30.0 if len(calls) == 1 else 1.0)  # first call compiles
+
+    m = measure(enqueue, stream=7, policy=TimingPolicy(warmup_iters=2, iters=1))
+
+    assert m.first_call_ms == pytest.approx(30.0)
+    assert m.warmup_iters == 2
+
+
+def test_cold_flush_allocation_failure_names_warm_mode(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, buffer_error=RuntimeError("out of memory"))
+
+    with pytest.raises(ExecutionError, match="--cache-mode warm"):
+        measure(
+            _enqueue(log),
+            stream=7,
+            policy=TimingPolicy(warmup_iters=1, iters=1, cache_mode="cold"),
+        )
+
+
+def _install_fake_torch_sync_debug(monkeypatch, modes: List[str]):
+    cuda = types.SimpleNamespace(
+        get_sync_debug_mode=lambda: 0,
+        set_sync_debug_mode=lambda mode: modes.append(mode),
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+
+
+def test_host_sync_in_torch_enqueue_falls_back_to_events(monkeypatch) -> None:
+    """A syncing enqueue would deadlock the stalled stream, so measure() must
+    detect it during priming and time in events mode instead."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    modes: List[str] = []
+    _install_fake_torch_sync_debug(monkeypatch, modes)
+
+    def enqueue() -> None:
+        log.append("enqueue")
+        if modes and modes[-1] == "error":
+            raise RuntimeError("called a synchronizing CUDA operation")
+
+    m = measure(
+        enqueue,
+        stream=7,
+        policy=TimingPolicy(warmup_iters=0, iters=2),
+        torch_stream=object(),
+    )
+
+    assert m.mode == "events"
+    assert m.fallback_reason.startswith("host sync in enqueue: ")
+    assert "arm" not in log
+    assert modes == ["error", 0]  # debug mode restored
+    assert len(m.kernel_ms) == 2
+    # Priming, the failed checked call, and its unchecked rerun.
+    assert m.warmup_iters == 3 == log.count("enqueue") - len(m.kernel_ms)
+
+
+def test_host_sync_in_torch_enqueue_is_recorded_in_block_mode(monkeypatch) -> None:
+    """Block mode does not stall the stream, so a syncing enqueue still runs,
+    but its host round-trips fall inside the block's event span: the probe's
+    finding must stay on the measurement as in per-launch mode."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    modes: List[str] = []
+    _install_fake_torch_sync_debug(monkeypatch, modes)
+
+    def enqueue() -> None:
+        if modes and modes[-1] == "error":
+            raise RuntimeError("called a synchronizing CUDA operation")
+
+    m = measure(
+        enqueue,
+        stream=7,
+        policy=TimingPolicy(warmup_iters=0, iters=2, timing_block=4),
+        torch_stream=object(),
+    )
+
+    assert m.mode == "block"
+    assert m.fallback_reason.startswith("host sync in enqueue: ")
+
+
+def test_async_torch_enqueue_stays_staged(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    modes: List[str] = []
+    _install_fake_torch_sync_debug(monkeypatch, modes)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=0, iters=1),
+        torch_stream=object(),
+    )
+
+    assert m.mode == "staged"
+    assert m.fallback_reason is None
+    # First call populates host caches unchecked; one more checked call.
+    assert m.warmup_iters == 2
+    # The probe's work drains before the first gated iteration is armed.
+    assert log[:5] == ["enqueue", "device_sync", "enqueue", "device_sync", "arm"]
+
+
+def test_genuine_enqueue_error_during_sync_probe_propagates(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    _install_fake_torch_sync_debug(monkeypatch, [])
+    calls = []
+
+    def enqueue() -> None:
+        calls.append(1)
+        if len(calls) > 1:
+            raise ExecutionError("kernel launch failed")
+
+    with pytest.raises(ExecutionError, match="kernel launch failed"):
+        measure(
+            enqueue,
+            stream=7,
+            policy=TimingPolicy(warmup_iters=1, iters=1),
+            torch_stream=object(),
+        )
+
+
+def test_staged_measure_success_path_ordering(monkeypatch) -> None:
+    """The work is enqueued behind the armed gate, between the two records, and
+    the gate is released before waiting on the stop event (else it hangs)."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, kernel_ms=2.5)
+    timer = StalledRegionTimer(stream=7)
+
+    _, kernel_ms = timer.measure(_enqueue(log))
+
+    assert log == ["arm", "record", "enqueue", "record", "release", "event_sync"]
+    assert kernel_ms == 2.5
+
+
+def test_staged_measure_releases_gate_when_enqueue_raises(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    timer = StalledRegionTimer(stream=7)
+
+    def boom() -> None:
+        raise RuntimeError("enqueue failed")
+
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        timer.measure(boom)
+
+    # Gate released after arm, device drained, stop event never waited on.
+    assert log == ["arm", "record", "release", "device_sync"]
+
+
+def test_watchdog_release_rejects_the_sample(monkeypatch) -> None:
+    """A gate the watchdog released timed host gaps too: no sample is returned."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    fake.HipStallGate.watchdog_fired = True
+    timer = StalledRegionTimer(stream=7)
+
+    with pytest.raises(StallFallbackError, match="watchdog invalidated"):
+        timer.measure(_enqueue(log))
+
+
+def test_gate_that_cannot_arm_requests_fallback(monkeypatch) -> None:
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    fake.HipStallGate.arm_error = RuntimeError("unsupported stream")
+    timer = StalledRegionTimer(stream=7)
+
+    with pytest.raises(StallFallbackError, match="could not arm"):
+        timer.measure(_enqueue(log))
+    assert log == []  # nothing enqueued behind a gate that never armed
+
+
+def test_stall_failure_in_the_loop_propagates_from_measure(monkeypatch) -> None:
+    """measure() must not turn a stall failure into an events-mode row: the
+    suite runner remeasures the whole graph so its rows share one mode."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    fake.HipStallGate.watchdog_fired = True
+
+    with pytest.raises(StallFallbackError):
+        measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=2))
+
+
+def test_gate_that_cannot_be_created_requests_fallback(monkeypatch) -> None:
+    """A per-row silent events fallback would mix modes inside one graph."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+
+    def no_gate(self) -> None:
+        raise RuntimeError("out of signal memory")
+
+    monkeypatch.setattr(fake.HipStallGate, "__init__", no_gate)
+
+    with pytest.raises(StallFallbackError, match="stall gate unavailable"):
+        measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=1))
+
+
+def test_disabled_stall_gate_times_in_events_mode(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=1, iters=2, stall_gate=False),
+    )
+
+    assert m.mode == "events"
+    assert "arm" not in log
+    assert m.fallback_reason.startswith("stall gate failed in this graph")
+
+
+def test_binding_without_watchdog_state_is_not_staged(monkeypatch) -> None:
+    """Without HipStallGate.timed_out a released gate is undetectable, so the
+    loop uses events mode and records why."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    monkeypatch.delattr(fake.HipStallGate, "timed_out")
+
+    m = measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=1))
+
+    assert m.mode == "events"
+    assert "HipStallGate.timed_out" in m.fallback_reason
+
+
+def test_missing_hipdnn_reports_hip_unavailable(monkeypatch) -> None:
+    import builtins
+
+    monkeypatch.setattr(timing_module, "hipdnn", None)
+    real_import = builtins.__import__
+
+    def blocking_import(name, *args, **kwargs):
+        if name == "hipdnn_frontend":
+            raise ImportError("blocked hipdnn_frontend")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
+
+    assert timing_module.is_hip_available() is False
+    with pytest.raises(RuntimeError, match="not importable"):
+        measure(lambda: None, stream=0, policy=TimingPolicy())
+
+
+def test_block_timing_follows_rocke_protocol(monkeypatch) -> None:
+    """timing_block=N follows rocKE time_launches / Solera measure(): every
+    sample runs warmup_iters untimed executions, drains, then times N
+    back-to-back executions in one event pair (elapsed / N); the first sample
+    is discarded. The stall gate is skipped even where staging is available,
+    because N gated enqueues can fill the HIP queue."""
+    log: List[str] = []
+    clock = FakeClock()
+    fake = _install_fake_hip(monkeypatch, log, staged=True, clock=clock)
+    elapsed = iter([40.0, 8.0, 12.0])
+    fake.HipEvent.elapsed_time = lambda self, other: next(elapsed)
+
+    m = measure(
+        _enqueue(log, clock, ms=0.5),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=2, iters=2, timing_block=4),
+    )
+
+    assert "arm" not in log
+    sample = ["enqueue"] * 2 + ["device_sync", "record"]
+    sample += ["enqueue"] * 4 + ["record", "event_sync"]
+    priming = ["enqueue", "device_sync"]
+    assert log == priming + sample * 3
+    assert m.kernel_ms == [2.0, 3.0]
+    assert m.host_ms == [pytest.approx(0.5), pytest.approx(0.5)]
+    # One priming enqueue plus two untimed executions before each of 3 samples.
+    assert (m.mode, m.timing_block, m.warmup_iters) == ("block", 4, 7)
+    assert m.fallback_reason is None
+
+
+def test_block_min_time_counts_every_execution_in_the_block(monkeypatch) -> None:
+    """The --min-time-ms budget is device time: a block of 4 that takes 8 ms
+    adds 8 ms, not its 2 ms per-execution average."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, kernel_ms=8.0)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=0, iters=1, min_time_ms=9.0, timing_block=4),
+    )
+
+    assert m.kernel_ms == [2.0, 2.0]
+
+
+def test_cold_cache_rejects_block_timing() -> None:
+    """A flush before a block of N leaves only the first execution cold."""
+    with pytest.raises(ValueError, match="--timing-block"):
+        TimingPolicy(cache_mode="cold", timing_block=2)
+
+
+def test_timer_measures_the_with_block(monkeypatch) -> None:
+    clock = FakeClock()
+    clock.advance_ms(100.0)  # elapsed is relative to entry, not the epoch
+    monkeypatch.setattr(timing_module, "time", clock)
+
+    with timing_module.Timer() as timer:
+        clock.advance_ms(250.0)
+    clock.advance_ms(1000.0)  # after exit: not counted
+
+    assert timer.elapsed_ms == pytest.approx(250.0)
+    assert timer.elapsed_s == pytest.approx(0.25)

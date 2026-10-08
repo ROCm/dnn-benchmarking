@@ -9,7 +9,6 @@ version = 1
 
 warmup = 10
 iters = 100
-verbose = true
 
 # Optional plugin discovery directory. setup_env.py prints the selected prefix; pass
 # <selected-prefix>/lib/hipdnn_plugins/engines when plugin discovery is not

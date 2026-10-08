@@ -3,20 +3,11 @@
 
 """Tensor information dataclass."""
 
-import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-# Map data type strings to byte sizes
-DTYPE_SIZES = {
-    "float": 4,
-    "half": 2,
-    "bfloat16": 2,
-    "double": 8,
-    "int8": 1,
-    "int32": 4,
-    "uint8": 1,
-}
+from ..common.dtypes import DType, get_dtype
+from ..common.exceptions import GraphLoadError
 
 
 @dataclass
@@ -27,10 +18,12 @@ class TensorInfo:
         uid: Unique identifier for the tensor.
         name: Human-readable name of the tensor.
         dims: Dimensions of the tensor (e.g., [N, C, H, W]).
-        strides: Memory strides for each dimension.
-        data_type: Data type as string (e.g., "float", "half").
+        data_type: Data type name from the graph (e.g., "float", "half").
         is_virtual: Whether this is a virtual (intermediate) tensor.
         is_output: Whether this tensor is marked as a graph output.
+        value: Embedded scalar for pass-by-value tensors, else None.
+        dtype: Registry entry for ``data_type``; construction raises
+            UnsupportedGraphError for an unknown type.
     """
 
     uid: int
@@ -41,19 +34,15 @@ class TensorInfo:
     is_virtual: bool
     is_output: bool = False
     value: Optional[Any] = None
+    dtype: DType = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self.dtype = get_dtype(self.data_type)
 
     @property
     def element_size(self) -> int:
         """Get size of one element in bytes."""
-        dtype_lower = self.data_type.lower()
-        size = DTYPE_SIZES.get(dtype_lower)
-        if size is None:
-            warnings.warn(
-                f"Unknown data type '{self.data_type}', defaulting to 4 bytes",
-                stacklevel=2,
-            )
-            return 4
-        return size
+        return self.dtype.size
 
     @property
     def num_elements(self) -> int:
@@ -91,23 +80,30 @@ class TensorInfo:
         return self.storage_elements * self.element_size
 
     @classmethod
-    def from_json(cls, tensor_json: dict, is_output: bool = False) -> "TensorInfo":
-        """Create TensorInfo from a JSON tensor object.
+    def from_json(cls, tensor_json: dict) -> "TensorInfo":
+        """Create TensorInfo from a JSON tensor object (``is_output`` False).
 
         Args:
             tensor_json: Dictionary containing tensor attributes from graph JSON.
-            is_output: Whether this tensor is a graph output.
 
         Returns:
             TensorInfo instance.
+
+        Raises:
+            GraphLoadError: If a required field is missing or malformed.
+            UnsupportedGraphError: If the data type is not supported.
         """
-        return cls(
-            uid=tensor_json["uid"],
-            name=tensor_json.get("name", f"tensor_{tensor_json['uid']}"),
-            dims=tensor_json["dims"],
-            strides=tensor_json.get("strides", []),
-            data_type=tensor_json.get("data_type", "float"),
-            is_virtual=tensor_json.get("virtual", False),
-            is_output=is_output,
-            value=tensor_json.get("value"),
-        )
+        try:
+            return cls(
+                uid=int(tensor_json["uid"]),
+                name=tensor_json.get("name", f"tensor_{tensor_json['uid']}"),
+                dims=[int(d) for d in tensor_json["dims"]],
+                strides=[int(s) for s in tensor_json.get("strides") or []],
+                data_type=tensor_json["data_type"],
+                is_virtual=bool(tensor_json.get("virtual", False)),
+                value=tensor_json.get("value"),
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise GraphLoadError(
+                f"Malformed tensor entry {tensor_json!r:.200}: {type(e).__name__}: {e}"
+            ) from e

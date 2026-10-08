@@ -1,324 +1,131 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Integration tests for CLI."""
+"""End-to-end smoke of the dnn-benchmark CLI in a subprocess."""
 
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import List
 
 import pytest
 
+from tests.conftest import expected_timer
+from tests.integration.conftest import GRAPHS_DIR, PROJECT_ROOT
 
-class TestCLIIntegration:
-    """Integration tests for CLI invocation."""
 
-    @pytest.fixture
-    def sample_graph_path(self) -> Path:
-        """Get path to sample graph."""
-        return Path(__file__).parent.parent.parent / "graphs" / "sample_conv_fwd.json"
+@pytest.mark.gpu
+def test_cli_smoke(
+    hipdnn, torch_gpu, plugin_path_cli_args: List[str], tmp_path: Path
+) -> None:
+    """One good graph with --validate plus one broken graph.
 
-    def test_cli_help(self) -> None:
-        """Test that --help works."""
-        result = subprocess.run(
-            [sys.executable, "-m", "dnn_benchmarking", "--help"],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
+    Pins the user-facing contract: results on stdout, progress on stderr,
+    per-graph isolation, exit code 1 for a graph error, and a v2 JSON file.
+    """
+    conv = GRAPHS_DIR / "sample_conv_fwd.json"
+    broken = tmp_path / "broken.json"
+    broken.write_text("{")
+    output = tmp_path / "results.json"
 
-        assert result.returncode == 0
-        assert "dnn-benchmark" in result.stdout or "dnn_benchmarking" in result.stdout
-        assert "--graph" in result.stdout
-        assert "--warmup" in result.stdout
-        assert "--iters" in result.stdout
-
-    def test_cli_missing_required_arg(self) -> None:
-        """Test that missing --graph arg gives error."""
-        result = subprocess.run(
-            [sys.executable, "-m", "dnn_benchmarking"],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
-
-        assert result.returncode != 0
-        assert "graph" in result.stderr.lower() or "required" in result.stderr.lower()
-
-    def test_cli_nonexistent_graph(self) -> None:
-        """Test error handling for nonexistent graph file."""
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "dnn_benchmarking",
-                "--graph",
-                "/nonexistent/path/graph.json",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
-
-        assert result.returncode != 0
-        combined = (result.stdout + result.stderr).lower()
-        assert "no graph files found" in combined or "error" in combined
-
-    @pytest.mark.gpu
-    def test_cli_full_run(
-        self,
-        sample_graph_path: Path,
-        plugin_paths,
-        plugin_path_cli_args,
-    ) -> None:
-        """Test full CLI run with sample graph (requires GPU)."""
-        if not sample_graph_path.exists():
-            pytest.skip(f"Sample graph not found: {sample_graph_path}")
-
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                pytest.skip("PyTorch GPU not available")
-        except ImportError as e:
-            pytest.skip(f"PyTorch not available: {e}")
-
-        # Check if hipdnn is available
-        try:
-            import hipdnn_frontend
-
-            hipdnn_frontend.set_engine_plugin_paths(
-                plugin_paths, hipdnn_frontend.PluginLoadingMode.ABSOLUTE
-            )
-            hipdnn_frontend.Handle()
-        except Exception as e:
-            pytest.skip(f"hipdnn_frontend not available or no GPU: {e}")
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "dnn_benchmarking",
-                "--graph",
-                str(sample_graph_path),
-                "--warmup",
-                "1",
-                "--iters",
-                "2",
-                "-v",
-            ]
-            + plugin_path_cli_args,
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
-
-        # Check output contains expected sections
-        assert "hipDNN Benchmark" in result.stdout
-        assert "Execution Statistics" in result.stdout
-        assert "Mean" in result.stdout
-
-        # Should succeed
-        assert result.returncode == 0, f"CLI failed with: {result.stderr}"
-
-    @pytest.mark.gpu
-    @pytest.mark.parametrize(
-        "graph_name,expected_name",
+    proc = subprocess.run(
         [
-            ("sample_conv_fwd.json", "sample_conv_fwd_16x16x16x16_k16_3x3"),
-            pytest.param(
-                "sample_matmul.json",
-                "sample_matmul_256x512x1024",
-                marks=pytest.mark.xfail(
-                    reason="MIOpen plugin doesn't support matmul operations yet"
-                ),
-            ),
-            pytest.param(
-                "sample_relu.json",
-                "sample_relu_activation_64x128x56x56",
-                marks=pytest.mark.xfail(
-                    reason="MIOpen plugin doesn't support pointwise operations yet"
-                ),
-            ),
-            pytest.param(
-                "sample_add.json",
-                "sample_pointwise_add_128x256x14x14",
-                marks=pytest.mark.xfail(
-                    reason="MIOpen plugin doesn't support pointwise operations yet"
-                ),
-            ),
-            ("sample_batchnorm.json", "sample_batchnorm_inference_32x64x28x28"),
+            sys.executable,
+            "-m",
+            "dnn_benchmarking",
+            "--graph",
+            str(conv),
+            str(broken),
+            "--warmup",
+            "1",
+            "--iters",
+            "3",
+            "--validate",
+            "pytorch",
+            "-o",
+            str(output),
+            *plugin_path_cli_args,
         ],
+        capture_output=True,
+        text=True,
+        cwd=PROJECT_ROOT,
+        timeout=600,
     )
-    def test_cli_all_sample_graphs(
-        self,
-        graph_name: str,
-        expected_name: str,
-        plugin_paths,
-        plugin_path_cli_args,
-    ) -> None:
-        """Test CLI execution with all sample graph types."""
-        sample_path = Path(__file__).parent.parent.parent / "graphs" / graph_name
+    assert proc.returncode == 1, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
 
-        if not sample_path.exists():
-            pytest.skip(f"Sample graph not found: {sample_path}")
+    # Progress lines go to stderr only; the results table and summary to stdout.
+    assert re.search(r"^\[1/2\] ", proc.stderr, re.MULTILINE)
+    assert re.search(r"^\[2/2\] ", proc.stderr, re.MULTILINE)
+    assert not re.search(r"^\[\d/2\] ", proc.stdout, re.MULTILINE)
+    assert "sample_conv_fwd_16x16x16x16_k16_3x3" in proc.stdout
+    assert re.search(r"^Summary: 2 graph\(s\)", proc.stdout, re.MULTILINE)
 
-        try:
-            import torch
+    data = json.loads(output.read_text())
+    assert data["schema_version"] == 2
+    assert data["run"]["complete"] is True
+    config = data["run"]["config"]
+    assert (config["validate"], config["iters"], config["seed"]) == ("pytorch", 3, 0)
+    assert data["summary"]["graphs"] == 2
+    assert data["summary"]["graph_errors"] == 1
+    assert data["summary"]["failed"] == 0
 
-            if not torch.cuda.is_available():
-                pytest.skip("PyTorch GPU not available")
-        except ImportError as e:
-            pytest.skip(f"PyTorch not available: {e}")
+    graphs = {g["graph_path"]: g for g in data["graphs"]}
+    bad = graphs[str(broken)]
+    assert (bad["status"], bad["results"]) == ("error", [])
+    assert bad["error"]
 
-        # Check if hipdnn is available
-        try:
-            import hipdnn_frontend
-
-            hipdnn_frontend.set_engine_plugin_paths(
-                plugin_paths, hipdnn_frontend.PluginLoadingMode.ABSOLUTE
-            )
-            hipdnn_frontend.Handle()
-        except Exception as e:
-            pytest.skip(f"hipdnn_frontend not available or no GPU: {e}")
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "dnn_benchmarking",
-                "--graph",
-                str(sample_path),
-                "--warmup",
-                "1",
-                "--iters",
-                "2",
-                "-v",
-            ]
-            + plugin_path_cli_args,
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
-
-        # Check output contains expected sections
-        assert "hipDNN Benchmark" in result.stdout
-        assert expected_name in result.stdout
-        assert "Execution Statistics" in result.stdout
-        assert "Mean" in result.stdout
-
-        # Should succeed
-        assert result.returncode == 0, f"CLI failed for {graph_name}: {result.stderr}"
+    good = graphs[str(conv)]
+    assert good["status"] == "ok"
+    reference = [r for r in good["results"] if r["role"] == "reference"]
+    engines = [r for r in good["results"] if r["role"] == "engine"]
+    assert [(r["runtime"], r["verdict"]) for r in reference] == [
+        ("pytorch", "reference")
+    ]
+    assert engines
+    for row in engines:
+        assert row["verdict"] == "passed", row
+        assert re.fullmatch(r"0x[0-9A-F]{16}", row["engine"]["id"])
+        ootb = row["ootb"]
+        assert ootb["correctness"]["match"] is True
+        assert ootb["kernel"]["n"] == ootb["host"]["n"] == 3
+        assert ootb["timing"]["warmup_iters"] == 1
 
 
-class TestCLIParser:
-    """Unit tests for CLI parser."""
+@pytest.mark.gpu
+def test_cli_pytorch_runtime(torch_gpu, tmp_path: Path) -> None:
+    """--runtime pytorch reaches the PyTorch runner: one timed pytorch row."""
+    output = tmp_path / "results.json"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dnn_benchmarking",
+            "--runtime",
+            "pytorch",
+            "-g",
+            str(GRAPHS_DIR / "sample_relu.json"),
+            "--warmup",
+            "1",
+            "--iters",
+            "3",
+            "-o",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=PROJECT_ROOT,
+        timeout=600,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
 
-    def test_parse_default_values(self) -> None:
-        """Test parsing with default values."""
-        from dnn_benchmarking.cli.parser import create_parser
-
-        args = create_parser().parse_args(["--graph", "/test/graph.json"])
-
-        assert args.graph == ["/test/graph.json"]
-        assert args.warmup == 10
-        assert args.iters == 100
-        # --engine defaults to None (= run all discovered engines)
-        assert args.engine is None
-
-    def test_parse_custom_values(self) -> None:
-        """Test parsing with custom values."""
-        from dnn_benchmarking.cli.parser import create_parser
-
-        args = create_parser().parse_args(
-            [
-                "--graph",
-                "/test/graph.json",
-                "--warmup",
-                "20",
-                "--iters",
-                "200",
-                "--engine",
-                "2",
-            ]
-        )
-
-        assert args.graph == ["/test/graph.json"]
-        assert args.warmup == 20
-        assert args.iters == 200
-        assert args.engine == [2]
-
-    def test_parse_short_options(self) -> None:
-        """Test parsing with short option names."""
-        from dnn_benchmarking.cli.parser import create_parser
-
-        args = create_parser().parse_args(
-            ["-g", "/test/graph.json", "-w", "5", "-i", "50", "-e", "3"]
-        )
-
-        assert args.graph == ["/test/graph.json"]
-        assert args.warmup == 5
-        assert args.iters == 50
-        assert args.engine == [3]
-
-    def test_engine_comma_list_parses_at_subprocess_level(self) -> None:
-        """A comma-separated --engine value is accepted by the CLI without error."""
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "dnn_benchmarking",
-                "--graph",
-                "/nonexistent/path/graph.json",
-                "--engine",
-                "1,2,3",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
-        # Should fail because graph doesn't exist (rc=1), not because of arg parse (rc=2)
-        assert result.returncode == 1, (
-            f"Expected rc=1 (graph not found), got {result.returncode}. "
-            f"stderr: {result.stderr}"
-        )
-
-    def test_engine_invalid_value_rejected(self) -> None:
-        """A non-integer --engine value is rejected by the parser (rc=2)."""
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "dnn_benchmarking",
-                "--graph",
-                "/x.json",
-                "--engine",
-                "abc",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent.parent,
-        )
-        assert result.returncode == 2  # argparse error
-
-    def test_verbose_flag_accepted(self) -> None:
-        """The -v / --verbose flag is accepted by the parser."""
-        for flag in ("-v", "--verbose"):
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "dnn_benchmarking",
-                    "--graph",
-                    "/nonexistent/path/graph.json",
-                    flag,
-                ],
-                capture_output=True,
-                text=True,
-                cwd=Path(__file__).parent.parent.parent,
-            )
-            # Same as above: rc=1 means parser accepted the flag and we got past arg parse
-            assert result.returncode == 1, (
-                f"{flag}: expected rc=1 (graph not found), got {result.returncode}. "
-                f"stderr: {result.stderr}"
-            )
+    [graph] = json.loads(output.read_text())["graphs"]
+    [row] = graph["results"]
+    assert (row["runtime"], row["role"], row["status"]) == (
+        "pytorch",
+        "engine",
+        "success",
+    ), row
+    assert row["ootb"]["kernel"]["n"] == 3
+    assert row["ootb"]["timing"]["timer"] == expected_timer()

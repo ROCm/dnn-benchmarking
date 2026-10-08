@@ -4,31 +4,29 @@
 """Configuration module for dnn-benchmarking."""
 
 from .benchmark_config import (
-    BenchmarkConfig,
-    EXECUTION_BACKEND_CHOICES,
+    CACHE_MODE_CHOICES,
     EngineSelection,
-    ExecutionBackendName,
+    RuntimeName,
     MetricsConfig,
-    PYTORCH_SDPA_BACKEND_CHOICES,
+    OracleMode,
+    PMC_SET_CHOICES,
     PyTorchSdpaBackendName,
-    REFERENCE_PROVIDER_CHOICES,
     ReferenceProviderName,
     SuiteConfig,
-    TimingBackendName,
+    TimingPolicy,
     ValidationConfig,
 )
 
 __all__ = [
-    "BenchmarkConfig",
-    "EXECUTION_BACKEND_CHOICES",
+    "CACHE_MODE_CHOICES",
     "EngineSelection",
-    "ExecutionBackendName",
+    "RuntimeName",
     "MetricsConfig",
-    "PYTORCH_SDPA_BACKEND_CHOICES",
+    "OracleMode",
+    "PMC_SET_CHOICES",
     "PyTorchSdpaBackendName",
-    "REFERENCE_PROVIDER_CHOICES",
     "ReferenceProviderName",
     "SuiteConfig",
-    "TimingBackendName",
+    "TimingPolicy",
     "ValidationConfig",
 ]

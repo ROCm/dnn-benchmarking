@@ -1,62 +1,15 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Graph execution with timing for benchmarks."""
+"""hipDNN graph build and timed execution."""
 
 import json
 from typing import Any, Dict, List, Optional
 
-from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
-from ..config.benchmark_config import (
-    BenchmarkConfig,
-    ExecutionBackendName,
-    TimingBackendName,
-)
-from ..reporting.statistics import BenchmarkMetadata, BenchmarkResult
-from .timing import (
-    GpuTimerInterface,
-    HipGpuTimer,
-    StallFallbackError,
-    StalledRegionTimer,
-    Timer,
-    _is_staged_hip_available,
-    create_gpu_timer,
-    run_staged_iterations,
-)
-
-# Map graph JSON data type strings to hipdnn DataType enum names.
-# The hipdnn.DataType enum is only available when hipdnn_frontend is imported,
-# so we map to attribute name strings and resolve at runtime.
-_DATA_TYPE_STR_MAP = {
-    "FLOAT": "FLOAT",
-    "DOUBLE": "DOUBLE",
-    "HALF": "HALF",
-    "BFLOAT16": "BFLOAT16",
-    "INT8": "INT8",
-    "INT32": "INT32",
-    "UINT8": "UINT8",
-    "INT64": "INT64",
-    "BOOLEAN": "BOOLEAN",
-}
-
-
-def _resolve_data_type(hipdnn: Any, type_str: str) -> Optional[Any]:
-    """Resolve a data type string to a hipdnn.DataType enum value.
-
-    Args:
-        hipdnn: The hipdnn_frontend module.
-        type_str: Data type string from graph JSON (e.g. "FLOAT", "HALF").
-
-    Returns:
-        Matching hipdnn.DataType enum value, or None if the string is not
-        a recognised data type. Callers should skip configuring the graph
-        attribute when None is returned and let hipDNN inference resolve it.
-    """
-    enum_name = _DATA_TYPE_STR_MAP.get(type_str.upper())
-    if enum_name is None:
-        return None
-    return getattr(hipdnn.DataType, enum_name, None)
+from ..config.benchmark_config import TimingPolicy
+from ..reporting.suite_results import engine_id_hex
+from .timing import Measurement, StallFallbackError, Timer, device_sync, measure
 
 
 def _get_handle_stream(handle: Any) -> int:
@@ -68,42 +21,23 @@ def _get_handle_stream(handle: Any) -> int:
 
 
 class Executor:
-    """Executes hipDNN graphs with warmup and timed benchmark loops.
+    """Builds a hipDNN graph for one engine and times it with ``measure``."""
 
-    This class handles:
-    - Loading graph from JSON into hipdnn
-    - Setting engine preferences
-    - Building the operation graph
-    - Running warmup iterations
-    - Running timed benchmark iterations
-    """
-
-    def __init__(
-        self,
-        graph_json_str: str,
-        config: BenchmarkConfig,
-        collect_kernel_timing: bool = True,
-    ) -> None:
-        """Initialize executor with graph JSON and configuration.
+    def __init__(self, graph_json_str: str, policy: TimingPolicy) -> None:
+        """Initialize executor with graph JSON and timing policy.
 
         Args:
             graph_json_str: The graph as a JSON string.
-            config: Benchmark configuration.
-            collect_kernel_timing: When True, record per-iteration GPU kernel
-                timings via HIP events when available; otherwise collect only
-                E2E timing with stream synchronization.
+            policy: How ``benchmark`` warms up and samples.
         """
         self._graph_json_str = graph_json_str
-        self._config = config
-        self._collect_kernel_timing = collect_kernel_timing
+        self._policy = policy
         self._execution_stream: Optional[int] = None
         self._graph: Any = None
         self._workspace: Any = None
         self._workspace_ptr: int = 0
         self._workspace_size: int = 0
         self._init_time_ms: float = 0.0
-        self._stream_sync_timer: Optional[HipGpuTimer] = None
-        self._selected_engine_id: Optional[int] = None
 
     def _build_through_operation_graph(self, handle: Any) -> Any:
         """Create the hipdnn graph and run it up to ``build_operation_graph``.
@@ -139,20 +73,13 @@ class Executor:
         except (json.JSONDecodeError, TypeError):
             graph_dict = {}
 
-        if "io_data_type" in graph_dict:
-            io_dt = _resolve_data_type(hipdnn, graph_dict["io_data_type"])
-            if io_dt is not None:
-                self._graph.set_io_data_type(io_dt)
-        if "intermediate_data_type" in graph_dict:
-            intermediate_dt = _resolve_data_type(
-                hipdnn, graph_dict["intermediate_data_type"]
-            )
-            if intermediate_dt is not None:
-                self._graph.set_intermediate_data_type(intermediate_dt)
-        if "compute_data_type" in graph_dict:
-            compute_dt = _resolve_data_type(hipdnn, graph_dict["compute_data_type"])
-            if compute_dt is not None:
-                self._graph.set_compute_data_type(compute_dt)
+        # Configure only the data types the JSON states; unknown names are
+        # left for hipDNN inference.
+        for key in ("io_data_type", "intermediate_data_type", "compute_data_type"):
+            if key in graph_dict:
+                data_type = getattr(hipdnn.DataType, str(graph_dict[key]).upper(), None)
+                if data_type is not None:
+                    getattr(self._graph, f"set_{key}")(data_type)
 
         # Normalise node compute_data_type: from_json rejects "unset", which
         # hipDNN emits when the caller leaves the field unset. Promote to the
@@ -239,8 +166,8 @@ class Executor:
                 result = self._graph.create_execution_plan_ext(engine_id)
                 if result.is_bad():
                     raise UnsupportedGraphError(
-                        f"Forced engine {engine_id} not applicable to this graph: "
-                        f"{result.get_message()}"
+                        f"Forced engine {engine_id_hex(engine_id)} not applicable "
+                        f"to this graph: {result.get_message()}"
                     )
             else:
                 result = self._graph.create_execution_plans()
@@ -274,7 +201,7 @@ class Executor:
                 raise ExecutionError(f"Failed to build plans: {result.get_message()}")
 
             if not for_autotune:
-                self._record_selected_engine(engine_id)
+                self._check_selected_engine(engine_id)
 
             if for_autotune:
                 workspace_size = self._graph.get_autotune_workspace_size()
@@ -312,9 +239,8 @@ class Executor:
         cfg = hipdnn.AutotuneConfig()
         cfg.engine_id_filter = [engine_id]
         # At least one warmup keeps first-execute provider setup out of the
-        # candidate timing. The later reported benchmark keeps the user's
-        # configured warmup count.
-        cfg.warmup_iterations = max(1, self._config.warmup_iters)
+        # candidate timing.
+        cfg.warmup_iterations = max(1, self._policy.warmup_iters)
         # Precompiled plans preserve the backend's candidate set. A default
         # plan spec narrows it; add_engine_sweep() invents knob combinations.
         try:
@@ -350,7 +276,6 @@ class Executor:
                 f"candidates were filtered to engine {engine_id}"
             )
 
-        self._record_selected_engine(None)
         return results
 
     def plan_name(self, handle: Any) -> Optional[str]:
@@ -369,30 +294,22 @@ class Executor:
             return None
         return str(self._graph.get_plan_name(handle))
 
-    @property
-    def selected_engine_id(self) -> Optional[int]:
-        """Engine ID that actually backed the built plan, or None if unknown."""
-        return self._selected_engine_id
-
-    def _record_selected_engine(self, requested_engine_id: Optional[int]) -> None:
-        """Read back and record the engine that actually backs the built plan.
+    def _check_selected_engine(self, requested_engine_id: Optional[int]) -> None:
+        """Reject a plan backed by an engine other than the forced one.
 
         ``get_execution_plan_engine_id`` is the authoritative source for the
-        engine that will run, regardless of how it was chosen. A forced engine
-        that differs from the engine actually selected should be impossible on
-        the hard-select path, so any mismatch is treated as an unsupported-graph
-        skip rather than mislabeled timings.
+        engine that will run. A mismatch should be impossible on the
+        hard-select path, so it is treated as an unsupported-graph skip
+        rather than mislabeled timings.
         """
-        # prepare() has already created the execution plan, so the frontend has
-        # cached the engine actually selected for it; the getter returns that
-        # cached id.
+        if requested_engine_id is None:
+            return
         actual = int(self._graph.get_execution_plan_engine_id())
-        self._selected_engine_id = actual
-        if requested_engine_id is not None and actual != requested_engine_id:
+        if actual != requested_engine_id:
             raise UnsupportedGraphError(
-                f"Forced engine {requested_engine_id} was not selected; the "
-                f"backend ran engine {actual} (silent fallback). Skipping to "
-                f"avoid mislabeled results."
+                f"Forced engine {engine_id_hex(requested_engine_id)} was not "
+                f"selected; the backend ran engine {engine_id_hex(actual)} "
+                f"(silent fallback). Skipping to avoid mislabeled results."
             )
 
     def _get_execution_stream(self, handle: Any) -> int:
@@ -407,15 +324,6 @@ class Executor:
             )
         return stream
 
-    def _get_stream_sync_timer(self, stream: int) -> HipGpuTimer:
-        """Return the reusable event-backed synchronizer for the execution stream."""
-        if self._stream_sync_timer is None:
-            try:
-                self._stream_sync_timer = HipGpuTimer(stream)
-            except RuntimeError as e:
-                raise ExecutionError(str(e)) from e
-        return self._stream_sync_timer
-
     def execute_once(self, handle: Any, variant_pack: Dict[int, int]) -> None:
         """Execute the prepared graph once without collecting timings."""
         if self._graph is None:
@@ -423,182 +331,44 @@ class Executor:
         if self._workspace is not None:
             self._workspace.zeros()
 
-        stream = self._get_execution_stream(handle)
+        self._get_execution_stream(handle)
+        self.enqueue(handle, variant_pack)
+        try:
+            device_sync("hip")
+        except RuntimeError as e:
+            raise ExecutionError(str(e)) from e
+
+    def enqueue(self, handle: Any, variant_pack: Dict[int, int]) -> None:
+        """Submit one graph execution: no workspace reset, no device sync."""
         result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
         if result.is_bad():
             raise ExecutionError(f"Graph execution failed: {result.get_message()}")
-        self._get_stream_sync_timer(stream).synchronize_stream()
 
-    def warmup(self, handle: Any, variant_pack: Dict[int, int]) -> None:
-        """Run warmup iterations (timing discarded).
+    def benchmark(self, handle: Any, variant_pack: Dict[int, int]) -> Measurement:
+        """Prime and time the prepared graph per the executor's policy.
 
         Args:
             handle: hipdnn.Handle instance.
             variant_pack: Mapping of tensor UIDs to device pointers.
 
         Raises:
-            ExecutionError: If graph not prepared or execution fails.
+            ExecutionError: If graph not prepared, execution fails, or HIP
+                timing is unavailable.
         """
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
-
         stream = self._get_execution_stream(handle)
-        # Block timing (rocKE / Solera protocol) warms up before every sample
-        # in benchmark(); here it only runs the one untimed compile call.
-        count = 1 if self._config.timing_block > 1 else self._config.warmup_iters
-        for _ in range(count):
-            result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
-            if result.is_bad():
-                raise ExecutionError(f"Warmup execution failed: {result.get_message()}")
-
-        # hipDNN graph execution is asynchronous. Drain untimed warmup work before
-        # benchmark() starts the measured loop, otherwise the first timed E2E
-        # iteration can include queued warmup kernels.
-        if count > 0:
-            self._get_stream_sync_timer(stream).synchronize_stream()
-
-    def benchmark(
-        self,
-        handle: Any,
-        variant_pack: Dict[int, int],
-        graph_name: str = "",
-        allow_staging: bool = True,
-    ) -> BenchmarkResult:
-        """Run benchmark iterations and collect timing.
-
-        Collects both E2E (wall-clock) timing and GPU kernel timing when available.
-
-        Args:
-            handle: hipdnn.Handle instance.
-            variant_pack: Mapping of tensor UIDs to device pointers.
-            graph_name: Optional name/identifier for the graph being benchmarked.
-            allow_staging: Use stall-gated timing when the device supports it.
-
-        Returns:
-            BenchmarkResult with E2E and optional kernel timings, plus metadata.
-
-        Raises:
-            ExecutionError: If graph not prepared or execution fails.
-        """
-        if self._graph is None:
-            raise ExecutionError("Graph not prepared. Call prepare() first.")
-
-        host_timings: List[float] = []
-        kernel_timings: Optional[List[float]] = None
-        gpu_timer: Optional[GpuTimerInterface] = None
-        timing_backend_name: str = ""
-        stream_sync_timer = None
-        stream = self._get_execution_stream(handle)
-
-        # Stalled-queue staging measures a gap-free GPU span and pure host
-        # submission cost; available only on HIP devices supporting
-        # stream-wait-value. Falls back to the non-staged loop otherwise.
-        # Block timing (timing_block > 1) always uses the plain event loop:
-        # N executions queued behind the stall gate can fill the HIP queue
-        # and block the host before the gate is released.
-        block = self._config.timing_block
-        staged_timer: Optional[StalledRegionTimer] = None
-        if (
-            allow_staging
-            and block == 1
-            and self._collect_kernel_timing
-            and _is_staged_hip_available()
-        ):
-            try:
-                staged_timer = StalledRegionTimer(stream)
-            except RuntimeError as e:
-                raise StallFallbackError(f"stall gate unavailable: {e}") from e
-
-        if staged_timer is not None:
-            timing_backend_name = TimingBackendName.HIP.value
-
-            def enqueue() -> None:
-                result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
-                if result.is_bad():
-                    raise ExecutionError(
-                        f"Benchmark execution failed: {result.get_message()}"
-                    )
-
-            # Untimed priming pass, mirroring the PyTorch executor: the
-            # staged timer arms a stream gate before the measured enqueue,
-            # so a provider's first-call plan compile inside the gated
-            # region never drains — with --warmup 0 the run hung
-            # indefinitely (reproduced on MI210 for any --iters).
-            # run_staged_iterations drains the device (barrier) before the
-            # first measurement.
-            enqueue()
-
-            host_timings, kernel_timings = run_staged_iterations(
-                staged_timer, self._config.benchmark_iters, enqueue
+        try:
+            return measure(
+                lambda: self.enqueue(handle, variant_pack),
+                stream=stream,
+                policy=self._policy,
+                timer="hip",
             )
-        else:
-            # Create GPU timer when kernel timing is requested and available.
-            if self._collect_kernel_timing:
-                try:
-                    gpu_timer = create_gpu_timer(stream=stream)
-                except RuntimeError as e:
-                    raise ExecutionError(str(e)) from e
-                if gpu_timer is not None:
-                    kernel_timings = []
-                    timing_backend_name = gpu_timer.backend_name
-
-            def execute() -> None:
-                result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
-                if result.is_bad():
-                    raise ExecutionError(
-                        f"Benchmark execution failed: {result.get_message()}"
-                    )
-
-            # Each sample times ``block`` back-to-back executions between one
-            # event pair and records the per-execution average (block == 1 is
-            # plain per-execution timing). Block > 1 follows the rocKE /
-            # Solera protocol: warmup_iters untimed executions plus a drain
-            # before every sample, and the first sample is discarded.
-            per_sample_warmup = self._config.warmup_iters if block > 1 else 0
-            iters = self._config.benchmark_iters
-            for i in range(iters):
-                for _ in range(per_sample_warmup):
-                    execute()
-                if per_sample_warmup:
-                    self._get_stream_sync_timer(stream).synchronize_stream()
-                kernel_ms = None
-                with Timer() as t:
-                    if gpu_timer:
-                        gpu_timer.start()
-                    for _ in range(block):
-                        execute()
-                    if gpu_timer:
-                        gpu_timer.stop()
-                        kernel_ms = gpu_timer.elapsed_ms() / block
-                    else:
-                        if stream_sync_timer is None:
-                            stream_sync_timer = self._get_stream_sync_timer(stream)
-                        stream_sync_timer.synchronize_stream()
-
-                if block > 1 and i == 0 and iters > 1:
-                    continue
-                if kernel_ms is not None:
-                    assert kernel_timings is not None
-                    kernel_timings.append(kernel_ms)
-                host_timings.append(t.elapsed_ms / block)
-
-        # Build metadata
-        metadata = BenchmarkMetadata(
-            graph_name=graph_name,
-            graph_path=str(self._config.graph_path),
-            warmup_iters=self._config.warmup_iters,
-            benchmark_iters=self._config.benchmark_iters,
-            timing_block=block,
-            engine_id=self._config.engine_id,
-            timing_backend=timing_backend_name,
-            execution_backend=ExecutionBackendName.HIPDNN.value,
-        )
-
-        return BenchmarkResult(
-            host_timings=host_timings,
-            kernel_timings=kernel_timings,
-            metadata=metadata,
-        )
+        except StallFallbackError:
+            raise
+        except RuntimeError as e:
+            raise ExecutionError(str(e)) from e
 
     @property
     def init_time_ms(self) -> float:
@@ -614,8 +384,3 @@ class Executor:
         graph object.
         """
         return self._workspace_size
-
-    @property
-    def graph(self) -> Any:
-        """Get the underlying hipdnn graph object."""
-        return self._graph

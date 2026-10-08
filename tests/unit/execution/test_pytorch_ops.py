@@ -1909,6 +1909,72 @@ class TestReplayTensorsScalarCache:
         assert _scalar_value(tensors, 1, {}) == 9.0
 
 
+class _GpuTensor(torch.Tensor):
+    """CPU tensor that reports ``is_cuda`` so CPU torch reaches the GPU branch."""
+
+    @property
+    def is_cuda(self) -> bool:
+        return True
+
+
+_BN_NODES = {
+    "miopen_batch_norm": {
+        "type": "BatchnormAttributes",
+        "inputs": {
+            "x_tensor_uid": 1,
+            "scale_tensor_uid": 2,
+            "bias_tensor_uid": 3,
+            "epsilon_tensor_uid": 4,
+        },
+        "outputs": {"y_tensor_uid": 5},
+    },
+    "miopen_batch_norm_backward": {
+        "type": "BatchnormBackwardAttributes",
+        "inputs": {"dy_tensor_uid": 3, "x_tensor_uid": 1, "scale_tensor_uid": 2},
+        "outputs": {
+            "dx_tensor_uid": 5,
+            "dscale_tensor_uid": 6,
+            "dbias_tensor_uid": 7,
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("miopen_op", sorted(_BN_NODES))
+@pytest.mark.parametrize("rocm_build", [True, False])
+def test_gpu_batchnorm_uses_miopen_only_on_rocm_builds(
+    monkeypatch, miopen_op, rocm_build
+) -> None:
+    """CUDA torch has no aten.miopen_batch_norm*, even for GPU tensors; ROCm
+    torch must use it so the reference runs the engine's MIOpen primitive."""
+    from dnn_benchmarking.execution.pytorch_ops.handlers import batchnorm
+
+    native_fwd = torch.native_batch_norm
+    native_bwd = torch.ops.aten.native_batch_norm_backward
+    calls = []
+
+    def miopen(*args):
+        calls.append(miopen_op)
+        if miopen_op == "miopen_batch_norm":
+            return native_fwd(*args)
+        x, dy, w, rm, rv, sm, si, eps = args
+        return native_bwd(dy, x, w, rm, rv, sm, si, True, eps, [True] * 3)
+
+    monkeypatch.setattr(torch.ops.aten, miopen_op, miopen)
+    monkeypatch.setattr(batchnorm.torch_support, "is_rocm_build", lambda: rocm_build)
+    tensors = {
+        1: torch.randn(4, 3, 2, 2).as_subclass(_GpuTensor),
+        2: torch.randn(3),
+        3: torch.randn(4, 3, 2, 2) if "backward" in miopen_op else torch.randn(3),
+        4: torch.tensor([1e-5]),
+    }
+
+    pytorch_ops.execute_graph({"nodes": [_BN_NODES[miopen_op]]}, tensors)
+
+    assert calls == ([miopen_op] if rocm_build else [])
+    assert 5 in tensors
+
+
 class TestStorePlanned:
     """The shared store-with-declared-shape helper used by norm/reduction/resample."""
 
@@ -2195,6 +2261,46 @@ class TestPyTorchSdpaPaged:
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
 
+    def test_paged_sliding_window_masks_each_sequence(self) -> None:
+        """A width-1 band (left/right bound 0) lets query i of each sequence see
+        only that sequence's key i, so O is V's first q_len rows per sequence."""
+        q, k_pages, v_pages, page_table, _, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(left_bound=0, right_bound=0), tensors)
+
+        rep = self.HQ // self.HKV
+        expected = torch.cat(
+            [
+                v[:, :q_len, :].repeat_interleave(rep, dim=0)
+                for v, q_len in zip(dense_v, self.Q_LENS)
+            ],
+            dim=-2,
+        ).unsqueeze(0)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    def test_replay_reads_seq_lens_from_host_once(self, monkeypatch) -> None:
+        """A seq_len .tolist() on every replay syncs the stream inside the staged
+        timer's gated region and hangs; ReplayTensors must read each once."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        replay = pytorch_ops.ReplayTensors(
+            self._tensors(q, k_pages, v_pages, page_table)
+        )
+        seq_lens = sorted(replay[uid].data_ptr() for uid in (7, 8))
+        reads = []
+        tolist = torch.Tensor.tolist
+
+        def counting_tolist(t):
+            if t.data_ptr() in seq_lens:
+                reads.append(t.data_ptr())
+            return tolist(t)
+
+        monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+        graph = pytorch_ops.compile_graph(self._graph())
+        graph.execute(replay)
+        graph.execute(replay)
+
+        assert sorted(reads) == seq_lens
+
     def test_bundle_causal_spelling_matches_boolean_spelling(self) -> None:
         """The shipped paged bundles express causality as (-1, 0) while the model
         traces set causal_mask. Both must resolve to the same mask."""
@@ -2266,8 +2372,8 @@ class TestPyTorchSdpaPaged:
 
 
 class TestPyTorchSdpaMaskDerivation:
-    """The mask a graph is asking for, derived the way the engine derives it
-    (Gfx950AttentionTiledNative.cpp::maskTypeFor)."""
+    """The mask a graph is asking for, derived the way hipDNN derives it
+    (PlanUtils.hpp::extractDiagonalBandParams, CpuFpReferenceSdpa::isMasked)."""
 
     @staticmethod
     def _node(**attributes):
@@ -2302,14 +2408,24 @@ class TestPyTorchSdpaMaskDerivation:
 
         assert _sdpa_derive_mask(self._node()) == (False, None)
 
-    def test_a_real_bound_wins_over_the_boolean(self) -> None:
-        """causal_mask + a left bound is a WINDOW. Reading the boolean first
-        discards the window and serves the wrong triangle."""
+    def test_the_deprecated_boolean_wins_over_bounds(self) -> None:
+        """hipDNN: causal_mask means top-left causal and the bounds are
+        ignored, so a left bound must not turn it into a window."""
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sdpa_derive_mask,
         )
 
         assert _sdpa_derive_mask(self._node(causal_mask=True, left_bound=127)) == (
+            True,
+            None,
+        )
+
+    def test_left_bound_with_causal_right_bound_is_a_window(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(self._node(left_bound=127, right_bound=0)) == (
             False,
             128,
         )
@@ -2343,6 +2459,10 @@ class TestPyTorchSdpaMaskDerivation:
         [
             ({"left_bound": -5}, "neither unbounded nor a width"),
             ({"right_bound": 3}, "forward-looking band"),
+            # hipDNN keeps k <= q + right_bound; an unbounded or positive right
+            # edge is not the causal band the reference builds.
+            ({"left_bound": 2}, "forward-looking band"),
+            ({"left_bound": 2, "right_bound": 1}, "forward-looking band"),
         ],
     )
     def test_illegal_bounds_are_declined(self, attributes, match) -> None:

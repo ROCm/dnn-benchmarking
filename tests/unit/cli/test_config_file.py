@@ -1,18 +1,20 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Unit tests for dnn-benchmark TOML config files."""
+"""Unit tests for the dnn-benchmark CLI parser and TOML config files."""
 
 import importlib
-import json
+import re
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from dnn_benchmarking.cli.config_file import apply_config_file
-from dnn_benchmarking.cli.parser import create_parser
-from dnn_benchmarking.reporting.reporter import Reporter
+from dnn_benchmarking.cli.parser import CONFIG_OPTIONS, create_parser
+
+ROOT = Path(__file__).resolve().parents[3]
+MIOPEN_ENGINE_ID = 0x15B46865C717A122  # FNV-1a-64("MIOPEN_ENGINE"), below 2**63
 
 
 def _write_config(path: Path, text: str) -> Path:
@@ -26,24 +28,86 @@ def _parse_with_config(argv: list[str]):
     return args
 
 
-def test_cli_abbreviations_are_treated_as_explicit_overrides(tmp_path: Path) -> None:
+def _config_error(tmp_path: Path, body: str) -> str:
+    config = _write_config(tmp_path / "bench.toml", f"version = 1\n{body}\n")
+    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
+    with pytest.raises(ValueError) as excinfo:
+        apply_config_file(args)
+    return str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("MIOPEN_ENGINE", MIOPEN_ENGINE_ID),
+        ("0x15B46865C717A122", MIOPEN_ENGINE_ID),
+        (str(MIOPEN_ENGINE_ID), MIOPEN_ENGINE_ID),
+        ("-4567890123456789012", -4567890123456789012),
+        # Unsigned hex/decimal above 2**63 wraps to hipDNN's signed int64 IDs.
+        ("0xFFFFFFFFFFFFFFFF", -1),
+        (str(2**64 - 2), -2),
+        ("0x8000000000000000", -(1 << 63)),
+        # FNV-1a-64("HIP_MLOPS_ENGINE") = 0xDD993EF5525F7BF9, above 2**63; hipDNN's
+        # engineNameToId casts it to int64.
+        ("HIP_MLOPS_ENGINE", 0xDD993EF5525F7BF9 - (1 << 64)),
+        # Any token that is not a number is a name, as in hipDNN.
+        ("hipkernel:ConvFwd", 0xF6975AB2C79B088E - (1 << 64)),
+    ],
+)
+def test_engine_tokens_resolve_identically_from_cli_and_config(
+    tmp_path: Path, token: str, expected: int
+) -> None:
+    cli_args = _parse_with_config([f"--engine={token},7"])
     config = _write_config(
         tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["from_config.json"]
-warmup = 3
-iters = 7
-""",
+        f'version = 1\n[[engines]]\nid = "{token}"\n[[engines]]\nid = 7\n',
     )
+    config_args = _parse_with_config(["--config", str(config)])
 
-    args = _parse_with_config(
-        ["--config", str(config), "--graph", "from_cli.json", "--iter", "11"]
-    )
+    assert cli_args.engine == [expected, 7]
+    assert config_args.engine == [expected, 7]
 
-    assert args.graph == ["from_cli.json"]
-    assert args.warmup == 3
-    assert args.iters == 11
+
+@pytest.mark.parametrize("token", [str(2**64), "0x1" + "0" * 16, ","])
+def test_invalid_engine_tokens_are_usage_errors(token: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        create_parser().parse_args(["--engine", token])
+    assert exc.value.code == 2
+
+
+def test_engine_list_keeps_order_and_duplicates() -> None:
+    args = create_parser().parse_args(["-e", "3, 1,3,MIOPEN_ENGINE"])
+    assert args.engine == [3, 1, 3, MIOPEN_ENGINE_ID]
+
+
+def test_plugin_path_is_a_comma_list() -> None:
+    args = create_parser().parse_args(["--plugin-path", "/a, /b,"])
+    assert args.plugin_path == [Path("/a"), Path("/b")]
+    with pytest.raises(SystemExit) as exc:
+        create_parser().parse_args(["--plugin-path", " , "])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--iters", "0"],
+        ["--warmup", "-1"],
+        ["--min-time-ms", "-0.5"],
+        ["--profiling-timeout", "-1"],
+        ["--rtol=-1e-3"],  # "--rtol -1e-3" fails in argparse, not the bound
+        ["--atol=-1"],
+        ["--rtol", "nan"],  # NaN would pass every comparison
+        ["--atol", "inf"],
+        ["--min-time-ms", "nan"],
+        ["--cache-mode", "lukewarm"],
+        ["--iter", "5"],  # abbreviations are rejected (allow_abbrev=False)
+    ],
+)
+def test_invalid_cli_values_are_usage_errors(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        create_parser().parse_args(argv)
+    assert exc.value.code == 2
 
 
 def test_config_populates_args_when_cli_does_not_override(tmp_path: Path) -> None:
@@ -54,9 +118,11 @@ version = 1
 graphs = ["graphs/a.json", "graphs/b.json"]
 warmup = 3
 iters = 7
+min_time_ms = 25
+cache_mode = "cold"
 seed = 42
-validate = "none"
-metrics_tier = "off"
+quiet = true
+metrics = false
 
 [[engines]]
 id = 1
@@ -74,10 +140,11 @@ plugin_path = "/plugins/a"
         str(tmp_path / "graphs/a.json"),
         str(tmp_path / "graphs/b.json"),
     ]
-    assert args.warmup == 3
-    assert args.iters == 7
-    assert args.seed == 42
-    assert args.metrics_tier == "off"
+    assert (args.warmup, args.iters, args.seed) == (3, 7, 42)
+    assert args.min_time_ms == 25.0
+    assert args.cache_mode == "cold"
+    assert args.quiet is True
+    assert args.metrics is False
     assert args.engine == [1, 1]
     # Driveless absolute paths from the config keep their order and tail;
     # on Windows the loader anchors them to the config dir's drive, so
@@ -88,102 +155,53 @@ plugin_path = "/plugins/a"
     assert plugin_paths[1].endswith("plugins/a")
 
 
-def test_cli_scalars_override_config_values(tmp_path: Path) -> None:
+def test_cli_values_override_config_values(tmp_path: Path) -> None:
     config = _write_config(
         tmp_path / "bench.toml",
         """
 version = 1
 graphs = ["from_config.json"]
 iters = 7
+oracle_mode = "exhaustive"
 """,
     )
 
     args = _parse_with_config(
-        ["--config", str(config), "--graph", "from_cli.json", "--iters", "11"]
+        [
+            "--config",
+            str(config),
+            "--graph",
+            "from_cli.json",
+            "--iters",
+            "11",
+            "--oracle-mode",
+            "plan",
+        ]
     )
 
     assert args.graph == ["from_cli.json"]
     assert args.iters == 11
-
-
-def test_oracle_mode_config_key_populates_args(tmp_path: Path) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["from_config.json"]
-oracle_mode = "exhaustive"
-""",
-    )
-
-    args = _parse_with_config(["--config", str(config)])
-
-    assert args.oracle_mode == "exhaustive"
-
-
-def test_oracle_mode_cli_flag_overrides_config(tmp_path: Path) -> None:
-    """An explicit --oracle-mode wins over `oracle_mode` in the config."""
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["from_config.json"]
-oracle_mode = "exhaustive"
-""",
-    )
-
-    args = _parse_with_config(["--config", str(config), "--oracle-mode", "plan"])
-
     assert args.oracle_mode == "plan"
 
 
-def test_pytorch_rocm_fa_library_config_and_cli_precedence(tmp_path: Path) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["from_config.json"]
-pytorch_sdpa_backend = "flash"
-pytorch_rocm_fa_library = "aotriton"
-""",
-    )
+@pytest.mark.parametrize(
+    ("key", "flag"),
+    [
+        ("verbose", "--no-verbose"),
+        ("quiet", "--no-quiet"),
+        ("autotune", "--no-autotune"),
+        ("perf", "--no-perf"),
+        ("roofline", "--no-roofline"),
+        ("pmc_allow_multipass", "--no-pmc-allow-multipass"),
+    ],
+)
+def test_cli_can_turn_off_a_boolean_the_config_turns_on(
+    tmp_path: Path, key: str, flag: str
+) -> None:
+    config = _write_config(tmp_path / "bench.toml", f"version = 1\n{key} = true\n")
 
-    args = _parse_with_config(["--config", str(config)])
-    assert args.pytorch_sdpa_backend == "flash"
-    assert args.pytorch_rocm_fa_library == "aotriton"
-
-    args = _parse_with_config(
-        [
-            "--config",
-            str(config),
-            "--pytorch-rocm-fa-library",
-            "ck",
-        ]
-    )
-    assert args.pytorch_sdpa_backend == "flash"
-    assert args.pytorch_rocm_fa_library == "ck"
-
-
-def test_pytorch_sdpa_backend_cli_overrides_toml(tmp_path: Path) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["from_config.json"]
-pytorch_sdpa_backend = "math"
-""",
-    )
-
-    args = _parse_with_config(
-        [
-            "--config",
-            str(config),
-            "--pytorch-sdpa-backend",
-            "flash",
-        ]
-    )
-    assert args.pytorch_sdpa_backend == "flash"
-    assert args.pytorch_rocm_fa_library is None
+    assert getattr(_parse_with_config(["--config", str(config)]), key) is True
+    assert getattr(_parse_with_config(["--config", str(config), flag]), key) is False
 
 
 def test_cli_engine_replaces_config_engine_matrix(tmp_path: Path) -> None:
@@ -191,7 +209,6 @@ def test_cli_engine_replaces_config_engine_matrix(tmp_path: Path) -> None:
         tmp_path / "bench.toml",
         """
 version = 1
-graphs = ["g.json"]
 
 [[engines]]
 id = 2
@@ -207,66 +224,33 @@ plugin_path = "/plugins/a"
 
     assert args.engine == [9, 8]
     assert args.plugin_path is None
-    assert not hasattr(args, "_config_engine_names")
 
 
-def test_comparison_table_is_rejected_as_unknown_field(tmp_path: Path) -> None:
+def test_cli_engine_keeps_top_level_config_plugin_path(tmp_path: Path) -> None:
+    """Regression (CLI-03): --engine alone must not drop the recipe's plugin dir."""
     config = _write_config(
         tmp_path / "bench.toml",
         """
 version = 1
-graphs = ["g.json"]
-
-[comparison]
-baseline = "missing"
-""",
-    )
-    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
-
-    with pytest.raises(ValueError, match="Unknown config field: comparison"):
-        apply_config_file(args)
-
-
-def test_engine_config_uses_ids_without_display_labels(tmp_path: Path) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["g.json"]
+plugin_path = "plugins"
 
 [[engines]]
 id = 2
-
-[[engines]]
-id = 1
 """,
     )
 
-    args = _parse_with_config(["--config", str(config)])
+    args = _parse_with_config(["--config", str(config), "--engine", "9"])
 
-    assert args.engine == [2, 1]
-    assert not hasattr(args, "_config_engine_names")
+    assert args.engine == [9]
+    assert args.plugin_path == [tmp_path / "plugins"]
 
 
 def test_every_engine_sets_plugin_path_when_any_engine_does(tmp_path: Path) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["g.json"]
-
-[[engines]]
-id = 1
-plugin_path = "/plugins/a"
-
-[[engines]]
-id = 2
-""",
+    message = _config_error(
+        tmp_path,
+        '[[engines]]\nid = 1\nplugin_path = "/plugins/a"\n[[engines]]\nid = 2',
     )
-    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
-
-    with pytest.raises(ValueError, match="Every config engine must set plugin_path"):
-        apply_config_file(args)
+    assert "Every config engine must set plugin_path" in message
 
 
 @pytest.mark.parametrize(
@@ -274,97 +258,46 @@ id = 2
     [
         ("itres = 1000", "itres"),
         ("[profiling]\nenabled = true", "profiling"),
+        ("[comparison]\nbaseline = 'x'", "comparison"),
     ],
 )
 def test_unknown_top_level_config_fields_are_rejected(
     tmp_path: Path, body: str, field: str
 ) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        f"""
-version = 1
-graphs = ["g.json"]
-{body}
-""",
-    )
-    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
-
-    with pytest.raises(ValueError, match=f"Unknown config field: {field}"):
-        apply_config_file(args)
+    assert f"Unknown config field: {field}" in _config_error(tmp_path, body)
 
 
-@pytest.mark.parametrize(
-    ("body", "field"),
-    [
-        ('plugin_pat = "/plugins"', "plugin_pat"),
-        ('label = "baseline"', "label"),
-        ('name = "baseline"', "name"),
-    ],
-)
-def test_unknown_engine_config_fields_are_rejected(
-    tmp_path: Path, body: str, field: str
-) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        f"""
-version = 1
-graphs = ["g.json"]
-
-[[engines]]
-id = 1
-{body}
-""",
-    )
-    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
-
-    with pytest.raises(ValueError, match=f"Unknown config engine 0 field: {field}"):
-        apply_config_file(args)
+@pytest.mark.parametrize("field", ["plugin_pat", "label", "name"])
+def test_unknown_engine_config_fields_are_rejected(tmp_path: Path, field: str) -> None:
+    message = _config_error(tmp_path, f'[[engines]]\nid = 1\n{field} = "x"')
+    assert f"Unknown config engine 0 field: {field}" in message
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("backend", '"pytoch"'),
+        ("runtime", '"pytoch"'),
         ("oracle_mode", '"full"'),
         ("validate", '"torch"'),
-        ("metrics_tier", '"full"'),
-        ("emit_trace", '"json"'),
         ("pmc", '"everything"'),
-        ("pytorch_sdpa_backend", '"invalid"'),
+        ("cache_mode", '"hot"'),
         ("pytorch_sdpa_backend", '"aotriton"'),
-        ("pytorch_sdpa_backend", '"aotriton_preferred"'),
     ],
 )
 def test_invalid_config_choice_values_are_rejected(
     tmp_path: Path, field: str, value: str
 ) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        f"""
-version = 1
-graphs = ["g.json"]
-{field} = {value}
-""",
-    )
-    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
-
-    with pytest.raises(ValueError, match=f"Config field '{field}' must be one of"):
-        apply_config_file(args)
+    message = _config_error(tmp_path, f"{field} = {value}")
+    assert f"Config field '{field}' must be one of" in message
 
 
-def test_bool_is_rejected_for_integer_config_fields(tmp_path: Path) -> None:
-    config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["g.json"]
-iters = true
-""",
-    )
-    args = create_parser(suppress_defaults=True).parse_args(["--config", str(config)])
-
-    with pytest.raises(ValueError, match="Config field 'iters' must be int"):
-        apply_config_file(args)
+@pytest.mark.parametrize(
+    "body",
+    ["iters = true", "iters = 0", "warmup = -1", "min_time_ms = -1", "seed = 1.5"],
+)
+def test_invalid_config_scalars_are_rejected(tmp_path: Path, body: str) -> None:
+    key = body.split()[0]
+    assert f"Config field '{key}'" in _config_error(tmp_path, body)
 
 
 def test_config_paths_are_relative_to_config_file(tmp_path: Path) -> None:
@@ -378,6 +311,7 @@ graphs = ["../graphs/g.json"]
 output = "results/out.json"
 plugin_path = "../plugins"
 profiling_output_dir = "profiles"
+hipdnn_cache_dir = "hipdnn-cache"
 """,
     )
 
@@ -387,99 +321,70 @@ profiling_output_dir = "profiles"
     assert args.output == config_dir / "results/out.json"
     assert args.plugin_path == [config_dir / "../plugins"]
     assert args.profiling_output_dir == config_dir / "profiles"
+    assert args.hipdnn_cache_dir == config_dir / "hipdnn-cache"
 
 
-def test_sample_configs_parse_and_reference_existing_graphs() -> None:
-    root = Path(__file__).resolve().parents[3]
-
-    full_config = root / "sample_configs" / "config.toml.example"
+def test_sample_configs_parse_and_cover_every_config_key() -> None:
+    full_config = ROOT / "sample_configs" / "config.toml.example"
     full_args = _parse_with_config(["--config", str(full_config)])
-
     assert full_args.graph
     for graph in full_args.graph:
         assert Path(graph).exists()
 
-    basic_config = root / "sample_configs" / "basic.toml.example"
-    graph = root / "graphs" / "sample_conv_fwd.json"
+    graph = ROOT / "graphs" / "sample_conv_fwd.json"
     basic_args = _parse_with_config(
-        ["--config", str(basic_config), "--graph", str(graph)]
+        [
+            "--config",
+            str(ROOT / "sample_configs" / "basic.toml.example"),
+            "--graph",
+            str(graph),
+        ]
     )
-
     assert basic_args.graph == [str(graph)]
-    assert basic_args.warmup == 10
-    assert basic_args.iters == 100
-    assert basic_args.verbose is True
-    assert basic_args.plugin_path is None
+
+    text = full_config.read_text()
+    missing = [
+        option.config_key
+        for option in CONFIG_OPTIONS
+        if not re.search(rf"^#?\s*{option.config_key}\s*=", text, re.MULTILINE)
+    ]
+    assert missing == []
 
 
-def test_invalid_config_backend_errors_before_graph_resolution(
-    tmp_path: Path, capsys
+@pytest.fixture
+def cache_env(tmp_path: Path, monkeypatch) -> None:
+    """Pre-set cache variables so main() leaves the process environment alone."""
+    for var in (
+        "XDG_CACHE_HOME",
+        "MIOPEN_USER_DB_PATH",
+        "MIOPEN_CUSTOM_CACHE_DIR",
+        "AMD_COMGR_CACHE_DIR",
+    ):
+        monkeypatch.setenv(var, str(tmp_path / "cache"))
+
+
+def test_invalid_config_is_a_usage_error_before_graph_resolution(
+    tmp_path: Path, cache_env
 ) -> None:
     config = _write_config(
-        tmp_path / "bench.toml",
-        """
-version = 1
-graphs = ["g.json"]
-backend = "pytoch"
-""",
+        tmp_path / "bench.toml", 'version = 1\ngraphs = ["g.json"]\nruntime = "x"\n'
     )
     main_module = importlib.import_module("dnn_benchmarking.cli.main")
 
     with (
         patch.object(main_module, "_resolve_graphs") as mock_resolve,
-        patch("sys.argv", ["dnn-benchmark", "--config", str(config)]),
         pytest.raises(SystemExit) as exc,
     ):
-        main_module.main()
+        main_module.main(["--config", str(config)])
 
     assert exc.value.code == 2
     mock_resolve.assert_not_called()
-    assert "Config field 'backend' must be one of" in capsys.readouterr().err
 
 
-@patch("dnn_benchmarking.cli.suite_runner_cli.run_suite_benchmark")
-def test_main_uses_config_graphs_and_builds_suite_config(
-    mock_benchmark: MagicMock, tmp_path: Path
-) -> None:
-    graph = tmp_path / "g.json"
-    graph.write_text(json.dumps({"name": "g", "nodes": [], "tensors": []}))
-    config = _write_config(
-        tmp_path / "bench.toml",
-        f"""
-version = 1
-graphs = ["{graph.as_posix()}"]
-warmup = 1
-iters = 2
-
-[[engines]]
-id = 2
-
-[[engines]]
-id = 1
-""",
-    )
-    mock_benchmark.return_value = 0
-
+def test_missing_graph_without_config_is_a_usage_error(cache_env) -> None:
     main_module = importlib.import_module("dnn_benchmarking.cli.main")
 
-    with patch("sys.argv", ["dnn-benchmark", "--config", str(config)]):
-        rc = main_module.main()
-
-    assert rc == 0
-    suite_config = mock_benchmark.call_args.kwargs["config"]
-    assert suite_config.warmup_iters == 1
-    assert suite_config.benchmark_iters == 2
-    assert suite_config.engine_filter == [2, 1]
-
-
-def test_missing_graph_without_config_errors(capsys) -> None:
-    main_module = importlib.import_module("dnn_benchmarking.cli.main")
-
-    with (
-        patch("sys.argv", ["dnn-benchmark"]),
-        pytest.raises(SystemExit) as exc,
-    ):
-        main_module.main()
+    with pytest.raises(SystemExit) as exc:
+        main_module.main([])
 
     assert exc.value.code == 2
-    assert "--graph is required" in capsys.readouterr().err
