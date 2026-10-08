@@ -389,7 +389,7 @@ Rules:
   when no row is left, the label is `no A row` or `no B row`.
 - A pair is `within noise` when the relative change is not more than
   `max(threshold / 100, 2 * sqrt(r_A^2 + r_B^2))`, where `threshold` is the
-  `--threshold` percent and `r` is `iqr_ms / median_ms` of the compared
+  `--threshold` percent and `r` is `(p75_ms - p25_ms) / median_ms` of the compared
   metric in each file (`a_rel_iqr`, `b_rel_iqr` in the
   `--json` and `--csv` output). A slower B beyond that limit is a
   `REGRESSION`. A faster B is `faster`.

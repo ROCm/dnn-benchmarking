@@ -210,24 +210,24 @@ are only in `run.config` (`cache_mode`, `timing_block`). See
 ### stats
 
 `kernel` and `host` use the same object. All values are milliseconds, except
-`n` and `cv`.
+`n`.
 
 | Key | Meaning |
 |---|---|
 | `n` | Number of timed samples. |
 | `mean_ms` | Arithmetic mean. |
 | `std_ms` | Sample standard deviation (ddof = 1). `0` when `n` is 1. |
-| `cv` | Coefficient of variation, `std_ms / mean_ms` (fraction, not percent). |
 | `min_ms` | Minimum. |
 | `p25_ms` | 25th percentile. |
 | `median_ms` | Upper median, `sorted(samples)[n // 2]` (the rocKE / Solera definition; always an observed sample). This is the headline value. |
 | `p75_ms` | 75th percentile. |
 | `p95_ms` | 95th percentile. `null` when `n` is less than 20. |
 | `max_ms` | Maximum. |
-| `iqr_ms` | `p75_ms - p25_ms`. |
 
 Percentiles use linear interpolation (`numpy.percentile`). The tool does not
-remove outliers.
+remove outliers. The file does not store values that a reader can derive:
+the coefficient of variation is `std_ms / mean_ms`, and the interquartile
+range (IQR) is `p75_ms - p25_ms`.
 
 ### metrics
 
@@ -279,7 +279,7 @@ loop. Paths are relative to the row:
 
 | Note | Condition |
 |---|---|
-| `noisy: IQR x% of median` | `ootb.kernel.iqr_ms / ootb.kernel.median_ms` is more than 0.05 and `ootb.kernel.n` is 10 or more. |
+| `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.kernel.n` is 10 or more. |
 | `outlier: max Nx median` | `ootb.kernel.max_ms` is more than 2 x `ootb.kernel.median_ms`. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
@@ -422,7 +422,7 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `status` | `row.status` |
 | `verdict` | `row.verdict` |
 | `kernel_median_ms` | `row.ootb.kernel.median_ms` |
-| `kernel_cv` | `row.ootb.kernel.cv` |
+| `kernel_cv` | `row.ootb.kernel.std_ms / row.ootb.kernel.mean_ms` |
 | `host_median_ms` | `row.ootb.host.median_ms` |
 | `n` | `row.ootb.kernel.n` |
 | `timing_mode` | `row.ootb.timing.mode` |

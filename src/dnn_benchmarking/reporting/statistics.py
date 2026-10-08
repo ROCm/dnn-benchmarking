@@ -20,7 +20,6 @@ class BenchmarkStats:
         n: Number of samples.
         mean_ms: Arithmetic mean.
         std_ms: Sample standard deviation (ddof=1; 0 for n == 1).
-        cv: Coefficient of variation, ``std_ms / mean_ms``.
         min_ms: Minimum.
         p25_ms: 25th percentile.
         median_ms: Upper median ``sorted(timings)[n // 2]`` (rocKE / Solera
@@ -33,7 +32,6 @@ class BenchmarkStats:
     n: int
     mean_ms: float
     std_ms: float
-    cv: float
     min_ms: float
     p25_ms: float
     median_ms: float
@@ -59,7 +57,6 @@ class BenchmarkStats:
             n=int(arr.size),
             mean_ms=mean,
             std_ms=std,
-            cv=std / mean if mean > 0 else 0.0,
             min_ms=float(arr.min()),
             p25_ms=p25,
             median_ms=median,
@@ -69,8 +66,13 @@ class BenchmarkStats:
         )
 
     @property
+    def cv(self) -> float:
+        """Coefficient of variation, ``std_ms / mean_ms`` (not serialized)."""
+        return self.std_ms / self.mean_ms if self.mean_ms > 0 else 0.0
+
+    @property
     def iqr_ms(self) -> float:
-        """Interquartile range."""
+        """Interquartile range (not serialized)."""
         return self.p75_ms - self.p25_ms
 
     def to_dict(self) -> Dict[str, Any]:
@@ -78,7 +80,6 @@ class BenchmarkStats:
         d: Dict[str, Any] = asdict(self)
         if self.n < 20:
             d["p95_ms"] = None
-        d["iqr_ms"] = self.iqr_ms
         return d
 
 

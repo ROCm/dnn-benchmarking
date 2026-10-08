@@ -49,9 +49,9 @@ class TestBenchmarkStats:
         assert BenchmarkStats.from_timings([1.0] * 19).to_dict()["p95_ms"] is None
         assert BenchmarkStats.from_timings([1.0] * 20).to_dict()["p95_ms"] == 1.0
 
-    def test_to_dict_carries_iqr(self) -> None:
+    def test_to_dict_omits_derivable_spread(self) -> None:
         d = BenchmarkStats.from_timings(list(range(1, 101))).to_dict()
-        assert d["iqr_ms"] == pytest.approx(d["p75_ms"] - d["p25_ms"])
+        assert "cv" not in d and "iqr_ms" not in d
 
 
 class TestNoiseWarnings:

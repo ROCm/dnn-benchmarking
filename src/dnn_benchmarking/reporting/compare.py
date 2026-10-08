@@ -96,8 +96,10 @@ def _stat(row: Dict[str, Any], metric: str) -> Tuple[Optional[float], Optional[f
     if row["verdict"] in ("error", "skipped") or not s:
         return None, None
     # The writer stores NaN/inf as null; a null median leaves the pair unusable.
-    median, iqr = s["median_ms"], s["iqr_ms"]
-    return median, (iqr / median if iqr is not None and median > 0 else None)
+    median, p25, p75 = s["median_ms"], s["p25_ms"], s["p75_ms"]
+    if median is None or p25 is None or p75 is None or median <= 0:
+        return median, None
+    return median, (p75 - p25) / median
 
 
 def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any]]:

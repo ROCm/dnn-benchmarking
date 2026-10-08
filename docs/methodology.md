@@ -173,8 +173,8 @@ in block mode. The row warning is then `block timing: <reason>`.
 ## Statistics
 
 For `kernel` and `host` the tool reports `n`, `mean_ms`, `std_ms` (ddof 1),
-`cv` (`std/mean`), `min_ms`, `p25_ms`, `median_ms`, `p75_ms`, `p95_ms`,
-`max_ms` and `iqr_ms`. `median_ms` is the upper median `sorted(t)[n // 2]`,
+`min_ms`, `p25_ms`, `median_ms`, `p75_ms`, `p95_ms` and `max_ms`. The
+interquartile range (IQR) is `p75_ms - p25_ms`. `median_ms` is the upper median `sorted(t)[n // 2]`,
 the rocKE / Solera definition, so it is always an observed sample. The other
 percentiles use linear interpolation. `p95_ms` is
 `null` below 20 samples, because it is then close to the maximum.

@@ -153,6 +153,12 @@ def _stats_dict(stats: Optional[BenchmarkStats]) -> Optional[Dict[str, Any]]:
     return stats.to_dict() if stats is not None else None
 
 
+def _cv(stats: Dict[str, Any]) -> Optional[float]:
+    """CSV ``kernel_cv`` from a serialized stats object (null when unknown)."""
+    std, mean = stats.get("std_ms"), stats.get("mean_ms")
+    return std / mean if std is not None and mean else None
+
+
 @dataclass
 class CorrectnessResult:
     """Correctness tracking for a single provider/engine run.
@@ -757,7 +763,7 @@ class SuiteResult:
                         "status": r["status"],
                         "verdict": r["verdict"],
                         "kernel_median_ms": kernel.get("median_ms"),
-                        "kernel_cv": kernel.get("cv"),
+                        "kernel_cv": _cv(kernel),
                         "host_median_ms": host.get("median_ms"),
                         "n": kernel.get("n"),
                         "timing_mode": timing.get("mode"),

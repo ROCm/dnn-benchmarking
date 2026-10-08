@@ -71,8 +71,8 @@ PLAN_KEYS = {
     "correctness",
 }  # fmt: skip
 STATS_KEYS = {
-    "n", "mean_ms", "std_ms", "cv", "min_ms", "p25_ms", "median_ms", "p75_ms",
-    "p95_ms", "max_ms", "iqr_ms",
+    "n", "mean_ms", "std_ms", "min_ms", "p25_ms", "median_ms", "p75_ms", "p95_ms",
+    "max_ms",
 }  # fmt: skip
 TIMING_KEYS = {
     "mode", "timer", "warmup_iters", "first_call_ms", "capped", "fallback_reason",
