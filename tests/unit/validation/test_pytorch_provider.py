@@ -1039,7 +1039,13 @@ class TestPyTorchProviderNewOps:
                     "type": "SdpaAttributes",
                     "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
                     "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
-                    "attributes": {"dropout_probability": 0.0, **attributes},
+                    # An absent attn_scale is 1.0 since #78, so state the
+                    # 1/sqrt(d) that _masked applies.
+                    "attributes": {
+                        "dropout_probability": 0.0,
+                        "attn_scale_value": 2.0**-0.5,
+                        **attributes,
+                    },
                 }
             ],
         }
@@ -1057,13 +1063,15 @@ class TestPyTorchProviderNewOps:
         out = torch.matmul(torch.softmax(scores, dim=-1), v_t)
         return out.numpy(), torch.logsumexp(scores, dim=-1, keepdim=True).numpy()
 
-    @pytest.mark.parametrize(
-        "attributes",
-        [
-            {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"},
-            {"causal_mask_bottom_right": True},
-        ],
-    )
+    # The two spellings hipDNN resolves as bottom-right. causal_mask is NOT one
+    # of them: extractDiagonalBandParams pins it top-left and drops the
+    # alignment, so it gets its own top-left test below.
+    _BOTTOM_RIGHT_FORMS = [
+        {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
+        {"causal_mask_bottom_right": True},
+    ]
+
+    @pytest.mark.parametrize("attributes", _BOTTOM_RIGHT_FORMS)
     def test_sdpa_bottom_right_causal_aligns_the_last_query_to_the_last_key(
         self, attributes: dict
     ) -> None:
@@ -1081,11 +1089,35 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
         np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
 
-    def test_sdpa_bottom_right_decode_sees_the_whole_cache(self) -> None:
-        """Sq = 1 bottom-right is unmasked attention, not key 0 only."""
+    def test_sdpa_causal_mask_stays_top_left_under_a_bottom_right_alignment(
+        self,
+    ) -> None:
+        """causal_mask wins over diagonal_alignment, as hipDNN resolves it.
+
+        Reading the alignment first would grade a graph the engines run
+        top-left against the bottom-right band of the test above.
+        """
         outputs, q, k, v = self._bottom_right_case(
-            1, 4, {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}
+            3, 5, {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}
         )
+        keep = torch.tensor(
+            [
+                [True, False, False, False, False],
+                [True, True, False, False, False],
+                [True, True, True, False, False],
+            ]
+        )
+        expected, expected_stats = self._masked(q, k, v, keep)
+
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+        np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
+
+    @pytest.mark.parametrize("attributes", _BOTTOM_RIGHT_FORMS)
+    def test_sdpa_bottom_right_decode_sees_the_whole_cache(
+        self, attributes: dict
+    ) -> None:
+        """Sq = 1 bottom-right is unmasked attention, not key 0 only."""
+        outputs, q, k, v = self._bottom_right_case(1, 4, attributes)
         expected, _ = self._masked(q, k, v, torch.ones(1, 4, dtype=torch.bool))
 
         np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
@@ -1093,12 +1125,14 @@ class TestPyTorchProviderNewOps:
     def test_sdpa_bottom_right_window_counts_back_from_the_shifted_diagonal(
         self,
     ) -> None:
+        # A window is only honoured in the bounds spelling: the deprecated
+        # booleans drop left_bound along with the alignment.
         outputs, q, k, v = self._bottom_right_case(
             2,
             5,
             {
-                "causal_mask": True,
                 "left_bound": 1,
+                "right_bound": 0,
                 "diagonal_alignment": "BOTTOM_RIGHT",
             },
         )
@@ -1113,7 +1147,7 @@ class TestPyTorchProviderNewOps:
     def test_sdpa_top_left_window_stats_use_the_window(self) -> None:
         """Stats must come from the same band as O, not plain attention."""
         outputs, q, k, v = self._bottom_right_case(
-            4, 4, {"causal_mask": True, "left_bound": 1}
+            4, 4, {"left_bound": 1, "right_bound": 0}
         )
         keep = torch.tensor(
             [
@@ -1128,7 +1162,19 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
         np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
 
-    def test_sdpa_backward_still_rejects_bottom_right(self) -> None:
+    @pytest.mark.parametrize(
+        "parameters,match",
+        [
+            ({"causal_mask_bottom_right": True}, "bottom-right causal"),
+            (
+                {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
+                "TOP_LEFT",
+            ),
+        ],
+    )
+    def test_sdpa_backward_still_rejects_bottom_right(
+        self, parameters: dict, match: str
+    ) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.zeros((1, 1, 2, 2), dtype=np.float32)
         stats = np.zeros((1, 1, 2, 1), dtype=np.float32)
@@ -1149,7 +1195,64 @@ class TestPyTorchProviderNewOps:
                         "dk_tensor_uid": 8,
                         "dv_tensor_uid": 9,
                     },
+                    "parameters": parameters,
+                }
+            ],
+        }
+
+        with pytest.raises(UnsupportedGraphError, match=match):
+            provider.compute_reference(
+                graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
+            )
+
+    def test_sdpa_backward_accepts_causal_mask_with_a_bottom_right_alignment(
+        self,
+    ) -> None:
+        """causal_mask makes the alignment dead text, so backward runs top-left.
+
+        Sq != Skv keeps the two diagonals apart: a bottom-right reading would
+        let query 0 see three keys instead of one.
+        """
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        torch.manual_seed(0)
+        scale = 1.0 / (8**0.5)
+        q_t = torch.randn(1, 1, 2, 8, requires_grad=True)
+        k_t = torch.randn(1, 1, 4, 8, requires_grad=True)
+        v_t = torch.randn(1, 1, 4, 8, requires_grad=True)
+        do_t = torch.randn(1, 1, 2, 8)
+        keep = torch.tensor(
+            [[True, False, False, False], [True, True, False, False]]
+        )
+        scores = (q_t @ k_t.transpose(-2, -1)) * scale
+        scores = scores.masked_fill(~keep, float("-inf"))
+        out = torch.softmax(scores, dim=-1) @ v_t
+        lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+        out.backward(do_t)
+
+        graph_json = {
+            "tensors": [
+                {"uid": 10, "dims": [1, 1, 2, 8], "data_type": "float"},
+                {"uid": 11, "dims": [1, 1, 4, 8], "data_type": "float"},
+                {"uid": 12, "dims": [1, 1, 4, 8], "data_type": "float"},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 10,
+                        "dk_tensor_uid": 11,
+                        "dv_tensor_uid": 12,
+                    },
                     "parameters": {
+                        "attn_scale_value": scale,
                         "causal_mask": True,
                         "diagonal_alignment": "BOTTOM_RIGHT",
                     },
@@ -1157,10 +1260,27 @@ class TestPyTorchProviderNewOps:
             ],
         }
 
-        with pytest.raises(UnsupportedGraphError, match="TOP_LEFT"):
-            provider.compute_reference(
-                graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
-            )
+        outputs = provider.compute_reference(
+            graph_json,
+            {
+                1: q_t.detach().numpy(),
+                2: k_t.detach().numpy(),
+                3: v_t.detach().numpy(),
+                4: out.detach().numpy(),
+                5: do_t.numpy(),
+                6: lse.detach().numpy(),
+            },
+        )
+
+        np.testing.assert_allclose(
+            outputs[10].data, q_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            outputs[11].data, k_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            outputs[12].data, v_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
 
     def test_sdpa_additive_attention_mask_matches_torch(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
@@ -1509,6 +1629,10 @@ class TestPyTorchProviderNewOps:
             ({"padding_mask": True}, "alibi/padding"),
             ({"right_bound": 1}, "forward-looking band"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
+            (
+                {"causal_mask": True, "causal_mask_bottom_right": True},
+                "mutually exclusive",
+            ),
         ],
     )
     def test_sdpa_forward_rejects_unsupported_attributes(

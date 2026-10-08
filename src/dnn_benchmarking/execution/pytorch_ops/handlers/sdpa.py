@@ -123,9 +123,26 @@ def _sdpa_bottom_right(node: Dict[str, Any]) -> bool:
     Bottom-right puts the last query on the last key: query ``i`` sees keys up
     to ``i + Skv - Sq``. It is what decode and chunked prefill (Sq < Skv) mean;
     top-left with Sq = 1 would see only key 0.
+
+    The deprecated booleans are resolved ahead of ``diagonal_alignment``, the
+    way hipDNN resolves them (``PlanUtils.hpp::extractDiagonalBandParams``,
+    ``Gfx950AttentionDenseNative.cpp::maskTypeFor``): ``causal_mask`` pins the
+    diagonal top-left and overrides the alignment, and the two booleans
+    together are rejected. Reading the alignment first would grade a graph the
+    engines run top-left against a bottom-right reference, which passes a
+    wrong engine and fails a right one.
     """
-    if _sdpa_bool(node, "causal_mask_bottom_right"):
+    top_left_flag = _sdpa_bool(node, "causal_mask")
+    bottom_right_flag = _sdpa_bool(node, "causal_mask_bottom_right")
+    if top_left_flag and bottom_right_flag:
+        raise ValueError(
+            "SDPA causal_mask and causal_mask_bottom_right are mutually "
+            "exclusive; use diagonal_alignment with left_bound=-1, right_bound=0"
+        )
+    if bottom_right_flag:
         return True
+    if top_left_flag:
+        return False
     diagonal_alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
     if diagonal_alignment in ("TOP_LEFT", 0, None):
         return False
@@ -225,10 +242,16 @@ def _band_mask(
     bottom_right: bool,
 ) -> Optional[torch.Tensor]:
     """The additive causal band for q/k, or None when torch's top-left
-    ``is_causal`` (or no mask at all) already says it."""
-    if window is None and not (is_causal and bottom_right):
-        return None
+    ``is_causal`` (or no mask at all) already says it.
+
+    With Sq == Skv the bottom-right diagonal is the top-left one, so this
+    returns None there as well. Building the explicit band anyway would cost
+    the timed row its flash backend, which takes no ``attn_mask``, and make
+    ``--pytorch-sdpa-backend flash`` fail on the shipped square causal bundles.
+    """
     q_len, kv_len = int(q.shape[-2]), int(k.shape[-2])
+    if window is None and not (is_causal and bottom_right and q_len != kv_len):
+        return None
     if bottom_right and q_len > kv_len:
         raise ValueError(
             f"Bottom-right causal SDPA with Sq {q_len} > Skv {kv_len} leaves "

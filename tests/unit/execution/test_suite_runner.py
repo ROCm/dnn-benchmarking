@@ -1039,6 +1039,7 @@ class TestCorrectnessChecking:
         mock_timed_reference.return_value = MagicMock(
             result=skipped_result,
             outputs=None,
+            reference_pass_failed=False,
         )
         mock_check_corr.return_value = CorrectnessResult(
             execution_success=True,
@@ -1063,9 +1064,66 @@ class TestCorrectnessChecking:
         assert mock_check_corr.call_args.args[3] is ref_outputs
         # The skipped row must not read as "nothing was validated".
         reason = result.results[0].skip_reason
-        assert "PyTorch GPU not available" in reason
+        assert reason.startswith("Timing skipped (PyTorch GPU not available).")
         assert "still validated" in reason and "CPU" in reason
 
+    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
+    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner._check_correctness")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_a_failed_reference_pass_is_not_reported_as_skipped_timing(
+        self,
+        mock_bm_cls,
+        mock_exec_cls,
+        mock_check_corr,
+        mock_get_ref,
+        mock_resolve_name,
+        mock_timed_reference,
+    ):
+        """Timing can finish and only the MATH output pass fail, out of memory
+        on a large graph for instance. Saying "Timing skipped" there is wrong."""
+        mock_resolve_name.return_value = "engine_1"
+        ref_outputs = {
+            2: ReferenceOutput(data=np.array([1.0], dtype=np.float32), tensor_uid=2)
+        }
+        ref_provider = MagicMock()
+        ref_provider.name = "pytorch"
+        ref_provider.compute_reference.return_value = ref_outputs
+        mock_get_ref.return_value = ref_provider
+        mock_timed_reference.return_value = MagicMock(
+            result=ProviderEngineResult(
+                provider="pytorch",
+                engine_id=0,
+                status="skipped",
+                role="reference",
+                skip_reason="HIP out of memory",
+            ),
+            outputs=None,
+            reference_pass_failed=True,
+        )
+        mock_check_corr.return_value = CorrectnessResult(
+            execution_success=True,
+            tolerance_match=True,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[1])
+        mock_bm_cls.return_value = _make_bm_mock()
+
+        result = run_graph_all_providers(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            tensor_infos=[_make_tensor_info(1), _make_tensor_info(2, is_output=True)],
+            config=_make_config(validation=ValidationConfig(provider="pytorch")),
+            handle=MagicMock(),
+        )
+
+        reason = result.results[0].skip_reason
+        assert reason.startswith("Reference output pass failed (HIP out of memory).")
+        assert "Timing skipped" not in reason
+        assert "still validated" in reason and "CPU" in reason
     @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
     @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
@@ -1982,6 +2040,73 @@ class TestTimedPytorchRowEngineRole:
         )
 
         assert calls == {"benchmark": False, "execute_once": True}
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    def test_a_failing_reference_pass_is_recorded_as_such(
+        self,
+        mock_buffer_manager_cls,
+        mock_pytorch_executor_cls,
+    ):
+        """Timing finished; only the reference output pass raised."""
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+        executor.benchmark.return_value = BenchmarkResult(
+            host_timings=[1.0],
+            kernel_timings=[0.5],
+            metadata=BenchmarkMetadata(),
+        )
+        executor.execute_once.side_effect = RuntimeError("HIP out of memory")
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(metrics=MetricsConfig(tier="off")),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "skipped"
+        assert row.outputs is None
+        assert row.reference_pass_failed is True
+        assert "HIP out of memory" in (row.result.skip_reason or "")
+
+    @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
+    @patch("dnn_benchmarking.execution.pytorch_buffer_manager.PyTorchCudaBufferManager")
+    def test_a_failing_timed_loop_is_not_blamed_on_the_reference_pass(
+        self,
+        mock_buffer_manager_cls,
+        mock_pytorch_executor_cls,
+    ):
+        executor = MagicMock()
+        executor.init_time_ms = 0.5
+        executor.benchmark.side_effect = RuntimeError("PyTorch GPU not available")
+        mock_pytorch_executor_cls.return_value = executor
+        mock_buffer_manager_cls.return_value = _make_bm_mock()
+
+        row = _run_timed_pytorch_row(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            graph_name="test_graph",
+            tensor_infos=[],
+            config=_make_config(metrics=MetricsConfig(tier="off")),
+            input_data={},
+            analytical_flops=None,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+            role="reference",
+        )
+
+        assert row.result.status == "skipped"
+        assert row.reference_pass_failed is False
+        executor.execute_once.assert_not_called()
 
     @patch("dnn_benchmarking.execution.pytorch_executor.PyTorchCudaExecutor")
     def test_engine_role_failure_is_error(self, mock_pytorch_executor_cls):

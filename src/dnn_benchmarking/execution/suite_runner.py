@@ -67,10 +67,17 @@ _DEFAULT_ATOL = 1e-6
 
 @dataclass
 class _TimedPytorchRow:
-    """Timed PyTorch row plus reference outputs (reference role only)."""
+    """Timed PyTorch row plus reference outputs (reference role only).
+
+    ``reference_pass_failed`` separates the two ways the row can end without
+    outputs: timing itself failed, or timing finished and the reference output
+    pass failed (MATH SDPA out of memory on a large graph, for example). The
+    skip reason has to name the right one.
+    """
 
     result: ProviderEngineResult
     outputs: Optional[Dict[int, ReferenceOutput]]
+    reference_pass_failed: bool = False
 
 
 _STALL_FALLBACK_WARNING = (
@@ -539,6 +546,10 @@ def _run_timed_pytorch_row(
         engine_version=engine_version,
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    # "timing" until the timed loop is done, then "reference" while the
+    # reference output pass runs. Whichever one raises is what the skip reason
+    # has to name.
+    stage = "timing"
     strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
 
     with Timer() as elapsed_timer:
@@ -600,6 +611,7 @@ def _run_timed_pytorch_row(
                     )
 
                 if role == "reference":
+                    stage = "reference"
                     buffer_manager.zero_outputs()
                     # Timing above used default dispatch; the outputs other
                     # rows are graded against come from repeatable SDPA.
@@ -611,6 +623,7 @@ def _run_timed_pytorch_row(
                         buffer_manager,
                         keep_device=not config.metrics.opt_in_pass_requested,
                     )
+                    stage = "post"
 
             if role == "reference":
                 result.correctness = _reference_row_correctness(config)
@@ -656,7 +669,11 @@ def _run_timed_pytorch_row(
             else:
                 result.skip_reason = msg
     result.elapsed_time_ms = elapsed_timer.elapsed_ms
-    return _TimedPytorchRow(result=result, outputs=outputs)
+    return _TimedPytorchRow(
+        result=result,
+        outputs=outputs,
+        reference_pass_failed=stage == "reference",
+    )
 
 
 def run_graph_all_providers(
@@ -868,15 +885,21 @@ def run_graph_all_providers(
                     graph_input_data,
                     config,
                 )
-            # Only the timing row was skipped: say that engines are still
-            # graded, and what the CPU fallback cost, since no row times it.
+            # The timed row produced no outputs: say which of its two steps
+            # failed, that engines are still graded, and what the CPU fallback
+            # cost, since no row times it.
             if (
                 timed_reference is not None
                 and timed_reference.result.status == "skipped"
                 and reference_outputs is not None
             ):
+                failed_step = (
+                    "Reference output pass failed"
+                    if timed_reference.reference_pass_failed
+                    else "Timing skipped"
+                )
                 timed_reference.result.skip_reason = (
-                    f"Timing skipped ({timed_reference.result.skip_reason}). "
+                    f"{failed_step} ({timed_reference.result.skip_reason}). "
                     "Engine outputs are still validated against reference "
                     "outputs computed on the CPU, which took "
                     f"{cpu_reference_timer.elapsed_ms / 1000:.1f} s."

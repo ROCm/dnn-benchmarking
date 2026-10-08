@@ -2255,7 +2255,7 @@ class TestPyTorchSdpaPaged:
     @pytest.mark.parametrize(
         "attributes",
         [
-            {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"},
+            {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
             {"causal_mask_bottom_right": True},
         ],
     )
@@ -2274,6 +2274,30 @@ class TestPyTorchSdpaPaged:
         top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
         assert not torch.allclose(tensors[4], top_left, atol=1e-3)
+
+    def test_paged_causal_mask_ignores_a_bottom_right_alignment(self) -> None:
+        """causal_mask is top-left in hipDNN whatever the alignment says.
+
+        The #70 fix kit writes decode graphs in exactly this form, so reading
+        the alignment here would silently grade them against the wrong band.
+        """
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(
+            self._graph(causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"), tensors
+        )
+
+        top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        bottom_right = self._dense_reference(
+            q, dense_k, dense_v, is_causal=True, bottom_right=True
+        )
+        assert torch.allclose(tensors[4], top_left, atol=1e-5)
+        assert not torch.allclose(tensors[4], bottom_right, atol=1e-3)
+
+    def test_paged_rejects_both_causal_flags(self) -> None:
+        graph = self._graph(causal_mask=True, causal_mask_bottom_right=True)
+        with pytest.raises(UnsupportedGraphError, match="mutually exclusive"):
+            pytorch_ops.compile_graph(graph)
 
     def test_bundle_causal_spelling_matches_boolean_spelling(self) -> None:
         """The shipped paged bundles express causality as (-1, 0) while the model
@@ -2432,3 +2456,133 @@ class TestPyTorchSdpaMaskDerivation:
 
         with pytest.raises(ValueError, match=match):
             _sdpa_derive_mask(self._node(**attributes))
+
+
+class TestPyTorchSdpaDiagonalAlignment:
+    """Which corner the causal diagonal sits in, resolved the way hipDNN
+    resolves it (PlanUtils.hpp::extractDiagonalBandParams)."""
+
+    @staticmethod
+    def _node(**attributes):
+        return {
+            "type": "SdpaAttributes",
+            "inputs": {},
+            "outputs": {},
+            "attributes": attributes,
+        }
+
+    @pytest.mark.parametrize(
+        "attributes, expected",
+        [
+            ({}, False),
+            ({"diagonal_alignment": "BOTTOM_RIGHT"}, True),
+            ({"causal_mask_bottom_right": True}, True),
+            ({"causal_mask_bottom_right": True, "diagonal_alignment": "TOP_LEFT"}, True),
+            ({"causal_mask": True}, False),
+            # causal_mask overrides the alignment, so this is top-left.
+            ({"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}, False),
+        ],
+    )
+    def test_the_booleans_win_over_the_alignment(self, attributes, expected) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_bottom_right,
+        )
+
+        assert _sdpa_bottom_right(self._node(**attributes)) is expected
+
+    def test_both_booleans_are_declined(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_bottom_right,
+        )
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _sdpa_bottom_right(
+                self._node(causal_mask=True, causal_mask_bottom_right=True)
+            )
+
+
+class TestPyTorchSdpaCausalBandHandoff:
+    """What the handler hands torch: an explicit band costs the flash backend,
+    which takes no attn_mask, so it is built only where is_causal cannot say
+    the same thing."""
+
+    @staticmethod
+    def _graph(sq: int, skv: int, **attributes):
+        return {
+            "tensors": [],
+            "nodes": [
+                {
+                    "name": "sdpa",
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"attn_scale_value": 0.25, **attributes},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _call_kwargs(graph, sq: int, skv: int):
+        tensors = {
+            1: torch.zeros(1, 1, sq, 2),
+            2: torch.zeros(1, 1, skv, 2),
+            3: torch.zeros(1, 1, skv, 2),
+        }
+        seen = {}
+
+        def recording_sdpa(query, key, value, **kwargs):
+            seen.update(kwargs)
+            return torch.zeros(1, 1, sq, 2)
+
+        with patch.object(
+            torch.nn.functional,
+            "scaled_dot_product_attention",
+            side_effect=recording_sdpa,
+        ):
+            pytorch_ops.execute_graph(graph, tensors)
+        return seen
+
+    def test_square_bottom_right_keeps_the_boolean_causal_path(self) -> None:
+        """Sq == Skv: the bottom-right diagonal IS the top-left one. The shipped
+        quick/SdpaFwd hd128_causal bundles are this case, and an attn_mask there
+        would make --pytorch-sdpa-backend flash fail."""
+        kwargs = self._call_kwargs(
+            self._graph(256, 256, right_bound=0, diagonal_alignment="BOTTOM_RIGHT"),
+            256,
+            256,
+        )
+
+        assert kwargs["attn_mask"] is None
+        assert kwargs["is_causal"] is True
+
+    def test_non_square_bottom_right_needs_the_explicit_band(self) -> None:
+        kwargs = self._call_kwargs(
+            self._graph(3, 5, right_bound=0, diagonal_alignment="BOTTOM_RIGHT"), 3, 5
+        )
+
+        assert kwargs["is_causal"] is False
+        keep = kwargs["attn_mask"] == 0
+        assert torch.equal(
+            keep,
+            torch.tensor(
+                [
+                    [True, True, True, False, False],
+                    [True, True, True, True, False],
+                    [True, True, True, True, True],
+                ]
+            ),
+        )
+
+    def test_square_causal_mask_keeps_the_boolean_causal_path(self) -> None:
+        kwargs = self._call_kwargs(
+            self._graph(256, 256, causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"),
+            256,
+            256,
+        )
+
+        assert kwargs["attn_mask"] is None
+        assert kwargs["is_causal"] is True

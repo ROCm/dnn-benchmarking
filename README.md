@@ -137,8 +137,10 @@ see below).
 
 With CPU-only torch, `--validate pytorch` still grades every hipDNN engine row:
 the reference outputs are computed on the CPU. Only the timed `pytorch`
-reference row is skipped, and its `skip_reason` says so and gives the CPU
-reference time. The CPU reference is much slower for large SDPA graphs (on an
+reference row is skipped, and its `skip_reason` names which of the row's two
+steps failed ("Timing skipped" or "Reference output pass failed"), says that
+engines are still graded, and gives the CPU reference time. The CPU reference
+is much slower for large SDPA graphs (on an
 MI355X host with 8 cores, the CPU reference for B4 H48 fp16 graphs took 2.8 s at S1024,
 10 s at S2048 and 65 s at S4096, while the whole three-graph run took about 6 s
 with ROCm torch), so use ROCm torch for large
@@ -280,6 +282,16 @@ dnn-benchmark --graph ./graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa
 the graph must execute native forward SDPA through the selected public category
 or the benchmark errors. No non-default selection falls back to normal dispatch
 or a CPU PyTorch reference.
+
+The forward SDPA reference reads a graph's causal diagonal the way hipDNN
+resolves it. `causal_mask: true` is top-left and overrides both
+`diagonal_alignment` and any bounds written beside it; bottom-right is
+`causal_mask_bottom_right: true`, or `right_bound: 0` with
+`diagonal_alignment: BOTTOM_RIGHT`. Setting both booleans is an error, as it is
+in hipDNN. A bottom-right diagonal is applied as an explicit additive mask,
+which the flash backend cannot take, so it is only built when Sq differs from
+Skv: with Sq equal to Skv the two diagonals coincide and the boolean
+`is_causal` path (and `--pytorch-sdpa-backend flash`) still works.
 
 `--pytorch-rocm-fa-library LIBRARY` is ROCm-only and requires
 `--pytorch-sdpa-backend flash`. It forwards `LIBRARY` unchanged to PyTorch's
