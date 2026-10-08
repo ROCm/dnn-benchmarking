@@ -255,7 +255,7 @@ def test_tuned_run_reports_its_own_build_timing_and_throughput(tuned):
 
 
 def test_workspace_is_not_reported_with_metrics_off(tuned):
-    o = _run(config=_config(metrics=MetricsConfig(tier="off"))).oracle
+    o = _run(config=_config(metrics=MetricsConfig(basic=False))).oracle
 
     assert o.workspace_bytes is None
 
@@ -382,10 +382,10 @@ def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
 
     args = create_parser().parse_args(child.argv[3:])
     child_config = SuiteConfig.from_namespace(args)
-    assert child.argv[1:3] == ["-m", "dnn_benchmarking"]
-    assert args.internal_pytorch_tuned is True
+    # Launching plain ``dnn_benchmarking`` would time untuned PyTorch.
+    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.pytorch_tuned_child"]
     assert args.graph == [str(tmp_path / "g.json")]
-    assert child_config.backend == "pytorch"
+    assert child_config.runtime == "pytorch"
     assert child_config.oracle_mode == "off"
     assert child_config.timing_policy == config.timing_policy
     assert child_config.seed == 11

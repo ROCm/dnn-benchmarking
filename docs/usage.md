@@ -174,9 +174,9 @@ support an input.
 ### PyTorch kernel selection
 
 When PyTorch runs (`--runtime pytorch` or `--validate pytorch`), the CLI sets
-these PyTorch controls so the PyTorch baseline is not handicapped. A value
-already in the environment wins. The tool prints the settings in effect and
-records them in `environment.pytorch_env`.
+these PyTorch controls so the PyTorch baseline is not handicapped. The CLI
+overwrites any value already in the environment, so the command line is the
+only control. The tool prints the settings.
 
 | Setting | Why |
 |---|---|
@@ -188,7 +188,8 @@ row and the `--validate pytorch` reference row) also gets a tuned run: MIOpen
 exhaustive conv search (`torch.backends.cudnn.benchmark=True`) and TunableOp
 GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
 
-- The tuned run executes in a child process. PyTorch keeps conv algorithm
+- The tuned run executes in a child process
+  (`python -m dnn_benchmarking.cli.pytorch_tuned_child`). PyTorch keeps conv algorithm
   choices in a process-wide cache whose key ignores `cudnn.benchmark`, so a
   tuned run in the benchmark process would reuse or leak the OOTB choice.
 - The child keeps its TunableOp results file and `MIOPEN_USER_DB_PATH` in a

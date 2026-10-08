@@ -860,31 +860,8 @@ def test_unsupported_tensor_dtype_is_no_engines_not_an_error(tmp_path, runtime) 
     assert "int3" in graph["message"] and graph["graph_id"]
 
 
-@pytest.mark.parametrize(
-    "flag", ["--internal-profiling-run", "--internal-pytorch-tuned"]
-)
-def test_internal_flags_are_hidden_from_help(flag) -> None:
-    assert flag not in create_parser().format_help()
-
-
-@pytest.mark.parametrize(
-    "argv, expected",
-    [
-        ([], 2),
-        (["-r", "pytorch", "--oracle-mode", "exhaustive"], 2),
-        (["-r", "pytorch"], 0),
-    ],
-    ids=["hipdnn", "pytorch-oracle", "pytorch"],
-)
-def test_internal_pytorch_tuned_needs_pytorch_without_oracle(
-    tmp_path, backend, argv, expected
-) -> None:
-    """The child must not recurse into another tuned child or time hipDNN."""
-    backend(lambda path: _graph(path, [_passed()]))
-    code, text = _run(_args("--internal-pytorch-tuned", *argv), _graphs(tmp_path, 1))
-    assert code == expected
-    assert ("--internal-pytorch-tuned requires" in text) == (expected == 2)
-    assert len(backend.calls) == (expected == 0)
+def test_internal_flags_are_hidden_from_help() -> None:
+    assert "--internal-profiling-run" not in create_parser().format_help()
 
 
 _PYTORCH_ENV = dict.fromkeys(pytorch_tuning.ENV_NAMES, "1")
@@ -893,31 +870,25 @@ _PYTORCH_ENV = dict.fromkeys(pytorch_tuning.ENV_NAMES, "1")
 @pytest.mark.parametrize(
     "argv", [["--validate", "pytorch"], ["-r", "pytorch"]], ids=["validate", "runtime"]
 )
-def test_pytorch_runs_set_and_record_rocm_flags(tmp_path, backend, argv) -> None:
-    backend(lambda path: _graph(path, [_passed()]))
-    out = tmp_path / "out.json"
-    _run(_args("-o", str(out), *argv), _graphs(tmp_path, 1))
+def test_pytorch_runs_set_rocm_flags(tmp_path, runtime, argv) -> None:
+    runtime(lambda path: _graph(path, [_passed()]))
+    _run(_args(*argv), _graphs(tmp_path, 1))
     assert {n: os.environ.get(n) for n in _PYTORCH_ENV} == _PYTORCH_ENV
-    assert SuiteResult.load(out)["environment"]["pytorch_env"] == _PYTORCH_ENV
 
 
-def test_caller_pytorch_flag_wins(tmp_path, backend, monkeypatch) -> None:
+def test_shell_value_cannot_override_pytorch_flag(tmp_path, runtime, monkeypatch):
+    """The command line is the only control of what PyTorch rows measure."""
     monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", "0")
-    backend(lambda path: _graph(path, [_passed()]))
-    out = tmp_path / "out.json"
-    _run(_args("-o", str(out), "-r", "pytorch"), _graphs(tmp_path, 1))
-    assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "0"
-    recorded = SuiteResult.load(out)["environment"]["pytorch_env"]
-    assert recorded == {**_PYTORCH_ENV, "PYTORCH_MIOPEN_SUGGEST_NHWC": "0"}
+    runtime(lambda path: _graph(path, [_passed()]))
+    _run(_args("-r", "pytorch"), _graphs(tmp_path, 1))
+    assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
 
 
-def test_hipdnn_only_run_leaves_pytorch_flags_unset(tmp_path, backend) -> None:
+def test_hipdnn_only_run_leaves_pytorch_flags_unset(tmp_path, runtime) -> None:
     """hipDNN rows must not run under PyTorch-only settings."""
-    backend(lambda path: _graph(path, [_passed()]))
-    out = tmp_path / "out.json"
-    _run(_args("-o", str(out)), _graphs(tmp_path, 1))
+    runtime(lambda path: _graph(path, [_passed()]))
+    _run(_args(), _graphs(tmp_path, 1))
     assert not any(n in os.environ for n in _PYTORCH_ENV)
-    assert SuiteResult.load(out)["environment"]["pytorch_env"] is None
 
 
 @pytest.mark.parametrize(

@@ -134,7 +134,7 @@ Rules that keep the design intact:
   `build_plans()`. Prime each engine with `Executor.prime` before its timed
   OOTB build, and build the oracle's `global.benchmarking=1` plan right after
   the OOTB build, so the two build times start from the same process state.
-- Run tuned PyTorch only in the `--internal-pytorch-tuned` child process.
+- Run tuned PyTorch only in the `cli/pytorch_tuned_child.py` child process.
   PyTorch's conv algorithm cache and MIOpen's user database would otherwise
   carry tuning into the OOTB measurement.
 

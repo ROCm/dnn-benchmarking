@@ -14,11 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
-from ..common.pytorch_tuning import (
-    apply_pytorch_environment,
-    enable_tuned_pytorch,
-    pytorch_environment_snapshot,
-)
+from ..common.pytorch_tuning import apply_pytorch_environment
 from ..config.benchmark_config import (
     RuntimeName,
     PyTorchSdpaBackendName,
@@ -124,13 +120,6 @@ def run_suite_cli(
     except ValueError as e:
         reporter.error(str(e))
         return 2
-    if args.internal_pytorch_tuned and (
-        config.runtime is not RuntimeName.PYTORCH or config.oracle_enabled
-    ):
-        reporter.error(
-            "--internal-pytorch-tuned requires --runtime pytorch --oracle-mode off"
-        )
-        return 2
 
     output_path: Optional[Path] = args.output
     if output_path is not None:
@@ -153,7 +142,7 @@ def run_suite_cli(
         return 2
 
     _warn_ignored_options(config, reporter)
-    _apply_pytorch_environment(config, args.internal_pytorch_tuned, reporter)
+    _apply_pytorch_environment(config, reporter)
     if config.runtime is RuntimeName.HIPDNN:
         _apply_tuning_environment(config, reporter)
         if config.oracle_enabled:
@@ -282,7 +271,6 @@ def _run_suite(
     environment = collect_environment_info()
     if config.oracle_enabled or config.autotune:
         environment["selection_env"] = {n: os.environ.get(n) for n in _SELECTION_ENV}
-    environment["pytorch_env"] = pytorch_environment_snapshot()
     run_config = _run_config(config)
     total = len(graph_paths)
     reporter.print_suite_header(environment, run_config, total)
@@ -415,13 +403,10 @@ def _warn_oracle(reporter: Reporter) -> None:
         )
 
 
-def _apply_pytorch_environment(
-    config: SuiteConfig, tuned_child: bool, reporter: Reporter
-) -> None:
+def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
     """Set PyTorch's kernel-selection controls when PyTorch is timed or used.
 
-    Must run before the first PyTorch conv or SDPA call. The tuned-PyTorch
-    child (``--internal-pytorch-tuned``) also turns on the exhaustive search.
+    Must run before the first PyTorch conv or SDPA call.
     """
     if not (
         config.runtime is RuntimeName.PYTORCH
@@ -429,9 +414,6 @@ def _apply_pytorch_environment(
     ):
         return
     effective = apply_pytorch_environment()
-    if tuned_child:
-        enable_tuned_pytorch()
-        return
     settings = ", ".join(f"{k}={v}" for k, v in effective.items())
     tuned = "; tuned runs use an isolated subprocess" if config.oracle_enabled else ""
     reporter.info(f"PyTorch kernel selection: {settings}{tuned}")

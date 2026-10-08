@@ -100,7 +100,6 @@ The CLI collects these values one time, at suite start.
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
 | `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle-mode` or `--autotune` is set. |
-| `pytorch_env` | object or null | The PyTorch kernel-selection variables in effect: `PYTORCH_MIOPEN_SUGGEST_NHWC`, `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL`. `null` unless `--runtime pytorch` or `--validate pytorch`. See [usage.md](usage.md#pytorch-kernel-selection). |
 
 ## summary
 

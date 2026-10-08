@@ -185,8 +185,7 @@ def _pytorch_tuned_argv(
     argv = [
         sys.executable,
         "-m",
-        "dnn_benchmarking",
-        "--internal-pytorch-tuned",
+        "dnn_benchmarking.cli.pytorch_tuned_child",
         "--runtime",
         "pytorch",
         "--oracle-mode",

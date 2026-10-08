@@ -76,7 +76,6 @@ ENVIRONMENT_KEYS = (
     "torch_version",
     "amdsmi_available",
     "selection_env",
-    "pytorch_env",
 )
 ROW_COLUMNS = (
     "gpu_arch",

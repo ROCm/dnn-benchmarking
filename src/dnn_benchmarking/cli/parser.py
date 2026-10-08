@@ -614,12 +614,4 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
         default=False,
         help=argparse.SUPPRESS,
     )
-    # Hidden child mode for the tuned PyTorch run: the parent re-execs the CLI
-    # with --runtime pytorch so tuning state stays out of its own process.
-    parser.add_argument(
-        "--internal-pytorch-tuned",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
     return parser

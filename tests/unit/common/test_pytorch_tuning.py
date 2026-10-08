@@ -18,8 +18,6 @@ def _clean_env(monkeypatch):
         # setenv first so monkeypatch restores what apply_pytorch_environment sets.
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
-    # No torch import: keeps cudnn.benchmark out of the process under test.
-    monkeypatch.setattr(pytorch_tuning.torch_support, "module_available", lambda: False)
 
 
 def _tuning_vars() -> dict:
@@ -31,13 +29,6 @@ def test_defaults_enable_nhwc_and_aotriton() -> None:
     assert effective["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
     assert effective["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] == "1"
     assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
-
-
-def test_caller_environment_wins(monkeypatch) -> None:
-    monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", "0")
-    effective = pytorch_tuning.apply_pytorch_environment()
-    assert effective["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "0"
-    assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "0"
 
 
 def test_ootb_environment_never_enables_tuning_or_touches_miopen() -> None:
@@ -63,12 +54,3 @@ def test_tuned_subprocess_env_forces_isolated_state(monkeypatch, tmp_path) -> No
     assert env["MIOPEN_USER_DB_PATH"] == str(tmp_path)
     assert env["DNN_BENCH_TEST_PASSTHROUGH"] == "kept"
     assert dict(os.environ) == parent_before
-
-
-def test_snapshot_is_none_until_applied() -> None:
-    assert pytorch_tuning.pytorch_environment_snapshot() is None
-    pytorch_tuning.apply_pytorch_environment()
-    assert (
-        pytorch_tuning.pytorch_environment_snapshot()["PYTORCH_MIOPEN_SUGGEST_NHWC"]
-        == "1"
-    )

@@ -35,7 +35,7 @@ ENV_KEYS = {
     "gpu_pcie_link", "amdgpu_driver_version", "gpu_power_cap_w",
     "gpu_max_sclk_mhz", "gpu_compute_partition", "rocm_version", "cuda_version",
     "cudnn_version", "hipdnn_version", "python_version", "torch_version",
-    "amdsmi_available", "selection_env", "pytorch_env",
+    "amdsmi_available", "selection_env",
 }  # fmt: skip
 SUMMARY_KEYS = {
     "graphs", "rows", "passed", "unchecked", "failed", "skipped", "errors",
