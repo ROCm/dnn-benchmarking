@@ -50,7 +50,7 @@ def _measurement(**kw):
         kernel_ms=[1.0] * 10,
         host_ms=[0.01] * 10,
         mode="staged",
-        backend="hip",
+        timer="hip",
         cache_mode="warm",
         warmup_iters=2,
         first_call_ms=5.0,
@@ -277,7 +277,7 @@ def test_one_hipdnn_row_per_engine_named_from_engine_info(fake):
     assert graph.graph_id == graph_id_for(GRAPH)
     assert graph.status == "ok" and graph.error is None
     assert [
-        (r.provider, r.engine_id, r.engine_name, r.engine_version, r.verdict)
+        (r.runtime, r.engine_id, r.engine_name, r.engine_version, r.verdict)
         for r in graph.results
     ] == [
         ("hipdnn", 1, "ENG_A", "2.1", "unchecked"),
@@ -353,7 +353,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         kernel_ms=[1.0] * 9 + [5.0],
         capped=True,
         mode="events",
-        backend="torch",
+        timer="torch",
         cache_mode="cold",
         warmup_iters=7,
         timing_block=4,
@@ -368,7 +368,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     assert row.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
     assert row.to_dict()["ootb"]["timing"] == {
         "mode": "events",
-        "backend": "torch",
+        "timer": "torch",
         "cache_mode": "cold",
         "warmup_iters": 7,
         "first_call_ms": 5.0,
@@ -397,12 +397,12 @@ def test_every_executor_gets_the_run_policy_and_a_heuristic_plan(fake):
     assert fake.for_autotune == [False, False]
 
 
-def test_metrics_tier_off_skips_probes_and_throughput(fake, monkeypatch):
+def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
     monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
     fake.discovered = [1]
     fake.clocks = [{"sclk_mhz": 1700}] * 2
 
-    row = _run(metrics=MetricsConfig(tier="off"))[0].results[0]
+    row = _run(metrics=MetricsConfig(basic=False))[0].results[0]
 
     assert row.gpu_kernel_stats is not None
     assert row.clocks_before is None and row.derived_tflops_per_s is None
@@ -446,7 +446,7 @@ def test_unsupported_graph_still_gets_the_pytorch_reference_row(fake_torch):
     graph, _ = _validate()
 
     assert graph.status == "no_engines"
-    assert [(r.provider, r.role, r.engine_id, r.verdict) for r in graph.results] == [
+    assert [(r.runtime, r.role, r.engine_id, r.verdict) for r in graph.results] == [
         ("pytorch", "reference", None, "reference")
     ]
     assert graph.results[0].gpu_kernel_stats is not None
@@ -841,13 +841,13 @@ def test_reference_provider_is_usable_or_says_why_not(monkeypatch, provider, rea
     assert got == expected
 
 
-class TestPytorchBackend:
+class TestPytorchRuntime:
     def _run(self, graph_json=GRAPH, **config):
-        return suite_runner.run_graph_pytorch_backend(
+        return suite_runner.run_graph_pytorch(
             PATH,
             graph_json,
             TENSORS,
-            SuiteConfig(backend="pytorch", **config),
+            SuiteConfig(runtime="pytorch", **config),
             Reporter(io.StringIO()),
         )
 
@@ -857,7 +857,7 @@ class TestPytorchBackend:
         (row,) = graph.results
         assert graph.graph_id == graph_id_for(GRAPH) and graph.status == "ok"
         assert (
-            row.provider,
+            row.runtime,
             row.engine_id,
             row.engine_name,
             row.role,

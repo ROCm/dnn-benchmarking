@@ -5,11 +5,9 @@
 
 from .benchmark_config import (
     CACHE_MODE_CHOICES,
-    EMIT_TRACE_CHOICES,
     EngineSelection,
-    ExecutionBackendName,
+    RuntimeName,
     MetricsConfig,
-    MetricsTier,
     OracleMode,
     PMC_SET_CHOICES,
     PyTorchSdpaBackendName,
@@ -21,11 +19,9 @@ from .benchmark_config import (
 
 __all__ = [
     "CACHE_MODE_CHOICES",
-    "EMIT_TRACE_CHOICES",
     "EngineSelection",
-    "ExecutionBackendName",
+    "RuntimeName",
     "MetricsConfig",
-    "MetricsTier",
     "OracleMode",
     "PMC_SET_CHOICES",
     "PyTorchSdpaBackendName",

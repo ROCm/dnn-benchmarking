@@ -18,7 +18,7 @@ from dnn_benchmarking.reporting.suite_results import GraphResult, ProviderEngine
 
 def _render(extra_metrics) -> str:
     pe = ProviderEngineResult(
-        provider="hipdnn",
+        runtime="hipdnn",
         engine_id=1,
         engine_name="MIOPEN_ENGINE",
         status="success",

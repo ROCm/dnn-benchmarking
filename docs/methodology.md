@@ -9,9 +9,9 @@ measures it. The code is `src/dnn_benchmarking/execution/timing.py`
 - The headline number is `kernel_med`: the median device time of one launch
   of the graph, in the table and in `ootb.kernel.median_ms`.
 - One loop implementation (`timing.measure`) times hipDNN engines and the
-  PyTorch backend. The two backends get the same warmup, stop rule, cache
+  PyTorch runtime. The two runtimes get the same warmup, stop rule, cache
   mode and statistics.
-- Each plan records how it was measured in `timing`: mode, event backend,
+- Each plan records how it was measured in `timing`: mode, timer,
   cache mode, warmup count, first-call cost, cap and fallback reason.
 - TFLOP/s and GB/s use the median. The tool reports the spread (IQR, CV) and
   flags noise. It never removes samples.
@@ -35,14 +35,14 @@ host enqueues all work before the gate opens. Thus the span has no host
 launch gaps between the kernels of a multi-kernel graph. It is the device
 time of one launch, with the kernels back to back.
 
-The `staged` mode needs the HIP backend (`hipdnn_frontend` with the
+The `staged` mode needs the HIP timer (`hipdnn_frontend` with the
 `HipStallGate` binding, including its watchdog state `timed_out`) and a
 device with stream wait-value support. When this is not available, the tool
 uses `events` mode and records the reason in `timing.fallback_reason`:
 
 | Reason | Cause |
 |---|---|
-| `staged timing requires the hip backend` | PyTorch backend on CUDA, or on ROCm without `hipdnn_frontend`. |
+| `staged timing requires the hip timer` | PyTorch runtime on CUDA, or on ROCm without `hipdnn_frontend`. |
 | `hipdnn_frontend is missing staging bindings: ...` | An old `hipdnn_frontend` (for example, one without `HipStallGate.timed_out`). |
 | `device does not support hipStreamWaitValue32` | The device or driver has no stream wait-value support. |
 | `host sync in enqueue: ...` | The PyTorch graph reads a device value on the host. A stalled stream would then never complete. |
@@ -75,7 +75,7 @@ Before the warmup, `measure()` always primes the engine:
    time as `first_call_ms`. This value includes one-time costs such as kernel
    compile, MIOpen find and lazy allocation. The console shows it as `setup`
    and `first call`.
-2. For the PyTorch backend, it runs one more `enqueue()` with
+2. For the PyTorch runtime, it runs one more `enqueue()` with
    `torch.cuda.set_sync_debug_mode("error")`, then a device sync. If this
    call synchronizes with the host, the loop uses `events` mode.
 
@@ -85,7 +85,7 @@ Priming launches are not timed and never flushed.
 
 `--warmup N` (default 10) is a launch count, not a time budget. The priming
 launches are part of the count. The remaining `N - 1` launches (`N - 2` for
-the PyTorch backend) go through the timed-iteration path: the same mode
+the PyTorch runtime) go through the timed-iteration path: the same mode
 (`staged` or `events`), the same per-iteration sync and, in `cold` mode, the
 same flush. The tool discards their samples.
 
@@ -99,7 +99,7 @@ change (25.4 to 25.6 us).
 
 `timing.warmup_iters` is the number of untimed launches that actually ran.
 Outside block mode it is `max(priming launches, --warmup)`: priming is 1
-launch for hipDNN, 2 for the PyTorch backend (the host-sync probe), and 3
+launch for hipDNN, 2 for the PyTorch runtime (the host-sync probe), and 3
 when the probe finds a host sync and runs the launch again. So it is 1 or
 more, also when `--warmup 0` is given. In block mode it is the priming
 launches plus `--warmup` for every sample, the discarded first sample
@@ -209,7 +209,7 @@ moved the mean and the standard deviation, but not the median.
 
 ## Clocks before and after
 
-With `--metrics-tier basic` (default) and amdsmi available, the runner reads
+With `--metrics` (default) and amdsmi available, the runner reads
 the GPU clocks before priming and warmup, and right after the timed loop:
 `sclk_mhz`, `mclk_mhz`, `power_w`, `temp_hotspot_c` and `throttle_status`.
 The row gets the warning `throttled` when `throttle_status` after the loop is
@@ -219,7 +219,7 @@ tool does not set or lock clocks.
 
 ## Profiling child process
 
-`--pmc`, `--emit-trace`, `--perf` and `--roofline` do not change the timed
+`--pmc`, `--trace`, `--perf` and `--roofline` do not change the timed
 numbers. After the timed row completes, the tool starts one child process for
 each pass under the profiler:
 
@@ -290,7 +290,7 @@ Other methods on the same shapes:
 | Method | conv_fwd | matmul |
 |---|---|---|
 | This tool, hipDNN, staged | 25.44 to 25.60 | 28.96 |
-| This tool, `--backend pytorch`, staged | 26 | 29 |
+| This tool, `--runtime pytorch`, staged | 26 | 29 |
 | Stall-gated timer on the raw PyTorch op | 25.76 to 25.92 | 28.96 |
 | `triton.testing.do_bench` median (L2 flush, event pair per launch) | 25.76 | 29.12 |
 | Event pair per launch after a 256 MB L2 flush | 25.44 to 25.76 | 28.96 to 29.12 |
@@ -312,7 +312,7 @@ What the numbers show:
 - L2 state did not cause the difference for these shapes: 28.80 us warm and
   28.64 us cold.
 
-hipDNN and `--backend pytorch` on the same graphs, kernel median in ms:
+hipDNN and `--runtime pytorch` on the same graphs, kernel median in ms:
 
 | Graph | hipDNN | PyTorch |
 |---|---|---|
@@ -330,14 +330,14 @@ minimum-to-maximum ranges can include clock-ramp outliers.
 
 ### Change against the previous loop (MI210, gfx90a)
 
-Every `graphs/*.json` ran on both backends with `--warmup 10 --iters 100`,
+Every `graphs/*.json` ran on both runtimes with `--warmup 10 --iters 100`,
 once with the previous loop (`main` at 2af0454) and once with this loop,
 back to back, in two repeats (92 median pairs):
 
 - 85 of 92 medians agree within 2 %. On kernels near 14 us, 1 % is one
   0.16 us step of the event timer.
 - The other pairs are bimodal kernels (CV 0.1 to 0.3), where the median moves
-  between the two modes. `conv_dgrad` on the PyTorch backend read 26 % and
+  between the two modes. `conv_dgrad` on the PyTorch runtime read 26 % and
   36 % lower; its mean moved less (43.1 to 43.0 us, 44.3 to 39.7 us).
   `conv_dgrad` on `MIOPEN_ENGINE_DETERMINISTIC` read 5.4 % lower in both
   repeats. Two other rows moved in one repeat only.
@@ -360,7 +360,7 @@ The tool does not do these things yet:
   (top-left causal). A bounded left window is supported only with
   `right_bound = 0`. Other masks make the reference decline the graph as
   unsupported.
-- One buffer manager for both backends. The hipDNN path (`BufferManager`) and
+- One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
 - Graph-replay timing (HIP or CUDA graph capture). Back-to-back timing is

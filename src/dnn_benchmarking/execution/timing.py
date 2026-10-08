@@ -9,14 +9,14 @@ Modes
   stream (``StalledRegionTimer``), so the start->stop event span is gap-free
   device time with no host submission inside it.
 * ``events``: start/stop events around each enqueue. Used when staging is not
-  available (torch backend, missing stream-wait-value support) or when the
+  available (torch timer, missing stream-wait-value support) or when the
   enqueue synchronizes with the host, which would deadlock a stalled stream.
 
 In both modes ``host_ms`` is ``perf_counter`` around the enqueue call only,
 i.e. host submission cost.
 
-Event backends
---------------
+Timers
+------
 * ``hip``: HIP events from ``hipdnn_frontend`` recorded on a raw stream
   pointer. Preferred on ROCm.
 * ``torch``: ``torch.cuda.Event`` recorded on a torch stream; CUDA hosts,
@@ -44,7 +44,7 @@ class Measurement:
         host_ms: Host submit time (enqueue only) per execution, same shape.
         mode: ``staged`` (stall-gated gap-free span), ``events``, or
             ``block`` (rocKE block timing, ``timing_block > 1``).
-        backend: Event backend, ``hip`` or ``torch``.
+        timer: Event timer, ``hip`` or ``torch``.
         cache_mode: ``warm`` or ``cold``.
         warmup_iters: Untimed enqueues actually run (always >= 1): priming,
             any host-sync probe rerun, and discarded measured-path warmups.
@@ -59,7 +59,7 @@ class Measurement:
     kernel_ms: List[float]
     host_ms: List[float]
     mode: str
-    backend: str
+    timer: str
     cache_mode: str
     warmup_iters: int
     first_call_ms: float
@@ -80,12 +80,12 @@ _STAGED_HIP_API = ("HipStallGate", "hip_can_use_stream_wait_value")
 # ponytail: fixed 512 MiB >= 2x the largest last-level cache we target (MI300X
 # MALL, 256 MiB); derive from device properties if a bigger cache appears.
 _FLUSH_BYTES = 512 * 1024 * 1024
-# One cold-cache flush buffer per backend, allocated on first cold iteration.
+# One cold-cache flush buffer per timer, allocated on first cold iteration.
 _flush_buffers: Dict[str, Any] = {}
 
 # Lazily imported hipdnn_frontend module. Resolved on first HIP use so the tool
 # stays importable on hosts without hipDNN (e.g. CUDA machines running the
-# PyTorch backend). Tests may inject a fake module here.
+# PyTorch runtime). Tests may inject a fake module here.
 hipdnn: Optional[Any] = None
 
 
@@ -139,25 +139,25 @@ def _staged_unavailable_reason() -> Optional[str]:
 class EventTimer:
     """Start/stop GPU event pair on one stream."""
 
-    def __init__(self, backend: str, stream: int = 0, torch_stream: Any = None):
+    def __init__(self, timer: str, stream: int = 0, torch_stream: Any = None):
         """Create the event pair.
 
         Args:
-            backend: ``hip`` (HIP events on ``stream``) or ``torch``
+            timer: ``hip`` (HIP events on ``stream``) or ``torch``
                 (``torch.cuda.Event`` on ``torch_stream``, default the current
                 torch stream).
             stream: HIP stream pointer encoded as an integer.
-            torch_stream: torch.cuda.Stream for the torch backend.
+            torch_stream: torch.cuda.Stream for the torch timer.
 
         Raises:
-            RuntimeError: If the backend's runtime is unavailable.
+            RuntimeError: If the timer's runtime is unavailable.
         """
-        if backend == "hip":
+        if timer == "hip":
             module = _require_hip_runtime()
             self._stream: Any = int(stream)
             self._start = module.HipEvent()
             self._stop = module.HipEvent()
-        elif backend == "torch":
+        elif timer == "torch":
             import torch
 
             self._stream = (
@@ -168,7 +168,7 @@ class EventTimer:
             self._start = torch.cuda.Event(enable_timing=True)
             self._stop = torch.cuda.Event(enable_timing=True)
         else:
-            raise ValueError(f"Unknown timing backend: {backend!r}")
+            raise ValueError(f"Unknown timer: {timer!r}")
 
     def start(self) -> None:
         self._start.record(self._stream)
@@ -244,9 +244,9 @@ class StalledRegionTimer:
         return (t1 - t0) * 1000.0, float(self._start.elapsed_time(self._stop))
 
 
-def device_sync(backend: str) -> None:
+def device_sync(timer: str) -> None:
     """Block until all work on the current device (``hip`` or ``torch``) is done."""
-    if backend == "hip":
+    if timer == "hip":
         _require_hip_runtime().hip_device_synchronize()
     else:
         import torch
@@ -254,12 +254,12 @@ def device_sync(backend: str) -> None:
         torch.cuda.synchronize()
 
 
-def _flush_cache(backend: str) -> None:
+def _flush_cache(timer: str) -> None:
     """Evict L2/MALL by zeroing the flush buffer, then drain the device."""
-    buf = _flush_buffers.get(backend)
+    buf = _flush_buffers.get(timer)
     if buf is None:
         try:
-            if backend == "hip":
+            if timer == "hip":
                 buf = _require_hip_runtime().DeviceBuffer(_FLUSH_BYTES)
             else:
                 import torch
@@ -274,12 +274,12 @@ def _flush_cache(backend: str) -> None:
             # Free device buffers before interpreter teardown; nanobind
             # reports module-global instances still alive at exit as leaks.
             atexit.register(_flush_buffers.clear)
-        _flush_buffers[backend] = buf
-    if backend == "hip":
+        _flush_buffers[timer] = buf
+    if timer == "hip":
         buf.zeros()
     else:
         buf.zero_()
-    device_sync(backend)
+    device_sync(timer)
 
 
 def _probe_host_sync(enqueue: Callable[[], None]) -> Optional[str]:
@@ -322,7 +322,7 @@ def measure(
     *,
     stream: int,
     policy: TimingPolicy,
-    backend: str = "hip",
+    timer: str = "hip",
     torch_stream: Any = None,
 ) -> Measurement:
     """Prime, warm up, then time ``enqueue`` per ``policy`` (a ``TimingPolicy``).
@@ -344,22 +344,22 @@ def measure(
     Args:
         enqueue: Submits one iteration of work to ``stream`` / ``torch_stream``.
             Torch callers must already be inside ``torch.cuda.stream(...)``.
-        stream: HIP stream pointer (``hip`` backend, staging).
+        stream: HIP stream pointer (``hip`` timer, staging).
         policy: Warmup/iteration counts, time budget, and cache mode.
-        backend: ``hip`` or ``torch`` event backend.
+        timer: ``hip`` or ``torch`` timer.
         torch_stream: torch.cuda.Stream the enqueue runs on, if torch-driven.
 
     Raises:
         ExecutionError: If the cold-cache flush buffer cannot be allocated.
         StallFallbackError: If stall-gated timing failed (see
             ``StalledRegionTimer``); the caller remeasures without stalling.
-        RuntimeError: If the event backend is unavailable.
+        RuntimeError: If the timer is unavailable.
     """
-    events = EventTimer(backend, stream, torch_stream)
+    events = EventTimer(timer, stream, torch_stream)
 
     t0 = time.perf_counter()
     enqueue()
-    device_sync(backend)
+    device_sync(timer)
     first_call_ms = (time.perf_counter() - t0) * 1000.0
     primed = 1
     reason: Optional[str] = None
@@ -367,17 +367,17 @@ def measure(
         reason = _probe_host_sync(enqueue)
         # A detected sync costs a second (unchecked) enqueue.
         primed += 1 if reason is None else 2
-        device_sync(backend)
+        device_sync(timer)
 
     if policy.timing_block > 1:
         return _measure_blocks(
-            enqueue, events, policy, backend, first_call_ms, primed, reason
+            enqueue, events, policy, timer, first_call_ms, primed, reason
         )
 
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
-        if backend != "hip":
-            reason = "staged timing requires the hip backend"
+        if timer != "hip":
+            reason = "staged timing requires the hip timer"
         elif not policy.stall_gate:
             reason = "stall gate failed in this graph; every row remeasured unstalled"
         else:
@@ -393,7 +393,7 @@ def measure(
     def iteration() -> Tuple[float, float]:
         """One ``(host_ms, kernel_ms)`` sample on the timed path."""
         if cold:
-            _flush_cache(backend)
+            _flush_cache(timer)
         if staged is not None:
             return staged.measure(enqueue)
         events.start()
@@ -423,7 +423,7 @@ def measure(
         kernel_ms=kernel_ms,
         host_ms=host_ms,
         mode="staged" if staged is not None else "events",
-        backend=backend,
+        timer=timer,
         cache_mode=policy.cache_mode,
         warmup_iters=max(primed, policy.warmup_iters),
         first_call_ms=first_call_ms,
@@ -436,7 +436,7 @@ def _measure_blocks(
     enqueue: Callable[[], None],
     events: EventTimer,
     policy: TimingPolicy,
-    backend: str,
+    timer: str,
     first_call_ms: float,
     untimed: int,
     host_sync: Optional[str],
@@ -467,7 +467,7 @@ def _measure_blocks(
         for _ in range(policy.warmup_iters):
             enqueue()
         untimed += policy.warmup_iters
-        device_sync(backend)
+        device_sync(timer)
         events.start()
         t0 = time.perf_counter()
         for _ in range(block):
@@ -486,7 +486,7 @@ def _measure_blocks(
         kernel_ms=kernel_ms,
         host_ms=host_ms,
         mode="block",
-        backend=backend,
+        timer=timer,
         cache_mode=policy.cache_mode,
         warmup_iters=untimed,
         first_call_ms=first_call_ms,

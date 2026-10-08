@@ -120,7 +120,7 @@ min_time_ms = 25
 cache_mode = "cold"
 seed = 42
 quiet = true
-metrics_tier = "off"
+metrics = false
 
 [[engines]]
 id = 1
@@ -142,7 +142,7 @@ plugin_path = "/plugins/a"
     assert args.min_time_ms == 25.0
     assert args.cache_mode == "cold"
     assert args.quiet is True
-    assert args.metrics_tier == "off"
+    assert args.metrics is False
     assert args.engine == [1, 1]
     # Driveless absolute paths from the config keep their order and tail;
     # on Windows the loader anchors them to the config dir's drive, so
@@ -274,11 +274,9 @@ def test_unknown_engine_config_fields_are_rejected(tmp_path: Path, field: str) -
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("backend", '"pytoch"'),
+        ("runtime", '"pytoch"'),
         ("oracle_mode", '"full"'),
         ("validate", '"torch"'),
-        ("metrics_tier", '"full"'),
-        ("emit_trace", '"json"'),
         ("pmc", '"everything"'),
         ("cache_mode", '"hot"'),
         ("pytorch_sdpa_backend", '"aotriton"'),
@@ -311,7 +309,7 @@ graphs = ["../graphs/g.json"]
 output = "results/out.json"
 plugin_path = "../plugins"
 profiling_output_dir = "profiles"
-cache_dir = "hipdnn-cache"
+hipdnn_cache_dir = "hipdnn-cache"
 """,
     )
 
@@ -321,7 +319,7 @@ cache_dir = "hipdnn-cache"
     assert args.output == config_dir / "results/out.json"
     assert args.plugin_path == [config_dir / "../plugins"]
     assert args.profiling_output_dir == config_dir / "profiles"
-    assert args.cache_dir == config_dir / "hipdnn-cache"
+    assert args.hipdnn_cache_dir == config_dir / "hipdnn-cache"
 
 
 def test_sample_configs_parse_and_cover_every_config_key() -> None:
@@ -367,7 +365,7 @@ def test_invalid_config_is_a_usage_error_before_graph_resolution(
     tmp_path: Path, cache_env
 ) -> None:
     config = _write_config(
-        tmp_path / "bench.toml", 'version = 1\ngraphs = ["g.json"]\nbackend = "x"\n'
+        tmp_path / "bench.toml", 'version = 1\ngraphs = ["g.json"]\nruntime = "x"\n'
     )
     main_module = importlib.import_module("dnn_benchmarking.cli.main")
 

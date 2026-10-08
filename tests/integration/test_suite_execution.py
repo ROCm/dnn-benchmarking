@@ -10,7 +10,7 @@ import re
 import pytest
 
 from dnn_benchmarking.config import (
-    ExecutionBackendName,
+    RuntimeName,
     MetricsConfig,
     OracleMode,
     PyTorchSdpaBackendName,
@@ -19,10 +19,10 @@ from dnn_benchmarking.config import (
 from dnn_benchmarking.execution import Executor
 from dnn_benchmarking.execution.suite_runner import (
     run_graph_all_providers,
-    run_graph_pytorch_backend,
+    run_graph_pytorch,
 )
 from dnn_benchmarking.reporting.reporter import Reporter
-from tests.conftest import expected_timing_backend
+from tests.conftest import expected_timer
 from tests.integration.conftest import load_graph
 
 pytestmark = pytest.mark.gpu
@@ -47,17 +47,17 @@ def _run_conv(hipdnn, **config):
 
 
 def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
-    """Default basic tier: timing, derived metrics, and a strict-JSON v2 row."""
+    """Default metrics on: timing, derived metrics, and a strict-JSON v2 row."""
     result, successes = _run_conv(hipdnn)
     assert result.status == "ok"
     assert re.fullmatch(r"[0-9a-f]{12}", result.graph_id)
 
     for r in successes:
-        assert r.provider == "hipdnn"
+        assert r.runtime == "hipdnn"
         assert r.engine_name and not r.engine_name.startswith("0x")
         assert r.cpu_build_time_ms > 0
         assert r.gpu_kernel_stats.n == r.host_stats.n == 3
-        assert r.timing.backend == "hip" and r.timing.warmup_iters == 1
+        assert r.timing.timer == "hip" and r.timing.warmup_iters == 1
         assert r.workspace_bytes >= 0
         assert r.analytical_flops > 0 and r.analytical_io_bytes > 0
         assert r.derived_tflops_per_s > 0 and r.derived_gbytes_per_s > 0
@@ -75,9 +75,9 @@ def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
         assert row["oracle"] is None
 
 
-def test_metrics_tier_off_suppresses_basic_fields(hipdnn) -> None:
-    """``metrics-tier=off`` skips the always-on probes; timing still runs."""
-    _, successes = _run_conv(hipdnn, metrics=MetricsConfig(tier="off"))
+def test_no_metrics_suppresses_basic_fields(hipdnn) -> None:
+    """``--no-metrics`` skips the always-on probes; timing still runs."""
+    _, successes = _run_conv(hipdnn, metrics=MetricsConfig(basic=False))
     for r in successes:
         assert r.gpu_kernel_stats is not None
         assert r.workspace_bytes is None
@@ -134,24 +134,22 @@ def test_oracle_plan_records_tuned_payload(hipdnn) -> None:
 
 
 @pytest.mark.parametrize("graph_name", ["sample_conv_fwd.json", "sample_relu.json"])
-def test_pytorch_backend_times_graph(torch_gpu, graph_name: str) -> None:
-    """--backend pytorch: one timed pytorch row per graph, no hipDNN."""
+def test_pytorch_runtime_times_graph(torch_gpu, graph_name: str) -> None:
+    """--runtime pytorch: one timed pytorch row per graph, no hipDNN."""
     path, graph_json, tensor_infos = load_graph(graph_name)
-    config = SuiteConfig(
-        warmup_iters=1, benchmark_iters=2, backend=ExecutionBackendName.PYTORCH
-    )
-    result = run_graph_pytorch_backend(
+    config = SuiteConfig(warmup_iters=1, benchmark_iters=2, runtime=RuntimeName.PYTORCH)
+    result = run_graph_pytorch(
         path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
     )
 
     [row] = result.results
-    assert (row.provider, row.status, row.verdict) == (
+    assert (row.runtime, row.status, row.verdict) == (
         "pytorch",
         "success",
         "unchecked",
     ), row.error_message
     assert row.gpu_kernel_stats.n == row.host_stats.n == 2
-    assert row.timing.backend == expected_timing_backend()
+    assert row.timing.timer == expected_timer()
 
 
 def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
@@ -160,10 +158,10 @@ def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
     config = SuiteConfig(
         warmup_iters=1,
         benchmark_iters=2,
-        backend=ExecutionBackendName.PYTORCH,
+        runtime=RuntimeName.PYTORCH,
         pytorch_sdpa_backend=PyTorchSdpaBackendName.MATH,
     )
-    result = run_graph_pytorch_backend(
+    result = run_graph_pytorch(
         path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
     )
 

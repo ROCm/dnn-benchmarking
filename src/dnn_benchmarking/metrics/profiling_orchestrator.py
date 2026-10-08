@@ -3,7 +3,7 @@
 
 """Re-exec orchestrator for opt-in profiling sources.
 
-When the user passes ``--pmc``, ``--emit-trace``, ``--perf``, or
+When the user passes ``--pmc``, ``--trace``, ``--perf``, or
 ``--roofline``, the timed pass runs first to keep its numbers clean.
 After it succeeds, this orchestrator runs the workload again — once per
 requested source — under the corresponding external profiler (rocprofv3,
@@ -155,7 +155,7 @@ def check_requested_tools(metrics_config: MetricsConfig) -> List[str]:
         flag
         for flag, on in (
             ("--pmc", metrics_config.pmc_set is not None),
-            ("--emit-trace", metrics_config.emit_trace is not None),
+            ("--trace", metrics_config.trace),
         )
         if on
     ]
@@ -252,10 +252,10 @@ def run_profiling_passes(
             {"pmc_set": metrics_config.pmc_set},
         ),
         (
-            metrics_config.emit_trace is not None,
+            metrics_config.trace,
             "trace",
             _trace_mod,
-            f"trace_{metrics_config.emit_trace}",
+            "trace_pftrace",
             {},
         ),
         (metrics_config.perf, "perf", _perf_mod, "perf", {}),

@@ -42,8 +42,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_strict)
 
 
-def expected_timing_backend() -> str:
-    """Return the GPU timing backend the executor must select on this host.
+def expected_timer() -> str:
+    """Return the GPU timer the executor must select on this host.
 
     ROCm torch times with direct HIP events ("hip"); CUDA uses torch.cuda
     events ("torch"). Deliberately not the executor's own predicate, so a ROCm

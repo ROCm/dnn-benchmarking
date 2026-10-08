@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
-    ExecutionBackendName,
+    RuntimeName,
     PyTorchSdpaBackendName,
     ReferenceProviderName,
     SuiteConfig,
@@ -33,7 +33,7 @@ from ..reporting.suite_results import (
     engine_id_hex,
     graph_id_for,
 )
-from .backends import BackendStartupError, GraphRunner, start_backend
+from .runtimes import RuntimeStartupError, GraphRunner, start_runtime
 
 #: Minimum seconds between intermediate result writes.
 WRITE_INTERVAL_S = 10.0
@@ -143,14 +143,14 @@ def run_suite_cli(
         return 2
 
     _warn_ignored_options(config, reporter)
-    if config.backend is ExecutionBackendName.HIPDNN:
+    if config.runtime is RuntimeName.HIPDNN:
         _apply_tuning_environment(config, reporter)
         if config.oracle_enabled:
             _warn_oracle(config, reporter)
 
     try:
-        run_graph = start_backend(config, reporter)
-    except BackendStartupError as e:
+        run_graph = start_runtime(config, reporter)
+    except RuntimeStartupError as e:
         reporter.error(str(e))
         return e.exit_code
 
@@ -186,12 +186,12 @@ def _dir_problem(directory: Path) -> Optional[str]:
 def _run_config(config: SuiteConfig) -> Dict[str, Any]:
     """The effective configuration recorded as ``run.config``."""
     pytorch = (
-        config.backend is ExecutionBackendName.PYTORCH
+        config.runtime is RuntimeName.PYTORCH
         or config.validation.provider is ReferenceProviderName.PYTORCH
     )
     metrics = config.metrics
     return {
-        "backend": config.backend.value,
+        "runtime": config.runtime.value,
         "engine_filter": (
             [engine_id_hex(e) for e in config.engine_filter]
             if config.engine_filter is not None
@@ -215,13 +215,13 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "atol": config.validation.atol,
         "oracle_mode": config.oracle_mode.value,
         "autotune": config.autotune,
-        "cache_dir": config.cache_dir,
+        "hipdnn_cache_dir": config.hipdnn_cache_dir,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
-        "metrics_tier": metrics.tier.value,
+        "metrics": metrics.basic,
         "profiling": {
             "pmc": metrics.pmc_set,
-            "emit_trace": metrics.emit_trace,
+            "trace": metrics.trace,
             "perf": metrics.perf,
             "roofline": metrics.roofline,
         },
@@ -363,11 +363,11 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
     metrics = config.metrics
     if metrics.profiling_output_dir is not None and not metrics.opt_in_pass_requested:
         reporter.warning(
-            "--profiling-output-dir has no effect without --pmc, --emit-trace, "
+            "--profiling-output-dir has no effect without --pmc, --trace, "
             "--perf or --roofline"
         )
     pytorch_selected = (
-        config.backend is ExecutionBackendName.PYTORCH
+        config.runtime is RuntimeName.PYTORCH
         or config.validation.provider is ReferenceProviderName.PYTORCH
     )
     sdpa_set = (
@@ -376,7 +376,7 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
     )
     if sdpa_set and not pytorch_selected:
         reporter.warning(
-            "PyTorch SDPA options have no effect without --backend pytorch or "
+            "PyTorch SDPA options have no effect without --runtime pytorch or "
             "--validate pytorch"
         )
 
@@ -407,8 +407,8 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     plus one warning per hazard.
     """
     leaked = False
-    if config.cache_dir:
-        os.environ["HIPDNN_CACHE_DIR"] = config.cache_dir
+    if config.hipdnn_cache_dir:
+        os.environ["HIPDNN_CACHE_DIR"] = config.hipdnn_cache_dir
     cache = os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
 
     if config.autotune:
@@ -422,11 +422,11 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
             "--autotune; kernels are benchmarked, not heuristic-selected"
         )
     autotune = config.autotune or leaked
-    if config.autotune and not config.cache_dir:
+    if config.autotune and not config.hipdnn_cache_dir:
         # The winner cache outlives the run and reads are not gated on
         # benchmarking, so a previous session's ranking can be reported.
         reporter.warning(
-            "--autotune without --cache-dir: winners cached by earlier runs "
+            "--autotune without --hipdnn-cache-dir: winners cached by earlier runs "
             "may be reported instead of measured"
         )
     reporter.info(

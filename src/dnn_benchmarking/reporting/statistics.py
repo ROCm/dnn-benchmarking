@@ -114,7 +114,7 @@ class TimingInfo:
     """
 
     mode: str
-    backend: str
+    timer: str
     cache_mode: str
     warmup_iters: int
     first_call_ms: float
@@ -127,7 +127,7 @@ class TimingInfo:
         """Copy the provenance fields of an ``execution.timing.Measurement``."""
         return cls(
             mode=m.mode,
-            backend=m.backend,
+            timer=m.timer,
             cache_mode=m.cache_mode,
             warmup_iters=m.warmup_iters,
             first_call_ms=m.first_call_ms,

@@ -52,7 +52,7 @@ def test_pytorch_gpu_timing_cuda(graph_name: str) -> None:
 
     assert len(m.kernel_ms) == len(m.host_ms) == 3
     assert all(t > 0.0 for t in m.kernel_ms + m.host_ms)
-    assert m.backend == "torch"
+    assert m.timer == "torch"
 
 
 def test_cuda_environment_metadata_sentinels() -> None:
@@ -78,7 +78,7 @@ def test_cuda_suite_header_shows_cuda_label_not_rocm() -> None:
         "min_time_ms": 0.0,
         "cache_mode": "warm",
         "seed": 0,
-        "backend": "pytorch",
+        "runtime": "pytorch",
     }
     Reporter(output=output).print_suite_header(
         collect_environment_info(), run_config, 1

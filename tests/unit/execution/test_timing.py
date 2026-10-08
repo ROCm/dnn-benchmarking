@@ -236,7 +236,7 @@ def test_events_mode_times_exactly_one_enqueue(monkeypatch) -> None:
 
 
 def _install_fake_torch_cuda(monkeypatch, log: List[str]) -> None:
-    """torch with just what the torch event backend and its flush use."""
+    """torch with just what the torch timer and its flush use."""
 
     class Event:
         def __init__(self, enable_timing: bool = False) -> None:
@@ -279,7 +279,7 @@ def test_cold_flushes_before_every_events_mode_iteration(monkeypatch, backend) -
         _enqueue(log),
         stream=7,
         policy=TimingPolicy(warmup_iters=3, iters=2, cache_mode="cold"),
-        backend=backend,
+        timer=backend,
     )
 
     assert m.mode == "events"

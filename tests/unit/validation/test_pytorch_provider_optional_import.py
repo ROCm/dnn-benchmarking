@@ -22,7 +22,7 @@ def import_without_torch(name, *args, **kwargs):
 builtins.__import__ = import_without_torch
 from dnn_benchmarking.cli.parser import create_parser
 from dnn_benchmarking.validation.providers.pytorch_provider import PyTorchReferenceProvider
-import dnn_benchmarking.cli.backends
+import dnn_benchmarking.cli.runtimes
 import dnn_benchmarking.cli.main
 import dnn_benchmarking.execution.suite_runner
 assert create_parser() is not None

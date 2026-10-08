@@ -12,7 +12,7 @@ from typing import List
 
 import pytest
 
-from tests.conftest import expected_timing_backend
+from tests.conftest import expected_timer
 from tests.integration.conftest import GRAPHS_DIR, PROJECT_ROOT
 
 
@@ -80,7 +80,7 @@ def test_cli_smoke(
     assert good["status"] == "ok"
     reference = [r for r in good["results"] if r["role"] == "reference"]
     engines = [r for r in good["results"] if r["role"] == "engine"]
-    assert [(r["provider"], r["verdict"]) for r in reference] == [
+    assert [(r["runtime"], r["verdict"]) for r in reference] == [
         ("pytorch", "reference")
     ]
     assert engines
@@ -94,15 +94,15 @@ def test_cli_smoke(
 
 
 @pytest.mark.gpu
-def test_cli_pytorch_backend(torch_gpu, tmp_path: Path) -> None:
-    """--backend pytorch reaches the PyTorch runner: one timed pytorch row."""
+def test_cli_pytorch_runtime(torch_gpu, tmp_path: Path) -> None:
+    """--runtime pytorch reaches the PyTorch runner: one timed pytorch row."""
     output = tmp_path / "results.json"
     proc = subprocess.run(
         [
             sys.executable,
             "-m",
             "dnn_benchmarking",
-            "--backend",
+            "--runtime",
             "pytorch",
             "-g",
             str(GRAPHS_DIR / "sample_relu.json"),
@@ -122,10 +122,10 @@ def test_cli_pytorch_backend(torch_gpu, tmp_path: Path) -> None:
 
     [graph] = json.loads(output.read_text())["graphs"]
     [row] = graph["results"]
-    assert (row["provider"], row["role"], row["status"]) == (
+    assert (row["runtime"], row["role"], row["status"]) == (
         "pytorch",
         "engine",
         "success",
     ), row
     assert row["ootb"]["kernel"]["n"] == 3
-    assert row["ootb"]["timing"]["backend"] == expected_timing_backend()
+    assert row["ootb"]["timing"]["timer"] == expected_timer()

@@ -7,10 +7,10 @@ Benchmarking and validation tool for hipDNN graphs.
 
 dnn-benchmarking loads serialized hipDNN graphs (JSON). It runs each graph
 through the installed hipDNN engine plugins, or through PyTorch with
-`--backend pytorch`. For each engine it measures the device time of one
+`--runtime pytorch`. For each engine it measures the device time of one
 launch and, if you ask, compares the output with a PyTorch reference.
 
-- One timed loop for all backends. The headline number is the median device
+- One timed loop for all runtimes. The headline number is the median device
   time per launch (`kernel_med`), measured with a stall-gated event span.
 - Each result records how it was measured: timing mode, cache mode, warmup,
   sample count, seed and first-call cost.
@@ -24,7 +24,7 @@ launch and, if you ask, compares the output with a PyTorch reference.
 - Python 3.12 or newer.
 - hipDNN backend: an AMD GPU with ROCm, the hipDNN Python bindings
   (`hipdnn_frontend`) and the engine plugins. `setup_env.py` builds them.
-- PyTorch backend: a ROCm or CUDA build of PyTorch. hipDNN is not necessary.
+- PyTorch runtime: a ROCm or CUDA build of PyTorch. hipDNN is not necessary.
 - `--validate pytorch`: any PyTorch build. A CPU build is sufficient.
 - Optional: amdsmi for GPU clocks and throttle status; `rocprofv3`, `perf`
   and `rocprof-compute` for the profiling flags.
@@ -55,7 +55,7 @@ launch and, if you ask, compares the output with a PyTorch reference.
 3. Run the same graph through PyTorch:
 
    ```bash
-   dnn-benchmark -g graphs/sample_conv_fwd.json --backend pytorch
+   dnn-benchmark -g graphs/sample_conv_fwd.json --runtime pytorch
    ```
 
 4. Benchmark a set of graphs, validate the outputs and write the results:
@@ -96,7 +96,7 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | Engine row error, graph error, failed final result write, no graph files, or backend not available. |
+| 1 | Engine row error, graph error, failed final result write, no graph files, or runtime not available. |
 | 2 | Usage or config error. |
 | 3 | An engine row failed validation. |
 | 130 / 143 | Interrupted by SIGINT / SIGTERM. A partial result file has `run.complete = false`. |

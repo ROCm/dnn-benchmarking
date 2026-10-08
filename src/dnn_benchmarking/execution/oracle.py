@@ -109,7 +109,7 @@ def run_oracle_pass(
                 host_stats=BenchmarkStats.from_timings(tuned.host_ms),
                 gpu_kernel_stats=BenchmarkStats.from_timings(tuned.kernel_ms),
                 workspace_bytes=(
-                    executor.workspace_size if config.metrics.basic_enabled else None
+                    executor.workspace_size if config.metrics.basic else None
                 ),
                 warm_baseline_host_stats=BenchmarkStats.from_timings(baseline.host_ms),
                 warm_baseline_gpu_kernel_stats=BenchmarkStats.from_timings(

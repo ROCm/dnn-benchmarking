@@ -35,7 +35,7 @@ def _row(
 ) -> ProviderEngineResult:
     stats = _stats(median_ms) if median_ms is not None else None
     return ProviderEngineResult(
-        provider="pytorch" if role == "reference" else "hipdnn",
+        runtime="pytorch" if role == "reference" else "hipdnn",
         engine_id=None if role == "reference" else 0x15B46865C717A122,
         engine_name=None if role == "reference" else name,
         status="success",

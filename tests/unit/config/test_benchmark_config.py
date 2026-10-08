@@ -10,7 +10,7 @@ import pytest
 from dnn_benchmarking.cli.config_file import apply_config_file
 from dnn_benchmarking.cli.parser import create_parser
 from dnn_benchmarking.config import (
-    ExecutionBackendName,
+    RuntimeName,
     OracleMode,
     PyTorchSdpaBackendName,
     SuiteConfig,
@@ -40,7 +40,7 @@ iters = 2
 min_time_ms = 5
 cache_mode = "cold"
 oracle_mode = "plan"
-metrics_tier = "off"
+metrics = false
 rtol = 1e-3
 
 [[engines]]
@@ -63,7 +63,7 @@ id = 1
         assert suite.engine_filter is None  # --plugin-path replaces the matrix
         assert suite.plugin_paths == [Path("/plugins")]
         assert suite.oracle_mode is OracleMode.PLAN
-        assert suite.metrics.basic_enabled is False
+        assert suite.metrics.basic is False
         assert suite.validation.tolerance_override == (1e-3, 1e-3)
 
     def test_default_seed_is_fixed(self) -> None:
@@ -90,9 +90,9 @@ id = 1
         suite = SuiteConfig.from_namespace(_namespace(["-g", "g.json"]))
         assert suite.plugin_paths == [Path("/opt/rocm-x/lib/hipdnn_plugins/engines")]
 
-    def test_pytorch_backend_gets_no_default_plugin_path(self, monkeypatch) -> None:
+    def test_pytorch_runtime_gets_no_default_plugin_path(self, monkeypatch) -> None:
         monkeypatch.setenv("ROCM_PATH", "/opt/rocm-x")
-        suite = SuiteConfig.from_namespace(_namespace(["-b", "pytorch"]))
+        suite = SuiteConfig.from_namespace(_namespace(["-r", "pytorch"]))
         assert suite.plugin_paths is None
 
     def test_pmc_all_with_multipass_reaches_metrics_config(self) -> None:
@@ -107,19 +107,19 @@ id = 1
             (["--plugin-path", "/p"], "--plugin-path"),
             (["--validate", "pytorch"], "--validate pytorch"),
             (["--pmc", "basic"], "--pmc"),
-            (["--emit-trace", "pftrace"], "--emit-trace"),
+            (["--trace"], "--trace"),
             (["--perf"], "--perf"),
             (["--roofline"], "--roofline"),
             (["--oracle-mode", "plan"], "--oracle-mode"),
             (["--autotune"], "--autotune"),
-            (["--cache-dir", "/c"], "--cache-dir"),
+            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
         ],
     )
-    def test_pytorch_backend_rejects_hipdnn_only_options(
+    def test_pytorch_runtime_rejects_hipdnn_only_options(
         self, argv: list[str], flag: str
     ) -> None:
-        args = _namespace(["-b", "pytorch", *argv])
-        with pytest.raises(ValueError, match=f"{flag}.*--backend pytorch"):
+        args = _namespace(["-r", "pytorch", *argv])
+        with pytest.raises(ValueError, match=f"{flag}.*--runtime pytorch"):
             SuiteConfig.from_namespace(args)
 
 
@@ -134,7 +134,7 @@ class TestSuiteConfigValidation:
             ({"timing_block": 0}, "--timing-block"),
             ({"cache_mode": "cold", "timing_block": 2}, "--timing-block"),
             ({"engine_filter": []}, "--engine"),
-            ({"backend": "tensorflow"}, "--backend"),
+            ({"runtime": "tensorflow"}, "--runtime"),
             ({"oracle_mode": "full"}, "--oracle-mode"),
             ({"pytorch_sdpa_backend": "aotriton"}, "--pytorch-sdpa-backend"),
             (
@@ -167,8 +167,8 @@ class TestSuiteConfigValidation:
         )
         assert config.pytorch_sdpa_backend is PyTorchSdpaBackendName.FLASH
 
-    def test_backend_string_is_normalised(self) -> None:
-        assert SuiteConfig(backend="pytorch").backend is ExecutionBackendName.PYTORCH
+    def test_runtime_string_is_normalised(self) -> None:
+        assert SuiteConfig(runtime="pytorch").runtime is RuntimeName.PYTORCH
 
 
 class TestSuiteConfigPluginPaths:

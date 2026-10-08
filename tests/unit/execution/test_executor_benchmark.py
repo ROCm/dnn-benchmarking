@@ -92,7 +92,7 @@ def test_benchmark_times_on_the_handle_stream(hip_log) -> None:
 
     m = executor.benchmark(_Handle(123), {})
 
-    assert m.mode == "staged" and m.backend == "hip"
+    assert m.mode == "staged" and m.timer == "hip"
     assert m.kernel_ms == [0.5, 0.5, 0.5]
     assert hip_log.count("execute") == 2 + 3
     streams = {entry[1] for entry in hip_log if isinstance(entry, tuple)}

@@ -3,8 +3,8 @@
 
 """PyTorch executor and buffer manager on a live GPU (ROCm or CUDA).
 
-The timing backend differs per platform (HIP events on ROCm, torch.cuda
-events on CUDA), so assertions use ``expected_timing_backend()``.
+The timer differs per platform (HIP events on ROCm, torch.cuda
+events on CUDA), so assertions use ``expected_timer()``.
 """
 
 import numpy as np
@@ -14,7 +14,7 @@ from dnn_benchmarking.config import PyTorchSdpaBackendName, TimingPolicy
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.pytorch_buffer_manager import PyTorchCudaBufferManager
 from dnn_benchmarking.execution.pytorch_executor import PyTorchCudaExecutor
-from tests.conftest import expected_timing_backend
+from tests.conftest import expected_timer
 from tests.integration.conftest import load_graph
 
 pytestmark = pytest.mark.gpu
@@ -91,7 +91,7 @@ def test_benchmark_times_every_iteration(
     assert all(t > 0 for t in m.kernel_ms + m.host_ms)
     # The host-sync probe may add one priming enqueue; it is counted honestly.
     assert m.warmup_iters >= policy.warmup_iters
-    assert m.backend == expected_timing_backend()
+    assert m.timer == expected_timer()
     assert m.cache_mode == cache_mode
     assert m.mode == "staged" or m.fallback_reason, m
 

@@ -31,7 +31,7 @@ SUITE_RESULT_SCHEMA_VERSION = 2
 # Keys of run.config / environment that are always emitted (null when the
 # producer did not supply them). Extra producer keys are kept as-is.
 RUN_CONFIG_KEYS = (
-    "backend",
+    "runtime",
     "engine_filter",
     "plugin_paths",
     "warmup_iters",
@@ -45,13 +45,13 @@ RUN_CONFIG_KEYS = (
     "atol",
     "oracle_mode",
     "autotune",
-    "cache_dir",
+    "hipdnn_cache_dir",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
-    "metrics_tier",
+    "metrics",
     "profiling",
 )
-PROFILING_KEYS = ("pmc", "emit_trace", "perf", "roofline")
+PROFILING_KEYS = ("pmc", "trace", "perf", "roofline")
 ENVIRONMENT_KEYS = (
     "hostname",
     "cpu_model",
@@ -88,7 +88,7 @@ ROW_COLUMNS = (
     "gpu_arch",
     "graph_name",
     "graph_id",
-    "provider",
+    "runtime",
     "role",
     "engine_id",
     "engine_name",
@@ -357,19 +357,19 @@ Verdict = Literal["passed", "failed", "unchecked", "reference", "skipped", "erro
 
 @dataclass
 class ProviderEngineResult(PlanResult):
-    """Result for one provider/engine combination on one graph.
+    """Result for one runtime/engine combination on one graph.
 
     The inherited ``PlanResult`` fields describe the OOTB plan (JSON
     ``ootb``).
 
     Attributes:
-        provider: Backend, ``hipdnn`` or ``pytorch``.
+        runtime: Runtime that produced the row, ``hipdnn`` or ``pytorch``.
         engine_id: Engine ID used; None when the row has no hipDNN engine.
         status: One of 'success', 'error', 'skipped'.
         engine_version: Loaded provider plugin version.
         started_at: UTC timestamp immediately before this engine run.
         role: ``engine`` for engine rows, ``reference`` for timed
-            validation-provider rows that are shown for comparison but are not
+            validation reference rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
         plugin_path: Plugin the engine was loaded from.
         elapsed_time_ms: Wall time of the whole row (build, timing,
@@ -399,7 +399,7 @@ class ProviderEngineResult(PlanResult):
     _VALID_STATUSES = {"success", "error", "skipped"}
     _VALID_ROLES = {"engine", "reference"}
 
-    provider: str
+    runtime: str
     engine_id: Optional[int]
     status: Literal["success", "error", "skipped"]
     engine_version: str = "unavailable"
@@ -439,7 +439,7 @@ class ProviderEngineResult(PlanResult):
     @classmethod
     def error_row(
         cls,
-        provider: str,
+        runtime: str,
         engine_id: Optional[int],
         message: str,
         *,
@@ -449,7 +449,7 @@ class ProviderEngineResult(PlanResult):
     ) -> "ProviderEngineResult":
         """Build an ``error`` row carrying only its reason."""
         return cls(
-            provider=provider,
+            runtime=runtime,
             engine_id=engine_id,
             status="error",
             error_message=message,
@@ -461,7 +461,7 @@ class ProviderEngineResult(PlanResult):
     @classmethod
     def skipped_row(
         cls,
-        provider: str,
+        runtime: str,
         engine_id: Optional[int],
         reason: str,
         *,
@@ -471,7 +471,7 @@ class ProviderEngineResult(PlanResult):
     ) -> "ProviderEngineResult":
         """Build a ``skipped`` row carrying only its reason."""
         return cls(
-            provider=provider,
+            runtime=runtime,
             engine_id=engine_id,
             status="skipped",
             skip_reason=reason,
@@ -508,7 +508,7 @@ class ProviderEngineResult(PlanResult):
         their reason).
         """
         return {
-            "provider": self.provider,
+            "runtime": self.runtime,
             "role": self.role,
             "engine": {
                 "id": engine_id_hex(self.engine_id),
@@ -734,7 +734,7 @@ class SuiteResult:
                 rows.append(
                     {
                         **base,
-                        "provider": r["provider"],
+                        "runtime": r["runtime"],
                         "role": r["role"],
                         "engine_id": r["engine"]["id"],
                         "engine_name": r["engine"]["name"],

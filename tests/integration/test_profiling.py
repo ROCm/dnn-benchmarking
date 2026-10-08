@@ -142,10 +142,10 @@ def test_pmc_basic_populates_counters(tmp_path):
 
 
 @pytest.mark.rocprofv3
-def test_emit_trace_pftrace_records_artifact(tmp_path):
+def test_trace_records_pftrace_artifact(tmp_path):
     skip_if_no_gpu_torch()
     _require_rocm_tool("rocprofv3")
-    data = _run_dnn_bench(["--emit-trace", "pftrace"], tmp_path)
+    data = _run_dnn_bench(["--trace", "pftrace"], tmp_path)
     extra = _first_pe_extra(data)
     assert "trace" in extra
     trace = extra["trace"]
@@ -283,7 +283,7 @@ def test_roofline_strict_requires_csv_and_workload(tmp_path):
 def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     """Combined four-source variant of the lenient combined test above.
 
-    Adds ``--emit-trace pftrace`` to the four-source set (the lenient
+    Adds ``--trace`` to the four-source set (the lenient
     version only tests PMC+perf+roofline) and asserts each slice carries
     a real artifact, not a tool-error sentinel. This is the closest the
     test suite gets to a full integration cover.
@@ -295,7 +295,7 @@ def test_combined_strict_includes_trace_and_real_payloads(tmp_path):
     _require_perf_kernel_events()
 
     data = _run_dnn_bench(
-        ["--pmc", "basic", "--emit-trace", "pftrace", "--perf", "--roofline"], tmp_path
+        ["--pmc", "basic", "--trace", "pftrace", "--perf", "--roofline"], tmp_path
     )
     extra = _first_pe_extra(data)
 

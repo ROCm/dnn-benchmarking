@@ -11,16 +11,13 @@ from dnn_benchmarking.config.benchmark_config import MetricsConfig, SuiteConfig
 
 
 def test_off_tier_disables_basic_probes() -> None:
-    assert MetricsConfig(tier="off").basic_enabled is False
-    assert SuiteConfig(metrics=MetricsConfig(tier="off")).metrics.basic_enabled is False
+    assert MetricsConfig(basic=False).basic is False
+    assert SuiteConfig(metrics=MetricsConfig(basic=False)).metrics.basic is False
 
 
 @pytest.mark.parametrize(
     ("kwargs", "flag"),
     [
-        ({"tier": "ultra"}, "--metrics-tier"),
-        ({"emit_trace": "csv"}, "--emit-trace"),
-        ({"emit_trace": ""}, "--emit-trace"),
         ({"pmc_set": "everything"}, "--pmc"),
         ({"pmc_set": " "}, "--pmc"),
         ({"profiling_timeout_s": -1}, "--profiling-timeout"),
@@ -34,7 +31,7 @@ def test_invalid_values_name_the_flag(kwargs: dict, flag: str) -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"emit_trace": "pftrace"},
+        {"trace": True},
         {"pmc_set": "basic"},
         {"perf": True},
         {"roofline": True},

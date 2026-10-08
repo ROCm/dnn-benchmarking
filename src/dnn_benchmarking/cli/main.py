@@ -88,7 +88,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ValueError as e:
         parser.error(str(e))
 
-    # Backend startup (in the suite runner) is the authoritative GPU check;
+    # Runtime startup (in the suite runner) is the authoritative GPU check;
     # optional telemetry tools such as amd-smi are not gated here.
     if args.internal_profiling_run:
         from .internal_profiling import run_internal_profiling

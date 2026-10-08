@@ -95,13 +95,13 @@ dnn-benchmarking finds the engine plugins in
 | Mode | PyTorch | hipDNN and providers | Use |
 |---|---|---|---|
 | `rocm` (default) | ROCm nightly for the detected architecture | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
-| `cuda` | CUDA PyTorch from PyPI, or `--torch-index-url` | Not built. No bindings, no amdsmi, no `ROCM_PATH` | `--backend pytorch` on NVIDIA GPUs. |
+| `cuda` | CUDA PyTorch from PyPI, or `--torch-index-url` | Not built. No bindings, no amdsmi, no `ROCM_PATH` | `--runtime pytorch` on NVIDIA GPUs. |
 | `cpu` | CPU-only PyTorch | Built from source and installed into `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm`. With `--reuse-artifacts`, uses the hipDNN installed there. | CI and `--validate pytorch` with a system ROCm. |
 | `existing` | Keep the PyTorch in the venv | ROCm PyTorch: its SDK libraries. CUDA PyTorch: the `cuda` path. CPU PyTorch: the installed ROCm. | Reuse a venv. |
 | `none` | Not installed | Same as `cpu` | hipDNN backend without PyTorch. |
 
-A CPU-only PyTorch never enables `--backend pytorch`. It is only for
-`--validate pytorch`. `--backend pytorch` needs a ROCm or CUDA build.
+A CPU-only PyTorch never enables `--runtime pytorch`. It is only for
+`--validate pytorch`. `--runtime pytorch` needs a ROCm or CUDA build.
 
 The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
 `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
@@ -118,10 +118,10 @@ python3 setup_env.py --torch-mode cpu --rocm-prefix /opt/rocm --reuse-artifacts
 ```bash
 python3 setup_env.py --torch-mode cuda --workspace .workspace
 source .workspace/.venv/bin/activate
-dnn-benchmark -g 'graphs/*.json' --backend pytorch -o cuda_results.json
+dnn-benchmark -g 'graphs/*.json' --runtime pytorch -o cuda_results.json
 ```
 
-Only `--backend pytorch` works on a CUDA host. Kernel timing uses
+Only `--runtime pytorch` works on a CUDA host. Kernel timing uses
 `torch.cuda` events (`timing.mode = "events"`). In the result file,
 `gpu_arch` is `"unknown"`, `rocm_version` is `null`, and `cuda_version` and
 `cudnn_version` are set. Use `dnn-benchmark compare` to compare the file

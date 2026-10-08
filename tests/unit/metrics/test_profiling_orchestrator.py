@@ -61,16 +61,14 @@ class TestCheckRequestedTools:
             assert orch.check_requested_tools(MetricsConfig()) == []
 
     def test_reports_each_missing_tool_once(self):
-        cfg = MetricsConfig(
-            pmc_set="basic", emit_trace="pftrace", perf=True, roofline=True
-        )
+        cfg = MetricsConfig(pmc_set="basic", trace=True, perf=True, roofline=True)
         with (
             patch.object(orch, "resolve_rocm_tool", return_value=None),
             patch.object(orch._perf_mod, "_resolve_perf", return_value=None),
         ):
             missing = orch.check_requested_tools(cfg)
         assert len(missing) == 3
-        assert "--pmc/--emit-trace" in missing[0] and "rocprofv3" in missing[0]
+        assert "--pmc/--trace" in missing[0] and "rocprofv3" in missing[0]
         assert "--perf" in missing[1]
         assert "--roofline" in missing[2] and "rocprof-compute" in missing[2]
 
@@ -266,9 +264,7 @@ class TestDispatch:
         assert result == {}
 
     def test_dispatches_each_requested_source(self, tmp_path):
-        cfg = MetricsConfig(
-            pmc_set="basic", emit_trace="pftrace", perf=True, roofline=True
-        )
+        cfg = MetricsConfig(pmc_set="basic", trace=True, perf=True, roofline=True)
         with (
             patch.object(
                 orch._pmc_mod, "run", return_value={"pmc": {"ok": True}}
@@ -345,7 +341,7 @@ class TestDispatch:
         """
         cfg = MetricsConfig(
             pmc_set="basic",
-            emit_trace="pftrace",
+            trace=True,
             perf=True,
             roofline=True,
             profiling_timeout_s=1234,
@@ -380,7 +376,7 @@ class TestDispatch:
         assert captured == {"pmc": 1234, "trace": 1234, "perf": 1234, "roofline": 1234}
 
     def test_subdir_per_source_is_created(self, tmp_path):
-        cfg = MetricsConfig(pmc_set="basic", emit_trace="pftrace")
+        cfg = MetricsConfig(pmc_set="basic", trace=True)
         captured = {}
 
         def fake_pmc(inner_argv, out_dir, **kwargs):

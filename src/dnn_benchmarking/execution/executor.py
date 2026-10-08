@@ -363,7 +363,7 @@ class Executor:
                 lambda: self.enqueue(handle, variant_pack),
                 stream=stream,
                 policy=self._policy,
-                backend="hip",
+                timer="hip",
             )
         except StallFallbackError:
             raise

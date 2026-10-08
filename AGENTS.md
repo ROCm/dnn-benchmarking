@@ -10,8 +10,8 @@ loads JSON-serialized hipDNN graphs, runs them through hipDNN engine plugins,
 measures each engine, and optionally compares the outputs with a PyTorch
 reference.
 
-`--backend pytorch` runs the same graphs through PyTorch on ROCm or CUDA. Both
-backends share the suite path, the timed loop (`execution/timing.measure`)
+`--runtime pytorch` runs the same graphs through PyTorch on ROCm or CUDA. Both
+runtimes share the suite path, the timed loop (`execution/timing.measure`)
 and the result schema. A CUDA host without hipDNN can thus produce a result
 file that `dnn-benchmark compare` can compare with a ROCm result. The package
 stays importable without `hipdnn_frontend`: every hipDNN import is lazy. The
@@ -33,7 +33,7 @@ option, a result key, the timing method or an exit code.
 
 ```bash
 python3 setup_env.py --workspace .workspace     # ROCm host: venv, ROCm torch, hipDNN, plugins
-python3 setup_env.py --torch-mode cuda          # CUDA host: PyTorch backend only
+python3 setup_env.py --torch-mode cuda          # CUDA host: PyTorch runtime only
 pip install -e ".[test]"                         # package only, into an existing env
 source .workspace/.venv/bin/activate             # sets ROCM_PATH and LD_LIBRARY_PATH
 ```
@@ -46,7 +46,7 @@ Each worktree keeps its own `.workspace/` (or `build/`) and `.venv`.
 dnn-benchmark -g graphs/sample_conv_fwd.json                  # all engines, summary table
 dnn-benchmark -g graphs/sample_conv_fwd.json -e MIOPEN_ENGINE -v
 dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
-dnn-benchmark -g graphs/sample_conv_fwd.json --backend pytorch
+dnn-benchmark -g graphs/sample_conv_fwd.json --runtime pytorch
 dnn-benchmark compare base.json new.json
 ```
 
@@ -58,8 +58,8 @@ package, run `PYTHONPATH=src python -m dnn_benchmarking ...`.
 | Code | Meaning |
 |---|---|
 | 0 | Success. An all-skipped run is also 0. |
-| 1 | Engine row error, graph error, failed final result write (not a periodic one), no graph files, or backend not available at startup. |
-| 2 | Usage error: argparse, config file, backend-incompatible option, unknown `--engine`, unwritable `-o` or `--profiling-output-dir`, missing profiler tool. |
+| 1 | Engine row error, graph error, failed final result write (not a periodic one), no graph files, or runtime not available at startup. |
+| 2 | Usage error: argparse, config file, runtime-incompatible option, unknown `--engine`, unwritable `-o` or `--profiling-output-dir`, missing profiler tool. |
 | 3 | At least one engine row failed validation. 3 wins over 1, and 1 wins over 0. Only `role == "engine"` rows count, as in `summary()`. |
 | 130 / 143 | SIGINT / SIGTERM. The result file is partial (`run.complete = false`). |
 
@@ -75,7 +75,7 @@ src/dnn_benchmarking/
 │   ├── parser.py             # CLI_OPTIONS: one table for flags, defaults, config keys
 │   ├── config_file.py        # TOML recipe merge (defaults < config < CLI)
 │   ├── suite_runner_cli.py   # startup checks, per-graph loop, result writes, exit codes
-│   ├── backends.py           # backend startup; returns the per-graph runner
+│   ├── runtimes.py           # runtime startup; returns the per-graph runner
 │   └── internal_profiling.py # hidden --internal-profiling-run child
 ├── common/                   # exceptions, dtypes registry, torch/ROCm runtime helpers
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
@@ -106,14 +106,14 @@ src/dnn_benchmarking/
 └── validation/               # reference providers and tolerance comparison
 ```
 
-Data flow (hipDNN): CLI -> `SuiteConfig` -> `backends.start_backend` -> for
+Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
 each graph: `GraphLoader` -> `suite_runner.run_graph_all_providers` ->
 `Executor` + `BufferManager` -> `timing.measure` -> correctness, oracle,
 profiling -> `GraphResult` -> `Reporter` and `SuiteResult.write`.
 
-Data flow (PyTorch): the same, with `run_graph_pytorch_backend`,
+Data flow (PyTorch): the same, with `run_graph_pytorch`,
 `PyTorchCudaExecutor` and `PyTorchCudaBufferManager`. One
-`provider = "pytorch"` row per graph. No engine discovery or plugins.
+`runtime = "pytorch"` row per graph. No engine discovery or plugins.
 
 Rules that keep the design intact:
 
@@ -135,7 +135,7 @@ Rules that keep the design intact:
 | Tier | Location / marker | Needs |
 |---|---|---|
 | Unit | `tests/unit/`, no marker | Any host. Fake torch. No GPU. |
-| GPU-generic | `gpu` | Any live GPU (ROCm or CUDA). `expected_timing_backend()` adapts the assertions. ROCm-only tests skip through the `hipdnn` and `plugin_paths` fixtures. |
+| GPU-generic | `gpu` | Any live GPU (ROCm or CUDA). `expected_timer()` adapts the assertions. ROCm-only tests skip through the `hipdnn` and `plugin_paths` fixtures. |
 | CUDA-only | `gpu` + `cuda` | A CUDA PyTorch build and GPU. |
 | Profiling | `rocprofv3`, `perf`, `rocprof_compute` | The profiler binary. See `docs/troubleshooting.md`. |
 | Strict profiling | `profiling_strict` | Real profiler artefacts. Runs only with `--profiling-strict`. |
@@ -157,7 +157,7 @@ on any host. The `-ra` in pyproject.toml prints the reason of every skip;
 read them on a GPU host. GPU tests need the ROCm libraries on
 `LD_LIBRARY_PATH`; the `setup_env.py` activation script sets it. The
 integration fixture `hipdnn` needs only `hipdnn_frontend` and a HIP device;
-request `torch_gpu` too only in tests that use PyTorch (`--backend pytorch`,
+request `torch_gpu` too only in tests that use PyTorch (`--runtime pytorch`,
 `--validate pytorch`).
 
 Test rules:

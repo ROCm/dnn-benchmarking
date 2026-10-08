@@ -35,12 +35,12 @@ def test_default_stays_on_the_heuristic_path() -> None:
 
 def test_autotune_without_cache_dir_is_a_hazard() -> None:
     [warning] = _warnings(autotune=True)
-    assert "--cache-dir" in warning
+    assert "--hipdnn-cache-dir" in warning
     assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
 def test_autotune_with_cache_dir_is_isolated() -> None:
-    lines = _lines(autotune=True, cache_dir="/tmp/phase-x")
+    lines = _lines(autotune=True, hipdnn_cache_dir="/tmp/phase-x")
     assert [line for line in lines if line.startswith("WARNING")] == []
     assert any("kernel selection: autotune;" in line for line in lines)
     assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
@@ -61,15 +61,15 @@ def test_leaked_force_benchmarking(monkeypatch, value, warned) -> None:
     assert any(f"kernel selection: {path};" in line for line in lines)
 
 
-def test_pytorch_backend_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) -> None:
+def test_pytorch_runtime_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) -> None:
     applied = []
     monkeypatch.setattr(
         suite_runner_cli, "_apply_tuning_environment", lambda c, r: applied.append(c)
     )
     monkeypatch.setattr(suite_runner_cli, "collect_environment_info", lambda: {})
-    monkeypatch.setattr(suite_runner_cli, "start_backend", lambda c, r: lambda *a: None)
+    monkeypatch.setattr(suite_runner_cli, "start_runtime", lambda c, r: lambda *a: None)
 
-    args = create_parser(suppress_defaults=True).parse_args(["-b", "pytorch"])
+    args = create_parser(suppress_defaults=True).parse_args(["-r", "pytorch"])
     apply_config_file(args)
     suite_runner_cli.run_suite_cli(args, [], Reporter(output=io.StringIO()))
     assert applied == []

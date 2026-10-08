@@ -23,12 +23,12 @@ from dnn_benchmarking.reporting.suite_results import (
 TOP_KEYS = {"schema_version", "tool", "run", "environment", "summary", "graphs"}
 RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
-    "backend", "engine_filter", "plugin_paths", "warmup_iters", "iters",
+    "runtime", "engine_filter", "plugin_paths", "warmup_iters", "iters",
     "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
-    "oracle_mode", "autotune", "cache_dir", "pytorch_sdpa_backend",
-    "pytorch_rocm_fa_library", "metrics_tier", "profiling",
+    "oracle_mode", "autotune", "hipdnn_cache_dir", "pytorch_sdpa_backend",
+    "pytorch_rocm_fa_library", "metrics", "profiling",
 }  # fmt: skip
-PROFILING_KEYS = {"pmc", "emit_trace", "perf", "roofline"}
+PROFILING_KEYS = {"pmc", "trace", "perf", "roofline"}
 ENV_KEYS = {
     "hostname", "cpu_model", "cpu_count", "numa_nodes", "total_ram_gb",
     "kernel_version", "gpu_model", "gpu_arch", "gpu_compute_units", "gpu_hbm_gb",
@@ -57,7 +57,7 @@ GRAPH_KEYS = {
     "results",
 }
 ROW_KEYS = {
-    "provider", "role", "engine", "status", "verdict", "message", "started_at",
+    "runtime", "role", "engine", "status", "verdict", "message", "started_at",
     "elapsed_s", "metrics", "ootb", "oracle", "oracle_error", "warnings",
     "extra_metrics",
 }  # fmt: skip
@@ -74,7 +74,7 @@ STATS_KEYS = {
     "p95_ms", "max_ms", "iqr_ms",
 }  # fmt: skip
 TIMING_KEYS = {
-    "mode", "backend", "cache_mode", "warmup_iters", "first_call_ms", "capped",
+    "mode", "timer", "cache_mode", "warmup_iters", "first_call_ms", "capped",
     "fallback_reason", "timing_block",
 }  # fmt: skip
 CORRECTNESS_KEYS = {
@@ -126,7 +126,7 @@ def full_suite() -> SuiteResult:
     """Every optional field populated, one row per status."""
     oracle = _oracle()
     row = ProviderEngineResult(
-        provider="hipdnn",
+        runtime="hipdnn",
         engine_id=0x15B46865C717A122,
         engine_name="MIOPEN_ENGINE",
         status="success",
@@ -295,7 +295,7 @@ def test_full_row_values() -> None:
         "build_ms": 7.0,
         "timing": {
             "mode": "events",
-            "backend": "hip",
+            "timer": "hip",
             "cache_mode": "cold",
             "warmup_iters": 11,
             "first_call_ms": 13.5,

@@ -14,10 +14,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
-    EMIT_TRACE_CHOICES,
-    ExecutionBackendName,
+    RuntimeName,
     MetricsConfig,
-    MetricsTier,
     OracleMode,
     PMC_SET_CHOICES,
     PyTorchSdpaBackendName,
@@ -271,7 +269,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Run",
         CACHE_MODE_CHOICES,
         _default(SuiteConfig, "cache_mode"),
-        "warm reuses caches; cold flushes L2/MALL before each timed iteration",
+        "GPU L2/MALL: warm keeps them; cold flushes them before each timed iteration",
     ),
     CliOption(
         flags=("--timing-block",),
@@ -297,19 +295,19 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_kind=ConfigKind.SCALAR,
         config_type=int,
     ),
-    # Backend/Selection
+    # Runtime/Selection
     _choice_option(
-        ("--backend", "-b"),
-        "backend",
-        "Backend/Selection",
-        _values(ExecutionBackendName),
-        _default(SuiteConfig, "backend"),
+        ("--runtime", "-r"),
+        "runtime",
+        "Runtime/Selection",
+        _values(RuntimeName),
+        _default(SuiteConfig, "runtime"),
         "hipdnn runs engine plugins; pytorch runs the graph through PyTorch",
     ),
     CliOption(
         flags=("--engine", "-e"),
         dest="engine",
-        group="Backend/Selection",
+        group="Runtime/Selection",
         parser_type=_parse_engine_list,
         default=_default(SuiteConfig, "engine_filter"),
         metavar="ENGINES",
@@ -319,7 +317,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
         flags=("--plugin-path",),
         dest="plugin_path",
-        group="Backend/Selection",
+        group="Runtime/Selection",
         parser_type=_parse_plugin_path_list,
         metavar="PATHS",
         help="plugin dir, or comma list matching --engine order "
@@ -330,26 +328,26 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
     _bool_option(
         ("--autotune",),
         "autotune",
-        "Backend/Selection",
+        "Runtime/Selection",
         SuiteConfig,
         "autotune",
         "benchmark candidate kernels on first execute and cache the winner "
-        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --cache-dir",
+        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --hipdnn-cache-dir",
     ),
     CliOption(
-        flags=("--cache-dir",),
-        dest="cache_dir",
-        group="Backend/Selection",
+        flags=("--hipdnn-cache-dir",),
+        dest="hipdnn_cache_dir",
+        group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
         help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
-        config_key="cache_dir",
+        config_key="hipdnn_cache_dir",
         config_kind=ConfigKind.PATH,
     ),
     _choice_option(
         ("--pytorch-sdpa-backend",),
         "pytorch_sdpa_backend",
-        "Backend/Selection",
+        "Runtime/Selection",
         _values(PyTorchSdpaBackendName),
         _default(SuiteConfig, "pytorch_sdpa_backend"),
         "PyTorch SDPA category; non-default categories are strict (no fallback)",
@@ -357,7 +355,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
     CliOption(
         flags=("--pytorch-rocm-fa-library",),
         dest="pytorch_rocm_fa_library",
-        group="Backend/Selection",
+        group="Runtime/Selection",
         parser_type=str,
         default=_default(SuiteConfig, "pytorch_rocm_fa_library"),
         metavar="LIBRARY",
@@ -374,7 +372,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Validation",
         _values(ReferenceProviderName),
         _default(ValidationConfig, "provider"),
-        "reference provider for correctness checks; pytorch adds a timed "
+        "reference runtime for correctness checks; pytorch adds a timed "
         "reference row",
     ),
     CliOption(
@@ -440,14 +438,14 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "quiet",
         "suppress progress lines; tables and the summary still print",
     ),
-    _choice_option(
-        ("--metrics-tier",),
-        "metrics_tier",
+    _bool_option(
+        ("--metrics",),
+        "metrics",
         "Output",
-        _values(MetricsTier),
-        _default(MetricsConfig, "tier"),
-        "basic adds FLOPs/IO, workspace, host and GPU snapshots at no timing "
-        "cost; off disables them",
+        MetricsConfig,
+        "basic",
+        "FLOPs/IO, workspace, host and GPU snapshots at no timing cost "
+        "(default: on)",
     ),
     # Profiling
     _choice_option(
@@ -467,14 +465,13 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "pmc_allow_multipass",
         "allow --pmc all (multi-pass replay; can hang for minutes)",
     ),
-    _choice_option(
-        ("--emit-trace",),
-        "emit_trace",
+    _bool_option(
+        ("--trace",),
+        "trace",
         "Profiling",
-        EMIT_TRACE_CHOICES,
-        _default(MetricsConfig, "emit_trace"),
+        MetricsConfig,
+        "trace",
         "re-run under rocprofv3 and write a Perfetto kernel/memcpy trace",
-        optional=True,
     ),
     _bool_option(
         ("--perf",),
@@ -534,7 +531,7 @@ examples:
   dnn-benchmark -g graphs/sample_conv_fwd.json -e MIOPEN_ENGINE,MIOPEN_ENGINE \\
       --plugin-path /path/to/build_a/engines,/path/to/build_b/engines
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
-  dnn-benchmark -g graphs/sample_sdpa.json --backend pytorch --pytorch-sdpa-backend flash
+  dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
 engines:

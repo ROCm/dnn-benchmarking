@@ -32,7 +32,7 @@ a run; the table is what it is checking and how to close each gap.
 
 | Source | Needs | Provided by |
 | --- | --- | --- |
-| `--pmc`, `--emit-trace pftrace` | `rocprofv3` from the **same** ROCm as torch | The rocm-sdk wheels. Never mix a system `/opt/rocm` profiler with wheel-ROCm torch: the profiler injects the system LLVM runtime and the workload dies loading `libamd_comgr.so.3` |
+| `--pmc`, `--trace` | `rocprofv3` from the **same** ROCm as torch | The rocm-sdk wheels. Never mix a system `/opt/rocm` profiler with wheel-ROCm torch: the profiler injects the system LLVM runtime and the workload dies loading `libamd_comgr.so.3` |
 | `--perf` | a **runnable** `perf`, and either `/proc/sys/kernel/perf_event_paranoid <= 1` or `CAP_PERFMON`/`CAP_SYS_ADMIN` for kernel events | Host, not the venv: `apt install linux-tools-$(uname -r)`. Distro `perf` is a wrapper that exits 2 when no linux-tools matches the running kernel — routine in a container. When that happens the run falls back to an installed build from `/usr/lib/linux-tools*` and records `binary` + `binary_substituted` in the slice, so counters from a foreign-kernel perf are always labelled as such. The paranoid sysctl is not namespaced, so a container reads the host's value; a root/privileged container bypasses it by capability and still records `cycles:k` |
 | `--roofline` | `rocprof-compute` **paired with the ROCm whose `rocprofv3` it drives** | The `rocprofiler-compute` system package. Deliberately absent from the wheel-only Docker image: pulling it in means adding a second ROCm install, which is the mismatch above. A hand-installed copy is not a shortcut — rocprofiler-compute 3.3.0 against ROCm 7.15 dies on `$ROCM_PATH/share/rocprofiler-sdk/counter_defs.yaml`, which that ROCm does not ship. Note it also clears the whole `-p` directory it is given, so never point it at a directory holding other artefacts |
 
@@ -48,7 +48,7 @@ raises an exception, the row keeps its timed values and gets the warning
 ## Profiling integration tests
 
 The profiling smoke tests in `tests/integration/test_profiling.py`
-(`--pmc`, `--emit-trace`, `--perf`, `--roofline`) plus the combined
+(`--pmc`, `--trace`, `--perf`, `--roofline`) plus the combined
 `test_combined_pmc_perf_roofline_merge_into_one_extra_metrics` are
 **double-gated**: each carries a pytest marker (`rocprofv3`, `perf`, or
 `rocprof_compute`) AND an inline binary/host probe that calls
@@ -116,7 +116,7 @@ python -m dnn_benchmarking --profiling-timeout 0 ...
 ```
 
 The budget applies *per subprocess*, not per suite — a four-source
-`--pmc basic --emit-trace pftrace --perf --roofline` invocation can
+`--pmc basic --trace --perf --roofline` invocation can
 spend up to 4 × the budget under the worst case.
 
 ### Profiling VRAM headroom
@@ -216,7 +216,7 @@ the post-hoc render can switch:
 rocprof-compute analyze --path <workload_path> --roofline-data-type FP16
 ```
 
-### Kernel + memcpy trace (`--emit-trace pftrace`)
+### Kernel + memcpy trace (`--trace`)
 
 The `path` field under `extra_metrics["trace"]` points to the generated
 `.pftrace` file. Open it at:

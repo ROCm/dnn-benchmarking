@@ -43,15 +43,15 @@ the same output format.
 
 [methodology.md](methodology.md) explains each value.
 
-### Backend/Selection
+### Runtime/Selection
 
 | Option | Default | Description |
 |---|---|---|
-| `-b`, `--backend {hipdnn,pytorch}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). |
+| `-r`, `--runtime {hipdnn,pytorch}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
-| `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--cache-dir`. |
-| `--cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
+| `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
+| `--hipdnn-cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
@@ -93,7 +93,7 @@ log2 values of e8m0 outputs. The source is `TOLERANCES` in
 | `-o`, `--output PATH` | none | Write the results to `PATH`: CSV when `PATH` ends in `.csv`, else JSON. See [results-schema.md](results-schema.md). |
 | `-v`, `--verbose`, `--no-verbose` | off | Add a detail block for each engine below each table. |
 | `-q`, `--quiet`, `--no-quiet` | off | Do not show progress lines and info messages. Tables, the summary, warnings and errors still show. |
-| `--metrics-tier {basic,off}` | basic | `basic` adds FLOPs, I/O bytes, TFLOP/s, GB/s, workspace, VRAM and GPU clocks. They do not change the timed numbers. `off` disables them. |
+| `--metrics`, `--no-metrics` | on | Adds FLOPs, I/O bytes, TFLOP/s, GB/s, workspace, VRAM and GPU clocks. They do not change the timed numbers. `--no-metrics` disables them. |
 
 ### Profiling
 
@@ -104,7 +104,7 @@ profiler, after the timed row completes. The timed numbers do not change.
 |---|---|---|
 | `--pmc {basic,memory,flops,all}` | off | Collect hardware counters with `rocprofv3` (about 30 % extra wall time). `all` requires `--pmc-allow-multipass`. |
 | `--pmc-allow-multipass`, `--no-pmc-allow-multipass` | off | Allow `--pmc all`. Multi-pass replay can hang for minutes. |
-| `--emit-trace {pftrace}` | off | Write a Perfetto kernel and memcpy trace with `rocprofv3`. |
+| `--trace`, `--no-trace` | off | Write a Perfetto kernel and memcpy trace with `rocprofv3`. |
 | `--perf`, `--no-perf` | off | Collect CPU cycles, instructions and IPC with `perf stat`. |
 | `--roofline`, `--no-roofline` | off | Collect HBM and compute ceilings with `rocprof-compute --roof-only` (about 3 extra runs). |
 | `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. With a profiling flag, the tool checks at startup that it can create files there. Without one, the option has no effect and the tool shows a warning. |
@@ -144,23 +144,23 @@ To list the engine names and IDs of a plugin directory, run
 
 The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 
-## PyTorch backend
+## PyTorch runtime
 
-`--backend pytorch` runs each graph through PyTorch and gives one
-`provider = "pytorch"` row per graph. It uses the same timed loop, output
+`--runtime pytorch` runs each graph through PyTorch and gives one
+`runtime = "pytorch"` row per graph. It uses the same timed loop, output
 format and result schema as the hipDNN backend. It runs on ROCm and on CUDA.
 
-These options are hipDNN-only. With `--backend pytorch` they stop the run
+These options are hipDNN-only. With `--runtime pytorch` they stop the run
 with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`, `--pmc`,
-`--emit-trace`, `--perf`, `--roofline`, `--oracle-mode` (other than `off`),
-`--autotune` and `--cache-dir`.
+`--trace`, `--perf`, `--roofline`, `--oracle-mode` (other than `off`),
+`--autotune` and `--hipdnn-cache-dir`.
 
 The SDPA options (`--pytorch-sdpa-backend`, `--pytorch-rocm-fa-library`) have
-an effect only with `--backend pytorch` or `--validate pytorch`. Otherwise
+an effect only with `--runtime pytorch` or `--validate pytorch`. Otherwise
 the tool shows a warning.
 
 ```bash
-dnn-benchmark -g graphs/sample_sdpa.json --backend pytorch \
+dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch \
   --pytorch-sdpa-backend flash --pytorch-rocm-fa-library aotriton
 ```
 
@@ -169,7 +169,7 @@ dnn-benchmark -g graphs/sample_sdpa.json --backend pytorch \
 can use a different Flash implementation when the preferred one does not
 support an input.
 
-## Kernel selection (`--autotune`, `--cache-dir`)
+## Kernel selection (`--autotune`, `--hipdnn-cache-dir`)
 
 A hipDNN engine selects a kernel in one of two ways:
 
@@ -185,16 +185,16 @@ This is an info line, so `-q` hides it.
 
 The winner cache is on disk. Its key is the graph content and the device, not
 the checkout or the session. Thus a run can report a ranking that an earlier
-or a concurrent run tuned. Give each phase its own empty `--cache-dir`:
+or a concurrent run tuned. Give each phase its own empty `--hipdnn-cache-dir`:
 
 ```bash
-dnn-benchmark -g 'graphs/*.json' --cache-dir /tmp/cache-heuristic
-dnn-benchmark -g 'graphs/*.json' --autotune --cache-dir /tmp/cache-tuned
+dnn-benchmark -g 'graphs/*.json' --hipdnn-cache-dir /tmp/cache-heuristic
+dnn-benchmark -g 'graphs/*.json' --autotune --hipdnn-cache-dir /tmp/cache-tuned
 ```
 
 The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
 value in the environment without `--autotune`, and when `--autotune` has no
-`--cache-dir`.
+`--hipdnn-cache-dir`.
 
 ## Oracle mode
 
@@ -343,8 +343,8 @@ with code 143 without it. The file then holds the last periodic write.
 | Code | Meaning |
 |---|---|
 | 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
-| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a backend that is not available at startup (hipDNN, PyTorch or the reference provider). |
-| 2 | Usage error: a bad flag, a bad config file, an option that the backend does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
+| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a runtime that is not available at startup (hipDNN, PyTorch or the reference provider). |
+| 2 | Usage error: a bad flag, a bad config file, an option that the runtime does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
 | 143 | Interrupted by SIGTERM. On Linux the run ends within 30 seconds, also when it is blocked in GPU code. |
@@ -410,7 +410,7 @@ dnn-benchmark -g 'graphs/*.json' -o new.json
 dnn-benchmark compare base.json new.json
 ```
 
-To compare a ROCm host with a CUDA host, run `--backend pytorch -o` on each
+To compare a ROCm host with a CUDA host, run `--runtime pytorch -o` on each
 host, then compare the two files on one host.
 
 ## Profiling

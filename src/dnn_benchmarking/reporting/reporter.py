@@ -100,7 +100,7 @@ def _fmt_mib(mib: float) -> str:
 
 
 def _display_name(pe: ProviderEngineResult) -> str:
-    return pe.engine_name or pe.provider
+    return pe.engine_name or pe.runtime
 
 
 def _reason(pe: ProviderEngineResult) -> Optional[str]:
@@ -302,7 +302,7 @@ class Reporter:
             f"Timing:  warmup {rc['warmup_iters']}, iters {rc['iters']} "
             f"(min-time {rc['min_time_ms']:g} ms), cache {rc['cache_mode']}, "
             + (f"block {block} launches/sample, " if block > 1 else "")
-            + f"seed {rc['seed']}, backend {rc['backend']}"
+            + f"seed {rc['seed']}, runtime {rc['runtime']}"
         )
         self._print()
 
@@ -551,9 +551,7 @@ class Reporter:
             add("cost", ", ".join(costs))
         if pe.timing is not None:
             t = pe.timing
-            text = (
-                f"{t.mode}/{t.backend}, cache {t.cache_mode}, warmup {t.warmup_iters}"
-            )
+            text = f"{t.mode}/{t.timer}, cache {t.cache_mode}, warmup {t.warmup_iters}"
             if t.capped:
                 text += ", capped at max iters"
             if t.fallback_reason:

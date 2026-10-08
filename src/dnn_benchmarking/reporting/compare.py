@@ -88,7 +88,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _engine_label(row: Dict[str, Any]) -> str:
     e = row["engine"]
-    return e["name"] or e["id"] or row["provider"]
+    return e["name"] or e["id"] or row["runtime"]
 
 
 def _stat(row: Dict[str, Any], metric: str) -> Tuple[Optional[float], Optional[float]]:
@@ -119,7 +119,7 @@ def _keyed(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
     seen: Dict[Tuple[Any, ...], int] = {}
     out = {}
     for r in rows:
-        k = (r["role"], r["provider"], r["engine"]["id"], r["engine"]["name"])
+        k = (r["role"], r["runtime"], r["engine"]["id"], r["engine"]["name"])
         seen[k] = seen.get(k, -1) + 1
         out[k + (seen[k],)] = r
     return out
@@ -250,7 +250,7 @@ def _describe(label: str, path: str, doc: Dict[str, Any]) -> str:
     env, cfg = doc["environment"], doc["run"]["config"]
     return (
         f"{label}: {path}  {env.get('gpu_model') or '?'} {env.get('gpu_arch') or '?'}"
-        f"  backend={cfg.get('backend')} cache={cfg.get('cache_mode')}"
+        f"  runtime={cfg.get('runtime')} cache={cfg.get('cache_mode')}"
     )
 
 

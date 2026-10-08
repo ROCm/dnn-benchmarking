@@ -23,8 +23,8 @@ cache_mode = "warm"  # "warm" or "cold" (flush L2/MALL before each timed iterati
 timing_block = 1     # launches per timed sample; N > 1 = rocKE block timing (warm cache only)
 seed = 0             # random seed for input data
 
-# --- Backend / selection -----------------------------------------------------
-backend = "hipdnn"   # "hipdnn" or "pytorch"
+# --- Runtime / selection -----------------------------------------------------
+runtime = "hipdnn"   # "hipdnn" or "pytorch"
 
 # Plugin directory, or a list matching the [[engines]] order. setup_env.py
 # prints the selected prefix; defaults to $ROCM_PATH/lib/hipdnn_plugins/engines
@@ -32,7 +32,7 @@ backend = "hipdnn"   # "hipdnn" or "pytorch"
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
 autotune = false     # benchmark candidate kernels and cache the winner
-# cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # per-run HIPDNN_CACHE_DIR
+# hipdnn_cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # per-run HIPDNN_CACHE_DIR
 
 pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
 # pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"
@@ -52,12 +52,12 @@ oracle_mode = "off"  # "off", "plan" or "exhaustive"
 output = "/tmp/dnn-benchmark-results.json"  # .csv writes CSV
 verbose = false
 quiet = false
-metrics_tier = "basic"  # "basic" or "off"
+metrics = true       # FLOPs/IO, workspace, host and GPU snapshots
 
 # --- Profiling (each enabled pass re-runs the workload under a tool) ---------
 # pmc = "basic"         # "basic", "memory", "flops" or "all"
 pmc_allow_multipass = false  # required for pmc = "all"
-# emit_trace = "pftrace"
+trace = false        # Perfetto kernel/memcpy trace
 perf = false
 roofline = false
 # profiling_output_dir = "/tmp/dnn-benchmark-profiling"

@@ -217,7 +217,7 @@ def test_rocm_benchmark_is_staged_on_the_torch_stream(
 
     m = executor.benchmark({1: "x"})
 
-    assert (m.mode, m.backend) == ("staged", "hip")
+    assert (m.mode, m.timer) == ("staged", "hip")
     assert m.kernel_ms == [1.0, 1.0]
     hip_streams = {e[1] for e in fake_cuda.log if e[0] in ("hip_record", "arm")}
     assert hip_streams == {0xCAFE}
@@ -275,7 +275,7 @@ def test_times_with_torch_events_without_a_shared_hip_runtime(
 
     m = executor.benchmark({})
 
-    assert (m.mode, m.backend) == ("events", "torch")
+    assert (m.mode, m.timer) == ("events", "torch")
     assert m.kernel_ms == [2.0, 2.0]
     assert m.fallback_reason
     recorded = {e[1] for e in fake_cuda.log if isinstance(e, tuple)}

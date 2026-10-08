@@ -48,25 +48,25 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 | Key | Type | Meaning |
 |---|---|---|
-| `backend` | string | `hipdnn` or `pytorch`. |
+| `runtime` | string | `hipdnn` or `pytorch`. |
 | `engine_filter` | array of string or null | `--engine` selections as hex engine IDs (same format as `engine.id`). `null` means all discovered engines. |
-| `plugin_paths` | array of string or null | Plugin directories. `null` for `--backend pytorch`. |
+| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. |
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
 | `cache_mode` | string | `warm` or `cold`. |
 | `timing_block` | int | `--timing-block`. `1` = one launch per sample; `N > 1` = rocKE block timing. |
 | `seed` | int | Input data seed. |
-| `validate` | string or null | Reference provider (`pytorch`), or `null` when validation is off. |
+| `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle_mode` | string | `off`, `plan` or `exhaustive`. |
 | `autotune` | bool | `--autotune`. |
-| `cache_dir` | string or null | `--cache-dir`. |
-| `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--backend pytorch` or `--validate pytorch`. |
+| `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
+| `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
-| `metrics_tier` | string | `basic` or `off`. |
-| `profiling` | object | Requested profiling passes: `pmc` (set name or null), `emit_trace` (`pftrace` or null), `perf` (bool), `roofline` (bool). |
+| `metrics` | bool | `--metrics`: the always-on probes ran. |
+| `profiling` | object | Requested profiling passes: `pmc` (set name or null), `trace` (bool), `perf` (bool), `roofline` (bool). |
 
 ## environment
 
@@ -81,7 +81,7 @@ collected at suite end.
 | `numa_nodes` | int | NUMA nodes in `/sys/devices/system/node`. |
 | `total_ram_gb` | float | Host RAM, GiB. |
 | `kernel_version` | string | Linux kernel release. |
-| `gpu_model` | string | GPU name: from PyTorch when the process has already imported it (PyTorch backend), else amdsmi `market_name`, else the `Marketing Name` from `rocminfo`. |
+| `gpu_model` | string | GPU name: from PyTorch when the process has already imported it (PyTorch runtime), else amdsmi `market_name`, else the `Marketing Name` from `rocminfo`. |
 | `gpu_arch` | string | gfx target (for example `gfx90a`). `"unknown"` when no AMD GPU is found, for example on a CUDA host. |
 | `gpu_compute_units` | int | Compute units, from amdsmi, or from PyTorch when the process has already imported it. |
 | `gpu_hbm_gb` | float | Device memory, GiB. |
@@ -127,7 +127,7 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
 | `error` | string or null | Graph-level failure, as `ExceptionType: message`. A failure before any row runs has the prefix `Engine discovery failed: ` or `Input data generation failed: `. |
 | `message` | string or null | Why no engine applies, when `status` is `no_engines`: hipDNN's reason, or the unsupported tensor data type. The console shows `no engines applicable: <message>`. |
-| `results` | array | One [row](#row) per engine or provider. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. |
+| `results` | array | One [row](#row) per engine or reference. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. |
 
 ### graph_id
 
@@ -145,7 +145,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `provider` | string | `hipdnn` or `pytorch`. |
+| `runtime` | string | Runtime that produced the row: `hipdnn` or `pytorch`. |
 | `role` | string | `engine` for a benchmarked engine. `reference` for the timed reference row that `--validate pytorch` adds. |
 | `engine` | object | See [engine](#engine). |
 | `status` | string | `success`, `error` or `skipped`. |
@@ -195,7 +195,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | Key | Type | Meaning |
 |---|---|---|
 | `mode` | string | `staged` (stall-gated device span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
-| `backend` | string | Event backend: `hip` or `torch`. |
+| `timer` | string | Event timer: `hip` (HIP events) or `torch` (`torch.cuda.Event`). |
 | `cache_mode` | string | `warm` or `cold`. |
 | `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
 | `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
@@ -238,7 +238,7 @@ remove outliers.
 | `clocks_before` | object or null | GPU clocks before priming and warmup of the default plan, so often the idle clocks. See [clocks](#clocks). |
 | `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. |
 
-`--metrics-tier off` sets the analytical values, `vram_mb`, both clock
+`--no-metrics` sets the analytical values, `vram_mb`, both clock
 objects, and the plan `workspace_bytes`, `tflops` and `gbps` to `null`, and
 `flops_partial` to `false`.
 
@@ -413,7 +413,7 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `gpu_arch` | `environment.gpu_arch` |
 | `graph_name` | `graph.graph_name` |
 | `graph_id` | `graph.graph_id` |
-| `provider` | `row.provider` |
+| `runtime` | `row.runtime` |
 | `role` | `row.role` |
 | `engine_id` | `row.engine.id` |
 | `engine_name` | `row.engine.name` |

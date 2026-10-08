@@ -147,7 +147,7 @@ def _measure_row(
     benchmark: Callable[[], Measurement],
 ) -> None:
     """Run the timed loop and record stats, provenance, clocks and warnings."""
-    basic = ctx.config.metrics.basic_enabled
+    basic = ctx.config.metrics.basic
     probe = GpuSmiProbe() if basic else None
     if probe is not None:
         row.clocks_before = probe.clocks()
@@ -265,7 +265,7 @@ def _graph_context(
         reporter=reporter,
         input_data=generate_input_data(tensor_infos, config.seed, graph_json),
     )
-    if config.metrics.basic_enabled:
+    if config.metrics.basic:
         try:
             ctx.flops, ctx.flops_partial = compute_flops(graph_json)
         except Exception as e:
@@ -295,13 +295,13 @@ def _run_pytorch_row(
     engine comparison. Unsupported graphs are skipped unless the SDPA
     selection is strict. Any other failure of a default-dispatch reference
     is skipped (the CPU reference may still serve); any other failure of a
-    strict SDPA selection or of the ``--backend pytorch`` engine row is an
+    strict SDPA selection or of the ``--runtime pytorch`` engine row is an
     error.
     """
     config = ctx.config
     strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
     row = ProviderEngineResult(
-        provider="pytorch",
+        runtime="pytorch",
         engine_id=None,
         engine_name="pytorch",
         status="success",
@@ -362,7 +362,7 @@ def run_single_provider_engine(
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
     row = ProviderEngineResult(
-        provider="hipdnn",
+        runtime="hipdnn",
         engine_id=engine_id,
         engine_name=engine_name,
         status="success",
@@ -373,7 +373,7 @@ def run_single_provider_engine(
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
         row.cpu_build_time_ms = executor.init_time_ms
-        if config.metrics.basic_enabled:
+        if config.metrics.basic:
             row.workspace_bytes = executor.workspace_size
 
         with BufferManager(
@@ -446,7 +446,7 @@ def _failed_row(
 ) -> ProviderEngineResult:
     """Replace a partially filled row with a reason-only error/skipped row."""
     failed = make(
-        row.provider,
+        row.runtime,
         row.engine_id,
         message,
         engine_name=row.engine_name,
@@ -676,7 +676,7 @@ def _run_engine_selection(
     )
 
 
-def run_graph_pytorch_backend(
+def run_graph_pytorch(
     graph_path: Path,
     graph_json: Dict[str, Any],
     tensor_infos: list,
@@ -685,11 +685,11 @@ def run_graph_pytorch_backend(
 ) -> GraphResult:
     """Run a single graph through the PyTorch executor as the sole engine row.
 
-    The ``--backend pytorch`` counterpart of :func:`run_graph_all_providers`:
+    The ``--runtime pytorch`` counterpart of :func:`run_graph_all_providers`:
     no hipDNN engine discovery, plugins, or reference validation.
     """
     return _with_stall_fallback(
-        lambda cfg: _run_graph_pytorch_backend(
+        lambda cfg: _run_graph_pytorch(
             graph_path, graph_json, tensor_infos, cfg, reporter
         ),
         config,
@@ -697,7 +697,7 @@ def run_graph_pytorch_backend(
     )
 
 
-def _run_graph_pytorch_backend(
+def _run_graph_pytorch(
     graph_path: Path,
     graph_json: Dict[str, Any],
     tensor_infos: list,

@@ -26,7 +26,7 @@ class _Tty(io.StringIO):
 
 def _passed_row(name: str = "MIOPEN_ENGINE") -> ProviderEngineResult:
     return ProviderEngineResult(
-        provider="hipdnn",
+        runtime="hipdnn",
         engine_id=1,
         engine_name=name,
         status="success",
@@ -193,7 +193,7 @@ class TestSuiteHeader:
         "min_time_ms": 0.0,
         "cache_mode": "cold",
         "seed": 0,
-        "backend": "hipdnn",
+        "runtime": "hipdnn",
     }
 
     def test_header_states_machine_and_methodology(self) -> None:
@@ -212,7 +212,7 @@ class TestSuiteHeader:
         assert "AMD Instinct MI210 (gfx90a, 104 CUs, 64 GB HBM)" in text
         assert "ROCm:    7.0.2" in text
         assert (
-            "warmup 10, iters 100 (min-time 0 ms), cache cold, seed 0, backend hipdnn"
+            "warmup 10, iters 100 (min-time 0 ms), cache cold, seed 0, runtime hipdnn"
             in text
         )
 

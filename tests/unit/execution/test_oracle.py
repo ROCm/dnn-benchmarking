@@ -34,7 +34,7 @@ def _m(kernel_ms, host_ms=0.01):
         kernel_ms=list(kernel_ms),
         host_ms=[host_ms] * len(kernel_ms),
         mode="staged",
-        backend="hip",
+        timer="hip",
         cache_mode="warm",
         warmup_iters=1,
         first_call_ms=1.0,
@@ -128,7 +128,7 @@ def _run(
     mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=None, **config
 ):
     row = ProviderEngineResult(
-        provider="hipdnn", engine_id=5, status="success", correctness=correctness
+        runtime="hipdnn", engine_id=5, status="success", correctness=correctness
     )
     row.analytical_flops = flops
 

@@ -40,7 +40,7 @@ def _validate_config() -> SuiteConfig:
         warmup_iters=1,
         benchmark_iters=2,
         validation=ValidationConfig(provider="pytorch"),
-        metrics=MetricsConfig(tier="off"),
+        metrics=MetricsConfig(basic=False),
     )
 
 
@@ -55,7 +55,7 @@ def _assert_engines_match_reference(
     assert result.error is None, result.error
     reference = [r for r in result.results if r.role == "reference"]
     assert [r.verdict for r in reference] == ["reference"], reference
-    assert reference[0].provider == "pytorch"
+    assert reference[0].runtime == "pytorch"
     assert reference[0].gpu_kernel_stats is not None
     assert reference[0].host_stats is not None
 
@@ -107,7 +107,7 @@ def test_benchmark_measures_and_writes_output(
     assert all(t > 0 for t in m.kernel_ms + m.host_ms)
     if not m.capped:
         assert sum(m.kernel_ms) >= policy.min_time_ms
-    assert m.backend == "hip"
+    assert m.timer == "hip"
     assert m.cache_mode == policy.cache_mode
     assert m.warmup_iters == policy.warmup_iters
     assert m.first_call_ms > 0

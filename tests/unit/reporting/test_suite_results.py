@@ -286,7 +286,7 @@ class TestWriteLoad:
             "gpu_arch": "gfx90a",
             "graph_name": "g",
             "graph_id": "0123456789ab",
-            "provider": "hipdnn",
+            "runtime": "hipdnn",
             "role": "engine",
             "engine_id": "0xFFFFFFFFFFFFFFFF",
             "engine_name": "MIOPEN_ENGINE",
