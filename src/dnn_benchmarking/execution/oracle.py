@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -293,10 +293,15 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
 
 
 def _stats(data: Optional[Dict[str, Any]]) -> Optional[BenchmarkStats]:
-    """Rebuild stats from a v2 stats object."""
+    """Rebuild stats from a v2 stats object.
+
+    The file keeps only ``n`` and the quartiles; the console-only fields
+    (mean, std, min, p95, max) are None, and nothing reads them for a tuned
+    row (the speedup, throughput and table use the median).
+    """
     if not data:
         return None
-    return BenchmarkStats(**data)
+    return BenchmarkStats(**{f.name: data.get(f.name) for f in fields(BenchmarkStats)})
 
 
 def run_pytorch_tuned(
