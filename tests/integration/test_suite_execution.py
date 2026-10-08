@@ -6,13 +6,13 @@
 import io
 import json
 import re
+import sys
 
 import pytest
 
 from dnn_benchmarking.config import (
     RuntimeName,
     MetricsConfig,
-    OracleMode,
     PyTorchSdpaBackendName,
     SuiteConfig,
 )
@@ -21,6 +21,7 @@ from dnn_benchmarking.execution.suite_runner import (
     run_graph_all_providers,
     run_graph_pytorch,
 )
+from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.reporting.reporter import Reporter
 from tests.conftest import expected_timer
 from tests.integration.conftest import load_graph
@@ -69,7 +70,7 @@ def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
         ootb = row["ootb"]
         assert ootb["kernel"]["median_ms"] > 0
         assert ootb["host"]["median_ms"] > 0
-        assert set(ootb["kernel"]) == {"n", "p25_ms", "median_ms", "p75_ms"}
+        assert set(ootb["kernel"]) == {"p25_ms", "median_ms", "p75_ms"}
         assert ootb["correctness"] is None
         assert row["oracle"] is None
 
@@ -99,37 +100,44 @@ def test_engine_selection_runs_in_caller_order(hipdnn) -> None:
     assert [r.engine_id for r in result.results] == selection
 
 
-def test_oracle_plan_records_tuned_payload(hipdnn) -> None:
-    """--oracle-mode plan attaches the tuned plan and a median-based delta."""
-    result, successes = _run_conv(hipdnn, oracle_mode=OracleMode.PLAN)
-    tuned = [r for r in successes if r.oracle is not None]
-    assert tuned, [(r.engine_name, r.oracle_error) for r in successes]
+def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) -> None:
+    """--oracle builds and times a global.benchmarking plan.
 
-    r = tuned[0]
-    # The active plan resolves to the row's own registered engine name,
-    # never the "0x..." fallback an unregistered engine ID produces.
-    assert r.oracle.plan_name == r.engine_name
-    assert r.oracle.rank == 0
-    assert r.oracle.compiled_plan_index >= 0
-    assert r.oracle.compiled_plans_benchmarked >= 1
-
-    row = json.loads(json.dumps(r.to_dict(), allow_nan=False))
-    oracle = row["oracle"]
-    assert row["oracle_error"] is None
-    # The tuned plan is the same object as the OOTB plan, plus tuning keys.
-    assert set(row["ootb"]) <= set(oracle)
-    assert set(oracle["delta"]) == {
-        "basis",
-        "baseline_median_ms",
-        "oracle_median_ms",
-        "delta_ms",
-        "speedup",
-    }
-    # The baseline is the post-sweep re-timing, never the row's own
-    # pre-sweep OOTB number.
-    assert oracle["delta"]["baseline_median_ms"] == (
-        oracle["baseline_kernel"]["median_ms"]
+    Runs the CLI in a child process: hipDNN keeps a tuned winner in memory
+    for the life of the process, so an in-process run would leave later
+    tests unable to time the OOTB plan of this graph.
+    """
+    out = tmp_path / "oracle.json"
+    proc = run_capped(
+        [
+            sys.executable,
+            "-m",
+            "dnn_benchmarking",
+            "--graph",
+            str(load_graph("sample_conv_fwd.json")[0]),
+            "--warmup",
+            "1",
+            "--iters",
+            "3",
+            "--oracle",
+            "-o",
+            str(out),
+            *plugin_path_cli_args,
+        ],
+        600,
     )
+    assert out.is_file(), proc.stderr
+    rows = [r for g in json.loads(out.read_text())["graphs"] for r in g["results"]]
+    tuned = [r for r in rows if r["status"] == "success" and r["oracle"] is not None]
+    assert tuned, [(r["engine"]["name"], r["oracle_error"]) for r in rows]
+
+    ootb, oracle = tuned[0]["ootb"], tuned[0]["oracle"]
+    assert tuned[0]["oracle_error"] is None
+    # The tuned plan is the same object as the OOTB plan, plus one key.
+    assert set(oracle) - set(ootb) == {"tuning_available"}
+    # Both plans report their own plan build through the same timed path.
+    assert ootb["build_ms"] > 0 and oracle["build_ms"] > 0
+    assert oracle["kernel"]["median_ms"] > 0
 
 
 @pytest.mark.parametrize("graph_name", ["sample_conv_fwd.json", "sample_relu.json"])

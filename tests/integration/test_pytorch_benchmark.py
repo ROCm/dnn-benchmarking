@@ -28,7 +28,6 @@ def _benchmark(graph_name: str, policy: TimingPolicy = POLICY, **executor_kwargs
     executor_kwargs.setdefault("pytorch_sdpa_backend", PyTorchSdpaBackendName.DEFAULT)
     executor = PyTorchCudaExecutor(graph_json, policy, **executor_kwargs)
     executor.prepare()
-    assert executor.init_time_ms > 0
 
     with PyTorchCudaBufferManager(tensor_infos) as bm:
         bm.allocate_all()

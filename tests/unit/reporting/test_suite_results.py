@@ -1,7 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for verdicts, summary counts, oracle delta and result file I/O."""
+"""Tests for verdicts, summary counts, oracle speedup and result file I/O."""
 
 import csv
 import json
@@ -19,8 +19,8 @@ from dnn_benchmarking.reporting.suite_results import (
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
-    build_oracle_delta,
     graph_id_for,
+    oracle_speedup,
 )
 
 
@@ -114,48 +114,60 @@ class TestGraphStatusAndSummary:
         assert suite.to_dict()["summary"]["rows"] == 1
 
 
-def _oracle(**stats) -> OracleResult:
-    return OracleResult(
-        plan_name="p",
-        compiled_plan_index=0,
-        rank=0,
-        sweep_min_time_ms=1.0,
-        compiled_plans_benchmarked=1,
-        compiled_plans_total=2,
-        compiled_plans_failed=0,
-        knob_settings=[],
-        **stats,
+def _kernel(*timings) -> BenchmarkStats:
+    return BenchmarkStats.from_timings(list(timings))
+
+
+def _tuned_row(
+    ootb=(2.0, 2.0, 2.0, 20.0),
+    tuned=(1.0, 1.0, 1.0, 9.0),
+    ootb_correctness=None,
+    tuned_correctness=None,
+) -> ProviderEngineResult:
+    # Default samples are skewed, so means (6.5, 3.0) differ from medians (2, 1).
+    row = _row(correctness=ootb_correctness)
+    row.ootb.gpu_kernel_stats = _kernel(*ootb) if ootb is not None else None
+    row.oracle = OracleResult(
+        tuning_available=True,
+        gpu_kernel_stats=_kernel(*tuned) if tuned is not None else None,
+        correctness=tuned_correctness,
     )
+    return row
 
 
-class TestBuildOracleDelta:
-    def test_uses_median_not_mean(self) -> None:
-        # Skewed samples: means differ from medians.
-        baseline = BenchmarkStats.from_timings([2.0, 2.0, 2.0, 20.0])
-        tuned = BenchmarkStats.from_timings([1.0, 1.0, 1.0, 1.0])
-        delta = build_oracle_delta(
-            _oracle(gpu_kernel_stats=tuned, warm_baseline_gpu_kernel_stats=baseline)
+class TestOracleSpeedup:
+    def test_is_ootb_median_over_tuned_median(self) -> None:
+        assert oracle_speedup(_tuned_row()) == 2.0
+
+    def test_no_tuned_run_means_no_speedup(self) -> None:
+        row = _row()
+        row.ootb.gpu_kernel_stats = _kernel(1.0)
+        assert oracle_speedup(row) is None
+
+    @pytest.mark.parametrize(
+        "ootb_match, tuned_match, expected",
+        [
+            (False, True, None),
+            (True, False, None),
+            (None, None, 2.0),  # unchecked is not a failure
+            (True, True, 2.0),
+        ],
+    )
+    def test_explicit_validation_failure_suppresses_speedup(
+        self, ootb_match, tuned_match, expected
+    ) -> None:
+        row = _tuned_row(
+            ootb_correctness=_correct(ootb_match),
+            tuned_correctness=_correct(tuned_match),
         )
-        assert delta.basis == "kernel"
-        assert delta.baseline_median_ms == 2.0
-        assert delta.oracle_median_ms == 1.0
-        assert delta.delta_ms == 1.0
-        assert delta.speedup == 2.0
+        assert oracle_speedup(row) == expected
 
-    def test_no_warm_baseline_means_no_delta(self) -> None:
-        # The row's own OOTB timing must never stand in for the baseline.
-        tuned = BenchmarkStats.from_timings([1.0])
-        assert build_oracle_delta(_oracle(gpu_kernel_stats=tuned)) is None
-
-    @pytest.mark.parametrize("baseline, tuned", [(2.0, 0.0), (0.0, 2.0)])
-    def test_non_positive_median_means_no_delta(self, baseline, tuned) -> None:
-        delta = build_oracle_delta(
-            _oracle(
-                gpu_kernel_stats=BenchmarkStats.from_timings([tuned]),
-                warm_baseline_gpu_kernel_stats=BenchmarkStats.from_timings([baseline]),
-            )
-        )
-        assert delta is None
+    @pytest.mark.parametrize(
+        "ootb, tuned",
+        [((2.0,), (0.0,)), ((0.0,), (2.0,)), (None, (1.0,)), ((1.0,), None)],
+    )
+    def test_missing_or_non_positive_median_means_no_speedup(self, ootb, tuned) -> None:
+        assert oracle_speedup(_tuned_row(ootb=ootb, tuned=tuned)) is None
 
 
 def test_graph_id_is_order_independent_and_content_sensitive() -> None:
@@ -179,7 +191,7 @@ def _sample_suite(complete=True) -> SuiteResult:
             gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 29 + [5.0]),
             host_stats=BenchmarkStats.from_timings([0.01] * 29 + [1.0]),
             correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
-            timing=TimingInfo("staged", "hip", 10, 3.0),
+            timing=TimingInfo("staged", "hip", 10, 30, 3.0),
             cpu_build_time_ms=12.0,
             workspace_bytes=4096,
             derived_tflops_per_s=1.5,
@@ -318,7 +330,7 @@ class TestWriteLoad:
             "verdict": "passed",
             "kernel_median_ms": "0.5",
             "host_median_ms": "0.01",
-            "n": "30",
+            "samples": "30",
             "timing_mode": "staged",
             "cache_mode": "cold",
             "timing_block": "4",

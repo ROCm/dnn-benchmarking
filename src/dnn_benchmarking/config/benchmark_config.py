@@ -63,14 +63,6 @@ def _normalize_pytorch_sdpa_settings(
 CACHE_MODE_CHOICES = ("warm", "cold")
 
 
-class OracleMode(str, Enum):
-    """Oracle comparison depth."""
-
-    OFF = "off"
-    PLAN = "plan"
-    EXHAUSTIVE = "exhaustive"
-
-
 PMC_SET_CHOICES = ("basic", "memory", "flops", "all")
 
 
@@ -306,14 +298,14 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
-        oracle_mode: Oracle comparison depth. "off" runs no comparison;
-            "plan" times the auto-tuner's chosen plan against the heuristic
-            plan; "exhaustive" additionally forces provider kernel
-            benchmarking so providers sample kernel variants.
+        oracle: Build and time a second plan per engine with
+            ``global.benchmarking=1``, so providers sample their candidate
+            kernels, against the OOTB plan. PyTorch rows get a tuned run in
+            an isolated subprocess. Cannot be combined with ``autotune``.
         metrics: Metric collection configuration. Defaults to the always-on
             probes and no extra runs.
-        runtime: Runtime that executes the graph (``hipdnn`` runs discovered engine plugins,
-            ``pytorch`` runs the graph through the PyTorch executor as a single
+        runtime: Runtime that executes the graph (``hipdnn`` runs discovered
+            engine plugins, ``pytorch`` runs the graph through the PyTorch executor as a single
             engine row per graph).
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
             PyTorch timing or reference execution.
@@ -326,7 +318,7 @@ class SuiteConfig:
     seed: int = 0
     engine_filter: Optional[List[int]] = None
     verbose: bool = False
-    oracle_mode: OracleMode = OracleMode.OFF
+    oracle: bool = False
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None
@@ -379,7 +371,7 @@ class SuiteConfig:
             verbose=args.verbose,
             quiet=args.quiet,
             compact_json=args.compact_json,
-            oracle_mode=args.oracle_mode,
+            oracle=args.oracle,
             metrics=MetricsConfig(
                 basic=args.metrics,
                 trace=args.trace,
@@ -402,16 +394,6 @@ class SuiteConfig:
                 str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
             ),
         )
-
-    @property
-    def oracle_enabled(self) -> bool:
-        """True when any oracle comparison should run."""
-        return self.oracle_mode is not OracleMode.OFF
-
-    @property
-    def oracle_exhaustive(self) -> bool:
-        """True when the oracle pass must force provider kernel benchmarking."""
-        return self.oracle_mode is OracleMode.EXHAUSTIVE
 
     def __post_init__(self) -> None:
         """Validate values and cross-field constraints; messages name CLI flags."""
@@ -443,10 +425,13 @@ class SuiteConfig:
             self.runtime = RuntimeName(self.runtime)
         except ValueError as e:
             raise ValueError(_one_of("--runtime", RuntimeName)) from e
-        try:
-            self.oracle_mode = OracleMode(self.oracle_mode)
-        except ValueError as e:
-            raise ValueError(_one_of("--oracle-mode", OracleMode)) from e
+        if self.oracle and self.autotune:
+            # --autotune sets HIPDNN_FORCE_BENCHMARKING=1, which providers apply
+            # over the knob, so the OOTB plan would be tuned too.
+            raise ValueError(
+                "--oracle and --autotune cannot be combined: --autotune tunes "
+                "the OOTB plan too, so the comparison would measure nothing"
+            )
         (
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
@@ -466,7 +451,6 @@ class SuiteConfig:
                 ("--trace", self.metrics.trace),
                 ("--perf", self.metrics.perf),
                 ("--roofline", self.metrics.roofline),
-                ("--oracle-mode", self.oracle_enabled),
                 ("--autotune", self.autotune),
                 ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ]

@@ -172,8 +172,9 @@ in block mode. The row warning is then `block timing: <reason>`.
 
 ## Statistics
 
-For `kernel` and `host` the result file stores `n`, `p25_ms`, `median_ms` and
-`p75_ms`. The interquartile range (IQR) is `p75_ms - p25_ms`. `median_ms` is
+For `kernel` and `host` the result file stores `p25_ms`, `median_ms` and
+`p75_ms`; the sample count `n` is the plan's `timing.samples`.
+The interquartile range (IQR) is `p75_ms - p25_ms`. `median_ms` is
 the upper median `sorted(t)[n // 2]`, the rocKE / Solera definition, so it is
 always an observed sample. The quartiles use linear interpolation. The
 verbose console also shows the mean, std (ddof 1), min, p95 (below 20

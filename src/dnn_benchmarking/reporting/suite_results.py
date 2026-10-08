@@ -43,7 +43,7 @@ RUN_CONFIG_KEYS = (
     "validate",
     "rtol",
     "atol",
-    "oracle_mode",
+    "oracle",
     "autotune",
     "hipdnn_cache_dir",
     "pytorch_sdpa_backend",
@@ -90,7 +90,7 @@ ROW_COLUMNS = (
     "kernel_median_ms",
     "kernel_iqr_pct",
     "host_median_ms",
-    "n",
+    "samples",
     "timing_mode",
     "cache_mode",
     "timing_block",
@@ -258,105 +258,25 @@ class PlanResult:
 
 @dataclass
 class OracleResult(PlanResult):
-    """Tuned plan for one engine row, plus how it was selected.
+    """Tuned run for one row; the row's own ``PlanResult`` is the OOTB plan.
 
-    ``sweep_min_time_ms`` is the fastest single selection-sweep iteration.
-    Reported timing comes from the later ``gpu_kernel_stats`` or ``host_stats``
-    benchmark.
+    hipDNN: the tuned plan is built for the same engine as the OOTB plan,
+    with ``global.benchmarking=1``. A benchmarking build compiles every
+    candidate the provider can sample, so its build is expected to be slower.
+    PyTorch: the tuned run comes from an isolated child process and has no
+    plan build.
 
-    Candidate counts describe compiled plans, not provider-internal kernels.
-    ``exhaustive_enabled`` means the selected engine advertises
-    ``global.benchmarking`` and the run requested it. Providers can reuse
-    cached selections, so it does not prove a fresh search occurred.
-
-    ``warm_baseline_*`` contains the OOTB plan re-timed after selection. The
-    delta uses this warm measurement, not the row's earlier OOTB timing.
-    ``correctness`` is the tuned plan's verdict; the row retains the OOTB
-    verdict. The ``PlanResult`` fields use the row's analytical FLOPs and
-    I/O bytes with the tuned kernel median, like the row's own throughputs.
+    ``tuning_available`` is False when the engine exposes no tuning knob, so
+    the tuned run re-measured the OOTB configuration. ``correctness`` is the
+    tuned plan's verdict; the row keeps the OOTB verdict. Throughputs use the
+    row's analytical FLOPs and I/O bytes with the tuned kernel median.
     """
 
-    plan_name: str
-    compiled_plan_index: int
-    rank: int
-    sweep_min_time_ms: float
-    compiled_plans_benchmarked: int
-    compiled_plans_total: int
-    compiled_plans_failed: int
-    knob_settings: List[Dict[str, Any]]
-    exhaustive_requested: bool = False
-    exhaustive_supported: bool = False
-    warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
-    warm_baseline_host_stats: Optional[BenchmarkStats] = None
-    warm_baseline_derived_tflops_per_s: Optional[float] = None
-
-    @property
-    def exhaustive_enabled(self) -> bool:
-        """True when a capable provider was built for exhaustive selection."""
-        return self.exhaustive_requested and self.exhaustive_supported
-
-    @property
-    def tuning_available(self) -> bool:
-        """Return whether this pass had a tuning alternative."""
-        return self.compiled_plans_total > 1 or self.exhaustive_enabled
+    tuning_available: bool
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to the v2 ``oracle`` object: the plan object plus tuning."""
-        return {
-            **self.plan_dict(),
-            "tuning_available": self.tuning_available,
-            "plan_name": self.plan_name,
-            "compiled_plan_index": self.compiled_plan_index,
-            "rank": self.rank,
-            "sweep_min_time_ms": self.sweep_min_time_ms,
-            "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
-            "compiled_plans_total": self.compiled_plans_total,
-            "compiled_plans_failed": self.compiled_plans_failed,
-            "knob_settings": list(self.knob_settings),
-            "exhaustive_requested": self.exhaustive_requested,
-            "exhaustive_enabled": self.exhaustive_enabled,
-            "exhaustive_supported": self.exhaustive_supported,
-            "baseline_kernel": _stats_dict(self.warm_baseline_gpu_kernel_stats),
-            "baseline_host": _stats_dict(self.warm_baseline_host_stats),
-            "baseline_tflops": self.warm_baseline_derived_tflops_per_s,
-        }
-
-
-@dataclass
-class OracleDelta:
-    """Warm heuristic baseline vs tuned run for one engine row.
-
-    Both sides are measured after the autotuning sweep, back to back on the
-    same buffers, so device warmth is common to them and the ratio isolates
-    the plan change. This is deliberately not the row's headline OOTB
-    timing: that one is measured before the sweep exists and is the
-    "what you get out of the box" number, which at low ``--warmup`` can sit
-    well above steady state and would inflate the speedup.
-
-    Attributes:
-        basis: Timing pair compared; always ``kernel`` (device median).
-        baseline_median_ms: Median of the heuristic plan, re-timed post-sweep.
-        oracle_median_ms: Median of the post-tuning run.
-        delta_ms: ``baseline_median_ms - oracle_median_ms``; positive means
-            the oracle is faster.
-        speedup: ``baseline_median_ms / oracle_median_ms``.
-    """
-
-    basis: Literal["kernel"]
-    baseline_median_ms: float
-    oracle_median_ms: float
-    delta_ms: float
-    speedup: float
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "basis": self.basis,
-            "baseline_median_ms": self.baseline_median_ms,
-            "oracle_median_ms": self.oracle_median_ms,
-            "delta_ms": self.delta_ms,
-            "speedup": self.speedup,
-        }
+        return {**self.plan_dict(), "tuning_available": self.tuning_available}
 
 
 Verdict = Literal["passed", "failed", "unchecked", "reference", "skipped", "error"]
@@ -392,7 +312,6 @@ class ProviderEngineResult:
         ootb: The default (out-of-the-box) plan. Serialized only for
             ``success`` rows.
         oracle: Tuned plan; set only for oracle runs that tuned.
-        oracle_delta: Warm-baseline vs tuned comparison.
         oracle_error: Why tuning produced no result; exclusive with oracle.
         clocks_after: GPU clocks sampled right after the timed loop.
         engine_name: Display name of the engine (e.g. MIOPEN_ENGINE).
@@ -419,7 +338,6 @@ class ProviderEngineResult:
     extra_metrics: Optional[Dict[str, Any]] = None
     ootb: PlanResult = field(default_factory=PlanResult)
     oracle: Optional[OracleResult] = None
-    oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
     clocks_after: Optional[Dict[str, Any]] = None
     engine_name: Optional[str] = None
@@ -526,45 +444,44 @@ class ProviderEngineResult:
                 "clocks_after": self.clocks_after,
             },
             "ootb": self.ootb.plan_dict() if self.status == "success" else None,
-            "oracle": (
-                {
-                    **self.oracle.to_dict(),
-                    "delta": self.oracle_delta.to_dict() if self.oracle_delta else None,
-                }
-                if self.oracle is not None
-                else None
-            ),
+            "oracle": self.oracle.to_dict() if self.oracle is not None else None,
             "oracle_error": self.oracle_error,
             "warnings": list(self.warnings or []),
             "extra_metrics": self.extra_metrics,
         }
 
 
-def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
-    """Compare the warm heuristic baseline against the tuned run by kernel median.
+def timing_modes_differ(row: ProviderEngineResult) -> bool:
+    """True when the OOTB and tuned plans were timed in different modes."""
+    a = row.ootb.timing
+    b = row.oracle.timing if row.oracle is not None else None
+    return a is not None and b is not None and a.mode != b.mode
 
-    Both operands come from ``oracle``: the sweep-adjacent re-timing of the
-    heuristic plan and the post-tuning run. The row's own OOTB timing is
-    deliberately not used: it is measured before the sweep, so at low
-    ``--warmup`` it can sit above steady state and report a speedup that is
-    accumulated warmup rather than a better plan.
 
-    Returns None when either side lacks kernel statistics or either median
-    is non-positive.
+def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
+    """OOTB kernel median / tuned kernel median, or None when not comparable.
+
+    None when the row has no tuned run, either plan failed validation, the
+    two plans were timed in different modes (a stall-fallback OOTB in
+    ``events`` against a ``staged`` tuned child), or a median is missing or
+    non-positive. Rows with ``tuning_available`` False still get a ratio;
+    callers report them as "no-search" and keep them out of averages. The
+    speedup is derived, never stored in the result file.
     """
-    if oracle.warm_baseline_gpu_kernel_stats is None or oracle.gpu_kernel_stats is None:
+    oracle = row.oracle
+    if oracle is None or any(
+        verdict is not None and verdict.explicitly_failed
+        for verdict in (row.ootb.correctness, oracle.correctness)
+    ):
         return None
-    baseline = oracle.warm_baseline_gpu_kernel_stats.median_ms
-    tuned = oracle.gpu_kernel_stats.median_ms
-    if baseline <= 0.0 or tuned <= 0.0:
+    if row.ootb.gpu_kernel_stats is None or oracle.gpu_kernel_stats is None:
         return None
-    return OracleDelta(
-        basis="kernel",
-        baseline_median_ms=baseline,
-        oracle_median_ms=tuned,
-        delta_ms=baseline - tuned,
-        speedup=baseline / tuned,
-    )
+    if timing_modes_differ(row):
+        return None
+    ootb, tuned = row.ootb.gpu_kernel_stats.median_ms, oracle.gpu_kernel_stats.median_ms
+    if ootb <= 0.0 or tuned <= 0.0:
+        return None
+    return ootb / tuned
 
 
 @dataclass
@@ -746,7 +663,7 @@ class SuiteResult:
                         "kernel_median_ms": kernel.get("median_ms"),
                         "kernel_iqr_pct": _iqr_pct(kernel),
                         "host_median_ms": host.get("median_ms"),
-                        "n": kernel.get("n"),
+                        "samples": timing.get("samples"),
                         "timing_mode": timing.get("mode"),
                         "tflops": ootb.get("tflops"),
                         "gbps": ootb.get("gbps"),

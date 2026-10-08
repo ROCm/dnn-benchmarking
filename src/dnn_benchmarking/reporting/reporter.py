@@ -18,7 +18,14 @@ from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple
 
 from ..metrics import _diagnostic
 from .statistics import BenchmarkStats, noise_warnings
-from .suite_results import GraphResult, ProviderEngineResult, SuiteResult, engine_id_hex
+from .suite_results import (
+    GraphResult,
+    ProviderEngineResult,
+    SuiteResult,
+    engine_id_hex,
+    oracle_speedup,
+    timing_modes_differ,
+)
 
 _TIMING_MODE_LABEL = {
     "staged": "staged stall-gate",
@@ -124,7 +131,10 @@ def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
     if pe.oracle is not None and not pe.oracle.tuning_available:
         # One fixed configuration: the ratio is run-to-run noise.
         return "no-search"
-    if pe.oracle_delta is not None:
+    if timing_modes_differ(pe):
+        # Event-timed OOTB against stall-gated tuned: not one measurement.
+        return "mixed-timing"
+    if oracle_speedup(pe) is not None:
         return None
     if pe.oracle_error is not None:
         return "failed"
@@ -329,20 +339,31 @@ class Reporter:
             self._print(f"Results: {output_path}")
 
     def print_oracle_summary(self, graphs: Sequence[GraphResult]) -> None:
-        """Print the suite-wide geomean of reportable oracle speedups."""
-        rows = [pe for gr in graphs for pe in gr.results if pe.oracle_delta is not None]
+        """Print the suite-wide geomean of reportable oracle speedups.
+
+        Reference rows are baselines, not engines under test, so they are
+        not averaged in.
+        """
+        rows = [
+            pe
+            for gr in graphs
+            for pe in gr.results
+            if pe.role == "engine" and pe.oracle is not None
+        ]
         if not rows:
             return
-        speedups = [pe.oracle_delta.speedup for pe in rows if _oracle_state(pe) is None]
+        speedups = [oracle_speedup(pe) for pe in rows if _oracle_state(pe) is None]
         excluded = len(rows) - len(speedups)
         if not speedups:
             self._print(
                 f"Oracle: no reportable speedup on any of {excluded} tuned row(s) "
-                "(no tuning alternatives or invalid results)"
+                "(no search, invalid or mixed timing)"
             )
             return
         suffix = (
-            f"; {excluded} row(s) excluded (no search or invalid)" if excluded else ""
+            f"; {excluded} row(s) excluded (no search, invalid or mixed timing)"
+            if excluded
+            else ""
         )
         self._print(
             f"Oracle: {len(speedups)} tuned row(s), geomean speedup "
@@ -507,7 +528,7 @@ class Reporter:
     @staticmethod
     def _oracle_cell(pe: ProviderEngineResult) -> str:
         state = _oracle_state(pe)
-        return state if state is not None else f"{pe.oracle_delta.speedup:.2f}x"
+        return state if state is not None else f"{oracle_speedup(pe):.2f}x"
 
     @staticmethod
     def _note(pe: ProviderEngineResult) -> str:
@@ -654,43 +675,30 @@ class Reporter:
         o = pe.oracle
         if o is None:
             return [f"unavailable: {pe.oracle_error}"] if pe.oracle_error else []
-        knobs = (
-            ", ".join(f"{k['knob_id']}={k['value']}" for k in o.knob_settings)
-            if o.knob_settings
-            else "engine defaults"
-        )
-        lines = [
-            f"plan {o.plan_name} (index {o.compiled_plan_index}, rank {o.rank}); knobs {knobs}",
-            f"{o.compiled_plans_benchmarked}/{o.compiled_plans_total} compiled plans benchmarked "
-            f"({o.compiled_plans_failed} failed); sweep min {_fmt_time(o.sweep_min_time_ms)}",
-        ]
-        if o.exhaustive_requested:
-            lines.append(
-                "exhaustive search enabled (a cached selection may be reused)"
-                if o.exhaustive_supported
-                else "exhaustive unsupported by this engine; plan-level tuning only"
+        costs = []
+        if o.cpu_build_time_ms is not None:
+            costs.append(
+                f"build {_fmt_duration(o.cpu_build_time_ms)} "
+                "(global.benchmarking=1; prepares every candidate)"
             )
+        if o.timing is not None:
+            costs.append(f"first call {_fmt_duration(o.timing.first_call_ms)}")
+        lines = [", ".join(costs)] if costs else []
         if not o.tuning_available:
-            lines.append(
-                "no tuning alternative: re-measured the heuristic plan; delta is noise"
-            )
-        if o.correctness is not None and not o.correctness.passed:
+            lines.append("no tuning knob: re-measured the OOTB plan; speedup is noise")
+        if o.correctness is not None and o.correctness.explicitly_failed:
             detail = o.correctness.error_message or "output mismatch"
             lines.append(
                 f"tuned plan FAILED validation ({detail}); no speedup reported"
             )
-        d = pe.oracle_delta
-        if d is not None:
+        speedup = oracle_speedup(pe)
+        if speedup is not None:
             lines.append(
-                f"{_fmt_time(d.baseline_median_ms)} warm heuristic -> "
-                f"{_fmt_time(d.oracle_median_ms)} tuned = {d.speedup:.2f}x (basis {d.basis})"
+                f"{_fmt_time(pe.ootb.gpu_kernel_stats.median_ms)} OOTB -> "
+                f"{_fmt_time(o.gpu_kernel_stats.median_ms)} tuned = {speedup:.2f}x"
             )
         if o.derived_tflops_per_s is not None:
-            base = o.warm_baseline_derived_tflops_per_s
-            lines.append(
-                f"throughput {o.derived_tflops_per_s:.3f} TFLOP/s tuned"
-                + (f", {base:.3f} warm heuristic" if base is not None else "")
-            )
+            lines.append(f"throughput {o.derived_tflops_per_s:.3f} TFLOP/s tuned")
         return lines
 
     @staticmethod

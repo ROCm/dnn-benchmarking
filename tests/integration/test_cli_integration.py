@@ -89,7 +89,7 @@ def test_cli_smoke(
         assert re.fullmatch(r"0x[0-9A-F]{16}", row["engine"]["id"])
         ootb = row["ootb"]
         assert ootb["correctness"]["match"] is True
-        assert ootb["kernel"]["n"] == ootb["host"]["n"] == 3
+        assert ootb["timing"]["samples"] == 3
         assert ootb["timing"]["warmup_iters"] == 1
 
 
@@ -127,5 +127,5 @@ def test_cli_pytorch_runtime(torch_gpu, tmp_path: Path) -> None:
         "engine",
         "success",
     ), row
-    assert row["ootb"]["kernel"]["n"] == 3
+    assert row["ootb"]["timing"]["samples"] == 3
     assert row["ootb"]["timing"]["timer"] == expected_timer()

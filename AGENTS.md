@@ -87,7 +87,7 @@ src/dnn_benchmarking/
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
-│   ├── oracle.py             # --oracle-mode pass
+│   ├── oracle.py             # --oracle pass
 │   └── correctness.py        # output comparison for a row
 ├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
 ├── metrics/
@@ -129,6 +129,14 @@ Rules that keep the design intact:
   seconds, so the hipDNN path must not import it at startup. Code that only
   reads torch facts (environment, GPU identity) uses `sys.modules["torch"]`
   when torch is already loaded, and does not import it.
+- Build every hipDNN plan through `Executor.prepare`, which times only
+  `create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
+  `build_plans()`. Prime each engine with `Executor.prime` before its timed
+  OOTB build, and build the oracle's `global.benchmarking=1` plan right after
+  the OOTB build, so the two build times start from the same process state.
+- Run tuned PyTorch only in the `cli/pytorch_tuned_child.py` child process.
+  PyTorch's conv algorithm cache and MIOpen's user database would otherwise
+  carry tuning into the OOTB measurement.
 
 ## Tests
 

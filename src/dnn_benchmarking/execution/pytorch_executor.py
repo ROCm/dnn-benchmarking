@@ -11,7 +11,7 @@ from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
 from . import pytorch_ops
-from .timing import Measurement, Timer, is_hip_available, measure
+from .timing import Measurement, is_hip_available, measure
 
 
 class PyTorchCudaExecutor:
@@ -59,7 +59,6 @@ class PyTorchCudaExecutor:
         self._timer = (
             "hip" if torch_support.is_rocm_build() and is_hip_available() else "torch"
         )
-        self._init_time_ms: float = 0.0
         self._stream: Optional[Any] = None
         self._compiled: Optional[pytorch_ops.CompiledGraph] = None
 
@@ -69,21 +68,18 @@ class PyTorchCudaExecutor:
         Raises:
             ExecutionError: If graph contains unsupported operations.
         """
-        with Timer() as t:
-            unsupported = pytorch_ops.get_unsupported_operations(self._graph_json)
-            if unsupported:
-                raise ExecutionError(
-                    f"Graph contains unsupported operations: {unsupported}. "
-                    f"Supported: {list(pytorch_ops.get_supported_operations())}"
-                )
+        unsupported = pytorch_ops.get_unsupported_operations(self._graph_json)
+        if unsupported:
+            raise ExecutionError(
+                f"Graph contains unsupported operations: {unsupported}. "
+                f"Supported: {list(pytorch_ops.get_supported_operations())}"
+            )
 
-            self._compiled = pytorch_ops.compile_graph(self._graph_json)
+        self._compiled = pytorch_ops.compile_graph(self._graph_json)
 
-            with torch.cuda.device(self._device):
-                torch.cuda.init()
-                self._stream = torch.cuda.default_stream(self._device)
-
-        self._init_time_ms = t.elapsed_ms
+        with torch.cuda.device(self._device):
+            torch.cuda.init()
+            self._stream = torch.cuda.default_stream(self._device)
 
     def execute_once(self, tensors: Dict[int, torch.Tensor]) -> None:
         """Execute the graph once and synchronize.
@@ -142,11 +138,6 @@ class PyTorchCudaExecutor:
             raise
         except Exception as e:
             raise ExecutionError(f"Graph execution failed: {e}") from e
-
-    @property
-    def init_time_ms(self) -> float:
-        """Get graph initialization time in milliseconds."""
-        return self._init_time_ms
 
     @property
     def device(self) -> torch.device:

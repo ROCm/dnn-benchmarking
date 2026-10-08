@@ -162,7 +162,7 @@ def test_cli_values_override_config_values(tmp_path: Path) -> None:
 version = 1
 graphs = ["from_config.json"]
 iters = 7
-oracle_mode = "exhaustive"
+oracle = true
 """,
     )
 
@@ -174,14 +174,13 @@ oracle_mode = "exhaustive"
             "from_cli.json",
             "--iters",
             "11",
-            "--oracle-mode",
-            "plan",
+            "--no-oracle",
         ]
     )
 
     assert args.graph == ["from_cli.json"]
     assert args.iters == 11
-    assert args.oracle_mode == "plan"
+    assert args.oracle is False
 
 
 @pytest.mark.parametrize(
@@ -277,7 +276,6 @@ def test_unknown_engine_config_fields_are_rejected(tmp_path: Path, field: str) -
     ("field", "value"),
     [
         ("runtime", '"pytoch"'),
-        ("oracle_mode", '"full"'),
         ("validate", '"torch"'),
         ("pmc", '"everything"'),
         ("cache_mode", '"hot"'),
