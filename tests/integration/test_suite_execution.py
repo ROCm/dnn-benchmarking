@@ -55,12 +55,12 @@ def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
     for r in successes:
         assert r.runtime == "hipdnn"
         assert r.engine_name and not r.engine_name.startswith("0x")
-        assert r.cpu_build_time_ms > 0
-        assert r.gpu_kernel_stats.n == r.host_stats.n == 3
-        assert r.timing.timer == "hip" and r.timing.warmup_iters == 1
-        assert r.workspace_bytes >= 0
+        assert r.ootb.cpu_build_time_ms > 0
+        assert r.ootb.gpu_kernel_stats.n == r.ootb.host_stats.n == 3
+        assert r.ootb.timing.timer == "hip" and r.ootb.timing.warmup_iters == 1
+        assert r.ootb.workspace_bytes >= 0
         assert r.analytical_flops > 0 and r.analytical_io_bytes > 0
-        assert r.derived_tflops_per_s > 0 and r.derived_gbytes_per_s > 0
+        assert r.ootb.derived_tflops_per_s > 0 and r.ootb.derived_gbytes_per_s > 0
 
         row = json.loads(json.dumps(r.to_dict(), allow_nan=False))
         assert HEX_ID.fullmatch(row["engine"]["id"])
@@ -79,11 +79,11 @@ def test_no_metrics_suppresses_basic_fields(hipdnn) -> None:
     """``--no-metrics`` skips the always-on probes; timing still runs."""
     _, successes = _run_conv(hipdnn, metrics=MetricsConfig(basic=False))
     for r in successes:
-        assert r.gpu_kernel_stats is not None
-        assert r.workspace_bytes is None
+        assert r.ootb.gpu_kernel_stats is not None
+        assert r.ootb.workspace_bytes is None
         assert r.analytical_flops is None
         assert r.analytical_io_bytes is None
-        assert r.derived_tflops_per_s is None
+        assert r.ootb.derived_tflops_per_s is None
         assert r.vram_used_mb is None
 
 
@@ -148,8 +148,8 @@ def test_pytorch_runtime_times_graph(torch_gpu, graph_name: str) -> None:
         "success",
         "unchecked",
     ), row.error_message
-    assert row.gpu_kernel_stats.n == row.host_stats.n == 2
-    assert row.timing.timer == expected_timer()
+    assert row.ootb.gpu_kernel_stats.n == row.ootb.host_stats.n == 2
+    assert row.ootb.timing.timer == expected_timer()
 
 
 def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
@@ -168,4 +168,4 @@ def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
     [row] = result.results
     assert row.verdict == "error"
     assert "native forward SDPA call" in row.error_message
-    assert row.gpu_kernel_stats is None and row.host_stats is None
+    assert row.ootb.gpu_kernel_stats is None and row.ootb.host_stats is None

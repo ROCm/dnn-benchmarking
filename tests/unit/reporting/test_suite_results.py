@@ -15,6 +15,7 @@ from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
     OracleResult,
+    PlanResult,
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
@@ -28,7 +29,9 @@ def _correct(match) -> CorrectnessResult:
 
 
 def _row(status="success", role="engine", correctness=None) -> ProviderEngineResult:
-    return ProviderEngineResult("hipdnn", 1, status, role=role, correctness=correctness)
+    return ProviderEngineResult(
+        "hipdnn", 1, status, role=role, ootb=PlanResult(correctness=correctness)
+    )
 
 
 def _suite(graphs, complete=True) -> SuiteResult:
@@ -61,7 +64,7 @@ class TestVerdict:
         skip = ProviderEngineResult.skipped_row("pytorch", None, "unsupported")
         assert (err.verdict, err.to_dict()["message"]) == ("error", "boom")
         assert (skip.verdict, skip.to_dict()["message"]) == ("skipped", "unsupported")
-        assert err.correctness is None and skip.correctness is None
+        assert err.ootb.correctness is None and skip.ootb.correctness is None
 
 
 class TestGraphStatusAndSummary:
@@ -166,15 +169,17 @@ def _sample_suite(complete=True) -> SuiteResult:
         -1,
         "success",
         engine_name="MIOPEN_ENGINE",
-        gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 29 + [5.0]),
-        host_stats=BenchmarkStats.from_timings([0.01] * 29 + [1.0]),
-        correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
-        timing=TimingInfo("staged", "hip", "cold", 10, 3.0, timing_block=4),
         elapsed_time_ms=2500.0,
-        cpu_build_time_ms=12.0,
-        workspace_bytes=4096,
-        derived_tflops_per_s=1.5,
-        derived_gbytes_per_s=20.0,
+        ootb=PlanResult(
+            gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 29 + [5.0]),
+            host_stats=BenchmarkStats.from_timings([0.01] * 29 + [1.0]),
+            correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
+            timing=TimingInfo("staged", "hip", "cold", 10, 3.0, timing_block=4),
+            cpu_build_time_ms=12.0,
+            workspace_bytes=4096,
+            derived_tflops_per_s=1.5,
+            derived_gbytes_per_s=20.0,
+        ),
     )
     return _suite(
         [
@@ -313,7 +318,7 @@ class TestWriteLoad:
 
     def test_csv_writes_non_finite_statistics_as_empty_cells(self, tmp_path) -> None:
         suite = _sample_suite()
-        suite.graphs[0].results[0].gpu_kernel_stats = BenchmarkStats.from_timings(
+        suite.graphs[0].results[0].ootb.gpu_kernel_stats = BenchmarkStats.from_timings(
             [float("nan")] * 3
         )
         path = tmp_path / "r.csv"

@@ -20,6 +20,7 @@ from dnn_benchmarking.execution.timing import Measurement
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
+    PlanResult,
     ProviderEngineResult,
 )
 from dnn_benchmarking.validation import ReferenceOutput
@@ -128,7 +129,10 @@ def _run(
     mode="plan", correctness=None, bm=None, refs=None, flops=None, handle=None, **config
 ):
     row = ProviderEngineResult(
-        runtime="hipdnn", engine_id=5, status="success", correctness=correctness
+        runtime="hipdnn",
+        engine_id=5,
+        status="success",
+        ootb=PlanResult(correctness=correctness),
     )
     row.analytical_flops = flops
 

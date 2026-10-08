@@ -26,6 +26,7 @@ from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    PlanResult,
     ProviderEngineResult,
     SuiteResult,
 )
@@ -53,7 +54,9 @@ def _passed(engine_id: int = 1) -> ProviderEngineResult:
         runtime="hipdnn",
         engine_id=engine_id,
         status="success",
-        correctness=CorrectnessResult(tolerance_match=True, rtol=1e-3, atol=1e-3),
+        ootb=PlanResult(
+            correctness=CorrectnessResult(tolerance_match=True, rtol=1e-3, atol=1e-3)
+        ),
     )
 
 
@@ -62,7 +65,9 @@ def _failed() -> ProviderEngineResult:
         runtime="hipdnn",
         engine_id=2,
         status="success",
-        correctness=CorrectnessResult(tolerance_match=False, rtol=1e-3, atol=1e-3),
+        ootb=PlanResult(
+            correctness=CorrectnessResult(tolerance_match=False, rtol=1e-3, atol=1e-3)
+        ),
     )
 
 

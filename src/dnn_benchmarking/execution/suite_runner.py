@@ -156,9 +156,9 @@ def _measure_row(
         row.clocks_after = probe.clocks()
 
     kernel = BenchmarkStats.from_timings(m.kernel_ms)
-    row.gpu_kernel_stats = kernel
-    row.host_stats = BenchmarkStats.from_timings(m.host_ms)
-    row.timing = TimingInfo.from_measurement(m)
+    row.ootb.gpu_kernel_stats = kernel
+    row.ootb.host_stats = BenchmarkStats.from_timings(m.host_ms)
+    row.ootb.timing = TimingInfo.from_measurement(m)
     warnings = list(row.warnings or []) + noise_warnings(kernel)
     if m.capped:
         warnings.append("capped at max_iters")
@@ -176,8 +176,8 @@ def _measure_row(
         row.analytical_flops = ctx.flops
         row.analytical_flops_partial = ctx.flops_partial
         row.analytical_io_bytes = ctx.io_bytes
-        row.derived_tflops_per_s, row.derived_gbytes_per_s = derive_throughputs(
-            ctx.flops, ctx.io_bytes, kernel.median_ms
+        row.ootb.derived_tflops_per_s, row.ootb.derived_gbytes_per_s = (
+            derive_throughputs(ctx.flops, ctx.io_bytes, kernel.median_ms)
         )
         # Sampled while the row's workspace and I/O buffers are still live.
         row.vram_used_mb = probe.snapshot().get("vram_used_mb")
@@ -321,7 +321,7 @@ def _run_pytorch_row(
             pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
         )
         executor.prepare()
-        row.cpu_build_time_ms = executor.init_time_ms
+        row.ootb.cpu_build_time_ms = executor.init_time_ms
         with PyTorchCudaBufferManager(ctx.tensor_infos) as bm:
             bm.allocate_all()
             bm.load_input_data(ctx.input_data)
@@ -372,9 +372,9 @@ def run_single_provider_engine(
     try:
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
-        row.cpu_build_time_ms = executor.init_time_ms
+        row.ootb.cpu_build_time_ms = executor.init_time_ms
         if config.metrics.basic:
-            row.workspace_bytes = executor.workspace_size
+            row.ootb.workspace_bytes = executor.workspace_size
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -388,7 +388,7 @@ def run_single_provider_engine(
             if ctx.reference_outputs is not None:
                 bm.zero_outputs()
                 executor.execute_once(handle, variant_pack)
-                row.correctness = check_correctness(
+                row.ootb.correctness = check_correctness(
                     bm,
                     ctx.tensor_infos,
                     ctx.reference_outputs,
@@ -398,7 +398,7 @@ def run_single_provider_engine(
             elif config.validation.enabled:
                 # Validation was requested but no reference is usable: keep
                 # --validate a hard gate.
-                row.correctness = mismatch(
+                row.ootb.correctness = mismatch(
                     config, ctx.reference_error or "Reference outputs unavailable"
                 )
 

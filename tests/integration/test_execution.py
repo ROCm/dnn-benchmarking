@@ -56,8 +56,8 @@ def _assert_engines_match_reference(
     reference = [r for r in result.results if r.role == "reference"]
     assert [r.verdict for r in reference] == ["reference"], reference
     assert reference[0].runtime == "pytorch"
-    assert reference[0].gpu_kernel_stats is not None
-    assert reference[0].host_stats is not None
+    assert reference[0].ootb.gpu_kernel_stats is not None
+    assert reference[0].ootb.host_stats is not None
 
     engines = [r for r in result.results if r.role == "engine"]
     errors = [(r.engine_name, r.error_message) for r in engines if r.status == "error"]
@@ -72,7 +72,8 @@ def _assert_engines_match_reference(
     verdicts = {r.verdict for r in engines}
     assert "passed" in verdicts
     assert verdicts <= {"passed", "skipped"}, [
-        (r.engine_name, r.verdict, r.error_message or r.correctness) for r in engines
+        (r.engine_name, r.verdict, r.error_message or r.ootb.correctness)
+        for r in engines
     ]
 
 

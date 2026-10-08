@@ -210,8 +210,9 @@ class CorrectnessResult:
 class PlanResult:
     """One built and timed plan: the OOTB plan or the tuned plan.
 
-    The row is the OOTB plan (JSON ``ootb``) and ``OracleResult`` is the
-    tuned plan (JSON ``oracle``), so both serialize to the same object.
+    A row holds the OOTB plan in ``ootb`` and the tuned plan (an
+    ``OracleResult``) in ``oracle``, side by side; both serialize to the same
+    object.
 
     Attributes:
         cpu_build_time_ms: CPU time to build the plan (JSON ``build_ms``).
@@ -356,11 +357,11 @@ Verdict = Literal["passed", "failed", "unchecked", "reference", "skipped", "erro
 
 
 @dataclass
-class ProviderEngineResult(PlanResult):
+class ProviderEngineResult:
     """Result for one runtime/engine combination on one graph.
 
-    The inherited ``PlanResult`` fields describe the OOTB plan (JSON
-    ``ootb``).
+    The OOTB plan (``ootb``) and the tuned plan (``oracle``) are sibling
+    plan objects.
 
     Attributes:
         runtime: Runtime that produced the row, ``hipdnn`` or ``pytorch``.
@@ -388,6 +389,8 @@ class ProviderEngineResult(PlanResult):
             earlier engines on the same graph).
         extra_metrics: Opt-in profiling payload (rocprofv3 PMC / trace,
             perf, roofline).
+        ootb: The default (out-of-the-box) plan. Serialized only for
+            ``success`` rows.
         oracle: Tuned plan; set only for oracle runs that tuned.
         oracle_delta: Warm-baseline vs tuned comparison.
         oracle_error: Why tuning produced no result; exclusive with oracle.
@@ -417,6 +420,7 @@ class ProviderEngineResult(PlanResult):
     analytical_io_bytes: Optional[int] = None
     vram_used_mb: Optional[float] = None
     extra_metrics: Optional[Dict[str, Any]] = None
+    ootb: PlanResult = field(default_factory=PlanResult)
     oracle: Optional[OracleResult] = None
     oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
@@ -493,7 +497,7 @@ class ProviderEngineResult(PlanResult):
             return "skipped"
         if self.role == "reference":
             return "reference"
-        c = self.correctness
+        c = self.ootb.correctness
         if c is not None and c.explicitly_failed:
             return "failed"
         if c is not None and c.passed:
@@ -529,7 +533,7 @@ class ProviderEngineResult(PlanResult):
                 "clocks_before": self.clocks_before,
                 "clocks_after": self.clocks_after,
             },
-            "ootb": self.plan_dict() if self.status == "success" else None,
+            "ootb": self.ootb.plan_dict() if self.status == "success" else None,
             "oracle": (
                 {
                     **self.oracle.to_dict(),

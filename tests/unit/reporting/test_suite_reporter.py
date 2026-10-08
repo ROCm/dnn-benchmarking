@@ -3,6 +3,7 @@
 
 """Per-graph table and verbose detail block rendering."""
 
+import dataclasses
 import io
 from typing import List, Optional
 
@@ -14,6 +15,7 @@ from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
     OracleResult,
+    PlanResult,
     ProviderEngineResult,
     build_oracle_delta,
 )
@@ -23,6 +25,9 @@ def _stats(median_ms: float, n: int = 100, jitter: float = 0.0) -> BenchmarkStat
     """Samples around ``median_ms``; ``jitter`` > 0.05 makes them noisy."""
     timings = [median_ms * (1 + jitter * (-1) ** i) for i in range(n - 1)]
     return BenchmarkStats.from_timings(timings + [median_ms])
+
+
+_PLAN_FIELDS = {f.name for f in dataclasses.fields(PlanResult)}
 
 
 def _row(
@@ -40,10 +45,13 @@ def _row(
         engine_name=None if role == "reference" else name,
         status="success",
         role=role,
-        gpu_kernel_stats=stats,
-        host_stats=_stats(0.013) if stats is not None else None,
-        correctness=correctness,
-        **kwargs,
+        **{k: v for k, v in kwargs.items() if k not in _PLAN_FIELDS},
+        ootb=PlanResult(
+            gpu_kernel_stats=stats,
+            host_stats=_stats(0.013) if stats is not None else None,
+            correctness=correctness,
+            **{k: v for k, v in kwargs.items() if k in _PLAN_FIELDS},
+        ),
     )
 
 
@@ -138,7 +146,7 @@ class TestTableLayout:
 
     def test_noisy_row_is_marked_and_partial_flops_are_approximate(self) -> None:
         noisy = _row("NOISY")
-        noisy.gpu_kernel_stats = _stats(0.0256, jitter=0.2)
+        noisy.ootb.gpu_kernel_stats = _stats(0.0256, jitter=0.2)
         steady = _row("STEADY", derived_tflops_per_s=1.5, analytical_flops_partial=True)
         text = _table(noisy, steady)
         assert "µs*" in _cells(text, "NOISY")
@@ -161,7 +169,7 @@ class TestTableLayout:
 
     def test_iqr_column_is_iqr_over_median(self) -> None:
         pe = _row()
-        pe.gpu_kernel_stats = BenchmarkStats.from_timings(
+        pe.ootb.gpu_kernel_stats = BenchmarkStats.from_timings(
             [0.9] * 10 + [1.0] + [1.1] * 10
         )
         text = _table(pe)
@@ -298,7 +306,7 @@ class TestVerboseBlock:
             clocks_after={"sclk_mhz": 1500.0, "throttle_status": 0},
             timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
         )
-        pe.host_stats = _stats(0.013, n=10)
+        pe.ootb.host_stats = _stats(0.013, n=10)
         return pe
 
     def test_table_always_printed_and_verbose_adds_detail(self) -> None:

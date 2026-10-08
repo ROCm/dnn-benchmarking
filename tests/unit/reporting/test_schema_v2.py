@@ -14,6 +14,7 @@ from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
     OracleResult,
+    PlanResult,
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
@@ -132,28 +133,11 @@ def full_suite() -> SuiteResult:
         status="success",
         engine_version="1.0",
         plugin_path="/opt/lib/plugin.so",
-        cpu_build_time_ms=3.0,
-        gpu_kernel_stats=_stats(0.5),
-        host_stats=_stats(0.01),
         elapsed_time_ms=1500.0,
-        correctness=CorrectnessResult(
-            tolerance_match=True,
-            rtol=1e-3,
-            atol=1e-5,
-            max_abs_diff=1e-6,
-            max_rel_diff=1e-4,
-            error_message="note",
-            n_mismatch=0,
-            n_total=4096,
-            worst_output_uid=7,
-        ),
         warnings=["noisy: CV 6.0%"],
-        workspace_bytes=1024,
         analytical_flops=10**9,
         analytical_flops_partial=True,
         analytical_io_bytes=10**6,
-        derived_tflops_per_s=2.0,
-        derived_gbytes_per_s=2000.0,
         vram_used_mb=512.0,
         extra_metrics={
             "pmc": {"SQ_WAVES": 64},
@@ -163,9 +147,28 @@ def full_suite() -> SuiteResult:
         },
         oracle=oracle,
         oracle_delta=build_oracle_delta(oracle),
-        timing=TimingInfo("staged", "hip", "warm", 10, 12.5),
         clocks_before={"sclk_mhz": 1700},
         clocks_after={"sclk_mhz": 1650},
+        ootb=PlanResult(
+            cpu_build_time_ms=3.0,
+            gpu_kernel_stats=_stats(0.5),
+            host_stats=_stats(0.01),
+            correctness=CorrectnessResult(
+                tolerance_match=True,
+                rtol=1e-3,
+                atol=1e-5,
+                max_abs_diff=1e-6,
+                max_rel_diff=1e-4,
+                error_message="note",
+                n_mismatch=0,
+                n_total=4096,
+                worst_output_uid=7,
+            ),
+            workspace_bytes=1024,
+            derived_tflops_per_s=2.0,
+            derived_gbytes_per_s=2000.0,
+            timing=TimingInfo("staged", "hip", "warm", 10, 12.5),
+        ),
     )
     # Distinct values, so a dropped or swapped value changes the output.
     env = {k: f"env_{k}" for k in ENV_KEYS}
@@ -376,8 +379,8 @@ def test_engine_id_is_unsigned_hex() -> None:
 def test_non_finite_floats_serialize_as_null() -> None:
     suite = full_suite()
     row = suite.graphs[0].results[0]
-    row.correctness.max_rel_diff = float("inf")
-    row.derived_tflops_per_s = float("nan")
+    row.ootb.correctness.max_rel_diff = float("inf")
+    row.ootb.derived_tflops_per_s = float("nan")
     doc = json.loads(suite.to_json())  # strict: would raise on NaN tokens
     out = doc["graphs"][0]["results"][0]
     assert out["ootb"]["correctness"]["max_rel_diff"] is None

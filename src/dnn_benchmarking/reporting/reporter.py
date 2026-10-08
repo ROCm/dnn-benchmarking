@@ -116,7 +116,8 @@ def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
     """Why the oracle speedup is not reportable, or None when it is."""
     tuned_verdict = pe.oracle.correctness if pe.oracle is not None else None
     if any(
-        v is not None and v.explicitly_failed for v in (pe.correctness, tuned_verdict)
+        v is not None and v.explicitly_failed
+        for v in (pe.ootb.correctness, tuned_verdict)
     ):
         # A wrong baseline or tuned plan cannot measure a gain.
         return "invalid"
@@ -248,14 +249,14 @@ class Reporter:
         if reason is not None:
             return f"{pe.status}: {_one_line(reason)}"
         parts = [pe.verdict]
-        kernel = pe.gpu_kernel_stats
+        kernel = pe.ootb.gpu_kernel_stats
         if kernel is not None:
             parts.append(_fmt_time(kernel.median_ms))
         detail = []
         if kernel is not None:
             detail.append(f"iqr {_iqr_pct(kernel):.1f}%")
-        if pe.timing is not None:
-            detail.append(f"setup {_fmt_duration(pe.timing.first_call_ms)}")
+        if pe.ootb.timing is not None:
+            detail.append(f"setup {_fmt_duration(pe.ootb.timing.first_call_ms)}")
         elif pe.elapsed_time_ms:
             detail.append(f"took {_fmt_duration(pe.elapsed_time_ms)}")
         if detail:
@@ -370,12 +371,12 @@ class Reporter:
 
         rows = gr.results
         best_candidates = [
-            pe.gpu_kernel_stats.median_ms
+            pe.ootb.gpu_kernel_stats.median_ms
             for pe in rows
             if pe.role == "engine"
             and pe.verdict in ("passed", "unchecked")
-            and pe.gpu_kernel_stats is not None
-            and pe.gpu_kernel_stats.median_ms > 0
+            and pe.ootb.gpu_kernel_stats is not None
+            and pe.ootb.gpu_kernel_stats.median_ms > 0
         ]
         best = min(best_candidates) if best_candidates else None
         with_oracle = any(pe.oracle is not None or pe.oracle_error for pe in rows)
@@ -391,8 +392,8 @@ class Reporter:
                 [
                     (
                         "-"
-                        if pe.gpu_kernel_stats is None
-                        else f"{_iqr_pct(pe.gpu_kernel_stats):.1f}"
+                        if pe.ootb.gpu_kernel_stats is None
+                        else f"{_iqr_pct(pe.ootb.gpu_kernel_stats):.1f}"
                     )
                     for pe in rows
                 ],
@@ -401,7 +402,11 @@ class Reporter:
                 "submit",
                 True,
                 [
-                    "-" if pe.host_stats is None else _fmt_time(pe.host_stats.median_ms)
+                    (
+                        "-"
+                        if pe.ootb.host_stats is None
+                        else _fmt_time(pe.ootb.host_stats.median_ms)
+                    )
                     for pe in rows
                 ],
             ),
@@ -412,8 +417,8 @@ class Reporter:
                 [
                     (
                         "-"
-                        if pe.derived_gbytes_per_s is None
-                        else f"{pe.derived_gbytes_per_s:.1f}"
+                        if pe.ootb.derived_gbytes_per_s is None
+                        else f"{pe.ootb.derived_gbytes_per_s:.1f}"
                     )
                     for pe in rows
                 ],
@@ -458,7 +463,9 @@ class Reporter:
 
     @staticmethod
     def _legend(rows: Sequence[ProviderEngineResult]) -> str:
-        timing = next((pe.timing for pe in rows if pe.timing is not None), None)
+        timing = next(
+            (pe.ootb.timing for pe in rows if pe.ootb.timing is not None), None
+        )
         how = (
             f" ({_TIMING_MODE_LABEL.get(timing.mode, timing.mode)}; cache {timing.cache_mode})"
             if timing is not None
@@ -471,7 +478,7 @@ class Reporter:
 
     @staticmethod
     def _kernel_cell(pe: ProviderEngineResult) -> str:
-        stats = pe.gpu_kernel_stats
+        stats = pe.ootb.gpu_kernel_stats
         if stats is None:
             return "- "
         # Always one marker column so the numbers stay aligned.
@@ -479,17 +486,17 @@ class Reporter:
 
     @staticmethod
     def _tflops_cell(pe: ProviderEngineResult) -> str:
-        if pe.derived_tflops_per_s is None:
+        if pe.ootb.derived_tflops_per_s is None:
             return "-"
         return (
             "~" if pe.analytical_flops_partial else ""
-        ) + f"{pe.derived_tflops_per_s:.2f}"
+        ) + f"{pe.ootb.derived_tflops_per_s:.2f}"
 
     @staticmethod
     def _vs_best_cell(pe: ProviderEngineResult, best: Optional[float]) -> str:
         if pe.role == "reference":
             return "ref"
-        stats = pe.gpu_kernel_stats
+        stats = pe.ootb.gpu_kernel_stats
         if (
             best is None
             or pe.verdict not in ("passed", "unchecked")  # best_candidates' rule
@@ -541,16 +548,16 @@ class Reporter:
         if reason is not None:
             add(pe.status, reason)
         costs = []
-        if pe.cpu_build_time_ms is not None:
-            costs.append(f"build {_fmt_duration(pe.cpu_build_time_ms)}")
-        if pe.timing is not None:
-            costs.append(f"first call {_fmt_duration(pe.timing.first_call_ms)}")
+        if pe.ootb.cpu_build_time_ms is not None:
+            costs.append(f"build {_fmt_duration(pe.ootb.cpu_build_time_ms)}")
+        if pe.ootb.timing is not None:
+            costs.append(f"first call {_fmt_duration(pe.ootb.timing.first_call_ms)}")
         if pe.elapsed_time_ms:
             costs.append(f"row total {_fmt_duration(pe.elapsed_time_ms)}")
         if costs:
             add("cost", ", ".join(costs))
-        if pe.timing is not None:
-            t = pe.timing
+        if pe.ootb.timing is not None:
+            t = pe.ootb.timing
             text = f"{t.mode}/{t.timer}, cache {t.cache_mode}, warmup {t.warmup_iters}"
             if t.capped:
                 text += ", capped at max iters"
@@ -564,7 +571,7 @@ class Reporter:
         metrics = self._metrics_text(pe)
         if metrics:
             add("metrics", metrics)
-        if pe.correctness is not None and pe.role == "engine":
+        if pe.ootb.correctness is not None and pe.role == "engine":
             add("correctness", self._correctness_text(pe))
         for line in self._oracle_lines(pe):
             add("oracle", line)
@@ -578,7 +585,10 @@ class Reporter:
     def _stats_lines(pe: ProviderEngineResult) -> List[str]:
         named = [
             (n, s)
-            for n, s in (("kernel", pe.gpu_kernel_stats), ("submit", pe.host_stats))
+            for n, s in (
+                ("kernel", pe.ootb.gpu_kernel_stats),
+                ("submit", pe.ootb.host_stats),
+            )
             if s
         ]
         if not named:
@@ -618,8 +628,8 @@ class Reporter:
     @staticmethod
     def _metrics_text(pe: ProviderEngineResult) -> str:
         parts = []
-        if pe.workspace_bytes is not None:
-            parts.append(f"workspace {_fmt_mib(pe.workspace_bytes / 2**20)}")
+        if pe.ootb.workspace_bytes is not None:
+            parts.append(f"workspace {_fmt_mib(pe.ootb.workspace_bytes / 2**20)}")
         if pe.analytical_flops is not None:
             partial = " (partial)" if pe.analytical_flops_partial else ""
             parts.append(f"flops {pe.analytical_flops:,}{partial}")
@@ -633,7 +643,7 @@ class Reporter:
 
     @staticmethod
     def _correctness_text(pe: ProviderEngineResult) -> str:
-        c = pe.correctness
+        c = pe.ootb.correctness
         if c.tolerance_match is None:
             return f"unchecked ({c.error_message or 'no comparison performed'})"
         parts = [f"rtol {c.rtol:.0e}", f"atol {c.atol:.0e}"]

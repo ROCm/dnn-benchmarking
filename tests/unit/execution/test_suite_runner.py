@@ -339,7 +339,7 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
         failed.error_message or failed.skip_reason,
     ) == (status, status, message)
     assert failed.engine_name == "ENG_A"
-    assert failed.gpu_kernel_stats is None and failed.correctness is None
+    assert failed.ootb.gpu_kernel_stats is None and failed.ootb.correctness is None
     assert ok.status == "success"
 
 
@@ -362,10 +362,10 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
 
     row = _run()[0].results[0]
 
-    assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
-    assert row.host_stats.median_ms == pytest.approx(0.01)
-    assert row.derived_tflops_per_s == pytest.approx(2.0)
-    assert row.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
+    assert row.ootb.gpu_kernel_stats.median_ms == pytest.approx(1.0)
+    assert row.ootb.host_stats.median_ms == pytest.approx(0.01)
+    assert row.ootb.derived_tflops_per_s == pytest.approx(2.0)
+    assert row.ootb.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
     assert row.to_dict()["ootb"]["timing"] == {
         "mode": "events",
         "timer": "torch",
@@ -376,8 +376,8 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "fallback_reason": "no stream wait",
         "timing_block": 4,
     }
-    assert row.workspace_bytes == 64 and row.vram_used_mb == 12.0
-    assert row.cpu_build_time_ms == 2.0
+    assert row.ootb.workspace_bytes == 64 and row.vram_used_mb == 12.0
+    assert row.ootb.cpu_build_time_ms == 2.0
     warnings = " | ".join(row.warnings)
     for expected in (
         "outlier: max 5.0x median",
@@ -404,8 +404,8 @@ def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
 
     row = _run(metrics=MetricsConfig(basic=False))[0].results[0]
 
-    assert row.gpu_kernel_stats is not None
-    assert row.clocks_before is None and row.derived_tflops_per_s is None
+    assert row.ootb.gpu_kernel_stats is not None
+    assert row.clocks_before is None and row.ootb.derived_tflops_per_s is None
 
 
 CLOCK = {"sclk_mhz": 1700.0, "throttle_status": 0}
@@ -449,7 +449,7 @@ def test_unsupported_graph_still_gets_the_pytorch_reference_row(fake_torch):
     assert [(r.runtime, r.role, r.engine_id, r.verdict) for r in graph.results] == [
         ("pytorch", "reference", None, "reference")
     ]
-    assert graph.results[0].gpu_kernel_stats is not None
+    assert graph.results[0].ootb.gpu_kernel_stats is not None
 
 
 @pytest.mark.parametrize(
@@ -489,7 +489,7 @@ def test_engines_are_validated_against_the_timed_reference(
 
     assert (reference.role, reference.verdict) == ("reference", "reference")
     assert engine.verdict == verdict
-    assert engine.correctness.n_total == 4
+    assert engine.ootb.correctness.n_total == 4
 
 
 def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
@@ -502,7 +502,7 @@ def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
     (engine,) = _validate()[0].results
 
     assert engine.verdict == "failed"
-    assert engine.correctness.error_message == reason
+    assert engine.ootb.correctness.error_message == reason
 
 
 @pytest.mark.parametrize(
@@ -527,7 +527,7 @@ def test_failed_timed_reference(
         "ExecutionError: PyTorch GPU not available"
     )
     assert engine.verdict == engine_verdict
-    assert engine.correctness.error_message == engine_reason
+    assert engine.ootb.correctness.error_message == engine_reason
 
 
 def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
@@ -547,7 +547,9 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
     assert graph.error is None
     reference, *engines = graph.results
     assert reference.status == "skipped"
-    assert [(e.engine_id, e.verdict, e.correctness.error_message) for e in engines] == [
+    assert [
+        (e.engine_id, e.verdict, e.ootb.correctness.error_message) for e in engines
+    ] == [
         (1, "failed", "cpu reference exploded"),
         (2, "failed", "cpu reference exploded"),
     ]
@@ -767,7 +769,7 @@ def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
     ]
     assert [r.engine_id for r in graph.results] == [1, 2]
     assert [r.status for r in graph.results] == ["success", "success"]
-    assert {r.timing.mode for r in graph.results} == {"events"}
+    assert {r.ootb.timing.mode for r in graph.results} == {"events"}
     assert all("stall gate failed" in " ".join(r.warnings) for r in graph.results)
     assert "remeasuring every row of this graph without stalling" in progress
 
@@ -778,7 +780,7 @@ def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):
     graph, _ = _validate()
 
     assert [r.role for r in graph.results] == ["reference", "engine", "engine"]
-    assert {r.timing.mode for r in graph.results} == {"events"}
+    assert {r.ootb.timing.mode for r in graph.results} == {"events"}
     assert [r.verdict for r in graph.results[1:]] == ["passed", "passed"]
 
 
@@ -797,7 +799,7 @@ def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
         ("success", "ENG_B"),
     ]
     for row in graph.results:
-        assert row.gpu_kernel_stats is not None and row.extra_metrics is None
+        assert row.ootb.gpu_kernel_stats is not None and row.extra_metrics is None
         assert "profiling failed: FileNotFoundError: /proc/nope" in row.warnings
     # Every profiling progress line is completed.
     assert progress.count("profiling ENG_A ... done") == 1
@@ -863,8 +865,8 @@ class TestPytorchRuntime:
             row.role,
             row.verdict,
         ) == ("pytorch", None, "pytorch", "engine", "unchecked")
-        assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
-        assert row.timing.mode == "staged"
+        assert row.ootb.gpu_kernel_stats.median_ms == pytest.approx(1.0)
+        assert row.ootb.timing.mode == "staged"
 
     def test_stall_failure_remeasures_the_row_unstalled(self, fake_torch):
         fake_torch.stall = {"pytorch"}
@@ -872,7 +874,7 @@ class TestPytorchRuntime:
         (row,) = self._run().results
 
         assert row.status == "success"
-        assert row.timing.mode == "events"
+        assert row.ootb.timing.mode == "events"
         assert [p.stall_gate for p in fake_torch.policies] == [True, False]
 
     def test_executor_failure_is_an_error_row(self, fake_torch):

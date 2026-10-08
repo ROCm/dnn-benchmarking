@@ -148,7 +148,7 @@ def run_oracle_pass(
         invalid = [
             side
             for side, verdict in (
-                ("baseline", row.correctness),
+                ("baseline", row.ootb.correctness),
                 ("tuned plan", oracle.correctness),
             )
             if verdict is not None and verdict.explicitly_failed

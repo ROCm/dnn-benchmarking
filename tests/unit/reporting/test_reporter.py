@@ -13,6 +13,7 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    PlanResult,
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
@@ -30,11 +31,13 @@ def _passed_row(name: str = "MIOPEN_ENGINE") -> ProviderEngineResult:
         engine_id=1,
         engine_name=name,
         status="success",
-        gpu_kernel_stats=BenchmarkStats.from_timings([0.0256] * 100),
-        host_stats=BenchmarkStats.from_timings([0.013] * 100),
         elapsed_time_ms=7900.0,
-        timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
-        correctness=CorrectnessResult(True, 1e-5, 1e-6),
+        ootb=PlanResult(
+            gpu_kernel_stats=BenchmarkStats.from_timings([0.0256] * 100),
+            host_stats=BenchmarkStats.from_timings([0.013] * 100),
+            timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
+            correctness=CorrectnessResult(True, 1e-5, 1e-6),
+        ),
     )
 
 
@@ -118,7 +121,7 @@ class TestProgress:
     def test_sub_10ms_setup_keeps_two_significant_digits(self) -> None:
         err = io.StringIO()
         row = _passed_row()
-        row.timing.first_call_ms = 0.123
+        row.ootb.timing.first_call_ms = 0.123
         Reporter(io.StringIO(), err).engine_done(row)
         assert "setup 0.12 ms" in err.getvalue()
 
@@ -227,9 +230,9 @@ class TestSuiteHeader:
 class TestSummaries:
     def test_summary_counts_unchecked_and_graph_errors_and_names_the_file(self) -> None:
         unchecked = _passed_row("U")
-        unchecked.correctness = None
+        unchecked.ootb.correctness = None
         failed = _passed_row("F")
-        failed.correctness = CorrectnessResult(False, 1e-5, 1e-6)
+        failed.ootb.correctness = CorrectnessResult(False, 1e-5, 1e-6)
         suite = SuiteResult(
             run=RunInfo(started_at="t", argv=[], config={}),
             environment={},
@@ -251,7 +254,7 @@ class TestSummaries:
 
     def test_graph_table_verdict_column_shows_verdicts(self) -> None:
         failed = _passed_row("F")
-        failed.correctness = CorrectnessResult(False, 1e-5, 1e-6)
+        failed.ootb.correctness = CorrectnessResult(False, 1e-5, 1e-6)
         reference = _passed_row("R")
         reference.role = "reference"
         out = io.StringIO()

@@ -14,6 +14,7 @@ from dnn_benchmarking.reporting.statistics import BenchmarkStats
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
+    PlanResult,
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
@@ -35,10 +36,12 @@ def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
         status,
         role=role,
         plugin_path=plugin_path,
-        gpu_kernel_stats=stats if status == "success" else None,
-        host_stats=_stats(host) if host else None,
         engine_name=name,
-        correctness=CorrectnessResult(match, 1e-3, 1e-5) if validated else None,
+        ootb=PlanResult(
+            gpu_kernel_stats=stats if status == "success" else None,
+            host_stats=_stats(host) if host else None,
+            correctness=CorrectnessResult(match, 1e-3, 1e-5) if validated else None,
+        ),
     )
 
 
