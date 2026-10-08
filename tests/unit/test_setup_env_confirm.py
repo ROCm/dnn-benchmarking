@@ -7,9 +7,12 @@ Under nohup, srun or CI, stdin is closed, so the "Continue? [Y/n]" prompt
 used to die with a bare EOFError traceback that never mentioned -y/--yes.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 _SETUP_ENV = Path(__file__).resolve().parents[2] / "setup_env.py"
 
@@ -34,6 +37,23 @@ def test_closed_stdin_fails_with_a_pointer_to_yes(tmp_path: Path) -> None:
     assert "Traceback" not in result.stderr
     assert "-y/--yes" in result.stderr
     # Failed before any work: no venv was created.
+    assert not (tmp_path / "ws" / ".venv").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Closing fd 0 requires POSIX")
+def test_closed_file_descriptor_fails_before_creating_a_venv(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(_SETUP_ENV), "--workspace", str(tmp_path / "ws")],
+        preexec_fn=lambda: os.close(0),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "-y/--yes" in result.stderr
     assert not (tmp_path / "ws" / ".venv").exists()
 
 

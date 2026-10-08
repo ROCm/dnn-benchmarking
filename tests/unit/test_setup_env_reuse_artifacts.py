@@ -1,11 +1,10 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for setup_env.py --reuse-artifacts and the hipDNN Python bindings.
+"""Reuse requires an installed binding package in the preserved venv.
 
---reuse-artifacts builds nothing, including the hipdnn_frontend bindings. With
-a fresh venv (--torch-mode cpu) setup used to warn and then print "Setup
-complete" for an environment that cannot import hipdnn_frontend.
+The binding may be present even when its native libraries cannot be loaded on
+the setup host. Checking for its package must not import those libraries.
 """
 
 import importlib.util
@@ -27,54 +26,89 @@ def setup_env():
     return module
 
 
-def _reuse_setup(module, tmp_path, monkeypatch, frontend_importable: bool):
+def _installed_setup(module, tmp_path, monkeypatch):
     prefix = tmp_path / "install"
+    for name in ("hipdnn_frontend", "hipdnn_backend"):
+        config = prefix / "lib" / "cmake" / name / f"{name}Config.cmake"
+        config.parent.mkdir(parents=True)
+        config.write_text("", encoding="utf-8")
+
     args = module.build_parser().parse_args(
         [
             "--workspace",
             str(tmp_path / "ws"),
             "--torch-mode",
-            "cpu",
+            "existing",
             "--rocm-prefix",
             str(prefix),
             "--reuse-artifacts",
         ]
     )
     setup = module.Setup(args)
-    monkeypatch.setattr(setup, "prefix_has_hipdnn", lambda prefix: True)
-    monkeypatch.setattr(setup, "maybe_install_amdsmi", lambda *a: None)
-    monkeypatch.setattr(setup, "write_activate_local", lambda *a: None)
-    monkeypatch.setattr(
-        setup,
-        "probe",
-        lambda code, *a: subprocess.CompletedProcess(
-            [], 0 if frontend_importable else 1, "", ""
-        ),
-    )
+    subprocess.run([sys.executable, "-m", "venv", str(setup.venv_dir)], check=True)
+    monkeypatch.setattr(setup, "maybe_install_amdsmi", lambda *prefixes: None)
     return setup, str(prefix)
 
 
-def test_reuse_without_bindings_fails_instead_of_claiming_success(
+def test_reuse_without_installed_bindings_fails(
     setup_env, tmp_path, monkeypatch, capsys
-) -> None:
-    setup, prefix = _reuse_setup(
-        setup_env, tmp_path, monkeypatch, frontend_importable=False
-    )
+):
+    setup, prefix = _installed_setup(setup_env, tmp_path, monkeypatch)
 
     with pytest.raises(SystemExit) as caught:
         setup.build_and_install(prefix)
 
     assert caught.value.code == 1
-    assert "--torch-mode existing" in capsys.readouterr().err
+    assert "hipdnn_frontend is not installed" in capsys.readouterr().err
 
 
-def test_reuse_with_bindings_already_in_the_venv_proceeds(
+def test_reuse_detects_bindings_without_loading_native_libraries(
     setup_env, tmp_path, monkeypatch
-) -> None:
-    setup, prefix = _reuse_setup(
-        setup_env, tmp_path, monkeypatch, frontend_importable=True
+):
+    setup, prefix = _installed_setup(setup_env, tmp_path, monkeypatch)
+    site = setup.probe("import sysconfig; print(sysconfig.get_path('purelib'))")
+    assert site.returncode == 0, site.stderr
+    package = Path(site.stdout.strip()) / "hipdnn_frontend"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "raise OSError('native ROCm runtime is unavailable on this host')\n",
+        encoding="utf-8",
     )
+    native_import = setup.probe("import hipdnn_frontend")
+    assert native_import.returncode != 0
+    assert "native ROCm runtime is unavailable" in native_import.stderr
 
     setup.build_and_install(prefix)
 
     assert setup.env["ROCM_PATH"] == prefix
+
+
+@pytest.mark.parametrize("mode", ("rocm", "cpu", "none"))
+def test_reuse_with_recreated_venv_fails_before_modifying_it(mode, tmp_path):
+    workspace = tmp_path / "ws"
+    venv = workspace / ".venv"
+    venv.mkdir(parents=True)
+    marker = venv / "keep"
+    marker.write_text("original", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SETUP_ENV),
+            "--workspace",
+            str(workspace),
+            "--torch-mode",
+            mode,
+            "--reuse-artifacts",
+            "--yes",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "--torch-mode existing" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert marker.read_text(encoding="utf-8") == "original"

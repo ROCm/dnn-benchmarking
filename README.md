@@ -44,12 +44,13 @@ Run the provided setup script from the `dnn-benchmarking` directory:
 `rocm-libraries` (hipDNN sources and provider plugins) is a git submodule
 tracking its `develop` branch by default. `setup_env.py` fetches it
 automatically on first run via a sparse, blobless clone limited to what this
-tool builds (`cmake`, `shared`, `projects/hipdnn`, `dnn-providers`) rather than
-the full ~9GB monorepo, and build hipDNN plus the provider plugins from it
-by default (pass `--reuse-artifacts` to skip and reuse whatever is already
-installed instead; it fetches no sources and builds no Python bindings, so use
-it with `--torch-mode existing` on a venv that already imports
-`hipdnn_frontend`). A submodule already populated by
+tool builds (`cmake`, `shared/ctest`, `projects/hipdnn`, `dnn-providers`) rather than
+the full ~9GB monorepo, and builds hipDNN plus the provider plugins from it
+by default (pass `--reuse-artifacts` to use an existing install instead).
+Reuse fetches no sources and builds no Python bindings. For hipDNN, use
+`--reuse-artifacts --torch-mode existing` with a venv where
+`hipdnn_frontend` is installed; ROCm/CPU torch modes are rejected before the
+venv is changed. CUDA mode uses PyTorch only. A submodule already populated by
 `git submodule update --init` (a full, non-sparse checkout) is left as-is.
 To build against a different rocm-libraries ref, check it out directly,
 e.g. `git -C rocm-libraries fetch --depth 1 origin <ref> && git -C

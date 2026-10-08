@@ -35,10 +35,9 @@ IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
-# Root directories the hipDNN/provider configure reads. Without shared/,
-# configure falls back to legacy CTest labels ("shared/ctest or test category
-# YAML not found").
-ROCM_LIBRARIES_ROOT_DIRS = ("cmake", "shared")
+# Root directories read by hipDNN/provider configure. Only shared/ctest supplies
+# the test category CMake file; the rest of shared/ is unnecessary here.
+ROCM_LIBRARIES_ROOT_DIRS = ("cmake", "shared/ctest")
 ROCM_LIBRARIES_SPARSE_DIRS = (
     *ROCM_LIBRARIES_ROOT_DIRS,
     "projects/hipdnn",
@@ -1318,14 +1317,26 @@ class Setup:
         )
         if self.do_build:
             self.build_and_install_bindings(install_prefix, toolchain_prefix)
-        elif self.probe("import hipdnn_frontend").returncode != 0:
-            fail(
-                "ERROR: --reuse-artifacts builds no hipDNN Python bindings, and "
-                f"hipdnn_frontend is not importable in {self.venv_dir}.",
-                "Use --torch-mode existing with a venv that already has "
-                "hipdnn_frontend, or drop --reuse-artifacts to build hipDNN and "
-                "its bindings.",
+        else:
+            # Reuse builds no bindings. Check installation without loading native
+            # HIP libraries, which may require ROCm wheel initialization at run time.
+            installed = self.probe(
+                "import importlib.util, sys; "
+                "sys.exit(importlib.util.find_spec('hipdnn_frontend') is None)"
             )
+            if installed.returncode != 0:
+                if installed.stderr.strip():
+                    fail(
+                        f"ERROR: could not inspect {self.venv_dir} for hipdnn_frontend.",
+                        installed.stderr.strip(),
+                    )
+                fail(
+                    "ERROR: --reuse-artifacts builds no hipDNN Python bindings, and "
+                    f"hipdnn_frontend is not installed in {self.venv_dir}.",
+                    "Use --torch-mode existing with a venv that already has "
+                    "hipdnn_frontend, or drop --reuse-artifacts to build hipDNN "
+                    "and its bindings.",
+                )
 
     # -- confirmation prompt ------------------------------------------------
 
@@ -1342,7 +1353,9 @@ class Setup:
         prompt = f"This will {' and '.join(actions)}. Continue? [Y/n] "
         try:
             confirm = input(prompt)
-        except (EOFError, OSError):
+        except (EOFError, OSError, RuntimeError) as exc:
+            if isinstance(exc, RuntimeError) and "lost sys.stdin" not in str(exc):
+                raise
             # nohup, srun and CI give no readable stdin, so input() cannot ask.
             fail(
                 "",
@@ -1425,6 +1438,13 @@ class Setup:
 
     def run(self) -> int:
         self.require_python_version()
+        if self.reuse_artifacts and self.torch_mode not in ("existing", "cuda"):
+            fail(
+                f"ERROR: --reuse-artifacts cannot use --torch-mode {self.torch_mode}: "
+                "setup would replace the venv without rebuilding hipDNN bindings.",
+                "Use --torch-mode existing with a venv that already has "
+                "hipdnn_frontend, or drop --reuse-artifacts to build the bindings.",
+            )
         self.workspace.mkdir(parents=True, exist_ok=True)
 
         self.confirm_build()

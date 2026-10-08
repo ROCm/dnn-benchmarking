@@ -1,12 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for the rocm-libraries sparse checkout made by setup_env.py.
-
-The hipDNN configure reads rocm-libraries/shared for its test category YAML.
-A sparse checkout without it configures with legacy CTest labels and says so
-only in a configure message.
-"""
+"""The setup checkout must stage hipDNN's CTest categories, without all of shared/."""
 
 import importlib.util
 import subprocess
@@ -18,66 +13,100 @@ import pytest
 _SETUP_ENV = Path(__file__).resolve().parents[2] / "setup_env.py"
 
 
+def _git(*args: str) -> str:
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
 @pytest.fixture()
-def setup_env(tmp_path, monkeypatch):
+def checkout_source(tmp_path):
+    source = tmp_path / "rocm-libraries-source"
+    _git("init", "--quiet", "-b", "main", str(source))
+    files = {
+        "CMakePresets.json": "{}\n",
+        "cmake/Settings.cmake": "# root CMake helper\n",
+        "shared/ctest/TestCategories.cmake": "# required by hipDNN configure\n",
+        "shared/tensile/large_unneeded_file.txt": "not a configure input\n",
+        "projects/hipdnn/CMakeLists.txt": "# hipDNN\n",
+        "dnn-providers/CMakeLists.txt": "# providers\n",
+    }
+    for name, content in files.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git("-C", str(source), "add", ".")
+    _git(
+        "-C",
+        str(source),
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.org",
+        "commit",
+        "--quiet",
+        "-m",
+        "local sparse-checkout fixture",
+    )
+    return source
+
+
+@pytest.fixture()
+def setup_env(tmp_path, monkeypatch, checkout_source):
+    root = tmp_path / "dnn-benchmarking"
+    root.mkdir()
+    (root / ".gitmodules").write_text(
+        '[submodule "rocm-libraries"]\n'
+        "    path = rocm-libraries\n"
+        f"    url = {checkout_source.as_posix()}\n"
+        "    branch = main\n",
+        encoding="utf-8",
+    )
     spec = importlib.util.spec_from_file_location("setup_env_sparse", _SETUP_ENV)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "ROCM_LIBRARIES_DIR", tmp_path / "rocm-libraries")
-    return module
+    monkeypatch.setattr(module, "SCRIPT_DIR", root)
+    monkeypatch.setattr(module, "ROCM_LIBRARIES_DIR", root / "rocm-libraries")
+    return module, root
 
 
-def _record_git(module, monkeypatch, sparse: bool) -> list:
-    calls = []
-
-    def fake_git_output(args):
-        if args[-1] == "core.sparseCheckout":
-            if not sparse:
-                raise subprocess.CalledProcessError(1, ["git", *args])
-            return "true"
-        return "abc123"
-
-    monkeypatch.setattr(module, "git_output", fake_git_output)
-    monkeypatch.setattr(module, "run_git", lambda args, **kw: calls.append(args))
-    return calls
+def _setup(module, root):
+    args = module.build_parser().parse_args(["--workspace", str(root / "workspace")])
+    return module.Setup(args)
 
 
-def _setup(module):
-    return module.Setup(module.build_parser().parse_args(["--workspace", "ws"]))
+def test_fresh_sparse_checkout_stages_categories_without_tensile(setup_env):
+    module, root = setup_env
+
+    _setup(module, root).ensure_rocm_libraries_checkout()
+
+    checkout = root / "rocm-libraries"
+    assert (checkout / "shared/ctest/TestCategories.cmake").is_file()
+    assert not (checkout / "shared/tensile/large_unneeded_file.txt").exists()
+    assert (checkout / "cmake/Settings.cmake").is_file()
+    assert (checkout / "CMakePresets.json").is_file()
 
 
-def test_a_fresh_checkout_includes_shared(setup_env, monkeypatch) -> None:
-    calls = _record_git(setup_env, monkeypatch, sparse=True)
-
-    _setup(setup_env).ensure_rocm_libraries_checkout()
-
-    (sparse_set,) = [c for c in calls if c[2:4] == ["sparse-checkout", "set"]]
-    assert {"cmake", "shared", "projects/hipdnn", "dnn-providers"} <= set(
-        sparse_set[4:]
+def test_existing_sparse_checkout_gains_missing_categories_without_tensile(
+    setup_env, checkout_source
+):
+    module, root = setup_env
+    checkout = root / "rocm-libraries"
+    _git("clone", "--quiet", "--no-checkout", str(checkout_source), str(checkout))
+    _git("-C", str(checkout), "sparse-checkout", "init", "--cone")
+    _git(
+        "-C",
+        str(checkout),
+        "sparse-checkout",
+        "set",
+        "cmake",
+        "projects/hipdnn",
+        "dnn-providers",
     )
+    _git("-C", str(checkout), "checkout", "--quiet", "main")
+    assert not (checkout / "shared/ctest/TestCategories.cmake").exists()
 
+    _setup(module, root).ensure_rocm_libraries_checkout()
 
-def test_an_older_sparse_checkout_gains_shared(setup_env, monkeypatch) -> None:
-    root = setup_env.ROCM_LIBRARIES_DIR
-    (root / ".git").mkdir(parents=True)
-    (root / "cmake").mkdir()
-    calls = _record_git(setup_env, monkeypatch, sparse=True)
-
-    _setup(setup_env).ensure_rocm_libraries_checkout()
-
-    assert [c for c in calls if "sparse-checkout" in c] == [
-        ["-C", str(root), "sparse-checkout", "add", "shared"]
-    ]
-
-
-def test_a_full_checkout_is_left_alone(setup_env, monkeypatch) -> None:
-    """A non-sparse checkout of a ref without shared/ must not break setup."""
-    root = setup_env.ROCM_LIBRARIES_DIR
-    (root / ".git").mkdir(parents=True)
-    (root / "cmake").mkdir()
-    calls = _record_git(setup_env, monkeypatch, sparse=False)
-
-    _setup(setup_env).ensure_rocm_libraries_checkout()
-
-    assert calls == []
+    assert (checkout / "shared/ctest/TestCategories.cmake").is_file()
+    assert not (checkout / "shared/tensile/large_unneeded_file.txt").exists()
