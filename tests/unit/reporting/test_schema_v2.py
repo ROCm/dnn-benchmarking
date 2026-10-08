@@ -25,7 +25,7 @@ RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
     "runtime", "engine_filter", "plugin_paths", "warmup_iters", "iters",
     "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
-    "oracle_mode", "autotune", "hipdnn_cache_dir", "pytorch_sdpa_backend",
+    "oracle", "autotune", "hipdnn_cache_dir", "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library", "metrics", "profiling",
 }  # fmt: skip
 PROFILING_KEYS = {"pmc", "trace", "perf", "roofline"}

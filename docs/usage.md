@@ -84,7 +84,7 @@ log2 values of e8m0 outputs. The source is `TOLERANCES` in
 
 | Option | Default | Description |
 |---|---|---|
-| `--oracle-mode {off,exhaustive}` | off | Also build and time a tuned (`global.benchmarking=1`) plan of each engine, and a tuned PyTorch run. See [Oracle mode](#oracle-mode). |
+| `--oracle`, `--no-oracle` | off | Also build and time a tuned (`global.benchmarking=1`) plan of each engine, and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
 
 ### Output
 
@@ -154,7 +154,7 @@ format and result schema as the hipDNN backend. It runs on ROCm and on CUDA.
 These options are hipDNN-only. With `--runtime pytorch` they stop the run
 with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`, `--pmc`,
 `--trace`, `--perf`, `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
-`--oracle-mode exhaustive` is accepted: the PyTorch row gets a tuned run (see
+`--oracle` is accepted: the PyTorch row gets a tuned run (see
 [PyTorch kernel selection](#pytorch-kernel-selection)).
 
 The SDPA options (`--pytorch-sdpa-backend`, `--pytorch-rocm-fa-library`) have
@@ -183,7 +183,7 @@ only control. The tool prints the settings.
 | `PYTORCH_MIOPEN_SUGGEST_NHWC=1` | Without it, the PyTorch MIOpen conv path transposes NHWC graphs to NCHW inside the timed region. |
 | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` | Without it, AOTriton rejects architectures that it marks experimental, and SDPA falls back to a slower backend. |
 
-With `--oracle-mode exhaustive`, every PyTorch row (the `--runtime pytorch`
+With `--oracle`, every PyTorch row (the `--runtime pytorch`
 row and the `--validate pytorch` reference row) also gets a tuned run: MIOpen
 exhaustive conv search (`torch.backends.cudnn.benchmark=True`) and TunableOp
 GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
@@ -229,11 +229,11 @@ The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
 value in the environment without `--autotune`, and when `--autotune` has no
 `--hipdnn-cache-dir`.
 
-## Oracle mode
+## Oracle
 
-`--oracle-mode exhaustive` compares the default (out-of-the-box, OOTB) plan
-of each engine with a tuned plan of the same engine. The default, `off`, times
-the OOTB plan only.
+`--oracle` compares the default (out-of-the-box, OOTB) plan of each engine
+with a tuned plan of the same engine. Without it, the tool times the OOTB plan
+only.
 
 The tool builds both plans through one timed path:
 `create_execution_plan_ext(engine_id, knobs)`, then `check_support()`, then
@@ -247,7 +247,7 @@ The tool builds both plans through one timed path:
 The build time covers only those three calls. Graph deserialization, the
 operation graph build and the workspace allocation are not timed.
 
-1. Before the timed OOTB build, every run (also without `--oracle-mode`)
+1. Before the timed OOTB build, every run (also without `--oracle`)
    builds the OOTB plan of the engine one time, untimed, and discards it. The
    first build of an engine in a process also pays one-time costs: provider
    setup and, on a cold page cache, the read of the plugin and kernel files.
@@ -291,13 +291,14 @@ supply tuned selections. For a cold OOTB baseline, set
 `HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` and `HIPDNN_DISABLE_CACHE=1`. The tool
 shows a warning when `HIPDNN_DISABLE_EXACT_ENGINE_CACHE` is not set, and,
 once that is set, when `HIPDNN_DISABLE_CACHE` is not set. It also shows a
-warning when `HIPDNN_FORCE_BENCHMARKING` is set (also by `--autotune`): the
+warning when `HIPDNN_FORCE_BENCHMARKING` is set in the environment: the
 providers apply that variable before the knob, so it reaches both plans.
+`--autotune` sets that variable, so the tool rejects `--oracle --autotune`.
 `environment.selection_env` records the relevant variables.
 
 ```bash
 HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 HIPDNN_DISABLE_CACHE=1 dnn-benchmark \
-  -g graphs/sample_conv_fwd.json --oracle-mode exhaustive -v -o oracle.json
+  -g graphs/sample_conv_fwd.json --oracle -v -o oracle.json
 ```
 
 ## Config files
@@ -361,7 +362,7 @@ Table columns:
 | `tflops` | TFLOP/s from the median. `-` when the FLOP count is unknown (a node with no formula). |
 | `gbps` | GB/s (10^9 bytes/s) from the median. |
 | `vs_best` | Best median of the graph divided by the row median. `1.00x` is the fastest row. `ref` marks the reference row. |
-| `oracle` | Only with `--oracle-mode`. See [Oracle mode](#oracle-mode). |
+| `oracle` | Only with `--oracle`. See [Oracle](#oracle). |
 | `note` | The skip or error reason, or the first row warning other than `noisy:`. `(+N)` shows the number of more warnings. |
 
 Example (MI210, `-g graphs/sample_conv_fwd.json graphs/sample_layernorm.json`):

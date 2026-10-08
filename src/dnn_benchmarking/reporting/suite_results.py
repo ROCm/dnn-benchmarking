@@ -43,7 +43,7 @@ RUN_CONFIG_KEYS = (
     "validate",
     "rtol",
     "atol",
-    "oracle_mode",
+    "oracle",
     "autotune",
     "hipdnn_cache_dir",
     "pytorch_sdpa_backend",

@@ -188,8 +188,6 @@ def _pytorch_tuned_argv(
         "dnn_benchmarking.cli.pytorch_tuned_child",
         "--runtime",
         "pytorch",
-        "--oracle-mode",
-        "off",
         "--no-metrics",
         "--quiet",
         "--graph",

@@ -12,7 +12,6 @@ import pytest
 from dnn_benchmarking.config import (
     RuntimeName,
     MetricsConfig,
-    OracleMode,
     PyTorchSdpaBackendName,
     SuiteConfig,
 )
@@ -100,8 +99,8 @@ def test_engine_selection_runs_in_caller_order(hipdnn) -> None:
 
 
 def test_oracle_exhaustive_times_a_knob_built_plan(hipdnn) -> None:
-    """--oracle-mode exhaustive builds and times a global.benchmarking plan."""
-    result, successes = _run_conv(hipdnn, oracle_mode=OracleMode.EXHAUSTIVE)
+    """--oracle builds and times a global.benchmarking plan."""
+    result, successes = _run_conv(hipdnn, oracle=True)
     tuned = [r for r in successes if r.oracle is not None]
     assert tuned, [(r.engine_name, r.oracle_error) for r in successes]
 

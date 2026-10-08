@@ -117,11 +117,11 @@ def tuned(monkeypatch):
 
 def _config(**kw):
     kw.setdefault("validation", ValidationConfig(provider="pytorch"))
-    return SuiteConfig(oracle_mode="exhaustive", **kw)
+    return SuiteConfig(oracle=True, **kw)
 
 
 def _pytorch_config(**kw):
-    return SuiteConfig(oracle_mode="exhaustive", runtime="pytorch", **kw)
+    return SuiteConfig(oracle=True, runtime="pytorch", **kw)
 
 
 def _row(correctness=None):
@@ -386,7 +386,7 @@ def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
     assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.pytorch_tuned_child"]
     assert args.graph == [str(tmp_path / "g.json")]
     assert child_config.runtime == "pytorch"
-    assert child_config.oracle_mode == "off"
+    assert child_config.oracle is False
     assert child_config.timing_policy == config.timing_policy
     assert child_config.seed == 11
 

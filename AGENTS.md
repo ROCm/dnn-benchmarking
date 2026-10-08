@@ -87,7 +87,7 @@ src/dnn_benchmarking/
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
-│   ├── oracle.py             # --oracle-mode pass
+│   ├── oracle.py             # --oracle pass
 │   └── correctness.py        # output comparison for a row
 ├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
 ├── metrics/

@@ -63,7 +63,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
-| `oracle_mode` | string | `off` or `exhaustive`. |
+| `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
 | `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
@@ -99,7 +99,7 @@ The CLI collects these values one time, at suite start.
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
-| `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle-mode` or `--autotune` is set. |
+| `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle` or `--autotune` is set. |
 
 ## summary
 
@@ -156,7 +156,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 | `elapsed_s` | float | Wall time of the whole row, seconds: build, priming, timing, validation, oracle and profiling. |
 | `metrics` | object | Graph values and GPU state. See [metrics](#metrics). |
 | `ootb` | object or null | The default (out-of-the-box) plan. See [plan](#plan). `null` when `status` is `error` or `skipped`. |
-| `oracle` | object or null | The tuned plan. See [oracle](#oracle). `null` unless `--oracle-mode` ran for the row and tuning produced a result. |
+| `oracle` | object or null | The tuned plan. See [oracle](#oracle). `null` unless `--oracle` ran for the row and tuning produced a result. |
 | `oracle_error` | string or null | Why tuning produced no result. `oracle` is then `null`. |
 | `warnings` | array of string | Non-fatal notes. See [Row warnings](#row-warnings). |
 | `extra_metrics` | object or null | Profiling results. See [extra_metrics](#extra_metrics). |
@@ -280,7 +280,7 @@ The tool never removes samples because of a warning.
 
 ### oracle
 
-`oracle` is `null` unless `--oracle-mode exhaustive` ran for the row and the
+`oracle` is `null` unless `--oracle` ran for the row and the
 tuned run produced a result. When the tuned run fails, `oracle_error` gives
 the reason and `oracle` is `null`.
 

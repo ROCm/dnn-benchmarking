@@ -336,7 +336,7 @@ def _run_pytorch_row(
             )
         # After the OOTB buffers are released, so the child's allocations do
         # not stack on top of them.
-        if config.oracle_enabled:
+        if config.oracle:
             run_pytorch_tuned(
                 row=row,
                 graph_path=ctx.graph_path,
@@ -391,7 +391,7 @@ def run_single_provider_engine(
                 graph_name=ctx.graph_name,
                 config=config,
             )
-            if config.oracle_enabled
+            if config.oracle
             else None
         )
 

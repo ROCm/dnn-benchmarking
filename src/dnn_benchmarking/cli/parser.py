@@ -16,7 +16,6 @@ from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
     RuntimeName,
     MetricsConfig,
-    OracleMode,
     PMC_SET_CHOICES,
     PyTorchSdpaBackendName,
     ReferenceProviderName,
@@ -399,14 +398,14 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_optional=True,
     ),
     # Comparison
-    _choice_option(
-        ("--oracle-mode",),
-        "oracle_mode",
+    _bool_option(
+        ("--oracle",),
+        "oracle",
         "Comparison",
-        _values(OracleMode),
-        _default(SuiteConfig, "oracle_mode"),
-        "exhaustive: also build and time a global.benchmarking=1 plan per "
-        "engine, and a tuned PyTorch run in a child process (much slower)",
+        SuiteConfig,
+        "oracle",
+        "also build and time a global.benchmarking=1 plan per engine, and a "
+        "tuned PyTorch run in a child process (much slower; not with --autotune)",
     ),
     # Output
     CliOption(

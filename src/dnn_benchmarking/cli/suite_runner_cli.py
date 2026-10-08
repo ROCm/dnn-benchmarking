@@ -145,7 +145,7 @@ def run_suite_cli(
     _apply_pytorch_environment(config, reporter)
     if config.runtime is RuntimeName.HIPDNN:
         _apply_tuning_environment(config, reporter)
-        if config.oracle_enabled:
+        if config.oracle:
             _warn_oracle(reporter)
 
     try:
@@ -213,7 +213,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         ),
         "rtol": config.validation.rtol,
         "atol": config.validation.atol,
-        "oracle_mode": config.oracle_mode.value,
+        "oracle": config.oracle,
         "autotune": config.autotune,
         "hipdnn_cache_dir": config.hipdnn_cache_dir,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
@@ -269,7 +269,7 @@ def _run_suite(
 ) -> int:
     """Run every graph, writing results as it goes; return the exit code."""
     environment = collect_environment_info()
-    if config.oracle_enabled or config.autotune:
+    if config.oracle or config.autotune:
         environment["selection_env"] = {n: os.environ.get(n) for n in _SELECTION_ENV}
     run_config = _run_config(config)
     total = len(graph_paths)
@@ -334,7 +334,7 @@ def _run_suite(
     reporter.print_summary(
         suite, str(output_path) if output_path and write_ok else None
     )
-    if config.oracle_enabled:
+    if config.oracle:
         reporter.print_oracle_summary(suite.graphs)
     return _exit_code(suite, write_ok)
 
@@ -379,16 +379,16 @@ def _warn_oracle(reporter: Reporter) -> None:
     """One line per condition that makes the OOTB or tuned plan non-cold."""
     if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
         reporter.warning(
-            "--oracle-mode: exact-engine cache is on, so the OOTB timing may "
+            "--oracle: exact-engine cache is on, so the OOTB timing may "
             "replay a persisted ranking (HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for cold)"
         )
     elif not _truthy_env("HIPDNN_DISABLE_CACHE"):
         reporter.warning(
-            "--oracle-mode: provider kernel caches are on "
+            "--oracle: provider kernel caches are on "
             "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
         )
     reporter.info(
-        "--oracle-mode exhaustive: each engine gets a second plan built with "
+        "--oracle: each engine gets a second plan built with "
         "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
         "engines re-measure the OOTB plan); MIOpen may reuse FindDb entries"
     )
@@ -397,9 +397,9 @@ def _warn_oracle(reporter: Reporter) -> None:
         # Providers apply the variable as override.value_or(knob): it wins over
         # the tuned plan's knob and also reaches the OOTB plan.
         reporter.warning(
-            f"--oracle-mode with HIPDNN_FORCE_BENCHMARKING={forced} (set directly "
-            "or by --autotune): it overrides the global.benchmarking knob for the "
-            "OOTB and the tuned plan, so the two may not differ"
+            f"--oracle with HIPDNN_FORCE_BENCHMARKING={forced} in the environment: "
+            "it overrides the global.benchmarking knob for the OOTB and the tuned "
+            "plan, so the two may not differ"
         )
 
 
@@ -415,7 +415,7 @@ def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
         return
     effective = apply_pytorch_environment()
     settings = ", ".join(f"{k}={v}" for k, v in effective.items())
-    tuned = "; tuned runs use an isolated subprocess" if config.oracle_enabled else ""
+    tuned = "; tuned runs use an isolated subprocess" if config.oracle else ""
     reporter.info(f"PyTorch kernel selection: {settings}{tuned}")
 
 

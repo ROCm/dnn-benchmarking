@@ -483,7 +483,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "validate": "pytorch",
         "rtol": None,
         "atol": None,
-        "oracle_mode": "off",
+        "oracle": False,
         "autotune": False,
         "hipdnn_cache_dir": None,
         "pytorch_sdpa_backend": "flash",
@@ -512,18 +512,14 @@ def test_run_config_records_non_default_selection_and_validation(
     _run(
         _args(
             *("-o", str(out), "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
-            *("--validate", "pytorch", "--rtol", "1e-3", "--oracle-mode", "exhaustive"),
+            *("--validate", "pytorch", "--rtol", "1e-3"),
             *("--autotune", "--hipdnn-cache-dir", cache),
         ),
         _graphs(tmp_path, 1),
     )
     config = SuiteResult.load(out)["run"]["config"]
-    picked = {k: config[k] for k in ("engine_filter", "rtol", "oracle_mode")}
-    assert picked == {
-        "engine_filter": ["0x15B46865C717A122"],
-        "rtol": 1e-3,
-        "oracle_mode": "exhaustive",
-    }
+    picked = {k: config[k] for k in ("engine_filter", "rtol")}
+    assert picked == {"engine_filter": ["0x15B46865C717A122"], "rtol": 1e-3}
     assert (config["autotune"], config["hipdnn_cache_dir"]) == (True, cache)
 
 
@@ -532,10 +528,11 @@ def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -
     plain, oracle = tmp_path / "plain.json", tmp_path / "oracle.json"
     tuned = tmp_path / "tuned.json"
     _run(_args("-o", str(plain)), _graphs(tmp_path, 1))
-    _run(_args("-o", str(oracle), "--oracle-mode", "exhaustive"), _graphs(tmp_path, 1))
+    _run(_args("-o", str(oracle), "--oracle"), _graphs(tmp_path, 1))
     _run(_args("-o", str(tuned), "--autotune"), _graphs(tmp_path, 1))
 
     assert SuiteResult.load(plain)["environment"]["selection_env"] is None
+    assert SuiteResult.load(oracle)["run"]["config"]["oracle"] is True
     env = SuiteResult.load(oracle)["environment"]["selection_env"]
     assert set(env) == set(suite_runner_cli._SELECTION_ENV)
     env = SuiteResult.load(tuned)["environment"]["selection_env"]
@@ -782,7 +779,7 @@ def test_oracle_warns_on_non_cold_baseline(
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle-mode", "exhaustive", *argv), _graphs(tmp_path, 1))
+    _, text = _run(_args("--oracle", *argv), _graphs(tmp_path, 1))
     warnings = _warnings(text)
     if expected is None:
         assert warnings == ""
@@ -811,27 +808,25 @@ def test_final_write_survives_a_second_signal(
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 
-@pytest.mark.parametrize("mode", ["off", "exhaustive"])
-def test_exhaustive_oracle_states_the_tuned_plan_knob(tmp_path, runtime, mode) -> None:
+@pytest.mark.parametrize("flag", ["--no-oracle", "--oracle"])
+def test_oracle_states_the_tuned_plan_knob(tmp_path, runtime, flag) -> None:
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle-mode", mode), _graphs(tmp_path, 1))
+    _, text = _run(_args(flag), _graphs(tmp_path, 1))
     notice = "each engine gets a second plan built with global.benchmarking=1"
-    assert (notice in text) == (mode == "exhaustive")
+    assert (notice in text) == (flag == "--oracle")
 
 
 @pytest.mark.parametrize(
-    "forced, argv, warned",
-    [(None, [], False), ("0", [], True), (None, ["--autotune"], True)],
-    ids=["unset", "env", "autotune"],
+    "forced, warned", [(None, False), ("0", True)], ids=["unset", "env"]
 )
 def test_forced_benchmarking_warns_it_overrides_the_tuned_knob(
-    tmp_path, runtime, monkeypatch, forced, argv, warned
+    tmp_path, runtime, monkeypatch, forced, warned
 ) -> None:
     # Any value overrides the knob, "0" included: providers read it as a value.
     if forced is not None:
         monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", forced)
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle-mode", "exhaustive", *argv), _graphs(tmp_path, 1))
+    _, text = _run(_args("--oracle"), _graphs(tmp_path, 1))
     assert ("overrides the global.benchmarking knob" in _warnings(text)) == warned
 
 

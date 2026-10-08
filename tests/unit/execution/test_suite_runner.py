@@ -431,7 +431,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
 def test_every_executor_gets_the_run_policy(fake):
     config = dict(warmup_iters=3, benchmark_iters=5, cache_mode="cold")
 
-    _run(oracle_mode="exhaustive", **config)
+    _run(oracle=True, **config)
 
     # Discovery, then per engine the prime, the OOTB plan and the tuned plan.
     assert fake.policies == [SuiteConfig(**config).timing_policy] * 7
@@ -446,7 +446,7 @@ def test_oracle_builds_both_plans_before_anything_runs(fake, reference, monkeypa
     monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
     handle = _Handle()
 
-    graph, _ = _validate(handle=handle, oracle_mode="exhaustive")
+    graph, _ = _validate(handle=handle, oracle=True)
 
     assert [(name, h is handle, cache) for name, h, cache in fake.calls] == [
         ("prime", True, None),
@@ -475,7 +475,7 @@ def test_tuned_plan_failing_validation_publishes_no_speedup(
 
     monkeypatch.setattr(suite_runner, "run_tuned_plan", wrong_tuned_outputs)
 
-    graph, _ = _validate(oracle_mode="exhaustive", engine_filter=[1])
+    graph, _ = _validate(oracle=True, engine_filter=[1])
 
     (row,) = graph.results
     assert (row.status, row.verdict) == ("success", "passed")
@@ -704,7 +704,7 @@ def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
 
 
 def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
-    """Without --oracle-mode or a profiling flag, no engine gets a tuned plan
+    """Without --oracle or a profiling flag, no engine gets a tuned plan
     and no profiler child is spawned."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
@@ -945,15 +945,15 @@ class TestPytorchRuntime:
         assert row.ootb.cpu_build_time_ms is None  # PyTorch has no plan build
 
     @pytest.mark.parametrize(
-        "oracle_mode, events",
+        "oracle, events",
         [
-            ("off", ["torch_buffers_freed"]),
+            (False, ["torch_buffers_freed"]),
             # The child's allocations must not stack on the row's buffers.
-            ("exhaustive", ["torch_buffers_freed", "pytorch_tuned"]),
+            (True, ["torch_buffers_freed", "pytorch_tuned"]),
         ],
     )
     def test_oracle_tunes_once_after_the_buffers_are_released(
-        self, fake_torch, monkeypatch, oracle_mode, events
+        self, fake_torch, monkeypatch, oracle, events
     ):
         rows = []
 
@@ -963,7 +963,7 @@ class TestPytorchRuntime:
 
         monkeypatch.setattr(suite_runner, "run_pytorch_tuned", run_pytorch_tuned)
 
-        (row,) = self._run(oracle_mode=oracle_mode).results
+        (row,) = self._run(oracle=oracle).results
 
         assert fake_torch.events == events
         assert rows == [(row, PATH)] * (len(events) - 1)

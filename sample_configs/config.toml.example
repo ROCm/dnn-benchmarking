@@ -44,9 +44,9 @@ validate = "none"    # "none" or "pytorch"
 # atol = 1e-3
 
 # --- Comparison --------------------------------------------------------------
-# "exhaustive" also builds and times a global.benchmarking=1 plan per engine,
-# and a tuned PyTorch run in a child process. Significantly slower.
-oracle_mode = "off"  # "off" or "exhaustive"
+# Also build and time a global.benchmarking=1 plan per engine, and a tuned
+# PyTorch run in a child process. Significantly slower. Not with autotune.
+oracle = false
 
 # --- Output ------------------------------------------------------------------
 output = "/tmp/dnn-benchmark-results.json"  # .csv writes CSV
