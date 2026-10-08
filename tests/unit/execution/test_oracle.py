@@ -5,6 +5,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,6 +160,7 @@ def _run(row=None, refs=None, bm=None, config=None):
     oracle_mod.run_tuned_plan(
         tuned=_build(row, config=config),
         row=row,
+        graph_id="g",
         engine_id=5,
         graph_name="g",
         config=config,
@@ -353,12 +355,13 @@ def child(monkeypatch):
     return launch
 
 
-def _run_pytorch(tmp_path, config=None):
+def _run_pytorch(tmp_path, config=None, node_type="ConvolutionFwdAttributes"):
     row = ProviderEngineResult(runtime="pytorch", engine_id=None, status="success")
     row.analytical_flops = 10**9
     oracle_mod.run_pytorch_tuned(
         row=row,
         graph_path=tmp_path / "g.json",
+        graph_json={"nodes": [{"type": node_type}]},
         graph_name="g",
         config=config or _pytorch_config(),
     )
@@ -416,6 +419,38 @@ def test_pytorch_tuned_row_comes_from_the_child_ootb_plan(child, tmp_path):
     assert o.host_stats.median_ms == pytest.approx(0.5)
     # 1e9 FLOPs over the child's 0.25 ms kernel median.
     assert o.derived_tflops_per_s == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    ("node_type", "available"),
+    [("MatmulAttributes", True), ("SdpaFwdAttributes", False)],
+)
+def test_pytorch_tuning_is_available_only_for_searched_ops(
+    child, tmp_path, node_type, available
+):
+    """The child searches convs and GEMMs only; any other graph re-measures
+    the OOTB kernels and must stay out of the geomean."""
+    row = _run_pytorch(tmp_path, node_type=node_type)
+    assert row.oracle.tuning_available is available
+
+
+def test_pytorch_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
+    """A wedged search must not hang the suite: --profiling-timeout bounds it."""
+    seen = []
+
+    def run_capped(argv, timeout_s, env=None):
+        seen.append(timeout_s)
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+
+    monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
+    config = _pytorch_config()
+    config.metrics.profiling_timeout_s = 7
+
+    row = _run_pytorch(tmp_path, config)
+
+    assert seen == [7]
+    assert row.oracle is None and row.status == "success"
+    assert "timed out after 7 s" in row.oracle_error
 
 
 def test_pytorch_child_without_output_reports_its_last_error_line(child, tmp_path):

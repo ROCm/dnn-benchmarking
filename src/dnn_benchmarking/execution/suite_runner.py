@@ -34,7 +34,12 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch
-from .oracle import build_tuned_plan, run_pytorch_tuned, run_tuned_plan
+from .oracle import (
+    build_tuned_plan,
+    run_pytorch_tuned,
+    run_tuned_plan,
+    tuned_in_process,
+)
 
 
 @dataclass
@@ -53,6 +58,7 @@ class _GraphContext:
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
     reference_error: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
+    graph_id: str = ""  # hipDNN runs only
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -340,6 +346,7 @@ def _run_pytorch_row(
             run_pytorch_tuned(
                 row=row,
                 graph_path=ctx.graph_path,
+                graph_json=ctx.graph_json,
                 graph_name=ctx.graph_name,
                 config=config,
             )
@@ -373,6 +380,13 @@ def run_single_provider_engine(
         plugin_path=plugin,
     )
     try:
+        if tuned_in_process(ctx.graph_id, engine_id):
+            # Typically the stall-fallback rerun of a graph whose first
+            # attempt already ran this engine's search, or a repeated graph.
+            raise RuntimeError(
+                "OOTB not measurable: this engine already ran a tuned search on "
+                "this graph in this process, and hipDNN would serve its winner"
+            )
         # Absorb the engine's one-time build costs (provider setup, cold
         # plugin and kernel file reads) before timing, so the OOTB and tuned
         # build times start from the same state.
@@ -425,6 +439,7 @@ def run_single_provider_engine(
                 run_tuned_plan(
                     tuned=tuned,
                     row=row,
+                    graph_id=ctx.graph_id,
                     engine_id=engine_id,
                     graph_name=ctx.graph_name,
                     config=config,
@@ -638,7 +653,7 @@ def _run_graph_all_providers(
 
     try:
         ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
-        ctx.graph_json_str = graph_json_str
+        ctx.graph_json_str, ctx.graph_id = graph_json_str, graph.graph_id
     except Exception as e:
         graph.error = f"Input data generation failed: {type(e).__name__}: {e}"
         return graph

@@ -849,6 +849,21 @@ def test_pytorch_buffers_share_the_executor_device(fake_torch):
     assert fake_torch.torch_buffer_devices == ["cuda:3"]
 
 
+def test_stall_rerun_reports_no_ootb_for_an_engine_that_already_tuned(fake):
+    """hipDNN keeps a tuned winner in memory and serves it to any later build
+    of the graph: engine 1 tuned before engine 2 stalled, so its rerun OOTB
+    would time the tuned kernel and must not be published."""
+    fake.stall = {2}
+
+    graph, _ = _run(oracle=True)
+
+    e1, e2 = graph.results
+    assert (e1.status, e1.to_dict()["ootb"]) == ("error", None)
+    assert "already ran a tuned search" in e1.error_message
+    # Engine 2 stalled in its OOTB loop, before its own search.
+    assert e2.status == "success" and e2.oracle is not None
+
+
 def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):
     fake_torch.stall = {"pytorch"}
 
@@ -957,7 +972,7 @@ class TestPytorchRuntime:
     ):
         rows = []
 
-        def run_pytorch_tuned(*, row, graph_path, graph_name, config):
+        def run_pytorch_tuned(*, row, graph_path, graph_json, graph_name, config):
             fake_torch.events.append("pytorch_tuned")
             rows.append((row, graph_path))
 

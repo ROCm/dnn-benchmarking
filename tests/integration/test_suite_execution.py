@@ -6,6 +6,7 @@
 import io
 import json
 import re
+import sys
 
 import pytest
 
@@ -20,6 +21,7 @@ from dnn_benchmarking.execution.suite_runner import (
     run_graph_all_providers,
     run_graph_pytorch,
 )
+from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.reporting.reporter import Reporter
 from tests.conftest import expected_timer
 from tests.integration.conftest import load_graph
@@ -98,15 +100,39 @@ def test_engine_selection_runs_in_caller_order(hipdnn) -> None:
     assert [r.engine_id for r in result.results] == selection
 
 
-def test_oracle_exhaustive_times_a_knob_built_plan(hipdnn) -> None:
-    """--oracle builds and times a global.benchmarking plan."""
-    result, successes = _run_conv(hipdnn, oracle=True)
-    tuned = [r for r in successes if r.oracle is not None]
-    assert tuned, [(r.engine_name, r.oracle_error) for r in successes]
+def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) -> None:
+    """--oracle builds and times a global.benchmarking plan.
 
-    row = json.loads(json.dumps(tuned[0].to_dict(), allow_nan=False))
-    ootb, oracle = row["ootb"], row["oracle"]
-    assert row["oracle_error"] is None
+    Runs the CLI in a child process: hipDNN keeps a tuned winner in memory
+    for the life of the process, so an in-process run would leave later
+    tests unable to time the OOTB plan of this graph.
+    """
+    out = tmp_path / "oracle.json"
+    proc = run_capped(
+        [
+            sys.executable,
+            "-m",
+            "dnn_benchmarking",
+            "--graph",
+            str(load_graph("sample_conv_fwd.json")[0]),
+            "--warmup",
+            "1",
+            "--iters",
+            "3",
+            "--oracle",
+            "-o",
+            str(out),
+            *plugin_path_cli_args,
+        ],
+        600,
+    )
+    assert out.is_file(), proc.stderr
+    rows = [r for g in json.loads(out.read_text())["graphs"] for r in g["results"]]
+    tuned = [r for r in rows if r["status"] == "success" and r["oracle"] is not None]
+    assert tuned, [(r["engine"]["name"], r["oracle_error"]) for r in rows]
+
+    ootb, oracle = tuned[0]["ootb"], tuned[0]["oracle"]
+    assert tuned[0]["oracle_error"] is None
     # The tuned plan is the same object as the OOTB plan, plus one key.
     assert set(oracle) - set(ootb) == {"tuning_available"}
     # Both plans report their own plan build through the same timed path.

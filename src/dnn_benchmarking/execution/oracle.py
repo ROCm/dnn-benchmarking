@@ -12,12 +12,13 @@ tuned run sets ``row.oracle_error`` and never fails the row.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
@@ -39,6 +40,31 @@ BENCHMARKING_KNOB = "global.benchmarking"
 # reads are not gated on benchmarking, so a later OOTB row would serve it.
 # ponytail: process-global guard; concurrent execution needs process isolation.
 _TUNED_ENV = {"HIPDNN_DISABLE_CACHE": "1"}
+
+# hipDNN also keeps each winner in memory for the life of the process, even
+# with HIPDNN_DISABLE_CACHE=1, and serves it to every later build of the same
+# graph content and engine, with or without the knob. An OOTB build of a pair
+# listed here would time the tuned kernel. Filled when a tuned plan executes.
+# ponytail: keyed by graph_id (exact JSON), so graphs that differ only in
+# names or UIDs still share hipDNN's content key; a child process per tuned
+# hipDNN pass removes this registry.
+_TUNED_IN_PROCESS: Set[Tuple[str, int]] = set()
+
+#: Node types whose PyTorch kernel the tuned child searches: MIOpen
+#: exhaustive conv search (cudnn.benchmark) and TunableOp GEMMs.
+_PYTORCH_TUNABLE_OPS = frozenset(
+    {
+        "ConvolutionFwdAttributes",
+        "ConvolutionBwdAttributes",
+        "ConvolutionWrwAttributes",
+        "MatmulAttributes",
+    }
+)
+
+
+def tuned_in_process(graph_id: str, engine_id: int) -> bool:
+    """True when this engine already executed a tuned plan for this graph."""
+    return (graph_id, engine_id) in _TUNED_IN_PROCESS
 
 
 @contextmanager
@@ -120,6 +146,7 @@ def run_tuned_plan(
     *,
     tuned: TunedPlan,
     row: ProviderEngineResult,
+    graph_id: str,
     engine_id: int,
     graph_name: str,
     config: SuiteConfig,
@@ -137,6 +164,10 @@ def run_tuned_plan(
     """
     try:
         with _tuned_env():
+            if tuned.tuning_available:
+                # Before the launch: a search that fails part way may still
+                # leave a winner behind.
+                _TUNED_IN_PROCESS.add((graph_id, engine_id))
             bm.zero_outputs()
             m = tuned.executor.benchmark(tuned.handle, variant_pack)
             oracle = OracleResult(
@@ -222,17 +253,25 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
     that holds it is deleted afterwards, so no OOTB run can observe it.
 
     Raises:
-        RuntimeError: If the child fails or reports no successful row.
+        RuntimeError: If the child fails, times out (``--profiling-timeout``)
+            or reports no successful row.
     """
     from ..common.pytorch_tuning import tuned_subprocess_env
 
     with tempfile.TemporaryDirectory(prefix="dnn-bench-pytorch-tuned-") as state_dir:
         output = Path(state_dir) / "result.json"
-        proc = run_capped(
-            _pytorch_tuned_argv(graph_path, config, output),
-            None,
-            env=tuned_subprocess_env(state_dir),
-        )
+        timeout_s = config.metrics.profiling_timeout_s or None
+        try:
+            proc = run_capped(
+                _pytorch_tuned_argv(graph_path, config, output),
+                timeout_s,
+                env=tuned_subprocess_env(state_dir),
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"tuned PyTorch child timed out after {timeout_s} s "
+                "(--profiling-timeout)"
+            ) from None
         if not output.is_file():
             lines = [
                 line.strip()
@@ -261,18 +300,27 @@ def _stats(data: Optional[Dict[str, Any]]) -> Optional[BenchmarkStats]:
 
 
 def run_pytorch_tuned(
-    *, row: ProviderEngineResult, graph_path: Path, graph_name: str, config: SuiteConfig
+    *,
+    row: ProviderEngineResult,
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    graph_name: str,
+    config: SuiteConfig,
 ) -> None:
     """Attach a tuned PyTorch run as ``row.oracle``; never fails the row.
 
     Call after the OOTB buffers are released, so the child's allocations do
     not stack on top of them. Tuned outputs are not validated: they never
-    enter this process.
+    enter this process. ``tuning_available`` is true only when the graph has
+    a conv or matmul node, the ops the child searches.
     """
     try:
         plan = _run_pytorch_tuned_child(graph_path, config)["ootb"]
         oracle = OracleResult(
-            tuning_available=True,
+            tuning_available=any(
+                node.get("type") in _PYTORCH_TUNABLE_OPS
+                for node in graph_json.get("nodes") or []
+            ),
             timing=TimingInfo(**plan["timing"]),
             gpu_kernel_stats=_stats(plan["kernel"]),
             host_stats=_stats(plan["host"]),

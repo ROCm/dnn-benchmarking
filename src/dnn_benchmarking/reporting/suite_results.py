@@ -451,13 +451,22 @@ class ProviderEngineResult:
         }
 
 
+def timing_modes_differ(row: ProviderEngineResult) -> bool:
+    """True when the OOTB and tuned plans were timed in different modes."""
+    a = row.ootb.timing
+    b = row.oracle.timing if row.oracle is not None else None
+    return a is not None and b is not None and a.mode != b.mode
+
+
 def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
     """OOTB kernel median / tuned kernel median, or None when not comparable.
 
-    None when the row has no tuned run, either plan failed validation, or a
-    median is missing or non-positive. Rows with ``tuning_available`` False
-    still get a ratio; callers report them as "no-search" and keep them out
-    of averages. The speedup is derived, never stored in the result file.
+    None when the row has no tuned run, either plan failed validation, the
+    two plans were timed in different modes (a stall-fallback OOTB in
+    ``events`` against a ``staged`` tuned child), or a median is missing or
+    non-positive. Rows with ``tuning_available`` False still get a ratio;
+    callers report them as "no-search" and keep them out of averages. The
+    speedup is derived, never stored in the result file.
     """
     oracle = row.oracle
     if oracle is None or any(
@@ -466,6 +475,8 @@ def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
     ):
         return None
     if row.ootb.gpu_kernel_stats is None or oracle.gpu_kernel_stats is None:
+        return None
+    if timing_modes_differ(row):
         return None
     ootb, tuned = row.ootb.gpu_kernel_stats.median_ms, oracle.gpu_kernel_stats.median_ms
     if ootb <= 0.0 or tuned <= 0.0:

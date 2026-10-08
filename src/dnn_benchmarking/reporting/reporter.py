@@ -24,6 +24,7 @@ from .suite_results import (
     SuiteResult,
     engine_id_hex,
     oracle_speedup,
+    timing_modes_differ,
 )
 
 _TIMING_MODE_LABEL = {
@@ -130,6 +131,9 @@ def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
     if pe.oracle is not None and not pe.oracle.tuning_available:
         # One fixed configuration: the ratio is run-to-run noise.
         return "no-search"
+    if timing_modes_differ(pe):
+        # Event-timed OOTB against stall-gated tuned: not one measurement.
+        return "mixed-timing"
     if oracle_speedup(pe) is not None:
         return None
     if pe.oracle_error is not None:
@@ -344,7 +348,7 @@ class Reporter:
             pe
             for gr in graphs
             for pe in gr.results
-            if pe.role == "engine" and oracle_speedup(pe) is not None
+            if pe.role == "engine" and pe.oracle is not None
         ]
         if not rows:
             return
@@ -353,11 +357,13 @@ class Reporter:
         if not speedups:
             self._print(
                 f"Oracle: no reportable speedup on any of {excluded} tuned row(s) "
-                "(no tuning alternatives or invalid results)"
+                "(no search, invalid or mixed timing)"
             )
             return
         suffix = (
-            f"; {excluded} row(s) excluded (no search or invalid)" if excluded else ""
+            f"; {excluded} row(s) excluded (no search, invalid or mixed timing)"
+            if excluded
+            else ""
         )
         self._print(
             f"Oracle: {len(speedups)} tuned row(s), geomean speedup "

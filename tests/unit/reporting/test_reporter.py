@@ -293,7 +293,7 @@ class TestSummaries:
             ]
         )
         text = out.getvalue()
-        # geomean(2, 8) = 4; the no-search row is counted as excluded, the
-        # invalid and the reference row are not tuned engine results at all.
+        # geomean(2, 8) = 4; the no-search and the invalid row are excluded,
+        # the reference row is not a tuned engine result at all.
         assert "2 tuned row(s)" in text and "4.00x" in text
-        assert "1 row(s) excluded" in text
+        assert "2 row(s) excluded" in text

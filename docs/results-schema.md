@@ -181,7 +181,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 
 | Key | Type | Meaning |
 |---|---|---|
-| `build_ms` | float or null | CPU time of the plan build only: `create_execution_plan_ext`, `check_support` and `build_plans`. `null` for PyTorch, which has no plan build. |
+| `build_ms` | float or null | CPU time of the plan build only: `create_execution_plan_ext`, `check_support` and `build_plans`. Every run first builds the OOTB plan once, untimed, so `build_ms` excludes one-time provider setup and cold file reads. `null` for PyTorch, which has no plan build. |
 | `timing` | object | How the samples were measured. See [timing](#timing). |
 | `kernel` | object or null | Device time per launch. See [stats](#stats). |
 | `host` | object or null | Host submit time per launch (enqueue call only). See [stats](#stats). |
@@ -288,7 +288,7 @@ the reason and `oracle` is `null`.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `tuning_available` | bool | `true` when the engine exposes the `global.benchmarking` knob, and always for PyTorch. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. |
+| `tuning_available` | bool | hipDNN: `true` when the engine exposes the `global.benchmarking` knob. PyTorch: `true` when the graph has a convolution or matmul node. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. `true` does not prove that a search ran: a provider can answer from its own database. |
 
 - hipDNN rows: the tuned plan is a second plan of the same engine, built with
   `global.benchmarking=1` right after the OOTB plan. Its first launch samples

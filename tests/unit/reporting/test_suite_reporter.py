@@ -236,6 +236,13 @@ def _oracle_row(ootb: Optional[CorrectnessResult] = None, **oracle_overrides):
     return pe
 
 
+def _mixed_timing_row() -> ProviderEngineResult:
+    # Stall-fallback OOTB in events mode, tuned PyTorch child staged.
+    pe = _oracle_row(timing=TimingInfo("staged", "hip", 1, 1.0))
+    pe.ootb.timing = TimingInfo("events", "hip", 1, 1.0)
+    return pe
+
+
 class TestOracleColumn:
     def test_no_oracle_column_without_oracle_data(self) -> None:
         assert "oracle" not in _table(_row()).splitlines()[1]
@@ -251,6 +258,8 @@ class TestOracleColumn:
             (_oracle_row(correctness=_verdict(False)), "invalid"),
             # No tuning knob: the tuned run re-measured OOTB, the ratio is noise.
             (_oracle_row(tuning_available=False), "no-search"),
+            # Events against staged medians are not one measurement.
+            (_mixed_timing_row(), "mixed-timing"),
             (_row(oracle_error="tuned build exploded"), "failed"),
         ],
     )

@@ -109,7 +109,7 @@ profiler, after the timed row completes. The timed numbers do not change.
 | `--perf`, `--no-perf` | off | Collect CPU cycles, instructions and IPC with `perf stat`. |
 | `--roofline`, `--no-roofline` | off | Collect HBM and compute ceilings with `rocprof-compute --roof-only` (about 3 extra runs). |
 | `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. With a profiling flag, the tool checks at startup that it can create files there. Without one, the option has no effect and the tool shows a warning. |
-| `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process. `0` disables the limit. |
+| `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process and for the tuned-PyTorch child of `--oracle`. `0` disables the limit. |
 
 See [Profiling](#profiling) below.
 
@@ -198,6 +198,12 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
   warmup and sampling settings. Its search runs in the untimed first launch.
 - The tool does not validate tuned PyTorch outputs. PyTorch rows have no plan
   build, so `build_ms` is `null`.
+- `tuning_available` is `true` only when the graph has a convolution or
+  matmul node. The child searches no other op, so for example SDPA and
+  pointwise graphs report `no-search`.
+- `--profiling-timeout` also bounds the child. A child that times out gives
+  `oracle_error` and no tuned result.
+- These settings also apply to the `--validate pytorch` reference kernels.
 
 The tool does not set `MIOPEN_FIND_MODE` or `MIOPEN_FIND_ENFORCE`. The hipDNN
 MIOpen plugin reads them too, so they would also change the hipDNN rows.
@@ -273,7 +279,8 @@ no speedup applies:
 
 | Label | Meaning |
 |---|---|
-| `no-search` | The engine exposes no `global.benchmarking` knob, so the tuned run re-measured the OOTB plan. |
+| `no-search` | The engine exposes no `global.benchmarking` knob, or the PyTorch graph has no conv or matmul node, so the tuned run re-measured the OOTB plan. |
+| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned PyTorch child times in `staged` mode. |
 | `invalid` | The OOTB or the tuned plan failed validation. |
 | `failed` | The tuned run did not produce a result (`oracle_error`). |
 | `n/a` | No comparison is available. |
@@ -285,9 +292,16 @@ failed `correctness` on either side, rows with `tuning_available: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
-The tuned pass sets `HIPDNN_DISABLE_CACHE=1`, so a later OOTB row never
-reads its winner. MIOpen FindDb and performance database entries can still
-supply tuned selections. For a cold OOTB baseline, set
+The tuned pass sets `HIPDNN_DISABLE_CACHE=1`, so hipDNN writes no winner to
+disk. hipDNN still keeps the winner in memory until the process exits, and
+any later build of the same graph and engine uses it, with or without the
+knob. Therefore an engine that ran a tuned search on a graph cannot give a
+second OOTB measurement of that graph in the same run. The tool reports such
+a row as an `error`. This occurs when a stall-gate fallback remeasures the
+graph, or when the same graph is listed twice. Graphs that differ only in
+names or tensor UIDs are not detected. MIOpen FindDb and performance database
+entries can also supply tuned selections, and the hipDNN tuned search writes
+to `MIOPEN_USER_DB_PATH`. For a cold OOTB baseline, set
 `HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` and `HIPDNN_DISABLE_CACHE=1`. The tool
 shows a warning when `HIPDNN_DISABLE_EXACT_ENGINE_CACHE` is not set, and,
 once that is set, when `HIPDNN_DISABLE_CACHE` is not set. It also shows a
