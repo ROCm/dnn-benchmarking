@@ -316,7 +316,8 @@ def _run_pytorch_row(
         )
         executor.prepare()
         row.ootb.cpu_build_time_ms = executor.init_time_ms
-        with PyTorchCudaBufferManager(ctx.tensor_infos) as bm:
+        # The executor's device, not the buffer manager's cuda:0 default.
+        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
             bm.allocate_all()
             bm.load_input_data(ctx.input_data)
             bm.zero_outputs()

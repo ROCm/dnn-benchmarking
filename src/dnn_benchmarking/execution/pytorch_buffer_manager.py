@@ -3,7 +3,7 @@
 
 """PyTorch CUDA tensor management for graph execution."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -36,7 +36,7 @@ class PyTorchCudaBufferManager:
     def __init__(
         self,
         tensor_infos: List[TensorInfo],
-        device: str = "cuda:0",
+        device: Union[str, torch.device] = "cuda:0",
     ) -> None:
         """Initialize buffer manager with tensor metadata.
 

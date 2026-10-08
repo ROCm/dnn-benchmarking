@@ -82,6 +82,7 @@ class Fake:
         self.clocks = []
         self.events = []
         self.torch_options = []
+        self.torch_buffer_devices = []
         self.torch_outputs_written = False
         self.policies = []
         self.for_autotune = []
@@ -189,6 +190,7 @@ def fake_torch(fake, monkeypatch):
             self.policy = policy
             fake.torch_options.append((pytorch_sdpa_backend, pytorch_rocm_fa_library))
             self.init_time_ms = 1.0
+            self.device = "cuda:3"  # not the buffer manager's cuda:0 default
 
         def prepare(self):
             if fake.torch_error:
@@ -202,7 +204,8 @@ def fake_torch(fake, monkeypatch):
             fake.torch_outputs_written = True
 
     class TorchBuffers:
-        def __init__(self, tensor_infos):
+        def __init__(self, tensor_infos, device):
+            fake.torch_buffer_devices.append(device)
             self._outputs = [t for t in tensor_infos if t.is_output]
 
         def __enter__(self):
@@ -767,6 +770,14 @@ def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
     assert {r.ootb.timing.mode for r in graph.results} == {"events"}
     assert all("stall gate failed" in " ".join(r.warnings) for r in graph.results)
     assert "remeasuring every row of this graph without stalling" in progress
+
+
+def test_pytorch_buffers_share_the_executor_device(fake_torch):
+    """Buffers on another device than the executor would make every
+    PyTorch row fail or silently copy across GPUs."""
+    _validate()
+
+    assert fake_torch.torch_buffer_devices == ["cuda:3"]
 
 
 def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):
