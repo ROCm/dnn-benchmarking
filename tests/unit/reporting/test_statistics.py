@@ -47,7 +47,7 @@ class TestBenchmarkStats:
         """compare needs the quartiles for its noise band; the rest is
         console-only and not serialized."""
         d = BenchmarkStats.from_timings(list(range(1, 101))).to_dict()
-        assert d == {"n": 100, "p25_ms": 25.75, "median_ms": 51.0, "p75_ms": 75.25}
+        assert d == {"p25_ms": 25.75, "median_ms": 51.0, "p75_ms": 75.25}
 
 
 class TestNoiseWarnings:

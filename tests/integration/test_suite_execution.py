@@ -70,7 +70,7 @@ def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
         ootb = row["ootb"]
         assert ootb["kernel"]["median_ms"] > 0
         assert ootb["host"]["median_ms"] > 0
-        assert set(ootb["kernel"]) == {"n", "p25_ms", "median_ms", "p75_ms"}
+        assert set(ootb["kernel"]) == {"p25_ms", "median_ms", "p75_ms"}
         assert ootb["correctness"] is None
         assert row["oracle"] is None
 

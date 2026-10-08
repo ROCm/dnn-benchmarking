@@ -61,9 +61,9 @@ PLAN_KEYS = {
     "build_ms", "timing", "kernel", "host", "workspace_bytes", "tflops", "gbps",
     "correctness",
 }  # fmt: skip
-STATS_KEYS = {"n", "p25_ms", "median_ms", "p75_ms"}
+STATS_KEYS = {"p25_ms", "median_ms", "p75_ms"}
 TIMING_KEYS = {
-    "mode", "timer", "warmup_iters", "first_call_ms", "capped", "fallback_reason",
+    "mode", "timer", "warmup_iters", "samples", "first_call_ms", "capped", "fallback_reason",
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
@@ -81,7 +81,7 @@ def _oracle() -> OracleResult:
     return OracleResult(
         tuning_available=False,
         cpu_build_time_ms=7.0,
-        timing=TimingInfo("events", "hip", 11, 13.5),
+        timing=TimingInfo("events", "hip", 11, 30, 13.5),
         gpu_kernel_stats=_stats(1.0),
         host_stats=_stats(3.0),
         correctness=CorrectnessResult(False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9),
@@ -130,7 +130,7 @@ def full_suite() -> SuiteResult:
             workspace_bytes=1024,
             derived_tflops_per_s=2.0,
             derived_gbytes_per_s=2000.0,
-            timing=TimingInfo("staged", "hip", 10, 12.5),
+            timing=TimingInfo("staged", "hip", 10, 30, 12.5),
         ),
     )
     # Distinct values, so a dropped or swapped value changes the output.
@@ -253,6 +253,7 @@ def test_full_row_values() -> None:
             "mode": "events",
             "timer": "hip",
             "warmup_iters": 11,
+            "samples": 30,
             "first_call_ms": 13.5,
             "capped": False,
             "fallback_reason": None,

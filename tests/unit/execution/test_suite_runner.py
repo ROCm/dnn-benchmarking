@@ -413,6 +413,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "mode": "events",
         "timer": "torch",
         "warmup_iters": 7,
+        "samples": 10,  # the loop's sample count, beyond --iters when extended
         "first_call_ms": 5.0,
         "capped": True,
         "fallback_reason": "no stream wait",

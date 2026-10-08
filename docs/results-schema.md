@@ -197,6 +197,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | `mode` | string | `staged` (stall-gated device span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
 | `timer` | string | Event timer: `hip` (HIP events) or `torch` (`torch.cuda.Event`). |
 | `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
+| `samples` | int | Number of timed samples behind `kernel` and `host` (`n` below). Equal to `--iters` unless `--min-time-ms` extends the loop. |
 | `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the PyTorch `enqueue()` syncs with the host. |
@@ -207,12 +208,11 @@ are only in `run.config` (`cache_mode`, `timing_block`). See
 
 ### stats
 
-`kernel` and `host` use the same object. All values are milliseconds, except
-`n`.
+`kernel` and `host` use the same object. All values are milliseconds. The
+sample count `n` is the plan's `timing.samples`.
 
 | Key | Meaning |
 |---|---|
-| `n` | Number of timed samples. |
 | `p25_ms` | 25th percentile. |
 | `median_ms` | Upper median, `sorted(samples)[n // 2]` (the rocKE / Solera definition; always an observed sample). This is the headline value. |
 | `p75_ms` | 75th percentile. |
@@ -269,7 +269,7 @@ loop. Paths are relative to the row:
 
 | Note | Condition |
 |---|---|
-| `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.kernel.n` is 10 or more. |
+| `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.timing.samples` is 10 or more. |
 | `outlier: max Nx median` | The slowest sample is more than 2 x `ootb.kernel.median_ms`. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
@@ -395,7 +395,7 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `kernel_median_ms` | `row.ootb.kernel.median_ms` |
 | `kernel_iqr_pct` | `100 * (row.ootb.kernel.p75_ms - row.ootb.kernel.p25_ms) / row.ootb.kernel.median_ms` |
 | `host_median_ms` | `row.ootb.host.median_ms` |
-| `n` | `row.ootb.kernel.n` |
+| `samples` | `row.ootb.timing.samples` |
 | `timing_mode` | `row.ootb.timing.mode` |
 | `cache_mode` | `run.config.cache_mode` |
 | `timing_block` | `run.config.timing_block` |

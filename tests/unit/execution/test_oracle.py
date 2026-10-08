@@ -321,6 +321,7 @@ def _child_row(status="success", message=None, kernel_ms=(0.25, 0.25, 0.3)):
         mode="staged",
         timer="hip",
         warmup_iters=3,
+        samples=len(kernel_ms),
         first_call_ms=40.0,
     )
     return {

@@ -292,16 +292,19 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
     return rows[0]
 
 
-def _stats(data: Optional[Dict[str, Any]]) -> Optional[BenchmarkStats]:
-    """Rebuild stats from a v2 stats object.
+def _stats(data: Optional[Dict[str, Any]], samples: int) -> Optional[BenchmarkStats]:
+    """Rebuild stats from a v2 stats object and the plan's ``timing.samples``.
 
-    The file keeps only ``n`` and the quartiles; the console-only fields
-    (mean, std, min, p95, max) are None, and nothing reads them for a tuned
-    row (the speedup, throughput and table use the median).
+    The file keeps only the quartiles; the console-only fields (mean, std,
+    min, p95, max) are None, and nothing reads them for a tuned row (the
+    speedup, throughput and table use the median).
     """
     if not data:
         return None
-    return BenchmarkStats(**{f.name: data.get(f.name) for f in fields(BenchmarkStats)})
+    values = {**data, "n": samples}
+    return BenchmarkStats(
+        **{f.name: values.get(f.name) for f in fields(BenchmarkStats)}
+    )
 
 
 def run_pytorch_tuned(
@@ -326,9 +329,9 @@ def run_pytorch_tuned(
                 node.get("type") in _PYTORCH_TUNABLE_OPS
                 for node in graph_json.get("nodes") or []
             ),
-            timing=TimingInfo(**plan["timing"]),
-            gpu_kernel_stats=_stats(plan["kernel"]),
-            host_stats=_stats(plan["host"]),
+            timing=(timing := TimingInfo(**plan["timing"])),
+            gpu_kernel_stats=_stats(plan["kernel"], timing.samples),
+            host_stats=_stats(plan["host"], timing.samples),
         )
         _set_throughputs(oracle, row)
         row.oracle = oracle

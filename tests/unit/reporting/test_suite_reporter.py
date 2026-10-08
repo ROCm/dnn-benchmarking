@@ -238,8 +238,8 @@ def _oracle_row(ootb: Optional[CorrectnessResult] = None, **oracle_overrides):
 
 def _mixed_timing_row() -> ProviderEngineResult:
     # Stall-fallback OOTB in events mode, tuned PyTorch child staged.
-    pe = _oracle_row(timing=TimingInfo("staged", "hip", 1, 1.0))
-    pe.ootb.timing = TimingInfo("events", "hip", 1, 1.0)
+    pe = _oracle_row(timing=TimingInfo("staged", "hip", 1, 30, 1.0))
+    pe.ootb.timing = TimingInfo("events", "hip", 1, 30, 1.0)
     return pe
 
 
@@ -283,7 +283,7 @@ class TestVerboseBlock:
                 n_total=1024,
             ),
             clocks_after={"sclk_mhz": 1500.0, "throttle_status": 0},
-            timing=TimingInfo("staged", "hip", 10, 7800.0),
+            timing=TimingInfo("staged", "hip", 10, 30, 7800.0),
         )
         pe.ootb.host_stats = _stats(0.013, n=10)
         return pe
@@ -318,7 +318,7 @@ class TestVerboseBlock:
     def test_oracle_detail_reports_the_tuned_build_not_the_ootb_build(self) -> None:
         pe = _oracle_row(
             cpu_build_time_ms=1500.0,
-            timing=TimingInfo("staged", "hip", 10, 2500.0),
+            timing=TimingInfo("staged", "hip", 10, 30, 2500.0),
         )
         pe.ootb.cpu_build_time_ms = 4.5
         out = io.StringIO()

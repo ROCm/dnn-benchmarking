@@ -71,9 +71,10 @@ class BenchmarkStats:
         return self.p75_ms - self.p25_ms
 
     #: The serialized subset: the median is the headline number, and the
-    #: quartiles give ``compare`` its noise band. The others are for the
-    #: console and in-process warnings only.
-    SERIALIZED = ("n", "p25_ms", "median_ms", "p75_ms")
+    #: quartiles give ``compare`` its noise band. The sample count is the
+    #: plan's ``timing.samples``; the others are for the console and
+    #: in-process warnings only.
+    SERIALIZED = ("p25_ms", "median_ms", "p75_ms")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-ready dict of :attr:`SERIALIZED` keys."""
@@ -110,11 +111,14 @@ class TimingInfo:
 
     Attributes mirror ``execution.timing.Measurement`` minus the samples and
     the run-wide ``cache_mode`` and ``timing_block`` (see ``run.config``).
+    ``samples`` is the number of timed samples, shared by the kernel and host
+    stats; it exceeds ``--iters`` when ``--min-time-ms`` extends the loop.
     """
 
     mode: str
     timer: str
     warmup_iters: int
+    samples: int
     first_call_ms: float
     capped: bool = False
     fallback_reason: Optional[str] = None
@@ -126,6 +130,7 @@ class TimingInfo:
             mode=m.mode,
             timer=m.timer,
             warmup_iters=m.warmup_iters,
+            samples=len(m.kernel_ms),
             first_call_ms=m.first_call_ms,
             capped=m.capped,
             fallback_reason=m.fallback_reason,
