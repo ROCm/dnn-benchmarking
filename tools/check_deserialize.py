@@ -11,10 +11,13 @@ Both levels also require every SDPA node to state its scale (an
 attn_scale_value or a scale tensor): an absent scale is the backend's default,
 not necessarily the scale the workload's source measured.
 
-They also check the causal diagonal of SDPA graphs with Sq != Skv. Top-left
-with Sq = 1 attends only to key 0, which no decode step means: that fails.
-Any other top-left causal graph with Sq != Skv is printed as a warning, since
-decode and chunked prefill almost always mean bottom-right.
+They also check the causal diagonal of SDPA graphs with Sq != Skv, using the
+mask hipDNN actually runs: causal_mask overrides diagonal_alignment and the
+written bounds, and setting both causal_mask and causal_mask_bottom_right is
+rejected. An effective top-left diagonal with Sq = 1 attends only to key 0,
+which no decode step means: that fails. Any other effective top-left causal
+graph with Sq != Skv is printed as a warning, since decode and chunked prefill
+almost always mean bottom-right.
 
 Usage:
   python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
@@ -52,33 +55,55 @@ def sdpa_nodes_without_scale(graph):
     return missing
 
 
-# hipDNN writes -1 for an unbounded side of the band, so left_bound=-1,
-# right_bound=-1 is an unmasked node.
-_UNBOUNDED = -1
+def sdpa_mask_flag_conflicts(graph):
+    """Names of SDPA nodes that set both deprecated causal flags.
+
+    hipDNN's extractDiagonalBandParams rejects the pair outright, so the graph
+    cannot run at all.
+    """
+    conflicts = []
+    for node in graph.get("nodes") or []:
+        if node.get("type") not in _SDPA_NODE_TYPES:
+            continue
+        attrs = node.get("attributes") or node.get("parameters") or {}
+        if attrs.get("causal_mask") and attrs.get("causal_mask_bottom_right"):
+            conflicts.append(node.get("name", "<unnamed>"))
+    return conflicts
 
 
+# hipDNN resolves the mask before any plan sees it (PlanUtils.hpp
+# ::extractDiagonalBandParams): causal_mask forces left_bound=-1, right_bound=0
+# and top-left, overriding diagonal_alignment and any written bounds;
+# causal_mask_bottom_right forces the same band bottom-right. The band itself
+# masks the right side only when right_bound >= 0
+# (CpuFpReferenceSdpa.hpp::isMasked), so a left_bound on its own is a window
+# that stays open on the right and is not causal.
 def _sdpa_is_causal(attrs):
-    left = attrs.get("left_bound")
     return bool(
         attrs.get("causal_mask")
         or attrs.get("causal_mask_bottom_right")
-        or (left is not None and left != _UNBOUNDED)
         or attrs.get("right_bound") == 0
     )
 
 
 def _sdpa_is_bottom_right(attrs):
-    return bool(
-        attrs.get("causal_mask_bottom_right")
-        or attrs.get("diagonal_alignment") == "BOTTOM_RIGHT"
+    if attrs.get("causal_mask_bottom_right"):
+        return True
+    # causal_mask wins over the alignment, so causal_mask + BOTTOM_RIGHT is
+    # still run top-left.
+    return not attrs.get("causal_mask") and (
+        attrs.get("diagonal_alignment") == "BOTTOM_RIGHT"
     )
 
 
 def sdpa_top_left_mismatches(graph):
-    """(errors, warnings) for top-left causal SDPA nodes with Sq != Skv.
+    """(errors, warnings) for SDPA nodes whose effective causal diagonal is
+    top-left while Sq != Skv.
 
-    Sq and Skv come from the Q and K dims. A paged K is a block container, so
-    its Skv is unknown and only the Sq = 1 rule applies.
+    "Effective" is what hipDNN runs, not what the JSON names: causal_mask
+    overrides diagonal_alignment. Sq and Skv come from the Q and K dims. A
+    paged K is a block container, so its Skv is unknown and only the Sq = 1
+    rule applies.
     """
     dims = {t.get("uid"): t.get("dims") for t in graph.get("tensors") or []}
     errors, warnings = [], []
@@ -99,12 +124,14 @@ def sdpa_top_left_mismatches(graph):
         name = node.get("name", "<unnamed>")
         if sq == 1 and skv != 1:
             errors.append(
-                f"SDPA node {name!r}: top-left causal mask with Sq=1, Skv={skv or 'paged'} "
-                "attends only to key 0; decode is bottom-right or unmasked"
+                f"SDPA node {name!r}: effective top-left causal mask with Sq=1, "
+                f"Skv={skv or 'paged'} attends only to key 0; decode is "
+                "bottom-right or unmasked"
             )
         elif skv is not None and sq != skv:
             warnings.append(
-                f"SDPA node {name!r}: top-left causal mask with Sq={sq}, Skv={skv}; "
+                f"SDPA node {name!r}: effective top-left causal mask with "
+                f"Sq={sq}, Skv={skv}; "
                 "decode and chunked prefill are usually bottom-right"
             )
     return errors, warnings
@@ -162,6 +189,13 @@ def main():
                 raise ValueError(
                     f"SDPA node(s) {unscaled} set neither attn_scale_value nor "
                     "scale_tensor_uid; write the scale the workload used"
+                )
+            conflicting = sdpa_mask_flag_conflicts(graph)
+            if conflicting:
+                raise ValueError(
+                    f"SDPA node(s) {conflicting} set both causal_mask and "
+                    "causal_mask_bottom_right; hipDNN rejects that pair. Use "
+                    "diagonal_alignment with left_bound=-1, right_bound=0"
                 )
             errors, warnings = sdpa_top_left_mismatches(graph)
             if errors:
