@@ -62,7 +62,7 @@ ROW_KEYS = {
     "elapsed_s", "metrics", "ootb", "oracle", "oracle_error", "warnings",
     "extra_metrics",
 }  # fmt: skip
-ENGINE_KEYS = {"id", "name", "version", "plugin_path"}
+ENGINE_KEYS = {"id", "name", "version"}
 METRICS_KEYS = {
     "flops", "flops_partial", "io_bytes", "vram_mb", "clocks_before", "clocks_after",
 }  # fmt: skip
@@ -75,8 +75,7 @@ STATS_KEYS = {
     "p95_ms", "max_ms", "iqr_ms",
 }  # fmt: skip
 TIMING_KEYS = {
-    "mode", "timer", "cache_mode", "warmup_iters", "first_call_ms", "capped",
-    "fallback_reason", "timing_block",
+    "mode", "timer", "warmup_iters", "first_call_ms", "capped", "fallback_reason",
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
@@ -110,7 +109,7 @@ def _oracle() -> OracleResult:
         exhaustive_requested=True,
         exhaustive_supported=False,
         cpu_build_time_ms=7.0,
-        timing=TimingInfo("events", "hip", "cold", 11, 13.5),
+        timing=TimingInfo("events", "hip", 11, 13.5),
         gpu_kernel_stats=_stats(1.0),
         warm_baseline_gpu_kernel_stats=_stats(2.0),
         host_stats=_stats(3.0),
@@ -167,7 +166,7 @@ def full_suite() -> SuiteResult:
             workspace_bytes=1024,
             derived_tflops_per_s=2.0,
             derived_gbytes_per_s=2000.0,
-            timing=TimingInfo("staged", "hip", "warm", 10, 12.5),
+            timing=TimingInfo("staged", "hip", 10, 12.5),
         ),
     )
     # Distinct values, so a dropped or swapped value changes the output.
@@ -263,7 +262,6 @@ def test_full_row_values() -> None:
         "id": "0x15B46865C717A122",
         "name": "MIOPEN_ENGINE",
         "version": "1.0",
-        "plugin_path": "/opt/lib/plugin.so",
     }
     assert row["metrics"] == {
         "flops": 10**9,
@@ -299,12 +297,10 @@ def test_full_row_values() -> None:
         "timing": {
             "mode": "events",
             "timer": "hip",
-            "cache_mode": "cold",
             "warmup_iters": 11,
             "first_call_ms": 13.5,
             "capped": False,
             "fallback_reason": None,
-            "timing_block": 1,
         },
         "workspace_bytes": 2048,
         "tflops": 4.0,

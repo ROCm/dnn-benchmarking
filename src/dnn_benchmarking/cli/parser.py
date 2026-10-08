@@ -423,6 +423,14 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_kind=ConfigKind.PATH,
     ),
     _bool_option(
+        ("--compact-json",),
+        "compact_json",
+        "Output",
+        SuiteConfig,
+        "compact_json",
+        "write the JSON result without whitespace (default: one-space indent)",
+    ),
+    _bool_option(
         ("-v", "--verbose"),
         "verbose",
         "Output",

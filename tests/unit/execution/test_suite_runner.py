@@ -369,12 +369,10 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     assert row.to_dict()["ootb"]["timing"] == {
         "mode": "events",
         "timer": "torch",
-        "cache_mode": "cold",
         "warmup_iters": 7,
         "first_call_ms": 5.0,
         "capped": True,
         "fallback_reason": "no stream wait",
-        "timing_block": 4,
     }
     assert row.ootb.workspace_bytes == 64 and row.vram_used_mb == 12.0
     assert row.ootb.cpu_build_time_ms == 2.0

@@ -304,7 +304,7 @@ class TestVerboseBlock:
             ),
             clocks_before={"sclk_mhz": 1700.0, "throttle_status": 0},
             clocks_after={"sclk_mhz": 1500.0, "throttle_status": 0},
-            timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
+            timing=TimingInfo("staged", "hip", 10, 7800.0),
         )
         pe.ootb.host_stats = _stats(0.013, n=10)
         return pe

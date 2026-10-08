@@ -91,6 +91,7 @@ log2 values of e8m0 outputs. The source is `TOLERANCES` in
 | Option | Default | Description |
 |---|---|---|
 | `-o`, `--output PATH` | none | Write the results to `PATH`: CSV when `PATH` ends in `.csv`, else JSON. See [results-schema.md](results-schema.md). |
+| `--compact-json`, `--no-compact-json` | off | Write the JSON result without whitespace. By default it is indented by one space. CSV output ignores this option. |
 | `-v`, `--verbose`, `--no-verbose` | off | Add a detail block for each engine below each table. |
 | `-q`, `--quiet`, `--no-quiet` | off | Do not show progress lines and info messages. Tables, the summary, warnings and errors still show. |
 | `--metrics`, `--no-metrics` | on | Adds FLOPs, I/O bytes, TFLOP/s, GB/s, workspace, VRAM and GPU clocks. They do not change the timed numbers. `--no-metrics` disables them. |

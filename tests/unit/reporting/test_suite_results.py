@@ -36,7 +36,12 @@ def _row(status="success", role="engine", correctness=None) -> ProviderEngineRes
 
 def _suite(graphs, complete=True) -> SuiteResult:
     return SuiteResult(
-        run=RunInfo(started_at="t", argv=["x"], config={"seed": 7}, complete=complete),
+        run=RunInfo(
+            started_at="t",
+            argv=["x"],
+            config={"seed": 7, "cache_mode": "cold", "timing_block": 4},
+            complete=complete,
+        ),
         environment={"gpu_arch": "gfx90a"},
         graphs=graphs,
     )
@@ -174,7 +179,7 @@ def _sample_suite(complete=True) -> SuiteResult:
             gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 29 + [5.0]),
             host_stats=BenchmarkStats.from_timings([0.01] * 29 + [1.0]),
             correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
-            timing=TimingInfo("staged", "hip", "cold", 10, 3.0, timing_block=4),
+            timing=TimingInfo("staged", "hip", 10, 3.0),
             cpu_build_time_ms=12.0,
             workspace_bytes=4096,
             derived_tflops_per_s=1.5,
@@ -261,6 +266,19 @@ class TestWriteLoad:
         SuiteResult.load(path)
         assert "partial" in capsys.readouterr().err
 
+    def test_floats_are_rounded_in_both_layouts(self, tmp_path) -> None:
+        suite = _sample_suite()
+        suite.graphs[0].results[0].ootb.derived_tflops_per_s = 1 / 3
+        indented, compact = tmp_path / "i.json", tmp_path / "c.json"
+        suite.write(indented)
+        suite.write(compact, compact=True)
+        text = compact.read_text()
+        assert "\n" not in text and ", " not in text and ": " not in text
+        assert indented.read_text().startswith('{\n "schema_version": 2,')
+        assert SuiteResult.load(compact) == SuiteResult.load(indented)
+        row = SuiteResult.load(compact)["graphs"][0]["results"][0]
+        assert row["ootb"]["tflops"] == 0.333333
+
     def test_json_row_values(self, tmp_path) -> None:
         path = tmp_path / "r.json"
         _sample_suite().write(path)
@@ -270,7 +288,6 @@ class TestWriteLoad:
         assert ootb["build_ms"] == 12.0
         assert (ootb["kernel"]["median_ms"], ootb["kernel"]["mean_ms"]) == (0.5, 0.65)
         assert ootb["host"]["median_ms"] == 0.01
-        assert ootb["timing"]["timing_block"] == 4
         assert (ootb["tflops"], ootb["gbps"], ootb["workspace_bytes"]) == (
             1.5,
             20.0,

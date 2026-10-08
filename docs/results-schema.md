@@ -14,6 +14,9 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
   `extra_metrics` objects, where the [extra_metrics](#extra_metrics) table
   marks the keys that can be absent.
 - The file is strict JSON. The writer maps `NaN` and infinity to `null`.
+- The writer rounds every float to 6 significant digits.
+- The file is indented by one space. `--compact-json` writes it without
+  whitespace.
 - Times are in milliseconds (`_ms`) unless the key name gives another unit.
 - `MB` and `GB` in environment key names are binary units: MiB (2^20 bytes)
   and GiB (2^30 bytes). `gbps` in `metrics` is decimal: 10^9 bytes per second.
@@ -167,7 +170,6 @@ The graph content decides the ID. The file name and the file path do not. Use
 | `id` | string or null | Engine ID as `0x` plus 16 upper-case hex digits. `null` for PyTorch rows. |
 | `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
 | `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
-| `plugin_path` | string or null | Plugin the engine was loaded from. |
 
 hipDNN engine IDs are signed 64-bit integers. JSON readers that use
 floating-point numbers lose precision above 2^53. For this reason the file
@@ -196,14 +198,14 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 |---|---|---|
 | `mode` | string | `staged` (stall-gated device span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
 | `timer` | string | Event timer: `hip` (HIP events) or `torch` (`torch.cuda.Event`). |
-| `cache_mode` | string | `warm` or `cold`. |
 | `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
 | `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the PyTorch `enqueue()` syncs with the host. |
-| `timing_block` | int | Launches per timed sample. `1` except in `block` mode. |
 
-See [methodology.md](methodology.md) for the meaning of each mode.
+The cache mode and the launches per sample apply to the whole run, so they
+are only in `run.config` (`cache_mode`, `timing_block`). See
+[methodology.md](methodology.md) for the meaning of each mode.
 
 ### stats
 
@@ -424,8 +426,8 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `host_median_ms` | `row.ootb.host.median_ms` |
 | `n` | `row.ootb.kernel.n` |
 | `timing_mode` | `row.ootb.timing.mode` |
-| `cache_mode` | `row.ootb.timing.cache_mode` |
-| `timing_block` | `row.ootb.timing.timing_block` |
+| `cache_mode` | `run.config.cache_mode` |
+| `timing_block` | `run.config.timing_block` |
 | `seed` | `run.config.seed` |
 | `tflops` | `row.ootb.tflops` |
 | `gbps` | `row.ootb.gbps` |

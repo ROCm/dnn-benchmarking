@@ -467,7 +467,7 @@ class Reporter:
             (pe.ootb.timing for pe in rows if pe.ootb.timing is not None), None
         )
         how = (
-            f" ({_TIMING_MODE_LABEL.get(timing.mode, timing.mode)}; cache {timing.cache_mode})"
+            f" ({_TIMING_MODE_LABEL.get(timing.mode, timing.mode)})"
             if timing is not None
             else ""
         )
@@ -558,7 +558,7 @@ class Reporter:
             add("cost", ", ".join(costs))
         if pe.ootb.timing is not None:
             t = pe.ootb.timing
-            text = f"{t.mode}/{t.timer}, cache {t.cache_mode}, warmup {t.warmup_iters}"
+            text = f"{t.mode}/{t.timer}, warmup {t.warmup_iters}"
             if t.capped:
                 text += ", capped at max iters"
             if t.fallback_reason:

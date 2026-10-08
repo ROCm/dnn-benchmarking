@@ -133,10 +133,15 @@ def _with_keys(d: Optional[Dict[str, Any]], keys: tuple) -> Dict[str, Any]:
     return {**dict.fromkeys(keys), **(d or {})}
 
 
+#: Significant digits kept for every float in a result file. Six resolve
+#: 0.1 ns on a 100 us kernel, well below timer and run-to-run noise.
+FLOAT_DIGITS = 6
+
+
 def _finite(obj: Any) -> Any:
-    """Map NaN/inf to None recursively so the output is strict JSON."""
+    """Round floats to FLOAT_DIGITS and map NaN/inf to None, recursively."""
     if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
+        return float(f"{obj:.{FLOAT_DIGITS}g}") if math.isfinite(obj) else None
     if isinstance(obj, dict):
         return {k: _finite(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -518,7 +523,6 @@ class ProviderEngineResult:
                 "id": engine_id_hex(self.engine_id),
                 "name": self.engine_name,
                 "version": self.engine_version,
-                "plugin_path": self.plugin_path,
             },
             "status": self.status,
             "verdict": self.verdict,
@@ -700,9 +704,15 @@ class SuiteResult:
             "graphs": [g.to_dict() for g in self.graphs],
         }
 
-    def to_json(self, indent: int = 2) -> str:
-        """Serialize to strict JSON: NaN/inf become null."""
-        return json.dumps(_finite(self.to_dict()), indent=indent, allow_nan=False)
+    def to_json(self, compact: bool = False) -> str:
+        """Serialize to strict JSON: NaN/inf become null, floats are rounded.
+
+        Indented by one space; ``compact`` drops all whitespace.
+        """
+        layout: Dict[str, Any] = (
+            {"separators": (",", ":")} if compact else {"indent": 1}
+        )
+        return json.dumps(_finite(self.to_dict()), allow_nan=False, **layout)
 
     def to_rows(self) -> List[Dict[str, Any]]:
         """Flatten to one dict per row with :data:`ROW_COLUMNS` keys.
@@ -712,14 +722,16 @@ class SuiteResult:
         """
         doc = _finite(self.to_dict())
         arch = doc["environment"]["gpu_arch"]
-        seed = doc["run"]["config"]["seed"]
+        config = doc["run"]["config"]
         rows: List[Dict[str, Any]] = []
         for g in doc["graphs"]:
             base = {
                 "gpu_arch": arch,
                 "graph_name": g["graph_name"],
                 "graph_id": g["graph_id"],
-                "seed": seed,
+                "seed": config["seed"],
+                "cache_mode": config["cache_mode"],
+                "timing_block": config["timing_block"],
             }
             if not g["results"]:
                 rows.append(
@@ -749,8 +761,6 @@ class SuiteResult:
                         "host_median_ms": host.get("median_ms"),
                         "n": kernel.get("n"),
                         "timing_mode": timing.get("mode"),
-                        "cache_mode": timing.get("cache_mode"),
-                        "timing_block": timing.get("timing_block"),
                         "tflops": ootb.get("tflops"),
                         "gbps": ootb.get("gbps"),
                         "workspace_bytes": ootb.get("workspace_bytes"),
@@ -760,12 +770,13 @@ class SuiteResult:
                 )
         return rows
 
-    def write(self, path: Union[str, Path]) -> None:
+    def write(self, path: Union[str, Path], compact: bool = False) -> None:
         """Write atomically: JSON, or CSV when ``path`` ends in ``.csv``.
 
         The content is fully serialized before a temp file in the target
         directory is written and renamed over ``path``, so readers never see
         a partial file and a failed write leaves any previous file intact.
+        ``compact`` applies to JSON only.
         """
         p = Path(path)
         if p.suffix.lower() == ".csv":
@@ -775,7 +786,7 @@ class SuiteResult:
             writer.writerows(self.to_rows())
             text = buf.getvalue()
         else:
-            text = self.to_json()
+            text = self.to_json(compact)
         p.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
         try:

@@ -110,17 +110,16 @@ def noise_warnings(stats: BenchmarkStats) -> List[str]:
 class TimingInfo:
     """How a plan's timings were measured (serialized as the plan's ``timing``).
 
-    Attributes mirror ``execution.timing.Measurement`` minus the samples.
+    Attributes mirror ``execution.timing.Measurement`` minus the samples and
+    the run-wide ``cache_mode`` and ``timing_block`` (see ``run.config``).
     """
 
     mode: str
     timer: str
-    cache_mode: str
     warmup_iters: int
     first_call_ms: float
     capped: bool = False
     fallback_reason: Optional[str] = None
-    timing_block: int = 1
 
     @classmethod
     def from_measurement(cls, m: Any) -> "TimingInfo":
@@ -128,12 +127,10 @@ class TimingInfo:
         return cls(
             mode=m.mode,
             timer=m.timer,
-            cache_mode=m.cache_mode,
             warmup_iters=m.warmup_iters,
             first_call_ms=m.first_call_ms,
             capped=m.capped,
             fallback_reason=m.fallback_reason,
-            timing_block=m.timing_block,
         )
 
     def to_dict(self) -> Dict[str, Any]:

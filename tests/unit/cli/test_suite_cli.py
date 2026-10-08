@@ -293,7 +293,7 @@ def test_final_write_failure_exits_1(tmp_path, runtime) -> None:
 def test_non_os_write_error_is_reported_and_exits_1(
     tmp_path, runtime, monkeypatch
 ) -> None:
-    def bad_write(self, path):
+    def bad_write(self, path, compact=False):
         raise ValueError("Out of range float values are not JSON compliant")
 
     monkeypatch.setattr(SuiteResult, "write", bad_write)
@@ -305,7 +305,9 @@ def test_non_os_write_error_is_reported_and_exits_1(
 
 def test_intermediate_writes_are_throttled(tmp_path, runtime, monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(SuiteResult, "write", lambda self, path: calls.append(path))
+    monkeypatch.setattr(
+        SuiteResult, "write", lambda self, path, compact=False: calls.append(path)
+    )
     runtime(lambda path: _graph(path, [_passed()]))
     _run(_args("-o", str(tmp_path / "out.json")), _graphs(tmp_path, 3))
     assert len(calls) == 1  # well inside WRITE_INTERVAL_S: only the final write
@@ -318,11 +320,11 @@ def test_failed_intermediate_write_does_not_override_final_write(
     real_write = SuiteResult.write
     calls = []
 
-    def flaky_write(self, path):
+    def flaky_write(self, path, compact=False):
         calls.append(path)
         if len(calls) == 1:
             raise OSError(28, "No space left on device")
-        real_write(self, path)
+        real_write(self, path, compact)
 
     monkeypatch.setattr(SuiteResult, "write", flaky_write)
     out = tmp_path / "out.json"

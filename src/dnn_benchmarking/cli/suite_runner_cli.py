@@ -284,7 +284,7 @@ def _run_suite(
         if output_path is None:
             return True
         try:
-            suite.write(output_path)
+            suite.write(output_path, compact=config.compact_json)
             return True
         except (OSError, TypeError, ValueError) as e:
             reporter.error(f"writing {output_path} failed: {e}")

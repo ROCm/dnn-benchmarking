@@ -50,6 +50,7 @@ oracle_mode = "off"  # "off", "plan" or "exhaustive"
 
 # --- Output ------------------------------------------------------------------
 output = "/tmp/dnn-benchmark-results.json"  # .csv writes CSV
+compact_json = false  # true drops all JSON whitespace (default: one-space indent)
 verbose = false
 quiet = false
 metrics = true       # FLOPs/IO, workspace, host and GPU snapshots

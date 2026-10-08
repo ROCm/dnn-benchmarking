@@ -35,7 +35,7 @@ def _passed_row(name: str = "MIOPEN_ENGINE") -> ProviderEngineResult:
         ootb=PlanResult(
             gpu_kernel_stats=BenchmarkStats.from_timings([0.0256] * 100),
             host_stats=BenchmarkStats.from_timings([0.013] * 100),
-            timing=TimingInfo("staged", "hip", "warm", 10, 7800.0),
+            timing=TimingInfo("staged", "hip", 10, 7800.0),
             correctness=CorrectnessResult(True, 1e-5, 1e-6),
         ),
     )

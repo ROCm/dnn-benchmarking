@@ -350,6 +350,8 @@ class SuiteConfig:
     timing_block: int = 1
     #: Suppress progress output; tables and the summary still print.
     quiet: bool = False
+    #: Write the JSON result without whitespace (default: one-space indent).
+    compact_json: bool = False
     #: Timing loop policy built from the fields above in ``__post_init__``.
     timing_policy: TimingPolicy = field(init=False, repr=False)
 
@@ -376,6 +378,7 @@ class SuiteConfig:
             engine_filter=args.engine,
             verbose=args.verbose,
             quiet=args.quiet,
+            compact_json=args.compact_json,
             oracle_mode=args.oracle_mode,
             metrics=MetricsConfig(
                 basic=args.metrics,
