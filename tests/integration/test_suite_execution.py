@@ -99,37 +99,20 @@ def test_engine_selection_runs_in_caller_order(hipdnn) -> None:
     assert [r.engine_id for r in result.results] == selection
 
 
-def test_oracle_plan_records_tuned_payload(hipdnn) -> None:
-    """--oracle-mode plan attaches the tuned plan and a median-based delta."""
-    result, successes = _run_conv(hipdnn, oracle_mode=OracleMode.PLAN)
+def test_oracle_exhaustive_times_a_knob_built_plan(hipdnn) -> None:
+    """--oracle-mode exhaustive builds and times a global.benchmarking plan."""
+    result, successes = _run_conv(hipdnn, oracle_mode=OracleMode.EXHAUSTIVE)
     tuned = [r for r in successes if r.oracle is not None]
     assert tuned, [(r.engine_name, r.oracle_error) for r in successes]
 
-    r = tuned[0]
-    # The active plan resolves to the row's own registered engine name,
-    # never the "0x..." fallback an unregistered engine ID produces.
-    assert r.oracle.plan_name == r.engine_name
-    assert r.oracle.rank == 0
-    assert r.oracle.compiled_plan_index >= 0
-    assert r.oracle.compiled_plans_benchmarked >= 1
-
-    row = json.loads(json.dumps(r.to_dict(), allow_nan=False))
-    oracle = row["oracle"]
+    row = json.loads(json.dumps(tuned[0].to_dict(), allow_nan=False))
+    ootb, oracle = row["ootb"], row["oracle"]
     assert row["oracle_error"] is None
-    # The tuned plan is the same object as the OOTB plan, plus tuning keys.
-    assert set(row["ootb"]) <= set(oracle)
-    assert set(oracle["delta"]) == {
-        "basis",
-        "baseline_median_ms",
-        "oracle_median_ms",
-        "delta_ms",
-        "speedup",
-    }
-    # The baseline is the post-sweep re-timing, never the row's own
-    # pre-sweep OOTB number.
-    assert oracle["delta"]["baseline_median_ms"] == (
-        oracle["baseline_kernel"]["median_ms"]
-    )
+    # The tuned plan is the same object as the OOTB plan, plus one key.
+    assert set(oracle) - set(ootb) == {"tuning_available"}
+    # Both plans report their own plan build through the same timed path.
+    assert ootb["build_ms"] > 0 and oracle["build_ms"] > 0
+    assert oracle["kernel"]["median_ms"] > 0
 
 
 @pytest.mark.parametrize("graph_name", ["sample_conv_fwd.json", "sample_relu.json"])

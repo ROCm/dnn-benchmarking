@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
+from ..common.pytorch_tuning import (
+    apply_pytorch_environment,
+    enable_tuned_pytorch,
+    pytorch_environment_snapshot,
+)
 from ..config.benchmark_config import (
     RuntimeName,
     PyTorchSdpaBackendName,
@@ -119,6 +124,13 @@ def run_suite_cli(
     except ValueError as e:
         reporter.error(str(e))
         return 2
+    if args.internal_pytorch_tuned and (
+        config.runtime is not RuntimeName.PYTORCH or config.oracle_enabled
+    ):
+        reporter.error(
+            "--internal-pytorch-tuned requires --runtime pytorch --oracle-mode off"
+        )
+        return 2
 
     output_path: Optional[Path] = args.output
     if output_path is not None:
@@ -141,10 +153,11 @@ def run_suite_cli(
         return 2
 
     _warn_ignored_options(config, reporter)
+    _apply_pytorch_environment(config, args.internal_pytorch_tuned, reporter)
     if config.runtime is RuntimeName.HIPDNN:
         _apply_tuning_environment(config, reporter)
         if config.oracle_enabled:
-            _warn_oracle(config, reporter)
+            _warn_oracle(reporter)
 
     try:
         run_graph = start_runtime(config, reporter)
@@ -269,6 +282,7 @@ def _run_suite(
     environment = collect_environment_info()
     if config.oracle_enabled or config.autotune:
         environment["selection_env"] = {n: os.environ.get(n) for n in _SELECTION_ENV}
+    environment["pytorch_env"] = pytorch_environment_snapshot()
     run_config = _run_config(config)
     total = len(graph_paths)
     reporter.print_suite_header(environment, run_config, total)
@@ -373,8 +387,8 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
         )
 
 
-def _warn_oracle(config: SuiteConfig, reporter: Reporter) -> None:
-    """One line per condition that makes the oracle's OOTB baseline non-cold."""
+def _warn_oracle(reporter: Reporter) -> None:
+    """One line per condition that makes the OOTB or tuned plan non-cold."""
     if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
         reporter.warning(
             "--oracle-mode: exact-engine cache is on, so the OOTB timing may "
@@ -385,11 +399,42 @@ def _warn_oracle(config: SuiteConfig, reporter: Reporter) -> None:
             "--oracle-mode: provider kernel caches are on "
             "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
         )
-    if config.oracle_exhaustive:
-        reporter.info(
-            "--oracle-mode exhaustive: providers may reuse tuned selections "
-            "(e.g. MIOpen FindDb); a cache miss costs candidates x variants"
+    reporter.info(
+        "--oracle-mode exhaustive: each engine gets a second plan built with "
+        "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
+        "engines re-measure the OOTB plan); MIOpen may reuse FindDb entries"
+    )
+    forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
+    if forced is not None:
+        # Providers apply the variable as override.value_or(knob): it wins over
+        # the tuned plan's knob and also reaches the OOTB plan.
+        reporter.warning(
+            f"--oracle-mode with HIPDNN_FORCE_BENCHMARKING={forced} (set directly "
+            "or by --autotune): it overrides the global.benchmarking knob for the "
+            "OOTB and the tuned plan, so the two may not differ"
         )
+
+
+def _apply_pytorch_environment(
+    config: SuiteConfig, tuned_child: bool, reporter: Reporter
+) -> None:
+    """Set PyTorch's kernel-selection controls when PyTorch is timed or used.
+
+    Must run before the first PyTorch conv or SDPA call. The tuned-PyTorch
+    child (``--internal-pytorch-tuned``) also turns on the exhaustive search.
+    """
+    if not (
+        config.runtime is RuntimeName.PYTORCH
+        or config.validation.provider is ReferenceProviderName.PYTORCH
+    ):
+        return
+    effective = apply_pytorch_environment()
+    if tuned_child:
+        enable_tuned_pytorch()
+        return
+    settings = ", ".join(f"{k}={v}" for k, v in effective.items())
+    tuned = "; tuned runs use an isolated subprocess" if config.oracle_enabled else ""
+    reporter.info(f"PyTorch kernel selection: {settings}{tuned}")
 
 
 def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:

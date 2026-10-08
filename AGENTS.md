@@ -129,6 +129,14 @@ Rules that keep the design intact:
   seconds, so the hipDNN path must not import it at startup. Code that only
   reads torch facts (environment, GPU identity) uses `sys.modules["torch"]`
   when torch is already loaded, and does not import it.
+- Build every hipDNN plan through `Executor.prepare`, which times only
+  `create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
+  `build_plans()`. Prime each engine with `Executor.prime` before its timed
+  OOTB build, and build the oracle's `global.benchmarking=1` plan right after
+  the OOTB build, so the two build times start from the same process state.
+- Run tuned PyTorch only in the `--internal-pytorch-tuned` child process.
+  PyTorch's conv algorithm cache and MIOpen's user database would otherwise
+  carry tuning into the OOTB measurement.
 
 ## Tests
 

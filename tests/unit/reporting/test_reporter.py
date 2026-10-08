@@ -11,9 +11,10 @@ from dnn_benchmarking.metrics import _diagnostic
 from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
+    PlanResult,
     CorrectnessResult,
     GraphResult,
-    PlanResult,
+    OracleResult,
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
@@ -266,21 +267,33 @@ class TestSummaries:
         cells = [line.split()[1] for line in lines[header + 1 : header + 4]]
         assert cells == ["passed", "failed", "reference"]
 
-    def test_oracle_summary_geomean_excludes_rows_without_a_real_search(self) -> None:
-        from dnn_benchmarking.reporting.suite_results import OracleDelta, OracleResult
-
-        def tuned(speedup: float, plans: int) -> ProviderEngineResult:
+    def test_oracle_summary_geomean_counts_only_reportable_engine_rows(self) -> None:
+        def tuned(
+            speedup: float, *, tuning=True, role="engine", tuned_match=True
+        ) -> ProviderEngineResult:
             pe = _passed_row()
-            pe.oracle = OracleResult("p", 0, 0, 0.1, plans, plans, 0, [])
-            pe.oracle_delta = OracleDelta(
-                "gpu_kernel", speedup, 1.0, speedup - 1.0, speedup
+            pe.role = role
+            pe.ootb.gpu_kernel_stats = BenchmarkStats.from_timings([speedup] * 10)
+            pe.oracle = OracleResult(
+                tuning_available=tuning,
+                gpu_kernel_stats=BenchmarkStats.from_timings([1.0] * 10),
+                correctness=CorrectnessResult(tuned_match, 1e-5, 1e-6),
             )
             return pe
 
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_oracle_summary(
-            [_graph(tuned(2.0, 5), tuned(8.0, 5), tuned(100.0, 1))]
+            [
+                _graph(tuned(2.0), tuned(100.0, tuning=False)),
+                _graph(
+                    tuned(8.0),
+                    tuned(1000.0, tuned_match=False),
+                    tuned(50.0, role="reference"),
+                ),
+            ]
         )
         text = out.getvalue()
-        assert "2 tuned row(s), geomean speedup 4.00x" in text
+        # geomean(2, 8) = 4; the no-search row is counted as excluded, the
+        # invalid and the reference row are not tuned engine results at all.
+        assert "2 tuned row(s)" in text and "4.00x" in text
         assert "1 row(s) excluded" in text

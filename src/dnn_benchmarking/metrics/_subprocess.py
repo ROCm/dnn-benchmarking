@@ -77,7 +77,9 @@ def _kill_tree(proc: "subprocess.Popen[str]") -> None:
 
 
 def run_capped(
-    argv: List[str], timeout_s: Optional[int]
+    argv: List[str],
+    timeout_s: Optional[int],
+    env: Optional[Dict[str, str]] = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run ``argv``, capturing text output, under a real wall-clock cap.
 
@@ -90,6 +92,7 @@ def run_capped(
     Args:
         argv: Command to run.
         timeout_s: Wall-clock budget in seconds; ``None`` disables it.
+        env: Child environment; ``None`` passes a copy of ``os.environ``.
 
     Returns:
         The completed process with ``stdout``/``stderr`` as text.
@@ -109,7 +112,7 @@ def run_capped(
         # Python-startup snapshot, while the C-level environ also holds the
         # variables HIP set with setenv() during its init in this process.
         # Passing those to the profiled child makes rocprofv3 abort (rc=-6).
-        env=dict(os.environ),
+        env=env if env is not None else dict(os.environ),
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout_s)

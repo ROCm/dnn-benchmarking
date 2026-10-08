@@ -34,7 +34,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch
-from .oracle import run_oracle_pass
+from .oracle import build_tuned_plan, run_pytorch_tuned, run_tuned_plan
 
 
 @dataclass
@@ -315,7 +315,6 @@ def _run_pytorch_row(
             pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
         )
         executor.prepare()
-        row.ootb.cpu_build_time_ms = executor.init_time_ms
         # The executor's device, not the buffer manager's cuda:0 default.
         with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
             bm.allocate_all()
@@ -334,6 +333,15 @@ def _run_pytorch_row(
         if role == "reference":
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
                 ctx.graph_json
+            )
+        # After the OOTB buffers are released, so the child's allocations do
+        # not stack on top of them.
+        if config.oracle_enabled:
+            run_pytorch_tuned(
+                row=row,
+                graph_path=ctx.graph_path,
+                graph_name=ctx.graph_name,
+                config=config,
             )
     except StallFallbackError:
         raise  # run_graph_* remeasures the whole graph unstalled.
@@ -365,11 +373,27 @@ def run_single_provider_engine(
         plugin_path=plugin,
     )
     try:
+        # Absorb the engine's one-time build costs (provider setup, cold
+        # plugin and kernel file reads) before timing, so the OOTB and tuned
+        # build times start from the same state.
+        Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
-        row.ootb.cpu_build_time_ms = executor.init_time_ms
+        row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
+        tuned = (
+            build_tuned_plan(
+                row=row,
+                handle=handle,
+                engine_id=engine_id,
+                graph_json_str=ctx.graph_json_str,
+                graph_name=ctx.graph_name,
+                config=config,
+            )
+            if config.oracle_enabled
+            else None
+        )
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -397,23 +421,21 @@ def run_single_provider_engine(
                     config, ctx.reference_error or "Reference outputs unavailable"
                 )
 
-            if config.oracle_enabled:
-                run_oracle_pass(
+            if tuned is not None:
+                run_tuned_plan(
+                    tuned=tuned,
                     row=row,
-                    handle=handle,
                     engine_id=engine_id,
-                    graph_json_str=ctx.graph_json_str,
                     graph_name=ctx.graph_name,
                     config=config,
                     bm=bm,
                     variant_pack=variant_pack,
-                    ootb_executor=executor,
                     tensor_infos=ctx.tensor_infos,
                     reference_outputs=ctx.reference_outputs,
                 )
-        # Release the workspace before the profiling child allocates its own
-        # VRAM; holding it roughly doubles peak VRAM on large graphs.
-        del executor
+        # Release both workspaces before the profiling child allocates its own
+        # VRAM; holding them roughly doubles peak VRAM on large graphs.
+        del executor, tuned
     except StallFallbackError:
         raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:

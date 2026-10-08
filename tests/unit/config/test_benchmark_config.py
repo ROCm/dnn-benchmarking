@@ -39,7 +39,7 @@ warmup = 1
 iters = 2
 min_time_ms = 5
 cache_mode = "cold"
-oracle_mode = "plan"
+oracle_mode = "exhaustive"
 metrics = false
 rtol = 1e-3
 
@@ -62,7 +62,7 @@ id = 1
         assert suite.seed == 7
         assert suite.engine_filter is None  # --plugin-path replaces the matrix
         assert suite.plugin_paths == [Path("/plugins")]
-        assert suite.oracle_mode is OracleMode.PLAN
+        assert suite.oracle_mode is OracleMode.EXHAUSTIVE
         assert suite.metrics.basic is False
         assert suite.validation.tolerance_override == (1e-3, 1e-3)
 
@@ -110,7 +110,6 @@ id = 1
             (["--trace"], "--trace"),
             (["--perf"], "--perf"),
             (["--roofline"], "--roofline"),
-            (["--oracle-mode", "plan"], "--oracle-mode"),
             (["--autotune"], "--autotune"),
             (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
         ],
@@ -121,6 +120,11 @@ id = 1
         args = _namespace(["-r", "pytorch", *argv])
         with pytest.raises(ValueError, match=f"{flag}.*--runtime pytorch"):
             SuiteConfig.from_namespace(args)
+
+    def test_pytorch_backend_accepts_oracle_mode(self) -> None:
+        """PyTorch rows get their tuned run in a child process."""
+        args = _namespace(["-r", "pytorch", "--oracle-mode", "exhaustive"])
+        assert SuiteConfig.from_namespace(args).oracle_enabled is True
 
 
 class TestSuiteConfigValidation:
@@ -135,7 +139,7 @@ class TestSuiteConfigValidation:
             ({"cache_mode": "cold", "timing_block": 2}, "--timing-block"),
             ({"engine_filter": []}, "--engine"),
             ({"runtime": "tensorflow"}, "--runtime"),
-            ({"oracle_mode": "full"}, "--oracle-mode"),
+            ({"oracle_mode": "plan"}, "--oracle-mode"),  # removed mode
             ({"pytorch_sdpa_backend": "aotriton"}, "--pytorch-sdpa-backend"),
             (
                 {"pytorch_sdpa_backend": "math", "pytorch_rocm_fa_library": "x"},

@@ -175,13 +175,13 @@ oracle_mode = "exhaustive"
             "--iters",
             "11",
             "--oracle-mode",
-            "plan",
+            "off",
         ]
     )
 
     assert args.graph == ["from_cli.json"]
     assert args.iters == 11
-    assert args.oracle_mode == "plan"
+    assert args.oracle_mode == "off"
 
 
 @pytest.mark.parametrize(

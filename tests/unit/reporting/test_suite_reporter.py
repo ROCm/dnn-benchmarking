@@ -17,7 +17,6 @@ from dnn_benchmarking.reporting.suite_results import (
     OracleResult,
     PlanResult,
     ProviderEngineResult,
-    build_oracle_delta,
 )
 
 
@@ -228,28 +227,12 @@ class TestTableLayout:
         assert "Invalid JSON in graph file" in out.getvalue()
 
 
-def _oracle(**overrides) -> OracleResult:
-    kwargs = dict(
-        plan_name="tuned_plan_7",
-        compiled_plan_index=2,
-        rank=0,
-        sweep_min_time_ms=0.210,
-        compiled_plans_benchmarked=5,
-        compiled_plans_total=5,
-        compiled_plans_failed=0,
-        knob_settings=[],
-        # Warm heuristic twice as slow as the tuned run: speedup 2.00x.
-        gpu_kernel_stats=_stats(0.250),
-        warm_baseline_gpu_kernel_stats=_stats(0.500),
-    )
-    kwargs.update(overrides)
-    return OracleResult(**kwargs)
-
-
-def _oracle_row(baseline: Optional[CorrectnessResult] = None, **oracle_overrides):
-    pe = _row(correctness=baseline)
-    pe.oracle = _oracle(**oracle_overrides)
-    pe.oracle_delta = build_oracle_delta(pe.oracle)
+def _oracle_row(ootb: Optional[CorrectnessResult] = None, **oracle_overrides):
+    # OOTB plan twice as slow as the tuned plan: speedup 2.00x.
+    pe = _row(median_ms=0.500, correctness=ootb)
+    kwargs = dict(tuning_available=True, gpu_kernel_stats=_stats(0.250))
+    kwargs.update(oracle_overrides)
+    pe.oracle = OracleResult(**kwargs)
     return pe
 
 
@@ -263,24 +246,12 @@ class TestOracleColumn:
             (_oracle_row(), "2.00x"),
             # Unchecked is not failed and keeps the ratio.
             (_oracle_row(_verdict(None)), "2.00x"),
-            # A wrong baseline or tuned plan cannot measure a gain.
+            # A wrong OOTB or tuned plan cannot measure a gain.
             (_oracle_row(_verdict(False)), "invalid"),
             (_oracle_row(correctness=_verdict(False)), "invalid"),
-            # One compiled plan and no provider search: the ratio is noise.
-            (
-                _oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1),
-                "no-search",
-            ),
-            (
-                _oracle_row(
-                    compiled_plans_benchmarked=1,
-                    compiled_plans_total=1,
-                    exhaustive_requested=True,
-                    exhaustive_supported=True,
-                ),
-                "2.00x",
-            ),
-            (_row(oracle_error="sweep exploded"), "failed"),
+            # No tuning knob: the tuned run re-measured OOTB, the ratio is noise.
+            (_oracle_row(tuning_available=False), "no-search"),
+            (_row(oracle_error="tuned build exploded"), "failed"),
         ],
     )
     def test_oracle_cell(self, pe, expected) -> None:
@@ -335,13 +306,21 @@ class TestVerboseBlock:
         assert "FAILED" in text and "max_abs_diff 6.20e-03" in text
         assert "n_mismatch 3/1024" in text
 
-    def test_oracle_detail_names_plan_knobs_and_speedup(self) -> None:
-        pe = _oracle_row(knob_settings=[{"knob_id": "SPLIT_K", "value": 4}])
+    def test_oracle_detail_reports_the_tuned_build_not_the_ootb_build(self) -> None:
+        pe = _oracle_row(
+            cpu_build_time_ms=1500.0,
+            timing=TimingInfo("staged", "hip", 10, 2500.0),
+        )
+        pe.ootb.cpu_build_time_ms = 4.5
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_verbose(_graph(pe))
-        text = out.getvalue()
-        assert "tuned_plan_7" in text and "SPLIT_K=4" in text
-        assert "500.00 µs" in text and "250.00 µs" in text and "2.00x" in text
+        oracle = [
+            line
+            for line in out.getvalue().splitlines()
+            if line.split()[:1] == ["oracle"]
+        ]
+        assert "build 1.5 s" in oracle[0] and "first call 2.5 s" in oracle[0]
+        assert not any("4.5 ms" in line for line in oracle)
 
     def test_failed_tuned_validation_is_explained(self) -> None:
         pe = _oracle_row(correctness=_verdict(False))
@@ -356,31 +335,14 @@ class TestVerboseBlock:
         )
         assert "FIRST (0x" in out.getvalue() and "SECOND (0x" in out.getvalue()
 
-    def test_plan_mode_oracle_claims_no_exhaustive_search(self) -> None:
-        out = io.StringIO()
-        Reporter(out, io.StringIO()).print_graph_verbose(_graph(_oracle_row()))
-        assert "tuned_plan_7" in out.getvalue()
-        assert "exhaustive" not in out.getvalue()
-
     @pytest.mark.parametrize(
         "pe, expected",
         [
             (
-                _row(oracle_error="sweep exploded"),
-                "oracle      unavailable: sweep exploded",
+                _row(oracle_error="tuned build exploded"),
+                "oracle      unavailable: tuned build exploded",
             ),
-            (
-                _oracle_row(exhaustive_requested=True, exhaustive_supported=True),
-                "exhaustive search enabled (a cached selection may be reused)",
-            ),
-            (
-                _oracle_row(exhaustive_requested=True),
-                "exhaustive unsupported by this engine; plan-level tuning only",
-            ),
-            (
-                _oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1),
-                "no tuning alternative: re-measured the heuristic plan; delta is noise",
-            ),
+            (_oracle_row(tuning_available=False), "no tuning knob"),
             (_row(correctness=_verdict(True)), "passed (rtol 1e-05, atol 1e-06)"),
             (
                 _row(correctness=CorrectnessResult(None, 1e-5, 1e-6)),
@@ -399,35 +361,18 @@ class TestVerboseBlock:
                 ),
                 "skipped     no configs",
             ),
-            (_oracle_row(), "rank 0); knobs engine defaults"),
-            (
-                _oracle_row(compiled_plans_benchmarked=4, compiled_plans_failed=1),
-                "4/5 compiled plans benchmarked (1 failed); sweep min 210.00 µs",
-            ),
-            (
-                _oracle_row(),
-                "500.00 µs warm heuristic -> 250.00 µs tuned = 2.00x (basis kernel)",
-            ),
-            (
-                _oracle_row(
-                    derived_tflops_per_s=1.5, warm_baseline_derived_tflops_per_s=0.75
-                ),
-                "throughput 1.500 TFLOP/s tuned, 0.750 warm heuristic",
-            ),
+            (_oracle_row(), "500.00 µs OOTB -> 250.00 µs tuned = 2.00x"),
+            (_oracle_row(derived_tflops_per_s=1.5), "1.500 TFLOP/s tuned"),
         ],
         ids=[
             "oracle-error",
-            "exhaustive",
-            "exhaustive-unsupported",
-            "single-plan",
+            "no-tuning-knob",
             "passed",
             "unchecked",
             "reference-warning",
             "error-row",
             "skipped-row",
-            "default-knobs",
-            "plan-counts",
-            "delta",
+            "speedup",
             "throughput",
         ],
     )
@@ -445,8 +390,7 @@ class TestVerboseBlock:
 
     def test_oracle_summary_without_reportable_speedup(self) -> None:
         out = io.StringIO()
-        pe = _oracle_row(compiled_plans_benchmarked=1, compiled_plans_total=1)
+        pe = _oracle_row(tuning_available=False)
         Reporter(out, io.StringIO()).print_oracle_summary([_graph(pe)])
-        assert out.getvalue().startswith(
-            "Oracle: no reportable speedup on any of 1 tuned row(s)"
-        )
+        assert "no reportable speedup" in out.getvalue()
+        assert "geomean" not in out.getvalue()

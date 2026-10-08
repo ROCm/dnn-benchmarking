@@ -18,7 +18,6 @@ from dnn_benchmarking.reporting.suite_results import (
     ProviderEngineResult,
     RunInfo,
     SuiteResult,
-    build_oracle_delta,
 )
 
 TOP_KEYS = {"schema_version", "tool", "run", "environment", "summary", "graphs"}
@@ -36,7 +35,7 @@ ENV_KEYS = {
     "gpu_pcie_link", "amdgpu_driver_version", "gpu_power_cap_w",
     "gpu_max_sclk_mhz", "gpu_compute_partition", "rocm_version", "cuda_version",
     "cudnn_version", "hipdnn_version", "python_version", "torch_version",
-    "amdsmi_available", "selection_env",
+    "amdsmi_available", "selection_env", "pytorch_env",
 }  # fmt: skip
 SUMMARY_KEYS = {
     "graphs", "rows", "passed", "unchecked", "failed", "skipped", "errors",
@@ -70,14 +69,7 @@ CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
     "n_total", "worst_output_uid", "message",
 }  # fmt: skip
-ORACLE_KEYS = PLAN_KEYS | {
-    "tuning_available", "plan_name", "compiled_plan_index", "rank",
-    "sweep_min_time_ms", "compiled_plans_benchmarked", "compiled_plans_total",
-    "compiled_plans_failed", "knob_settings", "exhaustive_requested",
-    "exhaustive_enabled", "exhaustive_supported", "baseline_kernel",
-    "baseline_host", "baseline_tflops", "delta",
-}  # fmt: skip
-DELTA_KEYS = {"basis", "baseline_median_ms", "oracle_median_ms", "delta_ms", "speedup"}
+ORACLE_KEYS = PLAN_KEYS | {"tuning_available"}
 
 
 def _stats(median: float = 1.0) -> BenchmarkStats:
@@ -87,33 +79,20 @@ def _stats(median: float = 1.0) -> BenchmarkStats:
 def _oracle() -> OracleResult:
     # Distinct values, so a field swap in to_dict changes the output.
     return OracleResult(
-        plan_name="plan",
-        compiled_plan_index=4,
-        rank=2,
-        sweep_min_time_ms=0.5,
-        compiled_plans_benchmarked=3,
-        compiled_plans_total=6,
-        compiled_plans_failed=1,
-        knob_settings=[{"knob": "k", "value": 8}],
-        exhaustive_requested=True,
-        exhaustive_supported=False,
+        tuning_available=False,
         cpu_build_time_ms=7.0,
         timing=TimingInfo("events", "hip", 11, 13.5),
         gpu_kernel_stats=_stats(1.0),
-        warm_baseline_gpu_kernel_stats=_stats(2.0),
         host_stats=_stats(3.0),
-        warm_baseline_host_stats=_stats(4.0),
         correctness=CorrectnessResult(False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9),
         derived_tflops_per_s=4.0,
         derived_gbytes_per_s=3000.0,
         workspace_bytes=2048,
-        warm_baseline_derived_tflops_per_s=2.5,
     )
 
 
 def full_suite() -> SuiteResult:
     """Every optional field populated, one row per status."""
-    oracle = _oracle()
     row = ProviderEngineResult(
         runtime="hipdnn",
         engine_id=0x15B46865C717A122,
@@ -131,8 +110,7 @@ def full_suite() -> SuiteResult:
             "roofline": None,
             "trace": None,
         },
-        oracle=oracle,
-        oracle_delta=build_oracle_delta(oracle),
+        oracle=_oracle(),
         clocks_after={"sclk_mhz": 1650},
         ootb=PlanResult(
             cpu_build_time_ms=3.0,
@@ -232,9 +210,6 @@ def test_full_document_has_exact_key_sets() -> None:
         assert set(plan["host"]) == STATS_KEYS
         assert set(plan["timing"]) == TIMING_KEYS
         assert set(plan["correctness"]) == CORRECTNESS_KEYS
-    assert set(row["oracle"]["baseline_kernel"]) == STATS_KEYS
-    assert set(row["oracle"]["delta"]) == DELTA_KEYS
-    assert row["oracle"]["delta"]["basis"] == "kernel"
     assert doc["schema_version"] == 2
     assert doc["environment"] == full_suite().environment  # values unchanged
 
@@ -271,7 +246,7 @@ def test_full_row_values() -> None:
         "worst_output_uid": 7,
         "message": "note",
     }
-    stats_keys = {"kernel", "host", "baseline_kernel", "baseline_host", "delta"}
+    stats_keys = {"kernel", "host"}
     assert {k: v for k, v in row["oracle"].items() if k not in stats_keys} == {
         "build_ms": 7.0,
         "timing": {
@@ -285,19 +260,7 @@ def test_full_row_values() -> None:
         "workspace_bytes": 2048,
         "tflops": 4.0,
         "gbps": 3000.0,
-        "plan_name": "plan",
-        "compiled_plan_index": 4,
-        "rank": 2,
-        "sweep_min_time_ms": 0.5,
-        "compiled_plans_benchmarked": 3,
-        "compiled_plans_total": 6,
-        "compiled_plans_failed": 1,
-        "tuning_available": True,
-        "knob_settings": [{"knob": "k", "value": 8}],
-        "exhaustive_requested": True,
-        "exhaustive_enabled": False,
-        "exhaustive_supported": False,
-        "baseline_tflops": 2.5,
+        "tuning_available": False,
         "correctness": {
             "match": False,
             "rtol": 2e-3,
@@ -310,14 +273,8 @@ def test_full_row_values() -> None:
             "message": "off",
         },
     }
-    medians = {k: row["oracle"][k]["median_ms"] for k in stats_keys - {"delta"}}
-    assert medians == {
-        "kernel": 1.0,
-        "baseline_kernel": 2.0,
-        "host": 3.0,
-        "baseline_host": 4.0,
-    }
-    assert row["oracle"]["delta"]["speedup"] == 2.0
+    medians = {k: row["oracle"][k]["median_ms"] for k in stats_keys}
+    assert medians == {"kernel": 1.0, "host": 3.0}
     assert row["oracle_error"] is None
     assert row["warnings"] == ["noisy: CV 6.0%"]
     assert row["elapsed_s"] == 1.5

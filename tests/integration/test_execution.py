@@ -93,7 +93,7 @@ def test_benchmark_measures_and_writes_output(
     handle = hipdnn.Handle()
     executor = Executor(json.dumps(sample_conv_fwd_json), policy)
     executor.prepare(handle)
-    assert executor.init_time_ms > 0
+    assert executor.build_time_ms > 0
 
     with BufferManager(tensor_infos) as bm:
         bm.allocate_all()

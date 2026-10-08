@@ -63,7 +63,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
-| `oracle_mode` | string | `off`, `plan` or `exhaustive`. |
+| `oracle_mode` | string | `off` or `exhaustive`. |
 | `autotune` | bool | `--autotune`. |
 | `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
@@ -100,6 +100,7 @@ The CLI collects these values one time, at suite start.
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
 | `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle-mode` or `--autotune` is set. |
+| `pytorch_env` | object or null | The PyTorch kernel-selection variables in effect: `PYTORCH_MIOPEN_SUGGEST_NHWC`, `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL`. `null` unless `--runtime pytorch` or `--validate pytorch`. See [usage.md](usage.md#pytorch-kernel-selection). |
 
 ## summary
 
@@ -181,7 +182,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 
 | Key | Type | Meaning |
 |---|---|---|
-| `build_ms` | float or null | CPU time to build the plan. |
+| `build_ms` | float or null | CPU time of the plan build only: `create_execution_plan_ext`, `check_support` and `build_plans`. `null` for PyTorch, which has no plan build. |
 | `timing` | object | How the samples were measured. See [timing](#timing). |
 | `kernel` | object or null | Device time per launch. See [stats](#stats). |
 | `host` | object or null | Host submit time per launch (enqueue call only). See [stats](#stats). |
@@ -280,45 +281,26 @@ The tool never removes samples because of a warning.
 
 ### oracle
 
-`oracle` is `null` unless `--oracle-mode plan` or `--oracle-mode exhaustive`
-ran for the row and tuning produced a result. When tuning fails,
-`oracle_error` gives the reason and `oracle` is `null`.
+`oracle` is `null` unless `--oracle-mode exhaustive` ran for the row and the
+tuned run produced a result. When the tuned run fails, `oracle_error` gives
+the reason and `oracle` is `null`.
 
-`oracle` is a [plan](#plan) object for the tuned plan, with these keys added:
+`oracle` is a [plan](#plan) object for the tuned run, with one key added:
 
 | Key | Type | Meaning |
 |---|---|---|
-| `plan_name` | string | Name of the selected plan. |
-| `compiled_plan_index` | int | Index of the selected compiled plan. |
-| `rank` | int | Rank of the selected plan in the sweep. |
-| `sweep_min_time_ms` | float | Fastest single iteration in the selection sweep. |
-| `compiled_plans_benchmarked` | int | Compiled plans that the sweep measured. |
-| `compiled_plans_total` | int | Eligible compiled plans, failures included. |
-| `compiled_plans_failed` | int | Compiled plans that failed. |
-| `tuning_available` | bool | More than one plan competed, or provider-level tuning was on. |
-| `knob_settings` | array | Explicit plan knob settings. Empty means no knob was set. |
-| `exhaustive_requested` | bool | The run requested provider-level tuning. |
-| `exhaustive_enabled` | bool | Provider-level tuning was requested and supported. |
-| `exhaustive_supported` | bool | The engine advertises `global.benchmarking`. |
-| `baseline_kernel` | stats or null | Default (OOTB) plan timed again after the sweep, device time. |
-| `baseline_host` | stats or null | Default plan timed again after the sweep, host submit time. |
-| `baseline_tflops` | float or null | Default plan TFLOP/s: row `metrics.flops` / `baseline_kernel.median_ms`. |
-| `delta` | object or null | Comparison by kernel median. See below. |
+| `tuning_available` | bool | `true` when the engine exposes the `global.benchmarking` knob, and always for PyTorch. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. |
 
-`delta` compares `baseline_kernel` with `kernel`. It is `null` when either
-side has no kernel statistics, when either median is 0 or less, or when the
-default or the tuned plan failed validation.
+- hipDNN rows: the tuned plan is a second plan of the same engine, built with
+  `global.benchmarking=1` right after the OOTB plan. Its first launch samples
+  the candidates, so `oracle.timing.first_call_ms` holds the search cost.
+- PyTorch rows: the tuned run comes from a child process (MIOpen exhaustive
+  conv search and TunableOp). `build_ms` and `correctness` are `null`.
 
-| Key | Meaning |
-|---|---|
-| `basis` | Always `kernel`. |
-| `baseline_median_ms` | Median of the default plan, timed after the sweep. |
-| `oracle_median_ms` | Median of the tuned plan. |
-| `delta_ms` | `baseline_median_ms - oracle_median_ms`. A positive value means the tuned plan is faster. |
-| `speedup` | `baseline_median_ms / oracle_median_ms`. |
-
-The baseline is the default plan timed again after the sweep, not
-`ootb.kernel`. Both sides then have the same device warmth.
+The file does not store a speedup. Use `ootb.kernel.median_ms /
+oracle.kernel.median_ms`. Do not report a speedup when either `correctness`
+failed. Keep rows with `tuning_available: false` and `reference` rows out of
+averages.
 
 ### extra_metrics
 

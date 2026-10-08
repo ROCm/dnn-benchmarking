@@ -64,10 +64,9 @@ CACHE_MODE_CHOICES = ("warm", "cold")
 
 
 class OracleMode(str, Enum):
-    """Oracle comparison depth."""
+    """Tuned comparison: off, or a second ``global.benchmarking`` plan."""
 
     OFF = "off"
-    PLAN = "plan"
     EXHAUSTIVE = "exhaustive"
 
 
@@ -306,10 +305,10 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
-        oracle_mode: Oracle comparison depth. "off" runs no comparison;
-            "plan" times the auto-tuner's chosen plan against the heuristic
-            plan; "exhaustive" additionally forces provider kernel
-            benchmarking so providers sample kernel variants.
+        oracle_mode: "off" runs no comparison. "exhaustive" builds a second
+            plan per engine with ``global.benchmarking=1``, so providers
+            sample their candidate kernels, and times it against the OOTB
+            plan. PyTorch rows get a tuned run in an isolated subprocess.
         metrics: Metric collection configuration. Defaults to the always-on
             probes and no extra runs.
         runtime: Runtime that executes the graph (``hipdnn`` runs discovered engine plugins,
@@ -405,12 +404,7 @@ class SuiteConfig:
 
     @property
     def oracle_enabled(self) -> bool:
-        """True when any oracle comparison should run."""
-        return self.oracle_mode is not OracleMode.OFF
-
-    @property
-    def oracle_exhaustive(self) -> bool:
-        """True when the oracle pass must force provider kernel benchmarking."""
+        """True when the tuned (oracle) comparison should run."""
         return self.oracle_mode is OracleMode.EXHAUSTIVE
 
     def __post_init__(self) -> None:
@@ -466,7 +460,6 @@ class SuiteConfig:
                 ("--trace", self.metrics.trace),
                 ("--perf", self.metrics.perf),
                 ("--roofline", self.metrics.roofline),
-                ("--oracle-mode", self.oracle_enabled),
                 ("--autotune", self.autotune),
                 ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ]

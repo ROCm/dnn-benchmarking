@@ -405,8 +405,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Comparison",
         _values(OracleMode),
         _default(SuiteConfig, "oracle_mode"),
-        "also time hipDNN's auto-tuned plan per engine; exhaustive forces "
-        "provider kernel search (much slower)",
+        "exhaustive: also build and time a global.benchmarking=1 plan per "
+        "engine, and a tuned PyTorch run in a child process (much slower)",
     ),
     # Output
     CliOption(
@@ -610,6 +610,14 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
     #   --internal-profiling-run --graph G --engine E --warmup W --iters I --seed S
     parser.add_argument(
         "--internal-profiling-run",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    # Hidden child mode for the tuned PyTorch run: the parent re-execs the CLI
+    # with --runtime pytorch so tuning state stays out of its own process.
+    parser.add_argument(
+        "--internal-pytorch-tuned",
         action="store_true",
         default=False,
         help=argparse.SUPPRESS,
