@@ -153,14 +153,11 @@ The graph content decides the ID. The file name and the file path do not. Use
 | `message` | string or null | Error message or skip reason. |
 | `started_at` | string | UTC ISO 8601 time when the row started. |
 | `elapsed_s` | float | Wall time of the whole row, seconds: build, priming, timing, validation, oracle and profiling. |
-| `build_ms` | float or null | CPU time to build the plan. |
-| `timing` | object or null | How the samples were measured. See [timing](#timing). |
-| `kernel` | object or null | Device time per launch. See [stats](#stats). |
-| `host` | object or null | Host submit time per launch (enqueue call only). See [stats](#stats). |
-| `metrics` | object | See [metrics](#metrics). |
-| `correctness` | object or null | See [correctness](#correctness). `null` when validation did not run. |
+| `metrics` | object | Graph values and GPU state. See [metrics](#metrics). |
+| `ootb` | object or null | The default (out-of-the-box) plan. See [plan](#plan). `null` when `status` is `error` or `skipped`. |
+| `oracle` | object or null | The tuned plan. See [oracle](#oracle). `null` unless `--oracle-mode` ran for the row and tuning produced a result. |
+| `oracle_error` | string or null | Why tuning produced no result. `oracle` is then `null`. |
 | `warnings` | array of string | Non-fatal notes. See [Row warnings](#row-warnings). |
-| `oracle` | object or null | See [oracle](#oracle). `null` unless `--oracle-mode` ran for the row. |
 | `extra_metrics` | object or null | Profiling results. See [extra_metrics](#extra_metrics). |
 
 ### engine
@@ -176,6 +173,22 @@ hipDNN engine IDs are signed 64-bit integers. JSON readers that use
 floating-point numbers lose precision above 2^53. For this reason the file
 stores the ID as the hex form of its unsigned 64-bit value
 (`"0x%016X" % (id & 0xFFFFFFFFFFFFFFFF)`). `--engine` accepts this string.
+
+### plan
+
+`ootb` and `oracle` use the same object, so the default plan and the tuned
+plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
+
+| Key | Type | Meaning |
+|---|---|---|
+| `build_ms` | float or null | CPU time to build the plan. |
+| `timing` | object | How the samples were measured. See [timing](#timing). |
+| `kernel` | object or null | Device time per launch. See [stats](#stats). |
+| `host` | object or null | Host submit time per launch (enqueue call only). See [stats](#stats). |
+| `workspace_bytes` | int or null | Workspace that hipDNN reserved for the plan. `null` for PyTorch. |
+| `tflops` | float or null | `metrics.flops / kernel.median_ms`, in 10^12 FLOP/s. |
+| `gbps` | float or null | `metrics.io_bytes / kernel.median_ms`, in 10^9 bytes/s. |
+| `correctness` | object or null | See [correctness](#correctness). `null` when validation did not run. |
 
 ### timing
 
@@ -221,15 +234,13 @@ remove outliers.
 | `flops` | int or null | Analytical FLOPs for one launch of the graph. `null` when no node type is recognised. |
 | `flops_partial` | bool | `true` when the graph has a node type with no FLOP formula. `flops` then counts only the recognised nodes. The console shows `~` before TFLOP/s. |
 | `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. |
-| `tflops` | float or null | `flops / kernel.median_ms`, in 10^12 FLOP/s. |
-| `gbps` | float or null | `io_bytes / kernel.median_ms`, in 10^9 bytes/s. |
-| `workspace_bytes` | int or null | Workspace that hipDNN reserved for the plan. |
 | `vram_mb` | float or null | Device VRAM in use after the timed loop, MiB, while the row's buffers are still allocated. amdsmi `vram_used` counts every process on the GPU, not only this one. It can include cached allocations from earlier engines on the same graph. |
-| `clocks_before` | object or null | GPU clocks before priming and warmup, so often the idle clocks. See [clocks](#clocks). |
-| `clocks_after` | object or null | GPU clocks right after the timed loop. |
+| `clocks_before` | object or null | GPU clocks before priming and warmup of the default plan, so often the idle clocks. See [clocks](#clocks). |
+| `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. |
 
-`--metrics-tier off` sets the analytical values, `workspace_bytes`, `vram_mb`
-and both clock objects to `null`, and `flops_partial` to `false`.
+`--metrics-tier off` sets the analytical values, `vram_mb`, both clock
+objects, and the plan `workspace_bytes`, `tflops` and `gbps` to `null`, and
+`flops_partial` to `false`.
 
 #### clocks
 
@@ -261,15 +272,16 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 ### Row warnings
 
 `warnings` holds short notes. The console table shows the first note in the
-`note` column. The runner adds these notes after the timed loop:
+`note` column. The runner adds these notes after the default plan's timed
+loop. Paths are relative to the row:
 
 | Note | Condition |
 |---|---|
-| `noisy: IQR x% of median` | `kernel.iqr_ms / kernel.median_ms` is more than 0.05 and `kernel.n` is 10 or more. |
-| `outlier: max Nx median` | `kernel.max_ms` is more than 2 x `kernel.median_ms`. |
-| `capped at max_iters` | `timing.capped` is `true`. |
-| `<mode> timing: <reason>` | `timing.fallback_reason` is set. `<mode>` is `events` or `block` (`timing.mode`). stderr also shows the same text one time per process. |
-| `throttled` | `clocks_after.throttle_status` is not 0. |
+| `noisy: IQR x% of median` | `ootb.kernel.iqr_ms / ootb.kernel.median_ms` is more than 0.05 and `ootb.kernel.n` is 10 or more. |
+| `outlier: max Nx median` | `ootb.kernel.max_ms` is more than 2 x `ootb.kernel.median_ms`. |
+| `capped at max_iters` | `ootb.timing.capped` is `true`. |
+| `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
+| `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
 
 The tool never removes samples because of a warning.
@@ -277,12 +289,13 @@ The tool never removes samples because of a warning.
 ### oracle
 
 `oracle` is `null` unless `--oracle-mode plan` or `--oracle-mode exhaustive`
-ran for the row.
+ran for the row and tuning produced a result. When tuning fails,
+`oracle_error` gives the reason and `oracle` is `null`.
+
+`oracle` is a [plan](#plan) object for the tuned plan, with these keys added:
 
 | Key | Type | Meaning |
 |---|---|---|
-| `status` | string | `ok`, or `error` when tuning produced no result. |
-| `error` | string or null | Why tuning failed. When `status` is `error`, all other keys except `delta` are `null`. |
 | `plan_name` | string | Name of the selected plan. |
 | `compiled_plan_index` | int | Index of the selected compiled plan. |
 | `rank` | int | Rank of the selected plan in the sweep. |
@@ -295,14 +308,9 @@ ran for the row.
 | `exhaustive_requested` | bool | The run requested provider-level tuning. |
 | `exhaustive_enabled` | bool | Provider-level tuning was requested and supported. |
 | `exhaustive_supported` | bool | The engine advertises `global.benchmarking`. |
-| `cpu_build_time_ms` | float or null | CPU time to build the tuned plan. |
-| `kernel` | stats or null | Tuned plan, device time. |
-| `host` | stats or null | Tuned plan, host submit time. |
 | `baseline_kernel` | stats or null | Default (OOTB) plan timed again after the sweep, device time. |
 | `baseline_host` | stats or null | Default plan timed again after the sweep, host submit time. |
-| `tflops` | float or null | Tuned plan TFLOP/s: row `metrics.flops` / `kernel.median_ms`. |
 | `baseline_tflops` | float or null | Default plan TFLOP/s: row `metrics.flops` / `baseline_kernel.median_ms`. |
-| `correctness` | object or null | Correctness of the tuned plan. The row `correctness` is for the default plan. |
 | `delta` | object or null | Comparison by kernel median. See below. |
 
 `delta` compares `baseline_kernel` with `kernel`. It is `null` when either
@@ -317,8 +325,8 @@ default or the tuned plan failed validation.
 | `delta_ms` | `baseline_median_ms - oracle_median_ms`. A positive value means the tuned plan is faster. |
 | `speedup` | `baseline_median_ms / oracle_median_ms`. |
 
-The baseline is the default plan timed again after the sweep, not the row
-`kernel` value. Both sides then have the same device warmth.
+The baseline is the default plan timed again after the sweep, not
+`ootb.kernel`. Both sides then have the same device warmth.
 
 ### extra_metrics
 
@@ -411,18 +419,18 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `engine_name` | `row.engine.name` |
 | `status` | `row.status` |
 | `verdict` | `row.verdict` |
-| `kernel_median_ms` | `row.kernel.median_ms` |
-| `kernel_cv` | `row.kernel.cv` |
-| `host_median_ms` | `row.host.median_ms` |
-| `n` | `row.kernel.n` |
-| `timing_mode` | `row.timing.mode` |
-| `cache_mode` | `row.timing.cache_mode` |
-| `timing_block` | `row.timing.timing_block` |
+| `kernel_median_ms` | `row.ootb.kernel.median_ms` |
+| `kernel_cv` | `row.ootb.kernel.cv` |
+| `host_median_ms` | `row.ootb.host.median_ms` |
+| `n` | `row.ootb.kernel.n` |
+| `timing_mode` | `row.ootb.timing.mode` |
+| `cache_mode` | `row.ootb.timing.cache_mode` |
+| `timing_block` | `row.ootb.timing.timing_block` |
 | `seed` | `run.config.seed` |
-| `tflops` | `row.metrics.tflops` |
-| `gbps` | `row.metrics.gbps` |
-| `workspace_bytes` | `row.metrics.workspace_bytes` |
-| `max_abs_diff` | `row.correctness.max_abs_diff` |
+| `tflops` | `row.ootb.tflops` |
+| `gbps` | `row.ootb.gbps` |
+| `workspace_bytes` | `row.ootb.workspace_bytes` |
+| `max_abs_diff` | `row.ootb.correctness.max_abs_diff` |
 | `message` | `row.message` |
 
 A graph with no rows (status `error`, or `no_engines` without `--validate`)

@@ -260,12 +260,13 @@ class TestWriteLoad:
         path = tmp_path / "r.json"
         _sample_suite().write(path)
         row = SuiteResult.load(path)["graphs"][0]["results"][0]
-        assert (row["elapsed_s"], row["build_ms"]) == (2.5, 12.0)
-        assert (row["kernel"]["median_ms"], row["kernel"]["mean_ms"]) == (0.5, 0.65)
-        assert row["host"]["median_ms"] == 0.01
-        assert row["timing"]["timing_block"] == 4
-        metrics = row["metrics"]
-        assert (metrics["tflops"], metrics["gbps"], metrics["workspace_bytes"]) == (
+        assert row["elapsed_s"] == 2.5
+        ootb = row["ootb"]
+        assert ootb["build_ms"] == 12.0
+        assert (ootb["kernel"]["median_ms"], ootb["kernel"]["mean_ms"]) == (0.5, 0.65)
+        assert ootb["host"]["median_ms"] == 0.01
+        assert ootb["timing"]["timing_block"] == 4
+        assert (ootb["tflops"], ootb["gbps"], ootb["workspace_bytes"]) == (
             1.5,
             20.0,
             4096,

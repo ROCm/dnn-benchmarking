@@ -206,9 +206,52 @@ class CorrectnessResult:
         }
 
 
+@dataclass(kw_only=True)
+class PlanResult:
+    """One built and timed plan: the OOTB plan or the tuned plan.
+
+    The row is the OOTB plan (JSON ``ootb``) and ``OracleResult`` is the
+    tuned plan (JSON ``oracle``), so both serialize to the same object.
+
+    Attributes:
+        cpu_build_time_ms: CPU time to build the plan (JSON ``build_ms``).
+        timing: How the samples were measured.
+        gpu_kernel_stats: Device time per launch (JSON ``kernel``).
+        host_stats: Host submit time per launch (JSON ``host``).
+        workspace_bytes: Workspace that hipDNN reserved for the plan.
+        derived_tflops_per_s: Graph FLOPs over the kernel median.
+        derived_gbytes_per_s: Graph I/O bytes over the kernel median.
+        correctness: Comparison of this plan's outputs with the reference.
+    """
+
+    cpu_build_time_ms: Optional[float] = None
+    timing: Optional[TimingInfo] = None
+    gpu_kernel_stats: Optional[BenchmarkStats] = None
+    host_stats: Optional[BenchmarkStats] = None
+    workspace_bytes: Optional[int] = None
+    derived_tflops_per_s: Optional[float] = None
+    derived_gbytes_per_s: Optional[float] = None
+    correctness: Optional[CorrectnessResult] = None
+
+    def plan_dict(self) -> Dict[str, Any]:
+        """Convert to the v2 plan object (``ootb`` and ``oracle``)."""
+        return {
+            "build_ms": self.cpu_build_time_ms,
+            "timing": self.timing.to_dict() if self.timing is not None else None,
+            "kernel": _stats_dict(self.gpu_kernel_stats),
+            "host": _stats_dict(self.host_stats),
+            "workspace_bytes": self.workspace_bytes,
+            "tflops": self.derived_tflops_per_s,
+            "gbps": self.derived_gbytes_per_s,
+            "correctness": (
+                self.correctness.to_dict() if self.correctness is not None else None
+            ),
+        }
+
+
 @dataclass
-class OracleResult:
-    """Post-tuning result for one engine row.
+class OracleResult(PlanResult):
+    """Tuned plan for one engine row, plus how it was selected.
 
     ``sweep_min_time_ms`` is the fastest single selection-sweep iteration.
     Reported timing comes from the later ``gpu_kernel_stats`` or ``host_stats``
@@ -222,11 +265,8 @@ class OracleResult:
     ``warm_baseline_*`` contains the OOTB plan re-timed after selection. The
     delta uses this warm measurement, not the row's earlier OOTB timing.
     ``correctness`` is the tuned plan's verdict; the row retains the OOTB
-    verdict.
-
-    ``derived_tflops_per_s`` (tuned plan) and
-    ``warm_baseline_derived_tflops_per_s`` (warm OOTB) use the row's
-    analytical FLOPs and each side's kernel median, like the row's TFLOP/s.
+    verdict. The ``PlanResult`` fields use the row's analytical FLOPs and
+    I/O bytes with the tuned kernel median, like the row's own throughputs.
     """
 
     plan_name: str
@@ -239,13 +279,8 @@ class OracleResult:
     knob_settings: List[Dict[str, Any]]
     exhaustive_requested: bool = False
     exhaustive_supported: bool = False
-    cpu_build_time_ms: Optional[float] = None
-    gpu_kernel_stats: Optional[BenchmarkStats] = None
-    host_stats: Optional[BenchmarkStats] = None
     warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
     warm_baseline_host_stats: Optional[BenchmarkStats] = None
-    correctness: Optional[CorrectnessResult] = None
-    derived_tflops_per_s: Optional[float] = None
     warm_baseline_derived_tflops_per_s: Optional[float] = None
 
     @property
@@ -259,8 +294,10 @@ class OracleResult:
         return self.compiled_plans_total > 1 or self.exhaustive_enabled
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
+        """Convert to the v2 ``oracle`` object: the plan object plus tuning."""
         return {
+            **self.plan_dict(),
+            "tuning_available": self.tuning_available,
             "plan_name": self.plan_name,
             "compiled_plan_index": self.compiled_plan_index,
             "rank": self.rank,
@@ -268,46 +305,14 @@ class OracleResult:
             "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
             "compiled_plans_total": self.compiled_plans_total,
             "compiled_plans_failed": self.compiled_plans_failed,
-            "tuning_available": self.tuning_available,
             "knob_settings": list(self.knob_settings),
             "exhaustive_requested": self.exhaustive_requested,
             "exhaustive_enabled": self.exhaustive_enabled,
             "exhaustive_supported": self.exhaustive_supported,
-            "cpu_build_time_ms": self.cpu_build_time_ms,
-            "kernel": _stats_dict(self.gpu_kernel_stats),
-            "host": _stats_dict(self.host_stats),
             "baseline_kernel": _stats_dict(self.warm_baseline_gpu_kernel_stats),
             "baseline_host": _stats_dict(self.warm_baseline_host_stats),
-            "tflops": self.derived_tflops_per_s,
             "baseline_tflops": self.warm_baseline_derived_tflops_per_s,
-            "correctness": (self.correctness.to_dict() if self.correctness else None),
         }
-
-
-# Keys of OracleResult.to_dict(); emitted as nulls on an oracle error so the
-# row's ``oracle`` object has one shape.
-_ORACLE_KEYS = (
-    "plan_name",
-    "compiled_plan_index",
-    "rank",
-    "sweep_min_time_ms",
-    "compiled_plans_benchmarked",
-    "compiled_plans_total",
-    "compiled_plans_failed",
-    "tuning_available",
-    "knob_settings",
-    "exhaustive_requested",
-    "exhaustive_enabled",
-    "exhaustive_supported",
-    "cpu_build_time_ms",
-    "kernel",
-    "host",
-    "baseline_kernel",
-    "baseline_host",
-    "tflops",
-    "baseline_tflops",
-    "correctness",
-)
 
 
 @dataclass
@@ -351,8 +356,11 @@ Verdict = Literal["passed", "failed", "unchecked", "reference", "skipped", "erro
 
 
 @dataclass
-class ProviderEngineResult:
+class ProviderEngineResult(PlanResult):
     """Result for one provider/engine combination on one graph.
+
+    The inherited ``PlanResult`` fields describe the OOTB plan (JSON
+    ``ootb``).
 
     Attributes:
         provider: Backend, ``hipdnn`` or ``pytorch``.
@@ -364,35 +372,25 @@ class ProviderEngineResult:
             validation-provider rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
         plugin_path: Plugin the engine was loaded from.
-        cpu_build_time_ms: CPU graph-build time.
-        gpu_kernel_stats: GPU kernel timing statistics (JSON ``kernel``).
-        host_stats: Host-side submission timing statistics (JSON ``host``).
         elapsed_time_ms: Wall time of the whole row (build, timing,
             validation, oracle, profiling).
-        correctness: Correctness comparison result.
         error_message: Why the row errored.
         skip_reason: Why the row was skipped.
         warnings: Non-fatal warnings for this row (noise, throttling, ...).
-        workspace_bytes: hipDNN-reserved workspace size in bytes.
         analytical_flops: Total analytical FLOPs across compute nodes
             (None for purely bandwidth-bound graphs).
         analytical_flops_partial: True when at least one node type was
             unrecognised; ``analytical_flops`` then covers only the
             recognised compute nodes.
         analytical_io_bytes: Sum of non-virtual tensor sizes (bytes).
-        derived_tflops_per_s: Throughput from analytical_flops and the
-            kernel median.
-        derived_gbytes_per_s: Bandwidth from analytical_io_bytes and the
-            kernel median.
         vram_used_mb: Process-wide VRAM allocated at the end of this
             engine's benchmark loop (may include cached allocations from
             earlier engines on the same graph).
         extra_metrics: Opt-in profiling payload (rocprofv3 PMC / trace,
             perf, roofline).
-        oracle: Post-tuning result; set only for oracle runs that tuned.
+        oracle: Tuned plan; set only for oracle runs that tuned.
         oracle_delta: Warm-baseline vs tuned comparison.
         oracle_error: Why tuning produced no result; exclusive with oracle.
-        timing: How the timings were measured.
         clocks_before: GPU clocks sampled right before the timed loop.
         clocks_after: GPU clocks sampled right after the timed loop.
         engine_name: Display name of the engine (e.g. MIOPEN_ENGINE).
@@ -410,26 +408,18 @@ class ProviderEngineResult:
     )
     role: Literal["engine", "reference"] = "engine"
     plugin_path: Optional[str] = None
-    cpu_build_time_ms: Optional[float] = None
-    gpu_kernel_stats: Optional[BenchmarkStats] = None
-    host_stats: Optional[BenchmarkStats] = None
     elapsed_time_ms: float = 0.0
-    correctness: Optional[CorrectnessResult] = None
     error_message: Optional[str] = None
     skip_reason: Optional[str] = None
     warnings: Optional[List[str]] = None
-    workspace_bytes: Optional[int] = None
     analytical_flops: Optional[int] = None
     analytical_flops_partial: bool = False
     analytical_io_bytes: Optional[int] = None
-    derived_tflops_per_s: Optional[float] = None
-    derived_gbytes_per_s: Optional[float] = None
     vram_used_mb: Optional[float] = None
     extra_metrics: Optional[Dict[str, Any]] = None
     oracle: Optional[OracleResult] = None
     oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
-    timing: Optional[TimingInfo] = None
     clocks_before: Optional[Dict[str, Any]] = None
     clocks_after: Optional[Dict[str, Any]] = None
     engine_name: Optional[str] = None
@@ -511,7 +501,12 @@ class ProviderEngineResult:
         return "unchecked"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 row object (every key always present)."""
+        """Convert to the v2 row object (every key always present).
+
+        ``ootb`` and ``oracle`` are the same plan object; ``ootb`` is null
+        when the row did not run (``error`` or ``skipped`` rows carry only
+        their reason).
+        """
         return {
             "provider": self.provider,
             "role": self.role,
@@ -526,42 +521,26 @@ class ProviderEngineResult:
             "message": self.error_message or self.skip_reason,
             "started_at": self.started_at,
             "elapsed_s": self.elapsed_time_ms / 1000.0,
-            "build_ms": self.cpu_build_time_ms,
-            "timing": self.timing.to_dict() if self.timing is not None else None,
-            "kernel": _stats_dict(self.gpu_kernel_stats),
-            "host": _stats_dict(self.host_stats),
             "metrics": {
                 "flops": self.analytical_flops,
                 "flops_partial": self.analytical_flops_partial,
                 "io_bytes": self.analytical_io_bytes,
-                "tflops": self.derived_tflops_per_s,
-                "gbps": self.derived_gbytes_per_s,
-                "workspace_bytes": self.workspace_bytes,
                 "vram_mb": self.vram_used_mb,
                 "clocks_before": self.clocks_before,
                 "clocks_after": self.clocks_after,
             },
-            "correctness": (
-                self.correctness.to_dict() if self.correctness is not None else None
+            "ootb": self.plan_dict() if self.status == "success" else None,
+            "oracle": (
+                {
+                    **self.oracle.to_dict(),
+                    "delta": self.oracle_delta.to_dict() if self.oracle_delta else None,
+                }
+                if self.oracle is not None
+                else None
             ),
+            "oracle_error": self.oracle_error,
             "warnings": list(self.warnings or []),
-            "oracle": self._oracle_dict(),
             "extra_metrics": self.extra_metrics,
-        }
-
-    def _oracle_dict(self) -> Optional[Dict[str, Any]]:
-        if self.oracle is None and self.oracle_error is None:
-            return None
-        fields = (
-            self.oracle.to_dict()
-            if self.oracle is not None
-            else dict.fromkeys(_ORACLE_KEYS)
-        )
-        return {
-            "status": "ok" if self.oracle is not None else "error",
-            "error": self.oracle_error,
-            **fields,
-            "delta": self.oracle_delta.to_dict() if self.oracle_delta else None,
         }
 
 
@@ -748,9 +727,10 @@ class SuiteResult:
                     }
                 )
             for r in g["results"]:
-                kernel, host = r["kernel"] or {}, r["host"] or {}
-                timing = r["timing"] or {}
-                correctness = r["correctness"] or {}
+                ootb = r["ootb"] or {}
+                kernel, host = ootb.get("kernel") or {}, ootb.get("host") or {}
+                timing = ootb.get("timing") or {}
+                correctness = ootb.get("correctness") or {}
                 rows.append(
                     {
                         **base,
@@ -767,9 +747,9 @@ class SuiteResult:
                         "timing_mode": timing.get("mode"),
                         "cache_mode": timing.get("cache_mode"),
                         "timing_block": timing.get("timing_block"),
-                        "tflops": r["metrics"]["tflops"],
-                        "gbps": r["metrics"]["gbps"],
-                        "workspace_bytes": r["metrics"]["workspace_bytes"],
+                        "tflops": ootb.get("tflops"),
+                        "gbps": ootb.get("gbps"),
+                        "workspace_bytes": ootb.get("workspace_bytes"),
                         "max_abs_diff": correctness.get("max_abs_diff"),
                         "message": r["message"],
                     }

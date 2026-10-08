@@ -89,6 +89,7 @@ class _TunedExecutor:
 
     def __init__(self, graph_json_str, policy):
         self.init_time_ms = 3.0
+        self.workspace_size = 4096
         type(self).policy = policy
 
     def prepare(self, handle, engine_id=None, for_autotune=False):

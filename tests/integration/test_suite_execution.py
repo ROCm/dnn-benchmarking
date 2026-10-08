@@ -66,11 +66,12 @@ def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
         assert HEX_ID.fullmatch(row["engine"]["id"])
         assert row["engine"]["name"] == r.engine_name
         assert row["verdict"] == "unchecked"
-        assert row["kernel"]["median_ms"] > 0
-        assert row["host"]["median_ms"] > 0
+        ootb = row["ootb"]
+        assert ootb["kernel"]["median_ms"] > 0
+        assert ootb["host"]["median_ms"] > 0
         # p95 needs n >= 20.
-        assert row["kernel"]["p95_ms"] is None
-        assert row["correctness"] is None
+        assert ootb["kernel"]["p95_ms"] is None
+        assert ootb["correctness"] is None
         assert row["oracle"] is None
 
 
@@ -113,8 +114,11 @@ def test_oracle_plan_records_tuned_payload(hipdnn) -> None:
     assert r.oracle.compiled_plan_index >= 0
     assert r.oracle.compiled_plans_benchmarked >= 1
 
-    oracle = json.loads(json.dumps(r.to_dict(), allow_nan=False))["oracle"]
-    assert oracle["status"] == "ok"
+    row = json.loads(json.dumps(r.to_dict(), allow_nan=False))
+    oracle = row["oracle"]
+    assert row["oracle_error"] is None
+    # The tuned plan is the same object as the OOTB plan, plus tuning keys.
+    assert set(row["ootb"]) <= set(oracle)
     assert set(oracle["delta"]) == {
         "basis",
         "baseline_median_ms",

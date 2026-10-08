@@ -158,16 +158,7 @@ def _measure_row(
     kernel = BenchmarkStats.from_timings(m.kernel_ms)
     row.gpu_kernel_stats = kernel
     row.host_stats = BenchmarkStats.from_timings(m.host_ms)
-    row.timing = TimingInfo(
-        mode=m.mode,
-        backend=m.backend,
-        cache_mode=m.cache_mode,
-        warmup_iters=m.warmup_iters,
-        first_call_ms=m.first_call_ms,
-        capped=m.capped,
-        fallback_reason=m.fallback_reason,
-        timing_block=m.timing_block,
-    )
+    row.timing = TimingInfo.from_measurement(m)
     warnings = list(row.warnings or []) + noise_warnings(kernel)
     if m.capped:
         warnings.append("capped at max_iters")

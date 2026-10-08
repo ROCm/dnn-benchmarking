@@ -92,7 +92,7 @@ def _engine_label(row: Dict[str, Any]) -> str:
 
 
 def _stat(row: Dict[str, Any], metric: str) -> Tuple[Optional[float], Optional[float]]:
-    s = row[metric]
+    s = (row["ootb"] or {}).get(metric)
     if row["verdict"] in ("error", "skipped") or not s:
         return None, None
     # The writer stores NaN/inf as null; a null median leaves the pair unusable.
@@ -108,10 +108,9 @@ def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any
         for r in graph["results"]
         if r["role"] == role
         and r["verdict"] in _USABLE
-        and r[metric]
-        and r[metric]["median_ms"] is not None
+        and _stat(r, metric)[0] is not None
     ]
-    return min(usable, key=lambda r: r[metric]["median_ms"], default=None)
+    return min(usable, key=lambda r: _stat(r, metric)[0], default=None)
 
 
 def _keyed(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], Dict[str, Any]]:

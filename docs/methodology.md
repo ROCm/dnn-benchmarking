@@ -7,11 +7,11 @@ measures it. The code is `src/dnn_benchmarking/execution/timing.py`
 ## Summary
 
 - The headline number is `kernel_med`: the median device time of one launch
-  of the graph, in the table and in `kernel.median_ms`.
+  of the graph, in the table and in `ootb.kernel.median_ms`.
 - One loop implementation (`timing.measure`) times hipDNN engines and the
   PyTorch backend. The two backends get the same warmup, stop rule, cache
   mode and statistics.
-- Each row records how it was measured in `timing`: mode, event backend,
+- Each plan records how it was measured in `timing`: mode, event backend,
   cache mode, warmup count, first-call cost, cap and fallback reason.
 - TFLOP/s and GB/s use the median. The tool reports the spread (IQR, CV) and
   flags noise. It never removes samples.

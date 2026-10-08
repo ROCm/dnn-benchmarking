@@ -366,7 +366,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
     assert row.host_stats.median_ms == pytest.approx(0.01)
     assert row.derived_tflops_per_s == pytest.approx(2.0)
     assert row.derived_gbytes_per_s == pytest.approx(32 / 1e-3 / 1e9)
-    assert row.to_dict()["timing"] == {
+    assert row.to_dict()["ootb"]["timing"] == {
         "mode": "events",
         "backend": "torch",
         "cache_mode": "cold",

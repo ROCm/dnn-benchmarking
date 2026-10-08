@@ -307,7 +307,8 @@ def test_null_median_written_for_nan_timings_is_unusable(tmp_path, capsys, by):
     nan = float("nan")
     a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
     b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 0, timings=[nan] * 3)])])
-    assert SuiteResult.load(b)["graphs"][0]["results"][0]["kernel"]["median_ms"] is None
+    b_row = SuiteResult.load(b)["graphs"][0]["results"][0]
+    assert b_row["ootb"]["kernel"]["median_ms"] is None
     code, report = _json(capsys, [a, b, "--by", by])
     (pair,) = report["pairs"]
     assert code == 0 and pair["speedup"] is None

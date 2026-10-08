@@ -58,13 +58,16 @@ GRAPH_KEYS = {
 }
 ROW_KEYS = {
     "provider", "role", "engine", "status", "verdict", "message", "started_at",
-    "elapsed_s", "build_ms", "timing", "kernel", "host", "metrics", "correctness",
-    "warnings", "oracle", "extra_metrics",
+    "elapsed_s", "metrics", "ootb", "oracle", "oracle_error", "warnings",
+    "extra_metrics",
 }  # fmt: skip
 ENGINE_KEYS = {"id", "name", "version", "plugin_path"}
 METRICS_KEYS = {
-    "flops", "flops_partial", "io_bytes", "tflops", "gbps", "workspace_bytes",
-    "vram_mb", "clocks_before", "clocks_after",
+    "flops", "flops_partial", "io_bytes", "vram_mb", "clocks_before", "clocks_after",
+}  # fmt: skip
+PLAN_KEYS = {
+    "build_ms", "timing", "kernel", "host", "workspace_bytes", "tflops", "gbps",
+    "correctness",
 }  # fmt: skip
 STATS_KEYS = {
     "n", "mean_ms", "std_ms", "cv", "min_ms", "p25_ms", "median_ms", "p75_ms",
@@ -78,13 +81,12 @@ CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
     "n_total", "worst_output_uid", "message",
 }  # fmt: skip
-ORACLE_KEYS = {
-    "status", "error", "plan_name", "compiled_plan_index", "rank",
+ORACLE_KEYS = PLAN_KEYS | {
+    "tuning_available", "plan_name", "compiled_plan_index", "rank",
     "sweep_min_time_ms", "compiled_plans_benchmarked", "compiled_plans_total",
-    "compiled_plans_failed", "tuning_available", "knob_settings",
-    "exhaustive_requested", "exhaustive_enabled", "exhaustive_supported",
-    "cpu_build_time_ms", "kernel", "host", "baseline_kernel", "baseline_host",
-    "tflops", "baseline_tflops", "correctness", "delta",
+    "compiled_plans_failed", "knob_settings", "exhaustive_requested",
+    "exhaustive_enabled", "exhaustive_supported", "baseline_kernel",
+    "baseline_host", "baseline_tflops", "delta",
 }  # fmt: skip
 DELTA_KEYS = {"basis", "baseline_median_ms", "oracle_median_ms", "delta_ms", "speedup"}
 
@@ -107,12 +109,15 @@ def _oracle() -> OracleResult:
         exhaustive_requested=True,
         exhaustive_supported=False,
         cpu_build_time_ms=7.0,
+        timing=TimingInfo("events", "hip", "cold", 11, 13.5),
         gpu_kernel_stats=_stats(1.0),
         warm_baseline_gpu_kernel_stats=_stats(2.0),
         host_stats=_stats(3.0),
         warm_baseline_host_stats=_stats(4.0),
         correctness=CorrectnessResult(False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9),
         derived_tflops_per_s=4.0,
+        derived_gbytes_per_s=3000.0,
+        workspace_bytes=2048,
         warm_baseline_derived_tflops_per_s=2.5,
     )
 
@@ -189,7 +194,7 @@ def full_suite() -> SuiteResult:
 
 
 def minimal_suite() -> SuiteResult:
-    """Nothing optional populated: an error row with an oracle error."""
+    """Nothing optional populated: an error row that also records an oracle error."""
     row = ProviderEngineResult.error_row("hipdnn", None, "boom")
     row.oracle_error = "tuning failed"
     return SuiteResult(
@@ -215,7 +220,6 @@ def _key_sets(doc: dict) -> dict:
         "row": set(row),
         "engine": set(row["engine"]),
         "metrics": set(row["metrics"]),
-        "oracle": set(row["oracle"]),
     }
 
 
@@ -235,12 +239,14 @@ def test_full_document_has_exact_key_sets() -> None:
     assert keys["engine"] == ENGINE_KEYS
     assert keys["metrics"] == METRICS_KEYS
     row = doc["graphs"][0]["results"][0]
-    assert set(row["kernel"]) == STATS_KEYS
-    assert set(row["host"]) == STATS_KEYS
-    assert set(row["timing"]) == TIMING_KEYS
-    assert set(row["correctness"]) == CORRECTNESS_KEYS
-    assert keys["oracle"] == ORACLE_KEYS
-    assert set(row["oracle"]["kernel"]) == STATS_KEYS
+    # The OOTB plan and the tuned plan are the same object type.
+    assert set(row["ootb"]) == PLAN_KEYS
+    assert set(row["oracle"]) == ORACLE_KEYS
+    for plan in (row["ootb"], row["oracle"]):
+        assert set(plan["kernel"]) == STATS_KEYS
+        assert set(plan["host"]) == STATS_KEYS
+        assert set(plan["timing"]) == TIMING_KEYS
+        assert set(plan["correctness"]) == CORRECTNESS_KEYS
     assert set(row["oracle"]["baseline_kernel"]) == STATS_KEYS
     assert set(row["oracle"]["delta"]) == DELTA_KEYS
     assert row["oracle"]["delta"]["basis"] == "kernel"
@@ -260,14 +266,20 @@ def test_full_row_values() -> None:
         "flops": 10**9,
         "flops_partial": True,
         "io_bytes": 10**6,
-        "tflops": 2.0,
-        "gbps": 2000.0,
-        "workspace_bytes": 1024,
         "vram_mb": 512.0,
         "clocks_before": {"sclk_mhz": 1700},
         "clocks_after": {"sclk_mhz": 1650},
     }
-    assert row["correctness"] == {
+    ootb = row["ootb"]
+    assert {k: ootb[k] for k in ("build_ms", "workspace_bytes", "tflops", "gbps")} == {
+        "build_ms": 3.0,
+        "workspace_bytes": 1024,
+        "tflops": 2.0,
+        "gbps": 2000.0,
+    }
+    assert (ootb["kernel"]["median_ms"], ootb["host"]["median_ms"]) == (0.5, 0.01)
+    assert ootb["timing"]["mode"] == "staged"
+    assert ootb["correctness"] == {
         "match": True,
         "rtol": 1e-3,
         "atol": 1e-5,
@@ -280,8 +292,20 @@ def test_full_row_values() -> None:
     }
     stats_keys = {"kernel", "host", "baseline_kernel", "baseline_host", "delta"}
     assert {k: v for k, v in row["oracle"].items() if k not in stats_keys} == {
-        "status": "ok",
-        "error": None,
+        "build_ms": 7.0,
+        "timing": {
+            "mode": "events",
+            "backend": "hip",
+            "cache_mode": "cold",
+            "warmup_iters": 11,
+            "first_call_ms": 13.5,
+            "capped": False,
+            "fallback_reason": None,
+            "timing_block": 1,
+        },
+        "workspace_bytes": 2048,
+        "tflops": 4.0,
+        "gbps": 3000.0,
         "plan_name": "plan",
         "compiled_plan_index": 4,
         "rank": 2,
@@ -294,8 +318,6 @@ def test_full_row_values() -> None:
         "exhaustive_requested": True,
         "exhaustive_enabled": False,
         "exhaustive_supported": False,
-        "cpu_build_time_ms": 7.0,
-        "tflops": 4.0,
         "baseline_tflops": 2.5,
         "correctness": {
             "match": False,
@@ -317,8 +339,9 @@ def test_full_row_values() -> None:
         "baseline_host": 4.0,
     }
     assert row["oracle"]["delta"]["speedup"] == 2.0
+    assert row["oracle_error"] is None
     assert row["warnings"] == ["noisy: CV 6.0%"]
-    assert (row["elapsed_s"], row["build_ms"]) == (1.5, 3.0)
+    assert row["elapsed_s"] == 1.5
 
 
 def test_minimal_document_has_the_same_key_sets() -> None:
@@ -330,15 +353,12 @@ def test_minimal_document_has_the_same_key_sets() -> None:
 def test_minimal_row_nulls() -> None:
     row = json.loads(minimal_suite().to_json())["graphs"][0]["results"][0]
     assert row["engine"]["id"] is None
-    assert row["kernel"] is None and row["host"] is None and row["timing"] is None
-    assert row["correctness"] is None
+    assert row["ootb"] is None
     assert row["warnings"] == []
     assert row["message"] == "boom"
     assert row["verdict"] == "error"
-    assert row["oracle"]["status"] == "error"
-    assert row["oracle"]["error"] == "tuning failed"
-    assert row["oracle"]["plan_name"] is None
-    assert row["oracle"]["delta"] is None
+    assert row["oracle"] is None
+    assert row["oracle_error"] == "tuning failed"
 
 
 def test_oracle_is_null_when_not_requested() -> None:
@@ -360,8 +380,8 @@ def test_non_finite_floats_serialize_as_null() -> None:
     row.derived_tflops_per_s = float("nan")
     doc = json.loads(suite.to_json())  # strict: would raise on NaN tokens
     out = doc["graphs"][0]["results"][0]
-    assert out["correctness"]["max_rel_diff"] is None
-    assert out["metrics"]["tflops"] is None
+    assert out["ootb"]["correctness"]["max_rel_diff"] is None
+    assert out["ootb"]["tflops"] is None
 
 
 def test_extra_metrics_serialize_on_non_success_rows() -> None:

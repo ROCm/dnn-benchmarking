@@ -108,7 +108,7 @@ def noise_warnings(stats: BenchmarkStats) -> List[str]:
 
 @dataclass
 class TimingInfo:
-    """How a row's timings were measured (serialized as the row's ``timing``).
+    """How a plan's timings were measured (serialized as the plan's ``timing``).
 
     Attributes mirror ``execution.timing.Measurement`` minus the samples.
     """
@@ -121,6 +121,20 @@ class TimingInfo:
     capped: bool = False
     fallback_reason: Optional[str] = None
     timing_block: int = 1
+
+    @classmethod
+    def from_measurement(cls, m: Any) -> "TimingInfo":
+        """Copy the provenance fields of an ``execution.timing.Measurement``."""
+        return cls(
+            mode=m.mode,
+            backend=m.backend,
+            cache_mode=m.cache_mode,
+            warmup_iters=m.warmup_iters,
+            first_call_ms=m.first_call_ms,
+            capped=m.capped,
+            fallback_reason=m.fallback_reason,
+            timing_block=m.timing_block,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a JSON-ready dict."""

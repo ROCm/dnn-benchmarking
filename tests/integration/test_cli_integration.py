@@ -87,9 +87,10 @@ def test_cli_smoke(
     for row in engines:
         assert row["verdict"] == "passed", row
         assert re.fullmatch(r"0x[0-9A-F]{16}", row["engine"]["id"])
-        assert row["correctness"]["match"] is True
-        assert row["kernel"]["n"] == row["host"]["n"] == 3
-        assert row["timing"]["warmup_iters"] == 1
+        ootb = row["ootb"]
+        assert ootb["correctness"]["match"] is True
+        assert ootb["kernel"]["n"] == ootb["host"]["n"] == 3
+        assert ootb["timing"]["warmup_iters"] == 1
 
 
 @pytest.mark.gpu
@@ -126,5 +127,5 @@ def test_cli_pytorch_backend(torch_gpu, tmp_path: Path) -> None:
         "engine",
         "success",
     ), row
-    assert row["kernel"]["n"] == 3
-    assert row["timing"]["backend"] == expected_timing_backend()
+    assert row["ootb"]["kernel"]["n"] == 3
+    assert row["ootb"]["timing"]["backend"] == expected_timing_backend()

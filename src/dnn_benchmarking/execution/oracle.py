@@ -11,7 +11,7 @@ from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
 from ..metrics._diagnostic import warn_once
 from ..metrics.analytical import derive_throughputs
-from ..reporting.statistics import BenchmarkStats
+from ..reporting.statistics import BenchmarkStats, TimingInfo
 from ..reporting.suite_results import (
     OracleResult,
     ProviderEngineResult,
@@ -105,8 +105,12 @@ def run_oracle_pass(
                     for k in winner.knob_settings
                 ],
                 cpu_build_time_ms=executor.init_time_ms,
+                timing=TimingInfo.from_measurement(tuned),
                 host_stats=BenchmarkStats.from_timings(tuned.host_ms),
                 gpu_kernel_stats=BenchmarkStats.from_timings(tuned.kernel_ms),
+                workspace_bytes=(
+                    executor.workspace_size if config.metrics.basic_enabled else None
+                ),
                 warm_baseline_host_stats=BenchmarkStats.from_timings(baseline.host_ms),
                 warm_baseline_gpu_kernel_stats=BenchmarkStats.from_timings(
                     baseline.kernel_ms
@@ -114,9 +118,13 @@ def run_oracle_pass(
                 exhaustive_requested=config.oracle_exhaustive,
                 exhaustive_supported=bool(winner.supports_exhaustive),
             )
-            # Same FLOPs and median denominator as the row's own TFLOP/s.
-            oracle.derived_tflops_per_s, _ = derive_throughputs(
-                row.analytical_flops, None, oracle.gpu_kernel_stats.median_ms
+            # Same FLOPs, bytes and median denominator as the row's throughputs.
+            oracle.derived_tflops_per_s, oracle.derived_gbytes_per_s = (
+                derive_throughputs(
+                    row.analytical_flops,
+                    row.analytical_io_bytes,
+                    oracle.gpu_kernel_stats.median_ms,
+                )
             )
             oracle.warm_baseline_derived_tflops_per_s, _ = derive_throughputs(
                 row.analytical_flops,
