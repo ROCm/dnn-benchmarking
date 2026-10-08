@@ -2406,18 +2406,6 @@ class TestPyTorchSdpaMaskDerivation:
 
         assert _sdpa_derive_mask(self._node()) == (False, None)
 
-    def test_a_real_bound_wins_over_the_boolean(self) -> None:
-        """causal_mask + a left bound is a WINDOW. Reading the boolean first
-        discards the window and serves the wrong triangle."""
-        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
-            _sdpa_derive_mask,
-        )
-
-        assert _sdpa_derive_mask(self._node(causal_mask=True, left_bound=127)) == (
-            False,
-            128,
-        )
-
     def test_window_width_includes_the_current_token(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sliding_window_mask,
@@ -2477,7 +2465,10 @@ class TestPyTorchSdpaDiagonalAlignment:
             ({}, False),
             ({"diagonal_alignment": "BOTTOM_RIGHT"}, True),
             ({"causal_mask_bottom_right": True}, True),
-            ({"causal_mask_bottom_right": True, "diagonal_alignment": "TOP_LEFT"}, True),
+            (
+                {"causal_mask_bottom_right": True, "diagonal_alignment": "TOP_LEFT"},
+                True,
+            ),
             ({"causal_mask": True}, False),
             # causal_mask overrides the alignment, so this is top-left.
             ({"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}, False),

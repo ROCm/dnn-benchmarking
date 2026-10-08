@@ -152,23 +152,17 @@ def _sdpa_bottom_right(node: Dict[str, Any]) -> bool:
 
 
 def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
-    """Resolve (is_causal, sliding_window_width) the way the engine does.
+    """Resolve causal flags and the supported bounded-window spelling.
 
-    Mirrors ``Gfx950AttentionTiledNative.cpp::maskTypeFor``. Two things there are
-    easy to get wrong and both produce a wrong answer rather than an error:
+    hipDNN's extractDiagonalBandParams resolves either deprecated causal flag
+    before written bounds or diagonal alignment. A flag therefore describes
+    the full causal band, even if a graph also carries a left_bound. Without
+    those flags, right_bound=0 supplies causality in the shipped bundles and
+    a bounded left side narrows that causal band. Other right-bound combinations
+    need an explicit mask; this reference does not model them as a causal window.
 
-      * **A real bound wins over the deprecated booleans.** They can only say
-        top-left vs bottom-right, so a graph that sets ``causal_mask`` *and*
-        carries ``left_bound`` is asking for a window; reading the boolean first
-        silently discards it.
-      * **Both spellings occur in this repo.** The shipped ``quick/SdpaFwd``
-        bundles leave the booleans false and express causality as
-        ``left_bound=-1, right_bound=0``, while the model traces set
-        ``causal_mask: true``. Reading only one convention passes one population
-        and mis-serves the other.
-
-    The window WIDTH is ``left_bound + 1``: hipDNN's left bound counts tokens
-    strictly before the current one, the band includes it.
+    The window WIDTH is ``left_bound + 1``: the bound counts tokens strictly
+    before the current one, and the band includes it.
     """
     unbounded = -1
     left = _node_param(node, "left_bound", unbounded)
@@ -176,13 +170,19 @@ def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
     left = unbounded if left is None else int(left)
     right = unbounded if right is None else int(right)
 
+    if _sdpa_bool(node, "causal_mask") or _sdpa_bool(node, "causal_mask_bottom_right"):
+        return True, None
+
     if left != unbounded:
         if left < 0:
             raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+        if right != 0:
+            raise ValueError(
+                f"SDPA bounded-left band requires right_bound=0 (got {right}); "
+                "right-open and forward-looking bands need an explicit mask"
+            )
         return False, left + 1
 
-    if _sdpa_bool(node, "causal_mask") or _sdpa_bool(node, "causal_mask_bottom_right"):
-        return True, None
     if right == unbounded:
         return False, None
     if right == 0:

@@ -1089,16 +1089,34 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
         np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
 
+    def test_bottom_right_causal_flag_discards_a_written_left_bound(self) -> None:
+        outputs, q, k, v = self._bottom_right_case(
+            3, 5, {"causal_mask_bottom_right": True, "left_bound": 1}
+        )
+        keep = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, False],
+                [True, True, True, True, True],
+            ]
+        )
+        expected, expected_stats = self._masked(q, k, v, keep)
+        np.testing.assert_allclose(outputs[4].data, expected, rtol=1e-5)
+        np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
+
+    @pytest.mark.parametrize("extra", [{}, {"left_bound": 1, "right_bound": -1}])
     def test_sdpa_causal_mask_stays_top_left_under_a_bottom_right_alignment(
-        self,
+        self, extra: dict
     ) -> None:
-        """causal_mask wins over diagonal_alignment, as hipDNN resolves it.
+        """causal_mask overrides diagonal alignment and bounds, as hipDNN resolves them.
 
         Reading the alignment first would grade a graph the engines run
         top-left against the bottom-right band of the test above.
         """
         outputs, q, k, v = self._bottom_right_case(
-            3, 5, {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}
+            3,
+            5,
+            {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT", **extra},
         )
         keep = torch.tensor(
             [
@@ -1205,8 +1223,9 @@ class TestPyTorchProviderNewOps:
                 graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
             )
 
+    @pytest.mark.parametrize("extra", [{}, {"left_bound": 1, "right_bound": -1}])
     def test_sdpa_backward_accepts_causal_mask_with_a_bottom_right_alignment(
-        self,
+        self, extra: dict
     ) -> None:
         """causal_mask makes the alignment dead text, so backward runs top-left.
 
@@ -1220,9 +1239,7 @@ class TestPyTorchProviderNewOps:
         k_t = torch.randn(1, 1, 4, 8, requires_grad=True)
         v_t = torch.randn(1, 1, 4, 8, requires_grad=True)
         do_t = torch.randn(1, 1, 2, 8)
-        keep = torch.tensor(
-            [[True, False, False, False], [True, True, False, False]]
-        )
+        keep = torch.tensor([[True, False, False, False], [True, True, False, False]])
         scores = (q_t @ k_t.transpose(-2, -1)) * scale
         scores = scores.masked_fill(~keep, float("-inf"))
         out = torch.softmax(scores, dim=-1) @ v_t
@@ -1255,6 +1272,7 @@ class TestPyTorchProviderNewOps:
                         "attn_scale_value": scale,
                         "causal_mask": True,
                         "diagonal_alignment": "BOTTOM_RIGHT",
+                        **extra,
                     },
                 }
             ],
@@ -1628,6 +1646,8 @@ class TestPyTorchProviderNewOps:
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
             ({"right_bound": 1}, "forward-looking band"),
+            ({"left_bound": 1}, "requires right_bound=0"),
+            ({"left_bound": 1, "right_bound": 1}, "requires right_bound=0"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
             (
                 {"causal_mask": True, "causal_mask_bottom_right": True},

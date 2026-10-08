@@ -1124,6 +1124,7 @@ class TestCorrectnessChecking:
         assert reason.startswith("Reference output pass failed (HIP out of memory).")
         assert "Timing skipped" not in reason
         assert "still validated" in reason and "CPU" in reason
+
     @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
     @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")

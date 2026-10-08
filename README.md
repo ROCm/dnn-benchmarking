@@ -293,6 +293,12 @@ which the flash backend cannot take, so it is only built when Sq differs from
 Skv: with Sq equal to Skv the two diagonals coincide and the boolean
 `is_causal` path (and `--pytorch-sdpa-backend flash`) still works.
 
+A bounded-left window needs `right_bound: 0` in this PyTorch reference. A
+bare `left_bound` is a valid right-open hipDNN band, which the reference
+rejects instead of silently adding a causal right edge. The hipDNN graph
+checker, `tools/check_deserialize.py`, may still accept it: it checks hipDNN
+deserialization, not whether this optional PyTorch reference can serve it.
+
 `--pytorch-rocm-fa-library LIBRARY` is ROCm-only and requires
 `--pytorch-sdpa-backend flash`. It forwards `LIBRARY` unchanged to PyTorch's
 `preferred_rocm_fa_library`; for example, use `aotriton`. PyTorch rejects an
