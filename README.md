@@ -13,6 +13,11 @@ timing and synchronized E2E timing use direct HIP runtime events exposed by
 `hipdnn_frontend`; PyTorch is only needed for the optional PyTorch executor and
 reference validation.
 
+On supported AMD GPUs, benchmark comparisons use a stall gate to exclude host
+submission gaps from HIP event timing. If the watchdog releases that gate, the
+tool discards the partial comparison and reruns every engine without stalling.
+This avoids comparing device-only and unstalled samples.
+
 The `--backend pytorch` executor also runs on NVIDIA GPUs with a CUDA PyTorch
 build, where it times kernels with `torch.cuda` events. Because the hipDNN and
 PyTorch backends share one suite execution path and emit the same
@@ -196,6 +201,10 @@ dnn-benchmark --graph ./graphs/sample_conv_fwd.json --engine 1,2
 
 # Multiple graphs (glob): same path, default summary table
 dnn-benchmark --graph 'graphs/*.json' --warmup 10 --iters 100
+
+# Block timing: each of the 100 samples times 50 back-to-back executions and
+# records elapsed/50, matching the rocKE benchmarks' timing method
+dnn-benchmark --graph 'graphs/*.json' --iters 100 --timing-block 50
 
 # With reproducible random seed
 dnn-benchmark --graph ./graphs/sample_conv_fwd.json --seed 42

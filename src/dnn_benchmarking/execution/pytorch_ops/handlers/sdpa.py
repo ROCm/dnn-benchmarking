@@ -3,7 +3,6 @@
 
 """Scaled-dot-product-attention forward/backward reference handlers."""
 
-from math import sqrt
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -30,10 +29,11 @@ def _sdpa_resolve_scale(
     tensors: Dict[int, torch.Tensor],
     scale_uid: Optional[int],
     attn_scale_value: Any,
-) -> Optional[float]:
+) -> float:
+    # hipDNN reads an absent attn_scale as 1.0 (cuDNN semantics), not 1/sqrt(d).
     if scale_uid is not None:
         return _scalar_value(tensors, scale_uid, node)
-    return None if attn_scale_value is None else float(attn_scale_value)
+    return 1.0 if attn_scale_value is None else float(attn_scale_value)
 
 
 def _sdpa_head_repeat(q_heads: int, kv_heads: int, label: str) -> int:
@@ -413,7 +413,7 @@ def _sdpa_stats(
     k_float = k.to(dtype=torch.float32)
     if rep_k > 1:
         k_float = k_float.repeat_interleave(rep_k, dim=-3)
-    scale_value = (1.0 / sqrt(float(q.shape[-1]))) if scale is None else scale
+    scale_value = 1.0 if scale is None else scale
     scores = torch.matmul(q_float, k_float.transpose(-2, -1)) * scale_value
     if attn_mask is not None:
         scores = scores + attn_mask.to(dtype=torch.float32)
@@ -617,7 +617,7 @@ def compile_sdpa_backward(
         stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
 
         head_dim = int(q.shape[-1])
-        scale_value = (1.0 / sqrt(float(head_dim))) if scale is None else float(scale)
+        scale_value = 1.0 if scale is None else float(scale)
         k_heads = int(k.shape[1])
         v_heads = int(v.shape[1])
         if rep_k > 1:

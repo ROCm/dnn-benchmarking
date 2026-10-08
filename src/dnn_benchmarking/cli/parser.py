@@ -154,6 +154,22 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_type=int,
     ),
     CliOption(
+        flags=("--timing-block",),
+        dest="timing_block",
+        parser_type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Executions per timed sample (default: 1). 1 times each execution "
+            "on its own. N > 1 times N back-to-back executions between one "
+            "GPU event pair and records elapsed/N, matching the rocKE "
+            "benchmarks' block timing"
+        ),
+        config_key="timing_block",
+        config_kind=ConfigKind.SCALAR,
+        config_type=int,
+    ),
+    CliOption(
         flags=("--autotune",),
         dest="autotune",
         action="store_true",

@@ -1517,6 +1517,7 @@ class TestPyTorchOpsNewHandlers:
             q,
             k.repeat_interleave(2, dim=-3),
             v.repeat_interleave(4, dim=-3),
+            scale=1.0,
         )
         torch.testing.assert_close(tensors[4], expected, rtol=1e-5, atol=1e-5)
 

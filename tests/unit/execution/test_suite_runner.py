@@ -4,6 +4,7 @@
 """Unit tests for suite_runner module."""
 
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -25,6 +26,7 @@ from dnn_benchmarking.execution.suite_runner import (
     _compute_reference_outputs_once,
     _hipdnn_buffer_device,
     set_plugin_path,
+    _collect_basic_metrics_post_loop,
 )
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -33,6 +35,7 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
+from dnn_benchmarking.execution.timing import StallFallbackError
 from dnn_benchmarking.reporting.statistics import (
     BenchmarkMetadata,
     BenchmarkResult,
@@ -168,7 +171,7 @@ class TestRunGraphAllProviders:
         mock_resolve_name,
     ):
         """run_graph_all_providers returns one ProviderEngineResult per discovered engine ID."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(
@@ -193,6 +196,62 @@ class TestRunGraphAllProviders:
             "engine_1",
             "engine_2",
         ]
+
+    @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_stall_timeout_restarts_every_engine_unstalled(
+        self,
+        mock_bm_cls,
+        mock_exec_cls,
+        mock_get_ref,
+        mock_resolve_name,
+    ):
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
+        mock_get_ref.return_value = None
+        mock_bm_cls.return_value = _make_bm_mock()
+        benchmark_calls: list[tuple[int, bool]] = []
+        created = 0
+
+        def make_executor(*args, **kwargs):
+            nonlocal created
+            executor = MagicMock()
+            executor.init_time_ms = 1.0
+            if created == 0:
+                executor.discover_engines.return_value = [1, 2]
+            else:
+                engine_id = kwargs["config"].engine_id
+
+                def benchmark(*args, allow_staging=True, **kwargs):
+                    benchmark_calls.append((engine_id, allow_staging))
+                    if engine_id == 2 and allow_staging:
+                        raise StallFallbackError("timed out")
+                    return BenchmarkResult(
+                        host_timings=[1.0],
+                        kernel_timings=[0.5],
+                        metadata=BenchmarkMetadata(timing_backend="hip"),
+                    )
+
+                executor.benchmark.side_effect = benchmark
+            created += 1
+            return executor
+
+        mock_exec_cls.side_effect = make_executor
+
+        result = run_graph_all_providers(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            tensor_infos=[_make_tensor_info(1)],
+            config=_make_config(),
+            handle=MagicMock(),
+        )
+
+        assert [row.status for row in result.results] == ["success", "success"]
+        assert benchmark_calls == [(1, True), (2, True), (1, False), (2, False)]
+        assert all(
+            "remeasured without stalling" in row.warnings[0] for row in result.results
+        )
 
     @patch("dnn_benchmarking.execution.suite_runner._resolve_engine_name")
     @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
@@ -438,7 +497,7 @@ class TestDiscoveryFailure:
         mock_resolve_name,
     ):
         """Explicit --engine IDs run in CLI order without discovery filtering."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1])
         mock_bm_cls.return_value = _make_bm_mock()
@@ -454,6 +513,65 @@ class TestDiscoveryFailure:
         assert len(result.results) == 1
         assert result.results[0].status == "success"
         assert result.results[0].engine_id == 99
+
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_engine_name_comes_from_the_per_engine_handle(
+        self, mock_bm_cls, mock_exec_cls, mock_get_ref
+    ):
+        """With --engine and no shared handle, the row is named by the handle
+        built for that engine, so plugin-supplied engines are not shown as hex."""
+        mock_get_ref.return_value = None
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
+        mock_bm_cls.return_value = _make_bm_mock()
+        plugin_handle = MagicMock()
+        plugin_handle.engine_id_to_name.return_value = "hipkernel:Gfx950AttentionDense"
+        frontend = SimpleNamespace(
+            Handle=MagicMock(return_value=plugin_handle),
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
+            engine_id_to_name=lambda _id: "",  # built-in registry: unknown
+        )
+
+        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
+            result = run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(engine_filter=[0x7636]),
+                handle=None,
+            )
+
+        assert result.results[0].provider == "hipkernel:Gfx950AttentionDense"
+
+    @patch("dnn_benchmarking.execution.suite_runner._get_reference_provider")
+    @patch("dnn_benchmarking.execution.suite_runner.Executor")
+    @patch("dnn_benchmarking.execution.suite_runner.BufferManager")
+    def test_setup_failure_row_keeps_the_built_in_registry_name(
+        self, mock_bm_cls, mock_exec_cls, mock_get_ref
+    ):
+        """When the per-engine handle cannot be built there is no handle to ask,
+        but the row must still carry the built-in engine name, not hex."""
+        mock_get_ref.return_value = None
+        mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0])
+        mock_bm_cls.return_value = _make_bm_mock()
+        frontend = SimpleNamespace(
+            Handle=MagicMock(side_effect=RuntimeError("plugin failed to load")),
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE=object()),
+            engine_id_to_name=lambda _id: "MIOPEN_ENGINE",
+        )
+
+        with patch.dict(sys.modules, {"hipdnn_frontend": frontend}):
+            result = run_graph_all_providers(
+                graph_path=Path("test.json"),
+                graph_json=_make_graph_json(),
+                tensor_infos=[_make_tensor_info(1)],
+                config=_make_config(engine_filter=[1]),
+                handle=None,
+            )
+
+        row = result.results[0]
+        assert (row.status, row.provider) == ("error", "MIOPEN_ENGINE")
 
 
 class TestSuiteConfigValidation:
@@ -520,7 +638,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """When --engine filter is set, only that engine ID is iterated."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2])
@@ -549,7 +667,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """engine_filter=[1, 3, 99] runs exactly those IDs in caller order."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
 
         mock_exec_cls.side_effect = _make_exec_factory(engine_ids=[0, 1, 2, 3])
@@ -578,7 +696,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """Repeated engine IDs are separate ordered selections."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
         mock_bm_cls.return_value = _make_bm_mock()
@@ -624,7 +742,7 @@ class TestEngineFilter:
         mock_resolve_name,
     ):
         """A later per-engine handle failure records an error row and continues."""
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(has_kernel_timings=True)
         mock_bm_cls.return_value = _make_bm_mock()
@@ -1417,7 +1535,30 @@ class TestResolveEngineName:
             return real_import(name, *args, **kwargs)
 
         with patch("builtins.__import__", side_effect=fake_import):
-            assert _resolve_engine_name(0xABC) == "engine_0xabc"
+            assert _resolve_engine_name(0xABC, None) == "engine_0xabc"
+
+    @staticmethod
+    def _frontend(registry_name):
+        return SimpleNamespace(engine_id_to_name=lambda _id: registry_name)
+
+    def test_handle_names_plugin_engine_missing_from_builtin_registry(self):
+        handle = MagicMock()
+        handle.engine_id_to_name.return_value = "hipkernel:Gfx950AttentionDense"
+        with patch.dict(sys.modules, {"hipdnn_frontend": self._frontend("")}):
+            name = _resolve_engine_name(0x7636, handle)
+        assert name == "hipkernel:Gfx950AttentionDense"
+
+    def test_falls_back_silently_when_handle_carries_no_such_engine(self, capsys):
+        from dnn_benchmarking.metrics._diagnostic import reset
+
+        reset()  # warn_once dedups process-wide; start from a clean slate.
+        handle = MagicMock()
+        handle.engine_id_to_name.side_effect = IndexError("not loaded")
+        with patch.dict(
+            sys.modules, {"hipdnn_frontend": self._frontend("MIOPEN_ENGINE")}
+        ):
+            assert _resolve_engine_name(1, handle) == "MIOPEN_ENGINE"
+        assert capsys.readouterr().err == ""
 
 
 class TestProfilingPassInvocation:
@@ -1427,7 +1568,7 @@ class TestProfilingPassInvocation:
     not bubble out as engine errors."""
 
     def _setup_mocks(self, mock_exec_cls, mock_bm_cls, mock_get_ref, mock_resolve_name):
-        mock_resolve_name.side_effect = lambda eid: f"engine_{eid}"
+        mock_resolve_name.side_effect = lambda eid, handle=None: f"engine_{eid}"
         mock_get_ref.return_value = None
         mock_exec_cls.side_effect = _make_exec_factory(
             engine_ids=[0], has_kernel_timings=True
@@ -1614,6 +1755,25 @@ class TestRunGraphPytorchBackend:
         assert result.engine_ids == [0]
         assert [r.provider for r in result.results] == ["pytorch"]
         assert result.results[0].status == "success"
+
+    @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
+    def test_stall_timeout_restarts_pytorch_row_unstalled(self, mock_timed_row):
+        row = ProviderEngineResult(provider="pytorch", engine_id=0, status="success")
+        mock_timed_row.side_effect = [
+            StallFallbackError("timed out"),
+            MagicMock(result=row, outputs=None),
+        ]
+
+        result = run_graph_pytorch_backend(
+            graph_path=Path("test.json"),
+            graph_json=_make_graph_json(),
+            tensor_infos=[_make_tensor_info(1)],
+            config=_make_config(),
+        )
+
+        assert mock_timed_row.call_count == 2
+        assert mock_timed_row.call_args_list[1].kwargs["allow_staging"] is False
+        assert "remeasured without stalling" in result.results[0].warnings[0]
 
     @patch("dnn_benchmarking.execution.suite_runner.generate_input_data")
     @patch("dnn_benchmarking.execution.suite_runner._run_timed_pytorch_row")
@@ -2033,7 +2193,7 @@ class TestOraclePass:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2087,7 +2247,7 @@ class TestOraclePass:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2142,6 +2302,25 @@ class TestOraclePass:
         assert oracle.warm_baseline_gpu_kernel_stats is not None
         assert oracle.warm_baseline_gpu_kernel_stats.mean_ms == 0.5
         assert result.results[0].oracle_delta.baseline_mean_ms == 0.5
+
+    def test_tuned_and_warm_ootb_report_median_tflops(self):
+        """Both oracle operands get TFLOP/s from the row's FLOPs and their own
+        kernel median, so tuned and warm OOTB throughput compare directly."""
+        factory, _ = _make_oracle_exec_factory()
+        with patch(
+            "dnn_benchmarking.execution.suite_runner.compute_flops",
+            return_value=(10**9, False),
+        ):
+            result = self._run(factory)
+
+        row = result.results[0]
+        # 1e9 FLOPs: 0.5 ms -> 2 TFLOP/s (OOTB, warm OOTB); 0.25 ms -> 4 (tuned).
+        assert row.derived_tflops_per_s == pytest.approx(2.0)
+        assert row.oracle.warm_baseline_derived_tflops_per_s == pytest.approx(2.0)
+        assert row.oracle.derived_tflops_per_s == pytest.approx(4.0)
+        d = row.oracle.to_dict()
+        assert d["derived_tflops_per_s"] == pytest.approx(4.0)
+        assert d["warm_baseline_derived_tflops_per_s"] == pytest.approx(2.0)
 
     def test_oracle_failure_leaves_ootb_row_intact(self):
         factory, _ = _make_oracle_exec_factory(
@@ -2260,7 +2439,7 @@ class TestOracleTunedPlanValidation:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2407,7 +2586,7 @@ class TestOracleExhaustiveEnvGuard:
         with (
             patch(
                 "dnn_benchmarking.execution.suite_runner._resolve_engine_name",
-                side_effect=lambda eid: f"engine_{eid}",
+                side_effect=lambda eid, handle=None: f"engine_{eid}",
             ),
             patch(
                 "dnn_benchmarking.execution.suite_runner._get_reference_provider",
@@ -2520,3 +2699,28 @@ class TestOracleExhaustiveEnvGuard:
         )
         assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
         assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+
+def test_basic_metrics_use_kernel_median_and_per_execution_cpu_time():
+    """derived_tflops_per_s divides by the kernel *median* (rocKE parity),
+    and CPU time is per timed execution (iters * timing_block)."""
+    result = ProviderEngineResult(provider="hipdnn", engine_id=1, status="success")
+    # Mean 4 ms, median 1 ms.
+    result.gpu_kernel_stats = BenchmarkStats.from_timings([1.0, 1.0, 10.0])
+    probe = SimpleNamespace(
+        delta=SimpleNamespace(user_time_ms=60.0, kernel_time_ms=6.0)
+    )
+
+    with patch("dnn_benchmarking.execution.suite_runner.GpuSmiProbe"):
+        _collect_basic_metrics_post_loop(
+            result=result,
+            cpu_time_probe=probe,
+            timed_executions=3 * 20,
+            analytical_flops=10**12,
+            analytical_flops_partial=False,
+            analytical_io_bytes=None,
+        )
+
+    assert result.derived_tflops_per_s == pytest.approx(1000.0)
+    assert result.cpu_user_time_per_iter_us == pytest.approx(1000.0)
+    assert result.cpu_kernel_time_per_iter_us == pytest.approx(100.0)

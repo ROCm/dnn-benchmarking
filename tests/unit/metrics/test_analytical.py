@@ -31,13 +31,18 @@ def _conv_graph(
     s: int = 3,
     h_out: int = 16,
     w_out: int = 16,
-    group_count: int = 1,
+    groups: int = 1,
 ) -> Dict[str, Any]:
     """Build a minimal conv-fwd graph dict with explicit dims for test math."""
     return {
         "tensors": [
             {"uid": 1, "dims": [n, c, h, w], "data_type": "float", "virtual": False},
-            {"uid": 2, "dims": [k, c, r, s], "data_type": "float", "virtual": False},
+            {
+                "uid": 2,
+                "dims": [k, c // groups, r, s],
+                "data_type": "float",
+                "virtual": False,
+            },
             {
                 "uid": 3,
                 "dims": [n, k, h_out, w_out],
@@ -51,7 +56,6 @@ def _conv_graph(
                 "type": "ConvolutionFwdAttributes",
                 "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
                 "outputs": {"y_tensor_uid": 3},
-                "parameters": {"group_count": group_count},
             }
         ],
     }
@@ -130,8 +134,8 @@ def _sdpa_graph(
                 "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
                 "outputs": {"o_tensor_uid": 4},
                 "attributes": {
-                    "causal_mask": causal,
-                    "causal_mask_bottom_right": bottom_right,
+                    "causal_mask": causal and not bottom_right,
+                    "causal_mask_bottom_right": causal and bottom_right,
                     "diagonal_alignment": (
                         "BOTTOM_RIGHT" if bottom_right else "TOP_LEFT"
                     ),
@@ -196,10 +200,31 @@ class TestComputeFlops:
         assert flops == 2 * 16 * 16 * 3 * 3 * 16 * 16 * 16
         assert partial is False
 
-    def test_conv_fwd_with_groups(self):
-        graph = _conv_graph(group_count=4)
+    def test_conv_fwd_with_groups_reads_c_per_group_from_weight(self):
+        # hipDNN graphs carry no group count; the weight is [K, C/g, R, S].
+        graph = _conv_graph(groups=4)
         flops, partial = compute_flops(graph)
         assert flops == (2 * 16 * 16 * 3 * 3 * 16 * 16 * 16) // 4
+        assert partial is False
+
+    def test_conv1d_fwd(self):
+        graph = {
+            "tensors": [
+                {"uid": 1, "dims": [2, 8, 32], "data_type": "float", "virtual": False},
+                {"uid": 2, "dims": [4, 8, 3], "data_type": "float", "virtual": False},
+                {"uid": 3, "dims": [2, 4, 30], "data_type": "float", "virtual": False},
+            ],
+            "nodes": [
+                {
+                    "name": "conv",
+                    "type": "ConvolutionFwdAttributes",
+                    "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
+                    "outputs": {"y_tensor_uid": 3},
+                }
+            ],
+        }
+        flops, partial = compute_flops(graph)
+        assert flops == 2 * 2 * 8 * 3 * 4 * 30
         assert partial is False
 
     def test_conv_fwd_with_zero_output_uid(self):
@@ -233,7 +258,6 @@ class TestComputeFlops:
                     "type": "ConvolutionFwdAttributes",
                     "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
                     "outputs": {"y_tensor_uid": 0},
-                    "parameters": {"group_count": 1},
                 }
             ],
         }
@@ -318,7 +342,6 @@ class TestComputeFlops:
                     "type": "ConvolutionBwdAttributes",
                     "inputs": {"dy_tensor_uid": 1, "w_tensor_uid": 2},
                     "outputs": {"dx_tensor_uid": 3},
-                    "parameters": {"group_count": 1},
                 }
             ],
         }
@@ -345,7 +368,6 @@ class TestComputeFlops:
                     "type": "ConvolutionWrwAttributes",
                     "inputs": {"x_tensor_uid": 1, "dy_tensor_uid": 2},
                     "outputs": {"dw_tensor_uid": 3},
-                    "parameters": {"group_count": 1},
                 }
             ],
         }
@@ -411,8 +433,8 @@ class TestComputeFlops:
                 {
                     "name": "red",
                     "type": "ReductionAttributes",
-                    "inputs": {"x_tensor_uid": 1},
-                    "outputs": {"y_tensor_uid": 2},
+                    "inputs": {"in_tensor_uid": 1},
+                    "outputs": {"out_tensor_uid": 2},
                 }
             ],
         }
@@ -500,7 +522,6 @@ class TestComputeFlops:
                     "type": "ConvolutionFwdAttributes",
                     "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
                     "outputs": {"y_tensor_uid": 0},
-                    "parameters": {"group_count": 1},
                 },
                 {
                     "name": "bn",
@@ -532,8 +553,49 @@ class TestComputeFlops:
         flops4, _ = compute_flops(_sdpa_graph(hkv=4))
         assert flops8 == flops4
 
-    def test_sdpa_sliding_window_partial(self):
-        flops, partial = compute_flops(_sdpa_graph(left_bound=256))
+    def test_sdpa_causal_bounds_match_deprecated_flag(self):
+        by_flag, _ = compute_flops(_sdpa_graph(causal=True))
+        by_bounds, _ = compute_flops(_sdpa_graph(right_bound=0))
+        assert by_bounds == by_flag
+
+    def test_sdpa_causal_sliding_window_bottom_right(self):
+        # Causal window of W keys = left W-1, right 0; Sq=4, Skv=6, W=3.
+        # offset 2 -> rows keep min(i + 3, 3) = 3 keys each -> 12 pairs, the
+        # rocKE benchmark's sum_i min(i + off + 1, W).
+        graph = _sdpa_graph(sq=4, skv=6, left_bound=2, right_bound=0)
+        graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
+        flops, partial = compute_flops(graph)
+        assert flops == 2 * 2 * 64 * 12 * (128 + 128)
+        assert partial is False
+
+    def test_sdpa_sliding_window_top_left_clamps_edges(self):
+        # left 1, right 1, Sq=Skv=4 -> rows keep 2,3,3,2 keys = 10 pairs.
+        flops, partial = compute_flops(
+            _sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1)
+        )
+        assert flops == 2 * 2 * 64 * 10 * (128 + 128)
+        assert partial is False
+
+    def test_sdpa_deprecated_causal_ignores_alignment_and_bounds(self):
+        # hipDNN: causal_mask=True means top-left causal regardless of bounds.
+        graph = _sdpa_graph(causal=True, sq=8, skv=4, left_bound=1)
+        graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
+        flops, _ = compute_flops(graph)
+        top_left, _ = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
+        assert flops == top_left
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"left_bound": -2},
+            {"causal_mask": True, "right_bound": -5},
+            {"causal_mask": True, "causal_mask_bottom_right": True},
+        ],
+    )
+    def test_sdpa_masks_hipdnn_rejects_are_partial(self, attrs):
+        graph = _sdpa_graph()
+        graph["nodes"][0]["attributes"].update(attrs)
+        flops, partial = compute_flops(graph)
         assert flops is None
         assert partial is True
 
@@ -556,10 +618,24 @@ class TestComputeFlops:
     def test_sdpa_causal_mask_bottom_right_alone_is_causal(self):
         # The boolean-only spelling: causal_mask false, no diagonal_alignment.
         # Offset Skv-Sq = 2: rows -> 3+4+5 = 12 query-key pairs, not the dense 15.
-        graph = _sdpa_graph(bottom_right=True, sq=3, skv=5)
-        del graph["nodes"][0]["attributes"]["diagonal_alignment"]
+        graph = _sdpa_graph(sq=3, skv=5)
+        attributes = graph["nodes"][0]["attributes"]
+        attributes["causal_mask_bottom_right"] = True
+        del attributes["diagonal_alignment"]
         flops, partial = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
+        assert partial is False
+
+    def test_sdpa_causal_mask_overrides_a_bottom_right_alignment(self):
+        # causal_mask pins the diagonal top-left whatever diagonal_alignment
+        # says, the way hipDNN's extractDiagonalBandParams resolves it:
+        # rows -> 1+2+3 = 6 pairs, not the bottom-right 12.
+        graph = _sdpa_graph(sq=3, skv=5)
+        attributes = graph["nodes"][0]["attributes"]
+        attributes["causal_mask"] = True
+        attributes["diagonal_alignment"] = "BOTTOM_RIGHT"
+        flops, partial = compute_flops(graph)
+        assert flops == 2 * 2 * 64 * 6 * (128 + 128)
         assert partial is False
 
     def test_sdpa_asymmetric_head_dims(self):
@@ -568,6 +644,135 @@ class TestComputeFlops:
         assert flops == 2 * 2 * 64 * (128 * 128) * (128 + 64)
         assert flops == 805306368
         assert partial is False
+
+    def test_sdpa_bwd_five_matmuls_with_parameters_section(self):
+        # hipDNN writes SDPA backward attributes under "parameters".
+        graph = _sdpa_graph(sq=8, skv=8, d=192, dv=128)
+        node = graph["nodes"][0]
+        node["type"] = "SdpaBackwardAttributes"
+        node["parameters"] = {"causal_mask": True}
+        del node["attributes"]
+        flops, partial = compute_flops(graph)
+        # Causal 8x8 -> 36 pairs; 3 matmuls over D_qk, 2 over D_vo.
+        assert flops == 2 * 2 * 64 * 36 * (3 * 192 + 2 * 128)
+        assert partial is False
+
+
+def _graph(node_type, tensors, inputs, outputs, **params):
+    return {
+        "tensors": [
+            {"uid": uid, "dims": dims, "data_type": "float", "virtual": False}
+            for uid, dims in tensors.items()
+        ],
+        "nodes": [{"type": node_type, "inputs": inputs, "outputs": outputs, **params}],
+    }
+
+
+class TestComputeFlopsCoverage:
+    """Handlers for the remaining hipDNN node types, in their real JSON layout."""
+
+    @pytest.mark.parametrize(
+        "mode, extra_inputs, rows",
+        [("none", {}, 128), ("gather", {"token_index_tensor_uid": 5}, 96)],
+    )
+    def test_moe_grouped_matmul_counts_routed_rows(self, mode, extra_inputs, rows):
+        graph = _graph(
+            "MoeGroupedMatmulAttributes",
+            {
+                1: [1, 128, 64],
+                2: [8, 64, 32],
+                3: [8, 1, 1],
+                4: [1, rows, 32],
+                5: [1, 96, 1],
+            },
+            {
+                "token_tensor_uid": 1,
+                "weight_tensor_uid": 2,
+                "first_token_offset_tensor_uid": 3,
+                **extra_inputs,
+            },
+            {"output_tensor_uid": 4},
+            mode=mode,
+        )
+        assert compute_flops(graph) == (2 * rows * 64 * 32, False)
+
+    def test_moe_grouped_matmul_bwd_weight_gradient(self):
+        graph = _graph(
+            "MoeGroupedMatmulBwdAttributes",
+            {1: [1, 128, 32], 2: [1, 128, 64], 3: [8, 1, 1], 4: [8, 64, 32]},
+            {
+                "doutput_tensor_uid": 1,
+                "token_tensor_uid": 2,
+                "first_token_offset_tensor_uid": 3,
+            },
+            {"dweight_tensor_uid": 4},
+        )
+        assert compute_flops(graph) == (2 * 128 * 64 * 32, False)
+
+    def test_block_scale_quantize_and_dequantize(self):
+        quant = _graph(
+            "BlockScaleQuantizeAttributes",
+            {1: [64, 512], 2: [64, 512], 3: [64, 4]},
+            {"x_tensor_uid": 1},
+            {"y_tensor_uid": 2, "scale_tensor_uid": 3},
+            block_size=128,
+        )
+        dequant = _graph(
+            "BlockScaleDequantizeAttributes",
+            {1: [64, 512], 2: [64, 4], 3: [64, 512]},
+            {"x_tensor_uid": 1, "scale_tensor_uid": 2},
+            {"y_tensor_uid": 3},
+            block_size=[128],
+        )
+        assert compute_flops(quant) == (2 * 64 * 512, False)
+        assert compute_flops(dequant) == (64 * 512, False)
+
+    def test_resample_fwd_reads_top_level_window(self):
+        graph = _graph(
+            "ResampleFwdAttributes",
+            {1: [2, 4, 16, 16], 2: [2, 4, 7, 7]},
+            {"x_tensor_uid": 1},
+            {"y_tensor_uid": 2},
+            window=[3, 3],
+            stride=[2, 2],
+            resample_mode="maxpool",
+        )
+        assert compute_flops(graph) == (2 * 4 * 7 * 7 * 9, False)
+
+    @pytest.mark.parametrize(
+        "mode, per_dy", [("MAXPOOL", 1), ("AVGPOOL_INCLUDE_PADDING", 9)]
+    )
+    def test_resample_bwd_max_routes_avg_spreads(self, mode, per_dy):
+        graph = _graph(
+            "ResampleBwdAttributes",
+            {1: [2, 4, 7, 7], 2: [2, 4, 16, 16]},
+            {"dy_tensor_uid": 1},
+            {"dx_tensor_uid": 2},
+            window=[3, 3],
+            resample_mode=mode,
+        )
+        assert compute_flops(graph) == (2 * 4 * 7 * 7 * per_dy, False)
+
+    @pytest.mark.parametrize(
+        "node_type", ["LayernormBackwardAttributes", "RMSNormBackwardAttributes"]
+    )
+    def test_norm_backward_counts_dx(self, node_type):
+        graph = _graph(
+            node_type,
+            {1: [8, 256, 128], 2: [8, 256, 128], 3: [1, 1, 128], 4: [8, 256, 128]},
+            {"dy_tensor_uid": 1, "x_tensor_uid": 2, "scale_tensor_uid": 3},
+            {"dx_tensor_uid": 4},
+        )
+        assert compute_flops(graph) == (8 * 8 * 256 * 128, False)
+
+    def test_batchnorm_inference_variance_ext(self):
+        graph = _graph(
+            "BatchnormInferenceAttributesVarianceExt",
+            {1: [4, 16, 8, 8], 2: [4, 16, 8, 8]},
+            {"x_tensor_uid": 1},
+            {"y_tensor_uid": 2},
+        )
+        assert compute_flops(graph) == (4 * 4 * 16 * 8 * 8, False)
 
 
 class TestComputeIoBytes:
@@ -623,7 +828,7 @@ class TestDeriveThroughputs:
     def test_both_when_inputs_present(self):
         # 1e9 FLOPs in 1 ms = 1 TFLOPs/s; 1e6 bytes in 1 ms = 1 GB/s.
         tflops, gbytes = derive_throughputs(
-            flops=10**9, io_bytes=10**6, kernel_mean_ms=1.0
+            flops=10**9, io_bytes=10**6, kernel_median_ms=1.0
         )
         assert tflops == pytest.approx(1.0)
         assert gbytes == pytest.approx(1.0)

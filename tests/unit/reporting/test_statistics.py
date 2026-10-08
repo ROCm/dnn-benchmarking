@@ -35,6 +35,12 @@ class TestBenchmarkStats:
         assert stats.p95_ms == 5.0
         assert stats.p99_ms == 5.0
 
+    def test_median_even_count_is_upper_middle_sample(self) -> None:
+        """Even counts take sorted[n // 2] like Solera, not the mean of the two
+        middle values (Solera's default 5 samples minus the first gives n=4)."""
+        stats = BenchmarkStats.from_timings([4.0, 1.0, 3.0, 2.0])
+        assert stats.median_ms == 3.0
+
     def test_from_timings_empty_raises(self) -> None:
         """Test that empty timings raises ValueError."""
         with pytest.raises(ValueError, match="timings list cannot be empty"):

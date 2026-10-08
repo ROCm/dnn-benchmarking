@@ -20,6 +20,7 @@ from . import pytorch_ops
 from .timing import (
     GpuTimerInterface,
     HipGpuTimer,
+    StallFallbackError,
     StalledRegionTimer,
     Timer,
     _is_staged_hip_available,
@@ -131,11 +132,14 @@ class PyTorchCudaExecutor:
         if not self._prepared:
             raise PyTorchExecutionError("Executor not prepared. Call prepare() first.")
 
+        # Block timing (rocKE / Solera protocol) warms up before every sample
+        # in benchmark(); here it only runs the one untimed compile call.
+        count = 1 if self._config.timing_block > 1 else self._config.warmup_iters
         with torch.cuda.device(self._device):
             with torch.cuda.stream(self._get_stream()):
-                for _ in range(self._config.warmup_iters):
+                for _ in range(count):
                     self._execute_graph(tensors)
-            if self._config.warmup_iters > 0:
+            if count > 0:
                 self._synchronize_stream()
 
     def execute_once(self, tensors: Dict[int, torch.Tensor]) -> None:
@@ -156,6 +160,7 @@ class PyTorchCudaExecutor:
         self,
         tensors: Dict[int, torch.Tensor],
         graph_name: str = "",
+        allow_staging: bool = True,
     ) -> BenchmarkResult:
         """Run benchmark iterations and collect timing.
 
@@ -164,6 +169,7 @@ class PyTorchCudaExecutor:
         Args:
             tensors: Mapping of tensor UIDs to CUDA tensors.
             graph_name: Optional name/identifier for the graph being benchmarked.
+            allow_staging: Use stall-gated timing on supported ROCm devices.
 
         Returns:
             BenchmarkResult with E2E and kernel timings, plus metadata.
@@ -180,17 +186,22 @@ class PyTorchCudaExecutor:
         # via .item()) are made async-safe by resolving those scalars once,
         # before the gated loop, via ReplayTensors. Staging is HIP-only; CUDA
         # torch and capability mismatches fall back to direct GPU-event timing.
+        # Block timing (timing_block > 1) always uses the event loop; see
+        # Executor.benchmark for why it skips the stall gate.
+        block = self._config.timing_block
         staged_timer: Optional[StalledRegionTimer] = None
         if (
-            self._collect_kernel_timing
+            allow_staging
+            and block == 1
+            and self._collect_kernel_timing
             and self._resolve_timing_backend() is TimingBackendName.HIP
             and _is_staged_hip_available()
         ):
             with torch.cuda.device(self._device):
                 try:
                     staged_timer = StalledRegionTimer(self._timing_stream())
-                except RuntimeError:
-                    staged_timer = None
+                except RuntimeError as e:
+                    raise StallFallbackError(f"stall gate unavailable: {e}") from e
 
         if staged_timer is not None:
             return self._benchmark_staged(staged_timer, tensors, graph_name)
@@ -214,24 +225,37 @@ class PyTorchCudaExecutor:
                     kernel_timings = []
                     timing_backend_name = gpu_timer.backend_name
 
-        for _ in range(self._config.benchmark_iters):
+        # Block > 1 follows the rocKE / Solera protocol: warmup_iters untimed
+        # executions plus a drain before every sample, and the first sample is
+        # discarded. See Executor.benchmark.
+        per_sample_warmup = self._config.warmup_iters if block > 1 else 0
+        iters = self._config.benchmark_iters
+        for i in range(iters):
             kernel_ms: Optional[float] = None
             with torch.cuda.device(self._device):
+                if per_sample_warmup:
+                    with torch.cuda.stream(self._get_stream()):
+                        for _ in range(per_sample_warmup):
+                            self._execute_graph(tensors)
+                    self._synchronize_stream()
                 with Timer() as t:
                     with torch.cuda.stream(self._get_stream()):
                         if gpu_timer is not None:
                             gpu_timer.start()
-                        self._execute_graph(tensors)
+                        for _ in range(block):
+                            self._execute_graph(tensors)
                         if gpu_timer is not None:
                             gpu_timer.stop()
-                            kernel_ms = gpu_timer.elapsed_ms()
+                            kernel_ms = gpu_timer.elapsed_ms() / block
                         else:
                             self._synchronize_stream()
 
+            if block > 1 and i == 0 and iters > 1:
+                continue
             if kernel_ms is not None:
                 assert kernel_timings is not None
                 kernel_timings.append(kernel_ms)
-            host_timings.append(t.elapsed_ms)
+            host_timings.append(t.elapsed_ms / block)
 
         # Build metadata
         metadata = BenchmarkMetadata(
@@ -239,6 +263,7 @@ class PyTorchCudaExecutor:
             graph_path=str(self._config.graph_path),
             warmup_iters=self._config.warmup_iters,
             benchmark_iters=self._config.benchmark_iters,
+            timing_block=block,
             engine_id=self._config.engine_id,
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.PYTORCH.value,

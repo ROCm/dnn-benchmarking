@@ -187,6 +187,7 @@ def _run_suite_graphs_after_startup(
         pytorch_rocm_fa_library_requested=(
             config.pytorch_rocm_fa_library if pytorch_selected else None
         ),
+        timing_block=config.timing_block,
         oracle=config.oracle_enabled,
     )
 
@@ -345,6 +346,7 @@ def run_suite_cli(
         config = SuiteConfig(
             warmup_iters=args.warmup,
             benchmark_iters=args.iters,
+            timing_block=args.timing_block,
             seed=args.seed,
             engine_filter=args.engine,
             verbose=args.verbose,

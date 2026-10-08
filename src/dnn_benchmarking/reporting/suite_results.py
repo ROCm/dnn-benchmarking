@@ -122,6 +122,10 @@ class OracleResult:
     delta uses this warm measurement, not the row's earlier OOTB timing.
     ``correctness`` is the tuned plan's verdict; the row retains the OOTB
     verdict.
+
+    ``derived_tflops_per_s`` (tuned plan) and ``warm_baseline_derived_tflops_per_s``
+    (warm OOTB) use the row's ``analytical_flops`` and each side's GPU kernel
+    median, like the row's own ``derived_tflops_per_s``.
     """
 
     plan_name: str
@@ -140,6 +144,8 @@ class OracleResult:
     warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
     warm_baseline_host_stats: Optional[BenchmarkStats] = None
     correctness: Optional[CorrectnessResult] = None
+    derived_tflops_per_s: Optional[float] = None
+    warm_baseline_derived_tflops_per_s: Optional[float] = None
 
     @property
     def exhaustive_enabled(self) -> bool:
@@ -182,6 +188,10 @@ class OracleResult:
                 else None
             ),
             "correctness": (self.correctness.to_dict() if self.correctness else None),
+            "derived_tflops_per_s": self.derived_tflops_per_s,
+            "warm_baseline_derived_tflops_per_s": (
+                self.warm_baseline_derived_tflops_per_s
+            ),
         }
 
 
@@ -251,15 +261,15 @@ class ProviderEngineResult:
             recognised compute nodes.
         analytical_io_bytes: Sum of non-virtual tensor sizes (bytes).
         derived_tflops_per_s: Throughput derived from analytical_flops
-            and the GPU kernel mean time.
+            and the GPU kernel median time.
         derived_gbytes_per_s: Bandwidth derived from analytical_io_bytes
-            and the GPU kernel mean time.
-        cpu_user_time_per_iter_us: User-space CPU time per benchmark
-            iteration in microseconds (rusage delta over the loop,
-            divided by ``benchmark_iters``). Mostly Python dispatch +
-            sync overhead.
-        cpu_kernel_time_per_iter_us: Kernel-space CPU time per
-            benchmark iteration in microseconds. Usually near zero;
+            and the GPU kernel median time.
+        cpu_user_time_per_iter_us: User-space CPU time per timed
+            execution in microseconds (rusage delta over the loop,
+            divided by ``benchmark_iters * timing_block``). Mostly Python
+            dispatch + sync overhead.
+        cpu_kernel_time_per_iter_us: Kernel-space CPU time per timed
+            execution in microseconds. Usually near zero;
             useful only as a spike diagnostic (heavy syscalls / page
             faults during the loop).
         vram_used_mb: Total process-wide GPU VRAM allocated at the
@@ -565,6 +575,9 @@ class SuiteMetadata:
             selected.
         pytorch_rocm_fa_library_requested: Requested ROCm Flash Attention
             implementation preference; None when not requested.
+        timing_block: Executions per timed sample. ``1`` means each
+            ``gpu_kernel_stats`` sample is one execution; ``N > 1`` means each
+            sample is the average of ``N`` back-to-back executions.
         rocm_version: ROCm/HIP version string (None on CUDA hosts).
         cuda_version: CUDA toolkit version the torch wheel was built
             against (None on ROCm hosts).
@@ -612,6 +625,7 @@ class SuiteMetadata:
     error_combinations: int
     pytorch_sdpa_backend_requested: Optional[str] = None
     pytorch_rocm_fa_library_requested: Optional[str] = None
+    timing_block: int = 1
     rocm_version: Optional[str] = None
     cuda_version: Optional[str] = None
     cudnn_version: Optional[str] = None
@@ -649,6 +663,7 @@ class SuiteMetadata:
             "pytorch_rocm_fa_library_requested": (
                 self.pytorch_rocm_fa_library_requested
             ),
+            "timing_block": self.timing_block,
             "rocm_version": self.rocm_version,
             "cuda_version": self.cuda_version,
             "cudnn_version": self.cudnn_version,
@@ -695,6 +710,7 @@ class SuiteResult:
         *,
         pytorch_sdpa_backend_requested: Optional[str] = None,
         pytorch_rocm_fa_library_requested: Optional[str] = None,
+        timing_block: int = 1,
         oracle: bool = False,
     ) -> "SuiteResult":
         """Build a SuiteResult from per-graph results with auto-computed metadata."""
@@ -758,6 +774,7 @@ class SuiteResult:
             error_combinations=total_error,
             pytorch_sdpa_backend_requested=pytorch_sdpa_backend_requested,
             pytorch_rocm_fa_library_requested=pytorch_rocm_fa_library_requested,
+            timing_block=timing_block,
             rocm_version=env_info.get("rocm_version"),
             cuda_version=env_info.get("cuda_version"),
             cudnn_version=env_info.get("cudnn_version"),

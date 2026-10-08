@@ -17,6 +17,7 @@ from ..reporting.statistics import BenchmarkMetadata, BenchmarkResult
 from .timing import (
     GpuTimerInterface,
     HipGpuTimer,
+    StallFallbackError,
     StalledRegionTimer,
     Timer,
     _is_staged_hip_available,
@@ -442,7 +443,10 @@ class Executor:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
 
         stream = self._get_execution_stream(handle)
-        for _ in range(self._config.warmup_iters):
+        # Block timing (rocKE / Solera protocol) warms up before every sample
+        # in benchmark(); here it only runs the one untimed compile call.
+        count = 1 if self._config.timing_block > 1 else self._config.warmup_iters
+        for _ in range(count):
             result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
             if result.is_bad():
                 raise ExecutionError(f"Warmup execution failed: {result.get_message()}")
@@ -450,7 +454,7 @@ class Executor:
         # hipDNN graph execution is asynchronous. Drain untimed warmup work before
         # benchmark() starts the measured loop, otherwise the first timed E2E
         # iteration can include queued warmup kernels.
-        if self._config.warmup_iters > 0:
+        if count > 0:
             self._get_stream_sync_timer(stream).synchronize_stream()
 
     def benchmark(
@@ -458,6 +462,7 @@ class Executor:
         handle: Any,
         variant_pack: Dict[int, int],
         graph_name: str = "",
+        allow_staging: bool = True,
     ) -> BenchmarkResult:
         """Run benchmark iterations and collect timing.
 
@@ -467,6 +472,7 @@ class Executor:
             handle: hipdnn.Handle instance.
             variant_pack: Mapping of tensor UIDs to device pointers.
             graph_name: Optional name/identifier for the graph being benchmarked.
+            allow_staging: Use stall-gated timing when the device supports it.
 
         Returns:
             BenchmarkResult with E2E and optional kernel timings, plus metadata.
@@ -487,12 +493,21 @@ class Executor:
         # Stalled-queue staging measures a gap-free GPU span and pure host
         # submission cost; available only on HIP devices supporting
         # stream-wait-value. Falls back to the non-staged loop otherwise.
+        # Block timing (timing_block > 1) always uses the plain event loop:
+        # N executions queued behind the stall gate can fill the HIP queue
+        # and block the host before the gate is released.
+        block = self._config.timing_block
         staged_timer: Optional[StalledRegionTimer] = None
-        if self._collect_kernel_timing and _is_staged_hip_available():
+        if (
+            allow_staging
+            and block == 1
+            and self._collect_kernel_timing
+            and _is_staged_hip_available()
+        ):
             try:
                 staged_timer = StalledRegionTimer(stream)
-            except RuntimeError:
-                staged_timer = None
+            except RuntimeError as e:
+                raise StallFallbackError(f"stall gate unavailable: {e}") from e
 
         if staged_timer is not None:
             timing_backend_name = TimingBackendName.HIP.value
@@ -527,30 +542,45 @@ class Executor:
                     kernel_timings = []
                     timing_backend_name = gpu_timer.backend_name
 
-            for _ in range(self._config.benchmark_iters):
+            def execute() -> None:
+                result = self._graph.execute(handle, variant_pack, self._workspace_ptr)
+                if result.is_bad():
+                    raise ExecutionError(
+                        f"Benchmark execution failed: {result.get_message()}"
+                    )
+
+            # Each sample times ``block`` back-to-back executions between one
+            # event pair and records the per-execution average (block == 1 is
+            # plain per-execution timing). Block > 1 follows the rocKE /
+            # Solera protocol: warmup_iters untimed executions plus a drain
+            # before every sample, and the first sample is discarded.
+            per_sample_warmup = self._config.warmup_iters if block > 1 else 0
+            iters = self._config.benchmark_iters
+            for i in range(iters):
+                for _ in range(per_sample_warmup):
+                    execute()
+                if per_sample_warmup:
+                    self._get_stream_sync_timer(stream).synchronize_stream()
                 kernel_ms = None
                 with Timer() as t:
                     if gpu_timer:
                         gpu_timer.start()
-                    result = self._graph.execute(
-                        handle, variant_pack, self._workspace_ptr
-                    )
-                    if result.is_bad():
-                        raise ExecutionError(
-                            f"Benchmark execution failed: {result.get_message()}"
-                        )
+                    for _ in range(block):
+                        execute()
                     if gpu_timer:
                         gpu_timer.stop()
-                        kernel_ms = gpu_timer.elapsed_ms()
+                        kernel_ms = gpu_timer.elapsed_ms() / block
                     else:
                         if stream_sync_timer is None:
                             stream_sync_timer = self._get_stream_sync_timer(stream)
                         stream_sync_timer.synchronize_stream()
 
+                if block > 1 and i == 0 and iters > 1:
+                    continue
                 if kernel_ms is not None:
                     assert kernel_timings is not None
                     kernel_timings.append(kernel_ms)
-                host_timings.append(t.elapsed_ms)
+                host_timings.append(t.elapsed_ms / block)
 
         # Build metadata
         metadata = BenchmarkMetadata(
@@ -558,6 +588,7 @@ class Executor:
             graph_path=str(self._config.graph_path),
             warmup_iters=self._config.warmup_iters,
             benchmark_iters=self._config.benchmark_iters,
+            timing_block=block,
             engine_id=self._config.engine_id,
             timing_backend=timing_backend_name,
             execution_backend=ExecutionBackendName.HIPDNN.value,

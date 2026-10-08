@@ -27,7 +27,7 @@ from ..config.benchmark_config import (
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
-from ..execution.timing import Timer
+from ..execution.timing import StallFallbackError, Timer
 from ..metrics import (
     CpuTimeProbe,
     GpuSmiProbe,
@@ -52,7 +52,6 @@ from ..validation.reference_provider import (
 )
 from ..validation.validator import Validator
 
-
 # bf16 has a 7-bit mantissa: 1 ULP ~= 2^-7 = 0.78% relative. Backward
 # convolutions (wgrad/dgrad) accumulate over large reductions, and the MIOpen
 # kernels hipDNN and PyTorch select round 2-3 ULP apart even when they pick the
@@ -72,6 +71,17 @@ class _TimedPytorchRow:
 
     result: ProviderEngineResult
     outputs: Optional[Dict[int, ReferenceOutput]]
+
+
+_STALL_FALLBACK_WARNING = (
+    "Stall-gated timing failed; every engine was remeasured without stalling."
+)
+
+
+def _mark_stall_fallback(result: GraphResult) -> GraphResult:
+    for row in result.results:
+        row.warnings = [*(row.warnings or []), _STALL_FALLBACK_WARNING]
+    return result
 
 
 def _output_node_types(graph_json: Dict[str, Any]) -> Dict[int, str]:
@@ -131,25 +141,43 @@ def _hipdnn_buffer_device(
     return None
 
 
-def _resolve_engine_name(engine_id: int) -> str:
+def _resolve_engine_name(engine_id: int, handle: Any) -> str:
     """Resolve an engine ID to its registered name.
 
-    Looks up the name via ``hipdnn_frontend.engine_id_to_name``. If the ID
-    isn't registered (returns empty string), falls back to a hex display
+    Asks ``handle.engine_id_to_name`` first: it queries the loaded plugins, so
+    it also names plugin-supplied engines such as the ``hipkernel:*`` kernel
+    ingestor engines. Falls back to ``hipdnn_frontend.engine_id_to_name``,
+    which only knows engines built into hipDNN, and finally to a hex display
     string so callers always have something printable.
 
-    Unexpected exceptions (plugin import error, registry corruption)
-    emit a one-shot warning to stderr so a silent fallback doesn't hide
-    a real plugin-init bug — the hex fallback only changes the artifact
-    path and reporting label, but the underlying error usually indicates
-    a broader registry problem worth surfacing.
+    A handle that does not carry the ID (``IndexError``) falls through
+    silently. Any other exception emits a warning to stderr (deduplicated per
+    engine ID and message by ``warn_once``) so a silent fallback doesn't hide a
+    real plugin-init bug — the hex fallback only changes the artifact path and
+    reporting label, but the underlying error usually indicates a broader
+    registry problem worth surfacing.
 
     Args:
         engine_id: int engine ID.
+        handle: The hipdnn.Handle that runs the engine, or None when no handle
+            exists (for example, creating it failed).
 
     Returns:
-        Registered engine name or ``f"engine_0x..."`` fallback.
+        Engine name or ``f"engine_0x..."`` fallback.
     """
+    if handle is not None:
+        try:
+            name = handle.engine_id_to_name(engine_id)
+            if name:
+                return name
+        except IndexError:
+            pass
+        except Exception as e:
+            warn_once(
+                "suite_runner",
+                f"handle engine_id_to_name failed for {engine_id:#x}: {e}; "
+                "falling back to the built-in registry",
+            )
     try:
         import hipdnn_frontend as hipdnn
 
@@ -157,8 +185,6 @@ def _resolve_engine_name(engine_id: int) -> str:
         if name:
             return name
     except Exception as e:
-        from ..metrics._diagnostic import warn_once
-
         warn_once(
             "suite_runner",
             f"engine_id_to_name failed for {engine_id:#x}: {e}; "
@@ -487,6 +513,7 @@ def _run_timed_pytorch_row(
     analytical_flops_partial: bool,
     analytical_io_bytes: Optional[int],
     role: Literal["engine", "reference"] = "reference",
+    allow_staging: bool = True,
 ) -> _TimedPytorchRow:
     """Run PyTorch once as a timed suite row.
 
@@ -523,6 +550,7 @@ def _run_timed_pytorch_row(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
+                timing_block=config.timing_block,
                 engine_id=0,
                 pytorch_sdpa_backend=config.pytorch_sdpa_backend,
                 pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
@@ -545,7 +573,9 @@ def _run_timed_pytorch_row(
                 if cpu_time_probe is not None:
                     cpu_time_probe.__enter__()
                 try:
-                    bench_result = executor.benchmark(tensors, graph_name=graph_name)
+                    bench_result = executor.benchmark(
+                        tensors, graph_name=graph_name, allow_staging=allow_staging
+                    )
                 finally:
                     if cpu_time_probe is not None:
                         cpu_time_probe.__exit__(None, None, None)
@@ -563,7 +593,7 @@ def _run_timed_pytorch_row(
                     _collect_basic_metrics_post_loop(
                         result=result,
                         cpu_time_probe=cpu_time_probe,
-                        benchmark_iters=config.benchmark_iters,
+                        timed_executions=_benchmark_executions(config),
                         analytical_flops=analytical_flops,
                         analytical_flops_partial=analytical_flops_partial,
                         analytical_io_bytes=analytical_io_bytes,
@@ -598,6 +628,8 @@ def _run_timed_pytorch_row(
                 )
             result.status = "success"
 
+        except StallFallbackError:
+            raise
         except UnsupportedGraphError as e:
             msg = str(e)
             if strict_selection:
@@ -634,6 +666,8 @@ def run_graph_all_providers(
     config: SuiteConfig,
     handle: Any,
     reporter: Optional[Reporter] = None,
+    _allow_staging: bool = True,
+    _engine_ids: Optional[List[int]] = None,
 ) -> GraphResult:
     """Run a single graph against every engine the backend ranks for it.
 
@@ -658,7 +692,9 @@ def run_graph_all_providers(
 
     validation_requested = config.validation.enabled
 
-    if config.engine_filter is not None:
+    if _engine_ids is not None:
+        engine_ids = _engine_ids
+    elif config.engine_filter is not None:
         # Explicit --engine is a selection, not a post-discovery filter. Keep the
         # caller's order so per-engine plugin paths are deterministic.
         engine_ids = list(config.engine_filter)
@@ -775,17 +811,32 @@ def run_graph_all_providers(
     ):
         if reporter is not None:
             reporter.print_engine_start("pytorch reference")
-        timed_reference = _run_timed_pytorch_row(
-            graph_path=graph_path,
-            graph_json=graph_json,
-            graph_name=graph_name,
-            tensor_infos=tensor_infos,
-            config=config,
-            input_data=graph_input_data,
-            analytical_flops=analytical_flops,
-            analytical_flops_partial=analytical_flops_partial,
-            analytical_io_bytes=analytical_io_bytes,
-        )
+        try:
+            timed_reference = _run_timed_pytorch_row(
+                graph_path=graph_path,
+                graph_json=graph_json,
+                graph_name=graph_name,
+                tensor_infos=tensor_infos,
+                config=config,
+                input_data=graph_input_data,
+                analytical_flops=analytical_flops,
+                analytical_flops_partial=analytical_flops_partial,
+                analytical_io_bytes=analytical_io_bytes,
+                allow_staging=_allow_staging,
+            )
+        except StallFallbackError:
+            return _mark_stall_fallback(
+                run_graph_all_providers(
+                    graph_path,
+                    graph_json,
+                    tensor_infos,
+                    config,
+                    handle,
+                    reporter,
+                    _allow_staging=False,
+                    _engine_ids=engine_ids,
+                )
+            )
         reference_outputs = timed_reference.outputs
         if reporter is not None:
             reporter.print_engine_result(timed_reference.result)
@@ -834,7 +885,6 @@ def run_graph_all_providers(
     for selection in engine_selections:
         engine_id = selection.engine_id
         engine_plugin_path = selection.plugin_path
-        engine_name = _resolve_engine_name(engine_id)
         engine_handle = handle
         with Timer() as t:
             if engine_handle is None:
@@ -848,6 +898,7 @@ def run_graph_all_providers(
                     )
                     engine_handle = hipdnn.Handle()
                 except (ImportError, RuntimeError, ValueError, OSError) as e:
+                    engine_name = _resolve_engine_name(engine_id, None)  # no handle
                     pe_result = _engine_setup_error_result(
                         provider=engine_name,
                         engine_id=engine_id,
@@ -862,28 +913,44 @@ def run_graph_all_providers(
                     pe_results.append(pe_result)
                     continue
 
+            engine_name = _resolve_engine_name(engine_id, engine_handle)
             if reporter is not None:
                 reporter.print_engine_start(engine_name)
 
-            pe_result = run_single_provider_engine(
-                graph_path=graph_path,
-                graph_json_str=graph_json_str,
-                graph_name=graph_name,
-                tensor_infos=tensor_infos,
-                config=config,
-                handle=engine_handle,
-                provider=engine_name,
-                engine_id=engine_id,
-                plugin_path=engine_plugin_path,
-                reference_outputs=reference_outputs,
-                reference_error=reference_error,
-                input_data=graph_input_data,
-                validation_requested=validation_requested,
-                graph_json=graph_json,
-                analytical_flops=analytical_flops,
-                analytical_flops_partial=analytical_flops_partial,
-                analytical_io_bytes=analytical_io_bytes,
-            )
+            try:
+                pe_result = run_single_provider_engine(
+                    graph_path=graph_path,
+                    graph_json_str=graph_json_str,
+                    graph_name=graph_name,
+                    tensor_infos=tensor_infos,
+                    config=config,
+                    handle=engine_handle,
+                    provider=engine_name,
+                    engine_id=engine_id,
+                    plugin_path=engine_plugin_path,
+                    reference_outputs=reference_outputs,
+                    reference_error=reference_error,
+                    input_data=graph_input_data,
+                    validation_requested=validation_requested,
+                    graph_json=graph_json,
+                    analytical_flops=analytical_flops,
+                    analytical_flops_partial=analytical_flops_partial,
+                    analytical_io_bytes=analytical_io_bytes,
+                    allow_staging=_allow_staging,
+                )
+            except StallFallbackError:
+                return _mark_stall_fallback(
+                    run_graph_all_providers(
+                        graph_path,
+                        graph_json,
+                        tensor_infos,
+                        config,
+                        handle,
+                        reporter,
+                        _allow_staging=False,
+                        _engine_ids=engine_ids,
+                    )
+                )
         pe_result.elapsed_time_ms = t.elapsed_ms
         if engine_plugin_path is not None:
             pe_result.plugin_path = str(engine_plugin_path)
@@ -986,18 +1053,34 @@ def run_graph_pytorch_backend(
 
     if reporter is not None:
         reporter.print_engine_start(provider)
-    row = _run_timed_pytorch_row(
-        graph_path=graph_path,
-        graph_json=graph_json,
-        graph_name=graph_name,
-        tensor_infos=tensor_infos,
-        config=config,
-        input_data=graph_input_data,
-        analytical_flops=analytical_flops,
-        analytical_flops_partial=analytical_flops_partial,
-        analytical_io_bytes=analytical_io_bytes,
-        role="engine",
-    ).result
+    try:
+        row = _run_timed_pytorch_row(
+            graph_path=graph_path,
+            graph_json=graph_json,
+            graph_name=graph_name,
+            tensor_infos=tensor_infos,
+            config=config,
+            input_data=graph_input_data,
+            analytical_flops=analytical_flops,
+            analytical_flops_partial=analytical_flops_partial,
+            analytical_io_bytes=analytical_io_bytes,
+            role="engine",
+        ).result
+    except StallFallbackError:
+        row = _run_timed_pytorch_row(
+            graph_path=graph_path,
+            graph_json=graph_json,
+            graph_name=graph_name,
+            tensor_infos=tensor_infos,
+            config=config,
+            input_data=graph_input_data,
+            analytical_flops=analytical_flops,
+            analytical_flops_partial=analytical_flops_partial,
+            analytical_io_bytes=analytical_io_bytes,
+            role="engine",
+            allow_staging=False,
+        ).result
+        row.warnings = [*(row.warnings or []), _STALL_FALLBACK_WARNING]
     if reporter is not None:
         reporter.print_engine_result(row)
 
@@ -1009,10 +1092,22 @@ def run_graph_pytorch_backend(
     )
 
 
+def _benchmark_executions(config: Any) -> int:
+    """Graph executions inside ``benchmark()``, the CPU probe's region.
+
+    Block timing (``timing_block > 1``) also runs ``warmup_iters`` untimed
+    executions before every sample (rocKE / Solera protocol).
+    """
+    per_sample = config.timing_block
+    if config.timing_block > 1:
+        per_sample += config.warmup_iters
+    return config.benchmark_iters * per_sample
+
+
 def _collect_basic_metrics_post_loop(
     result: ProviderEngineResult,
     cpu_time_probe: Optional[CpuTimeProbe],
-    benchmark_iters: int,
+    timed_executions: int,
     analytical_flops: Optional[int],
     analytical_flops_partial: bool,
     analytical_io_bytes: Optional[int],
@@ -1026,11 +1121,12 @@ def _collect_basic_metrics_post_loop(
     intermediate results.
     """
     if cpu_time_probe is not None and cpu_time_probe.delta is not None:
-        # Per-iter microseconds is the interpretable unit: the loop
-        # total is dominated by Python dispatch cost, and per-iter
-        # lets users compare directly against the kernel mean (also
-        # reported per-iter).
-        iters = max(benchmark_iters, 1)
+        # Per-execution microseconds is the interpretable unit: the loop
+        # total is dominated by Python dispatch cost, and per-execution
+        # lets users compare directly against the kernel median (also
+        # reported per execution). The divisor counts every execution in
+        # benchmark(), see _benchmark_executions.
+        iters = max(timed_executions, 1)
         result.cpu_user_time_per_iter_us = (
             cpu_time_probe.delta.user_time_ms * 1000.0 / iters
         )
@@ -1045,15 +1141,16 @@ def _collect_basic_metrics_post_loop(
     result.analytical_flops_partial = analytical_flops_partial
     result.analytical_io_bytes = analytical_io_bytes
 
-    # Derived throughputs use the *arithmetic mean* of post-warmup kernel
-    # timings — no trimming, no outlier rejection. A single noisy iter
-    # (context switch, thermal throttle) skews the headline number; for
-    # tighter signal use gpu_kernel_stats.min_ms or p95_ms.
-    kernel_mean = (
-        result.gpu_kernel_stats.mean_ms if result.gpu_kernel_stats is not None else None
+    # Derived throughputs use the *median* post-warmup kernel time — the
+    # same denominator as the rocKE benchmark pipeline (Solera/Strata), and
+    # robust to a single noisy iteration (context switch, thermal throttle).
+    kernel_median = (
+        result.gpu_kernel_stats.median_ms
+        if result.gpu_kernel_stats is not None
+        else None
     )
     tflops, gbytes = derive_throughputs(
-        analytical_flops, analytical_io_bytes, kernel_mean
+        analytical_flops, analytical_io_bytes, kernel_median
     )
     result.derived_tflops_per_s = tflops
     result.derived_gbytes_per_s = gbytes
@@ -1096,6 +1193,16 @@ def _exhaustive_env(enabled: bool):
                 os.environ[name] = value
 
 
+def _median_tflops(
+    flops: Optional[int], stats: Optional[BenchmarkStats]
+) -> Optional[float]:
+    """TFLOP/s from analytical FLOPs and a kernel-stats median, or None."""
+    tflops, _ = derive_throughputs(
+        flops, None, stats.median_ms if stats is not None else None
+    )
+    return tflops
+
+
 def _run_oracle_pass(
     *,
     result: ProviderEngineResult,
@@ -1124,6 +1231,7 @@ def _run_oracle_pass(
                 graph_path=graph_path,
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
+                timing_block=config.timing_block,
                 engine_id=engine_id,
             )
             executor = Executor(
@@ -1194,6 +1302,13 @@ def _run_oracle_pass(
                     getattr(winner, "supports_exhaustive", False)
                 ),
             )
+            # Same FLOPs and median denominator as the row's derived TFLOP/s.
+            oracle.derived_tflops_per_s = _median_tflops(
+                result.analytical_flops, oracle.gpu_kernel_stats
+            )
+            oracle.warm_baseline_derived_tflops_per_s = _median_tflops(
+                result.analytical_flops, oracle.warm_baseline_gpu_kernel_stats
+            )
 
             # Validate after timing; keep OOTB and tuned verdicts separate.
             if reference_outputs is not None:
@@ -1255,6 +1370,7 @@ def run_single_provider_engine(
     analytical_flops: Optional[int] = None,
     analytical_flops_partial: bool = False,
     analytical_io_bytes: Optional[int] = None,
+    allow_staging: bool = True,
 ) -> ProviderEngineResult:
     """Execute a single engine for a graph (single attempt)."""
     # Initialise the result conservatively as an error and mutate fields as
@@ -1273,6 +1389,7 @@ def run_single_provider_engine(
             graph_path=graph_path,
             warmup_iters=config.warmup_iters,
             benchmark_iters=config.benchmark_iters,
+            timing_block=config.timing_block,
             engine_id=engine_id,
         )
 
@@ -1306,7 +1423,10 @@ def run_single_provider_engine(
                 cpu_time_probe.__enter__()
             try:
                 bench_result = executor.benchmark(
-                    handle, variant_pack, graph_name=graph_name
+                    handle,
+                    variant_pack,
+                    graph_name=graph_name,
+                    allow_staging=allow_staging,
                 )
             finally:
                 if cpu_time_probe is not None:
@@ -1322,7 +1442,7 @@ def run_single_provider_engine(
                 _collect_basic_metrics_post_loop(
                     result=result,
                     cpu_time_probe=cpu_time_probe,
-                    benchmark_iters=config.benchmark_iters,
+                    timed_executions=_benchmark_executions(config),
                     analytical_flops=analytical_flops,
                     analytical_flops_partial=analytical_flops_partial,
                     analytical_io_bytes=analytical_io_bytes,
@@ -1427,6 +1547,8 @@ def run_single_provider_engine(
         result.status = "success"
         return result
 
+    except StallFallbackError:
+        raise
     except UnsupportedGraphError as e:
         result.cpu_build_time_ms = None
         result.gpu_kernel_stats = None
