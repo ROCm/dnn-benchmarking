@@ -12,7 +12,11 @@ import pytest
 import dnn_benchmarking.execution.timing as timing_module
 from dnn_benchmarking.common.exceptions import ExecutionError
 from dnn_benchmarking.config.benchmark_config import TimingPolicy
-from dnn_benchmarking.execution.timing import StalledRegionTimer, measure
+from dnn_benchmarking.execution.timing import (
+    StalledRegionTimer,
+    StallFallbackError,
+    measure,
+)
 
 
 class FakeClock:
@@ -58,11 +62,20 @@ def _install_fake_hip(
             return (other.recorded_at - self.recorded_at) * 1000.0
 
     class FakeGate:
+        # Class-level knobs so a test can make every gate fail.
+        arm_error: Exception = None
+        watchdog_fired = False
+
         def arm(self, stream: int) -> None:
+            if self.arm_error is not None:
+                raise self.arm_error
             log.append("arm")
 
         def release(self) -> None:
             log.append("release")
+
+        def timed_out(self) -> bool:
+            return self.watchdog_fired
 
     class FakeBuffer:
         def __init__(self, size: int) -> None:
@@ -433,6 +446,81 @@ def test_staged_measure_releases_gate_when_enqueue_raises(monkeypatch) -> None:
 
     # Gate released after arm, device drained, stop event never waited on.
     assert log == ["arm", "record", "release", "device_sync"]
+
+
+def test_watchdog_release_rejects_the_sample(monkeypatch) -> None:
+    """A gate the watchdog released timed host gaps too: no sample is returned."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    fake.HipStallGate.watchdog_fired = True
+    timer = StalledRegionTimer(stream=7)
+
+    with pytest.raises(StallFallbackError, match="watchdog invalidated"):
+        timer.measure(_enqueue(log))
+
+
+def test_gate_that_cannot_arm_requests_fallback(monkeypatch) -> None:
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    fake.HipStallGate.arm_error = RuntimeError("unsupported stream")
+    timer = StalledRegionTimer(stream=7)
+
+    with pytest.raises(StallFallbackError, match="could not arm"):
+        timer.measure(_enqueue(log))
+    assert log == []  # nothing enqueued behind a gate that never armed
+
+
+def test_stall_failure_in_the_loop_propagates_from_measure(monkeypatch) -> None:
+    """measure() must not turn a stall failure into an events-mode row: the
+    suite runner remeasures the whole graph so its rows share one mode."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    fake.HipStallGate.watchdog_fired = True
+
+    with pytest.raises(StallFallbackError):
+        measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=2))
+
+
+def test_gate_that_cannot_be_created_requests_fallback(monkeypatch) -> None:
+    """A per-row silent events fallback would mix modes inside one graph."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+
+    def no_gate(self) -> None:
+        raise RuntimeError("out of signal memory")
+
+    monkeypatch.setattr(fake.HipStallGate, "__init__", no_gate)
+
+    with pytest.raises(StallFallbackError, match="stall gate unavailable"):
+        measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=1))
+
+
+def test_disabled_stall_gate_times_in_events_mode(monkeypatch) -> None:
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+
+    m = measure(
+        _enqueue(log),
+        stream=7,
+        policy=TimingPolicy(warmup_iters=1, iters=2, stall_gate=False),
+    )
+
+    assert m.mode == "events"
+    assert "arm" not in log
+    assert m.fallback_reason.startswith("stall gate failed in this graph")
+
+
+def test_binding_without_watchdog_state_is_not_staged(monkeypatch) -> None:
+    """Without HipStallGate.timed_out a released gate is undetectable, so the
+    loop uses events mode and records why."""
+    log: List[str] = []
+    fake = _install_fake_hip(monkeypatch, log)
+    monkeypatch.delattr(fake.HipStallGate, "timed_out")
+
+    m = measure(_enqueue(log), stream=7, policy=TimingPolicy(warmup_iters=1, iters=1))
+
+    assert m.mode == "events"
+    assert "HipStallGate.timed_out" in m.fallback_reason
 
 
 def test_missing_hipdnn_reports_hip_unavailable(monkeypatch) -> None:

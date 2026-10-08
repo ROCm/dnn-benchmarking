@@ -9,8 +9,9 @@ Every row is timed by ``timing.measure`` (through the executors) and, with
 ``--validate``, compared against reference outputs computed once per graph.
 """
 
+import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -19,7 +20,7 @@ from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import PyTorchSdpaBackendName, SuiteConfig
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
-from ..execution.timing import Measurement, Timer
+from ..execution.timing import Measurement, StallFallbackError, Timer
 from ..graph.tensor_info import TensorInfo
 from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
@@ -348,6 +349,8 @@ def _run_pytorch_row(
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
                 ctx.graph_json
             )
+    except StallFallbackError:
+        raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(_error_or_skip(strict), row, str(e)), None
     except Exception as e:
@@ -425,6 +428,8 @@ def run_single_provider_engine(
         # Release the workspace before the profiling child allocates its own
         # VRAM; holding it roughly doubles peak VRAM on large graphs.
         del executor
+    except StallFallbackError:
+        raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
@@ -533,6 +538,27 @@ def _prepare_references(
     return row
 
 
+def _with_stall_fallback(
+    run: Callable[[SuiteConfig], GraphResult],
+    config: SuiteConfig,
+    reporter: Reporter,
+) -> GraphResult:
+    """Run one graph; if stall-gated timing fails, rerun every row unstalled.
+
+    Rows of one graph are compared with each other, so they must share a
+    timing mode: a declined arm or a watchdog release discards the partial
+    graph instead of mixing staged and events rows. Each rerun row records
+    the reason in ``timing.fallback_reason`` and ``warnings``.
+    """
+    try:
+        return run(config)
+    except StallFallbackError as e:
+        reporter.warning(f"{e}; remeasuring every row of this graph without stalling")
+        unstalled = copy.copy(config)
+        unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
+        return run(unstalled)
+
+
 def run_graph_all_providers(
     graph_path: Path,
     graph_json: Dict[str, Any],
@@ -546,7 +572,8 @@ def run_graph_all_providers(
     An unsupported graph (no applicable engine) yields ``engine_ids=[]`` and
     no engine rows; with ``--validate pytorch`` the timed PyTorch reference
     row is still emitted when PyTorch can run the graph. Discovery and input
-    generation failures set ``GraphResult.error``.
+    generation failures set ``GraphResult.error``. A stall-gate failure
+    reruns the whole graph without stalling (``_with_stall_fallback``).
 
     Args:
         graph_path: Path to the graph JSON file.
@@ -557,6 +584,24 @@ def run_graph_all_providers(
             plugin paths).
         reporter: Progress sink.
     """
+    return _with_stall_fallback(
+        lambda cfg: _run_graph_all_providers(
+            graph_path, graph_json, tensor_infos, cfg, handle, reporter
+        ),
+        config,
+        reporter,
+    )
+
+
+def _run_graph_all_providers(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    handle: Any,
+    reporter: Reporter,
+) -> GraphResult:
+    """One attempt of :func:`run_graph_all_providers` with ``config``'s policy."""
     graph = GraphResult(
         graph_name=graph_json.get("name", graph_path.stem),
         graph_path=str(graph_path),
@@ -652,6 +697,22 @@ def run_graph_pytorch_backend(
     The ``--backend pytorch`` counterpart of :func:`run_graph_all_providers`:
     no hipDNN engine discovery, plugins, or reference validation.
     """
+    return _with_stall_fallback(
+        lambda cfg: _run_graph_pytorch_backend(
+            graph_path, graph_json, tensor_infos, cfg, reporter
+        ),
+        config,
+        reporter,
+    )
+
+
+def _run_graph_pytorch_backend(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+) -> GraphResult:
     graph = GraphResult(
         graph_name=graph_json.get("name", graph_path.stem),
         graph_path=str(graph_path),

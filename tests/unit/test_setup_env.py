@@ -768,3 +768,29 @@ def test_main_names_the_failed_stage(
     assert "PyTorch (--torch-mode cuda)" in err
     if isinstance(error, subprocess.CalledProcessError):
         assert "pip install torch" in err
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="activate.local is a bash script written on Linux only",
+)
+def test_activate_puts_the_install_prefix_before_the_toolchain(
+    setup_env, tmp_path
+) -> None:
+    """A rebuilt binding must load the fresh libhipdnn_backend.so, not the
+    toolchain's older copy (#54)."""
+    setup = _setup(setup_env, tmp_path)
+    activate = setup.venv_dir / "bin" / "activate"
+    activate.parent.mkdir(parents=True)
+    activate.write_text("# venv activate\n")
+
+    setup.write_activate_local("/install", ("/install/lib", "/toolchain/lib"))
+
+    ld_path = subprocess.run(
+        ["bash", "-c", 'source "$1"; printf %s "$LD_LIBRARY_PATH"', "_", str(activate)],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert ld_path == "/install/lib:/toolchain/lib"

@@ -101,6 +101,9 @@ class TimingPolicy:
             ``warmup_iters`` untimed executions and drain, then time ``N``
             back-to-back executions in one event pair and record
             ``elapsed / N``; the first sample is discarded.
+        stall_gate: Allow stall-gated timing. The suite runner clears it to
+            remeasure a whole graph after the stall gate failed, so all rows
+            of one graph use the same mode. Not a CLI option.
     """
 
     warmup_iters: int = 10
@@ -109,6 +112,7 @@ class TimingPolicy:
     max_iters: int = 10_000
     cache_mode: str = "warm"
     timing_block: int = 1
+    stall_gate: bool = True
 
     def __post_init__(self) -> None:
         """Validate loop bounds and the cache mode; messages name CLI flags."""

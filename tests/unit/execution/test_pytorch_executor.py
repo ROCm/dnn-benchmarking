@@ -112,6 +112,9 @@ def _install_fake_hip(monkeypatch, log: List[Any]) -> None:
         def release(self) -> None:
             pass
 
+        def timed_out(self) -> bool:
+            return False
+
     monkeypatch.setattr(
         timing_module,
         "hipdnn",

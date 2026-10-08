@@ -19,7 +19,7 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.execution import suite_runner
-from dnn_benchmarking.execution.timing import Measurement
+from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
@@ -58,6 +58,16 @@ def _measurement(**kw):
     return Measurement(**{**base, **kw})
 
 
+def _stall_aware(f, key, policy):
+    """Fail the stall gate for ``key`` while staging is allowed; once the
+    runner disables it, time in events mode like ``timing.measure``."""
+    if key in f.stall and policy.stall_gate:
+        raise StallFallbackError("stall watchdog invalidated the measurement")
+    if not policy.stall_gate:
+        return _measurement(mode="events", fallback_reason="stall gate failed")
+    return _measurement(**f.measurement)
+
+
 class Fake:
     """Knobs shared by the fake executors, buffers and probes of one test."""
 
@@ -75,6 +85,7 @@ class Fake:
         self.torch_outputs_written = False
         self.policies = []
         self.for_autotune = []
+        self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
 
 
 @pytest.fixture
@@ -85,6 +96,7 @@ def fake(monkeypatch):
     class Executor:
         def __init__(self, graph_json_str, policy):
             f.policies.append(policy)
+            self.policy = policy
             self.init_time_ms, self.workspace_size = 2.0, 64
 
         def discover_engines(self, handle):
@@ -100,10 +112,10 @@ def fake(monkeypatch):
                 raise f.prepare_errors[engine_id]
 
         def benchmark(self, handle, variant_pack):
-            f.events.append("benchmark")
+            f.events.append(("benchmark", self.engine_id, self.policy.stall_gate))
             if self.engine_id in f.bench_errors:
                 raise f.bench_errors[self.engine_id]
-            return _measurement(**f.measurement)
+            return _stall_aware(f, self.engine_id, self.policy)
 
         def execute_once(self, handle, variant_pack):
             f.events.append("execute_once")
@@ -177,6 +189,7 @@ def fake_torch(fake, monkeypatch):
             pytorch_rocm_fa_library=None,
         ):
             fake.policies.append(policy)
+            self.policy = policy
             fake.torch_options.append((pytorch_sdpa_backend, pytorch_rocm_fa_library))
             self.init_time_ms = 1.0
 
@@ -186,7 +199,7 @@ def fake_torch(fake, monkeypatch):
 
         def benchmark(self, tensors):
             fake.torch_outputs_written = True
-            return _measurement()
+            return _stall_aware(fake, "pytorch", self.policy)
 
         def execute_once(self, tensors):
             fake.torch_outputs_written = True
@@ -721,7 +734,7 @@ def test_validation_reads_outputs_zeroed_after_the_timed_loop(fake_torch):
 
     assert fake_torch.events[:5] == [
         "zero_outputs",
-        "benchmark",
+        ("benchmark", 1, True),
         "zero_outputs",
         "execute_once",
         "read_output",
@@ -736,6 +749,37 @@ def test_explicit_engines_run_in_caller_order_without_discovery(fake):
     assert graph.engine_ids == [2, 9, 1]
     assert [r.engine_id for r in graph.results] == [2, 9, 1]
     assert "discover" not in fake.events
+
+
+def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
+    """One engine's watchdog release must not leave a graph with staged and
+    events rows side by side: every row is remeasured without stalling."""
+    fake.stall = {2}
+
+    graph, progress = _run()
+
+    benchmarks = [e for e in fake.events if isinstance(e, tuple)]
+    assert benchmarks == [
+        ("benchmark", 1, True),
+        ("benchmark", 2, True),
+        ("benchmark", 1, False),
+        ("benchmark", 2, False),
+    ]
+    assert [r.engine_id for r in graph.results] == [1, 2]
+    assert [r.status for r in graph.results] == ["success", "success"]
+    assert {r.timing.mode for r in graph.results} == {"events"}
+    assert all("stall gate failed" in " ".join(r.warnings) for r in graph.results)
+    assert "remeasuring every row of this graph without stalling" in progress
+
+
+def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):
+    fake_torch.stall = {"pytorch"}
+
+    graph, _ = _validate()
+
+    assert [r.role for r in graph.results] == ["reference", "engine", "engine"]
+    assert {r.timing.mode for r in graph.results} == {"events"}
+    assert [r.verdict for r in graph.results[1:]] == ["passed", "passed"]
 
 
 def test_profiling_failure_keeps_the_timed_row(fake, monkeypatch):
@@ -821,6 +865,15 @@ class TestPytorchBackend:
         ) == ("pytorch", None, "pytorch", "engine", "unchecked")
         assert row.gpu_kernel_stats.median_ms == pytest.approx(1.0)
         assert row.timing.mode == "staged"
+
+    def test_stall_failure_remeasures_the_row_unstalled(self, fake_torch):
+        fake_torch.stall = {"pytorch"}
+
+        (row,) = self._run().results
+
+        assert row.status == "success"
+        assert row.timing.mode == "events"
+        assert [p.stall_gate for p in fake_torch.policies] == [True, False]
 
     def test_executor_failure_is_an_error_row(self, fake_torch):
         fake_torch.torch_error = ExecutionError("PyTorch GPU not available")

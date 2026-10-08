@@ -36,16 +36,24 @@ launch gaps between the kernels of a multi-kernel graph. It is the device
 time of one launch, with the kernels back to back.
 
 The `staged` mode needs the HIP backend (`hipdnn_frontend` with the
-`HipStallGate` binding) and a device with stream wait-value support. When
-this is not available, the tool uses `events` mode and records the reason in
-`timing.fallback_reason`:
+`HipStallGate` binding, including its watchdog state `timed_out`) and a
+device with stream wait-value support. When this is not available, the tool
+uses `events` mode and records the reason in `timing.fallback_reason`:
 
 | Reason | Cause |
 |---|---|
 | `staged timing requires the hip backend` | PyTorch backend on CUDA, or on ROCm without `hipdnn_frontend`. |
-| `hipdnn_frontend is missing staging bindings: ...` | An old `hipdnn_frontend`. |
+| `hipdnn_frontend is missing staging bindings: ...` | An old `hipdnn_frontend` (for example, one without `HipStallGate.timed_out`). |
 | `device does not support hipStreamWaitValue32` | The device or driver has no stream wait-value support. |
 | `host sync in enqueue: ...` | The PyTorch graph reads a device value on the host. A stalled stream would then never complete. |
+| `stall gate failed in this graph; every row remeasured unstalled` | See below. |
+
+The stall gate has a watchdog. If the gate cannot arm, cannot be created, or
+the watchdog releases it before the host finished the enqueue, that sample
+includes host gaps and is invalid. The tool then discards every row of the
+graph and measures the whole graph again in `events` mode. A warning on
+stderr gives the cause. The rows of one graph are compared with each other,
+so they always share one mode.
 
 In `events` mode each iteration records the start event, calls `enqueue()`,
 records the stop event and waits. The span then includes any host launch gap

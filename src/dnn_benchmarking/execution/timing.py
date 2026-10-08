@@ -68,6 +68,12 @@ class Measurement:
     timing_block: int = 1
 
 
+class StallFallbackError(RuntimeError):
+    """The stall gate could not arm, or its watchdog released the stalled
+    stream, so the staged sample is invalid. The suite runner remeasures the
+    whole graph without stalling (see ``suite_runner``)."""
+
+
 _HIP_API = ("HipEvent", "hip_get_device_count", "hip_device_synchronize")
 _STAGED_HIP_API = ("HipStallGate", "hip_can_use_stream_wait_value")
 
@@ -120,6 +126,9 @@ def _staged_unavailable_reason() -> Optional[str]:
     except RuntimeError as e:
         return str(e)
     missing = [name for name in _STAGED_HIP_API if not hasattr(module, name)]
+    if not missing and not hasattr(module.HipStallGate, "timed_out"):
+        # Without the watchdog state a released gate gives silent bad samples.
+        missing = ["HipStallGate.timed_out"]
     if missing:
         return f"hipdnn_frontend is missing staging bindings: {', '.join(missing)}"
     if not module.hip_can_use_stream_wait_value():
@@ -198,8 +207,17 @@ class StalledRegionTimer:
         self._stop = self._hipdnn.HipEvent()
 
     def measure(self, enqueue: Callable[[], None]) -> Tuple[float, float]:
-        """Measure one staged iteration; returns ``(host_submit_ms, kernel_ms)``."""
-        self._gate.arm(self._stream)
+        """Measure one staged iteration; returns ``(host_submit_ms, kernel_ms)``.
+
+        Raises:
+            StallFallbackError: The gate could not arm, or the watchdog
+                released it before the enqueue finished (the span then holds
+                host submission gaps).
+        """
+        try:
+            self._gate.arm(self._stream)
+        except RuntimeError as e:
+            raise StallFallbackError(f"stall gate could not arm: {e}") from e
         try:
             self._start.record(self._stream)
             t0 = time.perf_counter()
@@ -221,6 +239,8 @@ class StalledRegionTimer:
             raise
         self._gate.release()
         self._stop.synchronize()
+        if self._gate.timed_out():
+            raise StallFallbackError("stall watchdog invalidated the measurement")
         return (t1 - t0) * 1000.0, float(self._start.elapsed_time(self._stop))
 
 
@@ -331,6 +351,8 @@ def measure(
 
     Raises:
         ExecutionError: If the cold-cache flush buffer cannot be allocated.
+        StallFallbackError: If stall-gated timing failed (see
+            ``StalledRegionTimer``); the caller remeasures without stalling.
         RuntimeError: If the event backend is unavailable.
     """
     events = EventTimer(backend, stream, torch_stream)
@@ -356,13 +378,15 @@ def measure(
     if reason is None:
         if backend != "hip":
             reason = "staged timing requires the hip backend"
+        elif not policy.stall_gate:
+            reason = "stall gate failed in this graph; every row remeasured unstalled"
         else:
             reason = _staged_unavailable_reason()
     if reason is None:
         try:
             staged = StalledRegionTimer(stream)
         except RuntimeError as e:
-            reason = str(e)
+            raise StallFallbackError(f"stall gate unavailable: {e}") from e
 
     cold = policy.cache_mode == "cold"
 

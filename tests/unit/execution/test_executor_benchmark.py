@@ -64,6 +64,9 @@ def hip_log(monkeypatch) -> List[Any]:
         def release(self) -> None:
             log.append("release")
 
+        def timed_out(self) -> bool:
+            return False
+
     monkeypatch.setattr(
         timing_module,
         "hipdnn",
@@ -100,6 +103,18 @@ def test_benchmark_execution_failure_is_execution_error(hip_log) -> None:
     executor = _executor(hip_log, fail="bad kernel", iters=1)
 
     with pytest.raises(ExecutionError, match="bad kernel"):
+        executor.benchmark(_Handle(0), {})
+
+
+def test_stall_failure_is_not_wrapped_as_execution_error(hip_log, monkeypatch) -> None:
+    """The suite runner remeasures a graph only on StallFallbackError; wrapping
+    it in ExecutionError would turn a watchdog release into an error row."""
+    executor = _executor(hip_log, iters=1)
+    monkeypatch.setattr(
+        timing_module.hipdnn.HipStallGate, "timed_out", lambda self: True
+    )
+
+    with pytest.raises(timing_module.StallFallbackError):
         executor.benchmark(_Handle(0), {})
 
 

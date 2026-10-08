@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
 from ..reporting.suite_results import engine_id_hex
-from .timing import Measurement, Timer, device_sync, measure
+from .timing import Measurement, StallFallbackError, Timer, device_sync, measure
 
 
 def _get_handle_stream(handle: Any) -> int:
@@ -365,6 +365,8 @@ class Executor:
                 policy=self._policy,
                 backend="hip",
             )
+        except StallFallbackError:
+            raise
         except RuntimeError as e:
             raise ExecutionError(str(e)) from e
 

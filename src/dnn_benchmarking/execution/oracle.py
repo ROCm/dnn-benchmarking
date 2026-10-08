@@ -20,6 +20,7 @@ from ..reporting.suite_results import (
 from ..validation import ReferenceOutput
 from .correctness import check_correctness
 from .executor import Executor
+from .timing import StallFallbackError
 
 # Benchmarking is latched when oracle plans are built. Disable hipDNN disk
 # caches so the selected provider variant cannot affect later runs.
@@ -152,6 +153,8 @@ def run_oracle_pass(
             )
         else:
             row.oracle_delta = build_oracle_delta(oracle)
+    except StallFallbackError:
+        raise  # The suite runner remeasures the whole graph unstalled.
     except Exception as e:
         row.oracle_error = f"{type(e).__name__}: {e}"
         warn_once(
