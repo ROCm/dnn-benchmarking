@@ -217,8 +217,10 @@ def compare(
             kind = "ref" if by == "ref" else "engine"
             pairs.append(_pair(name, ra, rb, metric, threshold, kind))
             continue
-        rows_b = _keyed(gb["results"])
-        for key, ra in _keyed(ga["results"]).items():
+        # Reference rows are compared with --by ref, not here.
+        rows_b = _keyed([r for r in gb["results"] if r["role"] == "engine"])
+        engines_a = [r for r in ga["results"] if r["role"] == "engine"]
+        for key, ra in _keyed(engines_a).items():
             pairs.append(_pair(name, ra, rows_b.pop(key, None), metric, threshold))
         pairs.extend(_pair(name, None, rb, metric, threshold) for rb in rows_b.values())
     ratios = [p.speedup for p in pairs if p.in_geomean]

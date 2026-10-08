@@ -315,7 +315,7 @@ def state(ok, detail):
 
 
 rocprofv3 = resolve_rocm_tool("rocprofv3")
-print(state(rocprofv3 is not None, f"--emit-trace pftrace / --pmc: rocprofv3 {rocprofv3 or 'not found'}"))
+print(state(rocprofv3 is not None, f"--trace / --pmc: rocprofv3 {rocprofv3 or 'not found'}"))
 
 
 rocprof_compute = resolve_rocm_tool("rocprof-compute")
@@ -1664,7 +1664,7 @@ class Setup:
 
         if cuda:
             print("Run PyTorch-backend benchmarks with:")
-            print("  python -m dnn_benchmarking --graph <graph.json> --backend pytorch")
+            print("  python -m dnn_benchmarking --graph <graph.json> --runtime pytorch")
             return
 
         print("Run benchmarks with:")

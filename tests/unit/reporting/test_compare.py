@@ -240,6 +240,17 @@ def test_failed_rows_excluded_from_geomean(tmp_path, capsys):
     assert code == 0
 
 
+def test_by_engine_ignores_reference_rows(tmp_path, capsys):
+    ref_a, ref_b = _row("torch", 1.0, role="reference"), _row(
+        "torch", 2.0, role="reference"
+    )
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E1", 1.0), ref_a])])
+    b = _write(tmp_path, "b.json", [("g", "id", [_row("E1", 1.0), ref_b])])
+    code, report = _json(capsys, [a, b, "--by", "engine"])
+    assert [p["engine_b"] for p in report["pairs"]] == ["E1"]
+    assert code == 0  # the slower reference is not a regression
+
+
 def test_graphs_only_in_one_file_are_listed(tmp_path, capsys):
     a = _write(tmp_path, "a.json", [("shared", "s", [_row("E", 1.0)]),
                                     ("gone", "x", [_row("E", 1.0)])])  # fmt: skip

@@ -105,7 +105,6 @@ def _at_least(kind: type, minimum: float) -> Callable[[Any], Any]:
 
 _UINT64 = 1 << 64
 _INT64_MIN = -(1 << 63)
-_ENGINE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 
 
 def _fnv1a64(name: str) -> int:
@@ -131,21 +130,19 @@ TYPED_ENGINE_NAMES: Dict[int, str] = {}
 def parse_engine_id(token: str) -> int:
     """Parse one engine as a decimal ID, a 0x hex ID, or an engine name.
 
-    Names resolve to FNV-1a-64 of the exact (case-sensitive) name. Hex and
-    names above 2**63 wrap to signed int64, matching hipDNN's engine IDs.
+    Any other token is a name, as in hipDNN's engineNameOrIdToId (names such
+    as ``hipkernel:ConvFwd`` contain ``:``). Names resolve to FNV-1a-64 of the
+    exact (case-sensitive) name. Hex and names above 2**63 wrap to signed
+    int64, matching hipDNN's engine IDs.
     """
     text = token.strip()
     if re.fullmatch(r"[+-]?\d+", text):
         return _signed64(int(text), token)
     if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
         return _signed64(int(text, 16), token)
-    if _ENGINE_NAME.fullmatch(text):
-        engine_id = _signed64(_fnv1a64(text), token)
-        TYPED_ENGINE_NAMES[engine_id] = text
-        return engine_id
-    raise argparse.ArgumentTypeError(
-        f"invalid engine {token!r}: expected a name, decimal ID or 0x hex ID"
-    )
+    engine_id = _signed64(_fnv1a64(text), token)
+    TYPED_ENGINE_NAMES[engine_id] = text
+    return engine_id
 
 
 def _parse_engine_list(s: str) -> List[int]:

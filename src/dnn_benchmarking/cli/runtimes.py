@@ -82,6 +82,13 @@ def _create_hipdnn_handle(config: SuiteConfig) -> Any:
 
     Handle creation is the authoritative GPU/runtime check for hipDNN.
     """
+    missing = [str(p) for p in config.plugin_paths or [] if not p.is_dir()]
+    if missing:
+        raise RuntimeStartupError(
+            f"hipDNN plugin path is not a directory: {', '.join(missing)} "
+            "(check --plugin-path)",
+            exit_code=2,
+        )
     try:
         initialize_pip_rocm_runtime()
         import hipdnn_frontend as hipdnn

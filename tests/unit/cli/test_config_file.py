@@ -50,6 +50,8 @@ def _config_error(tmp_path: Path, body: str) -> str:
         # FNV-1a-64("HIP_MLOPS_ENGINE") = 0xDD993EF5525F7BF9, above 2**63; hipDNN's
         # engineNameToId casts it to int64.
         ("HIP_MLOPS_ENGINE", 0xDD993EF5525F7BF9 - (1 << 64)),
+        # Any token that is not a number is a name, as in hipDNN.
+        ("hipkernel:ConvFwd", 0xF6975AB2C79B088E - (1 << 64)),
     ],
 )
 def test_engine_tokens_resolve_identically_from_cli_and_config(
@@ -66,7 +68,7 @@ def test_engine_tokens_resolve_identically_from_cli_and_config(
     assert config_args.engine == [expected, 7]
 
 
-@pytest.mark.parametrize("token", ["bad!", "0xZZ", str(2**64), "0x1" + "0" * 16, ","])
+@pytest.mark.parametrize("token", [str(2**64), "0x1" + "0" * 16, ","])
 def test_invalid_engine_tokens_are_usage_errors(token: str) -> None:
     with pytest.raises(SystemExit) as exc:
         create_parser().parse_args(["--engine", token])

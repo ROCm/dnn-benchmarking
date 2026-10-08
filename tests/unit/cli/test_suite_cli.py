@@ -567,17 +567,23 @@ def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
     return calls
 
 
+def _plugin_dirs(tmp_path) -> tuple:
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    return str(a), str(b)
+
+
 def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
-    monkeypatch,
+    tmp_path, monkeypatch
 ) -> None:
-    a, b = str(Path("/a")), str(Path("/b"))
+    a, b = _plugin_dirs(tmp_path)
     calls = _fake_hipdnn(monkeypatch, loaded={a: {1}, b: {1}})
     handles = []
     monkeypatch.setattr(
         runtimes, "run_graph_all_providers", lambda *args: handles.append(args[4])
     )
     config = suite_runner_cli.SuiteConfig.from_namespace(
-        _args("-e", "1,1", "--plugin-path", "/a,/b")
+        _args("-e", "1,1", "--plugin-path", f"{a},{b}")
     )
 
     runtimes.start_runtime(config, Reporter(output=io.StringIO()))(None, {}, [])
@@ -591,13 +597,22 @@ def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
 def test_unknown_engine_in_one_plugin_path_is_usage_error(
     tmp_path, monkeypatch
 ) -> None:
-    b = str(Path("/b"))
-    _fake_hipdnn(monkeypatch, loaded={str(Path("/a")): {1}, b: set()})
+    a, b = _plugin_dirs(tmp_path)
+    _fake_hipdnn(monkeypatch, loaded={a: {1}, b: set()})
     code, text = _run(
-        _args("-e", "1,1", "--plugin-path", "/a,/b"), _graphs(tmp_path, 1)
+        _args("-e", "1,1", "--plugin-path", f"{a},{b}"), _graphs(tmp_path, 1)
     )
     assert code == 2
     assert f"plugin loaded from {b}: 0x0000000000000001" in text
+
+
+def test_missing_plugin_path_is_usage_error(tmp_path, monkeypatch) -> None:
+    calls = _fake_hipdnn(monkeypatch)
+    missing = tmp_path / "nonexistent"
+    code, text = _run(_args("--plugin-path", str(missing)), _graphs(tmp_path, 1))
+    assert code == 2
+    assert f"not a directory: {missing}" in text
+    assert calls == []  # rejected before any handle
 
 
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:

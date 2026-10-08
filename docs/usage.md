@@ -376,9 +376,10 @@ Rules:
 - When a file has more than one graph with the same `graph_id`, the graphs
   pair in order of appearance. A graph with no partner shows as
   `graph only in A` or `graph only in B`.
-- In `--by engine` mode, rows join on role, provider, engine ID and engine
-  name. When a file has more than one row with the same key, the rows pair
-  in order of appearance.
+- In `--by engine` mode, only engine rows are compared; compare reference
+  rows with `--by ref`. Rows join on runtime, engine ID and engine name.
+  When a file has more than one row with the same key, the rows pair in
+  order of appearance.
 - `best` and `ref` select only rows with the verdict `passed`, `unchecked`
   or `reference`. In `engine` mode, a `failed` row gets a speedup with the
   label `A failed`, `B failed` or `A+B failed`, but it is not in the

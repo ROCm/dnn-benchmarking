@@ -156,7 +156,7 @@ def _stats_dict(stats: Optional[BenchmarkStats]) -> Optional[Dict[str, Any]]:
 def _cv(stats: Dict[str, Any]) -> Optional[float]:
     """CSV ``kernel_cv`` from a serialized stats object (null when unknown)."""
     std, mean = stats.get("std_ms"), stats.get("mean_ms")
-    return std / mean if std is not None and mean else None
+    return _finite(std / mean) if std is not None and mean else None
 
 
 @dataclass
