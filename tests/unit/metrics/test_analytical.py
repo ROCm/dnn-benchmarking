@@ -196,16 +196,14 @@ class TestComputeFlops:
         # 2 * N * C * R * S * K * H_out * W_out / group
         # = 2 * 16 * 16 * 3 * 3 * 16 * 16 * 16 / 1
         graph = _conv_graph()
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * 16 * 16 * 3 * 3 * 16 * 16 * 16
-        assert partial is False
 
     def test_conv_fwd_with_groups_reads_c_per_group_from_weight(self):
         # hipDNN graphs carry no group count; the weight is [K, C/g, R, S].
         graph = _conv_graph(groups=4)
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == (2 * 16 * 16 * 3 * 3 * 16 * 16 * 16) // 4
-        assert partial is False
 
     def test_conv1d_fwd(self):
         graph = {
@@ -223,9 +221,8 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * 2 * 8 * 3 * 4 * 30
-        assert partial is False
 
     def test_conv_fwd_with_zero_output_uid(self):
         # Regression: sample_conv_fwd.json uses uid=0 for the output
@@ -261,32 +258,25 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * 16 * 16 * 3 * 3 * 16 * 16 * 16
-        assert partial is False
 
     def test_matmul_2d(self):
-        flops, partial = compute_flops(_matmul_graph(m=256, n=1024, k=512))
+        flops = compute_flops(_matmul_graph(m=256, n=1024, k=512))
         assert flops == 2 * 256 * 1024 * 512
-        assert partial is False
 
     def test_matmul_batched(self):
-        flops, partial = compute_flops(
-            _matmul_graph(m=128, n=64, k=32, batch_dims=[8, 4])
-        )
+        flops = compute_flops(_matmul_graph(m=128, n=64, k=32, batch_dims=[8, 4]))
         assert flops == 2 * 8 * 4 * 128 * 64 * 32
-        assert partial is False
 
     def test_pointwise_one_flop_per_element(self):
-        flops, partial = compute_flops(_relu_graph())
+        flops = compute_flops(_relu_graph())
         assert flops == 4 * 8 * 16 * 16
-        assert partial is False
 
     def test_batchnorm_inference_4_flops_per_element(self):
         # 32 * 64 * 28 * 28 elements × 4 ops/elem.
-        flops, partial = compute_flops(_bnorm_graph())
+        flops = compute_flops(_bnorm_graph())
         assert flops == 4 * 32 * 64 * 28 * 28
-        assert partial is False
 
     def test_batchnorm_attributes_treated_as_fwd_training(self):
         # Real MIOpen workloads use BatchnormAttributes (without
@@ -294,9 +284,8 @@ class TestComputeFlops:
         # y_tensor output.
         graph = _bnorm_graph()
         graph["nodes"][0]["type"] = "BatchnormAttributes"
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 8 * 32 * 64 * 28 * 28
-        assert partial is False
 
     def test_batchnorm_backward_uses_dx_for_element_count(self):
         # Real MIOpen wgrad emits BatchnormBackwardAttributes whose
@@ -319,9 +308,8 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 8 * 16 * 64 * 28 * 28
-        assert partial is False
 
     def test_conv_bwd_attributes_uses_dx_for_input_shape_dy_for_output_spatial(self):
         # ConvolutionBwdAttributes (dgrad): dx = conv_transposed(dy, w).
@@ -345,10 +333,9 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         # 2 * N * C_in * R * S * K * H_out * W_out
         assert flops == 2 * n * c * r * s * k * h_out * w_out
-        assert partial is False
 
     def test_conv_wrw_attributes_uses_x_dy_for_shape(self):
         # ConvolutionWrwAttributes (wgrad): dw = conv(x, dy). Output
@@ -371,9 +358,8 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * n * c * r * s * k * h_out * w_out
-        assert partial is False
 
     def test_layernorm_8_flops_per_element(self):
         graph = {
@@ -400,9 +386,8 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 8 * 8 * 256 * 1024
-        assert partial is False
 
     def test_softmax_4_flops_per_element(self):
         graph = {
@@ -419,9 +404,8 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 4 * 4 * 1024
-        assert partial is False
 
     def test_reduction_one_flop_per_input_element(self):
         graph = {
@@ -438,12 +422,11 @@ class TestComputeFlops:
                 }
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         # Reduction work scales with the input size, not the (smaller) output.
         assert flops == 8 * 1024
-        assert partial is False
 
-    def test_unknown_node_type_marks_partial(self):
+    def test_unknown_node_type_makes_flops_unknown(self):
         graph = _conv_graph()
         graph["nodes"].append(
             {
@@ -453,10 +436,8 @@ class TestComputeFlops:
                 "outputs": {},
             }
         )
-        flops, partial = compute_flops(graph)
-        # Conv is still counted; the unknown node only flips partial.
-        assert flops == 2 * 16 * 16 * 3 * 3 * 16 * 16 * 16
-        assert partial is True
+        # A partial sum would understate TFLOP/s, so the whole count is unknown.
+        assert compute_flops(graph) is None
 
     def test_all_unknown_nodes_returns_none_not_zero(self):
         # A graph whose nodes are all unmodellable must report unknown
@@ -467,14 +448,12 @@ class TestComputeFlops:
                 {"name": "m", "type": "MysteryAttributes", "inputs": {}, "outputs": {}}
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops is None
-        assert partial is True
 
     def test_empty_graph(self):
-        flops, partial = compute_flops({"nodes": []})
+        flops = compute_flops({"nodes": []})
         assert flops is None
-        assert partial is False
 
     def test_mixed_graph_sums_all_recognised_flops(self):
         # Build a combined graph manually so conv and BN don't share UIDs
@@ -531,31 +510,28 @@ class TestComputeFlops:
                 },
             ],
         }
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         expected_conv = 2 * 16 * 16 * 3 * 3 * 16 * 16 * 16
         expected_bn = 4 * 32 * 64 * 28 * 28
         assert flops == expected_conv + expected_bn
-        assert partial is False
 
     def test_sdpa_noncausal(self):
-        flops, partial = compute_flops(_sdpa_graph())
+        flops = compute_flops(_sdpa_graph())
         assert flops == 2 * 2 * 64 * (2048 * 2048) * (128 + 128)
         assert flops == 274877906944
-        assert partial is False
 
     def test_sdpa_causal_top_left_square(self):
-        flops, partial = compute_flops(_sdpa_graph(causal=True))
+        flops = compute_flops(_sdpa_graph(causal=True))
         assert flops == 2 * 2 * 64 * (2048 * 2049 // 2) * (128 + 128)
-        assert partial is False
 
     def test_sdpa_gqa_uses_query_heads_only(self):
-        flops8, _ = compute_flops(_sdpa_graph(hkv=8))
-        flops4, _ = compute_flops(_sdpa_graph(hkv=4))
+        flops8 = compute_flops(_sdpa_graph(hkv=8))
+        flops4 = compute_flops(_sdpa_graph(hkv=4))
         assert flops8 == flops4
 
     def test_sdpa_causal_bounds_match_deprecated_flag(self):
-        by_flag, _ = compute_flops(_sdpa_graph(causal=True))
-        by_bounds, _ = compute_flops(_sdpa_graph(right_bound=0))
+        by_flag = compute_flops(_sdpa_graph(causal=True))
+        by_bounds = compute_flops(_sdpa_graph(right_bound=0))
         assert by_bounds == by_flag
 
     def test_sdpa_causal_sliding_window_bottom_right(self):
@@ -564,24 +540,20 @@ class TestComputeFlops:
         # rocKE benchmark's sum_i min(i + off + 1, W).
         graph = _sdpa_graph(sq=4, skv=6, left_bound=2, right_bound=0)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
-        assert partial is False
 
     def test_sdpa_sliding_window_top_left_clamps_edges(self):
         # left 1, right 1, Sq=Skv=4 -> rows keep 2,3,3,2 keys = 10 pairs.
-        flops, partial = compute_flops(
-            _sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1)
-        )
+        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1))
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
-        assert partial is False
 
     def test_sdpa_deprecated_causal_ignores_alignment_and_bounds(self):
         # hipDNN: causal_mask=True means top-left causal regardless of bounds.
         graph = _sdpa_graph(causal=True, sq=8, skv=4, left_bound=1)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
-        flops, _ = compute_flops(graph)
-        top_left, _ = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
+        flops = compute_flops(graph)
+        top_left = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
         assert flops == top_left
 
     @pytest.mark.parametrize(
@@ -592,35 +564,28 @@ class TestComputeFlops:
             {"causal_mask": True, "causal_mask_bottom_right": True},
         ],
     )
-    def test_sdpa_masks_hipdnn_rejects_are_partial(self, attrs):
+    def test_sdpa_masks_hipdnn_rejects_are_unknown(self, attrs):
         graph = _sdpa_graph()
         graph["nodes"][0]["attributes"].update(attrs)
-        flops, partial = compute_flops(graph)
-        assert flops is None
-        assert partial is True
+        assert compute_flops(graph) is None
 
     def test_sdpa_causal_top_left_nonsquare_clamps(self):
         # Sq=8 > Skv=4 exercises the min(i+1, Skv) clamp: rows -> 1+2+3+4+4+4+4+4 = 26.
-        flops, partial = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
+        flops = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
         assert flops == 2 * 2 * 64 * 26 * (128 + 128)
         assert flops == 1703936
-        assert partial is False
 
     def test_sdpa_causal_bottom_right_nonsquare(self):
         # BOTTOM_RIGHT offset = Skv-Sq = -4 exercises max(i+1+offset, 0): rows -> 0,0,0,0,1,2,3,4 = 10.
-        flops, partial = compute_flops(
-            _sdpa_graph(causal=True, bottom_right=True, sq=8, skv=4)
-        )
+        flops = compute_flops(_sdpa_graph(causal=True, bottom_right=True, sq=8, skv=4))
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
         assert flops == 655360
-        assert partial is False
 
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.
-        flops, partial = compute_flops(_sdpa_graph(sq=128, skv=128, d=128, dv=64))
+        flops = compute_flops(_sdpa_graph(sq=128, skv=128, d=128, dv=64))
         assert flops == 2 * 2 * 64 * (128 * 128) * (128 + 64)
         assert flops == 805306368
-        assert partial is False
 
     def test_sdpa_bwd_five_matmuls_with_parameters_section(self):
         # hipDNN writes SDPA backward attributes under "parameters".
@@ -629,10 +594,9 @@ class TestComputeFlops:
         node["type"] = "SdpaBackwardAttributes"
         node["parameters"] = {"causal_mask": True}
         del node["attributes"]
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         # Causal 8x8 -> 36 pairs; 3 matmuls over D_qk, 2 over D_vo.
         assert flops == 2 * 2 * 64 * 36 * (3 * 192 + 2 * 128)
-        assert partial is False
 
 
 def _graph(node_type, tensors, inputs, outputs, **params):
@@ -671,7 +635,7 @@ class TestComputeFlopsCoverage:
             {"output_tensor_uid": 4},
             mode=mode,
         )
-        assert compute_flops(graph) == (2 * rows * 64 * 32, False)
+        assert compute_flops(graph) == 2 * rows * 64 * 32
 
     def test_moe_grouped_matmul_bwd_weight_gradient(self):
         graph = _graph(
@@ -684,7 +648,7 @@ class TestComputeFlopsCoverage:
             },
             {"dweight_tensor_uid": 4},
         )
-        assert compute_flops(graph) == (2 * 128 * 64 * 32, False)
+        assert compute_flops(graph) == 2 * 128 * 64 * 32
 
     def test_block_scale_quantize_and_dequantize(self):
         quant = _graph(
@@ -701,8 +665,8 @@ class TestComputeFlopsCoverage:
             {"y_tensor_uid": 3},
             block_size=[128],
         )
-        assert compute_flops(quant) == (2 * 64 * 512, False)
-        assert compute_flops(dequant) == (64 * 512, False)
+        assert compute_flops(quant) == 2 * 64 * 512
+        assert compute_flops(dequant) == 64 * 512
 
     def test_resample_fwd_reads_top_level_window(self):
         graph = _graph(
@@ -714,7 +678,7 @@ class TestComputeFlopsCoverage:
             stride=[2, 2],
             resample_mode="maxpool",
         )
-        assert compute_flops(graph) == (2 * 4 * 7 * 7 * 9, False)
+        assert compute_flops(graph) == 2 * 4 * 7 * 7 * 9
 
     @pytest.mark.parametrize(
         "mode, per_dy", [("MAXPOOL", 1), ("AVGPOOL_INCLUDE_PADDING", 9)]
@@ -728,7 +692,7 @@ class TestComputeFlopsCoverage:
             window=[3, 3],
             resample_mode=mode,
         )
-        assert compute_flops(graph) == (2 * 4 * 7 * 7 * per_dy, False)
+        assert compute_flops(graph) == 2 * 4 * 7 * 7 * per_dy
 
     @pytest.mark.parametrize(
         "node_type", ["LayernormBackwardAttributes", "RMSNormBackwardAttributes"]
@@ -740,7 +704,7 @@ class TestComputeFlopsCoverage:
             {"dy_tensor_uid": 1, "x_tensor_uid": 2, "scale_tensor_uid": 3},
             {"dx_tensor_uid": 4},
         )
-        assert compute_flops(graph) == (8 * 8 * 256 * 128, False)
+        assert compute_flops(graph) == 8 * 8 * 256 * 128
 
     def test_batchnorm_inference_variance_ext(self):
         graph = _graph(
@@ -749,7 +713,7 @@ class TestComputeFlopsCoverage:
             {"x_tensor_uid": 1},
             {"y_tensor_uid": 2},
         )
-        assert compute_flops(graph) == (4 * 4 * 16 * 8 * 8, False)
+        assert compute_flops(graph) == 4 * 4 * 16 * 8 * 8
 
 
 class TestComputeIoBytes:

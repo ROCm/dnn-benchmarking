@@ -20,7 +20,6 @@ class TestBenchmarkStats:
     def test_single_value_has_zero_spread(self) -> None:
         stats = BenchmarkStats.from_timings([5.0])
         assert stats.std_ms == 0.0
-        assert stats.cv == 0.0
         assert stats.iqr_ms == 0.0
 
     def test_empty_raises(self) -> None:
@@ -30,7 +29,6 @@ class TestBenchmarkStats:
     def test_std_is_sample_std(self) -> None:
         stats = BenchmarkStats.from_timings([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
         assert stats.std_ms == pytest.approx((32 / 7) ** 0.5)
-        assert stats.cv == pytest.approx(stats.std_ms / 5.0)
 
     def test_percentiles_and_iqr(self) -> None:
         stats = BenchmarkStats.from_timings(list(range(1, 101)))
@@ -45,13 +43,11 @@ class TestBenchmarkStats:
         the two middle values, so the median is always an observed sample."""
         assert BenchmarkStats.from_timings([4.0, 1.0, 3.0, 2.0]).median_ms == 3.0
 
-    def test_to_dict_nulls_p95_below_20_samples(self) -> None:
-        assert BenchmarkStats.from_timings([1.0] * 19).to_dict()["p95_ms"] is None
-        assert BenchmarkStats.from_timings([1.0] * 20).to_dict()["p95_ms"] == 1.0
-
-    def test_to_dict_omits_derivable_spread(self) -> None:
+    def test_to_dict_keeps_only_the_median_and_quartiles(self) -> None:
+        """compare needs the quartiles for its noise band; the rest is
+        console-only and not serialized."""
         d = BenchmarkStats.from_timings(list(range(1, 101))).to_dict()
-        assert "cv" not in d and "iqr_ms" not in d
+        assert d == {"n": 100, "p25_ms": 25.75, "median_ms": 51.0, "p75_ms": 75.25}
 
 
 class TestNoiseWarnings:
@@ -81,7 +77,7 @@ class TestNoiseWarnings:
     def test_few_slow_samples_do_not_make_a_tight_core_noisy(self) -> None:
         """High CV from two slow samples; the robust spread stays zero."""
         stats = BenchmarkStats.from_timings([1.0] * 18 + [1.9, 1.9])
-        assert stats.cv > 0.05
+        assert stats.std_ms / stats.mean_ms > 0.05
         assert not any(w.startswith("noisy:") for w in noise_warnings(stats))
 
     def test_outlier_max_is_flagged(self) -> None:

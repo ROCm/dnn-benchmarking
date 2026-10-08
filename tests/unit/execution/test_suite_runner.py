@@ -157,9 +157,6 @@ def fake(monkeypatch):
         def clocks(self):
             return f.clocks.pop(0) if f.clocks else None
 
-        def snapshot(self):
-            return {"vram_used_mb": 12.0}
-
     monkeypatch.setattr(suite_runner, "Executor", Executor)
     monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
     monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
@@ -344,7 +341,7 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
 
 
 def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch):
-    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
+    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
     fake.discovered = [1]
     # Median 1 ms, mean 1.4 ms: throughput must come from the median.
     # Every timing field off its default, so a row cannot claim a cache mode,
@@ -374,7 +371,7 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "capped": True,
         "fallback_reason": "no stream wait",
     }
-    assert row.ootb.workspace_bytes == 64 and row.vram_used_mb == 12.0
+    assert row.ootb.workspace_bytes == 64
     assert row.ootb.cpu_build_time_ms == 2.0
     warnings = " | ".join(row.warnings)
     for expected in (
@@ -396,35 +393,35 @@ def test_every_executor_gets_the_run_policy_and_a_heuristic_plan(fake):
 
 
 def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
-    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: (2_000_000_000, False))
+    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
     fake.discovered = [1]
-    fake.clocks = [{"sclk_mhz": 1700}] * 2
+    fake.clocks = [{"sclk_mhz": 1700}]
 
     row = _run(metrics=MetricsConfig(basic=False))[0].results[0]
 
     assert row.ootb.gpu_kernel_stats is not None
-    assert row.clocks_before is None and row.ootb.derived_tflops_per_s is None
+    assert row.clocks_after is None and row.ootb.derived_tflops_per_s is None
 
 
 CLOCK = {"sclk_mhz": 1700.0, "throttle_status": 0}
 
 
 @pytest.mark.parametrize(
-    "before, after, throttled",
+    "after, throttled",
     [
-        (CLOCK, CLOCK, False),
-        (CLOCK, {**CLOCK, "sclk_mhz": 1400.0}, False),  # DPM drop, not throttling
-        (CLOCK, {**CLOCK, "throttle_status": 4}, True),
-        (None, None, False),
+        (CLOCK, False),
+        ({**CLOCK, "sclk_mhz": 1400.0}, False),  # DPM drop, not throttling
+        ({**CLOCK, "throttle_status": 4}, True),
+        (None, False),
     ],
 )
-def test_clocks_bracket_the_timed_loop(fake, before, after, throttled):
+def test_clocks_after_the_timed_loop_flag_throttling(fake, after, throttled):
     fake.discovered = [1]
-    fake.clocks = [before, after]
+    fake.clocks = [after]
 
     row = _run()[0].results[0]
 
-    assert (row.clocks_before, row.clocks_after) == (before, after)
+    assert row.clocks_after == after
     assert ("throttled" in row.warnings) is throttled
 
 

@@ -133,7 +133,7 @@ def _hipdnn_version() -> Optional[str]:
 def collect_environment_info() -> Dict[str, Any]:
     """Host, GPU and software versions for the result ``environment`` block.
 
-    Never raises. ``end_of_run`` and ``selection_env`` are filled by the
+    Never raises. ``selection_env`` is filled by the
     suite runner, not here.
     """
     amdsmi_available = is_amdsmi_available()

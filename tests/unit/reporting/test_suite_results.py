@@ -286,7 +286,7 @@ class TestWriteLoad:
         assert row["elapsed_s"] == 2.5
         ootb = row["ootb"]
         assert ootb["build_ms"] == 12.0
-        assert (ootb["kernel"]["median_ms"], ootb["kernel"]["mean_ms"]) == (0.5, 0.65)
+        assert ootb["kernel"]["median_ms"] == 0.5
         assert ootb["host"]["median_ms"] == 0.01
         assert (ootb["tflops"], ootb["gbps"], ootb["workspace_bytes"]) == (
             1.5,
@@ -302,8 +302,10 @@ class TestWriteLoad:
             rows = list(reader)
         assert tuple(reader.fieldnames) == ROW_COLUMNS
         row, graph_error, no_engines = rows
-        # Sample std 0.8216 over mean 0.65.
-        assert float(row.pop("kernel_cv")) == pytest.approx(1.264, abs=1e-3)
+        # IQR over the median, in percent.
+        kernel = _sample_suite().graphs[0].results[0].ootb.gpu_kernel_stats
+        expected = kernel.iqr_ms / kernel.median_ms * 100
+        assert float(row.pop("kernel_iqr_pct")) == pytest.approx(expected, rel=1e-5)
         assert row == {
             "gpu_arch": "gfx90a",
             "graph_name": "g",

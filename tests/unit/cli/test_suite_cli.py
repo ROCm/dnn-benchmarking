@@ -144,7 +144,6 @@ def test_graph_exception_is_isolated_and_written(tmp_path, runtime) -> None:
     assert graphs[1]["status"] == "error" and graphs[1]["graph_id"] is None
     assert graphs[2]["status"] == "ok"
     assert doc["summary"]["graph_errors"] == 2
-    assert set(doc["environment"]["end_of_run"]) >= {"host_rss_mb", "vram_used_mb"}
 
 
 def test_intermediate_write_is_a_loadable_partial_file(
@@ -785,23 +784,24 @@ def test_oracle_warns_on_non_cold_baseline(
         assert expected in warnings
 
 
-def test_final_write_survives_second_signal_and_snapshot_error(
+def test_final_write_survives_a_second_signal(
     tmp_path, runtime, monkeypatch, caller_handlers
 ) -> None:
-    def probe():
+    original = SuiteResult.write
+
+    def write(self, *args, **kwargs):
         signal.raise_signal(signal.SIGTERM)
         signal.raise_signal(signal.SIGINT)
-        raise RuntimeError("amdsmi gone")
+        return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(suite_runner_cli, "GpuSmiProbe", probe)
+    monkeypatch.setattr(SuiteResult, "write", write)
     runtime(lambda path: (_ for _ in ()).throw(KeyboardInterrupt()))
     out = tmp_path / "out.json"
 
-    code, text = _run(_args("-o", str(out)), _graphs(tmp_path, 1))
+    code, _ = _run(_args("-o", str(out)), _graphs(tmp_path, 1))
 
     assert code == 130
     assert SuiteResult.load(out)["run"]["complete"] is False
-    assert "end-of-run snapshot failed: amdsmi gone" in text
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 

@@ -69,8 +69,7 @@ def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
         ootb = row["ootb"]
         assert ootb["kernel"]["median_ms"] > 0
         assert ootb["host"]["median_ms"] > 0
-        # p95 needs n >= 20.
-        assert ootb["kernel"]["p95_ms"] is None
+        assert set(ootb["kernel"]) == {"n", "p25_ms", "median_ms", "p75_ms"}
         assert ootb["correctness"] is None
         assert row["oracle"] is None
 
@@ -84,7 +83,7 @@ def test_no_metrics_suppresses_basic_fields(hipdnn) -> None:
         assert r.analytical_flops is None
         assert r.analytical_io_bytes is None
         assert r.ootb.derived_tflops_per_s is None
-        assert r.vram_used_mb is None
+        assert r.clocks_after is None
 
 
 def test_engine_selection_runs_in_caller_order(hipdnn) -> None:

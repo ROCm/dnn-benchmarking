@@ -21,8 +21,6 @@ from ..config.benchmark_config import (
     SuiteConfig,
 )
 from ..graph.loader import GraphLoader
-from ..metrics.gpu_smi import GpuSmiProbe
-from ..metrics.host import host_memory_snapshot
 from ..metrics.machine_info import collect_environment_info
 from ..metrics.profiling_orchestrator import check_requested_tools
 from ..reporting.reporter import Reporter
@@ -314,12 +312,6 @@ def _run_suite(
         previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
-            try:
-                end_of_run = {**host_memory_snapshot(), **GpuSmiProbe().snapshot()}
-            except Exception as e:
-                reporter.warning(f"end-of-run snapshot failed: {e}")
-                end_of_run = {}
-            environment["end_of_run"] = end_of_run
             write_ok = write()
         finally:
             disarm_watchdog()

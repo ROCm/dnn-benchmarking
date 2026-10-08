@@ -12,7 +12,7 @@ import pytest
 from dnn_benchmarking.metrics import arch, gpu_smi, machine_info
 from dnn_benchmarking.metrics._diagnostic import reset as _reset_warns
 
-# Contract: result JSON v2 environment keys (minus end_of_run / selection_env,
+# Contract: result JSON v2 environment keys (minus selection_env,
 # which the suite runner fills).
 _ENVIRONMENT_KEYS = {
     "hostname",

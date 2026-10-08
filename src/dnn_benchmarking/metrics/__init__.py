@@ -5,8 +5,7 @@
 
 Always-on probes (no GPU work):
     * Analytical FLOPs / IO bytes from graph JSON (:mod:`analytical`).
-    * Host RAM snapshot (:mod:`host`).
-    * GPU clocks / power / throttle and VRAM via amdsmi (:mod:`gpu_smi`).
+    * GPU clocks / power / throttle via amdsmi (:mod:`gpu_smi`).
     * One-shot environment metadata (:mod:`machine_info`).
 
 Opt-in profiling sources (separate workload re-run, orchestrated via
@@ -23,7 +22,6 @@ replay can't pollute the headline timing. Results land in
 
 from .analytical import compute_flops, compute_io_bytes, derive_throughputs
 from .gpu_smi import GpuSmiProbe
-from .host import host_memory_snapshot
 from .machine_info import collect_environment_info
 
 __all__ = [
@@ -31,6 +29,5 @@ __all__ = [
     "compute_io_bytes",
     "derive_throughputs",
     "GpuSmiProbe",
-    "host_memory_snapshot",
     "collect_environment_info",
 ]

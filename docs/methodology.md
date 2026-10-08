@@ -172,12 +172,12 @@ in block mode. The row warning is then `block timing: <reason>`.
 
 ## Statistics
 
-For `kernel` and `host` the tool reports `n`, `mean_ms`, `std_ms` (ddof 1),
-`min_ms`, `p25_ms`, `median_ms`, `p75_ms`, `p95_ms` and `max_ms`. The
-interquartile range (IQR) is `p75_ms - p25_ms`. `median_ms` is the upper median `sorted(t)[n // 2]`,
-the rocKE / Solera definition, so it is always an observed sample. The other
-percentiles use linear interpolation. `p95_ms` is
-`null` below 20 samples, because it is then close to the maximum.
+For `kernel` and `host` the result file stores `n`, `p25_ms`, `median_ms` and
+`p75_ms`. The interquartile range (IQR) is `p75_ms - p25_ms`. `median_ms` is
+the upper median `sorted(t)[n // 2]`, the rocKE / Solera definition, so it is
+always an observed sample. The quartiles use linear interpolation. The
+verbose console also shows the mean, std (ddof 1), min, p95 (below 20
+samples it shows `-`) and max.
 
 The tool does not remove outliers. It adds warnings to the row:
 
@@ -200,22 +200,19 @@ moved the mean and the standard deviation, but not the median.
 - `flops` is an analytical count from the graph JSON (FMA = 2 FLOPs). The
   dispatch table is in `metrics/analytical/__init__.py`; the per-op formulas
   are in its sibling modules (`conv.py`, `matmul.py`, `elementwise.py`,
-  `normalization.py`, `reduction.py`, `sdpa.py`). When the graph has a node
-  type with no formula, `flops_partial` is `true` and the table shows `~`.
+  `normalization.py`, `reduction.py`, `sdpa.py`). When any node of the graph
+  has no formula, `flops` and `tflops` are `null`, not a partial count.
 - `io_bytes` is the sum of the sizes of all non-virtual tensors. It is a
   lower bound of the real memory traffic.
 - In `warm` mode, a small problem can stay in L2. GB/s can then be more than
   the HBM bandwidth. Use `--cache-mode cold` to measure from memory.
 
-## Clocks before and after
+## Clocks after the timed loop
 
-With `--metrics` (default) and amdsmi available, the runner reads
-the GPU clocks before priming and warmup, and right after the timed loop:
-`sclk_mhz`, `mclk_mhz`, `power_w`, `temp_hotspot_c` and `throttle_status`.
-The row gets the warning `throttled` when `throttle_status` after the loop is
-not 0. The pair does not measure clock drift during the timed loop:
-`clocks_before` is often the idle clock, because warmup has not run yet. The
-tool does not set or lock clocks.
+With `--metrics` (default) and amdsmi available, the runner reads the GPU
+clocks right after the timed loop: `sclk_mhz`, `mclk_mhz`, `power_w`,
+`temp_hotspot_c` and `throttle_status`. The row gets the warning `throttled`
+when `throttle_status` is not 0. The tool does not set or lock clocks.
 
 ## Profiling child process
 

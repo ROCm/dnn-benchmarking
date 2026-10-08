@@ -76,13 +76,6 @@ ENVIRONMENT_KEYS = (
     "torch_version",
     "amdsmi_available",
     "selection_env",
-    "end_of_run",
-)
-END_OF_RUN_KEYS = (
-    "host_rss_mb",
-    "host_ram_available_mb",
-    "vram_used_mb",
-    "vram_total_mb",
 )
 ROW_COLUMNS = (
     "gpu_arch",
@@ -95,7 +88,7 @@ ROW_COLUMNS = (
     "status",
     "verdict",
     "kernel_median_ms",
-    "kernel_cv",
+    "kernel_iqr_pct",
     "host_median_ms",
     "n",
     "timing_mode",
@@ -153,10 +146,12 @@ def _stats_dict(stats: Optional[BenchmarkStats]) -> Optional[Dict[str, Any]]:
     return stats.to_dict() if stats is not None else None
 
 
-def _cv(stats: Dict[str, Any]) -> Optional[float]:
-    """CSV ``kernel_cv`` from a serialized stats object (null when unknown)."""
-    std, mean = stats.get("std_ms"), stats.get("mean_ms")
-    return _finite(std / mean) if std is not None and mean else None
+def _iqr_pct(stats: Dict[str, Any]) -> Optional[float]:
+    """CSV ``kernel_iqr_pct``: IQR as a percentage of the median."""
+    p25, median, p75 = stats.get("p25_ms"), stats.get("median_ms"), stats.get("p75_ms")
+    if p25 is None or p75 is None or not median:
+        return None
+    return _finite((p75 - p25) / median * 100.0)
 
 
 @dataclass
@@ -389,15 +384,9 @@ class ProviderEngineResult:
         error_message: Why the row errored.
         skip_reason: Why the row was skipped.
         warnings: Non-fatal warnings for this row (noise, throttling, ...).
-        analytical_flops: Total analytical FLOPs across compute nodes
-            (None for purely bandwidth-bound graphs).
-        analytical_flops_partial: True when at least one node type was
-            unrecognised; ``analytical_flops`` then covers only the
-            recognised compute nodes.
+        analytical_flops: Total analytical FLOPs of the graph; None when any
+            node has no FLOP formula, so a partial count is never reported.
         analytical_io_bytes: Sum of non-virtual tensor sizes (bytes).
-        vram_used_mb: Process-wide VRAM allocated at the end of this
-            engine's benchmark loop (may include cached allocations from
-            earlier engines on the same graph).
         extra_metrics: Opt-in profiling payload (rocprofv3 PMC / trace,
             perf, roofline).
         ootb: The default (out-of-the-box) plan. Serialized only for
@@ -405,7 +394,6 @@ class ProviderEngineResult:
         oracle: Tuned plan; set only for oracle runs that tuned.
         oracle_delta: Warm-baseline vs tuned comparison.
         oracle_error: Why tuning produced no result; exclusive with oracle.
-        clocks_before: GPU clocks sampled right before the timed loop.
         clocks_after: GPU clocks sampled right after the timed loop.
         engine_name: Display name of the engine (e.g. MIOPEN_ENGINE).
     """
@@ -427,15 +415,12 @@ class ProviderEngineResult:
     skip_reason: Optional[str] = None
     warnings: Optional[List[str]] = None
     analytical_flops: Optional[int] = None
-    analytical_flops_partial: bool = False
     analytical_io_bytes: Optional[int] = None
-    vram_used_mb: Optional[float] = None
     extra_metrics: Optional[Dict[str, Any]] = None
     ootb: PlanResult = field(default_factory=PlanResult)
     oracle: Optional[OracleResult] = None
     oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
-    clocks_before: Optional[Dict[str, Any]] = None
     clocks_after: Optional[Dict[str, Any]] = None
     engine_name: Optional[str] = None
 
@@ -537,10 +522,7 @@ class ProviderEngineResult:
             "elapsed_s": self.elapsed_time_ms / 1000.0,
             "metrics": {
                 "flops": self.analytical_flops,
-                "flops_partial": self.analytical_flops_partial,
                 "io_bytes": self.analytical_io_bytes,
-                "vram_mb": self.vram_used_mb,
-                "clocks_before": self.clocks_before,
                 "clocks_after": self.clocks_after,
             },
             "ootb": self.ootb.plan_dict() if self.status == "success" else None,
@@ -700,7 +682,6 @@ class SuiteResult:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to the v2 document (not yet NaN-sanitized; see to_json)."""
         env = _with_keys(self.environment, ENVIRONMENT_KEYS)
-        env["end_of_run"] = _with_keys(env["end_of_run"], END_OF_RUN_KEYS)
         return {
             "schema_version": SUITE_RESULT_SCHEMA_VERSION,
             "tool": {"name": "dnn-benchmarking", "version": __version__},
@@ -763,7 +744,7 @@ class SuiteResult:
                         "status": r["status"],
                         "verdict": r["verdict"],
                         "kernel_median_ms": kernel.get("median_ms"),
-                        "kernel_cv": _cv(kernel),
+                        "kernel_iqr_pct": _iqr_pct(kernel),
                         "host_median_ms": host.get("median_ms"),
                         "n": kernel.get("n"),
                         "timing_mode": timing.get("mode"),

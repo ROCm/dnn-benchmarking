@@ -488,9 +488,7 @@ class Reporter:
     def _tflops_cell(pe: ProviderEngineResult) -> str:
         if pe.ootb.derived_tflops_per_s is None:
             return "-"
-        return (
-            "~" if pe.analytical_flops_partial else ""
-        ) + f"{pe.ootb.derived_tflops_per_s:.2f}"
+        return f"{pe.ootb.derived_tflops_per_s:.2f}"
 
     @staticmethod
     def _vs_best_cell(pe: ProviderEngineResult, best: Optional[float]) -> str:
@@ -565,7 +563,7 @@ class Reporter:
                 text += f", fallback: {t.fallback_reason}"
             add("timing", text)
         lines.extend(self._stats_lines(pe))
-        clocks = self._clocks_text(pe.clocks_before, pe.clocks_after)
+        clocks = self._clocks_text(pe.clocks_after)
         if clocks:
             add("clocks", clocks)
         metrics = self._metrics_text(pe)
@@ -612,17 +610,14 @@ class Reporter:
         return lines
 
     @staticmethod
-    def _clocks_text(
-        before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]
-    ) -> str:
-        before, after = before or {}, after or {}
+    def _clocks_text(after: Optional[Dict[str, Any]]) -> str:
+        """Clocks right after the timed loop."""
+        after = after or {}
         parts = []
         for key, label, unit in _CLOCK_KEYS:
-            a, b = before.get(key), after.get(key)
-            if a is None and b is None:
-                continue
-            a_text, b_text = ("?" if v is None else f"{v:g}" for v in (a, b))
-            parts.append(f"{label} {a_text}->{b_text}" + (f" {unit}" if unit else ""))
+            value = after.get(key)
+            if value is not None:
+                parts.append(f"{label} {value:g}" + (f" {unit}" if unit else ""))
         return ", ".join(parts)
 
     @staticmethod
@@ -631,14 +626,9 @@ class Reporter:
         if pe.ootb.workspace_bytes is not None:
             parts.append(f"workspace {_fmt_mib(pe.ootb.workspace_bytes / 2**20)}")
         if pe.analytical_flops is not None:
-            partial = " (partial)" if pe.analytical_flops_partial else ""
-            parts.append(f"flops {pe.analytical_flops:,}{partial}")
-        elif pe.analytical_flops_partial:
-            parts.append("flops n/a (no analytical model)")
+            parts.append(f"flops {pe.analytical_flops:,}")
         if pe.analytical_io_bytes is not None:
             parts.append(f"io {_fmt_mib(pe.analytical_io_bytes / 2**20)}")
-        if pe.vram_used_mb is not None:
-            parts.append(f"vram {_fmt_mib(pe.vram_used_mb)}")
         return ", ".join(parts)
 
     @staticmethod

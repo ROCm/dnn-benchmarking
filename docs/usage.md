@@ -294,7 +294,7 @@ Table columns:
 | `kernel_med` | Median device time per launch, in µs, ms or s. `*` marks a noisy row or an outlier. |
 | `iqr%` | Interquartile range of the kernel samples, as a percentage of the median. |
 | `submit` | Median host time of the enqueue call. |
-| `tflops` | TFLOP/s from the median. `~` means the FLOP count is partial. |
+| `tflops` | TFLOP/s from the median. `-` when the FLOP count is unknown (a node with no formula). |
 | `gbps` | GB/s (10^9 bytes/s) from the median. |
 | `vs_best` | Best median of the graph divided by the row median. `1.00x` is the fastest row. `ref` marks the reference row. |
 | `oracle` | Only with `--oracle-mode`. See [Oracle mode](#oracle-mode). |

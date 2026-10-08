@@ -126,7 +126,6 @@ class TestClocks:
         monkeypatch.setattr(gpu_smi, "_amdsmi", _cached(lambda: None))
         probe = gpu_smi.GpuSmiProbe()
         assert probe.clocks() is None
-        assert probe.snapshot() == {"vram_used_mb": None, "vram_total_mb": None}
         # Missing amdsmi is reported once at startup, never per probe.
         assert capsys.readouterr().err == ""
 
@@ -155,14 +154,6 @@ class TestDeviceMapping:
         assert gpu_smi.GpuSmiProbe(1)._handle == "h1"
         assert gpu_smi.GpuSmiProbe(5).clocks() is None
         assert gpu_smi.GpuSmiProbe(2)._handle is None  # index == len(handles)
-
-
-def test_snapshot_reports_vram_only(monkeypatch):
-    _install(monkeypatch, _fake_amdsmi())
-    assert gpu_smi.GpuSmiProbe().snapshot() == {
-        "vram_used_mb": 1024.0,
-        "vram_total_mb": 65536.0,
-    }
 
 
 def test_identity_reports_target_then_market_name(monkeypatch):

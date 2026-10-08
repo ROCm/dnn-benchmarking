@@ -36,14 +36,8 @@ ENV_KEYS = {
     "gpu_pcie_link", "amdgpu_driver_version", "gpu_power_cap_w",
     "gpu_max_sclk_mhz", "gpu_compute_partition", "rocm_version", "cuda_version",
     "cudnn_version", "hipdnn_version", "python_version", "torch_version",
-    "amdsmi_available", "selection_env", "end_of_run",
+    "amdsmi_available", "selection_env",
 }  # fmt: skip
-END_OF_RUN_KEYS = {
-    "host_rss_mb",
-    "host_ram_available_mb",
-    "vram_used_mb",
-    "vram_total_mb",
-}
 SUMMARY_KEYS = {
     "graphs", "rows", "passed", "unchecked", "failed", "skipped", "errors",
     "graph_errors", "no_engine_graphs",
@@ -63,17 +57,12 @@ ROW_KEYS = {
     "extra_metrics",
 }  # fmt: skip
 ENGINE_KEYS = {"id", "name", "version"}
-METRICS_KEYS = {
-    "flops", "flops_partial", "io_bytes", "vram_mb", "clocks_before", "clocks_after",
-}  # fmt: skip
+METRICS_KEYS = {"flops", "io_bytes", "clocks_after"}
 PLAN_KEYS = {
     "build_ms", "timing", "kernel", "host", "workspace_bytes", "tflops", "gbps",
     "correctness",
 }  # fmt: skip
-STATS_KEYS = {
-    "n", "mean_ms", "std_ms", "min_ms", "p25_ms", "median_ms", "p75_ms", "p95_ms",
-    "max_ms",
-}  # fmt: skip
+STATS_KEYS = {"n", "p25_ms", "median_ms", "p75_ms"}
 TIMING_KEYS = {
     "mode", "timer", "warmup_iters", "first_call_ms", "capped", "fallback_reason",
 }  # fmt: skip
@@ -135,9 +124,7 @@ def full_suite() -> SuiteResult:
         elapsed_time_ms=1500.0,
         warnings=["noisy: CV 6.0%"],
         analytical_flops=10**9,
-        analytical_flops_partial=True,
         analytical_io_bytes=10**6,
-        vram_used_mb=512.0,
         extra_metrics={
             "pmc": {"SQ_WAVES": 64},
             "perf": None,
@@ -146,7 +133,6 @@ def full_suite() -> SuiteResult:
         },
         oracle=oracle,
         oracle_delta=build_oracle_delta(oracle),
-        clocks_before={"sclk_mhz": 1700},
         clocks_after={"sclk_mhz": 1650},
         ootb=PlanResult(
             cpu_build_time_ms=3.0,
@@ -171,7 +157,6 @@ def full_suite() -> SuiteResult:
     )
     # Distinct values, so a dropped or swapped value changes the output.
     env = {k: f"env_{k}" for k in ENV_KEYS}
-    env["end_of_run"] = {k: float(i) for i, k in enumerate(sorted(END_OF_RUN_KEYS))}
     config = {k: "x" for k in CONFIG_KEYS}
     config["profiling"] = {k: False for k in PROFILING_KEYS}
     return SuiteResult(
@@ -216,7 +201,6 @@ def _key_sets(doc: dict) -> dict:
         "config": set(doc["run"]["config"]),
         "profiling": set(doc["run"]["config"]["profiling"]),
         "environment": set(doc["environment"]),
-        "end_of_run": set(doc["environment"]["end_of_run"]),
         "summary": set(doc["summary"]),
         "graph": set(graph),
         "row": set(row),
@@ -234,7 +218,6 @@ def test_full_document_has_exact_key_sets() -> None:
     assert keys["config"] == CONFIG_KEYS
     assert keys["profiling"] == PROFILING_KEYS
     assert keys["environment"] == ENV_KEYS
-    assert keys["end_of_run"] == END_OF_RUN_KEYS
     assert keys["summary"] == SUMMARY_KEYS
     assert keys["graph"] == GRAPH_KEYS
     assert keys["row"] == ROW_KEYS
@@ -265,10 +248,7 @@ def test_full_row_values() -> None:
     }
     assert row["metrics"] == {
         "flops": 10**9,
-        "flops_partial": True,
         "io_bytes": 10**6,
-        "vram_mb": 512.0,
-        "clocks_before": {"sclk_mhz": 1700},
         "clocks_after": {"sclk_mhz": 1650},
     }
     ootb = row["ootb"]

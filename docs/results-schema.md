@@ -73,8 +73,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 ## environment
 
-The CLI collects these values one time, at suite start. Only `end_of_run` is
-collected at suite end.
+The CLI collects these values one time, at suite start.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -99,9 +98,8 @@ collected at suite end.
 | `hipdnn_version` | string | `hipdnn_frontend.__version__`. |
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
-| `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition`, the VRAM values and all clock values are `null`. |
+| `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
 | `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle-mode` or `--autotune` is set. |
-| `end_of_run` | object | Snapshot at suite end: `host_rss_mb` (process RSS, MiB), `host_ram_available_mb` (MiB), `vram_used_mb` (MiB), `vram_total_mb` (MiB). |
 
 ## summary
 
@@ -215,34 +213,26 @@ are only in `run.config` (`cache_mode`, `timing_block`). See
 | Key | Meaning |
 |---|---|
 | `n` | Number of timed samples. |
-| `mean_ms` | Arithmetic mean. |
-| `std_ms` | Sample standard deviation (ddof = 1). `0` when `n` is 1. |
-| `min_ms` | Minimum. |
 | `p25_ms` | 25th percentile. |
 | `median_ms` | Upper median, `sorted(samples)[n // 2]` (the rocKE / Solera definition; always an observed sample). This is the headline value. |
 | `p75_ms` | 75th percentile. |
-| `p95_ms` | 95th percentile. `null` when `n` is less than 20. |
-| `max_ms` | Maximum. |
 
 Percentiles use linear interpolation (`numpy.percentile`). The tool does not
-remove outliers. The file does not store values that a reader can derive:
-the coefficient of variation is `std_ms / mean_ms`, and the interquartile
-range (IQR) is `p75_ms - p25_ms`.
+remove outliers. The interquartile range (IQR) is `p75_ms - p25_ms`;
+`dnn-benchmark compare` builds its noise band from it. The verbose console
+(`-v`) also shows the mean, standard deviation, minimum, p95 and maximum; the
+file does not store them.
 
 ### metrics
 
 | Key | Type | Meaning |
 |---|---|---|
-| `flops` | int or null | Analytical FLOPs for one launch of the graph. `null` when no node type is recognised. |
-| `flops_partial` | bool | `true` when the graph has a node type with no FLOP formula. `flops` then counts only the recognised nodes. The console shows `~` before TFLOP/s. |
+| `flops` | int or null | Analytical FLOPs for one launch of the graph. `null` when any node has no FLOP formula (or lacks the tensor data its formula needs), so a partial count is never reported. `tflops` is then `null` too. |
 | `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. |
-| `vram_mb` | float or null | Device VRAM in use after the timed loop, MiB, while the row's buffers are still allocated. amdsmi `vram_used` counts every process on the GPU, not only this one. It can include cached allocations from earlier engines on the same graph. |
-| `clocks_before` | object or null | GPU clocks before priming and warmup of the default plan, so often the idle clocks. See [clocks](#clocks). |
-| `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. |
+| `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. See [clocks](#clocks). |
 
-`--no-metrics` sets the analytical values, `vram_mb`, both clock
-objects, and the plan `workspace_bytes`, `tflops` and `gbps` to `null`, and
-`flops_partial` to `false`.
+`--no-metrics` sets these values and the plan `workspace_bytes`, `tflops` and
+`gbps` to `null`.
 
 #### clocks
 
@@ -280,7 +270,7 @@ loop. Paths are relative to the row:
 | Note | Condition |
 |---|---|
 | `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.kernel.n` is 10 or more. |
-| `outlier: max Nx median` | `ootb.kernel.max_ms` is more than 2 x `ootb.kernel.median_ms`. |
+| `outlier: max Nx median` | The slowest sample is more than 2 x `ootb.kernel.median_ms`. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
@@ -422,7 +412,7 @@ A `.csv` path writes one line per row with these columns (`ROW_COLUMNS`):
 | `status` | `row.status` |
 | `verdict` | `row.verdict` |
 | `kernel_median_ms` | `row.ootb.kernel.median_ms` |
-| `kernel_cv` | `row.ootb.kernel.std_ms / row.ootb.kernel.mean_ms` |
+| `kernel_iqr_pct` | `100 * (row.ootb.kernel.p75_ms - row.ootb.kernel.p25_ms) / row.ootb.kernel.median_ms` |
 | `host_median_ms` | `row.ootb.host.median_ms` |
 | `n` | `row.ootb.kernel.n` |
 | `timing_mode` | `row.ootb.timing.mode` |

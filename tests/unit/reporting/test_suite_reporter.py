@@ -144,14 +144,14 @@ class TestTableLayout:
         assert _cells(text, "SKIPPER")[1] == "skipped"
         assert _cells(text, "BROKEN")[1] == "error"
 
-    def test_noisy_row_is_marked_and_partial_flops_are_approximate(self) -> None:
+    def test_noisy_row_is_marked(self) -> None:
         noisy = _row("NOISY")
         noisy.ootb.gpu_kernel_stats = _stats(0.0256, jitter=0.2)
-        steady = _row("STEADY", derived_tflops_per_s=1.5, analytical_flops_partial=True)
+        steady = _row("STEADY", derived_tflops_per_s=1.5)
         text = _table(noisy, steady)
         assert "µs*" in _cells(text, "NOISY")
         assert "µs*" not in _cells(text, "STEADY")
-        assert "~1.50" in _cells(text, "STEADY")
+        assert "1.50" in _cells(text, "STEADY")
 
     def test_kernel_median_uses_readable_units(self) -> None:
         text = _table(_row("SMALL", 0.0256), _row("BIG", 4.1837))
@@ -302,7 +302,6 @@ class TestVerboseBlock:
                 n_mismatch=3,
                 n_total=1024,
             ),
-            clocks_before={"sclk_mhz": 1700.0, "throttle_status": 0},
             clocks_after={"sclk_mhz": 1500.0, "throttle_status": 0},
             timing=TimingInfo("staged", "hip", 10, 7800.0),
         )
@@ -332,7 +331,7 @@ class TestVerboseBlock:
             line.split() for line in text.splitlines() if line.split()[:1] == ["submit"]
         )
         assert submit[1] == "10" and submit[6] == "-"  # no p95 below 20 samples
-        assert "sclk 1700->1500 MHz" in text
+        assert "sclk 1500 MHz" in text
         assert "FAILED" in text and "max_abs_diff 6.20e-03" in text
         assert "n_mismatch 3/1024" in text
 
@@ -400,10 +399,6 @@ class TestVerboseBlock:
                 ),
                 "skipped     no configs",
             ),
-            (
-                _row(analytical_flops_partial=True),
-                "metrics     flops n/a (no analytical model)",
-            ),
             (_oracle_row(), "rank 0); knobs engine defaults"),
             (
                 _oracle_row(compiled_plans_benchmarked=4, compiled_plans_failed=1),
@@ -430,7 +425,6 @@ class TestVerboseBlock:
             "reference-warning",
             "error-row",
             "skipped-row",
-            "flops-no-model",
             "default-knobs",
             "plan-counts",
             "delta",

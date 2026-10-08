@@ -49,7 +49,6 @@ class _GraphContext:
     reporter: Reporter
     input_data: Dict[int, Any]
     flops: Optional[int] = None
-    flops_partial: bool = False
     io_bytes: Optional[int] = None
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
     reference_error: Optional[str] = None
@@ -149,8 +148,6 @@ def _measure_row(
     """Run the timed loop and record stats, provenance, clocks and warnings."""
     basic = ctx.config.metrics.basic
     probe = GpuSmiProbe() if basic else None
-    if probe is not None:
-        row.clocks_before = probe.clocks()
     m = benchmark()
     if probe is not None:
         row.clocks_after = probe.clocks()
@@ -174,13 +171,10 @@ def _measure_row(
 
     if probe is not None:
         row.analytical_flops = ctx.flops
-        row.analytical_flops_partial = ctx.flops_partial
         row.analytical_io_bytes = ctx.io_bytes
         row.ootb.derived_tflops_per_s, row.ootb.derived_gbytes_per_s = (
             derive_throughputs(ctx.flops, ctx.io_bytes, kernel.median_ms)
         )
-        # Sampled while the row's workspace and I/O buffers are still live.
-        row.vram_used_mb = probe.snapshot().get("vram_used_mb")
 
 
 def _reference_provider(
@@ -267,7 +261,7 @@ def _graph_context(
     )
     if config.metrics.basic:
         try:
-            ctx.flops, ctx.flops_partial = compute_flops(graph_json)
+            ctx.flops = compute_flops(graph_json)
         except Exception as e:
             warn_once("analytical", f"compute_flops failed for {graph_name}: {e}")
         try:

@@ -25,7 +25,7 @@ class BenchmarkStats:
         median_ms: Upper median ``sorted(timings)[n // 2]`` (rocKE / Solera
             definition; always an observed sample); the headline number.
         p75_ms: 75th percentile.
-        p95_ms: 95th percentile (serialized as null when n < 20).
+        p95_ms: 95th percentile (console only; meaningful for n >= 20).
         max_ms: Maximum.
     """
 
@@ -66,21 +66,18 @@ class BenchmarkStats:
         )
 
     @property
-    def cv(self) -> float:
-        """Coefficient of variation, ``std_ms / mean_ms`` (not serialized)."""
-        return self.std_ms / self.mean_ms if self.mean_ms > 0 else 0.0
-
-    @property
     def iqr_ms(self) -> float:
         """Interquartile range (not serialized)."""
         return self.p75_ms - self.p25_ms
 
+    #: The serialized subset: the median is the headline number, and the
+    #: quartiles give ``compare`` its noise band. The others are for the
+    #: console and in-process warnings only.
+    SERIALIZED = ("n", "p25_ms", "median_ms", "p75_ms")
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to a JSON-ready dict; p95 is null below 20 samples."""
-        d: Dict[str, Any] = asdict(self)
-        if self.n < 20:
-            d["p95_ms"] = None
-        return d
+        """Convert to a JSON-ready dict of :attr:`SERIALIZED` keys."""
+        return {k: getattr(self, k) for k in self.SERIALIZED}
 
 
 # Heuristic thresholds. NOISY_IQR: quiet MI210 runs show IQR 1-2 % of the

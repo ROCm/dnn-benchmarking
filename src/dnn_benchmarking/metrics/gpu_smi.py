@@ -150,19 +150,6 @@ class GpuSmiProbe:
             ),
         }
 
-    def snapshot(self) -> Dict[str, Optional[float]]:
-        """VRAM usage in MB: ``vram_used_mb``, ``vram_total_mb`` (None if unknown)."""
-        snap: Dict[str, Optional[float]] = {"vram_used_mb": None, "vram_total_mb": None}
-        if self._handle is None:
-            return snap
-        vram = _query(
-            lambda: self._amdsmi.amdsmi_get_gpu_vram_usage(self._handle), dict
-        )
-        if vram:
-            snap["vram_used_mb"] = _query(lambda: vram["vram_used"])
-            snap["vram_total_mb"] = _query(lambda: vram["vram_total"])
-        return snap
-
     def identity(self) -> Tuple[Optional[str], Optional[str]]:
         """``(target_graphics_version, market_name)``; None where unreported.
 
