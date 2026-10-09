@@ -9,7 +9,7 @@ enabling validation of GPU execution against known-correct implementations.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, Optional, Type
 
 if TYPE_CHECKING:
     import numpy as np
@@ -22,14 +22,12 @@ class ReferenceOutput:
     Attributes:
         data: The computed output data as numpy array.
         tensor_uid: UID of the tensor in the graph.
-        metadata: Optional provider-specific metadata.
         device_data: Same logical values as ``data`` as a torch GPU tensor,
             or None when only host data exists.
     """
 
     data: "np.ndarray"
     tensor_uid: int
-    metadata: Optional[Dict[str, Any]] = None
     device_data: Optional[Any] = None
 
 
@@ -139,28 +137,3 @@ class ReferenceProviderRegistry:
                 f"Unknown reference provider: '{name}'. Available: {available}"
             )
         return cls._providers[name](**kwargs)
-
-    @classmethod
-    def list_registered(cls) -> List[str]:
-        """List names of all registered providers."""
-        return list(cls._providers.keys())
-
-    @classmethod
-    def list_available(cls) -> List[str]:
-        """List names of providers that are currently usable.
-
-        Checks is_available() on each registered provider.
-
-        Returns:
-            List of provider names where is_available() returns True.
-        """
-        available = []
-        for name, provider_cls in cls._providers.items():
-            try:
-                instance = provider_cls()
-                if instance.is_available():
-                    available.append(name)
-            except Exception:
-                # Provider failed to instantiate, not available
-                pass
-        return available

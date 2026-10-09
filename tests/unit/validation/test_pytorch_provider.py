@@ -175,14 +175,21 @@ class TestPyTorchProviderMatmul:
         # A @ I = A
         assert np.allclose(outputs[3].data, a)
 
-    def test_matmul_bfloat16_uses_graph_dtype_and_returns_float32(self) -> None:
+    @pytest.mark.parametrize(
+        "tensor_dtype, io_data_type",
+        [("bfloat16", None), ("unset", "bfloat16")],  # hipDNN fill_from_context
+    )
+    def test_matmul_bfloat16_uses_graph_dtype_and_returns_float32(
+        self, tensor_dtype, io_data_type
+    ) -> None:
         torch = pytest.importorskip("torch")
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph_json = {
+            "io_data_type": io_data_type,
             "tensors": [
-                {"uid": 1, "name": "a", "dims": [2, 3], "data_type": "bfloat16"},
-                {"uid": 2, "name": "b", "dims": [3, 2], "data_type": "bfloat16"},
-                {"uid": 3, "name": "c", "dims": [2, 2], "data_type": "bfloat16"},
+                {"uid": 1, "name": "a", "dims": [2, 3], "data_type": tensor_dtype},
+                {"uid": 2, "name": "b", "dims": [3, 2], "data_type": tensor_dtype},
+                {"uid": 3, "name": "c", "dims": [2, 2], "data_type": tensor_dtype},
             ],
             "nodes": [
                 {
@@ -1299,6 +1306,40 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(
             outputs[12].data, v_t.grad.numpy(), rtol=1e-4, atol=1e-4
         )
+
+    def test_sdpa_sliding_window_masks_output_and_stats(self) -> None:
+        """A width-1 band (left/right bound 0) lets each query see only its own
+        key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array([[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]], dtype=np.float32)
+        v = np.array([[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]], dtype=np.float32)
+        dims = [1, 1, 3, 2]
+        graph_json = {
+            "tensors": [
+                *(
+                    {"uid": uid, "dims": dims, "data_type": "float"}
+                    for uid in (1, 2, 3, 4)
+                ),
+                {"uid": 6, "dims": [1, 1, 3, 1], "data_type": "float"},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "dropout_probability": 0.0,
+                        "left_bound": 0,
+                        "right_bound": 0,
+                    },
+                }
+            ],
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: q.copy(), 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, v, rtol=1e-6)
+        np.testing.assert_allclose(outputs[6].data[..., 0], (q * q).sum(-1), rtol=1e-6)
 
     def test_sdpa_additive_attention_mask_matches_torch(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")

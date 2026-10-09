@@ -1,782 +1,359 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Unit tests for suite_results module."""
+"""Tests for verdicts, summary counts, oracle speedup and result file I/O."""
 
+import csv
 import json
-import math
-import tempfile
-from pathlib import Path
+import os
 
-import numpy as np
 import pytest
 
-from dnn_benchmarking.reporting.statistics import BenchmarkStats
+from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
+    ROW_COLUMNS,
     CorrectnessResult,
     GraphResult,
     OracleResult,
+    PlanResult,
     ProviderEngineResult,
-    StatusCounts,
-    SuiteMetadata,
+    RunInfo,
     SuiteResult,
-    _format_cudnn_version,
-    build_oracle_delta,
-    collect_environment_info,
+    graph_id_for,
+    oracle_speedup,
 )
 
 
-class TestBenchmarkStatsToDict:
-    """Tests for BenchmarkStats.to_dict (used by suite serialization)."""
+def _correct(match) -> CorrectnessResult:
+    return CorrectnessResult(match, rtol=1e-3, atol=1e-5)
 
-    def test_to_dict(self):
-        """BenchmarkStats.to_dict includes all stat fields."""
-        stats = BenchmarkStats(
-            mean_ms=1.0, std_ms=0.1, min_ms=0.5, max_ms=1.5, p95_ms=1.4, p99_ms=1.49
-        )
-        d = stats.to_dict()
-        assert d == {
-            "mean_ms": 1.0,
-            "median_ms": 0.0,
-            "std_ms": 0.1,
-            "min_ms": 0.5,
-            "max_ms": 1.5,
-            "p95_ms": 1.4,
-            "p99_ms": 1.49,
-            "total_ms": 0.0,
-        }
 
+def _row(status="success", role="engine", correctness=None) -> ProviderEngineResult:
+    return ProviderEngineResult(
+        "hipdnn", 1, status, role=role, ootb=PlanResult(correctness=correctness)
+    )
 
-class TestCorrectnessResult:
-    """Tests for CorrectnessResult dataclass."""
 
-    def test_serializes_with_passed_rtol_atol(self):
-        """CorrectnessResult serializes with passed (bool), rtol, atol fields."""
-        cr = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=True,
-            rtol=1e-5,
-            atol=1e-8,
-            max_abs_diff=1e-7,
-            max_rel_diff=1e-6,
-        )
-        d = cr.to_dict()
-        assert d["passed"] is True
-        assert d["rtol"] == 1e-5
-        assert d["atol"] == 1e-8
-        assert d["execution_success"] is True
-        assert d["tolerance_match"] is True
+def _suite(graphs, complete=True) -> SuiteResult:
+    return SuiteResult(
+        run=RunInfo(
+            started_at="t",
+            argv=["x"],
+            config={"seed": 7, "cache_mode": "cold", "timing_block": 4},
+            complete=complete,
+        ),
+        environment={"gpu_arch": "gfx90a"},
+        graphs=graphs,
+    )
 
-    def test_passed_property_true(self):
-        """passed is True when execution_success=True and tolerance_match=True."""
-        cr = CorrectnessResult(
-            execution_success=True, tolerance_match=True, rtol=1e-5, atol=1e-8
-        )
-        assert cr.passed is True
 
-    def test_passed_property_false_when_no_match(self):
-        """passed is False when tolerance_match is False."""
-        cr = CorrectnessResult(
-            execution_success=True, tolerance_match=False, rtol=1e-5, atol=1e-8
-        )
-        assert cr.passed is False
-
-    def test_passed_property_false_when_execution_failed(self):
-        """passed is False when execution_success is False."""
-        cr = CorrectnessResult(
-            execution_success=False, tolerance_match=None, rtol=1e-5, atol=1e-8
-        )
-        assert cr.passed is False
-
-    def test_passed_property_false_when_tolerance_none(self):
-        """passed is False when tolerance_match is None (no comparison done)."""
-        cr = CorrectnessResult(
-            execution_success=True, tolerance_match=None, rtol=1e-5, atol=1e-8
-        )
-        assert cr.passed is False
-
-    def test_execution_success_separate_from_tolerance_match(self):
-        """CorrectnessResult includes execution_success (bool) separate
-        from tolerance_match (bool)."""
-        cr = CorrectnessResult(
-            execution_success=True,
-            tolerance_match=False,
-            rtol=1e-5,
-            atol=1e-8,
-        )
-        d = cr.to_dict()
-        assert "execution_success" in d
-        assert "tolerance_match" in d
-        assert d["execution_success"] is True
-        assert d["tolerance_match"] is False
-
-    def test_error_message_included_when_present(self):
-        """CorrectnessResult includes error_message in dict when set."""
-        cr = CorrectnessResult(
-            execution_success=False,
-            tolerance_match=None,
-            rtol=1e-5,
-            atol=1e-8,
-            error_message="No ref available",
-        )
-        d = cr.to_dict()
-        assert d["error_message"] == "No ref available"
-
-
-class TestProviderEngineResult:
-    """Tests for ProviderEngineResult dataclass."""
-
-    def test_success_serializes_with_timing_and_correctness(self):
-        """ProviderEngineResult with status='success' serializes with
-        cpu_build_time_ms, gpu_kernel_stats, host_stats, correctness."""
-        stats = BenchmarkStats(
-            mean_ms=1.0, std_ms=0.1, min_ms=0.5, max_ms=1.5, p95_ms=1.4, p99_ms=1.49
-        )
-        corr = CorrectnessResult(
-            execution_success=True, tolerance_match=True, rtol=1e-5, atol=1e-8
-        )
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            cpu_build_time_ms=10.5,
-            gpu_kernel_stats=stats,
-            host_stats=stats,
-            correctness=corr,
-        )
-        d = pe.to_dict()
-        assert d["status"] == "success"
-        assert d["cpu_build_time_ms"] == 10.5
-        assert "gpu_kernel_stats" in d
-        assert "host_stats" in d
-        assert "correctness" in d
-        assert d["gpu_kernel_stats"]["mean_ms"] == 1.0
-        assert d["engine_id"] == 1
-        assert d["engine_name"] == "miopen"
-        assert d["engine_version"] == "unavailable"
-        assert d["started_at"].endswith("+00:00")
-
-    def test_success_serializes_plugin_path(self):
-        stats = BenchmarkStats(
-            mean_ms=1.0,
-            std_ms=0.1,
-            min_ms=0.5,
-            max_ms=1.5,
-            p95_ms=1.4,
-            p99_ms=1.49,
-            median_ms=0.9,
-        )
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="success",
-            plugin_path="/plugins/a",
-            cpu_build_time_ms=10.5,
-            gpu_kernel_stats=stats,
-            host_stats=stats,
-        )
-
-        d = pe.to_dict()
-
-        assert d["plugin_path"] == "/plugins/a"
-        assert "comparison_to_baseline" not in d
-
-    def test_reference_role_serializes_and_is_not_legacy_baseline(self):
-        stats = BenchmarkStats(
-            mean_ms=1.0,
-            std_ms=0.1,
-            min_ms=0.5,
-            max_ms=1.5,
-            p95_ms=1.4,
-            p99_ms=1.49,
-            median_ms=0.9,
-        )
-        pe = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="success",
-            role="reference",
-            host_stats=stats,
-            gpu_kernel_stats=stats,
-        )
-
-        d = pe.to_dict()
-
-        assert d["role"] == "reference"
-        assert d["provider"] == "pytorch"
-        assert "comparison_to_baseline" not in d
-
-    @pytest.mark.parametrize("status", ["success", "skipped", "error"])
-    def test_rows_do_not_repeat_suite_sdpa_selection(self, status):
-        kwargs = {}
-        if status == "skipped":
-            kwargs["skip_reason"] = "requested category unavailable"
-        elif status == "error":
-            kwargs["error_message"] = "execution failed"
-        pytorch = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status=status,
-            **kwargs,
-        )
-
-        assert "pytorch_sdpa_backend_requested" not in pytorch.to_dict()
-
-    def test_warnings_serialize_for_reference_timing_rows(self):
-        pe = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="success",
-            role="reference",
-            warnings=[
-                "RMSNormBackwardAttributes uses a manual formula; "
-                "PyTorch reference timing is not solely built-in PyTorch operator time."
-            ],
-        )
-
-        d = pe.to_dict()
-
-        assert d["warnings"] == pe.warnings
-
-    def test_error_serializes_without_timing(self):
-        """ProviderEngineResult with status='error' serializes with
-        status, error_message, no timing data."""
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="error",
-            error_message="build failed",
-        )
-        d = pe.to_dict()
-        assert d["status"] == "error"
-        assert d["error_message"] == "build failed"
-        assert "cpu_build_time_ms" not in d
-        assert "gpu_kernel_stats" not in d
-        assert "host_stats" not in d
-
-    def test_skipped_serializes_with_reason(self):
-        """ProviderEngineResult with status='skipped' serializes with
-        status, skip_reason."""
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="skipped",
-            skip_reason="not supported",
-        )
-        d = pe.to_dict()
-        assert d["status"] == "skipped"
-        assert d["skip_reason"] == "not supported"
-        assert "cpu_build_time_ms" not in d
-
-    def test_error_status_serializes_correctness(self):
-        """C-01: error-status results with a populated correctness still
-        emit the correctness block in to_dict()."""
-        corr = CorrectnessResult.failed(
-            rtol=1e-5, atol=1e-8, error_message="build failed"
-        )
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=2,
-            status="error",
-            error_message="build failed",
-            correctness=corr,
-        )
-        d = pe.to_dict()
-        assert d["status"] == "error"
-        assert d["error_message"] == "build failed"
-        assert "correctness" in d
-        assert d["correctness"]["execution_success"] is False
-        assert d["correctness"]["tolerance_match"] is None
-        assert d["correctness"]["error_message"] == "build failed"
-
-    def test_skipped_status_serializes_correctness(self):
-        """C-01: skipped-status results with correctness still emit correctness."""
-        corr = CorrectnessResult.failed(
-            rtol=1e-5, atol=1e-8, error_message="not supported"
-        )
-        pe = ProviderEngineResult(
-            provider="miopen",
-            engine_id=3,
-            status="skipped",
-            skip_reason="not supported",
-            correctness=corr,
-        )
-        d = pe.to_dict()
-        assert d["status"] == "skipped"
-        assert d["skip_reason"] == "not supported"
-        assert "correctness" in d
-        assert d["correctness"]["execution_success"] is False
-
-
-class TestCorrectnessFailed:
-    """Tests for CorrectnessResult.failed factory (S-01)."""
-
-    def test_failed_factory_sets_expected_fields(self):
-        cr = CorrectnessResult.failed(rtol=1e-3, atol=1e-6, error_message="boom")
-        assert cr.execution_success is False
-        assert cr.tolerance_match is None
-        assert cr.rtol == 1e-3
-        assert cr.atol == 1e-6
-        assert cr.error_message == "boom"
-        assert cr.passed is False
-
-
-class TestGraphResult:
-    """Tests for GraphResult dataclass."""
-
-    def test_contains_graph_name_path_results(self):
-        """GraphResult contains graph_name, graph_path, list of
-        ProviderEngineResult."""
-        pe = ProviderEngineResult(
-            provider="miopen", engine_id=0, status="success", cpu_build_time_ms=5.0
-        )
-        gr = GraphResult(
-            graph_name="conv_fwd", graph_path="/path/to/conv.json", results=[pe]
-        )
-        assert gr.graph_name == "conv_fwd"
-        assert gr.graph_path == "/path/to/conv.json"
-        assert len(gr.results) == 1
-
-    def test_to_dict_nesting(self):
-        """GraphResult.to_dict produces correct nesting."""
-        pe = ProviderEngineResult(
-            provider="miopen", engine_id=0, status="error", error_message="fail"
-        )
-        gr = GraphResult(graph_name="conv", graph_path="/p/conv.json", results=[pe])
-        d = gr.to_dict()
-        assert d["graph_name"] == "conv"
-        assert d["graph_path"] == "/p/conv.json"
-        assert len(d["results"]) == 1
-        assert d["results"][0]["status"] == "error"
-
-    def test_count_by_status_buckets_all_outcomes(self):
-        """count_by_status returns the correct bucket counts."""
-        pass_corr = CorrectnessResult(
-            execution_success=True, tolerance_match=True, rtol=1e-5, atol=1e-8
-        )
-        fail_corr = CorrectnessResult(
-            execution_success=True, tolerance_match=False, rtol=1e-5, atol=1e-8
-        )
-        none_corr = CorrectnessResult(
-            execution_success=True, tolerance_match=None, rtol=1e-5, atol=1e-8
-        )
-        results = [
-            # 2 passes (one with explicit pass, one with no comparison)
-            ProviderEngineResult(
-                provider="p", engine_id=0, status="success", correctness=pass_corr
-            ),
-            ProviderEngineResult(
-                provider="p", engine_id=1, status="success", correctness=none_corr
-            ),
-            # 1 fail
-            ProviderEngineResult(
-                provider="p", engine_id=2, status="success", correctness=fail_corr
-            ),
-            # 1 skipped
-            ProviderEngineResult(
-                provider="p", engine_id=3, status="skipped", skip_reason="x"
-            ),
-            # 1 errored
-            ProviderEngineResult(
-                provider="p", engine_id=4, status="error", error_message="y"
-            ),
-        ]
-        gr = GraphResult(graph_name="g", graph_path="/p.json", results=results)
-        counts = gr.count_by_status()
-        assert counts.passed == 2
-        assert counts.failed == 1
-        assert counts.skipped == 1
-        assert counts.errored == 1
-
-    def test_count_by_status_success_without_correctness_counts_as_passed(self):
-        """A success with correctness=None counts as passed."""
-        pe = ProviderEngineResult(
-            provider="p", engine_id=0, status="success", correctness=None
-        )
-        gr = GraphResult(graph_name="g", graph_path="/p.json", results=[pe])
-        counts = gr.count_by_status()
-        assert counts == StatusCounts(passed=1, failed=0, skipped=0, errored=0)
-
-    def test_count_by_status_excludes_reference_rows(self):
-        """Timed reference rows are reported but not counted as engine passes."""
-        reference = ProviderEngineResult(
-            provider="pytorch",
-            engine_id=0,
-            status="success",
-            role="reference",
-        )
-        engine = ProviderEngineResult(provider="miopen", engine_id=1, status="success")
-        gr = GraphResult(
-            graph_name="g", graph_path="/p.json", results=[reference, engine]
-        )
-
-        counts = gr.count_by_status()
-
-        assert counts == StatusCounts(passed=1, failed=0, skipped=0, errored=0)
-
-    def test_count_by_status_empty_results(self):
-        """An empty results list yields all-zero counts."""
-        gr = GraphResult(graph_name="g", graph_path="/p.json", results=[])
-        counts = gr.count_by_status()
-        assert counts == StatusCounts(passed=0, failed=0, skipped=0, errored=0)
-
-
-class TestSuiteResult:
-    """Tests for SuiteResult and SuiteMetadata dataclasses."""
-
-    def _make_suite_result(self):
-        """Create a minimal SuiteResult for testing."""
-        meta = SuiteMetadata(
-            timestamp="2026-01-01T00:00:00Z",
-            hostname="testhost",
-            total_graphs=2,
-            total_combinations=2,
-            pass_combinations=1,
-            fail_combinations=1,
-            skip_combinations=0,
-            error_combinations=0,
-            rocm_version="6.0",
-            gpu_model="MI300X",
-            gpu_arch="gfx942",
-            python_version="3.12.3",
-            hipdnn_version="0.1.0",
-        )
-        stats = BenchmarkStats(
-            mean_ms=1.0, std_ms=0.1, min_ms=0.5, max_ms=1.5, p95_ms=1.4, p99_ms=1.49
-        )
-        corr = CorrectnessResult(
-            execution_success=True, tolerance_match=True, rtol=1e-5, atol=1e-8
-        )
-        pe1 = ProviderEngineResult(
-            provider="miopen",
-            engine_id=0,
-            status="success",
-            cpu_build_time_ms=5.0,
-            gpu_kernel_stats=stats,
-            host_stats=stats,
-            correctness=corr,
-        )
-        pe2 = ProviderEngineResult(
-            provider="miopen",
-            engine_id=1,
-            status="error",
-            error_message="fail",
-        )
-        gr1 = GraphResult(graph_name="conv", graph_path="/p/conv.json", results=[pe1])
-        gr2 = GraphResult(graph_name="relu", graph_path="/p/relu.json", results=[pe2])
-        return SuiteResult(metadata=meta, graphs=[gr1, gr2])
-
-    def test_metadata_includes_environment_fields(self):
-        """SuiteResult contains metadata with timestamp, hostname,
-        total_graphs, pass_count, fail_count, rocm_version, gpu_model,
-        python_version, hipdnn_version."""
-        sr = self._make_suite_result()
-        meta_d = sr.metadata.to_dict()
-        assert meta_d["timestamp"] == "2026-01-01T00:00:00Z"
-        assert meta_d["hostname"] == "testhost"
-        assert meta_d["total_graphs"] == 2
-        assert meta_d["total_combinations"] == 2
-        assert meta_d["pass_combinations"] == 1
-        assert meta_d["fail_combinations"] == 1
-        assert meta_d["skip_combinations"] == 0
-        assert meta_d["error_combinations"] == 0
-        assert meta_d["rocm_version"] == "6.0"
-        assert meta_d["gpu_model"] == "MI300X"
-        assert meta_d["gpu_arch"] == "gfx942"
-        assert meta_d["python_version"] == "3.12.3"
-        assert meta_d["hipdnn_version"] == "0.1.0"
-        assert meta_d["pytorch_sdpa_backend_requested"] is None
-        assert meta_d["pytorch_rocm_fa_library_requested"] is None
-        assert "pytorch_sdpa_category_executed" not in meta_d
-
-    def test_to_dict_graph_first_nesting(self):
-        """SuiteResult.to_dict() produces graph-first nesting: top-level
-        'graphs' array, each with 'results' array."""
-        sr = self._make_suite_result()
-        d = sr.to_dict()
-        assert "metadata" in d
-        assert "graphs" in d
-        assert isinstance(d["graphs"], list)
-        assert len(d["graphs"]) == 2
-        for g in d["graphs"]:
-            assert "graph_name" in g
-            assert "results" in g
-            assert isinstance(g["results"], list)
-
-    def test_save_json_writes_valid_file(self):
-        """SuiteResult.save_json(path) writes valid JSON to file."""
-        sr = self._make_suite_result()
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            path = f.name
-
-        sr.save_json(path)
-
-        loaded = json.loads(Path(path).read_text())
-        assert "metadata" in loaded
-        assert "graphs" in loaded
-        assert len(loaded["graphs"]) == 2
-
-        # Cleanup
-        Path(path).unlink()
-
-    def test_timing_stats_include_all_fields(self):
-        """SuiteResult.to_dict() timing stats include mean, std, min, max, p95, p99."""
-        sr = self._make_suite_result()
-        d = sr.to_dict()
-        # Get the first successful result
-        first_graph = d["graphs"][0]
-        first_result = first_graph["results"][0]
-        gpu_stats = first_result["gpu_kernel_stats"]
-        host_stats = first_result["host_stats"]
-
-        for stats in [gpu_stats, host_stats]:
-            assert "mean_ms" in stats
-            assert "std_ms" in stats
-            assert "min_ms" in stats
-            assert "max_ms" in stats
-            assert "p95_ms" in stats
-            assert "p99_ms" in stats
-
-    def test_from_graph_results_preserves_pytorch_sdpa_requests(self) -> None:
-        result = SuiteResult.from_graph_results(
-            [],
-            total_graphs=0,
-            pytorch_sdpa_backend_requested="flash",
-            pytorch_rocm_fa_library_requested="aotriton",
-        )
-
-        assert result.metadata.pytorch_sdpa_backend_requested == "flash"
-        assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
-        metadata = result.to_dict()["metadata"]
-        assert metadata["pytorch_sdpa_backend_requested"] == "flash"
-        assert metadata["pytorch_rocm_fa_library_requested"] == "aotriton"
-        assert "pytorch_sdpa_category_executed" not in metadata
-
-
-class TestCollectEnvironmentInfo:
-    """Tests for collect_environment_info helper."""
-
-    def test_returns_python_version(self):
-        """collect_environment_info always includes python_version."""
-        info = collect_environment_info()
-        assert "python_version" in info
-        assert info["python_version"] is not None
-        # Should be x.y.z format
-        parts = info["python_version"].split(".")
-        assert len(parts) == 3
-
-    def test_includes_gpu_arch_from_detect_arch(self, monkeypatch):
-        """gpu_arch is sourced from metrics.arch.detect_arch so the
-        JSON output and the rocprof_pmc PMC keying agree on the
-        gfx target. Patch the binding in suite_results (where the name
-        is now bound at import time), not in arch_mod — patching the
-        source module after the name has been imported wouldn't take."""
-        from dnn_benchmarking.reporting import suite_results as sr_mod
-
-        monkeypatch.setattr(sr_mod, "detect_arch", lambda: "gfx942")
-        info = collect_environment_info()
-        assert info["gpu_arch"] == "gfx942"
-
-    def test_includes_cuda_and_cudnn_keys(self):
-        """collect_environment_info always exposes the CUDA version keys.
-
-        The values are platform-dependent (populated only on a CUDA
-        host), but the keys must always be present so the JSON schema is
-        stable across ROCm and CUDA runs."""
-        info = collect_environment_info()
-        assert "cuda_version" in info
-        assert "cudnn_version" in info
-
-
-class TestFormatCudnnVersion:
-    """Tests for the packed-int cuDNN version decoder."""
-
+class TestVerdict:
     @pytest.mark.parametrize(
-        "raw,expected",
+        "row, expected",
         [
-            (92000, "9.20.0"),
-            (90000, "9.0.0"),
-            (91300, "9.13.0"),
-            (90201, "9.2.1"),
-            (8907, "8.9.7"),  # pre-9 packing scheme
+            (_row(correctness=_correct(True)), "passed"),
+            (_row(correctness=_correct(False)), "failed"),
+            (_row(correctness=_correct(None)), "unchecked"),
+            (_row(correctness=None), "unchecked"),
+            (_row(role="reference", correctness=_correct(False)), "reference"),
+            (_row(status="error", correctness=_correct(True)), "error"),
+            (_row(status="error", role="reference"), "error"),
+            (_row(status="skipped"), "skipped"),
         ],
     )
-    def test_decodes_packed_int(self, raw, expected):
-        assert _format_cudnn_version(raw) == expected
+    def test_verdict_matrix(self, row, expected) -> None:
+        assert row.verdict == expected
 
-    @pytest.mark.parametrize("raw", [None, 0])
-    def test_missing_version_returns_none(self, raw):
-        assert _format_cudnn_version(raw) is None
+    def test_row_factories_carry_reason_without_correctness(self) -> None:
+        err = ProviderEngineResult.error_row("hipdnn", 5, "boom", engine_name="E")
+        skip = ProviderEngineResult.skipped_row("pytorch", None, "unsupported")
+        assert (err.verdict, err.to_dict()["message"]) == ("error", "boom")
+        assert (skip.verdict, skip.to_dict()["message"]) == ("skipped", "unsupported")
+        assert err.ootb.correctness is None and skip.ootb.correctness is None
 
 
-def _stats(mean_ms: float) -> BenchmarkStats:
-    return BenchmarkStats(
-        mean_ms=mean_ms,
-        std_ms=0.0,
-        min_ms=mean_ms,
-        max_ms=mean_ms,
-        p95_ms=mean_ms,
-        p99_ms=mean_ms,
+class TestGraphStatusAndSummary:
+    def test_graph_status(self) -> None:
+        assert GraphResult("g", "p", [], engine_ids=[1]).status == "ok"
+        assert GraphResult("g", "p", []).status == "no_engines"
+        assert GraphResult("g", "p", [], engine_ids=[1], error="x").status == "error"
+
+    def test_summary_counts_engine_rows_only(self) -> None:
+        rows = [
+            _row(correctness=_correct(True)),
+            _row(correctness=_correct(False)),
+            _row(),
+            _row(status="skipped"),
+            _row(status="error"),
+            _row(role="reference"),
+            _row(status="error", role="reference"),
+        ]
+        suite = _suite(
+            [
+                GraphResult("a", "a.json", rows, engine_ids=[1]),
+                GraphResult("b", "b.json", [], error="load failed"),
+                GraphResult("c", "c.json", []),
+            ]
+        )
+        assert suite.summary() == {
+            "graphs": 3,
+            "rows": 5,
+            "passed": 1,
+            "unchecked": 1,
+            "failed": 1,
+            "skipped": 1,
+            "errors": 1,
+            "graph_errors": 1,
+            "no_engine_graphs": 1,
+        }
+
+    def test_summary_recomputed_after_mutation(self) -> None:
+        suite = _suite([GraphResult("a", "a.json", [], engine_ids=[1])])
+        suite.graphs[0].results.append(_row())
+        assert suite.summary()["unchecked"] == 1
+        assert suite.to_dict()["summary"]["rows"] == 1
+
+
+def _kernel(*timings) -> BenchmarkStats:
+    return BenchmarkStats.from_timings(list(timings))
+
+
+def _tuned_row(
+    ootb=(2.0, 2.0, 2.0, 20.0),
+    tuned=(1.0, 1.0, 1.0, 9.0),
+    ootb_correctness=None,
+    tuned_correctness=None,
+) -> ProviderEngineResult:
+    # Default samples are skewed, so means (6.5, 3.0) differ from medians (2, 1).
+    row = _row(correctness=ootb_correctness)
+    row.ootb.gpu_kernel_stats = _kernel(*ootb) if ootb is not None else None
+    row.oracle = OracleResult(
+        tuning_available=True,
+        gpu_kernel_stats=_kernel(*tuned) if tuned is not None else None,
+        correctness=tuned_correctness,
+    )
+    return row
+
+
+class TestOracleSpeedup:
+    def test_is_ootb_median_over_tuned_median(self) -> None:
+        assert oracle_speedup(_tuned_row()) == 2.0
+
+    def test_no_tuned_run_means_no_speedup(self) -> None:
+        row = _row()
+        row.ootb.gpu_kernel_stats = _kernel(1.0)
+        assert oracle_speedup(row) is None
+
+    @pytest.mark.parametrize(
+        "ootb_match, tuned_match, expected",
+        [
+            (False, True, None),
+            (True, False, None),
+            (None, None, 2.0),  # unchecked is not a failure
+            (True, True, 2.0),
+        ],
+    )
+    def test_explicit_validation_failure_suppresses_speedup(
+        self, ootb_match, tuned_match, expected
+    ) -> None:
+        row = _tuned_row(
+            ootb_correctness=_correct(ootb_match),
+            tuned_correctness=_correct(tuned_match),
+        )
+        assert oracle_speedup(row) == expected
+
+    @pytest.mark.parametrize(
+        "ootb, tuned",
+        [((2.0,), (0.0,)), ((0.0,), (2.0,)), (None, (1.0,)), ((1.0,), None)],
+    )
+    def test_missing_or_non_positive_median_means_no_speedup(self, ootb, tuned) -> None:
+        assert oracle_speedup(_tuned_row(ootb=ootb, tuned=tuned)) is None
+
+
+def test_graph_id_is_order_independent_and_content_sensitive() -> None:
+    a = graph_id_for({"nodes": [1, 2], "name": "g"})
+    assert a == graph_id_for({"name": "g", "nodes": [1, 2]})
+    assert a != graph_id_for({"name": "g", "nodes": [2, 1]})
+    # Golden value: sha256 of the compact sorted JSON '{"name":"g","nodes":[1,2]}'.
+    # It must not change, or old and new result files stop joining in compare.
+    assert a == "b01a1b729a95"
+
+
+def _sample_suite(complete=True) -> SuiteResult:
+    # Skewed samples so mean != median; every value-carrying field distinct.
+    row = ProviderEngineResult(
+        "hipdnn",
+        -1,
+        "success",
+        engine_name="MIOPEN_ENGINE",
+        elapsed_time_ms=2500.0,
+        ootb=PlanResult(
+            gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 29 + [5.0]),
+            host_stats=BenchmarkStats.from_timings([0.01] * 29 + [1.0]),
+            correctness=CorrectnessResult(True, 1e-3, 1e-5, max_abs_diff=2e-6),
+            timing=TimingInfo("staged", "hip", 10, 30, 3.0),
+            cpu_build_time_ms=12.0,
+            workspace_bytes=4096,
+            derived_tflops_per_s=1.5,
+            derived_gbytes_per_s=20.0,
+        ),
+    )
+    return _suite(
+        [
+            GraphResult("g", "g.json", [row], engine_ids=[-1], graph_id="0123456789ab"),
+            GraphResult("bad", "bad.json", [], error="parse failed"),
+            GraphResult("none", "none.json", [], message="no engine configs"),
+        ],
+        complete=complete,
     )
 
 
-def _oracle(**overrides) -> OracleResult:
-    kwargs = dict(
-        plan_name="plan_x",
-        compiled_plan_index=3,
-        rank=0,
-        sweep_min_time_ms=0.8,
-        compiled_plans_benchmarked=4,
-        compiled_plans_total=4,
-        compiled_plans_failed=0,
-        knob_settings=[],
+class TestWriteLoad:
+    def test_round_trip(self, tmp_path) -> None:
+        suite = _sample_suite()
+        path = tmp_path / "out" / "r.json"
+        suite.write(path)
+        assert SuiteResult.load(path) == json.loads(suite.to_json())
+        assert [p.name for p in path.parent.iterdir()] == ["r.json"]
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX permission bits; Windows only has read-only"
     )
-    kwargs.update(overrides)
-    return OracleResult(**kwargs)
+    def test_written_file_follows_umask(self, tmp_path) -> None:
+        path = tmp_path / "r.json"
+        old = os.umask(0o022)
+        try:
+            _sample_suite().write(path)
+        finally:
+            os.umask(old)
+        assert path.stat().st_mode & 0o777 == 0o644
 
+    def test_load_rejects_non_json_naming_the_file(self, tmp_path) -> None:
+        path = tmp_path / "r.csv"
+        _sample_suite().write(path)
+        with pytest.raises(ValueError, match="r.csv"):
+            SuiteResult.load(path)
 
-class TestOracleSerialization:
-    """Oracle payload emission on ProviderEngineResult."""
+    def test_failed_serialization_leaves_previous_file(self, tmp_path) -> None:
+        path = tmp_path / "r.json"
+        _sample_suite().write(path)
+        before = path.read_text()
+        broken = _sample_suite()
+        broken.graphs[0].results[0].extra_metrics = {"bad": object()}
+        with pytest.raises(TypeError):
+            broken.write(path)
+        assert path.read_text() == before
+        assert [p.name for p in tmp_path.iterdir()] == ["r.json"]
 
-    def test_oracle_keys_absent_when_unset(self):
-        pe = ProviderEngineResult(provider="p", engine_id=1, status="success")
-        d = pe.to_dict()
-        assert not {"oracle", "oracle_delta", "oracle_error"} & set(d)
+    def test_failed_rename_leaves_previous_file_and_no_temp(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        path = tmp_path / "r.json"
+        _sample_suite().write(path)
+        before = path.read_text()
+        changed = _sample_suite()
+        changed.graphs.clear()
 
-    def test_oracle_and_delta_serialize_under_success(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(1.0), warm_baseline_gpu_kernel_stats=_stats(2.0)
-        )
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="success",
-            gpu_kernel_stats=_stats(2.0),
-            oracle=oracle,
-        )
-        pe.oracle_delta = build_oracle_delta(oracle)
-        d = pe.to_dict()
-        assert d["oracle"]["plan_name"] == "plan_x"
-        # The engine is the row's own; it is deliberately not duplicated here.
-        assert "engine_id" not in d["oracle"]
-        assert "engine_name" not in d["oracle"]
-        assert d["oracle"]["knob_settings"] == []
-        assert d["oracle"]["exhaustive_requested"] is False
-        assert d["oracle"]["exhaustive_enabled"] is False
-        assert d["oracle"]["tuning_available"] is True
-        assert d["oracle"]["compiled_plans_benchmarked"] == 4
-        assert d["oracle"]["compiled_plans_total"] == 4
-        assert d["oracle"]["compiled_plans_failed"] == 0
-        assert d["oracle"]["gpu_kernel_stats"]["mean_ms"] == 1.0
-        assert d["oracle_delta"]["basis"] == "gpu_kernel"
-        assert d["oracle_delta"]["speedup"] == 2.0
-        assert d["oracle"]["warm_baseline_gpu_kernel_stats"]["mean_ms"] == 2.0
-        assert d["oracle"]["warm_baseline_host_stats"] is None
-        # The comparand is the warm re-timing, not the row's own OOTB number.
-        assert d["oracle_delta"]["baseline_mean_ms"] == 2.0
-        assert "ootb_mean_ms" not in d["oracle_delta"]
+        def fail(src, dst):
+            raise OSError("disk full")
 
-    def test_oracle_error_serializes_under_success(self):
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="success",
-            oracle_error="tuning failed",
-        )
-        assert pe.to_dict()["oracle_error"] == "tuning failed"
+        monkeypatch.setattr(os, "replace", fail)
+        with pytest.raises(OSError, match="disk full"):
+            changed.write(path)
+        assert path.read_text() == before
+        assert [p.name for p in tmp_path.iterdir()] == ["r.json"]
 
-    def test_oracle_keys_absent_on_error_status(self):
-        pe = ProviderEngineResult(
-            provider="p",
-            engine_id=1,
-            status="error",
-            error_message="boom",
-            oracle_error="tuning failed",
-        )
-        assert "oracle_error" not in pe.to_dict()
-
-
-class TestBuildOracleDelta:
-    """Basis selection and guard rails for the warm-baseline comparison."""
-
-    def test_prefers_gpu_kernel_basis(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(1.0),
-            host_stats=_stats(5.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
-            warm_baseline_host_stats=_stats(9.0),
-        )
-        delta = build_oracle_delta(oracle)
-        assert delta is not None
-        assert delta.basis == "gpu_kernel"
-        assert delta.baseline_mean_ms == 2.0
-        assert delta.oracle_mean_ms == 1.0
-        assert delta.delta_ms == 1.0
-        assert delta.speedup == 2.0
-
-    def test_falls_back_to_host_basis(self):
-        # No kernel stats on the tuned side, so the pair cannot be gpu_kernel
-        # even though a warm kernel baseline exists.
-        oracle = _oracle(
-            host_stats=_stats(4.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
-            warm_baseline_host_stats=_stats(8.0),
-        )
-        delta = build_oracle_delta(oracle)
-        assert delta is not None
-        assert delta.basis == "host"
-        assert delta.speedup == 2.0
-
-    def test_returns_none_without_comparable_stats(self):
-        assert build_oracle_delta(_oracle()) is None
-
-    def test_returns_none_without_a_warm_baseline(self):
-        # The row's own OOTB timing must never stand in for the baseline:
-        # it is measured before the sweep and would inflate the speedup.
-        oracle = _oracle(gpu_kernel_stats=_stats(1.0), host_stats=_stats(5.0))
-        assert build_oracle_delta(oracle) is None
-
-    def test_returns_none_when_oracle_mean_is_zero(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(0.0),
-            warm_baseline_gpu_kernel_stats=_stats(2.0),
-        )
-        assert build_oracle_delta(oracle) is None
-
-    def test_returns_none_when_baseline_mean_is_zero(self):
-        oracle = _oracle(
-            gpu_kernel_stats=_stats(1.0),
-            warm_baseline_gpu_kernel_stats=_stats(0.0),
-        )
-        assert build_oracle_delta(oracle) is None
-
-
-class TestSuiteMetadataSelectionEnv:
-    """hipdnn_selection_env is recorded only for oracle runs."""
-
-    _NAMES = (
-        "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-        "HIPDNN_CACHE_DIR",
-        "HIPDNN_DISABLE_CACHE",
-        "HIPDNN_FORCE_BENCHMARKING",
-        "MIOPEN_USER_DB_PATH",
-        "MIOPEN_CUSTOM_CACHE_DIR",
+    @pytest.mark.parametrize(
+        "version", [{}, {"schema_version": 1}, {"schema_version": 3}]
     )
+    def test_load_refuses_other_schema_versions(self, tmp_path, version) -> None:
+        path = tmp_path / "other.json"
+        path.write_text(json.dumps({**version, "metadata": {}, "graphs": []}))
+        with pytest.raises(ValueError, match="schema_version"):
+            SuiteResult.load(path)
 
-    def test_absent_without_oracle(self):
-        sr = SuiteResult.from_graph_results([], total_graphs=0)
-        assert sr.metadata.hipdnn_selection_env is None
-        assert "hipdnn_selection_env" not in sr.to_dict()["metadata"]
+    def test_load_warns_on_partial_results(self, tmp_path, capsys) -> None:
+        path = tmp_path / "partial.json"
+        _sample_suite(complete=False).write(path)
+        SuiteResult.load(path)
+        assert "partial" in capsys.readouterr().err
 
-    def test_records_all_names_with_oracle(self, monkeypatch):
-        for name in self._NAMES:
-            monkeypatch.delenv(name, raising=False)
-        monkeypatch.setenv("HIPDNN_CACHE_DIR", "/tmp/cache")
+    def test_floats_are_rounded_in_both_layouts(self, tmp_path) -> None:
+        suite = _sample_suite()
+        suite.graphs[0].results[0].ootb.derived_tflops_per_s = 1 / 3
+        indented, compact = tmp_path / "i.json", tmp_path / "c.json"
+        suite.write(indented)
+        suite.write(compact, compact=True)
+        text = compact.read_text()
+        assert "\n" not in text and ", " not in text and ": " not in text
+        assert indented.read_text().startswith('{\n "schema_version": 2,')
+        assert SuiteResult.load(compact) == SuiteResult.load(indented)
+        row = SuiteResult.load(compact)["graphs"][0]["results"][0]
+        assert row["ootb"]["tflops"] == 0.333333
 
-        sr = SuiteResult.from_graph_results([], total_graphs=0, oracle=True)
-        env = sr.to_dict()["metadata"]["hipdnn_selection_env"]
-        assert set(env) == set(self._NAMES)
-        assert env["HIPDNN_CACHE_DIR"] == "/tmp/cache"
-        assert env["HIPDNN_DISABLE_EXACT_ENGINE_CACHE"] is None
-        assert env["HIPDNN_DISABLE_CACHE"] is None
-        assert env["HIPDNN_FORCE_BENCHMARKING"] is None
+    def test_json_row_values(self, tmp_path) -> None:
+        path = tmp_path / "r.json"
+        _sample_suite().write(path)
+        row = SuiteResult.load(path)["graphs"][0]["results"][0]
+        assert row["elapsed_s"] == 2.5
+        ootb = row["ootb"]
+        assert ootb["build_ms"] == 12.0
+        assert ootb["kernel"]["median_ms"] == 0.5
+        assert ootb["host"]["median_ms"] == 0.01
+        assert (ootb["tflops"], ootb["gbps"], ootb["workspace_bytes"]) == (
+            1.5,
+            20.0,
+            4096,
+        )
+
+    def test_csv_rows(self, tmp_path) -> None:
+        path = tmp_path / "r.csv"
+        _sample_suite().write(path)
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        assert tuple(reader.fieldnames) == ROW_COLUMNS
+        row, graph_error, no_engines = rows
+        # IQR over the median, in percent.
+        kernel = _sample_suite().graphs[0].results[0].ootb.gpu_kernel_stats
+        expected = kernel.iqr_ms / kernel.median_ms * 100
+        assert float(row.pop("kernel_iqr_pct")) == pytest.approx(expected, rel=1e-5)
+        assert row == {
+            "gpu_arch": "gfx90a",
+            "graph_name": "g",
+            "graph_id": "0123456789ab",
+            "runtime": "hipdnn",
+            "role": "engine",
+            "engine_id": "0xFFFFFFFFFFFFFFFF",
+            "engine_name": "MIOPEN_ENGINE",
+            "status": "success",
+            "verdict": "passed",
+            "kernel_median_ms": "0.5",
+            "host_median_ms": "0.01",
+            "samples": "30",
+            "timing_mode": "staged",
+            "cache_mode": "cold",
+            "timing_block": "4",
+            "seed": "7",
+            "tflops": "1.5",
+            "gbps": "20.0",
+            "workspace_bytes": "4096",
+            "max_abs_diff": "2e-06",
+            "message": "",
+        }
+        assert no_engines["seed"] == "7"
+        assert (graph_error["graph_name"], graph_error["status"]) == ("bad", "error")
+        assert graph_error["message"] == "parse failed"
+        assert no_engines["status"] == "no_engines"
+        assert no_engines["message"] == "no engine configs"
+
+    def test_csv_writes_non_finite_statistics_as_empty_cells(self, tmp_path) -> None:
+        suite = _sample_suite()
+        suite.graphs[0].results[0].ootb.gpu_kernel_stats = BenchmarkStats.from_timings(
+            [float("nan")] * 3
+        )
+        path = tmp_path / "r.csv"
+        suite.write(path)
+        with open(path) as f:
+            row = next(csv.DictReader(f))
+        assert row["kernel_median_ms"] == ""

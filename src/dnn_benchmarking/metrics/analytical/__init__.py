@@ -55,10 +55,10 @@ Per-op FLOP / IO handlers live in this directory split by op family:
 ``reduction.py``. The dispatch table is the single source of truth
 for which node types we recognise.
 
-When a graph contains a node type this module does not recognise, the
-``partial`` flag in :func:`compute_flops` is set so callers can label
-the value as incomplete, and a one-shot warning surfaces the unknown
-type via :mod:`.._diagnostic.warn_once`.
+When a graph contains a node that this module cannot model (an unknown
+node type, or missing tensor data), :func:`compute_flops` returns ``None``
+rather than a partial count, and a one-shot warning names the unknown type
+via :mod:`.._diagnostic.warn_once`.
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -85,8 +85,8 @@ from .reduction import reduction_flops, resample_bwd_flops, resample_fwd_flops
 from .sdpa import sdpa_bwd_flops, sdpa_fwd_flops
 
 # Dispatch table: node "type" -> handler returning int FLOPs (or None
-# when tensor data is incomplete). Unrecognised types flip the
-# ``partial`` flag in compute_flops.
+# when tensor data is incomplete). An unrecognised type makes
+# compute_flops return None.
 _FLOP_HANDLERS = {
     # Convolution: hipDNN's actual node names are ConvolutionFwdAttributes,
     # ConvolutionBwdAttributes (dgrad), and ConvolutionWrwAttributes
@@ -127,58 +127,37 @@ _FLOP_HANDLERS = {
 }
 
 
-def compute_flops(graph_json: Dict[str, Any]) -> Tuple[Optional[int], bool]:
+def compute_flops(graph_json: Dict[str, Any]) -> Optional[int]:
     """Sum analytical FLOPs across a graph's nodes.
 
     Args:
         graph_json: Parsed hipDNN graph dictionary.
 
     Returns:
-        ``(total_flops, partial)``. ``total_flops`` is ``None`` when the
-        graph has no nodes at all, or when no node could be modelled
-        analytically (every node was unrecognised or lacked tensor
-        data) — a count of ``0`` in that case would be indistinguishable
-        from a genuine zero-FLOP graph, so ``None`` ("unknown") is
-        returned instead. ``partial`` is True when at least one node was
-        unrecognised or had missing tensor data; the returned sum then
-        reflects only the recognised nodes.
-
-    Unrecognised node types also surface a one-shot warning via
-    :func:`warn_once` so the user notices during a run; the structured
-    ``partial`` flag stays as the machine-readable signal.
+        Total FLOPs, or ``None`` ("unknown") when the graph has no nodes
+        or any node cannot be modelled (unknown type or missing tensor
+        data). A partial sum would understate TFLOP/s without saying so.
     """
     nodes = graph_json.get("nodes") or []
     if not nodes:
-        return None, False
+        return None
 
     tensors_by_uid = tensor_lookup(graph_json)
-
     total = 0
-    partial = False
-    modelled_any = False
     for node in nodes:
         node_type = node.get("type", "")
         handler = _FLOP_HANDLERS.get(node_type)
         if handler is None:
-            partial = True
             warn_once(
                 "analytical",
-                f"unrecognised node type {node_type!r}; FLOPs marked partial",
+                f"unrecognised node type {node_type!r}; FLOPs unknown",
             )
-            continue
+            return None
         flops = handler(node, tensors_by_uid)
         if flops is None:
-            partial = True
-            continue
+            return None
         total += flops
-        modelled_any = True
-
-    if not modelled_any:
-        # Nothing could be modelled analytically: report unknown (None)
-        # rather than a misleading 0 that reads as a real FLOP count.
-        return None, partial
-
-    return total, partial
+    return total
 
 
 def compute_io_bytes(tensor_infos: Iterable[TensorInfo]) -> int:
@@ -234,7 +213,7 @@ def derive_throughputs(
 def list_unsupported_node_types(graph_json: Dict[str, Any]) -> List[str]:
     """Return node type strings present in the graph that have no handler.
 
-    Useful for diagnostic output that explains *why* ``partial`` is True.
+    Useful for diagnostic output that explains *why* FLOPs are unknown.
     """
     seen: List[str] = []
     seen_set: set = set()

@@ -8,9 +8,10 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from dnn_benchmarking.common.exceptions import ExecutionError
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
-    _encode_bfloat16_dense_to_storage_bytes,
+    _encode_to_storage_bytes,
 )
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 
@@ -36,18 +37,17 @@ class TestTorchBackend:
         y = _strided(2, "bfloat16", is_output=True)
         bm = BufferManager([x, y], device="cpu")
         bm.allocate_all()
-        bm.load_input_data({x.uid: np.arange(6, dtype=np.float32).reshape(2, 3)})
+        x_data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        bm.load_input_data({x.uid: x_data})
         out = np.array([[1.0, -2.5, 3.25], [0.5, 4.0, -6.0]], dtype=np.float32)
-        bm._write_bytes(
-            bm._buffers[y.uid], _encode_bfloat16_dense_to_storage_bytes(out, y)
-        )
+        bm._write_bytes(bm._buffers[y.uid], _encode_to_storage_bytes(out, y))
 
         x_view = bm.get_output_tensor(x.uid)
         y_view = bm.get_output_tensor(y.uid)
 
         assert x_view.dtype == torch.float32
         assert y_view.dtype == torch.bfloat16
-        assert torch.equal(x_view, torch.from_numpy(bm.get_input_data(x.uid)))
+        assert torch.equal(x_view, torch.from_numpy(x_data))
         assert torch.equal(y_view.float(), torch.from_numpy(bm.get_output_data(y.uid)))
         assert torch.equal(y_view.float(), torch.from_numpy(out))
 
@@ -70,6 +70,19 @@ class TestTorchBackend:
 
         assert not bm._buffers[y.uid].any()
 
+    def test_zero_outputs_syncs_torch_before_hipdnn_runs(self, monkeypatch) -> None:
+        """zero_() runs on torch's stream and hipDNN on the handle stream; the
+        device sync is the only ordering between them."""
+        y = _strided(2, "float", is_output=True)
+        bm = BufferManager([y], device="cuda")
+        calls = []
+        bm._buffers[y.uid] = MagicMock(zero_=lambda: calls.append("zero_"))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+
+        bm.zero_outputs()
+
+        assert calls == ["zero_", "sync"]
+
 
 class TestDeviceBufferBackend:
     def test_get_output_tensor_is_none(self) -> None:
@@ -81,3 +94,18 @@ class TestDeviceBufferBackend:
 
         assert bm.get_output_tensor(y.uid) is None
         assert bm.create_variant_pack() == {y.uid: 1234}
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda bm: bm.create_variant_pack(),
+            lambda bm: bm.load_input_data({}),
+            lambda bm: bm.zero_outputs(),
+        ],
+        ids=["create_variant_pack", "load_input_data", "zero_outputs"],
+    )
+    def test_use_before_allocate_all_raises(self, call) -> None:
+        bm = BufferManager([_strided(1, "float", is_output=True)])
+
+        with pytest.raises(ExecutionError, match="Buffers not allocated"):
+            call(bm)

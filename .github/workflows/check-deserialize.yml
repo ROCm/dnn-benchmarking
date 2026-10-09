@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - 'Workloads/**'
+      - 'graphs/**'
       - 'src/dnn_benchmarking/graph/**'
       - 'tools/check_deserialize.py'
       - '.github/workflows/check-deserialize.yml'
@@ -14,6 +15,7 @@ on:
     branches: [main]
     paths:
       - 'Workloads/**'
+      - 'graphs/**'
       - 'src/dnn_benchmarking/graph/**'
       - 'tools/check_deserialize.py'
       - '.github/workflows/check-deserialize.yml'
@@ -58,7 +60,7 @@ jobs:
         run: |
           pip install -e .
           python tools/check_deserialize.py --level json --src src \
-            /tmp/workloads-extracted
+            /tmp/workloads-extracted graphs
 
       # No GPU required: from_json + validate + build_operation_graph only
       # assemble and finalize the backend operation-graph descriptor, no
@@ -72,4 +74,4 @@ jobs:
       - name: Check opgraph-level graph deserialization
         run: |
           .ci-workspace/.venv/bin/python tools/check_deserialize.py \
-            --level opgraph /tmp/workloads-extracted
+            --level opgraph /tmp/workloads-extracted graphs

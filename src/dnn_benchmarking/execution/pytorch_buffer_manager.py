@@ -3,26 +3,24 @@
 
 """PyTorch CUDA tensor management for graph execution."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
 
 from ..common import torch_support
-
 from ..graph.tensor_info import TensorInfo
-from .buffer_manager import generate_input_data
 
-# Map data type strings to torch dtypes
-TORCH_DTYPE_MAP = {
-    "float": torch.float32,
-    "half": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "double": torch.float64,
-    "int8": torch.int8,
-    "int32": torch.int32,
-    "uint8": torch.uint8,
-}
+# Floating dtypes NumPy can hold; the rest (bfloat16, fp8) go to host as float32.
+_NUMPY_FLOATS = (torch.float16, torch.float32, torch.float64)
+
+
+def host_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """Copy a tensor to a dense host array in the validation representation."""
+    host = tensor.detach().cpu()
+    if host.dtype.is_floating_point and host.dtype not in _NUMPY_FLOATS:
+        host = host.float()
+    return host.contiguous().numpy()
 
 
 class PyTorchCudaBufferManager:
@@ -30,7 +28,7 @@ class PyTorchCudaBufferManager:
 
     This class handles:
     - Allocating CUDA tensors for all non-virtual tensors
-    - Filling input tensors with random data
+    - Copying pre-generated inputs to the device
     - Zeroing output tensors
     - Providing tensors for graph execution
     """
@@ -38,7 +36,7 @@ class PyTorchCudaBufferManager:
     def __init__(
         self,
         tensor_infos: List[TensorInfo],
-        device: str = "cuda:0",
+        device: Union[str, torch.device] = "cuda:0",
     ) -> None:
         """Initialize buffer manager with tensor metadata.
 
@@ -49,21 +47,22 @@ class PyTorchCudaBufferManager:
         self._tensor_infos = tensor_infos
         self._device = torch.device(device)
         self._tensors: Dict[int, torch.Tensor] = {}
-        self._host_data: Dict[int, np.ndarray] = {}
 
     def allocate_all(self) -> None:
-        """Allocate CUDA tensors for all non-virtual tensors."""
+        """Allocate CUDA tensors for all non-virtual tensors.
+
+        Raises:
+            UnsupportedGraphError: If torch has no dtype for a tensor.
+        """
         for tensor_info in self._tensor_infos:
             if tensor_info.is_virtual:
                 continue
 
-            dtype = TORCH_DTYPE_MAP.get(tensor_info.data_type.lower(), torch.float32)
+            dtype = tensor_info.dtype.torch_dtype()
             if tensor_info.is_pass_by_value:
-                value = torch.tensor(
+                self._tensors[tensor_info.uid] = torch.tensor(
                     [tensor_info.value], dtype=dtype, device=self._device
                 )
-                self._tensors[tensor_info.uid] = value
-                self._host_data[tensor_info.uid] = np.asarray([tensor_info.value])
                 continue
 
             if tensor_info.strides:
@@ -81,19 +80,16 @@ class PyTorchCudaBufferManager:
                 )
             self._tensors[tensor_info.uid] = tensor
 
-    @staticmethod
-    def _host_numpy(tensor: torch.Tensor) -> np.ndarray:
-        """Copy a tensor to numpy using the validation representation."""
-        host = tensor.detach().cpu()
-        if host.dtype == torch.bfloat16:
-            host = host.to(dtype=torch.float32)
-        return host.contiguous().numpy()
-
     def load_input_data(self, input_data: Dict[int, np.ndarray]) -> None:
         """Copy pre-generated graph input data into CUDA tensors.
 
         The host-to-device copy happens before timing starts so PyTorch
         reference rows preserve the same timing semantics as hipDNN rows.
+        Pass-by-value tensors keep the value set by ``allocate_all`` unless
+        ``input_data`` supplies one.
+
+        Raises:
+            ValueError: If a non-scalar input is missing from ``input_data``.
         """
         for tensor_info in self._tensor_infos:
             if tensor_info.is_output or tensor_info.is_virtual:
@@ -102,30 +98,12 @@ class PyTorchCudaBufferManager:
             data = input_data.get(tensor_info.uid)
             if data is None:
                 if tensor_info.is_pass_by_value:
-                    data = np.asarray([tensor_info.value])
-                else:
-                    raise ValueError(
-                        f"Missing input data for tensor UID {tensor_info.uid}"
-                    )
+                    continue
+                raise ValueError(f"Missing input data for tensor UID {tensor_info.uid}")
 
             tensor = self._tensors.get(tensor_info.uid)
-            if tensor is None:
-                continue
-
-            host_tensor = torch.from_numpy(np.asarray(data))
-            tensor.copy_(host_tensor.to(dtype=tensor.dtype, device=self._device))
-            self._host_data[tensor_info.uid] = self._host_numpy(tensor)
-
-    def fill_inputs_random(self, seed: Optional[int] = None) -> None:
-        """Fill input tensor buffers with random data.
-
-        Args:
-            seed: Optional random seed for reproducibility.
-        """
-        if seed is not None:
-            torch.manual_seed(seed)
-
-        self.load_input_data(generate_input_data(self._tensor_infos, seed))
+            if tensor is not None:
+                tensor.copy_(torch.from_numpy(np.asarray(data)))
 
     def zero_outputs(self) -> None:
         """Zero output tensor buffers."""
@@ -158,18 +136,7 @@ class PyTorchCudaBufferManager:
         if tensor is None:
             return None
 
-        return self._host_numpy(tensor)
-
-    def get_input_data(self, uid: int) -> Optional[np.ndarray]:
-        """Get the host-side input data for a tensor.
-
-        Args:
-            uid: Tensor UID.
-
-        Returns:
-            Numpy array with input data, or None if not found.
-        """
-        return self._host_data.get(uid)
+        return host_numpy(tensor)
 
     def get_output_tensors(self) -> List[TensorInfo]:
         """Get list of output tensor infos.
@@ -182,7 +149,6 @@ class PyTorchCudaBufferManager:
     def cleanup(self) -> None:
         """Free all tensors."""
         self._tensors.clear()
-        self._host_data.clear()
         # Let PyTorch handle CUDA memory cleanup via garbage collection.
         # CPU-only torch installs expose the torch package but not a usable
         # CUDA/ROCm backend; cleanup must remain a no-op there.

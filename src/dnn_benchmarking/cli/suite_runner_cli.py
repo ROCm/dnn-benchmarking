@@ -1,259 +1,107 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Suite benchmark CLI dispatch and shared suite loop."""
+"""Suite CLI: config, startup checks, the per-graph loop, result writes, exit codes."""
 
 import argparse
 import os
+import signal
+import sys
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from ..common.rocm_runtime import default_hipdnn_plugin_paths
-from ..common.exceptions import ExecutionError, GraphLoadError
+from ..common.exceptions import UnsupportedGraphError
+from ..common.pytorch_tuning import apply_pytorch_environment
 from ..config.benchmark_config import (
-    ExecutionBackendName,
-    MetricsConfig,
+    RuntimeName,
     PyTorchSdpaBackendName,
     ReferenceProviderName,
     SuiteConfig,
-    ValidationConfig,
 )
 from ..graph.loader import GraphLoader
+from ..metrics.machine_info import collect_environment_info
+from ..metrics.profiling_orchestrator import check_requested_tools
 from ..reporting.reporter import Reporter
 from ..reporting.suite_results import (
     GraphResult,
-    ProviderEngineResult,
+    RunInfo,
     SuiteResult,
+    engine_id_hex,
+    graph_id_for,
 )
-from ..validation.reference_provider import ReferenceProviderRegistry
+from .runtimes import RuntimeStartupError, GraphRunner, start_runtime
 
-LoadedGraphRunner = Callable[
-    [Path, Dict[str, Any], list, SuiteConfig, Reporter], GraphResult
-]
+#: Minimum seconds between intermediate result writes.
+WRITE_INTERVAL_S = 10.0
 
-
-def _plugin_paths_from_environment() -> Optional[List[Path]]:
-    return default_hipdnn_plugin_paths()
-
-
-def _error_graph_result(graph_path: Path, error_message: str) -> GraphResult:
-    """Build a GraphResult representing a graph-level setup failure."""
-    return GraphResult(
-        graph_name=graph_path.stem,
-        graph_path=str(graph_path),
-        results=[
-            ProviderEngineResult(
-                provider="unknown",
-                engine_id=0,
-                status="error",
-                error_message=error_message,
-            )
-        ],
-    )
-
-
-def _run_one_graph(
-    graph_path: Path,
-    config: SuiteConfig,
-    reporter: Reporter,
-    run_loaded_graph: LoadedGraphRunner,
-) -> GraphResult:
-    """Load and run a single graph. Returns a GraphResult (errors included)."""
-    try:
-        loader = GraphLoader()
-        graph_json = loader.load_json(graph_path)
-        loader.validate(graph_json)
-        tensor_infos = loader.extract_tensor_info(graph_json)
-        result = run_loaded_graph(
-            graph_path, graph_json, tensor_infos, config, reporter
-        )
-        if len(result.results) == 0:
-            return _error_graph_result(
-                graph_path, "No provider/engine combinations matched filters"
-            )
-        return result
-    except (GraphLoadError, ExecutionError) as e:
-        return _error_graph_result(graph_path, str(e))
-
+#: Seconds a SIGTERM'd run gets to write its partial file before a forced exit.
+SIGTERM_GRACE_S = 30.0
 
 # Match hipDNN's documented truthy values. Notably, "0" leaves a switch off.
 _TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
 
-
-def _print_oracle_warnings(config: SuiteConfig, reporter: Reporter) -> None:
-    """Warn once about conditions that make the OOTB baseline non-cold."""
-    exact_cache_enabled = (
-        os.environ.get("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "").strip().lower()
-        not in _TRUTHY_ENV
-    )
-    all_cache_enabled = (
-        os.environ.get("HIPDNN_DISABLE_CACHE", "").strip().lower() not in _TRUTHY_ENV
-    )
-    if exact_cache_enabled or all_cache_enabled:
-        cache_root = os.environ.get("HIPDNN_CACHE_DIR") or "<default>"
-        if exact_cache_enabled:
-            message = (
-                "--oracle-mode: hipDNN's exact-match engine-ranking cache is "
-                "enabled, so the out-of-the-box timing may reflect a "
-                "previously persisted ranking rather than cold heuristic "
-                "selection. Set HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for a "
-                "cold OOTB baseline."
-            )
-        else:
-            message = (
-                "--oracle-mode: HIPDNN_DISABLE_CACHE is not enabled, so "
-                "provider kernel caches remain active and may affect the "
-                "comparison."
-            )
-        reporter.print_warning(
-            f"{message} Cache root: HIPDNN_CACHE_DIR={cache_root}. "
-            "Set HIPDNN_DISABLE_CACHE=1 to disable provider caches."
-        )
-    if config.warmup_iters == 0:
-        reporter.print_warning(
-            "--oracle-mode with --warmup 0: a plan's first execute() may "
-            "sample candidate kernels, so that cost lands inside both timed "
-            "loops"
-        )
-    if config.oracle_exhaustive:
-        reporter.print_warning(
-            "--oracle-mode exhaustive: the tuned pass enables each provider's "
-            "global.benchmarking capability (today the kernel ingestor and "
-            "MIOpen). Other engines stay at plan-level tuning. Providers can "
-            "reuse existing tuned selections, including MIOpen FindDb and "
-            "performance-database entries; this mode does not prove that the "
-            "current invocation performed a fresh search. On a cache miss, "
-            "expect the sweep to take candidates x variants longer."
-        )
+#: Variables that decide hipDNN kernel selection; recorded for oracle/autotune.
+_SELECTION_ENV = (
+    "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
+    "HIPDNN_CACHE_DIR",
+    "HIPDNN_DISABLE_CACHE",
+    "HIPDNN_FORCE_BENCHMARKING",
+    "MIOPEN_USER_DB_PATH",
+    "MIOPEN_CUSTOM_CACHE_DIR",
+)
 
 
-def _print_oracle_comparison(
-    config: SuiteConfig,
-    graph_results: List[GraphResult],
-    reporter: Reporter,
-) -> None:
-    """Print the suite-wide oracle comparison via the reporter."""
-    if not config.oracle_enabled:
-        return
-    # Rows where tuning had no alternative configuration re-measured the
-    # heuristic pick. Averaging them in would dilute a real result with noise.
-    tuned = [
-        pe
-        for gr in graph_results
-        for pe in gr.results
-        if pe.oracle_delta is not None and pe.oracle is not None
-    ]
-    speedups = [pe.oracle_delta.speedup for pe in tuned if pe.oracle.tuning_available]
-    reporter.print_oracle_summary(speedups, len(tuned) - len(speedups))
+class _Terminated(BaseException):
+    """Raised by the SIGTERM handler; BaseException so per-graph isolation
+    (``except Exception``) does not swallow it and the final write runs."""
 
 
-def _run_suite_graphs_after_startup(
-    graph_paths: List[Path],
-    config: SuiteConfig,
-    output_path: Optional[Path],
-    reporter: Reporter,
-    run_loaded_graph: LoadedGraphRunner,
-) -> int:
-    """Run loaded-graph callback for each graph and emit suite output."""
-    total = len(graph_paths)
-    if config.oracle_enabled:
-        _print_oracle_warnings(config, reporter)
-    reporter.print_running_benchmark(total)
-
-    graph_results: List[GraphResult] = []
-    for i, graph_path in enumerate(graph_paths, start=1):
-        reporter.print_suite_graph_start(i, total, graph_path.stem)
-        reporter.print_newline()
-        gr = _run_one_graph(graph_path, config, reporter, run_loaded_graph)
-        if gr.is_no_engine_graph():
-            reporter.print_no_engines_applicable()
-        if config.verbose:
-            reporter.print_verbose_graph_result(gr, config)
-        else:
-            reporter.print_graph_result_table(gr)
-        graph_results.append(gr)
-
-    pytorch_selected = (
-        config.backend is ExecutionBackendName.PYTORCH
-        or config.validation.provider is ReferenceProviderName.PYTORCH
-    )
-
-    suite_result = SuiteResult.from_graph_results(
-        graph_results,
-        total_graphs=total,
-        pytorch_sdpa_backend_requested=(
-            config.pytorch_sdpa_backend.value if pytorch_selected else None
-        ),
-        pytorch_rocm_fa_library_requested=(
-            config.pytorch_rocm_fa_library if pytorch_selected else None
-        ),
-        timing_block=config.timing_block,
-        oracle=config.oracle_enabled,
-    )
-
-    reporter.print_suite_summary(suite_result.metadata)
-    reporter.print_suite_footer()
-    _print_oracle_comparison(config, graph_results, reporter)
-
-    if output_path is not None:
-        suite_result.save_json(str(output_path))
-
-    if suite_result.metadata.fail_combinations > 0:
-        return 2
-    if suite_result.metadata.error_combinations > 0:
-        return 1
-    return 0
+def _raise_terminated(signum: int, frame: Any) -> None:
+    raise _Terminated()
 
 
-def _reference_provider_available(config: SuiteConfig, reporter: Reporter) -> bool:
-    if not config.validation.enabled:
-        return True
-    provider_name = config.validation.provider.value
-    try:
-        ref = ReferenceProviderRegistry.get_provider(provider_name)
-    except ValueError:
-        reporter.print_error(f"Reference provider '{provider_name}' is not registered.")
-        return False
-    if not ref.is_available():
-        reporter.print_error(
-            f"Reference provider '{provider_name}' is not available "
-            "(check that its dependencies are installed)."
-        )
-        return False
-    return True
+def _arm_sigterm_watchdog() -> Callable[[], None]:
+    """Force exit 143 if a SIGTERM is not handled within SIGTERM_GRACE_S.
+
+    A Python handler runs only between bytecodes, so it never runs while the
+    main thread waits in native GPU code (a hung kernel). The C-level handler
+    still writes the signal number to the wakeup fd, which wakes this thread.
+    Returns the function that disarms it once the run has handled the signal."""
+    if sys.platform == "win32":  # no wakeup-fd pipe; os.kill(SIGTERM) ends it
+        return lambda: None
+    handled = threading.Event()
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)  # required by set_wakeup_fd
+    previous_fd = signal.set_wakeup_fd(write_fd)
+    grace_s = SIGTERM_GRACE_S
+
+    def watch() -> None:
+        try:
+            while data := os.read(read_fd, 64):  # b"" once disarmed
+                if signal.SIGTERM in data and not handled.wait(grace_s):
+                    os._exit(143)
+        finally:
+            os.close(read_fd)
+
+    threading.Thread(target=watch, name="sigterm-watchdog", daemon=True).start()
+
+    def disarm() -> None:
+        handled.set()
+        signal.set_wakeup_fd(previous_fd)
+        os.close(write_fd)
+
+    return disarm
 
 
-def run_suite_benchmark(
-    graph_paths: List[Path],
-    config: SuiteConfig,
-    output_path: Optional[Path],
-    reporter: Reporter,
-    tarball_source: Optional[str] = None,
-) -> int:
-    """Run the benchmark suite and return an exit code."""
-    if not _reference_provider_available(config, reporter):
-        return 1
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV
 
-    if config.backend == ExecutionBackendName.PYTORCH:
-        from .pytorch_suite_runner import run_pytorch_suite_benchmark
 
-        return run_pytorch_suite_benchmark(
-            graph_paths=graph_paths,
-            config=config,
-            output_path=output_path,
-            reporter=reporter,
-            tarball_source=tarball_source,
-        )
-
-    from .hipdnn_suite_runner import run_hipdnn_suite_benchmark
-
-    return run_hipdnn_suite_benchmark(
-        graph_paths=graph_paths,
-        config=config,
-        output_path=output_path,
-        reporter=reporter,
-        tarball_source=tarball_source,
-    )
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def run_suite_cli(
@@ -261,176 +109,345 @@ def run_suite_cli(
     graph_paths: List[Path],
     reporter: Reporter,
     tarball_source: Optional[str] = None,
+    argv: Optional[List[str]] = None,
 ) -> int:
-    """Validate suite CLI args, build config, and delegate to run_suite_benchmark."""
+    """Build the config, run startup checks, run the suite; return the exit code.
+
+    ``argv`` is the command line recorded as ``run.argv`` (default ``sys.argv``).
+    """
     try:
-        backend = ExecutionBackendName(args.backend)
-        validation = ValidationConfig(
-            provider=args.validate,
-            rtol=args.rtol,
-            atol=args.atol,
-        )
-        metrics_config = MetricsConfig(
-            tier=args.metrics_tier,
-            emit_trace=args.emit_trace,
-            pmc_set=args.pmc,
-            perf=args.perf,
-            roofline=args.roofline,
-            pmc_allow_multipass=args.pmc_allow_multipass,
-            profiling_output_dir=args.profiling_output_dir,
-            profiling_timeout_s=args.profiling_timeout,
-        )
-        if backend is ExecutionBackendName.PYTORCH:
-            if args.engine:
-                reporter.print_error("--engine is not supported with --backend pytorch")
-                return 1
-            if args.plugin_path:
-                reporter.print_error(
-                    "--plugin-path is not supported with --backend pytorch"
-                )
-                return 1
-            if validation.provider is ReferenceProviderName.PYTORCH:
-                reporter.print_error(
-                    "--validate pytorch is not supported with --backend pytorch "
-                    "(the backend would validate against itself)"
-                )
-                return 1
-            if metrics_config.opt_in_pass_requested:
-                reporter.print_error(
-                    "Profiling options (--pmc, --emit-trace, --perf, "
-                    "--roofline) are not supported with --backend pytorch"
-                )
-                return 1
-            if args.oracle_mode != "off":
-                reporter.print_error(
-                    "--oracle-mode is not supported with --backend pytorch "
-                    "(auto-tuning is a hipDNN engine feature)"
-                )
-                return 1
-        # --profiling-output-dir is only meaningful when at least one
-        # opt-in profiling source fires. Passing it solo is a silent
-        # no-op today; surface that as a soft warning so the user
-        # knows to add --pmc / --emit-trace / --perf / --roofline.
-        if (
-            metrics_config.profiling_output_dir is not None
-            and not metrics_config.opt_in_pass_requested
-        ):
-            reporter.print_warning(
-                "--profiling-output-dir set but no opt-in profiling "
-                "source requested (--pmc, --emit-trace, --perf, "
-                "--roofline); the directory will not be written to"
-            )
-        if args.oracle_mode == "exhaustive" and args.warmup == 0:
-            reporter.print_error(
-                "--oracle-mode exhaustive requires --warmup >= 1: with "
-                "benchmarking forced, a plan's first execute() samples kernel "
-                "variants, and at zero warmup that sampling lands inside the "
-                "timed loop"
-            )
-            return 1
-        if (
-            (
-                args.pytorch_sdpa_backend != PyTorchSdpaBackendName.DEFAULT.value
-                or args.pytorch_rocm_fa_library is not None
-            )
-            and backend is not ExecutionBackendName.PYTORCH
-            and validation.provider is not ReferenceProviderName.PYTORCH
-        ):
-            reporter.print_warning(
-                "PyTorch SDPA options are ignored unless --backend pytorch or "
-                "--validate pytorch is selected"
-            )
-        plugin_paths = None
-        if backend is not ExecutionBackendName.PYTORCH:
-            plugin_paths = args.plugin_path or _plugin_paths_from_environment()
-        config = SuiteConfig(
-            warmup_iters=args.warmup,
-            benchmark_iters=args.iters,
-            timing_block=args.timing_block,
-            seed=args.seed,
-            engine_filter=args.engine,
-            verbose=args.verbose,
-            oracle_mode=args.oracle_mode,
-            metrics=metrics_config,
-            validation=validation,
-            plugin_paths=plugin_paths,
-            backend=backend,
-            pytorch_sdpa_backend=args.pytorch_sdpa_backend,
-            pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
-            autotune=getattr(args, "autotune", False),
-            cache_dir=str(args.cache_dir) if getattr(args, "cache_dir", None) else None,
-        )
+        config = SuiteConfig.from_namespace(args)
     except ValueError as e:
-        reporter.print_error(f"Suite configuration error: {e}")
-        return 1
+        reporter.error(str(e))
+        return 2
 
-    _apply_tuning_environment(config, reporter)
+    output_path: Optional[Path] = args.output
+    if output_path is not None:
+        problem = _output_problem(output_path)
+        if problem:
+            reporter.error(f"--output {output_path}: {problem}")
+            return 2
+    if config.metrics.opt_in_pass_requested:
+        # The orchestrator puts its timestamped run directory under this root.
+        profiling_dir = config.metrics.profiling_output_dir or Path("profiling-output")
+        problem = _dir_problem(profiling_dir)
+        if problem:
+            reporter.error(f"--profiling-output-dir {profiling_dir}: {problem}")
+            return 2
 
-    return run_suite_benchmark(
-        graph_paths=graph_paths,
-        config=config,
-        output_path=args.output,
-        reporter=reporter,
-        tarball_source=tarball_source,
+    missing = check_requested_tools(config.metrics)
+    for message in missing:
+        reporter.error(message)
+    if missing:
+        return 2
+
+    _warn_ignored_options(config, reporter)
+    _apply_pytorch_environment(config, reporter)
+    if config.runtime is RuntimeName.HIPDNN:
+        _apply_tuning_environment(config, reporter)
+        if config.oracle:
+            _warn_oracle(reporter)
+
+    try:
+        run_graph = start_runtime(config, reporter)
+    except RuntimeStartupError as e:
+        reporter.error(str(e))
+        return e.exit_code
+
+    if tarball_source:
+        reporter.info(f"Graphs from {tarball_source}")
+    if config.metrics.extra_runs_per_engine:
+        reporter.info(
+            f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) per engine"
+        )
+    if argv is None:
+        argv = list(sys.argv)
+    return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
+
+
+def _output_problem(path: Path) -> Optional[str]:
+    """Why results cannot be written to ``path``, or None when they can."""
+    if path.is_dir():
+        return "is a directory"
+    return _dir_problem(path.parent)
+
+
+def _dir_problem(directory: Path) -> Optional[str]:
+    """Why files cannot be created in ``directory`` (created if missing), or None."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"cannot create {directory}: {e.strerror or e}"
+    if not os.access(directory, os.W_OK | os.X_OK):
+        return f"{directory} is not writable"
+    return None
+
+
+def _run_config(config: SuiteConfig) -> Dict[str, Any]:
+    """The effective configuration recorded as ``run.config``."""
+    pytorch = (
+        config.runtime is RuntimeName.PYTORCH
+        or config.validation.provider is ReferenceProviderName.PYTORCH
+    )
+    metrics = config.metrics
+    return {
+        "runtime": config.runtime.value,
+        "engine_filter": (
+            [engine_id_hex(e) for e in config.engine_filter]
+            if config.engine_filter is not None
+            else None
+        ),
+        "plugin_paths": (
+            [str(p) for p in config.plugin_paths]
+            if config.plugin_paths is not None
+            else None
+        ),
+        "warmup_iters": config.warmup_iters,
+        "iters": config.benchmark_iters,
+        "min_time_ms": config.min_time_ms,
+        "cache_mode": config.cache_mode,
+        "timing_block": config.timing_block,
+        "seed": config.seed,
+        "validate": (
+            config.validation.provider.value if config.validation.enabled else None
+        ),
+        "rtol": config.validation.rtol,
+        "atol": config.validation.atol,
+        "oracle": config.oracle,
+        "autotune": config.autotune,
+        "hipdnn_cache_dir": config.hipdnn_cache_dir,
+        "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
+        "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
+        "metrics": metrics.basic,
+        "profiling": {
+            "pmc": metrics.pmc_set,
+            "trace": metrics.trace,
+            "perf": metrics.perf,
+            "roofline": metrics.roofline,
+        },
+    }
+
+
+def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
+    """Load and run one graph; any failure becomes a graph-level error.
+
+    An unsupported graph (e.g. a tensor data type this tool cannot allocate)
+    becomes ``no_engines`` like a graph no engine applies to, not an error."""
+    graph_id = None
+    try:
+        loader = GraphLoader()
+        graph_json = loader.load_json(graph_path)
+        graph_id = graph_id_for(graph_json)
+        loader.validate(graph_json)
+        tensor_infos = loader.extract_tensor_info(graph_json)
+        return run_graph(graph_path, graph_json, tensor_infos)
+    except UnsupportedGraphError as e:
+        return GraphResult(
+            graph_name=graph_path.stem,
+            graph_path=str(graph_path),
+            results=[],
+            graph_id=graph_id,
+            message=str(e),
+        )
+    except Exception as e:
+        return GraphResult(
+            graph_name=graph_path.stem,
+            graph_path=str(graph_path),
+            results=[],
+            graph_id=graph_id,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+def _run_suite(
+    graph_paths: List[Path],
+    config: SuiteConfig,
+    run_graph: GraphRunner,
+    output_path: Optional[Path],
+    reporter: Reporter,
+    argv: List[str],
+) -> int:
+    """Run every graph, writing results as it goes; return the exit code."""
+    environment = collect_environment_info()
+    if config.oracle or config.autotune:
+        environment["selection_env"] = {n: os.environ.get(n) for n in _SELECTION_ENV}
+    run_config = _run_config(config)
+    total = len(graph_paths)
+    reporter.print_suite_header(environment, run_config, total)
+    suite = SuiteResult(
+        run=RunInfo(started_at=_now(), argv=argv, config=run_config),
+        environment=environment,
+        graphs=[],
     )
 
+    def write() -> bool:
+        if output_path is None:
+            return True
+        try:
+            suite.write(output_path, compact=config.compact_json)
+            return True
+        except (OSError, TypeError, ValueError) as e:
+            reporter.error(f"writing {output_path} failed: {e}")
+            return False
 
-def _apply_tuning_environment(config: SuiteConfig, reporter) -> None:
-    """Set the kernel-selection environment, and SAY which path will run.
+    interrupted: Optional[int] = None
+    previous_sigterm = signal.signal(signal.SIGTERM, _raise_terminated)
+    disarm_watchdog = _arm_sigterm_watchdog()
+    try:
+        last_write = time.monotonic()
+        for i, graph_path in enumerate(graph_paths, start=1):
+            reporter.graph_start(i, total, graph_path.stem)
+            gr = _run_one_graph(graph_path, run_graph)
+            suite.graphs.append(gr)
+            reporter.print_graph_table(gr)
+            if time.monotonic() - last_write >= WRITE_INTERVAL_S:
+                write()  # a failure is reported; the final write decides
+                last_write = time.monotonic()
+        suite.run.finished_at = _now()
+        suite.run.complete = True
+    except KeyboardInterrupt:
+        interrupted = 130
+    except _Terminated:
+        interrupted = 143
+    finally:
+        # A second Ctrl-C or SIGTERM must not lose the results on disk.
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            write_ok = write()
+        finally:
+            disarm_watchdog()
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
-    An engine has two selection paths and they answer different questions:
-    the cold heuristic (default) measures how good the heuristic is, while
-    benchmarking measures what the shipped kernel set can actually deliver.
-    A perf table whose selection path is unstated is not interpretable, and the
-    default silently picks the first -- so the path is always announced, not
-    only when it is requested.
-    """
-    import os
-
-    if config.cache_dir:
-        os.environ["HIPDNN_CACHE_DIR"] = config.cache_dir
-        reporter.print_warning(f"HIPDNN_CACHE_DIR={config.cache_dir}")
-    elif not os.environ.get("HIPDNN_CACHE_DIR"):
-        # Unset means the shared per-user default (~/.cache/hipdnn). The winner
-        # cache is keyed by graph content and device -- NOT by checkout, engine
-        # or session -- so two concurrent runs over the same graphs read and
-        # write each other's measurements. Reads are ungated while writes are
-        # gated on benchmarking, so even an untuned run can serve a ranking some
-        # other session tuned, and report it as its own.
-        reporter.print_warning(
-            "no --cache-dir: using the shared per-user cache (~/.cache/hipdnn). "
-            "The winner cache is keyed by graph and device, not by checkout or "
-            "session, so a concurrent run over the same graphs can supply the "
-            "rankings this one reports. Pass --cache-dir for an isolated root."
+    if interrupted is not None:
+        where = (
+            f"partial results in {output_path}"
+            if output_path is not None and write_ok
+            else "no results file written"
         )
+        reporter.error(
+            f"interrupted after {len(suite.graphs)}/{total} graph(s); {where}"
+        )
+        return interrupted
+
+    reporter.print_summary(
+        suite, str(output_path) if output_path and write_ok else None
+    )
+    if config.oracle:
+        reporter.print_oracle_summary(suite.graphs)
+    return _exit_code(suite, write_ok)
+
+
+def _exit_code(suite: SuiteResult, write_ok: bool) -> int:
+    """3 on any failed engine verdict, else 1 on any engine error, graph error
+    or write failure, else 0. Reference rows do not count, matching summary()."""
+    verdicts = {
+        r.verdict for g in suite.graphs for r in g.results if r.role == "engine"
+    }
+    if "failed" in verdicts:
+        return 3
+    if "error" in verdicts or any(g.error for g in suite.graphs) or not write_ok:
+        return 1
+    return 0
+
+
+def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
+    """Options that are accepted but would silently do nothing."""
+    metrics = config.metrics
+    if metrics.profiling_output_dir is not None and not metrics.opt_in_pass_requested:
+        reporter.warning(
+            "--profiling-output-dir has no effect without --pmc, --trace, "
+            "--perf or --roofline"
+        )
+    pytorch_selected = (
+        config.runtime is RuntimeName.PYTORCH
+        or config.validation.provider is ReferenceProviderName.PYTORCH
+    )
+    sdpa_set = (
+        config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
+        or config.pytorch_rocm_fa_library is not None
+    )
+    if sdpa_set and not pytorch_selected:
+        reporter.warning(
+            "PyTorch SDPA options have no effect without --runtime pytorch or "
+            "--validate pytorch"
+        )
+
+
+def _warn_oracle(reporter: Reporter) -> None:
+    """One line per condition that makes the OOTB or tuned plan non-cold."""
+    if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
+        reporter.warning(
+            "--oracle: exact-engine cache is on, so the OOTB timing may "
+            "replay a persisted ranking (HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for cold)"
+        )
+    elif not _truthy_env("HIPDNN_DISABLE_CACHE"):
+        reporter.warning(
+            "--oracle: provider kernel caches are on "
+            "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
+        )
+    reporter.info(
+        "--oracle: each engine gets a second plan built with "
+        "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
+        "engines re-measure the OOTB plan); MIOpen may reuse FindDb entries"
+    )
+    forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
+    if forced is not None:
+        # Providers apply the variable as override.value_or(knob): it wins over
+        # the tuned plan's knob and also reaches the OOTB plan.
+        reporter.warning(
+            f"--oracle with HIPDNN_FORCE_BENCHMARKING={forced} in the environment: "
+            "it overrides the global.benchmarking knob for the OOTB and the tuned "
+            "plan, so the two may not differ"
+        )
+
+
+def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
+    """Set PyTorch's kernel-selection controls when PyTorch is timed or used.
+
+    Must run before the first PyTorch conv or SDPA call.
+    """
+    if not (
+        config.runtime is RuntimeName.PYTORCH
+        or config.validation.provider is ReferenceProviderName.PYTORCH
+    ):
+        return
+    effective = apply_pytorch_environment()
+    settings = ", ".join(f"{k}={v}" for k, v in effective.items())
+    tuned = "; tuned runs use an isolated subprocess" if config.oracle else ""
+    reporter.info(f"PyTorch kernel selection: {settings}{tuned}")
+
+
+def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
+    """Set the kernel-selection environment and state the path in effect.
+
+    Prints one info line ``kernel selection: heuristic|autotune; cache: ...``
+    plus one warning per hazard.
+    """
+    leaked = False
+    if config.hipdnn_cache_dir:
+        os.environ["HIPDNN_CACHE_DIR"] = config.hipdnn_cache_dir
+    cache = os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
 
     if config.autotune:
         os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
-        reporter.print_warning(
-            "kernel selection: BENCHMARKED -- every knob-filtered candidate is "
-            "sampled on each plan's first execute and the winner cached "
-            "(HIPDNN_FORCE_BENCHMARKING=1)"
+    elif _truthy_env("HIPDNN_FORCE_BENCHMARKING"):
+        # Process-wide and inherited from the shell: the run is NOT on the
+        # heuristic path even though --autotune was not passed.
+        leaked = True
+        reporter.warning(
+            "HIPDNN_FORCE_BENCHMARKING is set in the environment without "
+            "--autotune; kernels are benchmarked, not heuristic-selected"
         )
-        if not config.cache_dir:
-            reporter.print_warning(
-                "--autotune without --cache-dir: the winner cache outlives this "
-                "run, so results may be inherited from a previous kernel set "
-                "rather than measured for this one"
-            )
-        return
-
-    # Not requested. A leaked value from another shell or test would silently
-    # change the path, so report what is actually in effect rather than what
-    # was asked for.
-    leaked = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
-    if leaked:
-        reporter.print_warning(
-            f"HIPDNN_FORCE_BENCHMARKING={leaked} is set in the environment but "
-            "--autotune was not passed; kernel selection is NOT the default "
-            "heuristic path"
+    autotune = config.autotune or leaked
+    if config.autotune and not config.hipdnn_cache_dir:
+        # The winner cache outlives the run and reads are not gated on
+        # benchmarking, so a previous session's ranking can be reported.
+        reporter.warning(
+            "--autotune without --hipdnn-cache-dir: winners cached by earlier runs "
+            "may be reported instead of measured"
         )
-    else:
-        reporter.print_warning(
-            "kernel selection: COLD HEURISTIC (rank-0). Pass --autotune to "
-            "measure what the shipped kernel set can deliver."
-        )
+    reporter.info(
+        f"kernel selection: {'autotune' if autotune else 'heuristic'}; cache: {cache}"
+    )

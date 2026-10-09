@@ -1,25 +1,157 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Suite result data model with JSON serialization.
+"""Suite result data model and result JSON schema v2.
 
-Top-level structure is graph-first: SuiteResult contains metadata plus a
-list of GraphResult, each holding ProviderEngineResult entries with timing
-statistics and correctness data. Error entries carry status + message only.
+Top-level structure is graph-first: SuiteResult holds run info, the
+environment and a list of GraphResult, each holding ProviderEngineResult
+rows. Python attribute names are stable; the v2 JSON key names are applied
+only in ``to_dict``. Every key is always present (null when not
+applicable) so consumers never probe for key presence.
 """
 
+import csv
+import hashlib
+import io
 import json
+import math
 import os
-import socket
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from ..common import torch_support
-from ..metrics.arch import detect_arch
-from .statistics import BenchmarkStats
+from .. import __version__
+from .statistics import BenchmarkStats, TimingInfo
+
+SUITE_RESULT_SCHEMA_VERSION = 2
+
+# Keys of run.config / environment that are always emitted (null when the
+# producer did not supply them). Extra producer keys are kept as-is.
+RUN_CONFIG_KEYS = (
+    "runtime",
+    "engine_filter",
+    "plugin_paths",
+    "warmup_iters",
+    "iters",
+    "min_time_ms",
+    "cache_mode",
+    "timing_block",
+    "seed",
+    "validate",
+    "rtol",
+    "atol",
+    "oracle",
+    "autotune",
+    "hipdnn_cache_dir",
+    "pytorch_sdpa_backend",
+    "pytorch_rocm_fa_library",
+    "metrics",
+    "profiling",
+)
+PROFILING_KEYS = ("pmc", "trace", "perf", "roofline")
+ENVIRONMENT_KEYS = (
+    "hostname",
+    "cpu_model",
+    "cpu_count",
+    "numa_nodes",
+    "total_ram_gb",
+    "kernel_version",
+    "gpu_model",
+    "gpu_arch",
+    "gpu_compute_units",
+    "gpu_hbm_gb",
+    "gpu_pcie_link",
+    "amdgpu_driver_version",
+    "gpu_power_cap_w",
+    "gpu_max_sclk_mhz",
+    "gpu_compute_partition",
+    "rocm_version",
+    "cuda_version",
+    "cudnn_version",
+    "hipdnn_version",
+    "python_version",
+    "torch_version",
+    "amdsmi_available",
+    "selection_env",
+)
+ROW_COLUMNS = (
+    "gpu_arch",
+    "graph_name",
+    "graph_id",
+    "runtime",
+    "role",
+    "engine_id",
+    "engine_name",
+    "status",
+    "verdict",
+    "kernel_median_ms",
+    "kernel_iqr_pct",
+    "host_median_ms",
+    "samples",
+    "timing_mode",
+    "cache_mode",
+    "timing_block",
+    "seed",
+    "tflops",
+    "gbps",
+    "workspace_bytes",
+    "max_abs_diff",
+    "message",
+)
+
+
+def engine_id_hex(engine_id: Optional[int]) -> Optional[str]:
+    """Format an engine id as ``0x%016X`` of its unsigned 64-bit value.
+
+    hipDNN engine ids are signed 64-bit hashes; above 2**53 they lose
+    precision in float-based JSON readers, so the schema carries them as
+    hex strings.
+    """
+    if engine_id is None:
+        return None
+    return f"0x{engine_id & 0xFFFFFFFFFFFFFFFF:016X}"
+
+
+def graph_id_for(graph_json: Dict[str, Any]) -> str:
+    """Stable join key for a graph: sha256 of its canonical JSON, 12 hex chars."""
+    canonical = json.dumps(graph_json, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+
+def _with_keys(d: Optional[Dict[str, Any]], keys: tuple) -> Dict[str, Any]:
+    """Return ``d`` with every key in ``keys`` present (null when missing)."""
+    return {**dict.fromkeys(keys), **(d or {})}
+
+
+#: Significant digits kept for every float in a result file. Six resolve
+#: 0.1 ns on a 100 us kernel, well below timer and run-to-run noise.
+FLOAT_DIGITS = 6
+
+
+def _finite(obj: Any) -> Any:
+    """Round floats to FLOAT_DIGITS and map NaN/inf to None, recursively."""
+    if isinstance(obj, float):
+        return float(f"{obj:.{FLOAT_DIGITS}g}") if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
+def _stats_dict(stats: Optional[BenchmarkStats]) -> Optional[Dict[str, Any]]:
+    return stats.to_dict() if stats is not None else None
+
+
+def _iqr_pct(stats: Dict[str, Any]) -> Optional[float]:
+    """CSV ``kernel_iqr_pct``: IQR as a percentage of the median."""
+    p25, median, p75 = stats.get("p25_ms"), stats.get("median_ms"), stats.get("p75_ms")
+    if p25 is None or p75 is None or not median:
+        return None
+    return _finite((p75 - p25) / median * 100.0)
 
 
 @dataclass
@@ -27,28 +159,32 @@ class CorrectnessResult:
     """Correctness tracking for a single provider/engine run.
 
     Attributes:
-        execution_success: Did the run complete without error?
-        tolerance_match: Within rtol/atol? None if execution failed or
-            reference provider unavailable.
+        tolerance_match: Within rtol/atol? None when not checked (no
+            reference requested or reference unavailable).
         rtol: Relative tolerance used.
         atol: Absolute tolerance used.
         max_abs_diff: Maximum absolute difference (if comparison was performed).
         max_rel_diff: Maximum relative difference (if comparison was performed).
-        error_message: Explanation when tolerance_match is None.
+        error_message: Explanation when tolerance_match is None or False.
+        n_mismatch: Elements outside tolerance, summed over outputs.
+        n_total: Elements compared, summed over outputs.
+        worst_output_uid: Tensor UID of the output with the largest diff.
     """
 
-    execution_success: bool
     tolerance_match: Optional[bool]
     rtol: float
     atol: float
     max_abs_diff: Optional[float] = None
     max_rel_diff: Optional[float] = None
     error_message: Optional[str] = None
+    n_mismatch: Optional[int] = None
+    n_total: Optional[int] = None
+    worst_output_uid: Optional[int] = None
 
     @property
     def passed(self) -> bool:
-        """Overall pass = executed successfully AND tolerance matched."""
-        return self.execution_success and (self.tolerance_match is True)
+        """Validation ran and every output was within tolerance."""
+        return self.tolerance_match is True
 
     @property
     def explicitly_failed(self) -> bool:
@@ -59,251 +195,133 @@ class CorrectnessResult:
         that gate on a real failure must use this instead, or a plain run
         looks like a suite of failures.
         """
-        return not self.execution_success or self.tolerance_match is False
-
-    @classmethod
-    def failed(
-        cls, rtol: float, atol: float, error_message: str
-    ) -> "CorrectnessResult":
-        """Build a CorrectnessResult representing an execution failure.
-
-        Used at error/skip sites where the GPU run did not complete and no
-        comparison was performed.
-
-        Args:
-            rtol: Relative tolerance configured for comparison.
-            atol: Absolute tolerance configured for comparison.
-            error_message: Explanation of the failure.
-
-        Returns:
-            CorrectnessResult with execution_success=False and
-            tolerance_match=None.
-        """
-        return cls(
-            execution_success=False,
-            tolerance_match=None,
-            rtol=rtol,
-            atol=atol,
-            error_message=error_message,
-        )
+        return self.tolerance_match is False
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        d: Dict[str, Any] = {
-            "passed": self.passed,
-            "execution_success": self.execution_success,
-            "tolerance_match": self.tolerance_match,
+        """Convert to the v2 ``correctness`` object."""
+        return {
+            "match": self.tolerance_match,
             "rtol": self.rtol,
             "atol": self.atol,
-        }
-        if self.max_abs_diff is not None:
-            d["max_abs_diff"] = self.max_abs_diff
-        if self.max_rel_diff is not None:
-            d["max_rel_diff"] = self.max_rel_diff
-        if self.error_message is not None:
-            d["error_message"] = self.error_message
-        return d
-
-
-@dataclass
-class OracleResult:
-    """Post-tuning result for one engine row.
-
-    ``sweep_min_time_ms`` is the fastest single selection-sweep iteration.
-    Reported timing comes from the later ``gpu_kernel_stats`` or ``host_stats``
-    benchmark.
-
-    Candidate counts describe compiled plans, not provider-internal kernels.
-    ``exhaustive_enabled`` means the selected engine advertises
-    ``global.benchmarking`` and the run requested it. Providers can reuse
-    cached selections, so it does not prove a fresh search occurred.
-
-    ``warm_baseline_*`` contains the OOTB plan re-timed after selection. The
-    delta uses this warm measurement, not the row's earlier OOTB timing.
-    ``correctness`` is the tuned plan's verdict; the row retains the OOTB
-    verdict.
-
-    ``derived_tflops_per_s`` (tuned plan) and ``warm_baseline_derived_tflops_per_s``
-    (warm OOTB) use the row's ``analytical_flops`` and each side's GPU kernel
-    median, like the row's own ``derived_tflops_per_s``.
-    """
-
-    plan_name: str
-    compiled_plan_index: int
-    rank: int
-    sweep_min_time_ms: float
-    compiled_plans_benchmarked: int
-    compiled_plans_total: int
-    compiled_plans_failed: int
-    knob_settings: List[Dict[str, Any]]
-    exhaustive_requested: bool = False
-    exhaustive_supported: bool = False
-    cpu_build_time_ms: Optional[float] = None
-    gpu_kernel_stats: Optional[BenchmarkStats] = None
-    host_stats: Optional[BenchmarkStats] = None
-    warm_baseline_gpu_kernel_stats: Optional[BenchmarkStats] = None
-    warm_baseline_host_stats: Optional[BenchmarkStats] = None
-    correctness: Optional[CorrectnessResult] = None
-    derived_tflops_per_s: Optional[float] = None
-    warm_baseline_derived_tflops_per_s: Optional[float] = None
-
-    @property
-    def exhaustive_enabled(self) -> bool:
-        """True when a capable provider was built for exhaustive selection."""
-        return self.exhaustive_requested and self.exhaustive_supported
-
-    @property
-    def tuning_available(self) -> bool:
-        """Return whether this pass had a tuning alternative."""
-        return self.compiled_plans_total > 1 or self.exhaustive_enabled
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "plan_name": self.plan_name,
-            "compiled_plan_index": self.compiled_plan_index,
-            "rank": self.rank,
-            "sweep_min_time_ms": self.sweep_min_time_ms,
-            "compiled_plans_benchmarked": self.compiled_plans_benchmarked,
-            "compiled_plans_total": self.compiled_plans_total,
-            "compiled_plans_failed": self.compiled_plans_failed,
-            "tuning_available": self.tuning_available,
-            "knob_settings": list(self.knob_settings),
-            "exhaustive_requested": self.exhaustive_requested,
-            "exhaustive_enabled": self.exhaustive_enabled,
-            "exhaustive_supported": self.exhaustive_supported,
-            "cpu_build_time_ms": self.cpu_build_time_ms,
-            "gpu_kernel_stats": (
-                self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
-            ),
-            "host_stats": self.host_stats.to_dict() if self.host_stats else None,
-            "warm_baseline_gpu_kernel_stats": (
-                self.warm_baseline_gpu_kernel_stats.to_dict()
-                if self.warm_baseline_gpu_kernel_stats
-                else None
-            ),
-            "warm_baseline_host_stats": (
-                self.warm_baseline_host_stats.to_dict()
-                if self.warm_baseline_host_stats
-                else None
-            ),
-            "correctness": (self.correctness.to_dict() if self.correctness else None),
-            "derived_tflops_per_s": self.derived_tflops_per_s,
-            "warm_baseline_derived_tflops_per_s": (
-                self.warm_baseline_derived_tflops_per_s
-            ),
+            "max_abs_diff": self.max_abs_diff,
+            "max_rel_diff": self.max_rel_diff,
+            "n_mismatch": self.n_mismatch,
+            "n_total": self.n_total,
+            "worst_output_uid": self.worst_output_uid,
+            "message": self.error_message,
         }
 
 
-@dataclass
-class OracleDelta:
-    """Warm heuristic baseline vs tuned run for one engine row.
+@dataclass(kw_only=True)
+class PlanResult:
+    """One built and timed plan: the OOTB plan or the tuned plan.
 
-    Both sides are measured after the autotuning sweep, back to back on the
-    same buffers, so device warmth is common to them and the ratio isolates
-    the plan change. This is deliberately not the row's headline OOTB
-    timing: that one is measured before the sweep exists and is the
-    "what you get out of the box" number, which at low ``--warmup`` can sit
-    well above steady state and would inflate the speedup.
+    A row holds the OOTB plan in ``ootb`` and the tuned plan (an
+    ``OracleResult``) in ``oracle``, side by side; both serialize to the same
+    object.
 
     Attributes:
-        basis: Which timing pair the comparison used.
-        baseline_mean_ms: Mean of the heuristic plan, re-timed post-sweep.
-        oracle_mean_ms: Mean of the post-tuning run.
-        delta_ms: ``baseline_mean_ms - oracle_mean_ms``; positive means the
-            oracle is faster.
-        speedup: ``baseline_mean_ms / oracle_mean_ms``.
+        cpu_build_time_ms: CPU time to build the plan (JSON ``build_ms``).
+        timing: How the samples were measured.
+        gpu_kernel_stats: Device time per launch (JSON ``kernel``).
+        host_stats: Host submit time per launch (JSON ``host``).
+        workspace_bytes: Workspace that hipDNN reserved for the plan.
+        derived_tflops_per_s: Graph FLOPs over the kernel median.
+        derived_gbytes_per_s: Graph I/O bytes over the kernel median.
+        correctness: Comparison of this plan's outputs with the reference.
     """
 
-    basis: Literal["gpu_kernel", "host"]
-    baseline_mean_ms: float
-    oracle_mean_ms: float
-    delta_ms: float
-    speedup: float
+    cpu_build_time_ms: Optional[float] = None
+    timing: Optional[TimingInfo] = None
+    gpu_kernel_stats: Optional[BenchmarkStats] = None
+    host_stats: Optional[BenchmarkStats] = None
+    workspace_bytes: Optional[int] = None
+    derived_tflops_per_s: Optional[float] = None
+    derived_gbytes_per_s: Optional[float] = None
+    correctness: Optional[CorrectnessResult] = None
+
+    def plan_dict(self) -> Dict[str, Any]:
+        """Convert to the v2 plan object (``ootb`` and ``oracle``)."""
+        return {
+            "build_ms": self.cpu_build_time_ms,
+            "timing": self.timing.to_dict() if self.timing is not None else None,
+            "kernel": _stats_dict(self.gpu_kernel_stats),
+            "host": _stats_dict(self.host_stats),
+            "workspace_bytes": self.workspace_bytes,
+            "tflops": self.derived_tflops_per_s,
+            "gbps": self.derived_gbytes_per_s,
+            "correctness": (
+                self.correctness.to_dict() if self.correctness is not None else None
+            ),
+        }
+
+
+@dataclass
+class OracleResult(PlanResult):
+    """Tuned run for one row; the row's own ``PlanResult`` is the OOTB plan.
+
+    hipDNN: the tuned plan is built for the same engine as the OOTB plan,
+    with ``global.benchmarking=1``. A benchmarking build compiles every
+    candidate the provider can sample, so its build is expected to be slower.
+    PyTorch: the tuned run comes from an isolated child process and has no
+    plan build.
+
+    ``tuning_available`` is False when the engine exposes no tuning knob, so
+    the tuned run re-measured the OOTB configuration. ``correctness`` is the
+    tuned plan's verdict; the row keeps the OOTB verdict. Throughputs use the
+    row's analytical FLOPs and I/O bytes with the tuned kernel median.
+    """
+
+    tuning_available: bool
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "basis": self.basis,
-            "baseline_mean_ms": self.baseline_mean_ms,
-            "oracle_mean_ms": self.oracle_mean_ms,
-            "delta_ms": self.delta_ms,
-            "speedup": self.speedup,
-        }
+        """Convert to the v2 ``oracle`` object: the plan object plus tuning."""
+        return {**self.plan_dict(), "tuning_available": self.tuning_available}
+
+
+Verdict = Literal["passed", "failed", "unchecked", "reference", "skipped", "error"]
 
 
 @dataclass
 class ProviderEngineResult:
-    """Result for one provider/engine combination on one graph.
+    """Result for one runtime/engine combination on one graph.
+
+    The OOTB plan (``ootb``) and the tuned plan (``oracle``) are sibling
+    plan objects.
 
     Attributes:
-        provider: Provider name.
-        engine_id: Engine ID used.
+        runtime: Runtime that produced the row, ``hipdnn`` or ``pytorch``.
+        engine_id: Engine ID used; None when the row has no hipDNN engine.
         status: One of 'success', 'error', 'skipped'.
         engine_version: Loaded provider plugin version.
         started_at: UTC timestamp immediately before this engine run.
-        role: ``engine`` for hipDNN engine rows, ``reference`` for timed
-            validation-provider rows that are shown for comparison but are not
+        role: ``engine`` for engine rows, ``reference`` for timed
+            validation reference rows that are shown for comparison but are not
             counted as pass/fail engine combinations.
-        cpu_build_time_ms: CPU graph-build time.
-        gpu_kernel_stats: GPU kernel timing statistics.
-        host_stats: Host-side submission timing statistics.
-        correctness: Correctness comparison result.
-        error_message: Error message only (no partial timing on error).
-        skip_reason: Reason this combination was skipped.
-        warnings: Non-fatal warnings for this row, such as reference timing
-            paths that are not solely built-in PyTorch operators.
-        workspace_bytes: hipDNN-reserved workspace size in bytes.
-        analytical_flops: Total analytical FLOPs across compute nodes
-            (None for purely bandwidth-bound graphs).
-        analytical_flops_partial: True when at least one node type was
-            unrecognised — ``analytical_flops`` then reflects only the
-            recognised compute nodes.
+        plugin_path: Plugin the engine was loaded from.
+        elapsed_time_ms: Wall time of the whole row (build, timing,
+            validation, oracle, profiling).
+        error_message: Why the row errored.
+        skip_reason: Why the row was skipped.
+        warnings: Non-fatal warnings for this row (noise, throttling, ...).
+        analytical_flops: Total analytical FLOPs of the graph; None when any
+            node has no FLOP formula, so a partial count is never reported.
         analytical_io_bytes: Sum of non-virtual tensor sizes (bytes).
-        derived_tflops_per_s: Throughput derived from analytical_flops
-            and the GPU kernel median time.
-        derived_gbytes_per_s: Bandwidth derived from analytical_io_bytes
-            and the GPU kernel median time.
-        cpu_user_time_per_iter_us: User-space CPU time per timed
-            execution in microseconds (rusage delta over the loop,
-            divided by ``benchmark_iters * timing_block``). Mostly Python
-            dispatch + sync overhead.
-        cpu_kernel_time_per_iter_us: Kernel-space CPU time per timed
-            execution in microseconds. Usually near zero;
-            useful only as a spike diagnostic (heavy syscalls / page
-            faults during the loop).
-        vram_used_mb: Total process-wide GPU VRAM allocated at the
-            end of this engine's benchmark loop, sampled via amdsmi.
-            Workspace + I/O buffers + any allocator cache. Distinct
-            from ``workspace_bytes`` which is only the engine's
-            scratchpad request. Note this is process-wide and may
-            include cached allocations from previous engines on the
-            same graph.
-        extra_metrics: Opt-in profiling payload from rocprofv3 PMC /
-            traces, perf, and rocprof-compute roofline. None when no
-            opt-in profiling flag was supplied.
-        oracle: Post-tuning result for this engine row. Set only when
-            ``--oracle-mode`` was requested and tuning succeeded.
-        oracle_delta: OOTB-vs-oracle comparison. None when either side
-            lacks comparable statistics.
-        oracle_error: Why tuning produced no result for this row.
-            Mutually exclusive with ``oracle``.
-
-    Note:
-        Process RSS, host RAM availability, and the volatile parts of
-        an amdsmi snapshot (power/clocks/temps/utilisation) are *not*
-        per-engine — they're either flat across a suite (RSS) or
-        misleading post-loop snapshots (power/clocks/temps lag the
-        workload). They live on :class:`SuiteMetadata` instead. VRAM
-        is the exception: it's stable during the loop and varies
-        meaningfully across engines, so it lives here.
+        extra_metrics: Opt-in profiling payload (rocprofv3 PMC / trace,
+            perf, roofline).
+        ootb: The default (out-of-the-box) plan. Serialized only for
+            ``success`` rows.
+        oracle: Tuned plan; set only for oracle runs that tuned.
+        oracle_error: Why tuning produced no result; exclusive with oracle.
+        clocks_after: GPU clocks sampled right after the timed loop.
+        engine_name: Display name of the engine (e.g. MIOPEN_ENGINE).
     """
 
     _VALID_STATUSES = {"success", "error", "skipped"}
     _VALID_ROLES = {"engine", "reference"}
 
-    provider: str
-    engine_id: int
+    runtime: str
+    engine_id: Optional[int]
     status: Literal["success", "error", "skipped"]
     engine_version: str = "unavailable"
     started_at: str = field(
@@ -311,33 +329,21 @@ class ProviderEngineResult:
     )
     role: Literal["engine", "reference"] = "engine"
     plugin_path: Optional[str] = None
-    cpu_build_time_ms: Optional[float] = None
-    gpu_kernel_stats: Optional[BenchmarkStats] = None
-    host_stats: Optional[BenchmarkStats] = None
     elapsed_time_ms: float = 0.0
-    correctness: Optional[CorrectnessResult] = None
     error_message: Optional[str] = None
     skip_reason: Optional[str] = None
     warnings: Optional[List[str]] = None
-    # Always-on metrics (None when collection failed or skipped)
-    workspace_bytes: Optional[int] = None
     analytical_flops: Optional[int] = None
-    analytical_flops_partial: bool = False
     analytical_io_bytes: Optional[int] = None
-    derived_tflops_per_s: Optional[float] = None
-    derived_gbytes_per_s: Optional[float] = None
-    cpu_user_time_per_iter_us: Optional[float] = None
-    cpu_kernel_time_per_iter_us: Optional[float] = None
-    vram_used_mb: Optional[float] = None
-    # Opt-in profiling payload (rocprofv3 PMC / trace, perf, roofline).
     extra_metrics: Optional[Dict[str, Any]] = None
-    # Opt-in oracle (auto-tuned) comparison payload.
+    ootb: PlanResult = field(default_factory=PlanResult)
     oracle: Optional[OracleResult] = None
-    oracle_delta: Optional[OracleDelta] = None
     oracle_error: Optional[str] = None
+    clocks_after: Optional[Dict[str, Any]] = None
+    engine_name: Optional[str] = None
 
     def __post_init__(self) -> None:
-        """Validate status field."""
+        """Validate status and role."""
         if self.status not in self._VALID_STATUSES:
             raise ValueError(
                 f"Invalid status '{self.status}'. "
@@ -345,154 +351,137 @@ class ProviderEngineResult:
             )
         if self.role not in self._VALID_ROLES:
             raise ValueError(
-                f"Invalid role '{self.role}'. " f"Must be one of: {self._VALID_ROLES}"
+                f"Invalid role '{self.role}'. Must be one of: {self._VALID_ROLES}"
             )
+
+    @classmethod
+    def error_row(
+        cls,
+        runtime: str,
+        engine_id: Optional[int],
+        message: str,
+        *,
+        engine_name: Optional[str] = None,
+        role: Literal["engine", "reference"] = "engine",
+        plugin_path: Optional[str] = None,
+    ) -> "ProviderEngineResult":
+        """Build an ``error`` row carrying only its reason."""
+        return cls(
+            runtime=runtime,
+            engine_id=engine_id,
+            status="error",
+            error_message=message,
+            engine_name=engine_name,
+            role=role,
+            plugin_path=plugin_path,
+        )
+
+    @classmethod
+    def skipped_row(
+        cls,
+        runtime: str,
+        engine_id: Optional[int],
+        reason: str,
+        *,
+        engine_name: Optional[str] = None,
+        role: Literal["engine", "reference"] = "engine",
+        plugin_path: Optional[str] = None,
+    ) -> "ProviderEngineResult":
+        """Build a ``skipped`` row carrying only its reason."""
+        return cls(
+            runtime=runtime,
+            engine_id=engine_id,
+            status="skipped",
+            skip_reason=reason,
+            engine_name=engine_name,
+            role=role,
+            plugin_path=plugin_path,
+        )
+
+    @property
+    def verdict(self) -> Verdict:
+        """Single outcome label used by counts, console and JSON.
+
+        ``unchecked`` is a successful run whose output was not validated
+        (no correctness, or ``tolerance_match`` None); it is not a pass.
+        """
+        if self.status == "error":
+            return "error"
+        if self.status == "skipped":
+            return "skipped"
+        if self.role == "reference":
+            return "reference"
+        c = self.ootb.correctness
+        if c is not None and c.explicitly_failed:
+            return "failed"
+        if c is not None and c.passed:
+            return "passed"
+        return "unchecked"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization.
+        """Convert to the v2 row object (every key always present).
 
-        Error entries serialize status + error_message only, no timing.
-        Correctness, when present, is always serialized regardless of status
-        so that error/skip entries can carry their failure context.
-
-        Always-on metrics are emitted only inside the ``success`` branch
-        and only when non-None, so the JSON shape stays compact for
-        runs where probes were unavailable.
+        ``ootb`` and ``oracle`` are the same plan object; ``ootb`` is null
+        when the row did not run (``error`` or ``skipped`` rows carry only
+        their reason).
         """
-        d: Dict[str, Any] = {
-            "provider": self.provider,
-            "engine_id": self.engine_id,
-            "engine_name": self.provider,
-            "engine_version": self.engine_version,
-            "started_at": self.started_at,
+        return {
+            "runtime": self.runtime,
+            "role": self.role,
+            "engine": {
+                "id": engine_id_hex(self.engine_id),
+                "name": self.engine_name,
+                "version": self.engine_version,
+            },
             "status": self.status,
+            "verdict": self.verdict,
+            "message": self.error_message or self.skip_reason,
+            "started_at": self.started_at,
+            "elapsed_s": self.elapsed_time_ms / 1000.0,
+            "metrics": {
+                "flops": self.analytical_flops,
+                "io_bytes": self.analytical_io_bytes,
+                "clocks_after": self.clocks_after,
+            },
+            "ootb": self.ootb.plan_dict() if self.status == "success" else None,
+            "oracle": self.oracle.to_dict() if self.oracle is not None else None,
+            "oracle_error": self.oracle_error,
+            "warnings": list(self.warnings or []),
+            "extra_metrics": self.extra_metrics,
         }
-        if self.role != "engine":
-            d["role"] = self.role
-        if self.plugin_path is not None:
-            d["plugin_path"] = self.plugin_path
-        if self.warnings:
-            d["warnings"] = list(self.warnings)
-        # extra_metrics is exclusively populated by the opt-in
-        # profiling orchestrator, which the suite runner only fires on
-        # the success path. Asserting the invariant here makes it
-        # load-bearing: if a future caller routes profiling onto a
-        # non-success status, the assertion fires and forces a
-        # decision (emit always when present, or gate explicitly)
-        # rather than silently dropping the slice from the JSON.
-        if self.status != "success":
-            assert self.extra_metrics is None, (
-                f"extra_metrics is set on status={self.status!r}; "
-                "the orchestrator only runs on success today, so this "
-                "indicates either a new caller or a regression in the "
-                "success-gating in suite_runner.run_single_provider_engine"
-            )
-        if self.status == "success":
-            d["cpu_build_time_ms"] = self.cpu_build_time_ms
-            d["gpu_kernel_stats"] = (
-                self.gpu_kernel_stats.to_dict() if self.gpu_kernel_stats else None
-            )
-            d["host_stats"] = self.host_stats.to_dict() if self.host_stats else None
-            d["elapsed_time_ms"] = self.elapsed_time_ms
-
-            # Always-on metric fields — emit only when populated.
-            if self.workspace_bytes is not None:
-                d["workspace_bytes"] = self.workspace_bytes
-            if self.analytical_flops is not None:
-                d["analytical_flops"] = self.analytical_flops
-            if self.analytical_flops_partial:
-                d["analytical_flops_partial"] = True
-            if self.analytical_io_bytes is not None:
-                d["analytical_io_bytes"] = self.analytical_io_bytes
-            if self.derived_tflops_per_s is not None:
-                d["derived_tflops_per_s"] = self.derived_tflops_per_s
-            if self.derived_gbytes_per_s is not None:
-                d["derived_gbytes_per_s"] = self.derived_gbytes_per_s
-            if self.cpu_user_time_per_iter_us is not None:
-                d["cpu_user_time_per_iter_us"] = self.cpu_user_time_per_iter_us
-            if self.cpu_kernel_time_per_iter_us is not None:
-                d["cpu_kernel_time_per_iter_us"] = self.cpu_kernel_time_per_iter_us
-            if self.vram_used_mb is not None:
-                d["vram_used_mb"] = self.vram_used_mb
-            if self.extra_metrics is not None:
-                d["extra_metrics"] = self.extra_metrics
-            if self.oracle is not None:
-                d["oracle"] = self.oracle.to_dict()
-            if self.oracle_delta is not None:
-                d["oracle_delta"] = self.oracle_delta.to_dict()
-            if self.oracle_error is not None:
-                d["oracle_error"] = self.oracle_error
-        elif self.status == "error":
-            d["error_message"] = self.error_message
-        elif self.status == "skipped":
-            d["skip_reason"] = self.skip_reason
-
-        if self.correctness is not None:
-            d["correctness"] = self.correctness.to_dict()
-        return d
 
 
-def build_oracle_delta(oracle: OracleResult) -> Optional[OracleDelta]:
-    """Compare the warm heuristic baseline against the tuned run.
+def timing_modes_differ(row: ProviderEngineResult) -> bool:
+    """True when the OOTB and tuned plans were timed in different modes."""
+    a = row.ootb.timing
+    b = row.oracle.timing if row.oracle is not None else None
+    return a is not None and b is not None and a.mode != b.mode
 
-    Both operands come from ``oracle``: the sweep-adjacent re-timing of the
-    heuristic plan and the post-tuning run. The row's own OOTB timing is
-    deliberately not used — it is measured before the sweep, so at low
-    ``--warmup`` it can sit above steady state and report a speedup that is
-    accumulated warmup rather than a better plan.
 
-    Prefers GPU kernel time; falls back to host time when either side has
-    no kernel statistics.
+def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
+    """OOTB kernel median / tuned kernel median, or None when not comparable.
 
-    Args:
-        oracle: The post-tuning result, carrying its own warm baseline.
-
-        An OracleDelta, or None when no comparable statistics pair exists or
-        either mean is non-positive.
+    None when the row has no tuned run, either plan failed validation, the
+    two plans were timed in different modes (a stall-fallback OOTB in
+    ``events`` against a ``staged`` tuned child), or a median is missing or
+    non-positive. Rows with ``tuning_available`` False still get a ratio;
+    callers report them as "no-search" and keep them out of averages. The
+    speedup is derived, never stored in the result file.
     """
-    basis: Literal["gpu_kernel", "host"]
-    if (
-        oracle.warm_baseline_gpu_kernel_stats is not None
-        and oracle.gpu_kernel_stats is not None
+    oracle = row.oracle
+    if oracle is None or any(
+        verdict is not None and verdict.explicitly_failed
+        for verdict in (row.ootb.correctness, oracle.correctness)
     ):
-        basis = "gpu_kernel"
-        baseline_mean = oracle.warm_baseline_gpu_kernel_stats.mean_ms
-        oracle_mean = oracle.gpu_kernel_stats.mean_ms
-    elif oracle.warm_baseline_host_stats is not None and oracle.host_stats is not None:
-        basis = "host"
-        baseline_mean = oracle.warm_baseline_host_stats.mean_ms
-        oracle_mean = oracle.host_stats.mean_ms
-    else:
         return None
-
-    if baseline_mean <= 0.0 or oracle_mean <= 0.0:
+    if row.ootb.gpu_kernel_stats is None or oracle.gpu_kernel_stats is None:
         return None
-
-    return OracleDelta(
-        basis=basis,
-        baseline_mean_ms=baseline_mean,
-        oracle_mean_ms=oracle_mean,
-        delta_ms=baseline_mean - oracle_mean,
-        speedup=baseline_mean / oracle_mean,
-    )
-
-
-class StatusCounts(NamedTuple):
-    """Counts of provider/engine results bucketed by outcome.
-
-    Attributes:
-        passed: Successful runs whose correctness either matched or was not
-            checked (tolerance_match is True or None).
-        failed: Successful runs whose correctness comparison failed
-            (tolerance_match is False).
-        skipped: Runs marked as 'skipped' (unsupported combinations).
-        errored: Runs marked as 'error' (hard failure).
-    """
-
-    passed: int
-    failed: int
-    skipped: int
-    errored: int
+    if timing_modes_differ(row):
+        return None
+    ootb, tuned = row.ootb.gpu_kernel_stats.median_ms, oracle.gpu_kernel_stats.median_ms
+    if ootb <= 0.0 or tuned <= 0.0:
+        return None
+    return ootb / tuned
 
 
 @dataclass
@@ -502,423 +491,247 @@ class GraphResult:
     Attributes:
         graph_name: Name of the graph.
         graph_path: File path to the graph JSON.
-        results: List of ProviderEngineResult for each combination.
+        results: One row per provider/engine combination.
+        engine_ids: Engines applicable to the graph; empty means none.
+        graph_id: Join key from :func:`graph_id_for`.
+        error: Graph-level failure (load, discovery, input generation).
+        message: Why no engine applied, when ``status`` is ``no_engines``.
     """
 
     graph_name: str
     graph_path: str
     results: List[ProviderEngineResult]
     engine_ids: List[int] = field(default_factory=list)
+    graph_id: Optional[str] = None
+    error: Optional[str] = None
+    message: Optional[str] = None
 
-    def is_no_engine_graph(self) -> bool:
-        """True when this graph result represents a no-engine outcome."""
-        return len(self.engine_ids) == 0
-
-    def count_by_status(self) -> StatusCounts:
-        """Bucket results into pass/fail/skip/error counts.
-
-        A 'pass' is a successful run whose correctness check either passed or
-        was not performed (tolerance_match is True or None). A 'fail' is a
-        successful run whose correctness check explicitly failed
-        (tolerance_match is False).
-
-        Returns:
-            StatusCounts with the four bucket counts.
-        """
-        engine_results = [r for r in self.results if r.role == "engine"]
-        passed = sum(
-            1
-            for r in engine_results
-            if r.status == "success"
-            and (r.correctness is None or r.correctness.tolerance_match is not False)
-        )
-        failed = sum(
-            1
-            for r in engine_results
-            if r.status == "success"
-            and r.correctness is not None
-            and r.correctness.tolerance_match is False
-        )
-        skipped = sum(1 for r in engine_results if r.status == "skipped")
-        errored = sum(1 for r in engine_results if r.status == "error")
-        return StatusCounts(
-            passed=passed, failed=failed, skipped=skipped, errored=errored
-        )
+    @property
+    def status(self) -> Literal["ok", "no_engines", "error"]:
+        """``error`` on a graph-level failure, ``no_engines`` when none applied."""
+        if self.error is not None:
+            return "error"
+        if not self.engine_ids:
+            return "no_engines"
+        return "ok"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization.
-
-        Graph entry with 'results' array of provider/engine entries.
-        """
+        """Convert to the v2 graph object."""
         return {
+            "graph_id": self.graph_id,
             "graph_name": self.graph_name,
             "graph_path": self.graph_path,
+            "status": self.status,
+            "error": self.error,
+            "message": self.message,
             "results": [r.to_dict() for r in self.results],
         }
 
 
 @dataclass
-class SuiteMetadata:
-    """Suite-level summary plus environment info.
+class RunInfo:
+    """How and when the suite was run (JSON ``run``).
 
     Attributes:
-        timestamp: UTC timestamp when suite was run.
-        hostname: Machine hostname.
-        total_graphs: Total number of graphs in suite.
-        total_combinations: Total provider/engine combinations across all graphs.
-        pass_combinations: Combinations that passed correctness.
-        fail_combinations: Combinations that failed correctness.
-        skip_combinations: Combinations skipped (unsupported).
-        error_combinations: Combinations that errored during execution.
-        pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend for
-            PyTorch timing or reference validation; None when PyTorch was not
-            selected.
-        pytorch_rocm_fa_library_requested: Requested ROCm Flash Attention
-            implementation preference; None when not requested.
-        timing_block: Executions per timed sample. ``1`` means each
-            ``gpu_kernel_stats`` sample is one execution; ``N > 1`` means each
-            sample is the average of ``N`` back-to-back executions.
-        rocm_version: ROCm/HIP version string (None on CUDA hosts).
-        cuda_version: CUDA toolkit version the torch wheel was built
-            against (None on ROCm hosts).
-        cudnn_version: cuDNN version string, decoded major.minor.patch
-            (None on ROCm hosts or when cuDNN is unavailable).
-        gpu_model: GPU model name.
-        gpu_arch: GPU gfx target (e.g. "gfx90a", "gfx942"). Useful for
-            keying arch-specific PMC counter sets when analysing the
-            JSON downstream. "unknown" when detection failed.
-        python_version: Python version string.
-        hipdnn_version: hipDNN version string.
-        cpu_model: CPU model string from /proc/cpuinfo.
-        cpu_count: Number of logical CPUs.
-        numa_nodes: Number of NUMA nodes on the host.
-        total_ram_gb: Total host RAM in GiB.
-        kernel_version: Linux kernel version.
-        gpu_compute_units: Number of GPU compute units.
-        gpu_hbm_gb: Total GPU HBM in GiB.
-        gpu_pcie_link: PCIe link speed/width string (e.g. "gen4 x16").
-        amdgpu_driver_version: amdgpu driver version string.
-        host_rss_mb: Process RSS in MiB sampled once at suite end. Flat
-            across the suite — purely a steady-state footprint figure
-            (Python interpreter + torch + ROCm + hipDNN + buffers).
-        host_ram_available_mb: Host RAM available system-wide at suite
-            end, in MiB. Capacity hint, not a workload metric.
-        vram_used_mb: GPU VRAM currently allocated to this process at
-            suite end, via amdsmi. Reflects steady-state allocation, not
-            per-kernel peak.
-        vram_total_mb: Total VRAM on the GPU at suite end, via amdsmi.
-        hipdnn_selection_env: hipDNN cache/benchmarking and MIOpen
-            perf-db path environment variables sampled at suite end,
-            recorded only for oracle runs (``--oracle-mode plan`` or
-            ``exhaustive``). A ``None`` value means the variable was not
-            set, which is the load-bearing signal for cache-affected OOTB
-            timings.
+        started_at: UTC ISO timestamp of suite start.
+        argv: Command line.
+        config: Effective configuration (keys per :data:`RUN_CONFIG_KEYS`).
+        finished_at: UTC ISO timestamp of suite end; None while running.
+        complete: False for partial (interrupted or in-progress) results.
     """
 
-    timestamp: str
-    hostname: str
-    total_graphs: int
-    total_combinations: int
-    pass_combinations: int
-    fail_combinations: int
-    skip_combinations: int
-    error_combinations: int
-    pytorch_sdpa_backend_requested: Optional[str] = None
-    pytorch_rocm_fa_library_requested: Optional[str] = None
-    timing_block: int = 1
-    rocm_version: Optional[str] = None
-    cuda_version: Optional[str] = None
-    cudnn_version: Optional[str] = None
-    gpu_model: Optional[str] = None
-    gpu_arch: Optional[str] = None
-    python_version: Optional[str] = None
-    hipdnn_version: Optional[str] = None
-    cpu_model: Optional[str] = None
-    cpu_count: Optional[int] = None
-    numa_nodes: Optional[int] = None
-    total_ram_gb: Optional[float] = None
-    kernel_version: Optional[str] = None
-    gpu_compute_units: Optional[int] = None
-    gpu_hbm_gb: Optional[float] = None
-    gpu_pcie_link: Optional[str] = None
-    amdgpu_driver_version: Optional[str] = None
-    host_rss_mb: Optional[float] = None
-    host_ram_available_mb: Optional[float] = None
-    vram_used_mb: Optional[float] = None
-    vram_total_mb: Optional[float] = None
-    hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
+    started_at: str
+    argv: List[str]
+    config: Dict[str, Any]
+    finished_at: Optional[str] = None
+    complete: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        d: Dict[str, Any] = {
-            "timestamp": self.timestamp,
-            "hostname": self.hostname,
-            "total_graphs": self.total_graphs,
-            "total_combinations": self.total_combinations,
-            "pass_combinations": self.pass_combinations,
-            "fail_combinations": self.fail_combinations,
-            "skip_combinations": self.skip_combinations,
-            "error_combinations": self.error_combinations,
-            "pytorch_sdpa_backend_requested": self.pytorch_sdpa_backend_requested,
-            "pytorch_rocm_fa_library_requested": (
-                self.pytorch_rocm_fa_library_requested
-            ),
-            "timing_block": self.timing_block,
-            "rocm_version": self.rocm_version,
-            "cuda_version": self.cuda_version,
-            "cudnn_version": self.cudnn_version,
-            "gpu_model": self.gpu_model,
-            "gpu_arch": self.gpu_arch,
-            "python_version": self.python_version,
-            "hipdnn_version": self.hipdnn_version,
-            "cpu_model": self.cpu_model,
-            "cpu_count": self.cpu_count,
-            "numa_nodes": self.numa_nodes,
-            "total_ram_gb": self.total_ram_gb,
-            "kernel_version": self.kernel_version,
-            "gpu_compute_units": self.gpu_compute_units,
-            "gpu_hbm_gb": self.gpu_hbm_gb,
-            "gpu_pcie_link": self.gpu_pcie_link,
-            "amdgpu_driver_version": self.amdgpu_driver_version,
-            "host_rss_mb": self.host_rss_mb,
-            "host_ram_available_mb": self.host_ram_available_mb,
-            "vram_used_mb": self.vram_used_mb,
-            "vram_total_mb": self.vram_total_mb,
+        """Convert to the v2 ``run`` object."""
+        config = _with_keys(self.config, RUN_CONFIG_KEYS)
+        config["profiling"] = _with_keys(config["profiling"], PROFILING_KEYS)
+        return {
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "complete": self.complete,
+            "argv": list(self.argv),
+            "config": config,
         }
-        if self.hipdnn_selection_env is not None:
-            d["hipdnn_selection_env"] = dict(self.hipdnn_selection_env)
-        return d
 
 
 @dataclass
 class SuiteResult:
-    """Top-level suite result with graph-first nesting.
+    """Top-level suite result (result JSON schema v2).
 
     Attributes:
-        metadata: Suite-level metadata.
-        graphs: List of per-graph results.
+        run: Run info and effective config.
+        environment: Machine/software snapshot (keys per
+            :data:`ENVIRONMENT_KEYS`).
+        graphs: Per-graph results.
     """
 
-    metadata: SuiteMetadata
+    run: RunInfo
+    environment: Dict[str, Any]
     graphs: List[GraphResult]
 
-    @classmethod
-    def from_graph_results(
-        cls,
-        graph_results: List[GraphResult],
-        total_graphs: int,
-        *,
-        pytorch_sdpa_backend_requested: Optional[str] = None,
-        pytorch_rocm_fa_library_requested: Optional[str] = None,
-        timing_block: int = 1,
-        oracle: bool = False,
-    ) -> "SuiteResult":
-        """Build a SuiteResult from per-graph results with auto-computed metadata."""
-        env_info = collect_environment_info()
-        total_pass = total_fail = total_skip = total_error = 0
-        for gr in graph_results:
-            c = gr.count_by_status()
-            total_pass += c.passed
-            total_fail += c.failed
-            total_skip += c.skipped
-            total_error += c.errored
+    def summary(self) -> Dict[str, int]:
+        """Counts recomputed from the graphs on every call.
 
-        # Suite-end host/VRAM snapshot. Process RSS and VRAM are flat
-        # across the suite once libraries are loaded; sampling once here
-        # keeps the (graph, engine) results free of redundant noise.
-        # Failures fall back to None — never block metadata construction.
-        host_rss_mb: Optional[float] = None
-        host_ram_available_mb: Optional[float] = None
-        vram_used_mb: Optional[float] = None
-        vram_total_mb: Optional[float] = None
-        try:
-            from ..metrics.host import host_memory_snapshot
-
-            mem = host_memory_snapshot()
-            host_rss_mb = mem.get("host_rss_mb")
-            host_ram_available_mb = mem.get("host_ram_available_mb")
-        except Exception:
-            pass
-        try:
-            from ..metrics.gpu_smi import GpuSmiProbe
-
-            snap = GpuSmiProbe().snapshot()
-            vram_used_mb = snap.get("vram_used_mb")
-            vram_total_mb = snap.get("vram_total_mb")
-        except Exception:
-            pass
-
-        # Record selection controls only for oracle runs.
-        hipdnn_selection_env: Optional[Dict[str, Optional[str]]] = None
-        if oracle:
-            hipdnn_selection_env = {
-                name: os.environ.get(name)
-                for name in (
-                    "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-                    "HIPDNN_CACHE_DIR",
-                    "HIPDNN_DISABLE_CACHE",
-                    "HIPDNN_FORCE_BENCHMARKING",
-                    "MIOPEN_USER_DB_PATH",
-                    "MIOPEN_CUSTOM_CACHE_DIR",
-                )
-            }
-
-        metadata = SuiteMetadata(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            hostname=socket.gethostname(),
-            total_graphs=total_graphs,
-            total_combinations=total_pass + total_fail + total_skip + total_error,
-            pass_combinations=total_pass,
-            fail_combinations=total_fail,
-            skip_combinations=total_skip,
-            error_combinations=total_error,
-            pytorch_sdpa_backend_requested=pytorch_sdpa_backend_requested,
-            pytorch_rocm_fa_library_requested=pytorch_rocm_fa_library_requested,
-            timing_block=timing_block,
-            rocm_version=env_info.get("rocm_version"),
-            cuda_version=env_info.get("cuda_version"),
-            cudnn_version=env_info.get("cudnn_version"),
-            gpu_model=env_info.get("gpu_model"),
-            gpu_arch=env_info.get("gpu_arch"),
-            python_version=env_info.get("python_version"),
-            hipdnn_version=env_info.get("hipdnn_version"),
-            cpu_model=env_info.get("cpu_model"),
-            cpu_count=env_info.get("cpu_count"),
-            numa_nodes=env_info.get("numa_nodes"),
-            total_ram_gb=env_info.get("total_ram_gb"),
-            kernel_version=env_info.get("kernel_version"),
-            gpu_compute_units=env_info.get("gpu_compute_units"),
-            gpu_hbm_gb=env_info.get("gpu_hbm_gb"),
-            gpu_pcie_link=env_info.get("gpu_pcie_link"),
-            amdgpu_driver_version=env_info.get("amdgpu_driver_version"),
-            host_rss_mb=host_rss_mb,
-            host_ram_available_mb=host_ram_available_mb,
-            vram_used_mb=vram_used_mb,
-            vram_total_mb=vram_total_mb,
-            hipdnn_selection_env=hipdnn_selection_env,
-        )
-        return cls(metadata=metadata, graphs=graph_results)
+        Row buckets count ``role == 'engine'`` rows only (reference rows are
+        not pass/fail combinations) and sum to ``rows``.
+        """
+        verdicts = [
+            r.verdict for g in self.graphs for r in g.results if r.role == "engine"
+        ]
+        statuses = [g.status for g in self.graphs]
+        return {
+            "graphs": len(self.graphs),
+            "rows": len(verdicts),
+            "passed": verdicts.count("passed"),
+            "unchecked": verdicts.count("unchecked"),
+            "failed": verdicts.count("failed"),
+            "skipped": verdicts.count("skipped"),
+            "errors": verdicts.count("error"),
+            "graph_errors": statuses.count("error"),
+            "no_engine_graphs": statuses.count("no_engines"),
+        }
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization.
-
-        Returns dict with "metadata" and "graphs" keys.
-        """
+        """Convert to the v2 document (not yet NaN-sanitized; see to_json)."""
+        env = _with_keys(self.environment, ENVIRONMENT_KEYS)
         return {
-            "metadata": self.metadata.to_dict(),
+            "schema_version": SUITE_RESULT_SCHEMA_VERSION,
+            "tool": {"name": "dnn-benchmarking", "version": __version__},
+            "run": self.run.to_dict(),
+            "environment": env,
+            "summary": self.summary(),
             "graphs": [g.to_dict() for g in self.graphs],
         }
 
-    def to_json(self, indent: int = 2) -> str:
-        """Serialize to JSON string.
+    def to_json(self, compact: bool = False) -> str:
+        """Serialize to strict JSON: NaN/inf become null, floats are rounded.
 
-        Args:
-            indent: JSON indentation level.
-
-        Returns:
-            JSON string representation.
+        Indented by one space; ``compact`` drops all whitespace.
         """
-        return json.dumps(self.to_dict(), indent=indent)
+        layout: Dict[str, Any] = (
+            {"separators": (",", ":")} if compact else {"indent": 1}
+        )
+        return json.dumps(_finite(self.to_dict()), allow_nan=False, **layout)
 
-    def save_json(self, path: str) -> None:
-        """Write suite results to JSON file.
+    def to_rows(self) -> List[Dict[str, Any]]:
+        """Flatten to one dict per row with :data:`ROW_COLUMNS` keys.
 
-        Args:
-            path: Output file path.
+        A graph without rows (graph-level error, no engines) still yields
+        one row carrying the graph status and error.
+        """
+        doc = _finite(self.to_dict())
+        arch = doc["environment"]["gpu_arch"]
+        config = doc["run"]["config"]
+        rows: List[Dict[str, Any]] = []
+        for g in doc["graphs"]:
+            base = {
+                "gpu_arch": arch,
+                "graph_name": g["graph_name"],
+                "graph_id": g["graph_id"],
+                "seed": config["seed"],
+                "cache_mode": config["cache_mode"],
+                "timing_block": config["timing_block"],
+            }
+            if not g["results"]:
+                rows.append(
+                    {
+                        **dict.fromkeys(ROW_COLUMNS),
+                        **base,
+                        "status": g["status"],
+                        "message": g["error"] or g["message"],
+                    }
+                )
+            for r in g["results"]:
+                ootb = r["ootb"] or {}
+                kernel, host = ootb.get("kernel") or {}, ootb.get("host") or {}
+                timing = ootb.get("timing") or {}
+                correctness = ootb.get("correctness") or {}
+                rows.append(
+                    {
+                        **base,
+                        "runtime": r["runtime"],
+                        "role": r["role"],
+                        "engine_id": r["engine"]["id"],
+                        "engine_name": r["engine"]["name"],
+                        "status": r["status"],
+                        "verdict": r["verdict"],
+                        "kernel_median_ms": kernel.get("median_ms"),
+                        "kernel_iqr_pct": _iqr_pct(kernel),
+                        "host_median_ms": host.get("median_ms"),
+                        "samples": timing.get("samples"),
+                        "timing_mode": timing.get("mode"),
+                        "tflops": ootb.get("tflops"),
+                        "gbps": ootb.get("gbps"),
+                        "workspace_bytes": ootb.get("workspace_bytes"),
+                        "max_abs_diff": correctness.get("max_abs_diff"),
+                        "message": r["message"],
+                    }
+                )
+        return rows
+
+    def write(self, path: Union[str, Path], compact: bool = False) -> None:
+        """Write atomically: JSON, or CSV when ``path`` ends in ``.csv``.
+
+        The content is fully serialized before a temp file in the target
+        directory is written and renamed over ``path``, so readers never see
+        a partial file and a failed write leaves any previous file intact.
+        ``compact`` applies to JSON only.
         """
         p = Path(path)
+        if p.suffix.lower() == ".csv":
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=ROW_COLUMNS, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(self.to_rows())
+            text = buf.getvalue()
+        else:
+            text = self.to_json(compact)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.to_json())
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            # mkstemp creates 0600; give the result the mode open() would.
+            # os.chmod on the path, not os.fchmod: Windows lacks fchmod.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+            os.replace(tmp, p)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
+    @staticmethod
+    def load(path: Union[str, Path]) -> Dict[str, Any]:
+        """Read a v2 result document.
 
-def _format_cudnn_version(raw: Optional[int]) -> Optional[str]:
-    """Decode the packed integer from ``torch.backends.cudnn.version()``.
-
-    torch exposes cuDNN's version only as a packed int (e.g. ``92000``),
-    so we decode it to a human-readable ``major.minor.patch`` string.
-    cuDNN 9+ packs as ``major*10000 + minor*100 + patch``; earlier
-    releases used ``major*1000 + minor*100 + patch``. Returns ``None``
-    for a missing/zero version.
-    """
-    if not raw:
-        return None
-    if raw >= 90000:
-        major, minor, patch = raw // 10000, (raw % 10000) // 100, raw % 100
-    else:
-        major, minor, patch = raw // 1000, (raw % 1000) // 100, raw % 100
-    return f"{major}.{minor}.{patch}"
-
-
-def collect_environment_info() -> Dict[str, Any]:
-    """Collect ROCm/CUDA/GPU/Python/hipDNN versions plus static machine metadata.
-
-    Combines the legacy version probes (torch hip, hipdnn_frontend) with
-    the host- and GPU-side static info from
-    :func:`metrics.machine_info.collect_machine_info`. On a CUDA host the
-    ROCm/hipDNN probes stay ``None`` and ``cuda_version``/``cudnn_version``
-    are populated instead (and vice versa on ROCm). Never raises; missing
-    values are ``None`` so :class:`SuiteMetadata` can serialise a stable
-    shape.
-    """
-    python_version = (
-        f"{sys.version_info.major}.{sys.version_info.minor}"
-        f".{sys.version_info.micro}"
-    )
-    rocm_version: Optional[str] = None
-    cuda_version: Optional[str] = None
-    cudnn_version: Optional[str] = None
-    gpu_model: Optional[str] = None
-    hipdnn_version: Optional[str] = None
-
-    try:
-        if torch_support.module_available():
-            import torch
-
-            if hasattr(torch.version, "hip"):
-                rocm_version = torch.version.hip
-            if torch_support.is_cuda_build():
-                cuda_version = getattr(torch.version, "cuda", None)
-                try:
-                    cudnn_version = _format_cudnn_version(
-                        torch.backends.cudnn.version()
-                    )
-                except Exception:
-                    cudnn_version = None
-            if torch_support.gpu_available():
-                gpu_model = torch.cuda.get_device_name(0)
-    except Exception:
-        pass
-
-    try:
-        import hipdnn_frontend
-
-        hipdnn_version = getattr(hipdnn_frontend, "__version__", None)
-    except ImportError:
-        pass
-
-    # gfx target via the same torch -> rocminfo -> "unknown" chain used
-    # by metrics.rocprof_pmc, so the JSON output and the PMC keying
-    # agree on what arch this run targeted. detect_arch() never raises —
-    # it returns "unknown" when no GPU is detectable.
-    gpu_arch = detect_arch()
-
-    info: Dict[str, Any] = {
-        "rocm_version": rocm_version,
-        "cuda_version": cuda_version,
-        "cudnn_version": cudnn_version,
-        "gpu_model": gpu_model,
-        "gpu_arch": gpu_arch,
-        "python_version": python_version,
-        "hipdnn_version": hipdnn_version,
-    }
-
-    try:
-        from ..metrics.machine_info import collect_machine_info
-
-        info.update(collect_machine_info())
-    except Exception:
-        # machine_info already routes failures through warn_once; avoid
-        # propagating any unexpected exception out of metadata building.
-        pass
-
-    return info
+        Raises:
+            OSError: Unreadable file.
+            ValueError: Not a schema v2 JSON result file.
+        """
+        with open(path) as f:
+            try:
+                doc = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{path}: not a JSON result file ({e}); compare needs "
+                    "-o *.json output"
+                ) from None
+        version = doc.get("schema_version") if isinstance(doc, dict) else None
+        if version != SUITE_RESULT_SCHEMA_VERSION:
+            raise ValueError(
+                f"{path}: unsupported result schema_version {version!r} "
+                f"(expected {SUITE_RESULT_SCHEMA_VERSION}); regenerate it with this "
+                "version of dnn-benchmark"
+            )
+        if not doc["run"]["complete"]:
+            print(
+                f"warning: {path}: run.complete is false; results are partial",
+                file=sys.stderr,
+            )
+        return doc

@@ -1,959 +1,784 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Console output formatting for benchmark results."""
+"""Console output for benchmark suites.
 
+Results (suite header, per-graph tables, verbose detail, summaries) go to
+``output``; progress, info, warnings and errors go to ``err``. A progress
+line left open on a TTY is always terminated before anything else is
+written, including ``warn_once`` diagnostics routed through the sink.
+"""
+
+import shutil
 import sys
+import textwrap
 from pathlib import Path
 from statistics import geometric_mean
-from typing import List, Optional, TextIO
+from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple
 
-from ..config.benchmark_config import BenchmarkConfig, SuiteConfig
-from .statistics import BenchmarkStats
+from ..metrics import _diagnostic
+from .statistics import BenchmarkStats, noise_warnings
 from .suite_results import (
-    CorrectnessResult,
     GraphResult,
     ProviderEngineResult,
-    SuiteMetadata,
+    SuiteResult,
+    engine_id_hex,
+    oracle_speedup,
+    timing_modes_differ,
+)
+
+_TIMING_MODE_LABEL = {
+    "staged": "staged stall-gate",
+    "events": "per-launch events",
+    "block": "block mean of back-to-back launches",
+}
+_CLOCK_KEYS = (
+    ("sclk_mhz", "sclk", "MHz"),
+    ("mclk_mhz", "mclk", "MHz"),
+    ("power_w", "power", "W"),
+    ("temp_hotspot_c", "hotspot", "C"),
+    ("throttle_status", "throttle", ""),
 )
 
 
+def _width() -> int:
+    return shutil.get_terminal_size((120, 24)).columns
+
+
+def _clip(text: str, width: int) -> str:
+    """Truncate to ``width`` columns, marking the cut with an ellipsis."""
+    if len(text) <= width:
+        return text
+    return text[: max(width - 1, 0)] + "…" if width > 0 else ""
+
+
+def _render_table(
+    columns: Sequence[Tuple[str, bool, List[str]]],
+    widths: Sequence[int],
+    width: int,
+    indent: str = "",
+) -> List[str]:
+    """Header plus one line per row; ``columns`` is (header, right-aligned, cells)."""
+
+    def render(cells: Sequence[str]) -> str:
+        parts = []
+        for (_, right, _), w, cell in zip(columns, widths, cells):
+            cell = _clip(cell, w)
+            parts.append(cell.rjust(w) if right else cell.ljust(w))
+        return _clip((indent + "  ".join(parts)).rstrip(), width)
+
+    rows = zip(*(cells for _, _, cells in columns))
+    return [render([h for h, _, _ in columns]), *map(render, rows)]
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _unit(ms: float) -> Tuple[float, str]:
+    """Scale and suffix that render ``ms`` with a readable magnitude."""
+    if ms < 1.0:
+        return 1e3, "µs"
+    if ms < 1e3:
+        return 1.0, "ms"
+    return 1e-3, "s"
+
+
+def _fmt_time(ms: float) -> str:
+    """Per-launch time with an automatic µs/ms/s unit."""
+    scale, suffix = _unit(ms)
+    digits = 2 if suffix == "µs" else 3
+    return f"{ms * scale:.{digits}f} {suffix}"
+
+
+def _fmt_duration(ms: float) -> str:
+    """Wall-clock cost (setup, build): 2 significant digits below 10 ms."""
+    if ms < 10:
+        return f"{ms:.2g} ms"
+    return f"{ms:.0f} ms" if ms < 1e3 else f"{ms / 1e3:.1f} s"
+
+
+def _iqr_pct(stats: BenchmarkStats) -> float:
+    return stats.iqr_ms / stats.median_ms * 100 if stats.median_ms > 0 else 0.0
+
+
+def _fmt_mib(mib: float) -> str:
+    return f"{mib / 1024:.2f} GiB" if mib >= 1024 else f"{mib:.1f} MiB"
+
+
+def _display_name(pe: ProviderEngineResult) -> str:
+    return pe.engine_name or pe.runtime
+
+
+def _reason(pe: ProviderEngineResult) -> Optional[str]:
+    """Why a row did not produce timings, or None for successful rows."""
+    if pe.status == "skipped":
+        return pe.skip_reason or "no reason given"
+    if pe.status == "error":
+        return pe.error_message or "no error message"
+    return None
+
+
+def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
+    """Why the oracle speedup is not reportable, or None when it is."""
+    tuned_verdict = pe.oracle.correctness if pe.oracle is not None else None
+    if any(
+        v is not None and v.explicitly_failed
+        for v in (pe.ootb.correctness, tuned_verdict)
+    ):
+        # A wrong baseline or tuned plan cannot measure a gain.
+        return "invalid"
+    if pe.oracle is not None and not pe.oracle.tuning_available:
+        # One fixed configuration: the ratio is run-to-run noise.
+        return "no-search"
+    if timing_modes_differ(pe):
+        # Event-timed OOTB against stall-gated tuned: not one measurement.
+        return "mixed-timing"
+    if oracle_speedup(pe) is not None:
+        return None
+    if pe.oracle_error is not None:
+        return "failed"
+    return "n/a"
+
+
 class Reporter:
-    """Formats and prints benchmark results to console.
+    """Formats benchmark progress and results for the console."""
 
-    Handles all console output including:
-    - Configuration header
-    - Initialization timing
-    - Execution statistics
-    - Validation results
-    """
-
-    WIDTH = 80
-
-    def __init__(self, output: TextIO = sys.stdout) -> None:
-        """Initialize reporter with output stream.
-
-        Args:
-            output: Output stream (default: stdout).
-        """
-        self._output = output
-
-    def print_header(
+    def __init__(
         self,
-        config: BenchmarkConfig,
-        graph_name: str,
-        provider: Optional[str] = None,
+        output: Optional[TextIO] = None,
+        err: Optional[TextIO] = None,
+        *,
+        quiet: bool = False,
+        verbose: bool = False,
     ) -> None:
-        """Print benchmark configuration header.
+        """Bind output streams.
 
         Args:
-            config: Benchmark configuration.
-            graph_name: Name of the graph being benchmarked.
-            provider: Optional engine display name. When set, replaces the
-                legacy "(MIOpen)" literal so suite-mode verbose output can
-                show the actual engine for each result.
+            output: Results stream (default: sys.stdout).
+            err: Progress/diagnostics stream. Defaults to ``output`` when
+                ``output`` is given explicitly, else sys.stderr.
+            quiet: Suppress progress lines and info messages.
+            verbose: Add a per-engine detail block under each graph table.
         """
-        engine_label = provider if provider else "MIOpen"
-        self._print_line("=")
-        self._print(f"hipDNN Benchmark: {graph_name}")
-        self._print_line("=")
-        self._print(f"Graph:      {config.graph_path}")
-        self._print(f"Engine ID:  {config.engine_id} ({engine_label})")
-        self._print(f"Warmup:     {config.warmup_iters} iterations")
-        self._print(f"Benchmark:  {self._iters_label(config)}")
-        self._print_line("-")
-        self._print("")
+        if err is None:
+            err = output if output is not None else sys.stderr
+        self._out = output if output is not None else sys.stdout
+        self._err = err
+        self._quiet = quiet
+        self._verbose = verbose
+        self._tty = err.isatty()
+        self._engine_head: Optional[str] = None  # engine progress line in flight
+        self._pending: Optional[str] = None  # TTY line written without its newline
+        self._legend_done = False
 
-    def print_reference_header(
-        self, config: BenchmarkConfig, graph_name: str, provider: str
-    ) -> None:
-        """Print a timed validation-provider reference row header."""
-        self._print_line("=")
-        self._print(f"Validation Reference Benchmark: {graph_name}")
-        self._print_line("=")
-        self._print(f"Graph:      {config.graph_path}")
-        self._print(f"Provider:   {provider}")
-        self._print(f"Warmup:     {config.warmup_iters} iterations")
-        self._print(f"Benchmark:  {self._iters_label(config)}")
-        self._print_line("-")
-        self._print("")
+    # Stream plumbing
+
+    def _break(self) -> None:
+        """Terminate a pending progress line so the next write starts clean."""
+        if self._pending is not None:
+            self._pending = None
+            _diagnostic.set_sink(None)
+            self._err.write("\n")
+            self._err.flush()
+
+    def _print(self, text: str = "") -> None:
+        self._break()
+        print(text, file=self._out, flush=True)
+
+    def _print_err(self, text: str) -> None:
+        self._break()
+        print(text, file=self._err, flush=True)
+
+    def _begin(self, head: str) -> None:
+        if self._quiet or not self._tty:
+            return
+        self._break()
+        self._err.write(head)
+        self._err.flush()
+        self._pending = head
+        _diagnostic.set_sink(self._print_err)
+
+    def _finish(self, head: str, outcome: str) -> None:
+        if self._quiet:
+            return
+        outcome = _clip(outcome, _width() - len(head) - 1)
+        if self._pending == head:
+            # Nothing interrupted the line: complete it in place.
+            self._pending = None
+            _diagnostic.set_sink(None)
+            self._err.write(f" {outcome}\n")
+            self._err.flush()
+        else:
+            self._print_err(f"{head} {outcome}")
+
+    # Messages
+
+    def info(self, msg: str) -> None:
+        """Progress-level note (suppressed by ``quiet``)."""
+        if not self._quiet:
+            self._print_err(msg)
+
+    def warning(self, msg: str) -> None:
+        """Non-fatal problem; always shown."""
+        self._print_err(f"WARNING: {msg}")
+
+    def error(self, msg: str) -> None:
+        """Fatal or row-level error; always shown."""
+        self._print_err(f"ERROR: {msg}")
+
+    # Progress
+
+    def graph_start(self, index: int, total: int, name: str) -> None:
+        """Announce a graph: ``[i/n] name``."""
+        if not self._quiet:
+            self._print_err(f"[{index}/{total}] {name}")
+
+    def engine_start(self, label: str) -> None:
+        """Open the progress line for one engine row."""
+        self._engine_head = f"  {label} ..."
+        self._begin(self._engine_head)
+
+    def engine_done(self, result: ProviderEngineResult) -> None:
+        """Complete the engine progress line with the row outcome."""
+        head = self._engine_head or f"  {_display_name(result)} ..."
+        self._engine_head = None
+        self._finish(head, self._outcome(result))
+
+    def profiling_start(self, label: str) -> None:
+        """Open the progress line for an opt-in profiling pass."""
+        self._begin(f"    profiling {label} ...")
+
+    def profiling_done(self, label: str, seconds: float) -> None:
+        """Complete the profiling progress line."""
+        self._finish(f"    profiling {label} ...", f"done ({seconds:.1f} s)")
 
     @staticmethod
-    def _iters_label(config: BenchmarkConfig) -> str:
-        """Describe the timed loop, including block timing when enabled."""
-        label = f"{config.benchmark_iters} iterations"
-        if config.timing_block > 1:
-            label += f" x {config.timing_block} executions per timed block"
-        return label
+    def _outcome(pe: ProviderEngineResult) -> str:
+        reason = _reason(pe)
+        if reason is not None:
+            return f"{pe.status}: {_one_line(reason)}"
+        parts = [pe.verdict]
+        kernel = pe.ootb.gpu_kernel_stats
+        if kernel is not None:
+            parts.append(_fmt_time(kernel.median_ms))
+        detail = []
+        if kernel is not None:
+            detail.append(f"iqr {_iqr_pct(kernel):.1f}%")
+        if pe.ootb.timing is not None:
+            detail.append(f"setup {_fmt_duration(pe.ootb.timing.first_call_ms)}")
+        elif pe.elapsed_time_ms:
+            detail.append(f"took {_fmt_duration(pe.elapsed_time_ms)}")
+        if detail:
+            parts.append(f"({', '.join(detail)})")
+        return "  ".join(parts)
 
-    def print_init_time(self, init_time_ms: float) -> None:
-        """Print initialization timing.
-
-        Args:
-            init_time_ms: Graph initialization time in milliseconds.
-        """
-        self._print("Initialization:")
-        self._print(f"  Graph build time:     {init_time_ms:.2f} ms")
-        self._print("")
-
-    def print_stats(self, stats: BenchmarkStats) -> None:
-        """Print execution statistics.
-
-        Args:
-            stats: Benchmark statistics.
-        """
-        self._print("Execution Statistics:")
-        self._print_stats_block(stats)
-        self._print("")
-
-    def _print_stats_block(self, stats: BenchmarkStats) -> None:
-        """Print a statistics block (helper for print_stats).
-
-        Args:
-            stats: Benchmark statistics.
-        """
-        self._print(f"  Mean:                 {stats.mean_ms:.3f} ms")
-        self._print(f"  Median:               {stats.median_ms:.3f} ms")
-        self._print(f"  Std Dev:              {stats.std_ms:.3f} ms")
-        self._print(f"  Min:                  {stats.min_ms:.3f} ms")
-        self._print(f"  Max:                  {stats.max_ms:.3f} ms")
-        self._print(f"  P95:                  {stats.p95_ms:.3f} ms")
-        self._print(f"  P99:                  {stats.p99_ms:.3f} ms")
-
-    def print_validation(self, passed: bool, message: str) -> None:
-        """Print validation result.
-
-        Args:
-            passed: Whether validation passed.
-            message: Validation message.
-        """
-        status = "PASSED" if passed else "FAILED"
-        if "skipped" in message.lower() or "stubbed" in message.lower():
-            status = "SKIPPED"
-
-        self._print(f"Validation: {status} ({message})")
-
-    def print_footer(self) -> None:
-        """Print benchmark footer."""
-        self._print_line("=")
-
-    def print_error(self, message: str) -> None:
-        """Print error message.
-
-        Args:
-            message: Error message.
-        """
-        self._print(f"ERROR: {message}")
-
-    def print_warning(self, message: str) -> None:
-        """Print non-fatal warning message.
-
-        Args:
-            message: Warning message.
-        """
-        self._print(f"WARNING: {message}")
-
-    def print_oracle_summary(self, speedups: List[float], no_search_rows: int) -> None:
-        """Print the suite-wide oracle comparison line.
-
-        Args:
-            speedups: Per-row speedups from rows where tuning had an
-                alternative configuration to choose from.
-            no_search_rows: Rows excluded because nothing was searched.
-        """
-        if not speedups:
-            if no_search_rows:
-                self._print(
-                    f"Oracle comparison: no tuning alternatives available on "
-                    f"any of {no_search_rows} engine rows (one compiled plan "
-                    f"each, provider tuning unavailable); no speedup reported"
-                )
-            return
-        suffix = (
-            f"; {no_search_rows} row(s) excluded with no tuning search"
-            if no_search_rows
-            else ""
-        )
-        self._print(
-            f"Oracle comparison: {len(speedups)} engine rows tuned, "
-            f"geomean speedup {geometric_mean(speedups):.2f}x{suffix}"
-        )
-
-    def _print(self, text: str) -> None:
-        """Print a line of text.
-
-        Args:
-            text: Text to print.
-        """
-        print(text, file=self._output)
-
-    def _print_line(self, char: str) -> None:
-        """Print a horizontal line.
-
-        Args:
-            char: Character to use for the line.
-        """
-        print(char * self.WIDTH, file=self._output)
-
-    # Suite Methods
-
-    def print_hipdnn_init_start(self) -> None:
-        """Print hipDNN initialization start (no trailing newline)."""
-        print("Initializing hipDNN...", end="", flush=True, file=self._output)
-
-    def print_hipdnn_init_done(self) -> None:
-        """Print hipDNN initialization completion on the same line."""
-        print(" done", flush=True, file=self._output)
-
-    def print_hipdnn_init_newline(self) -> None:
-        """End the hipDNN init line (used before printing an error)."""
-        print(flush=True, file=self._output)
-
-    def print_running_benchmark(self, total: int) -> None:
-        """Print running benchmark status line."""
-        self._print(f"Running benchmark on {total} file(s)...")
+    # Suite header and summaries
 
     def print_suite_header(
-        self,
-        total_graphs: int,
-        tarball_source: Optional[str] = None,
-        extra_profiling_runs: int = 0,
+        self, env: Dict[str, Any], run_config: Dict[str, Any], n_graphs: int
     ) -> None:
-        """Print suite execution header.
-
-        Includes a one-line machine summary (CPU + GPU + ROCm) collected
-        by ``metrics.machine_info`` so console output matches the JSON
-        metadata. Failures are silent — ``machine_info`` already routes
-        them through ``warn_once``.
-
-        When ``extra_profiling_runs > 0`` the user gets an upfront notice
-        of the cost of opt-in profiling so they can size their suite
-        accordingly.
-        """
-        self._print_line("=")
-        self._print(f"hipDNN Benchmark Suite: {total_graphs} graph(s)")
-        self._print_line("=")
-        if tarball_source is not None:
-            self._print(f"Source:  {tarball_source} (extracted)")
-        self._print_machine_summary()
-        if extra_profiling_runs > 0:
-            self._print(
-                f"Profiling: {extra_profiling_runs} extra workload run(s) "
-                "per (graph, engine)"
+        """Print the machine and methodology lines that head every run."""
+        self._print(f"dnn-benchmark: {n_graphs} graph(s)")
+        self._print(f"Host:    {env.get('cpu_model') or 'unknown CPU'}")
+        gpu_extras = [
+            text
+            for text in (
+                env.get("gpu_arch"),
+                (
+                    f"{env['gpu_compute_units']} CUs"
+                    if env.get("gpu_compute_units")
+                    else None
+                ),
+                f"{env['gpu_hbm_gb']:g} GB HBM" if env.get("gpu_hbm_gb") else None,
             )
-        self._print("")
-
-    def _print_machine_summary(self) -> None:
-        """Print a compact machine identity line if any field is known."""
-        try:
-            from ..metrics.machine_info import collect_machine_info
-            from .suite_results import collect_environment_info
-        except ImportError:
-            return
-        try:
-            env = collect_environment_info()
-        except Exception:
-            return
-        cpu = env.get("cpu_model") or "unknown CPU"
-        gpu = env.get("gpu_model") or "unknown GPU"
-        cuda = env.get("cuda_version")
-        cudnn = env.get("cudnn_version")
-        cu = env.get("gpu_compute_units")
-        hbm = env.get("gpu_hbm_gb")
-        gpu_extras = []
-        if cu is not None:
-            gpu_extras.append(f"{cu} CUs")
-        if hbm is not None:
-            gpu_extras.append(f"{hbm:g} GB HBM")
-        gpu_label = gpu + (f" ({', '.join(gpu_extras)})" if gpu_extras else "")
-        self._print(f"Host:    {cpu}")
-        self._print(f"GPU:     {gpu_label}")
-        # A CUDA wheel reports cuda_version; a ROCm wheel does not. Show the
-        # platform-appropriate label so CUDA hosts never print a ROCm line
-        # (and vice versa).
-        if cuda is not None:
-            self._print(f"CUDA:    {cuda}")
-            if cudnn is not None:
-                self._print(f"cuDNN:   {cudnn}")
-        else:
-            rocm = env.get("rocm_version") or "unknown ROCm"
-            self._print(f"ROCm:    {rocm}")
-
-    def print_suite_graph_start(self, index: int, total: int, graph_name: str) -> None:
-        """Print per-graph progress line at start (no trailing newline).
-
-        Format: [1/3] graph_name...
-        """
-        print(
-            f"[{index}/{total}] {graph_name}...", end="", flush=True, file=self._output
-        )
-
-    def print_engine_start(self, name: str) -> None:
-        """Print the engine name with trailing ellipsis, no newline.
-
-        Format:   miopen_winograd...
-        """
-        print(f"  {name}...", end="", flush=True, file=self._output)
-
-    def print_engine_result(self, pe: ProviderEngineResult) -> None:
-        """Append the outcome to the engine start line, then newline.
-
-        Format:   miopen_winograd...passed
-        """
-        print(self._pe_outcome(pe), file=self._output)
-
-    def print_suite_graph_error(self, graph_name: str, error: str) -> None:
-        """Print inline error on the same line as the graph start, then newline.
-
-        Prints error then continues (caller must not abort).
-        """
-        self._print(f" ERROR: {error}")
-
-    def print_suite_summary(self, metadata: SuiteMetadata) -> None:
-        """Print suite execution summary from suite metadata.
-
-        Args:
-            metadata: SuiteMetadata containing graph and combination totals.
-        """
-        self._print("")
-        self._print_line("-")
-        self._print("Suite Summary:")
-        self._print(f"  Graphs:       {metadata.total_graphs}")
-        self._print(f"  Combinations: {metadata.total_combinations}")
-        self._print(f"  Passed:       {metadata.pass_combinations}")
-        self._print(f"  Failed:       {metadata.fail_combinations}")
-        self._print(f"  Skipped:      {metadata.skip_combinations}")
-        self._print(f"  Errors:       {metadata.error_combinations}")
-
-        # Suite-end footprint — process RSS and VRAM allocated at the
-        # moment the metadata was built. These are flat across the suite
-        # (steady-state library + buffer footprint), which is exactly
-        # why they belong here and not on every per-engine result.
-        footprint_present = any(
-            v is not None
-            for v in (
-                metadata.host_rss_mb,
-                metadata.host_ram_available_mb,
-                metadata.vram_used_mb,
-            )
-        )
-        if footprint_present:
-            self._print("")
-            self._print("Suite Footprint:")
-            if metadata.host_rss_mb is not None:
-                avail = metadata.host_ram_available_mb
-                avail_str = (
-                    f"  (host avail {self._fmt_mib(avail)})"
-                    if avail is not None
-                    else ""
-                )
-                self._print(
-                    f"  Host RSS:     {self._fmt_mib(metadata.host_rss_mb)}{avail_str}"
-                )
-            if metadata.vram_used_mb is not None:
-                if metadata.vram_total_mb:
-                    self._print(
-                        f"  VRAM used:    {self._fmt_mib(metadata.vram_used_mb)}"
-                        f" / {self._fmt_mib(metadata.vram_total_mb)}"
-                    )
-                else:
-                    self._print(
-                        f"  VRAM used:    {self._fmt_mib(metadata.vram_used_mb)}"
-                    )
-
-    def print_suite_footer(self) -> None:
-        """Print suite footer."""
-        self._print_line("=")
-
-    @staticmethod
-    def _pe_outcome(pe: ProviderEngineResult) -> str:
-        """Derive a short outcome label for a ProviderEngineResult."""
-        if pe.role == "reference" and pe.status == "success":
-            label = "reference"
-            timing = (
-                pe.gpu_kernel_stats
-                if pe.gpu_kernel_stats is not None
-                else pe.host_stats
-            )
-            if timing is not None:
-                exec_s = timing.total_ms / 1000
-                wall_s = pe.elapsed_time_ms / 1000
-                return f"{label} (exec {exec_s:.2f}s, elapsed {wall_s:.2f}s)"
-            return label
-        if pe.status == "success":
-            label = (
-                "failed"
-                if (
-                    pe.correctness is not None
-                    and pe.correctness.tolerance_match is False
-                )
-                else "passed"
-            )
-            timing = (
-                pe.gpu_kernel_stats
-                if pe.gpu_kernel_stats is not None
-                else pe.host_stats
-            )
-            if timing is not None:
-                exec_s = timing.total_ms / 1000
-                wall_s = pe.elapsed_time_ms / 1000
-                return f"{label} (exec {exec_s:.2f}s, elapsed {wall_s:.2f}s)"
-            return label
-        if pe.status == "skipped":
-            return "skipped"
-        return "errored"
-
-    def print_graph_result_table(self, graph_result: GraphResult) -> None:
-        """Render one compact summary row per engine for a graph."""
-        if not graph_result.results:
-            return
-
-        include_plugin = any(pe.plugin_path for pe in graph_result.results)
-        include_oracle = any(
-            pe.oracle or pe.oracle_error for pe in graph_result.results
-        )
-        headers = ["engine", "status"]
-        if include_plugin:
-            headers.append("plugin_path")
-        headers.extend(
-            [
-                "ootb_kernel_mean_ms" if include_oracle else "kernel_mean_ms",
-                "kernel_median_ms",
-                "host_mean_ms",
-                "host_median_ms",
-            ]
-        )
-        include_warnings = any(pe.warnings for pe in graph_result.results)
-        if include_oracle:
-            headers.extend(
-                [
-                    "warm_ootb_kernel_mean_ms",
-                    "oracle_kernel_mean_ms",
-                    "oracle_speedup",
-                ]
-            )
-        if include_warnings:
-            headers.append("warnings")
-        rows: List[List[str]] = []
-        for pe in graph_result.results:
-            row = [pe.provider, self._pe_status(pe)]
-            if include_plugin:
-                row.append(pe.plugin_path or "")
-            row.extend(
-                [
-                    self._fmt_stat(pe.gpu_kernel_stats, "mean_ms"),
-                    self._fmt_stat(pe.gpu_kernel_stats, "median_ms"),
-                    self._fmt_stat(pe.host_stats, "mean_ms"),
-                    self._fmt_stat(pe.host_stats, "median_ms"),
-                ]
-            )
-            if include_oracle:
-                # Show the warm OOTB operand used by oracle_speedup.
-                row.append(
-                    self._fmt_stat(pe.oracle.warm_baseline_gpu_kernel_stats, "mean_ms")
-                    if pe.oracle is not None
-                    else "n/a"
-                )
-                row.append(
-                    self._fmt_stat(pe.oracle.gpu_kernel_stats, "mean_ms")
-                    if pe.oracle is not None
-                    else "n/a"
-                )
-                # A speedup requires two valid operands.
-                if any(
-                    verdict is not None and verdict.explicitly_failed
-                    for verdict in (
-                        pe.correctness,
-                        pe.oracle.correctness if pe.oracle else None,
-                    )
-                ):
-                    row.append("invalid")
-                elif pe.oracle is not None and not pe.oracle.tuning_available:
-                    # A single fixed configuration produced only timing noise.
-                    row.append("no-search")
-                elif pe.oracle_delta is not None:
-                    row.append(f"{pe.oracle_delta.speedup:.2f}x")
-                elif pe.oracle_error is not None:
-                    row.append("failed")
-                else:
-                    row.append("n/a")
-            if include_warnings:
-                row.append(self._fmt_warnings(pe.warnings))
-            rows.append(row)
-
-        widths = [
-            max(len(headers[i]), *(len(row[i]) for row in rows))
-            for i in range(len(headers))
+            if text
         ]
-        self._print("Results:")
-        self._print("  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
-        self._print("  " + "  ".join("-" * width for width in widths))
-        for row in rows:
-            self._print(
-                "  " + "  ".join(row[i].ljust(widths[i]) for i in range(len(row)))
-            )
-        self._print("")
-
-    @staticmethod
-    def _pe_status(pe: ProviderEngineResult) -> str:
-        if pe.role == "reference" and pe.status == "success":
-            return "reference"
-        if pe.status != "success":
-            return pe.status
-        if pe.correctness is not None and pe.correctness.tolerance_match is False:
-            return "failed"
-        return "passed"
-
-    @staticmethod
-    def _fmt_warnings(warnings: Optional[List[str]]) -> str:
-        if not warnings:
-            return ""
-        if len(warnings) == 1:
-            return warnings[0]
-        return f"{warnings[0]} [{len(warnings) - 1} more, see JSON]"
-
-    @staticmethod
-    def _fmt_stat(stats: Optional[BenchmarkStats], name: str) -> str:
-        if stats is None:
-            return "n/a"
-        value = getattr(stats, name)
-        return f"{value:.3f}"
-
-    def print_verbose_graph_result(
-        self, graph_result: GraphResult, suite_config: SuiteConfig
-    ) -> None:
-        """Render a graph's per-engine results in the rich single-graph format.
-
-        For each ProviderEngineResult, prints a header + init time + execution
-        statistics + correctness block, matching the legacy run_benchmark output.
-        Used in verbose mode when the unified runner processes a graph.
-        """
-        for pe in graph_result.results:
-            cfg_view = BenchmarkConfig(
-                graph_path=Path(graph_result.graph_path),
-                warmup_iters=suite_config.warmup_iters,
-                benchmark_iters=suite_config.benchmark_iters,
-                timing_block=suite_config.timing_block,
-                engine_id=pe.engine_id,
-            )
-            if pe.role == "reference":
-                self.print_reference_header(
-                    cfg_view, graph_result.graph_name, pe.provider
-                )
-            else:
-                self.print_header(
-                    cfg_view, graph_result.graph_name, provider=pe.provider
-                )
-
-            if pe.cpu_build_time_ms is not None:
-                self.print_init_time(pe.cpu_build_time_ms)
-
-            if pe.status == "success":
-                self._print_pe_stats(pe)
-                self._print_pe_metrics(pe)
-                self._print_oracle_block(pe)
-                # Profiling artefacts render independently of the always-on
-                # metrics block — opt-in profiling is valid under
-                # --metrics-tier off, and the user should still see where
-                # their artefacts landed plus any tool-failure detail.
-                self._print_profiling_block(pe)
-                self._print_pe_warnings(pe)
-                if pe.role == "reference":
-                    self._print(
-                        "Reference: timing baseline (no correctness comparison)"
-                    )
-                    self._print("")
-                elif pe.correctness is not None:
-                    self._print_pe_correctness(pe.correctness, suite_config)
-            elif pe.status == "skipped":
-                self._print(f"Status: SKIPPED ({pe.skip_reason or 'no reason given'})")
-                self._print("")
-            else:  # error
-                self.print_error(pe.error_message or "execution failed")
-                self._print("")
-
-            self.print_footer()
-            self._print("")
-
-    def _print_pe_stats(self, pe: ProviderEngineResult) -> None:
-        """Print host + kernel stats from a ProviderEngineResult."""
-        if pe.host_stats is not None:
-            self._print("Host Submission Statistics:")
-            self._print_stats_block(pe.host_stats)
-            self._print("")
-        if pe.gpu_kernel_stats is not None:
-            self._print("Kernel Execution Statistics:")
-            self._print_stats_block(pe.gpu_kernel_stats)
-            self._print("")
-        elif pe.host_stats is not None:
-            self._print("Kernel Timing: Not available")
-            self._print("")
-
-    def _print_pe_warnings(self, pe: ProviderEngineResult) -> None:
-        if not pe.warnings:
-            return
-        self._print("Warnings:")
-        for warning in pe.warnings:
-            self._print(f"  WARNING: {warning}")
-        self._print("")
-
-    def _print_oracle_block(self, pe: ProviderEngineResult) -> None:
-        """Render the auto-tuned (oracle) comparison block in verbose mode."""
-        if pe.oracle is None:
-            if pe.oracle_error is not None:
-                self._print(f"Oracle (auto-tuned): unavailable — {pe.oracle_error}")
-                self._print("")
-            return
-
-        o = pe.oracle
-        self._print("Oracle (auto-tuned):")
+        gpu = env.get("gpu_model") or "unknown GPU"
         self._print(
-            f"  Plan:          {o.plan_name}  "
-            f"(compiled plan index {o.compiled_plan_index}, rank {o.rank})"
+            f"GPU:     {gpu}" + (f" ({', '.join(gpu_extras)})" if gpu_extras else "")
         )
-        if o.knob_settings:
-            self._print("  Knobs:")
-            for knob in o.knob_settings:
-                self._print(f"    {knob['knob_id']}={knob['value']}")
+        # A CUDA wheel reports cuda_version; a ROCm wheel does not.
+        if env.get("cuda_version"):
+            cudnn = env.get("cudnn_version")
+            self._print(
+                f"CUDA:    {env['cuda_version']}"
+                + (f", cuDNN {cudnn}" if cudnn else "")
+            )
         else:
-            self._print("  Knobs:         none set explicitly (engine defaults)")
+            self._print(f"ROCm:    {env.get('rocm_version') or 'unknown'}")
+        rc = run_config
+        block = rc.get("timing_block") or 1
         self._print(
-            f"  Compiled plans: {o.compiled_plans_benchmarked} benchmarked "
-            f"successfully ({o.compiled_plans_total} total, "
-            f"{o.compiled_plans_failed} failed)"
+            f"Timing:  warmup {rc['warmup_iters']}, iters {rc['iters']} "
+            f"(min-time {rc['min_time_ms']:g} ms), cache {rc['cache_mode']}, "
+            + (f"block {block} launches/sample, " if block > 1 else "")
+            + f"seed {rc['seed']}, runtime {rc['runtime']}"
         )
-        if o.exhaustive_requested:
-            if o.exhaustive_supported:
-                self._print(
-                    "  Exhaustive:    enabled for this provider "
-                    "(an existing tuned selection may be reused)"
-                )
-            else:
-                self._print(
-                    "  Exhaustive:    unsupported by this engine; "
-                    "this row was tuned at plan level only"
-                )
-        if not o.tuning_available:
-            self._print(
-                "  Tuning:        unavailable - one compiled plan and no "
-                "provider-level tuning capability, so this pass re-measured "
-                "the heuristic configuration; any delta below is run-to-run noise"
-            )
-        if o.correctness is not None:
-            if o.correctness.passed:
-                self._print("  Validation:    tuned plan passed")
-            else:
-                detail = o.correctness.error_message or "output mismatch"
-                self._print(
-                    f"  Validation:    tuned plan FAILED - {detail}; "
-                    "no speedup is reported for this row"
-                )
-        self._print(
-            f"  Sweep minimum: {o.sweep_min_time_ms:.3f} ms   "
-            "(fastest single iteration from the selection sweep)"
+        self._print()
+
+    def print_summary(
+        self, suite_result: SuiteResult, output_path: Optional[str]
+    ) -> None:
+        """Print row/graph counts and where the results were written."""
+        s = suite_result.summary()
+        line = (
+            f"Summary: {s['graphs']} graph(s), {s['rows']} row(s): "
+            f"{s['passed']} passed, {s['unchecked']} unchecked, {s['failed']} failed, "
+            f"{s['skipped']} skipped, {s['errors']} error(s)"
         )
-        if o.gpu_kernel_stats is not None:
-            self._print(f"  Kernel mean:   {o.gpu_kernel_stats.mean_ms:.3f} ms")
-        if o.host_stats is not None:
-            self._print(f"  Host mean:     {o.host_stats.mean_ms:.3f} ms")
-        if o.derived_tflops_per_s is not None:
-            self._print(f"  Throughput:    {o.derived_tflops_per_s:.3f} TFLOP/s")
-        if pe.oracle_delta is not None:
-            d = pe.oracle_delta
-            self._print(
-                f"  Warm OOTB:     {d.baseline_mean_ms:.3f} ms   "
-                "(heuristic plan, re-timed after the sweep)"
-            )
-            if o.warm_baseline_derived_tflops_per_s is not None:
-                self._print(
-                    "  Warm OOTB throughput: "
-                    f"{o.warm_baseline_derived_tflops_per_s:.3f} TFLOP/s"
-                )
-            self._print(
-                f"  Tuned vs warm OOTB: {d.delta_ms:+.3f} ms faster, "
-                f"{d.speedup:.2f}x  (basis: {d.basis})"
-            )
-        self._print("")
+        extras = []
+        if s["graph_errors"]:
+            extras.append(f"{s['graph_errors']} graph error(s)")
+        if s["no_engine_graphs"]:
+            extras.append(f"{s['no_engine_graphs']} graph(s) without engines")
+        if extras:
+            line += "; " + ", ".join(extras)
+        self._print(line)
+        if output_path is not None:
+            self._print(f"Results: {output_path}")
 
-    @staticmethod
-    def _fmt_mib(mib: float) -> str:
-        """Render a MiB quantity as MiB or GiB depending on magnitude."""
-        if mib >= 1024:
-            return f"{mib / 1024:.2f} GiB"
-        return f"{mib:.1f} MiB"
+    def print_oracle_summary(self, graphs: Sequence[GraphResult]) -> None:
+        """Print the suite-wide geomean of reportable oracle speedups.
 
-    def _print_pe_metrics(self, pe: ProviderEngineResult) -> None:
-        """Render the always-on metrics block in verbose mode.
-
-        Suppresses the entire section when no metric fields are
-        populated (e.g. when the user passed ``--metrics-tier off``)
-        so the output stays compact.
+        Reference rows are baselines, not engines under test, so they are
+        not averaged in.
         """
-        any_present = any(
-            v is not None
-            for v in (
-                pe.workspace_bytes,
-                pe.analytical_flops,
-                pe.analytical_io_bytes,
-                pe.derived_tflops_per_s,
-                pe.derived_gbytes_per_s,
-                pe.cpu_user_time_per_iter_us,
-                pe.cpu_kernel_time_per_iter_us,
-                pe.vram_used_mb,
-            )
-        )
-        if not any_present:
+        rows = [
+            pe
+            for gr in graphs
+            for pe in gr.results
+            if pe.role == "engine" and pe.oracle is not None
+        ]
+        if not rows:
             return
-
-        # Pull the unrounded kernel median used to derive throughput/BW so
-        # the printed numbers are reproducible from a single source of
-        # truth — without it, the user can't multiply the rounded median
-        # back through the FLOPs total to recover the printed TFLOPs.
-        kernel_median_ms = (
-            pe.gpu_kernel_stats.median_ms if pe.gpu_kernel_stats is not None else None
-        )
-        derivation_suffix = (
-            f"  (kernel median {kernel_median_ms:.4f} ms)"
-            if kernel_median_ms is not None
+        speedups = [oracle_speedup(pe) for pe in rows if _oracle_state(pe) is None]
+        excluded = len(rows) - len(speedups)
+        if not speedups:
+            self._print(
+                f"Oracle: no reportable speedup on any of {excluded} tuned row(s) "
+                "(no search, invalid or mixed timing)"
+            )
+            return
+        suffix = (
+            f"; {excluded} row(s) excluded (no search, invalid or mixed timing)"
+            if excluded
             else ""
         )
-
-        self._print("Derived Metrics:")
-        if pe.workspace_bytes is not None:
-            self._print(
-                f"  Workspace:            {self._fmt_mib(pe.workspace_bytes / 1024 / 1024)}"
-            )
-        if pe.analytical_flops is not None:
-            partial = " (partial)" if pe.analytical_flops_partial else ""
-            self._print(f"  Analytical FLOPs:     {pe.analytical_flops:,}{partial}")
-            if pe.derived_tflops_per_s is not None:
-                self._print(
-                    f"  Throughput:           {pe.derived_tflops_per_s:.3f} TFLOP/s"
-                    f"{derivation_suffix}"
-                )
-        elif pe.analytical_flops_partial:
-            # No node could be modelled analytically — show N/A rather than a
-            # misleading 0 so users know throughput is unavailable, not zero.
-            self._print("  Analytical FLOPs:     N/A (no analytical model)")
-            self._print("  Throughput:           N/A (no analytical model)")
-        if pe.analytical_io_bytes is not None:
-            self._print(
-                f"  Analytical I/O:       {self._fmt_mib(pe.analytical_io_bytes / 1024 / 1024)}"
-            )
-        if pe.derived_gbytes_per_s is not None:
-            self._print(
-                f"  Bandwidth:            {pe.derived_gbytes_per_s:.2f} GB/s"
-                f"{derivation_suffix}"
-            )
-        if (
-            pe.cpu_user_time_per_iter_us is not None
-            or pe.cpu_kernel_time_per_iter_us is not None
-        ):
-            user = (
-                pe.cpu_user_time_per_iter_us
-                if pe.cpu_user_time_per_iter_us is not None
-                else 0.0
-            )
-            kern = (
-                pe.cpu_kernel_time_per_iter_us
-                if pe.cpu_kernel_time_per_iter_us is not None
-                else 0.0
-            )
-            self._print(f"  CPU per iter (u/k):   {user:.1f} µs / {kern:.1f} µs")
-        if pe.vram_used_mb is not None:
-            self._print(f"  VRAM used:            {self._fmt_mib(pe.vram_used_mb)}")
-        self._print("")
-
-    def _print_profiling_block(self, pe: ProviderEngineResult) -> None:
-        """Render the opt-in profiling artefacts when extra_metrics is set.
-
-        Each line is conditional: a user who runs only --pmc sees one
-        line, only --emit-trace sees a different one, and so on. Long
-        counter lists fold to ``[N more, see JSON]`` so the console
-        block stays compact — full nested data is always in the JSON.
-        """
-        extra = pe.extra_metrics
-        if not extra:
-            return
-        any_present = any(
-            isinstance(extra.get(k), dict) for k in ("trace", "pmc", "perf", "roofline")
+        self._print(
+            f"Oracle: {len(speedups)} tuned row(s), geomean speedup "
+            f"{geometric_mean(speedups):.2f}x{suffix}"
         )
-        if not any_present:
+
+    # Per-graph table
+
+    def print_graph_table(self, graph_result: GraphResult) -> None:
+        """Print one row per engine; with ``verbose`` also the detail blocks."""
+        gr = graph_result
+        title = gr.graph_name
+        stem = Path(gr.graph_path).stem
+        if stem != gr.graph_name:
+            # The progress line announced the file stem; show both to link them.
+            title = f"{stem} ({gr.graph_name})"
+        self._print(title + (f"  [{gr.graph_id}]" if gr.graph_id else ""))
+        if gr.error:
+            self._print(_clip(f"  graph error: {_one_line(gr.error)}", _width()))
+        elif gr.status == "no_engines":
+            msg = f": {_one_line(gr.message)}" if gr.message else ""
+            self._print(_clip(f"  no engines applicable{msg}", _width()))
+        if not gr.results:
+            self._print()
             return
-        self._print("Profiling:")
+
+        rows = gr.results
+        best_candidates = [
+            pe.ootb.gpu_kernel_stats.median_ms
+            for pe in rows
+            if pe.role == "engine"
+            and pe.verdict in ("passed", "unchecked")
+            and pe.ootb.gpu_kernel_stats is not None
+            and pe.ootb.gpu_kernel_stats.median_ms > 0
+        ]
+        best = min(best_candidates) if best_candidates else None
+        with_oracle = any(pe.oracle is not None or pe.oracle_error for pe in rows)
+
+        # (header, right-aligned, cells)
+        columns: List[Tuple[str, bool, List[str]]] = [
+            ("engine", False, [_display_name(pe) for pe in rows]),
+            ("verdict", False, [pe.verdict for pe in rows]),
+            ("kernel_med", True, [self._kernel_cell(pe) for pe in rows]),
+            (
+                "iqr%",
+                True,
+                [
+                    (
+                        "-"
+                        if pe.ootb.gpu_kernel_stats is None
+                        else f"{_iqr_pct(pe.ootb.gpu_kernel_stats):.1f}"
+                    )
+                    for pe in rows
+                ],
+            ),
+            (
+                "submit",
+                True,
+                [
+                    (
+                        "-"
+                        if pe.ootb.host_stats is None
+                        else _fmt_time(pe.ootb.host_stats.median_ms)
+                    )
+                    for pe in rows
+                ],
+            ),
+            ("tflops", True, [self._tflops_cell(pe) for pe in rows]),
+            (
+                "gbps",
+                True,
+                [
+                    (
+                        "-"
+                        if pe.ootb.derived_gbytes_per_s is None
+                        else f"{pe.ootb.derived_gbytes_per_s:.1f}"
+                    )
+                    for pe in rows
+                ],
+            ),
+            ("vs_best", True, [self._vs_best_cell(pe, best) for pe in rows]),
+        ]
+        if with_oracle:
+            columns.append(("oracle", True, [self._oracle_cell(pe) for pe in rows]))
+        notes = [self._note(pe) for pe in rows]
+        if any(notes):
+            columns.append(("note", False, notes))
+
+        width = _width()
+        natural = [max(len(h), *(len(c) for c in cells)) for h, _, cells in columns]
+        # Engine name and note absorb the squeeze; numeric columns never do.
+        has_note = columns[-1][0] == "note"
+        flexible = {0, len(columns) - 1} if has_note else {0}
+        budget = (
+            width
+            - 2
+            - 2 * (len(columns) - 1)
+            - sum(w for i, w in enumerate(natural) if i not in flexible)
+        )
+        if has_note:
+            # The name keeps up to 32 columns; the note gets what remains.
+            natural[0] = min(natural[0], max(16, min(32, budget - len("note"))))
+            natural[-1] = max(len("note"), min(natural[-1], budget - natural[0]))
+        else:
+            natural[0] = min(natural[0], max(16, budget))
+
+        for line in _render_table(columns, natural, width, indent="  "):
+            self._print(line)
+        if not self._legend_done:
+            self._legend_done = True
+            for line in textwrap.wrap(
+                self._legend(rows), width, subsequent_indent="  "
+            ):
+                self._print(line)
+        self._print()
+        if self._verbose:
+            self.print_graph_verbose(gr)
+
+    @staticmethod
+    def _legend(rows: Sequence[ProviderEngineResult]) -> str:
+        timing = next(
+            (pe.ootb.timing for pe in rows if pe.ootb.timing is not None), None
+        )
+        how = (
+            f" ({_TIMING_MODE_LABEL.get(timing.mode, timing.mode)})"
+            if timing is not None
+            else ""
+        )
+        return (
+            f"  kernel_med = median device time per launch{how}; "
+            "submit = host enqueue time; vs_best = best median / row median; * = noisy"
+        )
+
+    @staticmethod
+    def _kernel_cell(pe: ProviderEngineResult) -> str:
+        stats = pe.ootb.gpu_kernel_stats
+        if stats is None:
+            return "- "
+        # Always one marker column so the numbers stay aligned.
+        return _fmt_time(stats.median_ms) + ("*" if noise_warnings(stats) else " ")
+
+    @staticmethod
+    def _tflops_cell(pe: ProviderEngineResult) -> str:
+        if pe.ootb.derived_tflops_per_s is None:
+            return "-"
+        return f"{pe.ootb.derived_tflops_per_s:.2f}"
+
+    @staticmethod
+    def _vs_best_cell(pe: ProviderEngineResult, best: Optional[float]) -> str:
+        if pe.role == "reference":
+            return "ref"
+        stats = pe.ootb.gpu_kernel_stats
+        if (
+            best is None
+            or pe.verdict not in ("passed", "unchecked")  # best_candidates' rule
+            or stats is None
+            or stats.median_ms <= 0
+        ):
+            return "-"
+        return f"{best / stats.median_ms:.2f}x"
+
+    @staticmethod
+    def _oracle_cell(pe: ProviderEngineResult) -> str:
+        state = _oracle_state(pe)
+        return state if state is not None else f"{oracle_speedup(pe):.2f}x"
+
+    @staticmethod
+    def _note(pe: ProviderEngineResult) -> str:
+        reason = _reason(pe)
+        if reason is not None:
+            return _one_line(reason)
+        # The kernel_med '*' marker already flags noise.
+        warnings = [w for w in pe.warnings or [] if not w.startswith("noisy:")]
+        if not warnings:
+            return ""
+        more = f" (+{len(warnings) - 1})" if len(warnings) > 1 else ""
+        return _one_line(warnings[0]) + more
+
+    # Verbose detail
+
+    def print_graph_verbose(self, graph_result: GraphResult) -> None:
+        """Print a compact detail block for every row of a graph."""
+        for pe in graph_result.results:
+            for line in self._detail_lines(pe):
+                self._print(line)
+            self._print()
+
+    def _detail_lines(self, pe: ProviderEngineResult) -> List[str]:
+        hex_id = engine_id_hex(pe.engine_id)
+        title = _display_name(pe) + (f" ({hex_id})" if hex_id else "")
+        if pe.role == "reference":
+            title += "  [reference]"
+        lines = [f"  {title}"]
+
+        def add(key: str, text: str) -> None:
+            lines.append(f"    {key:<12}{text}")
+
+        if pe.plugin_path:
+            add("plugin", pe.plugin_path)
+        reason = _reason(pe)
+        if reason is not None:
+            add(pe.status, reason)
+        costs = []
+        if pe.ootb.cpu_build_time_ms is not None:
+            costs.append(f"build {_fmt_duration(pe.ootb.cpu_build_time_ms)}")
+        if pe.ootb.timing is not None:
+            costs.append(f"first call {_fmt_duration(pe.ootb.timing.first_call_ms)}")
+        if pe.elapsed_time_ms:
+            costs.append(f"row total {_fmt_duration(pe.elapsed_time_ms)}")
+        if costs:
+            add("cost", ", ".join(costs))
+        if pe.ootb.timing is not None:
+            t = pe.ootb.timing
+            text = f"{t.mode}/{t.timer}, warmup {t.warmup_iters}"
+            if t.capped:
+                text += ", capped at max iters"
+            if t.fallback_reason:
+                text += f", fallback: {t.fallback_reason}"
+            add("timing", text)
+        lines.extend(self._stats_lines(pe))
+        clocks = self._clocks_text(pe.clocks_after)
+        if clocks:
+            add("clocks", clocks)
+        metrics = self._metrics_text(pe)
+        if metrics:
+            add("metrics", metrics)
+        if pe.ootb.correctness is not None and pe.role == "engine":
+            add("correctness", self._correctness_text(pe))
+        for line in self._oracle_lines(pe):
+            add("oracle", line)
+        for line in self._profiling_lines(pe.extra_metrics or {}):
+            add("profiling", line)
+        for warning in pe.warnings or []:
+            add("warning", warning)
+        return lines
+
+    @staticmethod
+    def _stats_lines(pe: ProviderEngineResult) -> List[str]:
+        named = [
+            (n, s)
+            for n, s in (
+                ("kernel", pe.ootb.gpu_kernel_stats),
+                ("submit", pe.ootb.host_stats),
+            )
+            if s
+        ]
+        if not named:
+            return []
+        cols = ("mean", "median", "std", "min", "p95", "max")
+        lines = [f"    {'':<12}{'n':>6}" + "".join(f"{c:>10}" for c in cols)]
+        for name, s in named:
+            scale, suffix = _unit(s.median_ms)
+            values = (
+                s.mean_ms,
+                s.median_ms,
+                s.std_ms,
+                s.min_ms,
+                s.p95_ms if s.n >= 20 else None,
+                s.max_ms,
+            )
+            cells = "".join(
+                f"{'-':>10}" if v is None else f"{v * scale:>10.3f}" for v in values
+            )
+            lines.append(f"    {name:<12}{s.n:>6}{cells}  {suffix}")
+        return lines
+
+    @staticmethod
+    def _clocks_text(after: Optional[Dict[str, Any]]) -> str:
+        """Clocks right after the timed loop."""
+        after = after or {}
+        parts = []
+        for key, label, unit in _CLOCK_KEYS:
+            value = after.get(key)
+            if value is not None:
+                parts.append(f"{label} {value:g}" + (f" {unit}" if unit else ""))
+        return ", ".join(parts)
+
+    @staticmethod
+    def _metrics_text(pe: ProviderEngineResult) -> str:
+        parts = []
+        if pe.ootb.workspace_bytes is not None:
+            parts.append(f"workspace {_fmt_mib(pe.ootb.workspace_bytes / 2**20)}")
+        if pe.analytical_flops is not None:
+            parts.append(f"flops {pe.analytical_flops:,}")
+        if pe.analytical_io_bytes is not None:
+            parts.append(f"io {_fmt_mib(pe.analytical_io_bytes / 2**20)}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _correctness_text(pe: ProviderEngineResult) -> str:
+        c = pe.ootb.correctness
+        if c.tolerance_match is None:
+            return f"unchecked ({c.error_message or 'no comparison performed'})"
+        parts = [f"rtol {c.rtol:.0e}", f"atol {c.atol:.0e}"]
+        if c.max_abs_diff is not None:
+            parts.append(f"max_abs_diff {c.max_abs_diff:.2e}")
+        if c.max_rel_diff is not None:
+            parts.append(f"max_rel_diff {c.max_rel_diff:.2e}")
+        if c.n_mismatch is not None:
+            total = f"/{c.n_total}" if c.n_total is not None else ""
+            parts.append(f"n_mismatch {c.n_mismatch}{total}")
+        if c.worst_output_uid is not None:
+            parts.append(f"worst output {c.worst_output_uid}")
+        verdict = "passed" if c.tolerance_match else "FAILED"
+        return f"{verdict} ({', '.join(parts)})"
+
+    @staticmethod
+    def _oracle_lines(pe: ProviderEngineResult) -> List[str]:
+        o = pe.oracle
+        if o is None:
+            return [f"unavailable: {pe.oracle_error}"] if pe.oracle_error else []
+        costs = []
+        if o.cpu_build_time_ms is not None:
+            costs.append(
+                f"build {_fmt_duration(o.cpu_build_time_ms)} "
+                "(global.benchmarking=1; prepares every candidate)"
+            )
+        if o.timing is not None:
+            costs.append(f"first call {_fmt_duration(o.timing.first_call_ms)}")
+        lines = [", ".join(costs)] if costs else []
+        if not o.tuning_available:
+            lines.append("no tuning knob: re-measured the OOTB plan; speedup is noise")
+        if o.correctness is not None and o.correctness.explicitly_failed:
+            detail = o.correctness.error_message or "output mismatch"
+            lines.append(
+                f"tuned plan FAILED validation ({detail}); no speedup reported"
+            )
+        speedup = oracle_speedup(pe)
+        if speedup is not None:
+            lines.append(
+                f"{_fmt_time(pe.ootb.gpu_kernel_stats.median_ms)} OOTB -> "
+                f"{_fmt_time(o.gpu_kernel_stats.median_ms)} tuned = {speedup:.2f}x"
+            )
+        if o.derived_tflops_per_s is not None:
+            lines.append(f"throughput {o.derived_tflops_per_s:.3f} TFLOP/s tuned")
+        return lines
+
+    @staticmethod
+    def _profiling_lines(extra: Dict[str, Any]) -> List[str]:
+        """One-line summaries per opt-in profiling source; full data is in JSON."""
+        lines: List[str] = []
+
+        def failures(name: str, slc: Dict[str, Any]) -> None:
+            if "skipped" in slc:
+                lines.append(f"{name}: skipped — {slc['skipped']}")
+            if "unexpected_error" in slc:
+                lines.append(f"{name}: unexpected error — {slc['unexpected_error']}")
+            if "returncode" in slc:
+                lines.append(f"{name}: failed (rc={slc['returncode']})")
+            if slc.get("error_tail"):
+                lines.extend(
+                    f"  | {t}" for t in str(slc["error_tail"]).splitlines()[-3:]
+                )
 
         trace = extra.get("trace")
         if isinstance(trace, dict):
-            fmt = trace.get("format", "?")
-            trace_path = trace.get("path")
-            if trace_path:
-                self._print(f"  Trace ({fmt}):         {trace_path}")
-                self._print("    → drag onto https://ui.perfetto.dev/")
-            elif "skipped" in trace:
-                self._print(f"  Trace ({fmt}):         skipped — {trace['skipped']}")
-            if "error_tail" in trace:
-                self._print(
-                    f"  Trace ({fmt}):         rocprofv3 errored "
-                    f"(rc={trace.get('returncode', '?')})"
+            name = f"trace ({trace.get('format', '?')})"
+            if trace.get("path"):
+                lines.append(
+                    f"{name}: {trace['path']}  (open in https://ui.perfetto.dev/)"
                 )
+            failures(name, trace)
 
         pmc = extra.get("pmc")
         if isinstance(pmc, dict):
-            arch = pmc.get("arch", "?")
-            pmc_set = pmc.get("set", "?")
-            counters = pmc.get("counters") or {}
-            db_path = pmc.get("db_path")
-            if counters:
-                head = list(counters.items())[:3]
-                rendered = "  ".join(
-                    f"{name}={int(v.get('sum', 0)):,}" for name, v in head
+            name = f"pmc ({pmc.get('set', '?')}, {pmc.get('arch', '?')})"
+            per_kernel = pmc.get("per_kernel") or {}
+            ranked = sorted(
+                per_kernel.items(), key=lambda kv: -kv[1].get("dispatches", 0)
+            )
+            for kernel, data in ranked[:3]:
+                counters = data.get("counters") or {}
+                shown = "  ".join(
+                    f"{c}={v:,.4g}" for c, v in list(counters.items())[:3]
                 )
-                more = len(counters) - len(head)
-                suffix = f"  [{more} more, see JSON]" if more > 0 else ""
-                self._print(f"  PMC ({pmc_set}, {arch}):  {rendered}{suffix}")
-            elif "skipped" in pmc:
-                self._print(f"  PMC ({pmc_set}, {arch}):  skipped — {pmc['skipped']}")
-            elif "error_tail" in pmc:
-                self._print(
-                    f"  PMC ({pmc_set}, {arch}):  rocprofv3 errored "
-                    f"(rc={pmc.get('returncode', '?')})"
+                more = f"  [+{len(counters) - 3}]" if len(counters) > 3 else ""
+                l2 = data.get("l2_hit_rate")
+                l2_text = f"  l2_hit {l2:.1%}" if isinstance(l2, (int, float)) else ""
+                lines.append(
+                    f"{name}: {_clip(kernel, 40)} x{data.get('dispatches', '?')}: "
+                    f"{shown}{more}{l2_text}"
                 )
-            # Surface the rocpd db path + analyze hint whenever we
-            # captured one, regardless of whether parsing succeeded.
-            # The db itself is the full source of truth; aggregates are
-            # the convenience layer.
-            if db_path:
-                self._print(f"  PMC db:               {db_path}")
-                self._print(
-                    "    → rocprof-compute analyze --path "
-                    f"{Path(db_path).parent} "
-                    "(see docs/troubleshooting.md for venv setup)"
-                )
+            if len(ranked) > 3:
+                lines.append(f"{name}: [{len(ranked) - 3} more kernel(s), see JSON]")
+            failures(name, pmc)
+            if pmc.get("db_path"):
+                db = pmc["db_path"]
+                lines.append(f"pmc db: {db}")
+                lines.append(f"  -> rocprof-compute analyze --path {Path(db).parent}")
 
         perf = extra.get("perf")
         if isinstance(perf, dict):
-            if "skipped" in perf:
-                self._print(f"  CPU (perf):           skipped — {perf['skipped']}")
-            elif "error_tail" in perf:
-                self._print(
-                    f"  CPU (perf):           errored "
-                    f"(rc={perf.get('returncode', '?')})"
-                )
-            else:
-                bits = []
-                ipc = perf.get("ipc_user")
-                if isinstance(ipc, (int, float)):
-                    bits.append(f"IPC={ipc:.2f}")
-                cu = perf.get("cycles_user")
-                if isinstance(cu, (int, float)):
-                    bits.append(f"cycles_u={cu:,.0f}")
-                iu = perf.get("instructions_user")
-                if isinstance(iu, (int, float)):
-                    bits.append(f"instr_u={iu:,.0f}")
-                tc = perf.get("task_clock_ms")
-                if isinstance(tc, (int, float)):
-                    bits.append(f"task_clock={tc:.1f}ms")
-                if bits:
-                    self._print(f"  CPU (perf):           {'  '.join(bits)}")
+            bits = []
+            for key, label, fmt in (
+                ("ipc_user", "IPC", "{:.2f}"),
+                ("cycles_user", "cycles_u", "{:,.0f}"),
+                ("instructions_user", "instr_u", "{:,.0f}"),
+                ("task_clock_ms", "task_clock", "{:.1f}ms"),
+            ):
+                value = perf.get(key)
+                if isinstance(value, (int, float)):
+                    bits.append(f"{label}={fmt.format(value)}")
+            if bits:
+                scope = f"  ({perf['scope']})" if perf.get("scope") else ""
+                lines.append(f"perf: {'  '.join(bits)}{scope}")
+            failures("perf", perf)
 
         roofline = extra.get("roofline")
         if isinstance(roofline, dict):
-            # rocprof-compute profile mode emits CSVs (no PDF); the
-            # rendered roofline (ASCII / GUI / TUI) comes from a
-            # separate `rocprof-compute analyze` pass against
-            # `workload_path`. analyze has its own Python deps that
-            # would downgrade torch's numpy if installed into the
-            # dnn-benchmarking venv — see docs/troubleshooting.md for
-            # the separate-venv recipe.
-            workload = roofline.get("workload_path")
-            csv = roofline.get("roofline_csv")
-            if csv:
-                self._print(f"  Roofline CSV:         {csv}")
-            if workload:
-                self._print(
-                    f"    → rocprof-compute analyze --path {workload} "
-                    "--block 4  (ASCII roofline)"
+            if roofline.get("roofline_csv"):
+                lines.append(f"roofline: {roofline['roofline_csv']}")
+            if roofline.get("workload_path"):
+                lines.append(
+                    f"  -> rocprof-compute analyze --path {roofline['workload_path']} "
+                    "--block 4  (ASCII; add --gui for web UI)"
                 )
-                self._print(
-                    "    → add --gui for interactive web UI "
-                    "(see docs/troubleshooting.md for analyze venv setup)"
-                )
-            if "skipped" in roofline:
-                self._print(f"  Roofline:             skipped — {roofline['skipped']}")
-            if "error_tail" in roofline:
-                self._print(
-                    f"  Roofline:             rocprof-compute errored "
-                    f"(rc={roofline.get('returncode', '?')})"
-                )
-        self._print("")
-
-    def _print_pe_correctness(
-        self, correctness: CorrectnessResult, suite_config: SuiteConfig
-    ) -> None:
-        """Print correctness block from a CorrectnessResult."""
-        if correctness.tolerance_match is None:
-            reason = correctness.error_message or "no reference comparison performed"
-            self._print(f"Reference Validation: SKIPPED ({reason})")
-            self._print(f"  Provider: {suite_config.validation.provider.value}")
-            self._print("")
-            return
-
-        status = "PASSED" if correctness.tolerance_match else "FAILED"
-        self._print(f"Reference Validation: {status}")
-        self._print(f"  Provider: {suite_config.validation.provider.value}")
-        self._print(f"  (rtol={correctness.rtol:.0e}, atol={correctness.atol:.0e})")
-        if not correctness.tolerance_match:
-            if correctness.max_abs_diff is not None:
-                self._print(f"  Max abs diff: {correctness.max_abs_diff:.2e}")
-            if correctness.max_rel_diff is not None:
-                self._print(f"  Max rel diff: {correctness.max_rel_diff:.2e}")
-        self._print("")
-
-    # CLI progress methods
-
-    def print_extracting(self, source: str) -> None:
-        """Print tarball extraction start message."""
-        print(f"Extracting {source}...", flush=True, file=self._output)
-
-    def print_extracted_count(self, count: int, source: str) -> None:
-        """Print number of graphs extracted from a source."""
-        self._print(f"Extracted {count} graph(s) from {source}")
-
-    def print_no_graphs_found(self, pattern: str) -> None:
-        """Print message when no graph files match the given pattern."""
-        self._print(f"No graph files found matching: {pattern}")
-
-    def print_no_engines_applicable(self) -> None:
-        """Print inline note when no engines matched for a graph."""
-        print("  no engines applicable", flush=True, file=self._output)
-
-    def print_newline(self) -> None:
-        """Print a blank line with flush."""
-        print(flush=True, file=self._output)
-
-    def print_reference_validation(
-        self,
-        provider_name: str,
-        passed: bool,
-        max_abs_diff: float,
-        max_rel_diff: float,
-        rtol: float,
-        atol: float,
-    ) -> None:
-        """Print reference validation result.
-
-        Args:
-            provider_name: Name of the reference provider used.
-            passed: Whether validation passed.
-            max_abs_diff: Maximum absolute difference.
-            max_rel_diff: Maximum relative difference.
-            rtol: Relative tolerance used.
-            atol: Absolute tolerance used.
-        """
-        status = "PASSED" if passed else "FAILED"
-        self._print(f"Reference Validation: {status}")
-        self._print(f"  Provider: {provider_name}")
-        self._print(f"  (rtol={rtol:.0e}, atol={atol:.0e})")
-        if not passed:
-            self._print(f"  Max abs diff: {max_abs_diff:.2e}")
-            self._print(f"  Max rel diff: {max_rel_diff:.2e}")
+            failures("roofline", roofline)
+        return lines
