@@ -119,8 +119,10 @@ ROCm torch wheels can contain their own `libhipdnn_backend.so` alongside HIP
 and COMGR. When `--rocm-prefix` selects a different hipDNN install, the
 hipDNN CLI imports `hipdnn_frontend` before probing an optional PyTorch
 reference. This gives the selected prefix's hipDNN library on
-`LD_LIBRARY_PATH` the first chance to bind. `--runtime pytorch` does not load
-the hipDNN bindings.
+`LD_LIBRARY_PATH` the first chance to bind. `--runtime pytorch` imports torch
+first. On ROCm its optional HIP event timer can import the bindings later;
+the backend that torch mapped first remains loaded. A CPU or CUDA PyTorch
+build does not require hipDNN.
 
 Import order does not make different HIP or COMGR versions compatible. On
 Linux, check `/proc/self/maps` in the benchmark process for

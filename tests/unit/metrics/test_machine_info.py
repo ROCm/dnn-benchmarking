@@ -123,7 +123,7 @@ class TestCollectEnvironmentInfo:
             info = machine_info.collect_environment_info()
         assert (info["gpu_arch"], info["gpu_model"]) == ("gfx942", "X")
 
-    def test_unloaded_hipdnn_is_not_imported(self, tmp_path, monkeypatch, capsys):
+    def test_broken_hipdnn_import_does_not_raise(self, tmp_path, monkeypatch, capsys):
         package = tmp_path / "hipdnn_frontend"
         package.mkdir()
         (package / "__init__.py").write_text("raise RuntimeError('no HIP device')\n")
@@ -132,16 +132,7 @@ class TestCollectEnvironmentInfo:
         with patch.object(machine_info, "is_amdsmi_available", return_value=False):
             info = machine_info.collect_environment_info()
         assert info["hipdnn_version"] is None
-        assert "hipdnn_frontend" not in sys.modules
-        assert "no HIP device" not in capsys.readouterr().err
-
-    def test_loaded_hipdnn_version_is_reported(self, monkeypatch):
-        module = type(sys)("hipdnn_frontend")
-        module.__version__ = "test-version"
-        monkeypatch.setitem(sys.modules, "hipdnn_frontend", module)
-        with patch.object(machine_info, "is_amdsmi_available", return_value=False):
-            info = machine_info.collect_environment_info()
-        assert info["hipdnn_version"] == "test-version"
+        assert "no HIP device" in capsys.readouterr().err
 
     def test_missing_amdsmi_is_recorded_and_warned_once(self, capsys):
         with patch.object(machine_info, "is_amdsmi_available", return_value=False):

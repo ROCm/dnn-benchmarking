@@ -6,8 +6,8 @@
 :func:`collect_environment_info` is called once at suite start, before
 any progress output, so its single amdsmi notice cannot interleave with
 a progress line. Every key is always present; unknown values are None,
-except ``gpu_arch``, which is ``"unknown"``. Torch GPU properties and the
-hipDNN version are queried only when the runtime already loaded those modules.
+except ``gpu_arch``, which is ``"unknown"``. torch is queried only when the
+process has already imported it: importing it takes seconds.
 """
 
 import importlib.util
@@ -120,9 +120,14 @@ def _torch_info() -> Dict[str, Any]:
 
 
 def _hipdnn_version() -> Optional[str]:
-    """Report the selected runtime's version without loading hipDNN for torch."""
-    hipdnn = sys.modules.get("hipdnn_frontend")
-    return getattr(hipdnn, "__version__", None) if hipdnn is not None else None
+    try:
+        import hipdnn_frontend
+    except ImportError:
+        return None
+    except Exception as e:  # a broken native install can fail any way on import
+        warn_once("machine_info", f"hipdnn_frontend import failed: {e}")
+        return None
+    return getattr(hipdnn_frontend, "__version__", None)
 
 
 def collect_environment_info() -> Dict[str, Any]:

@@ -103,16 +103,21 @@ def test_bindings_are_imported_before_torch(
     assert record.read_text() == "False"
 
 
-def test_pytorch_runtime_does_not_import_hipdnn(tmp_path: Path) -> None:
+def test_pytorch_runtime_imports_torch_before_optional_hip_timer(
+    tmp_path: Path,
+) -> None:
     result, record = _run_with_fake_frontend(tmp_path, "--runtime", "pytorch")
     if result.returncode:
         assert result.returncode == 1, result.stdout + result.stderr
         assert "--runtime pytorch: PyTorch sees no GPU" in (
             result.stdout + result.stderr
         )
+        assert not record.exists()  # CPU-only torch stops before GPU timing.
     else:
         assert "Summary: 1 graph(s)" in result.stdout
-    assert not record.exists(), "PyTorch-only CLI imported hipdnn_frontend"
+        if record.exists():
+            # ROCm can use hipDNN's HIP event timer after loading torch.
+            assert record.read_text() == "True"
 
 
 def test_native_binding_import_error_is_reported(tmp_path: Path) -> None:
