@@ -878,49 +878,22 @@ def test_reuse_accepts_bindings_whose_native_libraries_do_not_load(
     setup.install_bindings()
 
 
-# --- run() stage plan and main() failure reporting ---------------------------
-
-_STAGE_METHODS = (
-    "setup_venv",
-    "install_torch",
-    "install_package",
-    "ensure_rocm_libraries_checkout",
-    "install_build_deps",
-    "build_hipdnn",
-    "install_bindings",
-    "install_runtime_extras",
-    "verify",
-)
-_CUDA_PLAN = ["setup_venv", "install_torch", "install_package", "verify"]
-_FULL_PLAN = list(_STAGE_METHODS)
-_REUSE_PLAN = [m for m in _STAGE_METHODS if m != "install_build_deps"]
+# --- --reuse-artifacts preflight and main() failure reporting ----------------
 
 
-@pytest.mark.parametrize(
-    "argv, installed, expected",
-    [
-        ((), "missing", _FULL_PLAN),
-        (("--torch-mode", "cuda"), "missing", _CUDA_PLAN),
-        (("--torch-mode", "existing"), "cuda", _CUDA_PLAN),
-        (("--torch-mode", "existing"), "rocm", _FULL_PLAN),
-        (("--torch-mode", "cpu"), "missing", _FULL_PLAN),
-        (("--torch-mode", "cpu", "--reuse-artifacts"), "missing", _REUSE_PLAN),
-    ],
-)
-def test_run_stage_plan_follows_torch_mode(
-    setup_env, tmp_path, monkeypatch, argv, installed, expected
+@pytest.mark.parametrize("mode", ("rocm", "cpu", "none"))
+def test_reuse_rejects_replacing_venv_before_workspace_creation(
+    setup_env, tmp_path, capsys, mode
 ) -> None:
-    setup = _setup(setup_env, tmp_path, "-y", *argv)
-    if installed != "missing":
-        _fake_venv(setup_env, setup.venv_dir)
-    monkeypatch.setattr(setup, "get_torch_mode", lambda: installed)
-    monkeypatch.setattr(setup, "report_profiling_sources", lambda: None)
-    ran = []
-    for method in _STAGE_METHODS:
-        monkeypatch.setattr(setup, method, lambda m=method: ran.append(m))
+    setup = _setup(setup_env, tmp_path, "--torch-mode", mode, "--reuse-artifacts", "-y")
+    assert not setup.workspace.exists()
 
-    assert setup.run() == 0
-    assert ran == expected
+    with pytest.raises(SystemExit) as exc:
+        setup.run()
+
+    assert exc.value.code == 1
+    assert not setup.workspace.exists()
+    assert f"--torch-mode {mode}" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

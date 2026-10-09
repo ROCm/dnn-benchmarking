@@ -490,9 +490,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip building hipDNN/the provider plugins from source and use "
             "whatever is already installed in the selected ROCm prefix (e.g. a "
             "prior build in the same workspace). Fails if hipDNN is absent there "
-            "-- this never falls back to building. Builds no Python bindings: "
-            "the venv must already have hipdnn_frontend (e.g. --torch-mode "
-            "existing)."
+            "-- this never falls back to building. For hipDNN reuse, use "
+            "--torch-mode existing with hipdnn_frontend already installed in "
+            "the venv; CUDA-only setups need no hipDNN bindings."
         ),
     )
     parser.add_argument(
@@ -1658,6 +1658,13 @@ class Setup:
 
     def run(self) -> int:
         self.require_python_version()
+        if self.reuse_artifacts and self.torch_mode not in ("existing", "cuda"):
+            fail(
+                f"--reuse-artifacts cannot use --torch-mode {self.torch_mode}: "
+                "setup would replace the venv without rebuilding hipDNN bindings.",
+                "Use --torch-mode existing with a venv that already has "
+                "hipdnn_frontend, or drop --reuse-artifacts to build the bindings.",
+            )
         self.workspace.mkdir(parents=True, exist_ok=True)
         if venv_python(self.venv_dir).exists() and not self.clean:
             self.installed_torch_mode = self.get_torch_mode()
@@ -1688,10 +1695,10 @@ class Setup:
                 "bindings, and ROCm environment setup."
             )
         else:
-            stages.append(
-                ("rocm-libraries sources", self.ensure_rocm_libraries_checkout)
-            )
             if self.do_build:
+                stages.append(
+                    ("rocm-libraries sources", self.ensure_rocm_libraries_checkout)
+                )
                 stages.append(("Build dependencies", self.install_build_deps))
             stages += [
                 ("hipDNN and provider plugins", self.build_hipdnn),
