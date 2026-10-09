@@ -6,6 +6,11 @@
 Wraps the workload in ``perf stat -x, -e <events>``, parses the CSV
 output, and folds CPU cycles/instructions/IPC into ``extra_metrics["perf"]``.
 
+Scope: the counts cover the whole profiled child process (interpreter
+start, imports, plugin load, graph build, warmup and timed loop), not
+the timed loop alone. The slice says so with ``scope: "process_total"``;
+do not compare these numbers with per-iteration timings.
+
 Two tiers of events:
 
 * User-space (``cycles:u``, ``instructions:u``) — always available to
@@ -15,9 +20,6 @@ Two tiers of events:
   holds ``CAP_PERFMON``/``CAP_SYS_ADMIN``, which bypass the sysctl
   entirely. Dropped when neither holds; the recorded paranoid value
   tells the user why the kernel fields are None.
-
-Missing perf binary is a single warn_once + skipped metrics dict;
-nothing about ``--perf`` is fatal.
 """
 
 import glob
@@ -27,9 +29,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ._artifact_paths import DEFAULT_PROFILING_TIMEOUT_S
 from ._diagnostic import warn_once
-from ._subprocess import run_capped
+from ._subprocess import run_tool
 
 PERF_EVENTS_USER = [
     "cycles:u",
@@ -138,14 +139,8 @@ def _resolve_perf() -> Optional[Tuple[str, Optional[str]]]:
     return None
 
 
-def _build_argv(
-    events: List[str],
-    csv_path: Path,
-    inner_argv: List[str],
-    binary: str,
-) -> List[str]:
+def _build_argv(events: List[str], csv_path: Path, inner_argv: List[str]) -> List[str]:
     return [
-        binary,
         "stat",
         "-x,",
         "-o",
@@ -191,46 +186,35 @@ def _parse_perf_csv(csv_path: Path) -> Dict[str, Any]:
 def run(
     inner_argv: List[str],
     out_dir: Path,
-    timeout_s: int = DEFAULT_PROFILING_TIMEOUT_S,
+    timeout_s: int,
+    context: str,
 ) -> Dict[str, Any]:
-    """Run perf stat, parse CSV, return extra_metrics slice. Never raises.
+    """Run perf stat, parse CSV, return the ``{"perf": ...}`` slice. Never raises.
 
-    ``timeout_s`` bounds the perf subprocess; ``0`` disables.
+    Counts are process-total for the profiled child (``scope``).
     """
     resolved = _resolve_perf()
-    if resolved is None:
-        warn_once("perf", "no runnable perf binary found; skipping CPU counters")
-        return {"perf": {"skipped": "no runnable perf binary found"}}
-    binary, substitution = resolved
+    binary, substitution = resolved if resolved is not None else (None, None)
     if substitution:
         warn_once("perf", substitution)
 
     paranoid = _read_perf_paranoid()
     kernel_ok = _kernel_events_allowed(paranoid)
-    events = list(PERF_EVENTS_USER)
-    if kernel_ok:
-        events.extend(PERF_EVENTS_KERNEL)
+    events = PERF_EVENTS_USER + (PERF_EVENTS_KERNEL if kernel_ok else [])
 
-    # No hostname subdir: perf is a single CSV, the orchestrator's
-    # per-(graph, engine, source) subdir already disambiguates runs,
-    # and the user-facing path stays short.
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # No hostname subdir: perf writes one CSV and the orchestrator's
+    # per-(graph, engine, source) subdir already disambiguates runs.
     csv_path = out_dir / "perf.csv"
-    argv = _build_argv(events, csv_path, inner_argv, binary)
-
-    subprocess_timeout = timeout_s or None
-    try:
-        proc = run_capped(argv, subprocess_timeout)
-    except subprocess.TimeoutExpired:
-        warn_once("perf", f"perf invocation timed out after {subprocess_timeout}s")
-        return {
-            "perf": {
-                "skipped": f"perf invocation timed out after {subprocess_timeout}s"
-            }
-        }
-    except (OSError, subprocess.SubprocessError) as e:
-        warn_once("perf", f"perf invocation failed: {e}")
-        return {"perf": {"skipped": f"perf invocation failed: {e}"}}
+    proc, fields = run_tool(
+        "perf",
+        binary,
+        _build_argv(events, csv_path, inner_argv),
+        out_dir,
+        timeout_s,
+        context,
+    )
+    if proc is None:
+        return {"perf": {"scope": "process_total", **fields}}
 
     parsed = _parse_perf_csv(csv_path)
 
@@ -241,10 +225,11 @@ def run(
     cycles_user = _get("cycles:u")
     instr_user = _get("instructions:u")
     ipc_user: Optional[float] = None
-    if cycles_user and instr_user is not None and cycles_user > 0:
+    if cycles_user and instr_user is not None:
         ipc_user = float(instr_user) / float(cycles_user)
 
     result: Dict[str, Any] = {
+        "scope": "process_total",
         "cycles_user": cycles_user,
         "instructions_user": instr_user,
         "ipc_user": ipc_user,
@@ -261,22 +246,13 @@ def run(
         # having, but the reader must be able to see that is what they are.
         result["binary_substituted"] = substitution
     if csv_path.exists():
-        # Only advertise the artifact when perf actually wrote it: on a
-        # launch failure the directory exists but the CSV does not, and a
-        # consumer opening the advertised path would just get ENOENT.
+        # Only advertise the artifact when perf actually wrote it.
         result["csv_path"] = str(csv_path)
     if not kernel_ok:
         result["kernel_events_skipped_reason"] = (
             f"perf_event_paranoid={paranoid} (kernel events need <= 1, "
             "or CAP_PERFMON)"
         )
-    if proc.returncode != 0:
-        result["returncode"] = proc.returncode
-        tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
-        if tail:
-            result["error_tail"] = tail
-        warn_once(
-            "perf",
-            f"perf stat exited {proc.returncode}; partial counters may be present",
-        )
+    # Nonzero exit: counters parsed so far are kept alongside the tail.
+    result.update(fields)
     return {"perf": result}
