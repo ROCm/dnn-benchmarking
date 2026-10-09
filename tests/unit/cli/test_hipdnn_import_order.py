@@ -51,6 +51,12 @@ def _run_with_fake_frontend(
 
     plugin_path = tmp_path / "plugins"
     plugin_path.mkdir()
+    # The PyTorch-only runtime rejects hipDNN-specific plugin flags.
+    plugin_args = (
+        []
+        if extra_args == ("--runtime", "pytorch")
+        else ["--plugin-path", str(plugin_path)]
+    )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (str(fake.parent), str(_REPO / "src"), env.get("PYTHONPATH")) if p
@@ -64,8 +70,7 @@ def _run_with_fake_frontend(
             "dnn_benchmarking",
             "--graph",
             str(_REPO / "graphs" / "sample_relu.json"),
-            "--plugin-path",
-            str(plugin_path),
+            *plugin_args,
             "--warmup",
             "1",
             "--iters",
