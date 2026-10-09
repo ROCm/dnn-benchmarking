@@ -244,7 +244,8 @@ def test_sdpa_validation_grades_with_repeatable_math_on_gpu(hipdnn, torch_gpu) -
     scores = unmasked_scores.masked_fill(columns > rows, float("-inf"))
     expected = (torch_gpu.softmax(scores, dim=-1) @ v.float()).to(q.dtype)
     wrong = (torch_gpu.softmax(unmasked_scores, dim=-1) @ v.float()).to(q.dtype)
-    assert not torch_gpu.equal(expected, wrong)
+    with pytest.raises(AssertionError):
+        torch_gpu.testing.assert_close(wrong, expected, rtol=3e-2, atol=1e-3)
     torch_gpu.testing.assert_close(reference_outputs[0], expected, rtol=3e-2, atol=1e-3)
 
     strict = SuiteConfig(
