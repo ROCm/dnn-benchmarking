@@ -3,8 +3,7 @@
 
 """Graph loading and validation module for dnn-benchmarking."""
 
-from .loader import GraphLoader
+from .loader import GraphLoader, output_uids
 from .tensor_info import TensorInfo
-from .validator import GraphValidator
 
-__all__ = ["GraphLoader", "TensorInfo", "GraphValidator"]
+__all__ = ["GraphLoader", "TensorInfo", "output_uids"]

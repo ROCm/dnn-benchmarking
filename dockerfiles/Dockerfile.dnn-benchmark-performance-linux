@@ -9,6 +9,11 @@ FROM ${BASE_IMAGE} AS builder
 ARG DEVICE_TARGET=gfx942
 ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
 ARG ROCM_TORCH_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
+# The build context has no .git (see .dockerignore), so setup_env.py cannot
+# resolve the rocm-libraries submodule pin itself. The build script passes it
+# (`git rev-parse HEAD:rocm-libraries`); empty => setup warns and builds the
+# moving .gitmodules branch.
+ARG ROCM_LIBRARIES_REF=""
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
@@ -63,6 +68,9 @@ set -- \
 if [ -n "${ROCM_TORCH_INDEX_URL}" ]; then
     set -- "$@" --torch-index-url "${ROCM_TORCH_INDEX_URL}"
 fi
+if [ -n "${ROCM_LIBRARIES_REF}" ]; then
+    set -- "$@" --rocm-libraries-ref "${ROCM_LIBRARIES_REF}"
+fi
 
 python3.12 setup_env.py "$@"
 
@@ -111,7 +119,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Profiling sources in this image (setup_env.py prints the same summary):
 #
-#  * --pmc / --emit-trace: rocprofv3 comes from the ROCm wheels, and this
+#  * --pmc / --trace: rocprofv3 comes from the ROCm wheels, and this
 #    image deliberately installs no system ROCm, so the profiler and the
 #    workload always share one ROCm build. Mixing two is what makes
 #    rocprofv3 abort on a duplicate librocprofiler-sdk registration.
@@ -135,7 +143,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #    `/proc/sys/kernel/perf_event_paranoid <= 1` OR `CAP_PERFMON` /
 #    `CAP_SYS_ADMIN`. The sysctl is not namespaced, so the container
 #    reads the host's value — but `--cap-add=PERFMON` (or a privileged
-#    container) bypasses it without touching the host. Failing both,
+#    container) bypasses it without touching the host. The image runs as
+#    the non-root `dnnbench` user, which does not get added capabilities,
+#    so also pass `--user root` with `--cap-add=PERFMON`. Failing both,
 #    the run records user-space counters only and reports the paranoid
 #    value next to the None kernel fields. See docs/troubleshooting.md.
 
@@ -170,6 +180,18 @@ set -euo pipefail
 
 exec /opt/dnn-benchmark/.venv/bin/dnn-benchmark "$@"
 SCRIPT
+
+# Run as a non-root user. /dev/kfd and /dev/dri/renderD* are owned by the
+# host's `video` and `render` groups. The image adds `video` (GID 44 on
+# Ubuntu). The host `render` GID varies, so pass it at run time:
+#   docker run --device /dev/kfd --device /dev/dri \
+#     --group-add video --group-add "$(getent group render | cut -d: -f3)" ...
+RUN useradd --create-home --user-group --groups video dnnbench && \
+    chown dnnbench:dnnbench "${WORKSPACE_DIR}"
+USER dnnbench
+
+# One-shot benchmark CLI, not a long-running service.
+HEALTHCHECK NONE
 
 ENTRYPOINT ["dnn-benchmark-performance"]
 CMD []

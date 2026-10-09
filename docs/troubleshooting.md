@@ -32,17 +32,23 @@ a run; the table is what it is checking and how to close each gap.
 
 | Source | Needs | Provided by |
 | --- | --- | --- |
-| `--pmc`, `--emit-trace pftrace` | `rocprofv3` from the **same** ROCm as torch | The rocm-sdk wheels. Never mix a system `/opt/rocm` profiler with wheel-ROCm torch: the profiler injects the system LLVM runtime and the workload dies loading `libamd_comgr.so.3` |
+| `--pmc`, `--trace` | `rocprofv3` from the **same** ROCm as torch | The rocm-sdk wheels. Never mix a system `/opt/rocm` profiler with wheel-ROCm torch: the profiler injects the system LLVM runtime and the workload dies loading `libamd_comgr.so.3` |
 | `--perf` | a **runnable** `perf`, and either `/proc/sys/kernel/perf_event_paranoid <= 1` or `CAP_PERFMON`/`CAP_SYS_ADMIN` for kernel events | Host, not the venv: `apt install linux-tools-$(uname -r)`. Distro `perf` is a wrapper that exits 2 when no linux-tools matches the running kernel — routine in a container. When that happens the run falls back to an installed build from `/usr/lib/linux-tools*` and records `binary` + `binary_substituted` in the slice, so counters from a foreign-kernel perf are always labelled as such. The paranoid sysctl is not namespaced, so a container reads the host's value; a root/privileged container bypasses it by capability and still records `cycles:k` |
 | `--roofline` | `rocprof-compute` **paired with the ROCm whose `rocprofv3` it drives** | The `rocprofiler-compute` system package. Deliberately absent from the wheel-only Docker image: pulling it in means adding a second ROCm install, which is the mismatch above. A hand-installed copy is not a shortcut — rocprofiler-compute 3.3.0 against ROCm 7.15 dies on `$ROCM_PATH/share/rocprofiler-sdk/counter_defs.yaml`, which that ROCm does not ship. Note it also clears the whole `-p` directory it is given, so never point it at a directory holding other artefacts |
 
-A source that can't run is never fatal — it records a `skipped` entry
-with the reason in `extra_metrics` and the benchmark continues.
+Before the first graph, dnn-benchmarking checks that each requested
+profiler exists and that it can create files in `--profiling-output-dir`
+(default `./profiling-output`). If a check fails, the run stops with exit
+code 2 and names the problem. A profiler that starts but fails is not
+fatal: the row records a `skipped` reason (or `returncode` and
+`error_tail`) in `extra_metrics` and the benchmark continues. If a pass
+raises an exception, the row keeps its timed values and gets the warning
+`profiling failed: <error>`.
 
 ## Profiling integration tests
 
 The profiling smoke tests in `tests/integration/test_profiling.py`
-(`--pmc`, `--emit-trace`, `--perf`, `--roofline`) plus the combined
+(`--pmc`, `--trace`, `--perf`, `--roofline`) plus the combined
 `test_combined_pmc_perf_roofline_merge_into_one_extra_metrics` are
 **double-gated**: each carries a pytest marker (`rocprofv3`, `perf`, or
 `rocprof_compute`) AND an inline binary/host probe that calls
@@ -92,8 +98,9 @@ follow-up work, not a blocker.
 Every external profiler invocation (rocprofv3 PMC, rocprofv3 trace,
 perf stat, rocprof-compute) is capped at a per-process
 wall-clock budget. A wedged child surfaces as
-`extra_metrics["<source>"]["skipped"] == "timed out after Ns"`
-instead of blocking the entire suite.
+`extra_metrics["<source>"]["skipped"] == "<tool> timed out after Ns"`
+(for example `rocprofv3 timed out after 600s`) instead of blocking the
+entire suite.
 
 Default is **600 s (10 min)** per subprocess. Override via
 `--profiling-timeout SECONDS`:
@@ -109,28 +116,29 @@ python -m dnn_benchmarking --profiling-timeout 0 ...
 ```
 
 The budget applies *per subprocess*, not per suite — a four-source
-`--pmc basic --emit-trace pftrace --perf --roofline` invocation can
+`--pmc basic --trace --perf --roofline` invocation can
 spend up to 4 × the budget under the worst case.
 
 ### Profiling VRAM headroom
 
 The opt-in profiling pass spawns a fresh dnn-benchmarking subprocess
 that re-runs the same workload under the external profiler. The parent
-process tears down its `BufferManager` and `Executor` (releasing
-workspace + I/O buffers) *before* spawning, so the subprocess gets the
-full VRAM headroom the parent had — there is no double-allocation
-peak. If you still see OOMs only under `--pmc` / `--roofline` and not
-on the headline timed run, the cause is the profiler's own overhead
-(rocprof-compute's roofline replay in particular allocates extra
-device buffers); reduce `--iters` or run sources one at a time.
+process releases the engine's I/O buffers and executor (workspace)
+*before* spawning, so the subprocess gets the full VRAM headroom the
+parent had — there is no double-allocation peak. If you still see OOMs
+only under `--pmc` / `--roofline` and not on the headline timed run, the
+cause is the profiler's own overhead (rocprof-compute's roofline replay in
+particular allocates extra device buffers); run sources one at a time.
+The child runs `--warmup` + 5 iterations; `--iters` does not change it.
 
 ## Viewing profiling artefacts
 
 The opt-in profiling sources don't render their own visualisations —
 they capture raw artefacts (CSVs, sqlite dbs, pftrace files) and
-record paths in `extra_metrics["<source>"]` of the result JSON. The
-console reporter prints the open-it-with hint next to each path. The
-recipes below cover everything beyond the one-liner hint.
+record paths in `extra_metrics["<source>"]` of the result JSON. With
+`-v`, the console prints a one-line summary and the open-it-with hint
+next to each path. The recipes below cover everything beyond the
+one-liner hint.
 
 ### Roofline (`--roofline`)
 
@@ -208,7 +216,7 @@ the post-hoc render can switch:
 rocprof-compute analyze --path <workload_path> --roofline-data-type FP16
 ```
 
-### Kernel + memcpy trace (`--emit-trace pftrace`)
+### Kernel + memcpy trace (`--trace`)
 
 The `path` field under `extra_metrics["trace"]` points to the generated
 `.pftrace` file. Open it at:
@@ -228,14 +236,30 @@ The recorded artefacts:
 
 | Key | What |
 |---|---|
-| `counters` | Per-counter aggregates (sum + mean-per-kernel) |
-| `per_kernel` | Per-kernel × counter values |
+| `per_kernel` | Map of kernel name -> `{dispatches, counters, l2_hit_rate}` |
+| `counters_requested` | The counters passed to rocprofv3 |
 | `db_path` | Raw rocpd sqlite db with every event |
 | `set` / `arch` | Which counter set was collected and on which arch |
-| `arch_narrowed_to_fallback` | Set when `--pmc all` couldn't find your arch in `PMC_SETS` and fell back to the 2-counter fallback group |
+| `arch_narrowed_to_fallback` | Set when `--pmc all` couldn't find your arch in the CDNA table and fell back to the 2-counter fallback group |
 
-For aggregates, just read `extra_metrics["pmc"]["counters"]` directly
-from the result JSON — they're already summarised.
+There is no suite-wide aggregate. The profiled child also launches
+input-fill kernels, so a sum over every kernel would mix
+unrelated work. Each `per_kernel` entry holds:
+
+- `dispatches`: how many times the kernel ran in the child. Each engine
+  kernel runs once per execution, and the child runs `--warmup` + 5
+  executions.
+- `counters`: mean value **per dispatch** for each counter.
+- `l2_hit_rate`: `TCC_HIT / (TCC_HIT + TCC_MISS)`, present only for a set
+  that collects both (`memory`, `all`).
+
+```json
+"per_kernel": {
+  "<kernel name>": {"dispatches": 15, "counters": {"SQ_WAVES": 1024.0}, "l2_hit_rate": 0.91}
+}
+```
+
+With `-v`, the console shows the three kernels with the most dispatches.
 
 #### Full speed-of-light dashboard via rocprof-compute
 
@@ -273,15 +297,20 @@ The recorded artefacts:
 
 | Key | What |
 |---|---|
+| `scope` | Always `process_total`: the counts cover the whole child process (interpreter start, imports, plugin load, graph build, warmup and loop), not one launch |
 | `cycles_user` / `instructions_user` / `ipc_user` | Always present |
-| `cycles_kernel` / `instructions_kernel` | Only present when `/proc/sys/kernel/perf_event_paranoid <= 1` |
+| `cycles_kernel` / `instructions_kernel` | `None` unless `/proc/sys/kernel/perf_event_paranoid <= 1` or the process holds `CAP_PERFMON`/`CAP_SYS_ADMIN` |
 | `task_clock_ms` / `context_switches` / `page_faults` | Process-wide host counters |
 | `csv_path` | Raw `perf stat -x,` output |
 | `kernel_perf_paranoid` | The paranoid value at run time (so you know why kernel counters might be None) |
+| `binary` / `binary_substituted` | The perf binary used; `binary_substituted` is set when a build for another kernel was used |
 
-The summary fields cover the common asks. The raw CSV exists for
-people who want the per-event breakdown without our aggregation —
-it's the standard `perf stat -x,` seven-column format
+Do not divide these counts by the timed iterations: most of the process
+time is start-up, not the benchmark loop. Compare them only between runs of
+the same graph and engine.
+
+The raw CSV exists for people who want the per-event breakdown without
+our aggregation — it's the standard `perf stat -x,` seven-column format
 (`<value>,<unit>,<event>,<run-time-ns>,<percent>,<metric>,<metric-unit>`).
 
 If `cycles_kernel` is None, check `kernel_events_skipped_reason` in

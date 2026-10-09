@@ -11,8 +11,6 @@ modules (which need these helpers).
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_PROFILING_TIMEOUT_S = 600
-
 
 def find_first(search_dir: Path, pattern: str) -> Optional[Path]:
     """First match for ``pattern`` anywhere under ``search_dir``, or None.

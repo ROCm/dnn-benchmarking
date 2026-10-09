@@ -1,232 +1,204 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for BenchmarkConfig."""
+"""Tests for SuiteConfig, ValidationConfig and TimingPolicy."""
 
 from pathlib import Path
 
 import pytest
 
+from dnn_benchmarking.cli.config_file import apply_config_file
+from dnn_benchmarking.cli.parser import create_parser
 from dnn_benchmarking.config import (
-    BenchmarkConfig,
-    ExecutionBackendName,
-    ReferenceProviderName,
+    RuntimeName,
     PyTorchSdpaBackendName,
     SuiteConfig,
-    TimingBackendName,
+    TimingPolicy,
     ValidationConfig,
 )
 
 
-class TestBenchmarkConfig:
-    """Tests for BenchmarkConfig dataclass."""
+def _namespace(argv: list[str]):
+    args = create_parser(suppress_defaults=True).parse_args(argv)
+    apply_config_file(args)
+    return args
 
-    def test_default_values(self) -> None:
-        """Test that defaults are applied correctly."""
-        config = BenchmarkConfig(graph_path=Path("/test/graph.json"))
 
-        assert config.warmup_iters == 10
-        assert config.benchmark_iters == 100
-        assert config.engine_id == 1
-        assert config.pytorch_sdpa_backend is PyTorchSdpaBackendName.DEFAULT
+class TestFromNamespace:
+    """SuiteConfig.from_namespace maps merged CLI/config args onto the config."""
 
-    def test_custom_values(self) -> None:
-        """Test that custom values are stored correctly."""
-        config = BenchmarkConfig(
-            graph_path=Path("/test/graph.json"),
-            warmup_iters=20,
-            benchmark_iters=200,
-            engine_id=2,
+    def test_config_file_and_cli_values_reach_suite_config(
+        self, tmp_path: Path
+    ) -> None:
+        config = tmp_path / "bench.toml"
+        config.write_text(
+            """
+version = 1
+warmup = 1
+iters = 2
+min_time_ms = 5
+cache_mode = "cold"
+oracle = true
+metrics = false
+rtol = 1e-3
+
+[[engines]]
+id = "MIOPEN_ENGINE"
+
+[[engines]]
+id = 1
+"""
+        )
+        args = _namespace(
+            ["--config", str(config), "--seed", "7", "--plugin-path", "/plugins"]
         )
 
-        assert config.graph_path == Path("/test/graph.json")
-        assert config.warmup_iters == 20
-        assert config.benchmark_iters == 200
-        assert config.engine_id == 2
+        suite = SuiteConfig.from_namespace(args)
 
-    def test_string_path_converted_to_path(self) -> None:
-        """Test that string path is converted to Path object."""
-        config = BenchmarkConfig(graph_path="/test/graph.json")  # type: ignore
-
-        assert isinstance(config.graph_path, Path)
-        assert config.graph_path == Path("/test/graph.json")
-
-    def test_negative_warmup_raises(self) -> None:
-        """Test that negative warmup_iters raises ValueError."""
-        with pytest.raises(ValueError, match="warmup_iters must be non-negative"):
-            BenchmarkConfig(graph_path=Path("/test/graph.json"), warmup_iters=-1)
-
-    def test_zero_warmup_allowed(self) -> None:
-        """Test that zero warmup_iters is allowed."""
-        config = BenchmarkConfig(graph_path=Path("/test/graph.json"), warmup_iters=0)
-        assert config.warmup_iters == 0
-
-    def test_zero_benchmark_iters_raises(self) -> None:
-        """Test that zero benchmark_iters raises ValueError."""
-        with pytest.raises(ValueError, match="benchmark_iters must be positive"):
-            BenchmarkConfig(graph_path=Path("/test/graph.json"), benchmark_iters=0)
-
-    def test_negative_benchmark_iters_raises(self) -> None:
-        """Test that negative benchmark_iters raises ValueError."""
-        with pytest.raises(ValueError, match="benchmark_iters must be positive"):
-            BenchmarkConfig(graph_path=Path("/test/graph.json"), benchmark_iters=-1)
-
-    def test_negative_engine_id_accepted(self) -> None:
-        """Engine IDs are FNV-1a hashes; negative values (high bit set in
-        signed int64) must be accepted."""
-        config = BenchmarkConfig(
-            graph_path=Path("/test/graph.json"),
-            engine_id=-4567890123456789012,
+        assert suite.timing_policy == TimingPolicy(
+            warmup_iters=1, iters=2, min_time_ms=5.0, cache_mode="cold"
         )
-        assert config.engine_id == -4567890123456789012
+        assert suite.seed == 7
+        assert suite.engine_filter is None  # --plugin-path replaces the matrix
+        assert suite.plugin_paths == [Path("/plugins")]
+        assert suite.oracle is True
+        assert suite.metrics.basic is False
+        assert suite.validation.tolerance_override == (1e-3, 1e-3)
 
+    def test_default_seed_is_fixed(self) -> None:
+        """Inputs are reproducible without --seed (pre-fix default was random)."""
+        assert SuiteConfig.from_namespace(_namespace(["-g", "g.json"])).seed == 0
 
-class TestPyTorchSdpaBackendConfig:
-    """PyTorch SDPA backend selection validation."""
+    def test_shipped_run_defaults(self) -> None:
+        """docs/usage.md documents these; default-path trend numbers depend on them."""
+        suite = SuiteConfig.from_namespace(_namespace(["-g", "g.json"]))
 
-    def test_defaults_to_unrestricted_dispatch(self) -> None:
+        policy = suite.timing_policy
         assert (
-            BenchmarkConfig(graph_path=Path("/test/graph.json")).pytorch_sdpa_backend
-            is PyTorchSdpaBackendName.DEFAULT
-        )
-        assert SuiteConfig().pytorch_sdpa_backend is PyTorchSdpaBackendName.DEFAULT
+            policy.warmup_iters,
+            policy.iters,
+            policy.min_time_ms,
+            policy.max_iters,
+            policy.cache_mode,
+            policy.timing_block,
+        ) == (10, 100, 0.0, 10_000, "warm", 1)
+        assert suite.metrics.profiling_timeout_s == 600
+
+    def test_hipdnn_without_plugin_path_uses_rocm_path(self, monkeypatch) -> None:
+        monkeypatch.setenv("ROCM_PATH", "/opt/rocm-x")
+        suite = SuiteConfig.from_namespace(_namespace(["-g", "g.json"]))
+        assert suite.plugin_paths == [Path("/opt/rocm-x/lib/hipdnn_plugins/engines")]
+
+    def test_pytorch_runtime_gets_no_default_plugin_path(self, monkeypatch) -> None:
+        monkeypatch.setenv("ROCM_PATH", "/opt/rocm-x")
+        suite = SuiteConfig.from_namespace(_namespace(["-r", "pytorch"]))
+        assert suite.plugin_paths is None
+
+    def test_pmc_all_with_multipass_reaches_metrics_config(self) -> None:
+        args = _namespace(["-g", "g.json", "--pmc", "all", "--pmc-allow-multipass"])
+        metrics = SuiteConfig.from_namespace(args).metrics
+        assert (metrics.pmc_set, metrics.pmc_allow_multipass) == ("all", True)
 
     @pytest.mark.parametrize(
-        "backend",
-        [backend.value for backend in PyTorchSdpaBackendName],
-    )
-    def test_accepts_every_backend_for_both_config_types(self, backend: str) -> None:
-        assert (
-            BenchmarkConfig(
-                graph_path=Path("/test/graph.json"),
-                pytorch_sdpa_backend=backend,
-            ).pytorch_sdpa_backend.value
-            == backend
-        )
-        assert (
-            SuiteConfig(pytorch_sdpa_backend=backend).pytorch_sdpa_backend.value
-            == backend
-        )
-
-    @pytest.mark.parametrize(
-        "factory",
+        ("argv", "flag"),
         [
-            lambda: BenchmarkConfig(
-                graph_path=Path("/test/graph.json"),
-                pytorch_sdpa_backend="invalid",
-            ),
-            lambda: SuiteConfig(pytorch_sdpa_backend="invalid"),
+            (["-e", "1"], "--engine"),
+            (["--plugin-path", "/p"], "--plugin-path"),
+            (["--validate", "pytorch"], "--validate pytorch"),
+            (["--pmc", "basic"], "--pmc"),
+            (["--trace"], "--trace"),
+            (["--perf"], "--perf"),
+            (["--roofline"], "--roofline"),
+            (["--autotune"], "--autotune"),
+            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
         ],
     )
-    def test_rejects_invalid_backend_for_both_config_types(self, factory) -> None:
-        with pytest.raises(ValueError, match="Invalid PyTorch SDPA backend"):
-            factory()
+    def test_pytorch_runtime_rejects_hipdnn_only_options(
+        self, argv: list[str], flag: str
+    ) -> None:
+        args = _namespace(["-r", "pytorch", *argv])
+        with pytest.raises(ValueError, match=f"{flag}.*--runtime pytorch"):
+            SuiteConfig.from_namespace(args)
 
+    def test_pytorch_runtime_accepts_oracle(self) -> None:
+        """PyTorch rows get their tuned run in a child process."""
+        args = _namespace(["-r", "pytorch", "--oracle"])
+        assert SuiteConfig.from_namespace(args).oracle is True
+
+
+class TestSuiteConfigValidation:
     @pytest.mark.parametrize(
-        "factory",
+        ("kwargs", "flag"),
         [
-            lambda: BenchmarkConfig(
-                graph_path=Path("/test/graph.json"),
-                pytorch_sdpa_backend="flash",
-                pytorch_rocm_fa_library="aotriton",
-            ),
-            lambda: SuiteConfig(
-                pytorch_sdpa_backend="flash",
-                pytorch_rocm_fa_library="third-party-library",
+            ({"warmup_iters": -1}, "--warmup"),
+            ({"benchmark_iters": 0}, "--iters"),
+            ({"min_time_ms": -1.0}, "--min-time-ms"),
+            ({"cache_mode": "hot"}, "--cache-mode"),
+            ({"timing_block": 0}, "--timing-block"),
+            ({"cache_mode": "cold", "timing_block": 2}, "--timing-block"),
+            ({"engine_filter": []}, "--engine"),
+            ({"runtime": "tensorflow"}, "--runtime"),
+            # --autotune would tune the OOTB plan too: nothing to compare.
+            ({"oracle": True, "autotune": True}, "--autotune"),
+            ({"pytorch_sdpa_backend": "aotriton"}, "--pytorch-sdpa-backend"),
+            (
+                {"pytorch_sdpa_backend": "math", "pytorch_rocm_fa_library": "x"},
+                "--pytorch-rocm-fa-library",
             ),
         ],
     )
-    def test_accepts_arbitrary_rocm_fa_library_with_flash(self, factory) -> None:
-        config = factory()
+    def test_invalid_values_name_the_flag(self, kwargs: dict, flag: str) -> None:
+        with pytest.raises(ValueError, match=flag):
+            SuiteConfig(**kwargs)
 
+    def test_max_iters_below_iters_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_iters must be >= iters"):
+            TimingPolicy(iters=5, max_iters=4)
+
+    def test_iters_above_the_default_cap_raise_the_cap(self) -> None:
+        policy = SuiteConfig(benchmark_iters=20_000).timing_policy
+        assert policy.max_iters >= policy.iters == 20_000
+
+    @pytest.mark.parametrize("backend", [b.value for b in PyTorchSdpaBackendName])
+    def test_accepts_every_sdpa_backend(self, backend: str) -> None:
+        assert SuiteConfig(pytorch_sdpa_backend=backend).pytorch_sdpa_backend.value == (
+            backend
+        )
+
+    def test_rocm_fa_library_accepted_with_flash(self) -> None:
+        config = SuiteConfig(
+            pytorch_sdpa_backend="flash", pytorch_rocm_fa_library="third-party"
+        )
         assert config.pytorch_sdpa_backend is PyTorchSdpaBackendName.FLASH
-        assert config.pytorch_rocm_fa_library is not None
 
-    @pytest.mark.parametrize(
-        "factory",
-        [
-            lambda: BenchmarkConfig(
-                graph_path=Path("/test/graph.json"),
-                pytorch_sdpa_backend="math",
-                pytorch_rocm_fa_library="aotriton",
-            ),
-            lambda: SuiteConfig(
-                pytorch_sdpa_backend="default",
-                pytorch_rocm_fa_library="aotriton",
-            ),
-        ],
-    )
-    def test_rejects_rocm_fa_library_outside_flash(self, factory) -> None:
-        with pytest.raises(
-            ValueError,
-            match="pytorch_rocm_fa_library requires pytorch_sdpa_backend='flash'",
-        ):
-            factory()
-
-    @pytest.mark.parametrize(
-        "factory",
-        [
-            lambda: BenchmarkConfig(
-                graph_path=Path("/test/graph.json"),
-                pytorch_sdpa_backend="aotriton_preferred",
-            ),
-            lambda: SuiteConfig(pytorch_sdpa_backend="aotriton_preferred"),
-            lambda: BenchmarkConfig(
-                graph_path=Path("/test/graph.json"),
-                pytorch_sdpa_backend="aotriton",
-            ),
-            lambda: SuiteConfig(pytorch_sdpa_backend="aotriton"),
-        ],
-    )
-    def test_rejects_removed_aotriton_shorthand(self, factory) -> None:
-        with pytest.raises(ValueError, match="Invalid PyTorch SDPA backend"):
-            factory()
+    def test_runtime_string_is_normalised(self) -> None:
+        assert SuiteConfig(runtime="pytorch").runtime is RuntimeName.PYTORCH
 
 
 class TestSuiteConfigPluginPaths:
     """Tests for SuiteConfig engine/plugin path selection."""
 
     def test_single_plugin_path_applies_to_all_engines(self) -> None:
-        config = SuiteConfig(
-            engine_filter=[1, 2],
-            plugin_paths=[Path("/plugins/a")],
-        )
+        config = SuiteConfig(engine_filter=[1, 2], plugin_paths=[Path("/plugins/a")])
         selections = config.engine_selections_for([1, 2])
 
-        assert [s.engine_id for s in selections] == [1, 2]
-        assert [s.plugin_path for s in selections] == [
-            Path("/plugins/a"),
-            Path("/plugins/a"),
-        ]
+        assert [s.plugin_path for s in selections] == [Path("/plugins/a")] * 2
         assert config.plugin_path == Path("/plugins/a")
 
-    def test_multiple_plugin_paths_follow_engine_order(self) -> None:
-        config = SuiteConfig(
-            engine_filter=[2, 1],
-            plugin_paths=[Path("/plugins/b"), Path("/plugins/a")],
-        )
-        selections = config.engine_selections_for([2, 1])
+    @pytest.mark.parametrize(
+        "engines, paths", [([1, 1], ["a", "b"]), ([2, 1], ["b", "a"])]
+    )
+    def test_plugin_paths_pair_with_engines_in_caller_order(
+        self, engines: list[int], paths: list[str]
+    ) -> None:
+        plugin_paths = [Path("/plugins") / p for p in paths]
+        config = SuiteConfig(engine_filter=engines, plugin_paths=plugin_paths)
 
-        assert [s.engine_id for s in selections] == [2, 1]
-        assert [s.plugin_path for s in selections] == [
-            Path("/plugins/b"),
-            Path("/plugins/a"),
-        ]
+        selections = config.engine_selections_for(engines)
+
+        assert [s.engine_id for s in selections] == engines
+        assert [s.plugin_path for s in selections] == plugin_paths
         assert config.plugin_path is None
-
-    def test_repeated_engine_ids_keep_distinct_plugin_paths(self) -> None:
-        config = SuiteConfig(
-            engine_filter=[1, 1],
-            plugin_paths=[Path("/plugins/a"), Path("/plugins/b")],
-        )
-
-        selections = config.engine_selections_for([1, 1])
-
-        assert [s.engine_id for s in selections] == [1, 1]
-        assert [s.plugin_path for s in selections] == [
-            Path("/plugins/a"),
-            Path("/plugins/b"),
-        ]
 
     def test_multiple_plugin_paths_require_engine_filter(self) -> None:
         with pytest.raises(ValueError, match="requires --engine"):
@@ -240,92 +212,26 @@ class TestSuiteConfigPluginPaths:
             )
 
 
-class TestSuiteConfigTolerances:
-    """Tests for SuiteConfig validation tolerance overrides."""
-
-    def test_defaults_use_dtype_aware_tolerances(self) -> None:
-        config = SuiteConfig()
-        assert config.validation.rtol is None
-        assert config.validation.atol is None
-        assert config.validation.tolerance_override is None
-
+class TestValidationConfig:
     def test_both_tolerances_override_dtype_defaults(self) -> None:
-        config = SuiteConfig(validation=ValidationConfig(rtol=1e-3, atol=1e-4))
-        assert config.validation.tolerance_override == (1e-3, 1e-4)
+        assert ValidationConfig(rtol=1e-3, atol=1e-4).tolerance_override == (1e-3, 1e-4)
 
     def test_single_tolerance_applies_to_both_values(self) -> None:
-        assert SuiteConfig(
-            validation=ValidationConfig(rtol=1e-3)
-        ).validation.tolerance_override == (1e-3, 1e-3)
-        assert SuiteConfig(
-            validation=ValidationConfig(atol=1e-4)
-        ).validation.tolerance_override == (1e-4, 1e-4)
+        assert ValidationConfig(rtol=1e-3).tolerance_override == (1e-3, 1e-3)
+        assert ValidationConfig(atol=1e-4).tolerance_override == (1e-4, 1e-4)
 
+    def test_enabled_tracks_provider(self) -> None:
+        assert ValidationConfig(provider="none").enabled is False
+        assert ValidationConfig(provider="pytorch").enabled is True
 
-class TestValidationConfig:
-    """Tests for ValidationConfig dataclass."""
-
-    def test_default_values(self) -> None:
-        """Test that defaults are applied correctly."""
-        config = ValidationConfig()
-
-        assert config.provider is ReferenceProviderName.NONE
-        assert config.rtol is None
-        assert config.atol is None
-        assert config.enabled is False
-
-    def test_custom_values(self) -> None:
-        """Test that custom values are stored correctly."""
-        config = ValidationConfig(
-            provider="pytorch",
-            rtol=1e-3,
-            atol=1e-6,
-        )
-
-        assert config.provider is ReferenceProviderName.PYTORCH
-        assert config.rtol == 1e-3
-        assert config.atol == 1e-6
-
-    def test_enabled_property_none(self) -> None:
-        """Test enabled property with provider='none'."""
-        config = ValidationConfig(provider="none")
-
-        assert config.enabled is False
-
-    def test_enabled_property_pytorch(self) -> None:
-        """Test enabled property with provider='pytorch'."""
-        config = ValidationConfig(provider="pytorch")
-
-        assert config.enabled is True
-
-    def test_invalid_provider_raises(self) -> None:
-        """Test that invalid provider raises ValueError."""
-        with pytest.raises(ValueError, match="Invalid provider"):
-            ValidationConfig(provider="invalid_provider")
-
-    def test_negative_rtol_raises(self) -> None:
-        """Test that negative rtol raises ValueError."""
-        with pytest.raises(ValueError, match="rtol must be non-negative"):
-            ValidationConfig(rtol=-1e-5)
-
-    def test_negative_atol_raises(self) -> None:
-        """Test that negative atol raises ValueError."""
-        with pytest.raises(ValueError, match="atol must be non-negative"):
-            ValidationConfig(atol=-1e-8)
-
-
-class TestSuiteConfigBackend:
-    """SuiteConfig execution backend validation."""
-
-    def test_default_backend_is_hipdnn(self) -> None:
-        assert SuiteConfig().backend is ExecutionBackendName.HIPDNN
-
-    def test_pytorch_backend_accepted(self) -> None:
-        assert SuiteConfig(backend="pytorch").backend is ExecutionBackendName.PYTORCH
-
-    def test_unknown_backend_rejected(self) -> None:
-        with pytest.raises(ValueError, match="Invalid backend"):
-            SuiteConfig(backend="tensorflow")
-
-    def test_timing_backend_enum_values(self) -> None:
-        assert TimingBackendName.TORCH.value == "torch"
+    @pytest.mark.parametrize(
+        ("kwargs", "flag"),
+        [
+            ({"provider": "invalid"}, "--validate"),
+            ({"rtol": -1e-5}, "--rtol"),
+            ({"atol": -1e-8}, "--atol"),
+        ],
+    )
+    def test_invalid_values_name_the_flag(self, kwargs: dict, flag: str) -> None:
+        with pytest.raises(ValueError, match=flag):
+            ValidationConfig(**kwargs)
