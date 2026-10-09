@@ -465,10 +465,9 @@ def compile_sdpa(
 
     Serves paged (KV-cache) graphs as well as dense ones. PyTorch has no paged
     SDPA API -- ``F.scaled_dot_product_attention`` takes no page table -- so a
-    paged graph is gathered through its page table into dense per-sequence K/V
-    and then run one sequence at a time. That gather is unavoidable and it is the
-    same on both paths: ``--validate pytorch`` walks these very handlers with CPU
-    tensors, so there is no reference-side shortcut.
+    paged graph gathers each sequence's K/V into dense tensors before SDPA.
+    Both the timed PyTorch row and its GPU reference pass use this handler.
+    The CPU reference fallback uses the same gather on CPU tensors.
     """
     _sdpa_unsupported_if_present(
         node,
