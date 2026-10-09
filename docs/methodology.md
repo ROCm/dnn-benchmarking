@@ -354,10 +354,11 @@ The tool does not do these things yet:
   same precision as the result under test, and the tolerances must be loose.
   An fp32 reference needs new tolerances for all workloads.
 - SDPA reference for every mask. The PyTorch reference follows hipDNN mask
-  semantics: the deprecated `causal_mask` wins over left and right bounds
-  (top-left causal). A bounded left window is supported only with
-  `right_bound = 0`. Other masks make the reference decline the graph as
-  unsupported.
+  semantics: the deprecated `causal_mask` (top-left) and
+  `causal_mask_bottom_right` win over left and right bounds, and setting both
+  is an error. Without them, `diagonal_alignment` and the bounds decide. A
+  bounded left window is supported only with `right_bound = 0`. Other masks
+  make the reference decline the graph as unsupported.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.

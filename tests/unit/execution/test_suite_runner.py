@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -80,6 +81,7 @@ class Fake:
         self.measurement = {}
         self.engine_output = REF.copy()
         self.torch_error = None
+        self.torch_execute_error = None
         self.clocks = []
         self.events = []
         self.torch_options = []
@@ -223,6 +225,8 @@ def fake_torch(fake, monkeypatch):
             return _stall_aware(fake, "pytorch", self.policy)
 
         def execute_once(self, tensors):
+            if fake.torch_execute_error:
+                raise fake.torch_execute_error
             fake.torch_outputs_written = True
 
     class TorchBuffers:
@@ -593,16 +597,33 @@ def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "sdpa_backend, reference_status, engine_verdict, engine_reason",
+    "sdpa_backend, reference_status, reference_reason, engine_verdict, engine_reason",
     [
-        # CPU reference serves as fallback
-        ("default", "skipped", "passed", None),
+        # CPU reference serves as fallback, and the row names the failed step
+        (
+            "default",
+            "skipped",
+            "Timing skipped (ExecutionError: PyTorch GPU not available).",
+            "passed",
+            None,
+        ),
         # strict selection never falls back, and says why
-        ("math", "error", "failed", "ExecutionError: PyTorch GPU not available"),
+        (
+            "math",
+            "error",
+            "ExecutionError: PyTorch GPU not available",
+            "failed",
+            "ExecutionError: PyTorch GPU not available",
+        ),
     ],
 )
 def test_failed_timed_reference(
-    fake_torch, sdpa_backend, reference_status, engine_verdict, engine_reason
+    fake_torch,
+    sdpa_backend,
+    reference_status,
+    reference_reason,
+    engine_verdict,
+    engine_reason,
 ):
     fake_torch.discovered = [1]
     fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
@@ -610,11 +631,88 @@ def test_failed_timed_reference(
     reference, engine = _validate(pytorch_sdpa_backend=sdpa_backend)[0].results
 
     assert reference.status == reference_status
-    assert (reference.error_message or reference.skip_reason) == (
-        "ExecutionError: PyTorch GPU not available"
+    assert (reference.error_message or reference.skip_reason).startswith(
+        reference_reason
     )
     assert engine.verdict == engine_verdict
     assert engine.ootb.correctness.error_message == engine_reason
+
+
+def test_a_skipped_timed_reference_says_engines_are_still_graded(fake_torch):
+    """The skipped row must not read as "nothing was validated"."""
+    fake_torch.discovered = [1]
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+
+    reference, engine = _validate()[0].results
+
+    assert engine.verdict == "passed"
+    assert "still validated" in reference.skip_reason
+    assert "CPU" in reference.skip_reason
+
+
+def test_a_failed_reference_pass_is_not_reported_as_skipped_timing(fake_torch):
+    """Timing can finish and only the MATH output pass fail, out of memory on
+    a large graph for instance. Saying "Timing skipped" there is wrong."""
+    fake_torch.discovered = [1]
+    fake_torch.torch_execute_error = RuntimeError("HIP out of memory")
+
+    reference, engine = _validate()[0].results
+
+    assert reference.status == "skipped"
+    assert reference.skip_reason.startswith(
+        "Reference output pass failed (RuntimeError: HIP out of memory)."
+    )
+    assert "Timing skipped" not in reference.skip_reason
+    assert "still validated" in reference.skip_reason
+    # The timed loop ran, so the row's own failure did not cost the grading.
+    assert engine.verdict == "passed"
+
+
+def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
+    fake_torch, monkeypatch
+):
+    """Timing measures default dispatch; the graded outputs use MATH."""
+    import torch
+
+    from dnn_benchmarking.execution import pytorch_executor, pytorch_ops
+
+    def math_only_at_sdpa():
+        seen = []
+
+        def recording_sdpa(*args, **kwargs):
+            seen.append(
+                torch.backends.cuda.math_sdp_enabled()
+                and not torch.backends.cuda.flash_sdp_enabled()
+            )
+            return torch.empty(0)
+
+        q = torch.rand(1, 1, 2, 4)
+        with patch.object(
+            torch.nn.functional, "scaled_dot_product_attention", recording_sdpa
+        ):
+            pytorch_ops.execute_selected_sdpa(
+                q, q, q, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+            )
+        return seen[0]
+
+    calls = {}
+    executor_cls = pytorch_executor.PyTorchCudaExecutor
+    timed_loop, output_pass = executor_cls.benchmark, executor_cls.execute_once
+
+    def benchmark(self, tensors):
+        calls["benchmark"] = math_only_at_sdpa()
+        return timed_loop(self, tensors)
+
+    def execute_once(self, tensors):
+        calls["execute_once"] = math_only_at_sdpa()
+        return output_pass(self, tensors)
+
+    monkeypatch.setattr(executor_cls, "benchmark", benchmark)
+    monkeypatch.setattr(executor_cls, "execute_once", execute_once)
+
+    _validate()
+
+    assert calls == {"benchmark": False, "execute_once": True}
 
 
 def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(

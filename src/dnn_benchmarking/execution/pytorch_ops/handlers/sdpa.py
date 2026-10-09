@@ -54,6 +54,7 @@ def _sdpa_head_repeat(q_heads: int, kv_heads: int, label: str) -> int:
 def _plan_sdpa_common(
     node: Dict[str, Any],
     allow_paged: bool = False,
+    allow_bottom_right: bool = False,
 ) -> Tuple[Optional[int], float, bool, Optional[int], Any, Optional[int]]:
     unsupported = [
         "seed_tensor_uid",
@@ -86,13 +87,16 @@ def _plan_sdpa_common(
         raise ValueError(
             "SDPA alibi/padding masks are not supported by the PyTorch reference"
         )
-    if _sdpa_bool(node, "causal_mask_bottom_right"):
+    if _sdpa_bottom_right(node) and not allow_bottom_right:
+        if _sdpa_bool(node, "causal_mask_bottom_right"):
+            raise ValueError(
+                "SDPA bottom-right causal mask is not supported by the PyTorch "
+                "reference backward"
+            )
         raise ValueError(
-            "SDPA bottom-right causal mask is not supported by the PyTorch reference"
+            "Only TOP_LEFT SDPA diagonal alignment is supported by the PyTorch "
+            "reference backward"
         )
-    diagonal_alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
-    if diagonal_alignment not in ("TOP_LEFT", 0, None):
-        raise ValueError("Only TOP_LEFT SDPA diagonal alignment is supported")
 
     dropout_probability = _node_param(node, "dropout_probability", 0.0)
     dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
@@ -113,43 +117,80 @@ def _plan_sdpa_common(
     return mask_uid, dropout_p, is_causal, scale_uid, attn_scale_value, window
 
 
-def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
-    """Resolve (is_causal, sliding_window_width) the way hipDNN does.
+def _sdpa_bottom_right(node: Dict[str, Any]) -> bool:
+    """Whether the causal diagonal is aligned bottom-right.
 
-    Mirrors hipDNN's ``extractDiagonalBandParams`` (CPU reference) and the
-    ASM SDPA engine's ``getMaskType``:
+    Bottom-right puts the last query on the last key: query ``i`` sees keys up
+    to ``i + Skv - Sq``. It is what decode and chunked prefill (Sq < Skv) mean;
+    top-left with Sq = 1 would see only key 0.
 
-      * **The deprecated ``causal_mask`` wins**: it means top-left causal and
-        the bounds are ignored.
-      * Otherwise row ``q`` keeps ``q - left_bound <= k <= q + right_bound``,
-        an unset or ``-1`` bound being unbounded. The shipped ``quick/SdpaFwd``
-        bundles spell causality as ``left_bound=-1, right_bound=0``, while the
-        model traces set ``causal_mask: true``; both must resolve the same.
-
-    The window WIDTH is ``left_bound + 1`` (the band includes the current
-    token). Only causal bands (``right_bound == 0``) are expressible here.
+    The deprecated booleans are resolved ahead of ``diagonal_alignment``, the
+    way hipDNN resolves them (``PlanUtils.hpp::extractDiagonalBandParams``,
+    ``Gfx950AttentionDenseNative.cpp::maskTypeFor``): ``causal_mask`` pins the
+    diagonal top-left and overrides the alignment, and the two booleans
+    together are rejected. Reading the alignment first would grade a graph the
+    engines run top-left against a bottom-right reference, which passes a
+    wrong engine and fails a right one.
     """
-    if _sdpa_bool(node, "causal_mask"):
-        return True, None
+    top_left_flag = _sdpa_bool(node, "causal_mask")
+    bottom_right_flag = _sdpa_bool(node, "causal_mask_bottom_right")
+    if top_left_flag and bottom_right_flag:
+        raise ValueError(
+            "SDPA causal_mask and causal_mask_bottom_right are mutually "
+            "exclusive; use diagonal_alignment with left_bound=-1, right_bound=0"
+        )
+    if bottom_right_flag:
+        return True
+    if top_left_flag:
+        return False
+    diagonal_alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
+    if diagonal_alignment in ("TOP_LEFT", 0, None):
+        return False
+    if diagonal_alignment == "BOTTOM_RIGHT":
+        return True
+    raise ValueError(f"Unknown SDPA diagonal alignment {diagonal_alignment!r}")
 
+
+def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
+    """Resolve causal flags and the supported bounded-window spelling.
+
+    hipDNN's extractDiagonalBandParams resolves either deprecated causal flag
+    before written bounds or diagonal alignment. A flag therefore describes
+    the full causal band, even if a graph also carries a left_bound. Without
+    those flags, right_bound=0 supplies causality in the shipped bundles and
+    a bounded left side narrows that causal band. Other right-bound combinations
+    need an explicit mask; this reference does not model them as a causal window.
+
+    The window WIDTH is ``left_bound + 1``: the bound counts tokens strictly
+    before the current one, and the band includes it.
+    """
     unbounded = -1
     left = _node_param(node, "left_bound", unbounded)
     right = _node_param(node, "right_bound", unbounded)
     left = unbounded if left is None else int(left)
     right = unbounded if right is None else int(right)
 
-    if left < unbounded:
-        raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
-    if right != 0:
-        if right == unbounded and left == unbounded:
-            return False, None
-        raise ValueError(
-            f"SDPA right_bound {right} is a forward-looking band the reference "
-            "cannot express"
-        )
-    if left == unbounded:
+    if _sdpa_bool(node, "causal_mask") or _sdpa_bool(node, "causal_mask_bottom_right"):
         return True, None
-    return False, left + 1
+
+    if left != unbounded:
+        if left < 0:
+            raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+        if right != 0:
+            raise ValueError(
+                f"SDPA bounded-left band requires right_bound=0 (got {right}); "
+                "right-open and forward-looking bands need an explicit mask"
+            )
+        return False, left + 1
+
+    if right == unbounded:
+        return False, None
+    if right == 0:
+        return True, None
+    raise ValueError(
+        f"SDPA right_bound {right} is a forward-looking band the reference "
+        "cannot express"
+    )
 
 
 def _sdpa_resolve(
@@ -175,18 +216,49 @@ def _sdpa_resolve(
 def _sliding_window_mask(
     q_len: int,
     kv_len: int,
-    width: int,
+    width: Optional[int],
     device: torch.device,
     dtype: torch.dtype,
+    offset: int = 0,
 ) -> torch.Tensor:
     """Additive mask for a causal band of ``width`` tokens INCLUDING the current
-    one, i.e. the kernel's ``q - W + 1 <= k <= q``. Rows are aligned top-left,
-    matching the only diagonal alignment this reference accepts."""
-    q_idx = torch.arange(q_len, device=device).unsqueeze(-1)
+    one, i.e. the kernel's ``q - W + 1 <= k <= q``, or plain causal when
+    ``width`` is None. ``offset`` shifts the diagonal: 0 is top-left,
+    ``kv_len - q_len`` is bottom-right."""
+    q_idx = torch.arange(q_len, device=device).unsqueeze(-1) + offset
     k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
-    keep = (k_idx <= q_idx) & (k_idx > q_idx - width)
+    keep = k_idx <= q_idx
+    if width is not None:
+        keep = keep & (k_idx > q_idx - width)
     mask = torch.zeros((q_len, kv_len), device=device, dtype=dtype)
     return mask.masked_fill(~keep, float("-inf"))
+
+
+def _band_mask(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    is_causal: bool,
+    window: Optional[int],
+    bottom_right: bool,
+) -> Optional[torch.Tensor]:
+    """The additive causal band for q/k, or None when torch's top-left
+    ``is_causal`` (or no mask at all) already says it.
+
+    With Sq == Skv the bottom-right diagonal is the top-left one, so this
+    returns None there as well. Building the explicit band anyway would cost
+    the timed row its flash backend, which takes no ``attn_mask``, and make
+    ``--pytorch-sdpa-backend flash`` fail on the shipped square causal bundles.
+    """
+    q_len, kv_len = int(q.shape[-2]), int(k.shape[-2])
+    if window is None and not (is_causal and bottom_right and q_len != kv_len):
+        return None
+    if bottom_right and q_len > kv_len:
+        raise ValueError(
+            f"Bottom-right causal SDPA with Sq {q_len} > Skv {kv_len} leaves "
+            "queries with no keys"
+        )
+    offset = kv_len - q_len if bottom_right else 0
+    return _sliding_window_mask(q_len, kv_len, window, q.device, q.dtype, offset)
 
 
 def _call_sdpa(
@@ -199,6 +271,8 @@ def _call_sdpa(
     scale: Optional[float],
     rep_k: int,
     rep_v: int,
+    window: Optional[int] = None,
+    bottom_right: bool = False,
 ) -> torch.Tensor:
     # Expand K and V independently to the query head count. PyTorch's
     # enable_gqa only models equal K/V head counts, so explicit repeat is the
@@ -207,6 +281,12 @@ def _call_sdpa(
         k = k.repeat_interleave(rep_k, dim=-3)
     if rep_v > 1:
         v = v.repeat_interleave(rep_v, dim=-3)
+    # A sliding window or a bottom-right diagonal has no boolean spelling in
+    # torch's SDPA (is_causal is top-left), so it is expressed as the additive
+    # mask it actually is.
+    band = _band_mask(q, k, is_causal, window, bottom_right)
+    if band is not None:
+        attn_mask, is_causal = band, False
     return execute_selected_sdpa(
         q,
         k,
@@ -235,6 +315,7 @@ def _run_paged_sdpa(
     rep_k: int,
     rep_v: int,
     window: Optional[int],
+    bottom_right: bool = False,
 ) -> torch.Tensor:
     """Gather a paged KV cache to dense and run attention per sequence.
 
@@ -321,19 +402,19 @@ def _run_paged_sdpa(
             v_seq = v_seq.unsqueeze(0)
         q_start += q_len
 
-        # A sliding window has no boolean spelling in torch's SDPA, so it is
-        # expressed as the additive mask it actually is. is_causal is already
-        # False here: a window is derived only when causal_mask is unset.
-        seq_mask = (
-            None
-            if window is None
-            else _sliding_window_mask(
-                int(q_seq.shape[-2]), kv_len, window, q.device, q.dtype
-            )
-        )
         outputs.append(
             _call_sdpa(
-                q_seq, k_seq, v_seq, seq_mask, dropout_p, is_causal, scale, rep_k, rep_v
+                q_seq,
+                k_seq,
+                v_seq,
+                None,
+                dropout_p,
+                is_causal,
+                scale,
+                rep_k,
+                rep_v,
+                window,
+                bottom_right,
             )
         )
 
@@ -384,10 +465,9 @@ def compile_sdpa(
 
     Serves paged (KV-cache) graphs as well as dense ones. PyTorch has no paged
     SDPA API -- ``F.scaled_dot_product_attention`` takes no page table -- so a
-    paged graph is gathered through its page table into dense per-sequence K/V
-    and then run one sequence at a time. That gather is unavoidable and it is the
-    same on both paths: ``--validate pytorch`` walks these very handlers with CPU
-    tensors, so there is no reference-side shortcut.
+    paged graph gathers each sequence's K/V into dense tensors before SDPA.
+    Both the timed PyTorch row and its GPU reference pass use this handler.
+    The CPU reference fallback uses the same gather on CPU tensors.
     """
     _sdpa_unsupported_if_present(
         node,
@@ -410,7 +490,8 @@ def compile_sdpa(
         scale_uid,
         attn_scale_value,
         window,
-    ) = _plan_sdpa_common(node, allow_paged=True)
+    ) = _plan_sdpa_common(node, allow_paged=True, allow_bottom_right=True)
+    bottom_right = _sdpa_bottom_right(node)
     stats_uid = _optional_uid(node, "stats_tensor_uid")
 
     page_table_k_uid = _optional_uid(node, "page_table_k_tensor_uid")
@@ -451,25 +532,40 @@ def compile_sdpa(
                 rep_k,
                 rep_v,
                 window,
+                bottom_right,
             )
             _store_tensor(tensors, o_uid, o)
             return
 
-        if window is not None:
-            # A sliding window has no boolean spelling in torch's SDPA; build
-            # the additive band mask once so O and stats see the same mask.
-            # is_causal is already False: windows exclude causal_mask.
-            attn_mask = _sliding_window_mask(
-                int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
-            )
-        o = _call_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v)
+        o = _call_sdpa(
+            q,
+            k,
+            v,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            scale,
+            rep_k,
+            rep_v,
+            window,
+            bottom_right,
+        )
         _store_tensor(tensors, o_uid, o)
 
         if stats_uid is not None:
+            # Same band the output used, so stats and O agree.
+            band = _band_mask(q, k, is_causal, window, bottom_right)
             _store_tensor(
                 tensors,
                 stats_uid,
-                _sdpa_stats(q, k, attn_mask, is_causal, scale, rep_k),
+                _sdpa_stats(
+                    q,
+                    k,
+                    attn_mask if band is None else band,
+                    is_causal and band is None,
+                    scale,
+                    rep_k,
+                ),
             )
 
     return run

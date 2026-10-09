@@ -1657,6 +1657,53 @@ class TestPyTorchSdpaBackendSelection:
         sdpa_kernel.assert_not_called()
         preferred_library.assert_not_called()
 
+    @staticmethod
+    def _enabled_backends_at_call(state, reference_pass: bool) -> set[str]:
+        """Run one SDPA call and return the PyTorch backends it was allowed."""
+        seen: set[str] = set()
+
+        def recording_sdpa(*args, **kwargs):
+            backends = torch.backends.cuda
+            for name, enabled in (
+                ("flash", backends.flash_sdp_enabled()),
+                ("efficient", backends.mem_efficient_sdp_enabled()),
+                ("math", backends.math_sdp_enabled()),
+            ):
+                if enabled:
+                    seen.add(name)
+            return torch.empty(0)
+
+        with (
+            patch.object(
+                torch.nn.functional,
+                "scaled_dot_product_attention",
+                side_effect=recording_sdpa,
+            ),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+            pytorch_ops.reference_sdpa_pass() if reference_pass else nullcontext(),
+        ):
+            TestPyTorchSdpaBackendSelection._execute()
+        return seen
+
+    def test_default_reference_pass_runs_on_math_only(self) -> None:
+        """The fused ROCm kernels are not repeatable; a reference must be."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"math"}
+        # Timed default-dispatch calls keep every backend PyTorch offers.
+        assert {"flash", "math"} <= self._enabled_backends_at_call(
+            state, reference_pass=False
+        )
+
+    def test_reference_pass_keeps_a_strict_selection(self) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.FLASH)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"flash"}
+
     @pytest.mark.parametrize("missing", ["sdpa_kernel", "backend_member"])
     def test_missing_public_api_or_backend_member_does_not_call_sdpa(
         self, missing: str
@@ -2202,7 +2249,9 @@ class TestPyTorchSdpaPaged:
             8: torch.tensor(self.KV_LENS, dtype=torch.int32),
         }
 
-    def _dense_reference(self, q, dense_k, dense_v, is_causal=False):
+    def _dense_reference(
+        self, q, dense_k, dense_v, is_causal=False, bottom_right=False
+    ):
         import torch.nn.functional as F
 
         rep = self.HQ // self.HKV
@@ -2210,13 +2259,21 @@ class TestPyTorchSdpaPaged:
         for s, q_len in enumerate(self.Q_LENS):
             q_s = q[:, :, start : start + q_len, :]
             start += q_len
+            mask = None
+            if bottom_right:
+                # Each sequence's own offset: query i sees keys up to i + Skv - Sq.
+                kv_len = self.KV_LENS[s]
+                rows = torch.arange(q_len).unsqueeze(1)
+                cols = torch.arange(kv_len).unsqueeze(0)
+                mask = cols <= rows + (kv_len - q_len)
             out.append(
                 F.scaled_dot_product_attention(
                     q_s,
                     dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
                     dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    attn_mask=mask,
                     scale=1.0 / (self.D**0.5),
-                    is_causal=is_causal,
+                    is_causal=is_causal and not bottom_right,
                 )
             )
         return torch.cat(out, dim=-2)
@@ -2260,6 +2317,53 @@ class TestPyTorchSdpaPaged:
 
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
+            {"causal_mask_bottom_right": True},
+        ],
+    )
+    def test_paged_bottom_right_uses_each_sequences_own_offset(
+        self, attributes: dict
+    ) -> None:
+        """Sequences with different Sq and Skv get different diagonal offsets
+        (35 and 24 here), so one offset for the packed batch fails this."""
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(**attributes), tensors)
+
+        expected = self._dense_reference(
+            q, dense_k, dense_v, is_causal=True, bottom_right=True
+        )
+        top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+        assert not torch.allclose(tensors[4], top_left, atol=1e-3)
+
+    def test_paged_causal_mask_ignores_a_bottom_right_alignment(self) -> None:
+        """causal_mask is top-left in hipDNN whatever the alignment says.
+
+        The #70 fix kit writes decode graphs in exactly this form, so reading
+        the alignment here would silently grade them against the wrong band.
+        """
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(
+            self._graph(causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"), tensors
+        )
+
+        top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        bottom_right = self._dense_reference(
+            q, dense_k, dense_v, is_causal=True, bottom_right=True
+        )
+        assert torch.allclose(tensors[4], top_left, atol=1e-5)
+        assert not torch.allclose(tensors[4], bottom_right, atol=1e-3)
+
+    def test_paged_rejects_both_causal_flags(self) -> None:
+        graph = self._graph(causal_mask=True, causal_mask_bottom_right=True)
+        with pytest.raises(UnsupportedGraphError, match="mutually exclusive"):
+            pytorch_ops.compile_graph(graph)
 
     def test_paged_sliding_window_masks_each_sequence(self) -> None:
         """A width-1 band (left/right bound 0) lets query i of each sequence see
@@ -2472,3 +2576,136 @@ class TestPyTorchSdpaMaskDerivation:
 
         with pytest.raises(ValueError, match=match):
             _sdpa_derive_mask(self._node(**attributes))
+
+
+class TestPyTorchSdpaDiagonalAlignment:
+    """Which corner the causal diagonal sits in, resolved the way hipDNN
+    resolves it (PlanUtils.hpp::extractDiagonalBandParams)."""
+
+    @staticmethod
+    def _node(**attributes):
+        return {
+            "type": "SdpaAttributes",
+            "inputs": {},
+            "outputs": {},
+            "attributes": attributes,
+        }
+
+    @pytest.mark.parametrize(
+        "attributes, expected",
+        [
+            ({}, False),
+            ({"diagonal_alignment": "BOTTOM_RIGHT"}, True),
+            ({"causal_mask_bottom_right": True}, True),
+            (
+                {"causal_mask_bottom_right": True, "diagonal_alignment": "TOP_LEFT"},
+                True,
+            ),
+            ({"causal_mask": True}, False),
+            # causal_mask overrides the alignment, so this is top-left.
+            ({"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}, False),
+        ],
+    )
+    def test_the_booleans_win_over_the_alignment(self, attributes, expected) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_bottom_right,
+        )
+
+        assert _sdpa_bottom_right(self._node(**attributes)) is expected
+
+    def test_both_booleans_are_declined(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_bottom_right,
+        )
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _sdpa_bottom_right(
+                self._node(causal_mask=True, causal_mask_bottom_right=True)
+            )
+
+
+class TestPyTorchSdpaCausalBandHandoff:
+    """What the handler hands torch: an explicit band costs the flash backend,
+    which takes no attn_mask, so it is built only where is_causal cannot say
+    the same thing."""
+
+    @staticmethod
+    def _graph(sq: int, skv: int, **attributes):
+        return {
+            "tensors": [],
+            "nodes": [
+                {
+                    "name": "sdpa",
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"attn_scale_value": 0.25, **attributes},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _call_kwargs(graph, sq: int, skv: int):
+        tensors = {
+            1: torch.zeros(1, 1, sq, 2),
+            2: torch.zeros(1, 1, skv, 2),
+            3: torch.zeros(1, 1, skv, 2),
+        }
+        seen = {}
+
+        def recording_sdpa(query, key, value, **kwargs):
+            seen.update(kwargs)
+            return torch.zeros(1, 1, sq, 2)
+
+        with patch.object(
+            torch.nn.functional,
+            "scaled_dot_product_attention",
+            side_effect=recording_sdpa,
+        ):
+            pytorch_ops.execute_graph(graph, tensors)
+        return seen
+
+    def test_square_bottom_right_keeps_the_boolean_causal_path(self) -> None:
+        """Sq == Skv: the bottom-right diagonal IS the top-left one. The shipped
+        quick/SdpaFwd hd128_causal bundles are this case, and an attn_mask there
+        would make --pytorch-sdpa-backend flash fail."""
+        kwargs = self._call_kwargs(
+            self._graph(256, 256, right_bound=0, diagonal_alignment="BOTTOM_RIGHT"),
+            256,
+            256,
+        )
+
+        assert kwargs["attn_mask"] is None
+        assert kwargs["is_causal"] is True
+
+    def test_non_square_bottom_right_needs_the_explicit_band(self) -> None:
+        kwargs = self._call_kwargs(
+            self._graph(3, 5, right_bound=0, diagonal_alignment="BOTTOM_RIGHT"), 3, 5
+        )
+
+        assert kwargs["is_causal"] is False
+        keep = kwargs["attn_mask"] == 0
+        assert torch.equal(
+            keep,
+            torch.tensor(
+                [
+                    [True, True, True, False, False],
+                    [True, True, True, True, False],
+                    [True, True, True, True, True],
+                ]
+            ),
+        )
+
+    def test_square_causal_mask_keeps_the_boolean_causal_path(self) -> None:
+        kwargs = self._call_kwargs(
+            self._graph(256, 256, causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"),
+            256,
+            256,
+        )
+
+        assert kwargs["attn_mask"] is None
+        assert kwargs["is_causal"] is True

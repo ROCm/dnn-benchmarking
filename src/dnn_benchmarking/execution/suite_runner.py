@@ -43,6 +43,21 @@ from .oracle import (
 
 
 @dataclass
+class _TimedPytorchRow:
+    """Timed PyTorch row plus reference outputs (reference role only).
+
+    ``reference_pass_failed`` separates the two ways the row can end without
+    outputs: timing itself failed, or timing finished and the reference output
+    pass failed (MATH SDPA out of memory on a large graph, for example). The
+    skip reason has to name the right one.
+    """
+
+    result: ProviderEngineResult
+    outputs: Optional[Dict[int, ReferenceOutput]] = None
+    reference_pass_failed: bool = False
+
+
+@dataclass
 class _GraphContext:
     """Per-graph state shared by every row of one graph."""
 
@@ -288,7 +303,7 @@ def _torch_version() -> str:
 
 def _run_pytorch_row(
     ctx: _GraphContext, role: Literal["engine", "reference"]
-) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
+) -> _TimedPytorchRow:
     """Time the graph through PyTorch as one row.
 
     ``role="reference"`` additionally extracts reference outputs for the
@@ -309,6 +324,10 @@ def _run_pytorch_row(
         engine_version=_torch_version(),
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    # "timing" until the timed loop is done, then "reference" while the
+    # reference output pass runs. Whichever one raises is what the skip reason
+    # has to name.
+    stage = "timing"
     try:
         from . import pytorch_ops
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
@@ -329,13 +348,18 @@ def _run_pytorch_row(
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             if role == "reference":
+                stage = "reference"
                 bm.zero_outputs()
-                executor.execute_once(tensors)
+                # Timing above used default dispatch; the outputs other rows
+                # are graded against come from repeatable SDPA.
+                with pytorch_ops.reference_sdpa_pass():
+                    executor.execute_once(tensors)
                 # A profiling child allocates its own VRAM, so profiled runs
                 # keep host-only references (and DeviceBuffer I/O).
                 outputs = _pytorch_reference_outputs_from_buffer(
                     bm, keep_device=not config.metrics.opt_in_pass_requested
                 )
+                stage = "post"
         if role == "reference":
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
                 ctx.graph_json
@@ -353,11 +377,17 @@ def _run_pytorch_row(
     except StallFallbackError:
         raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
-        return _failed_row(_error_or_skip(strict), row, str(e)), None
+        return _TimedPytorchRow(
+            result=_failed_row(_error_or_skip(strict), row, str(e)),
+            reference_pass_failed=stage == "reference",
+        )
     except Exception as e:
         fatal = role == "engine" or strict
-        return _failed_row(_error_or_skip(fatal), row, f"{type(e).__name__}: {e}"), None
-    return row, outputs
+        return _TimedPytorchRow(
+            result=_failed_row(_error_or_skip(fatal), row, f"{type(e).__name__}: {e}"),
+            reference_pass_failed=stage == "reference",
+        )
+    return _TimedPytorchRow(result=row, outputs=outputs)
 
 
 def run_single_provider_engine(
@@ -535,16 +565,17 @@ def _prepare_references(
         warn_once("validation", f"{ctx.graph_name}: {ctx.reference_error}")
         return None
 
-    outputs: Optional[Dict[int, ReferenceOutput]] = None
+    timed: Optional[_TimedPytorchRow] = None
 
     def run() -> ProviderEngineResult:
-        nonlocal outputs
-        row, outputs = _run_pytorch_row(ctx, "reference")
-        return row
+        nonlocal timed
+        timed = _run_pytorch_row(ctx, "reference")
+        return timed.result
 
     row = _report_row(ctx.reporter, "pytorch reference", run)
-    if outputs is not None:
-        ctx.reference_outputs = outputs
+    assert timed is not None
+    if timed.outputs is not None:
+        ctx.reference_outputs = timed.outputs
     elif config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT:
         ctx.reference_error = (
             row.error_message
@@ -555,9 +586,26 @@ def _prepare_references(
             )
         )
     else:
-        ctx.reference_outputs, ctx.reference_error = _compute_reference_outputs_once(
-            provider, ctx.graph_json, ctx.input_data, config
-        )
+        with Timer() as cpu_timer:
+            cpu_outputs, cpu_error = _compute_reference_outputs_once(
+                provider, ctx.graph_json, ctx.input_data, config
+            )
+        ctx.reference_outputs, ctx.reference_error = cpu_outputs, cpu_error
+        # The timed row produced no outputs: say which of its two steps
+        # failed, that engines are still graded, and what the CPU fallback
+        # cost, since no row times it.
+        if row.status == "skipped" and ctx.reference_outputs is not None:
+            failed_step = (
+                "Reference output pass failed"
+                if timed.reference_pass_failed
+                else "Timing skipped"
+            )
+            row.skip_reason = (
+                f"{failed_step} ({row.skip_reason}). "
+                "Engine outputs are still validated against reference "
+                "outputs computed on the CPU, which took "
+                f"{cpu_timer.elapsed_ms / 1000:.1f} s."
+            )
     return row
 
 
@@ -770,6 +818,6 @@ def _run_graph_pytorch(
         return graph
 
     graph.results.append(
-        _report_row(reporter, "pytorch", lambda: _run_pytorch_row(ctx, "engine")[0])
+        _report_row(reporter, "pytorch", lambda: _run_pytorch_row(ctx, "engine").result)
     )
     return graph
