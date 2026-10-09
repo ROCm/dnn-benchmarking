@@ -2533,6 +2533,7 @@ class TestPyTorchSdpaMaskDerivation:
             False,
             128,
         )
+
     def test_window_width_includes_the_current_token(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sliding_window_mask,

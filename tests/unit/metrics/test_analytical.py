@@ -588,9 +588,8 @@ class TestComputeFlops:
         attributes = graph["nodes"][0]["attributes"]
         attributes["causal_mask_bottom_right"] = True
         del attributes["diagonal_alignment"]
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
-        assert partial is False
 
     def test_sdpa_causal_mask_overrides_a_bottom_right_alignment(self):
         # causal_mask pins the diagonal top-left whatever diagonal_alignment
@@ -600,9 +599,8 @@ class TestComputeFlops:
         attributes = graph["nodes"][0]["attributes"]
         attributes["causal_mask"] = True
         attributes["diagonal_alignment"] = "BOTTOM_RIGHT"
-        flops, partial = compute_flops(graph)
+        flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 6 * (128 + 128)
-        assert partial is False
 
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.
