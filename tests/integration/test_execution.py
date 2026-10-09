@@ -231,9 +231,7 @@ def test_sdpa_validation_grades_with_repeatable_math_on_gpu(hipdnn, torch_gpu) -
     assert first_inputs is not None
 
     q, k, v = (
-        torch_gpu.as_tensor(
-            first_inputs[uid], device="cuda", dtype=torch_gpu.bfloat16
-        )
+        torch_gpu.as_tensor(first_inputs[uid], device="cuda", dtype=torch_gpu.bfloat16)
         for uid in (1, 2, 3)
     )
     scale_attr = graph_json["nodes"][0]["attributes"]["attn_scale_value"]
