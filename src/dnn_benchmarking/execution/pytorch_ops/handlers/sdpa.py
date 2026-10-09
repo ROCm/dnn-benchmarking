@@ -3,7 +3,6 @@
 
 """Scaled-dot-product-attention forward/backward reference handlers."""
 
-from math import sqrt
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -30,10 +29,11 @@ def _sdpa_resolve_scale(
     tensors: Dict[int, torch.Tensor],
     scale_uid: Optional[int],
     attn_scale_value: Any,
-) -> Optional[float]:
+) -> float:
+    # hipDNN reads an absent attn_scale as 1.0 (cuDNN semantics), not 1/sqrt(d).
     if scale_uid is not None:
         return _scalar_value(tensors, scale_uid, node)
-    return None if attn_scale_value is None else float(attn_scale_value)
+    return 1.0 if attn_scale_value is None else float(attn_scale_value)
 
 
 def _sdpa_head_repeat(q_heads: int, kv_heads: int, label: str) -> int:
@@ -114,45 +114,42 @@ def _plan_sdpa_common(
 
 
 def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
-    """Resolve (is_causal, sliding_window_width) the way the engine does.
+    """Resolve (is_causal, sliding_window_width) the way hipDNN does.
 
-    Mirrors ``Gfx950AttentionTiledNative.cpp::maskTypeFor``. Two things there are
-    easy to get wrong and both produce a wrong answer rather than an error:
+    Mirrors hipDNN's ``extractDiagonalBandParams`` (CPU reference) and the
+    ASM SDPA engine's ``getMaskType``:
 
-      * **A real bound wins over the deprecated booleans.** They can only say
-        top-left vs bottom-right, so a graph that sets ``causal_mask`` *and*
-        carries ``left_bound`` is asking for a window; reading the boolean first
-        silently discards it.
-      * **Both spellings occur in this repo.** The shipped ``quick/SdpaFwd``
-        bundles leave the booleans false and express causality as
-        ``left_bound=-1, right_bound=0``, while the model traces set
-        ``causal_mask: true``. Reading only one convention passes one population
-        and mis-serves the other.
+      * **The deprecated ``causal_mask`` wins**: it means top-left causal and
+        the bounds are ignored.
+      * Otherwise row ``q`` keeps ``q - left_bound <= k <= q + right_bound``,
+        an unset or ``-1`` bound being unbounded. The shipped ``quick/SdpaFwd``
+        bundles spell causality as ``left_bound=-1, right_bound=0``, while the
+        model traces set ``causal_mask: true``; both must resolve the same.
 
-    The window WIDTH is ``left_bound + 1``: hipDNN's left bound counts tokens
-    strictly before the current one, the band includes it.
+    The window WIDTH is ``left_bound + 1`` (the band includes the current
+    token). Only causal bands (``right_bound == 0``) are expressible here.
     """
+    if _sdpa_bool(node, "causal_mask"):
+        return True, None
+
     unbounded = -1
     left = _node_param(node, "left_bound", unbounded)
     right = _node_param(node, "right_bound", unbounded)
     left = unbounded if left is None else int(left)
     right = unbounded if right is None else int(right)
 
-    if left != unbounded:
-        if left < 0:
-            raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
-        return False, left + 1
-
-    if _sdpa_bool(node, "causal_mask"):
+    if left < unbounded:
+        raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+    if right != 0:
+        if right == unbounded and left == unbounded:
+            return False, None
+        raise ValueError(
+            f"SDPA right_bound {right} is a forward-looking band the reference "
+            "cannot express"
+        )
+    if left == unbounded:
         return True, None
-    if right == unbounded:
-        return False, None
-    if right == 0:
-        return True, None
-    raise ValueError(
-        f"SDPA right_bound {right} is a forward-looking band the reference "
-        "cannot express"
-    )
+    return False, left + 1
 
 
 def _sdpa_resolve(
@@ -202,7 +199,6 @@ def _call_sdpa(
     scale: Optional[float],
     rep_k: int,
     rep_v: int,
-    window: Optional[int] = None,
 ) -> torch.Tensor:
     # Expand K and V independently to the query head count. PyTorch's
     # enable_gqa only models equal K/V head counts, so explicit repeat is the
@@ -211,13 +207,6 @@ def _call_sdpa(
         k = k.repeat_interleave(rep_k, dim=-3)
     if rep_v > 1:
         v = v.repeat_interleave(rep_v, dim=-3)
-    if window is not None:
-        # A sliding window has no boolean spelling in torch's SDPA, so it is
-        # expressed as the additive mask it actually is. is_causal is already
-        # False here: a bounded left edge wins over the deprecated booleans.
-        attn_mask = _sliding_window_mask(
-            int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
-        )
     return execute_selected_sdpa(
         q,
         k,
@@ -268,24 +257,22 @@ def _run_paged_sdpa(
 
     page_table_k = _tensor(tensors, page_table_k_uid, node)
     page_table_v = _tensor(tensors, page_table_v_uid, node)
-    seq_len_kv = _tensor(tensors, seq_len_kv_uid, node)
-    seq_len_q = (
-        _tensor(tensors, seq_len_q_uid, node) if seq_len_q_uid is not None else None
-    )
+    kv_lengths = _host_ints(tensors, seq_len_kv_uid, node)
 
     if k.ndim != 4 or v.ndim != 4:
         raise ValueError("Paged SDPA expects rank-4 paged K/V containers")
     page_size = int(k.shape[-2])
-    num_seqs = int(seq_len_kv.numel())
+    num_seqs = len(kv_lengths)
     if int(page_table_k.shape[0]) != num_seqs:
         raise ValueError(
             f"Paged SDPA page table has {int(page_table_k.shape[0])} rows for "
             f"{num_seqs} sequences"
         )
 
-    kv_lengths = [int(x) for x in seq_len_kv.flatten().tolist()]
-    if seq_len_q is not None:
-        q_lengths = [int(x) for x in seq_len_q.flatten().tolist()]
+    if seq_len_q_uid is not None:
+        # Host-resolved once per replay map: a .tolist() here would sync the
+        # stream inside the staged timer's gated region and deadlock.
+        q_lengths = _host_ints(tensors, seq_len_q_uid, node)
         if len(q_lengths) != num_seqs:
             raise ValueError("Paged SDPA seq_len_q/seq_len_kv disagree on num_seqs")
     else:
@@ -334,18 +321,19 @@ def _run_paged_sdpa(
             v_seq = v_seq.unsqueeze(0)
         q_start += q_len
 
+        # A sliding window has no boolean spelling in torch's SDPA, so it is
+        # expressed as the additive mask it actually is. is_causal is already
+        # False here: a window is derived only when causal_mask is unset.
+        seq_mask = (
+            None
+            if window is None
+            else _sliding_window_mask(
+                int(q_seq.shape[-2]), kv_len, window, q.device, q.dtype
+            )
+        )
         outputs.append(
             _call_sdpa(
-                q_seq,
-                k_seq,
-                v_seq,
-                None,
-                dropout_p,
-                is_causal,
-                scale,
-                rep_k,
-                rep_v,
-                window,
+                q_seq, k_seq, v_seq, seq_mask, dropout_p, is_causal, scale, rep_k, rep_v
             )
         )
 
@@ -365,7 +353,7 @@ def _sdpa_stats(
     k_float = k.to(dtype=torch.float32)
     if rep_k > 1:
         k_float = k_float.repeat_interleave(rep_k, dim=-3)
-    scale_value = (1.0 / sqrt(float(q.shape[-1]))) if scale is None else scale
+    scale_value = 1.0 if scale is None else scale
     scores = torch.matmul(q_float, k_float.transpose(-2, -1)) * scale_value
     if attn_mask is not None:
         scores = scores + attn_mask.to(dtype=torch.float32)
@@ -467,9 +455,14 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, o)
             return
 
-        o = _call_sdpa(
-            q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v, window
-        )
+        if window is not None:
+            # A sliding window has no boolean spelling in torch's SDPA; build
+            # the additive band mask once so O and stats see the same mask.
+            # is_causal is already False: windows exclude causal_mask.
+            attn_mask = _sliding_window_mask(
+                int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
+            )
+        o = _call_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, rep_k, rep_v)
         _store_tensor(tensors, o_uid, o)
 
         if stats_uid is not None:
@@ -548,7 +541,7 @@ def compile_sdpa_backward(
         stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
 
         head_dim = int(q.shape[-1])
-        scale_value = (1.0 / sqrt(float(head_dim))) if scale is None else float(scale)
+        scale_value = 1.0 if scale is None else float(scale)
         k_heads = int(k.shape[1])
         v_heads = int(v.shape[1])
         if rep_k > 1:

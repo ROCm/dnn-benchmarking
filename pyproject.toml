@@ -1,6 +1,6 @@
 [project]
 name = "dnn-benchmarking"
-version = "0.1.0"
+version = "0.2.0"
 description = "Benchmarking and validation tool for hipDNN graphs"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,9 +21,8 @@ classifiers = [
 # express those mutually exclusive indices in pyproject.toml.
 dependencies = [
     "numpy>=1.19.0",
-    # psutil powers the always-on host RAM / process RSS probes in
-    # metrics/host.py. Soft requirement at runtime: a missing module is
-    # logged once via warn_once and the corresponding fields stay None.
+    # psutil reads total host RAM in metrics/machine_info.py (with a
+    # /proc/meminfo fallback) and checks process liveness in the tests.
     "psutil>=5.9.0",
 ]
 
@@ -45,11 +44,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --strict-markers"
 markers = [
     "gpu: marks tests requiring GPU (deselect with '-m \"not gpu\"')",
-    "rocm: marks tests requiring AMD ROCm GPUs (deselect with '-m \"not rocm\"')",
     "cuda: marks tests requiring NVIDIA CUDA GPUs (deselect with '-m \"not cuda\"')",
-    "slow: marks slow integration tests",
     "rocprofv3: requires rocprofv3 binary on PATH",
     "perf: requires Linux perf binary on PATH and perf_event_paranoid <= 1",
     "rocprof_compute: requires rocprof-compute binary on PATH",
