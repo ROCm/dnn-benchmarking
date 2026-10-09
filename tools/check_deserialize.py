@@ -22,7 +22,7 @@ almost always mean bottom-right.
 Usage:
   python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
 """
-import argparse, glob, os, sys
+import argparse, glob, json, os, sys
 from pathlib import Path
 
 

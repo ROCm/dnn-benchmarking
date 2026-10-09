@@ -35,9 +35,9 @@ def _graph(sq, skv, paged=False, **attrs):
         inputs["page_table_k_tensor_uid"] = 5
     return {
         "tensors": [
-            {"uid": 1, "dims": [1, 8, sq, 64]},
-            {"uid": 2, "dims": [1, 8, skv, 64]},
-            {"uid": 3, "dims": [1, 8, skv, 64]},
+            {"uid": 1, "dims": [1, 8, sq, 64], "data_type": "float"},
+            {"uid": 2, "dims": [1, 8, skv, 64], "data_type": "float"},
+            {"uid": 3, "dims": [1, 8, skv, 64], "data_type": "float"},
         ],
         "nodes": [
             {
