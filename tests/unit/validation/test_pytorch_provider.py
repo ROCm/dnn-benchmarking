@@ -1225,6 +1225,81 @@ class TestPyTorchProviderNewOps:
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
 
+    def test_sdpa_bottom_right_causal_aligns_to_sequence_end(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 4, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [2.0], [3.0], [4.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "left_bound": -1,
+                        "right_bound": 0,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
+        np.testing.assert_allclose(outputs[6].data, [[[[np.log(3.0)], [np.log(4.0)]]]])
+
+    def test_sdpa_deprecated_causal_mask_overrides_bottom_right_alignment(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 4, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [2.0], [3.0], [4.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {
+                        "causal_mask": True,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[1.0], [1.5]]]])
+
+    def test_sdpa_attention_sink_contributes_only_to_softmax_denominator(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 1, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [3.0]]]], dtype=np.float32)
+        sink = np.array([np.log(2.0)], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "sink_token_tensor_uid": 5,
+                    },
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {},
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v, 5: sink})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[1.0]]]])
+        np.testing.assert_allclose(outputs[6].data, [[[[np.log(4.0)]]]])
+
     def test_sdpa_bfloat16_uses_graph_dtype(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[0.10, 0.20], [0.30, 0.40]]]], dtype=np.float32)
@@ -1298,7 +1373,6 @@ class TestPyTorchProviderNewOps:
             "dropout_mask_tensor_uid",
             "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
-            "sink_token_tensor_uid",
             "descale_q_tensor_uid",
             "descale_k_tensor_uid",
             "descale_v_tensor_uid",
@@ -1404,8 +1478,6 @@ class TestPyTorchProviderNewOps:
         [
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
-            ({"causal_mask_bottom_right": True}, "bottom-right causal"),
-            ({"diagonal_alignment": "BOTTOM_RIGHT"}, "TOP_LEFT"),
             ({"right_bound": 1}, "forward-looking band"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
         ],
