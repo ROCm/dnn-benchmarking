@@ -172,6 +172,13 @@ def _no_prompt(prompt):
     raise AssertionError("prompted")
 
 
+def _raise(error):
+    def prompt(_text):
+        raise error
+
+    return prompt
+
+
 def test_confirm_without_a_terminal_requires_yes_flag(
     setup_env, tmp_path, monkeypatch
 ) -> None:
@@ -183,6 +190,121 @@ def test_confirm_without_a_terminal_requires_yes_flag(
     assert exc.value.code == 1
 
     _setup(setup_env, tmp_path, "-y").confirm_build()
+
+
+def test_confirm_without_any_stdin_requires_yes_flag(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    """Closing fd 0 (nohup, srun, some CI) leaves sys.stdin as None."""
+    monkeypatch.setattr(sys, "stdin", None)
+    monkeypatch.setattr("builtins.input", _no_prompt)
+
+    with pytest.raises(SystemExit) as exc:
+        _setup(setup_env, tmp_path).confirm_build()
+    assert exc.value.code == 1
+    assert "-y" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        EOFError(),
+        OSError(5, "Input/output error"),
+        RuntimeError("input(): lost sys.stdin"),
+    ],
+)
+def test_confirm_reports_a_stdin_lost_after_the_check(
+    setup_env, tmp_path, monkeypatch, capsys, error
+) -> None:
+    """A terminal can close between isatty() and the read."""
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+    monkeypatch.setattr("builtins.input", _raise(error))
+
+    with pytest.raises(SystemExit) as exc:
+        _setup(setup_env, tmp_path).confirm_build()
+    assert exc.value.code == 1
+    assert "-y" in capsys.readouterr().err
+
+
+def test_confirm_does_not_swallow_an_unrelated_runtime_error(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    """Only a lost stdin becomes the -y message; other failures must surface."""
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+    monkeypatch.setattr("builtins.input", _raise(RuntimeError("readline is broken")))
+
+    with pytest.raises(RuntimeError, match="readline is broken"):
+        _setup(setup_env, tmp_path).confirm_build()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="closing fd 0 requires POSIX")
+def test_setup_without_stdin_fails_before_creating_a_venv(tmp_path) -> None:
+    closed_probe = (
+        "import errno, os\n"
+        "try:\n"
+        "    os.fstat(0)\n"
+        "except OSError as exc:\n"
+        "    assert exc.errno == errno.EBADF\n"
+        "else:\n"
+        "    raise AssertionError('fd 0 is open')\n"
+        "print('fd 0 closed')\n"
+    )
+    control = subprocess.run(
+        [sys.executable, "-c", closed_probe],
+        preexec_fn=lambda: os.close(0),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert control.returncode == 0, control.stderr
+    assert control.stdout.strip() == "fd 0 closed"
+
+    result = subprocess.run(
+        [sys.executable, str(_SETUP_ENV), "--workspace", str(tmp_path / "ws")],
+        preexec_fn=lambda: os.close(0),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "-y" in result.stderr
+    assert not (tmp_path / "ws" / ".venv").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows closed-fd 0 handling")
+def test_windows_setup_with_closed_fd0_requires_yes(tmp_path) -> None:
+    # Run setup in the same process that proves its CRT descriptor is closed.
+    script = (
+        "import errno, os, runpy, sys\n"
+        "try:\n"
+        "    os.close(0)\n"
+        "except OSError as exc:\n"
+        "    assert exc.errno == errno.EBADF\n"
+        "try:\n"
+        "    os.fstat(0)\n"
+        "except OSError as exc:\n"
+        "    assert exc.errno == errno.EBADF\n"
+        "else:\n"
+        "    raise AssertionError('fd 0 is open')\n"
+        "print('fd 0 closed', flush=True)\n"
+        "sys.argv = [sys.argv[1], '--workspace', sys.argv[2]]\n"
+        "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_SETUP_ENV), str(tmp_path / "ws")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "fd 0 closed" in result.stdout
+    assert "Traceback" not in result.stderr
+    assert "-y" in result.stderr
+    assert not (tmp_path / "ws" / ".venv").exists()
 
 
 # --- GPU arch detection ------------------------------------------------------
@@ -374,6 +496,8 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
     for rel in (
         "CMakePresets.json",
         "cmake/x.cmake",
+        "shared/ctest/TestCategories.cmake",
+        "shared/tensile/big.bin",
         "projects/hipdnn/CMakeLists.txt",
         "dnn-providers/CMakeLists.txt",
         "projects/other/big.bin",
@@ -479,6 +603,59 @@ def test_rocm_libraries_ref_pins_the_fetched_commit(
     ).ensure_rocm_libraries_checkout()
     assert _head(rocm_libraries) == pinned
     assert f"not the pinned {tip[:12]}" in capsys.readouterr().err
+
+
+def test_sparse_checkout_takes_only_the_shared_subtree_configure_reads(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
+    """hipDNN's configure reads shared/ctest. The rest of shared/ is dead weight."""
+    setup = _setup(setup_env, tmp_path)
+    setup.rocm_libraries_ref = "main"
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert (rocm_libraries / "shared/ctest/TestCategories.cmake").is_file()
+    assert not (rocm_libraries / "shared/tensile").exists()
+    assert (rocm_libraries / "cmake/x.cmake").is_file()
+    assert (rocm_libraries / "CMakePresets.json").is_file()
+
+
+def test_an_older_sparse_checkout_gains_the_root_dirs_added_since(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
+    setup = _setup(setup_env, tmp_path)
+    setup.rocm_libraries_ref = "main"
+    setup.ensure_rocm_libraries_checkout()
+    # What a setup_env.py from before cmake/ and shared/ctest/ staged.
+    _git(
+        "sparse-checkout",
+        "set",
+        "projects/hipdnn",
+        "dnn-providers",
+        cwd=rocm_libraries,
+    )
+    assert not (rocm_libraries / "shared/ctest").exists()
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert (rocm_libraries / "cmake/x.cmake").is_file()
+    assert (rocm_libraries / "shared/ctest/TestCategories.cmake").is_file()
+    assert not (rocm_libraries / "shared/tensile").exists()
+
+
+def test_a_full_checkout_is_not_made_sparse(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
+    """`git submodule update --init` gives a full checkout; leave it alone."""
+    _git("clone", "-q", str(tmp_path / "origin.git"), str(rocm_libraries))
+    setup = _setup(setup_env, tmp_path)
+    setup.rocm_libraries_ref = "main"
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert (rocm_libraries / "shared/tensile/big.bin").is_file()
+    assert (rocm_libraries / "projects/other/big.bin").is_file()
+    assert not setup._rocm_libraries_is_sparse()
 
 
 # --- venv reuse ----------------------------------------------------------------
@@ -698,49 +875,309 @@ def test_torch_mode_none_refuses_a_venv_with_torch(
     assert "--clean" in capsys.readouterr().err
 
 
-# --- run() stage plan and main() failure reporting ---------------------------
+# --- --reuse-artifacts bindings check ----------------------------------------
 
-_STAGE_METHODS = (
-    "setup_venv",
-    "install_torch",
-    "install_package",
-    "ensure_rocm_libraries_checkout",
-    "install_build_deps",
-    "build_hipdnn",
-    "install_bindings",
-    "install_runtime_extras",
-    "verify",
-)
-_CUDA_PLAN = ["setup_venv", "install_torch", "install_package", "verify"]
-_FULL_PLAN = list(_STAGE_METHODS)
-_REUSE_PLAN = [m for m in _STAGE_METHODS if m != "install_build_deps"]
+
+def _reuse_setup(setup_env, tmp_path):
+    """A --reuse-artifacts Setup over a real venv and a prefix holding hipDNN."""
+    prefix = tmp_path / "install"
+    for name in ("hipdnn_frontend", "hipdnn_backend"):
+        config = prefix / "lib" / "cmake" / name / f"{name}Config.cmake"
+        config.parent.mkdir(parents=True)
+        config.write_text("")
+    setup = _setup(
+        setup_env,
+        tmp_path,
+        "--torch-mode",
+        "existing",
+        "--rocm-prefix",
+        str(prefix),
+        "--reuse-artifacts",
+    )
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(setup.venv_dir)],
+        check=True,
+    )
+    return setup, str(prefix)
+
+
+def _installed_venv_package(setup, name: str, source: str) -> Path:
+    site = setup.probe("import sysconfig; print(sysconfig.get_path('purelib'))")
+    assert site.returncode == 0, site.stderr
+    package = Path(site.stdout.strip()) / name
+    package.mkdir()
+    (package / "__init__.py").write_text(source)
+    return package
+
+
+def test_reuse_without_installed_bindings_fails(setup_env, tmp_path, capsys) -> None:
+    """Reuse builds no bindings, so an absent package cannot be a warning."""
+    setup, prefix = _reuse_setup(setup_env, tmp_path)
+
+    setup.build_hipdnn()
+    with pytest.raises(SystemExit) as exc:
+        setup.install_bindings()
+
+    assert exc.value.code == 1
+    assert setup.env["ROCM_PATH"] == prefix
+    assert "hipdnn_frontend is not installed" in capsys.readouterr().err
+
+
+def test_reuse_accepts_bindings_whose_native_libraries_do_not_load(
+    setup_env, tmp_path
+) -> None:
+    """Presence is the question; the ROCm runtime behind it may be absent here."""
+    setup, _ = _reuse_setup(setup_env, tmp_path)
+    _installed_venv_package(
+        setup,
+        "hipdnn_frontend",
+        "raise OSError('native ROCm runtime is unavailable on this host')\n",
+    )
+    # The import this check replaced fails on exactly this installed package.
+    native = setup.probe("import hipdnn_frontend")
+    assert native.returncode != 0
+    assert "native ROCm runtime is unavailable" in native.stderr
+
+    setup.build_hipdnn()
+    setup.install_bindings()
 
 
 @pytest.mark.parametrize(
-    "argv, installed, expected",
+    "mode, torch_source",
     [
-        ((), "missing", _FULL_PLAN),
-        (("--torch-mode", "cuda"), "missing", _CUDA_PLAN),
-        (("--torch-mode", "existing"), "cuda", _CUDA_PLAN),
-        (("--torch-mode", "existing"), "rocm", _FULL_PLAN),
-        (("--torch-mode", "cpu"), "missing", _FULL_PLAN),
-        (("--torch-mode", "cpu", "--reuse-artifacts"), "missing", _REUSE_PLAN),
+        (
+            "cpu",
+            "from types import SimpleNamespace\n"
+            "version = SimpleNamespace(hip=None, cuda=None)\n",
+        ),
+        (
+            "rocm",
+            "from types import SimpleNamespace\n"
+            "version = SimpleNamespace(hip='6.4', cuda=None)\n",
+        ),
+        ("none", None),
     ],
 )
-def test_run_stage_plan_follows_torch_mode(
-    setup_env, tmp_path, monkeypatch, argv, installed, expected
+def test_hipdnn_reuse_keeps_prepared_venv_and_does_not_fetch_sources(
+    setup_env, tmp_path, monkeypatch, mode, torch_source
 ) -> None:
-    setup = _setup(setup_env, tmp_path, "-y", *argv)
-    if installed != "missing":
-        _fake_venv(setup_env, setup.venv_dir)
-    monkeypatch.setattr(setup, "get_torch_mode", lambda: installed)
+    prepared, prefix = _reuse_setup(setup_env, tmp_path)
+    if torch_source is not None:
+        _installed_venv_package(prepared, "torch", torch_source)
+        (prepared.venv_dir / setup_env.TORCH_RECORD).write_text(
+            json.dumps(
+                {
+                    "torch_index_url": (
+                        setup_env.ROCM_TORCH_INDEX_URL
+                        if mode == "rocm"
+                        else "https://download.pytorch.org/whl/cpu"
+                    ),
+                    "gpu_arch": "gfx90a" if mode == "rocm" else "",
+                }
+            )
+            + "\n"
+        )
+    frontend = _installed_venv_package(
+        prepared, "hipdnn_frontend", "raise OSError('no native runtime')\n"
+    )
+    # A package that cannot load natively must still pass the presence check.
+    assert prepared.probe("import hipdnn_frontend").returncode != 0
+    marker = prepared.venv_dir / "keep-me"
+    marker.write_text("original venv")
+    checkout = tmp_path / "full-sources"
+    checkout.mkdir()
+    source_marker = checkout / "keep-me"
+    source_marker.write_text("original checkout")
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", checkout)
+    monkeypatch.setattr(
+        setup_env,
+        "run_git",
+        lambda *args, **kwargs: pytest.fail("reuse fetched rocm-libraries"),
+    )
+    setup = _setup(
+        setup_env,
+        tmp_path,
+        "--torch-mode",
+        mode,
+        "--rocm-prefix",
+        prefix,
+        "--reuse-artifacts",
+        "-y",
+    )
+    # Keep this test offline; the real CLI's package install and native import
+    # are exercised separately on the actual ROCm image.
+    monkeypatch.setattr(setup, "install_package", lambda: None)
+    monkeypatch.setattr(setup, "install_runtime_extras", lambda: None)
+    monkeypatch.setattr(setup, "verify", lambda: None)
     monkeypatch.setattr(setup, "report_profiling_sources", lambda: None)
-    ran = []
-    for method in _STAGE_METHODS:
-        monkeypatch.setattr(setup, method, lambda m=method: ran.append(m))
+    monkeypatch.setattr(
+        setup, "pip", lambda *args, **kwargs: pytest.fail("reuse installed torch")
+    )
 
     assert setup.run() == 0
-    assert ran == expected
+    assert setup.env["ROCM_PATH"] == prefix
+    assert setup.get_torch_mode() == (mode if mode != "none" else "missing")
+    assert marker.read_text() == "original venv"
+    assert (frontend / "__init__.py").read_text() == (
+        "raise OSError('no native runtime')\n"
+    )
+    assert source_marker.read_text() == "original checkout"
+    assert not checkout.with_name("full-sources.partial").exists()
+
+
+def test_rocm_reuse_does_not_install_missing_toolchain(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    setup = _setup(setup_env, tmp_path, "--torch-mode", "rocm", "--reuse-artifacts")
+    setup.resolved_torch_index_url = setup_env.ROCM_TORCH_INDEX_URL
+    monkeypatch.setattr(setup, "_rocm_sdk_devel_root", lambda: None)
+    monkeypatch.setattr(
+        setup, "pip", lambda *args, **kwargs: pytest.fail("downloaded ROCm SDK")
+    )
+
+    with pytest.raises(SystemExit):
+        _ = setup.toolchain_prefix
+
+
+# --- --reuse-artifacts preflight and main() failure reporting ----------------
+
+
+@pytest.mark.parametrize("mode", ("rocm", "cpu", "none", "existing"))
+def test_reuse_rejects_fresh_venv_before_workspace_creation(tmp_path, mode) -> None:
+    workspace = tmp_path / "fresh"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SETUP_ENV),
+            "--workspace",
+            str(workspace),
+            "--torch-mode",
+            mode,
+            "--reuse-artifacts",
+            "-y",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "--reuse-artifacts" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not workspace.exists()
+
+
+@pytest.mark.parametrize(
+    "mode, installed, flags",
+    [
+        ("cpu", "cpu", ["--clean"]),
+        ("cpu", "cpu", ["--torch-index-url", "https://example.invalid/wrong"]),
+        ("cpu", "rocm", []),
+        ("rocm", "cpu", []),
+        ("rocm", "rocm", ["--gpu-arch", "gfx942"]),
+        ("none", "cpu", []),
+        ("cuda", "cpu", []),
+    ],
+)
+def test_reuse_rejects_clean_or_mismatched_venv_without_touching_it(
+    setup_env, tmp_path, mode, installed, flags
+) -> None:
+    prepared, prefix = _reuse_setup(setup_env, tmp_path)
+    hip = "'6.4'" if installed == "rocm" else "None"
+    _installed_venv_package(
+        prepared,
+        "torch",
+        f"from types import SimpleNamespace\n"
+        f"version = SimpleNamespace(hip={hip}, cuda=None)\n",
+    )
+    frontend = _installed_venv_package(
+        prepared, "hipdnn_frontend", "raise OSError('no native runtime')\n"
+    )
+    record = prepared.venv_dir / setup_env.TORCH_RECORD
+    record.write_text(
+        json.dumps(
+            {
+                "torch_index_url": (
+                    setup_env.ROCM_TORCH_INDEX_URL
+                    if installed == "rocm"
+                    else "https://download.pytorch.org/whl/cpu"
+                ),
+                "gpu_arch": "gfx90a" if installed == "rocm" else "",
+            }
+        )
+        + "\n"
+    )
+    record_before = record.read_bytes()
+    marker = prepared.venv_dir / "keep-me"
+    marker.write_text("unchanged")
+    activate = prepared.venv_dir / (
+        "Scripts/Activate.ps1" if setup_env.IS_WINDOWS else "bin/activate.local"
+    )
+    if not setup_env.IS_WINDOWS:
+        activate.write_text("export ROCM_PATH=/original\n")
+    activate_before = activate.read_bytes()
+    setup = _setup(
+        setup_env,
+        tmp_path,
+        "--torch-mode",
+        mode,
+        "--rocm-prefix",
+        prefix,
+        "--reuse-artifacts",
+        *flags,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        setup.run()
+
+    assert exc.value.code == 1
+    assert marker.read_text() == "unchanged"
+    assert record.read_bytes() == record_before
+    assert activate.read_bytes() == activate_before
+    assert (frontend / "__init__.py").read_text() == (
+        "raise OSError('no native runtime')\n"
+    )
+
+
+def test_existing_reuse_needs_installed_torch_before_modifying_venv(
+    setup_env, tmp_path
+) -> None:
+    setup, _ = _reuse_setup(setup_env, tmp_path)
+    marker = setup.venv_dir / "keep-me"
+    marker.write_text("unchanged")
+
+    with pytest.raises(SystemExit):
+        setup.run()
+
+    assert marker.read_text() == "unchanged"
+    if not setup_env.IS_WINDOWS:
+        assert not (setup.venv_dir / "bin/activate.local").exists()
+
+
+def test_none_reuse_rejects_a_broken_torch_package(setup_env, tmp_path) -> None:
+    prepared, prefix = _reuse_setup(setup_env, tmp_path)
+    _installed_venv_package(prepared, "torch", "raise OSError('broken torch')\n")
+    assert prepared.get_torch_mode() == "missing"
+    found = prepared.probe(
+        "import importlib.util; print(importlib.util.find_spec('torch') is not None)"
+    )
+    assert found.returncode == 0 and found.stdout.strip() == "True"
+    marker = prepared.venv_dir / "keep-me"
+    marker.write_text("unchanged")
+    setup = _setup(
+        setup_env,
+        tmp_path,
+        "--torch-mode",
+        "none",
+        "--rocm-prefix",
+        prefix,
+        "--reuse-artifacts",
+    )
+
+    with pytest.raises(SystemExit):
+        setup.run()
+
+    assert marker.read_text() == "unchanged"
 
 
 @pytest.mark.parametrize(
