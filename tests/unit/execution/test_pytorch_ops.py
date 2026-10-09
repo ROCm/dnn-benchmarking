@@ -2392,6 +2392,7 @@ class TestPyTorchSdpaMaskDerivation:
         assert _sdpa_derive_mask(self._node(left_bound=-1, right_bound=0)) == (
             True,
             None,
+            False,
         )
 
     def test_boolean_spelling_is_causal(self) -> None:
@@ -2399,14 +2400,14 @@ class TestPyTorchSdpaMaskDerivation:
             _sdpa_derive_mask,
         )
 
-        assert _sdpa_derive_mask(self._node(causal_mask=True)) == (True, None)
+        assert _sdpa_derive_mask(self._node(causal_mask=True)) == (True, None, False)
 
     def test_absent_bounds_are_unmasked(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sdpa_derive_mask,
         )
 
-        assert _sdpa_derive_mask(self._node()) == (False, None)
+        assert _sdpa_derive_mask(self._node()) == (False, None, False)
 
     def test_the_deprecated_boolean_wins_over_bounds(self) -> None:
         """hipDNN: causal_mask means top-left causal and the bounds are
@@ -2415,10 +2416,39 @@ class TestPyTorchSdpaMaskDerivation:
             _sdpa_derive_mask,
         )
 
-        assert _sdpa_derive_mask(self._node(causal_mask=True, left_bound=127)) == (
-            True,
-            None,
+        assert _sdpa_derive_mask(
+            self._node(
+                causal_mask=True,
+                left_bound=127,
+                diagonal_alignment="BOTTOM_RIGHT",
+            )
+        ) == (True, None, False)
+
+    def test_bottom_right_boolean_wins_over_bounds(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
         )
+
+        assert _sdpa_derive_mask(
+            self._node(
+                causal_mask_bottom_right=True,
+                left_bound=127,
+                diagonal_alignment="TOP_LEFT",
+            )
+        ) == (False, None, True)
+
+    def test_bottom_right_alignment_applies_to_causal_bounds(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _sdpa_derive_mask,
+        )
+
+        assert _sdpa_derive_mask(
+            self._node(
+                left_bound=-1,
+                right_bound=0,
+                diagonal_alignment="BOTTOM_RIGHT",
+            )
+        ) == (False, None, True)
 
     def test_left_bound_with_causal_right_bound_is_a_window(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
@@ -2428,14 +2458,25 @@ class TestPyTorchSdpaMaskDerivation:
         assert _sdpa_derive_mask(self._node(left_bound=127, right_bound=0)) == (
             False,
             128,
+            False,
         )
 
     def test_window_width_includes_the_current_token(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
-            _sliding_window_mask,
+            _diagonal_band_mask,
         )
 
-        keep = _sliding_window_mask(4, 4, 2, torch.device("cpu"), torch.float32) == 0
+        keep = (
+            _diagonal_band_mask(
+                4,
+                4,
+                2,
+                bottom_right=False,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+            == 0
+        )
         expected = torch.tensor(
             [
                 [True, False, False, False],
@@ -2448,11 +2489,47 @@ class TestPyTorchSdpaMaskDerivation:
 
     def test_width_one_is_the_diagonal(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
-            _sliding_window_mask,
+            _diagonal_band_mask,
         )
 
-        keep = _sliding_window_mask(3, 3, 1, torch.device("cpu"), torch.float32) == 0
+        keep = (
+            _diagonal_band_mask(
+                3,
+                3,
+                1,
+                bottom_right=False,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+            == 0
+        )
         assert torch.equal(keep, torch.eye(3, dtype=torch.bool))
+
+    def test_bottom_right_diagonal_tracks_sequence_end(self) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _diagonal_band_mask,
+        )
+
+        keep = (
+            _diagonal_band_mask(
+                2,
+                4,
+                None,
+                bottom_right=True,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+            == 0
+        )
+        assert torch.equal(
+            keep,
+            torch.tensor(
+                [
+                    [True, True, True, False],
+                    [True, True, True, True],
+                ]
+            ),
+        )
 
     @pytest.mark.parametrize(
         "attributes, match",
