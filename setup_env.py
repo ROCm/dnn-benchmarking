@@ -487,12 +487,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reuse-artifacts",
         action="store_true",
         help=(
-            "Skip building hipDNN/the provider plugins from source and use "
-            "whatever is already installed in the selected ROCm prefix (e.g. a "
-            "prior build in the same workspace). Fails if hipDNN is absent there "
-            "-- this never falls back to building. For hipDNN reuse, use "
-            "--torch-mode existing with hipdnn_frontend already installed in "
-            "the venv; CUDA-only setups need no hipDNN bindings."
+            "Skip building hipDNN, providers and Python bindings; use the "
+            "installed hipDNN prefix and hipdnn_frontend package instead. "
+            "ROCm, CPU and none modes require a pre-existing venv with the "
+            "requested torch mode and no --clean. --torch-mode existing keeps "
+            "the installed torch; CUDA-only setups need no hipDNN bindings."
         ),
     )
     parser.add_argument(
@@ -1051,7 +1050,9 @@ class Setup:
         if self.rocm_prefix:
             return self.resolve_installed_rocm_prefix()
         if self.torch_mode == "rocm":
-            return self.ensure_rocm_wheel_devel_prefix(self.resolved_torch_index_url)
+            # Reuse must not install the devel SDK into an existing venv.
+            index_url = "" if self.reuse_artifacts else self.resolved_torch_index_url
+            return self.ensure_rocm_wheel_devel_prefix(index_url)
         if self.torch_mode == "existing" and self.installed_torch_mode == "rocm":
             return self.ensure_rocm_wheel_devel_prefix("")
         return self.resolve_installed_rocm_prefix()
@@ -1509,9 +1510,8 @@ class Setup:
         fail(
             "--reuse-artifacts builds no hipDNN Python bindings, and "
             f"hipdnn_frontend is not installed in {self.venv_dir}.",
-            "Use --torch-mode existing with a venv that already has "
-            "hipdnn_frontend, or drop --reuse-artifacts to build hipDNN and "
-            "its bindings.",
+            "Install hipdnn_frontend in this venv first, or drop "
+            "--reuse-artifacts to build hipDNN and its bindings.",
         )
 
     def install_runtime_extras(self) -> None:
@@ -1658,15 +1658,19 @@ class Setup:
 
     def run(self) -> int:
         self.require_python_version()
-        if self.reuse_artifacts and self.torch_mode not in ("existing", "cuda"):
+        has_venv = venv_python(self.venv_dir).exists()
+        if (
+            self.reuse_artifacts
+            and self.torch_mode != "cuda"
+            and (self.clean or not has_venv)
+        ):
             fail(
-                f"--reuse-artifacts cannot use --torch-mode {self.torch_mode}: "
-                "setup would replace the venv without rebuilding hipDNN bindings.",
-                "Use --torch-mode existing with a venv that already has "
-                "hipdnn_frontend, or drop --reuse-artifacts to build the bindings.",
+                f"--reuse-artifacts with --torch-mode {self.torch_mode} needs "
+                "a pre-existing virtual environment that will not be cleaned.",
+                f"No reusable venv at {self.venv_dir}. Prepare one with "
+                "hipdnn_frontend, or drop --reuse-artifacts to build its bindings.",
             )
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        if venv_python(self.venv_dir).exists() and not self.clean:
+        if has_venv and not self.clean:
             self.installed_torch_mode = self.get_torch_mode()
         elif self.torch_mode == "existing":
             fail(
@@ -1675,6 +1679,45 @@ class Setup:
                 "Use --torch-mode rocm or --torch-mode cpu to create one and "
                 "install torch automatically.",
             )
+        if self.reuse_artifacts and has_venv and not self.clean:
+            if self.torch_mode in ("rocm", "cpu", "cuda"):
+                if self.installed_torch_mode != self.torch_mode:
+                    fail(
+                        f"--reuse-artifacts with --torch-mode {self.torch_mode} "
+                        f"cannot reuse {self.venv_dir}: it contains torch mode "
+                        f"'{self.installed_torch_mode}'.",
+                        "Use --torch-mode existing to keep that torch, or drop "
+                        "--reuse-artifacts and pass --clean to change modes.",
+                    )
+                self.require_same_torch_source(check_arch=self.torch_mode == "rocm")
+            elif (
+                self.torch_mode == "existing" and self.installed_torch_mode == "missing"
+            ):
+                fail(
+                    "--reuse-artifacts with --torch-mode existing needs torch "
+                    f"already installed in {self.venv_dir}.",
+                    "Install torch in that venv first, or drop --reuse-artifacts.",
+                )
+            elif self.torch_mode == "none":
+                if self.installed_torch_mode != "missing":
+                    fail(
+                        "--reuse-artifacts with --torch-mode none needs a venv "
+                        f"without torch; found '{self.installed_torch_mode}'.",
+                        "Use --torch-mode existing to keep its installed torch.",
+                    )
+                # An installed but broken torch also probes as "missing".
+                torch = self.probe(
+                    "import importlib.util, sys; "
+                    "sys.exit(importlib.util.find_spec('torch') is not None)"
+                )
+                if torch.returncode:
+                    fail(
+                        "--reuse-artifacts with --torch-mode none needs a venv "
+                        "without torch.",
+                        torch.stderr.strip()
+                        or "Remove torch from this venv before reusing it.",
+                    )
+        self.workspace.mkdir(parents=True, exist_ok=True)
         # CUDA torch supports only the PyTorch execution backend: no hipDNN
         # Python bindings, engine plugins, amdsmi, or ROCm prefix.
         cuda = self.torch_mode == "cuda" or (
