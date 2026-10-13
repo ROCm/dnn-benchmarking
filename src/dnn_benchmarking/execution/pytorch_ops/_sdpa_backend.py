@@ -6,7 +6,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import RLock
-from typing import Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
 
@@ -170,6 +170,69 @@ def _is_backend_unavailable_error(error: RuntimeError) -> bool:
     return "no available kernel" in message or "no viable backend" in message
 
 
+def strict_sdpa_selection() -> Optional[PyTorchSdpaBackendName]:
+    """The active strict SDPA category, or ``None`` under default dispatch."""
+    state = _ACTIVE_SDPA_BACKEND.get()
+    if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
+        return None
+    return state.selection
+
+
+def _sdpa_kwargs(
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float,
+    is_causal: bool,
+    scale: Optional[float],
+    enable_gqa: bool,
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = dict(
+        attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+    )
+    # Pass enable_gqa only when it is needed: torch < 2.5 has no such
+    # keyword, and equal-head graphs must still run there.
+    if enable_gqa:
+        kwargs["enable_gqa"] = True
+    return kwargs
+
+
+def default_sdpa_avoids_math(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float,
+    is_causal: bool,
+    scale: Optional[float],
+    enable_gqa: bool,
+) -> bool:
+    """Whether default dispatch picks a fused (Flash/Efficient) kernel.
+
+    Default dispatch falls back to the math backend only when no fused kernel
+    accepts the call, so this runs the call once restricted to the fused
+    kernels. cuDNN is left out: its default priority relative to math varies
+    across torch releases, so its acceptance proves nothing about the default.
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with _SDPA_SELECTION_LOCK:
+        try:
+            with sdpa_kernel(
+                [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            ):
+                torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    **_sdpa_kwargs(attn_mask, dropout_p, is_causal, scale, enable_gqa),
+                )
+        except RuntimeError as error:
+            if _is_backend_unavailable_error(error):
+                return False
+            raise
+    return True
+
+
 def execute_selected_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -179,19 +242,19 @@ def execute_selected_sdpa(
     dropout_p: float,
     is_causal: bool,
     scale: Optional[float],
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
-    """Execute SDPA with the current strict selection, if one is active."""
+    """Execute SDPA with the current strict selection, if one is active.
+
+    ``enable_gqa`` lets K/V carry fewer heads than Q (one shared count),
+    PyTorch's own grouped-query path.
+    """
+    kwargs = _sdpa_kwargs(attn_mask, dropout_p, is_causal, scale, enable_gqa)
     state = _ACTIVE_SDPA_BACKEND.get()
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
         with _SDPA_SELECTION_LOCK:
             return torch.nn.functional.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
+                query, key, value, **kwargs
             )
 
     sdpa_kernel, backend = _selected_sdp_backend(state.selection)
@@ -205,13 +268,7 @@ def execute_selected_sdpa(
                 sdpa_kernel(backend),
             ):
                 result = torch.nn.functional.scaled_dot_product_attention(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    dropout_p=dropout_p,
-                    is_causal=is_causal,
-                    scale=scale,
+                    query, key, value, **kwargs
                 )
         except RuntimeError as error:
             if _is_backend_unavailable_error(error):

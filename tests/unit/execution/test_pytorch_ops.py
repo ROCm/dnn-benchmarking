@@ -2371,6 +2371,180 @@ class TestPyTorchSdpaPaged:
             pytorch_ops.compile_graph(graph)
 
 
+class TestSdpaTimedRegion:
+    """After priming, a replayed SDPA forward runs only the op itself.
+
+    K/V head expansion, sliding-window masks and the paged gather derive from
+    constant inputs. The benchmark path builds them once, so they must not
+    reappear in timed iterations. The SDPA call is stubbed so its own
+    decomposition stays out of the recorded aten ops.
+    """
+
+    # Ops a timed iteration may run: Q slicing and the paged re-pack.
+    TIMED_OPS = {"aten.slice.Tensor", "aten.cat.default"}
+
+    @staticmethod
+    def _record(fn):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        ops = set()
+
+        class Recorder(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                ops.add(str(func))  # e.g. "aten.slice.Tensor"
+                return func(*args, **(kwargs or {}))
+
+        with Recorder():
+            fn()
+        return ops
+
+    @staticmethod
+    def _dense_graph(**attributes):
+        return {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"attn_scale_value": 0.5, **attributes},
+                }
+            ]
+        }
+
+    def _replay(self, graph_json, tensors, selection=None):
+        """Prime once, then record a second (timed) execution."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        calls = []
+
+        def fake_sdpa(q, k, v, *, enable_gqa=False, **_):
+            calls.append((int(k.shape[-3]), int(v.shape[-3]), enable_gqa))
+            return q
+
+        replay = pytorch_ops.ReplayTensors(tensors)
+        graph = pytorch_ops.compile_graph(graph_json)
+        with (
+            patch.object(sdpa, "execute_selected_sdpa", fake_sdpa),
+            patch.object(sdpa, "strict_sdpa_selection", return_value=selection),
+        ):
+            primed = self._record(lambda: graph.execute(replay))
+            timed = self._record(lambda: graph.execute(replay))
+        return primed, timed, calls
+
+    @pytest.mark.parametrize(
+        ("hk", "hv", "attributes", "expected_call"),
+        [
+            # Equal K/V heads: PyTorch's enable_gqa on the real-size K/V.
+            (2, 2, {}, (2, 2, True)),
+            # Hk != Hv: enable_gqa cannot express it; expanded untimed.
+            (2, 1, {}, (8, 8, False)),
+            # Sliding window: the additive mask is built untimed.
+            (2, 2, {"left_bound": 1, "right_bound": 0}, (2, 2, True)),
+        ],
+    )
+    def test_dense_timed_run_has_no_setup(
+        self, hk, hv, attributes, expected_call
+    ) -> None:
+        tensors = {
+            1: torch.randn(1, 8, 4, 16),
+            2: torch.randn(1, hk, 4, 16),
+            3: torch.randn(1, hv, 4, 16),
+        }
+        primed, timed, calls = self._replay(self._dense_graph(**attributes), tensors)
+
+        assert calls == [expected_call, expected_call]
+        assert timed <= self.TIMED_OPS, f"setup in timed run: {timed - self.TIMED_OPS}"
+        if expected_call[0] == 8 or attributes:
+            assert primed - self.TIMED_OPS, "priming should have built the setup"
+
+    def test_strict_math_expands_untimed(self) -> None:
+        """Math with enable_gqa expands K/V inside the call, so a strict math
+        selection gets the expansion up front instead."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        tensors = {
+            1: torch.randn(1, 8, 4, 16),
+            2: torch.randn(1, 2, 4, 16),
+            3: torch.randn(1, 2, 4, 16),
+        }
+        _, timed, calls = self._replay(
+            self._dense_graph(), tensors, PyTorchSdpaBackendName.MATH
+        )
+
+        assert calls == [(8, 8, False), (8, 8, False)]
+        assert timed <= self.TIMED_OPS
+
+    @pytest.mark.parametrize("attributes", [{}, {"left_bound": 3, "right_bound": 0}])
+    def test_paged_timed_run_has_no_gather(self, attributes) -> None:
+        paged = TestPyTorchSdpaPaged()
+        q, k_pages, v_pages, page_table, _, _ = paged._build()
+        primed, timed, calls = self._replay(
+            paged._graph(**attributes), paged._tensors(q, k_pages, v_pages, page_table)
+        )
+
+        heads = (paged.HKV, paged.HKV, True)
+        assert calls == [heads] * (2 * len(paged.KV_LENS))
+        assert timed <= self.TIMED_OPS, f"setup in timed run: {timed - self.TIMED_OPS}"
+        assert "aten.index.Tensor" in primed
+
+
+class TestDefaultSdpaAvoidsMath:
+    """The probe that keeps math-fallback GQA calls out of the timed baseline."""
+
+    @staticmethod
+    def _probe(sdpa):
+        from dnn_benchmarking.execution.pytorch_ops._sdpa_backend import (
+            default_sdpa_avoids_math,
+        )
+
+        x = torch.rand(1, 2, 2, 4)
+        with patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa):
+            return default_sdpa_avoids_math(
+                x,
+                x[:, :1],
+                x[:, :1],
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+                enable_gqa=True,
+            )
+
+    def test_fused_kernel_accepts(self) -> None:
+        from torch.nn import attention
+
+        selected = []
+
+        def fake_sdpa_kernel(backends):
+            selected.append(set(backends))
+            return nullcontext()
+
+        sdpa = MagicMock(side_effect=lambda q, *args, **kwargs: q)
+        with patch.object(attention, "sdpa_kernel", side_effect=fake_sdpa_kernel):
+            assert self._probe(sdpa) is True
+
+        # Math is never among the backends the probe allows.
+        assert selected == [
+            {
+                attention.SDPBackend.FLASH_ATTENTION,
+                attention.SDPBackend.EFFICIENT_ATTENTION,
+            }
+        ]
+        assert sdpa.call_args.kwargs["enable_gqa"] is True
+
+    def test_no_fused_kernel_means_math(self) -> None:
+        def sdpa(*args, **kwargs):
+            raise RuntimeError("No available kernel. Aborting execution.")
+
+        assert self._probe(sdpa) is False
+
+    def test_other_failures_propagate(self) -> None:
+        failure = RuntimeError("HIP error: out of memory")
+        with pytest.raises(RuntimeError) as caught:
+            self._probe(MagicMock(side_effect=failure))
+        assert caught.value is failure
+
+
 class TestPyTorchSdpaMaskDerivation:
     """The mask a graph is asking for, derived the way hipDNN derives it
     (PlanUtils.hpp::extractDiagonalBandParams, CpuFpReferenceSdpa::isMasked)."""

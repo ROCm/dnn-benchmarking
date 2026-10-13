@@ -4,7 +4,18 @@
 """Shared tensor and graph-node helpers for PyTorch reference handlers."""
 
 from math import prod
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 
@@ -34,8 +45,11 @@ __all__ = [
     "_strip_leading_singletons",
     "_sum_to_shape",
     "_host_ints",
+    "_replay_constant",
     "ReplayTensors",
 ]
+
+_T = TypeVar("_T")
 
 
 class ReplayTensors(dict):
@@ -57,6 +71,7 @@ class ReplayTensors(dict):
         super().__init__(*args, **kwargs)
         self._scalar_cache: Dict[int, float] = {}
         self._int_cache: Dict[int, List[int]] = {}
+        self._derived_cache: Dict[Hashable, Any] = {}
 
     def host_ints(self, uid: int) -> List[int]:
         """Return tensor ``uid`` flattened to host ints, resolved once."""
@@ -65,6 +80,16 @@ class ReplayTensors(dict):
             cached = [int(x) for x in self[uid].flatten().tolist()]
             self._int_cache[uid] = cached
         return cached
+
+    def derived(self, key: Hashable, build: Callable[[], _T]) -> _T:
+        """Return ``build()`` for ``key``, built once on the first call.
+
+        Holds handler setup derived only from constant inputs (layout
+        emulation, masks), so timed iterations do not repeat it.
+        """
+        if key not in self._derived_cache:
+            self._derived_cache[key] = build()
+        return self._derived_cache[key]
 
 
 def _as_tuple(
@@ -265,6 +290,15 @@ def _host_ints(
     if isinstance(tensors, ReplayTensors):
         return tensors.host_ints(uid)
     return [int(x) for x in tensor.flatten().tolist()]
+
+
+def _replay_constant(
+    tensors: Dict[int, torch.Tensor], key: Hashable, build: Callable[[], _T]
+) -> _T:
+    """``build()`` once per replay map; every call on a plain dict."""
+    if isinstance(tensors, ReplayTensors):
+        return tensors.derived(key, build)
+    return build()
 
 
 def _numel(shape: Sequence[int]) -> int:

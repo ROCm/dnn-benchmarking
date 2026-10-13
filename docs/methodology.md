@@ -81,6 +81,29 @@ Before the warmup, `measure()` always primes the engine:
 
 Priming launches are not timed and never flushed.
 
+### PyTorch SDPA setup
+
+The PyTorch runtime builds SDPA setup that derives only from the inputs in the
+first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
+
+- GQA and MQA graphs with equal K and V head counts call
+  `F.scaled_dot_product_attention(..., enable_gqa=True)` on K and V at their
+  real head count. This needs PyTorch 2.5 or later.
+- When K and V have different head counts, or with
+  `--pytorch-sdpa-backend math`, the tool expands K and V to the query head
+  count once, before the timed loop.
+- Sliding-window masks and the dense per-sequence K and V of paged graphs are
+  built once. A timed paged iteration does one SDPA call per sequence and one
+  `torch.cat`.
+- The `stats` output (log-sum-exp) is computed in every iteration.
+
+With the default backend selection, a GQA call that no fused kernel (Flash
+or memory-efficient) accepts would use the math backend. That backend copies
+K and V to the query head count inside the call. The tool skips these rows
+as unsupported and does not time them. On ROCm this includes GQA graphs with
+a sliding window, fp32 GQA graphs, and causal GQA graphs where the query and
+KV lengths differ.
+
 ## Warmup
 
 `--warmup N` (default 10) is a launch count, not a time budget. The priming
