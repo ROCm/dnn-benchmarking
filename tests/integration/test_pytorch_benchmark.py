@@ -108,3 +108,44 @@ def test_flash_aotriton_preference_benchmarks_sdpa(torch_gpu) -> None:
         pytorch_rocm_fa_library="aotriton",
     )
     assert m.kernel_ms[0] > 0 and m.host_ms[0] > 0
+
+
+def test_gqa_math_fallback_is_skipped_not_timed(torch_gpu) -> None:
+    """A GQA call no fused kernel accepts would run math, which copies K/V to
+    the query head count inside the timed call. The benchmark refuses it; the
+    one-shot reference still computes it.
+
+    A sliding window forces this on every arch: Flash takes no mask, and
+    Efficient needs equal Q/K/V head counts. If a torch release lifts either
+    limit, this test fails and the methodology note needs an update.
+    """
+    from dnn_benchmarking.common.exceptions import UnsupportedGraphError
+
+    torch = torch_gpu
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                "outputs": {"o_tensor_uid": 4},
+                "attributes": {
+                    "attn_scale_value": 0.125,
+                    "left_bound": 15,
+                    "right_bound": 0,
+                },
+            }
+        ]
+    }
+    tensors = {
+        uid: torch.randn(1, heads, 128, 64, device="cuda", dtype=torch.bfloat16)
+        for uid, heads in ((1, 8), (2, 2), (3, 2))
+    }
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+
+    with pytest.raises(UnsupportedGraphError, match="math backend"):
+        executor.benchmark(tensors)
+    executor.execute_once(tensors)
+    assert tensors[4].shape == (1, 8, 128, 64)

@@ -95,14 +95,21 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
 - Sliding-window masks and the dense per-sequence K and V of paged graphs are
   built once. A timed paged iteration does one SDPA call per sequence and one
   `torch.cat`.
-- The `stats` output (log-sum-exp) is computed in every iteration.
+- For the `stats` output (log-sum-exp), the fp32 copies of Q and K, the K
+  expansion and the mask are built once. Each iteration computes the score
+  matmul and the log-sum-exp.
 
 With the default backend selection, a GQA call that no fused kernel (Flash
 or memory-efficient) accepts would use the math backend. That backend copies
 K and V to the query head count inside the call. The tool skips these rows
 as unsupported and does not time them. On ROCm this includes GQA graphs with
-a sliding window, fp32 GQA graphs, and causal GQA graphs where the query and
-KV lengths differ.
+a sliding window and causal GQA graphs where the query and
+KV lengths differ. On MI210 (gfx90a), fp32 GQA graphs are skipped too. Other
+architectures can differ, because the result depends on the torch build.
+
+The setup is built once on the assumption that the inputs do not change
+between iterations. When a graph node computes an SDPA input, the tool skips
+the PyTorch row instead of timing the setup.
 
 ## Warmup
 

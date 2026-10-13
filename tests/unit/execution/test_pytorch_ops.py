@@ -3,6 +3,7 @@
 
 """Unit tests for PyTorch operation handlers error paths."""
 
+from collections import Counter
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
@@ -2096,6 +2097,53 @@ class TestNodeParamNullAttributes:
         torch.testing.assert_close(tensors[2], torch.zeros(3))
 
 
+# Ops a timed SDPA forward iteration may run besides the (stubbed) SDPA call:
+# Q slicing and the paged re-pack.
+_SDPA_TIMED_OPS = {"aten.slice.Tensor", "aten.cat.default"}
+
+
+def _record_aten_ops(fn) -> Counter:
+    """Count the aten ops ``fn`` dispatches, e.g. ``aten.slice.Tensor``."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ops: Counter = Counter()
+
+    class Recorder(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            ops[str(func)] += 1
+            return func(*args, **(kwargs or {}))
+
+    with Recorder():
+        fn()
+    return ops
+
+
+def _replay_sdpa(graph_json, tensors, selection=None):
+    """Prime a ReplayTensors map once, then record a second (timed) run.
+
+    The SDPA call is stubbed so its own decomposition stays out of the
+    recorded ops. Returns (priming ops, timed ops, stub calls), each call as
+    (K heads, V heads, enable_gqa).
+    """
+    from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+    calls = []
+
+    def fake_sdpa(q, k, v, *, enable_gqa, **_):
+        calls.append((int(k.shape[-3]), int(v.shape[-3]), enable_gqa))
+        return q
+
+    replay = pytorch_ops.ReplayTensors(tensors)
+    graph = pytorch_ops.compile_graph(graph_json)
+    with (
+        patch.object(sdpa, "execute_selected_sdpa", fake_sdpa),
+        patch.object(sdpa, "strict_sdpa_selection", return_value=selection),
+    ):
+        primed = _record_aten_ops(lambda: graph.execute(replay))
+        timed = _record_aten_ops(lambda: graph.execute(replay))
+    return primed, timed, calls
+
+
 class TestPyTorchSdpaPaged:
     """Paged (KV-cache) SDPA support.
 
@@ -2335,6 +2383,20 @@ class TestPyTorchSdpaPaged:
         with pytest.raises(UnsupportedGraphError, match="page table holds"):
             pytorch_ops.execute_graph(self._graph(), tensors)
 
+    @pytest.mark.parametrize("attributes", [{}, {"left_bound": 3, "right_bound": 0}])
+    def test_timed_run_has_no_gather(self, attributes) -> None:
+        """The gather and masks are built once; a timed run only slices Q,
+        calls SDPA per sequence and re-packs."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        primed, timed, calls = _replay_sdpa(
+            self._graph(**attributes), self._tensors(q, k_pages, v_pages, page_table)
+        )
+
+        heads = (self.HKV, self.HKV, True)
+        assert calls == [heads] * (2 * len(self.KV_LENS))
+        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        assert "aten.index.Tensor" in primed
+
     def test_backward_still_refuses_paged(self) -> None:
         """Only the forward handler gathers. A paged backward would otherwise
         compute a dense gradient and call it correct."""
@@ -2372,120 +2434,112 @@ class TestPyTorchSdpaPaged:
 
 
 class TestSdpaTimedRegion:
-    """After priming, a replayed SDPA forward runs only the op itself.
+    """After priming, a replayed dense SDPA forward runs only the op itself.
 
-    K/V head expansion, sliding-window masks and the paged gather derive from
-    constant inputs. The benchmark path builds them once, so they must not
-    reappear in timed iterations. The SDPA call is stubbed so its own
-    decomposition stays out of the recorded aten ops.
+    K/V head expansion, sliding-window masks and the stats operands derive
+    from constant inputs. The benchmark path builds them once, so they must not
+    reappear in timed iterations.
     """
 
-    # Ops a timed iteration may run: Q slicing and the paged re-pack.
-    TIMED_OPS = {"aten.slice.Tensor", "aten.cat.default"}
-
     @staticmethod
-    def _record(fn):
-        from torch.utils._python_dispatch import TorchDispatchMode
-
-        ops = set()
-
-        class Recorder(TorchDispatchMode):
-            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-                ops.add(str(func))  # e.g. "aten.slice.Tensor"
-                return func(*args, **(kwargs or {}))
-
-        with Recorder():
-            fn()
-        return ops
-
-    @staticmethod
-    def _dense_graph(**attributes):
+    def _graph(stats: bool = False, **attributes):
+        outputs = {"o_tensor_uid": 4}
+        if stats:
+            outputs["stats_tensor_uid"] = 5
         return {
             "nodes": [
                 {
                     "type": "SdpaAttributes",
                     "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
-                    "outputs": {"o_tensor_uid": 4},
+                    "outputs": outputs,
                     "attributes": {"attn_scale_value": 0.5, **attributes},
                 }
             ]
         }
 
-    def _replay(self, graph_json, tensors, selection=None):
-        """Prime once, then record a second (timed) execution."""
-        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
-
-        calls = []
-
-        def fake_sdpa(q, k, v, *, enable_gqa=False, **_):
-            calls.append((int(k.shape[-3]), int(v.shape[-3]), enable_gqa))
-            return q
-
-        replay = pytorch_ops.ReplayTensors(tensors)
-        graph = pytorch_ops.compile_graph(graph_json)
-        with (
-            patch.object(sdpa, "execute_selected_sdpa", fake_sdpa),
-            patch.object(sdpa, "strict_sdpa_selection", return_value=selection),
-        ):
-            primed = self._record(lambda: graph.execute(replay))
-            timed = self._record(lambda: graph.execute(replay))
-        return primed, timed, calls
+    @staticmethod
+    def _tensors(hk: int, hv: int, dtype=torch.float32):
+        return {
+            1: torch.randn(1, 8, 4, 16, dtype=dtype),
+            2: torch.randn(1, hk, 4, 16, dtype=dtype),
+            3: torch.randn(1, hv, 4, 16, dtype=dtype),
+        }
 
     @pytest.mark.parametrize(
-        ("hk", "hv", "attributes", "expected_call"),
+        ("hk", "hv", "attributes", "expected_call", "priming_builds_setup"),
         [
             # Equal K/V heads: PyTorch's enable_gqa on the real-size K/V.
-            (2, 2, {}, (2, 2, True)),
+            (2, 2, {}, (2, 2, True), False),
             # Hk != Hv: enable_gqa cannot express it; expanded untimed.
-            (2, 1, {}, (8, 8, False)),
+            (2, 1, {}, (8, 8, False), True),
             # Sliding window: the additive mask is built untimed.
-            (2, 2, {"left_bound": 1, "right_bound": 0}, (2, 2, True)),
+            (2, 2, {"left_bound": 1, "right_bound": 0}, (2, 2, True), True),
         ],
     )
-    def test_dense_timed_run_has_no_setup(
-        self, hk, hv, attributes, expected_call
+    def test_timed_run_has_no_setup(
+        self, hk, hv, attributes, expected_call, priming_builds_setup
     ) -> None:
-        tensors = {
-            1: torch.randn(1, 8, 4, 16),
-            2: torch.randn(1, hk, 4, 16),
-            3: torch.randn(1, hv, 4, 16),
-        }
-        primed, timed, calls = self._replay(self._dense_graph(**attributes), tensors)
+        primed, timed, calls = _replay_sdpa(
+            self._graph(**attributes), self._tensors(hk, hv)
+        )
 
         assert calls == [expected_call, expected_call]
-        assert timed <= self.TIMED_OPS, f"setup in timed run: {timed - self.TIMED_OPS}"
-        if expected_call[0] == 8 or attributes:
-            assert primed - self.TIMED_OPS, "priming should have built the setup"
+        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        assert bool(set(primed) - _SDPA_TIMED_OPS) == priming_builds_setup
 
     def test_strict_math_expands_untimed(self) -> None:
         """Math with enable_gqa expands K/V inside the call, so a strict math
         selection gets the expansion up front instead."""
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
-        tensors = {
-            1: torch.randn(1, 8, 4, 16),
-            2: torch.randn(1, 2, 4, 16),
-            3: torch.randn(1, 2, 4, 16),
-        }
-        _, timed, calls = self._replay(
-            self._dense_graph(), tensors, PyTorchSdpaBackendName.MATH
+        _, timed, calls = _replay_sdpa(
+            self._graph(), self._tensors(2, 2), PyTorchSdpaBackendName.MATH
         )
 
         assert calls == [(8, 8, False), (8, 8, False)]
-        assert timed <= self.TIMED_OPS
+        assert set(timed) <= _SDPA_TIMED_OPS
 
-    @pytest.mark.parametrize("attributes", [{}, {"left_bound": 3, "right_bound": 0}])
-    def test_paged_timed_run_has_no_gather(self, attributes) -> None:
-        paged = TestPyTorchSdpaPaged()
-        q, k_pages, v_pages, page_table, _, _ = paged._build()
-        primed, timed, calls = self._replay(
-            paged._graph(**attributes), paged._tensors(q, k_pages, v_pages, page_table)
+    @pytest.mark.parametrize("attributes", [{}, {"causal_mask": True}])
+    def test_stats_timed_run_matches_equal_heads(self, attributes) -> None:
+        """With stats, a bf16 GQA timed run does exactly the work of an MHA run
+        of the same size: no K expansion and no fp32 casts."""
+        _, gqa, _ = _replay_sdpa(
+            self._graph(stats=True, **attributes),
+            self._tensors(2, 2, torch.bfloat16),
+        )
+        _, mha, _ = _replay_sdpa(
+            self._graph(stats=True, **attributes),
+            self._tensors(8, 8, torch.bfloat16),
         )
 
-        heads = (paged.HKV, paged.HKV, True)
-        assert calls == [heads] * (2 * len(paged.KV_LENS))
-        assert timed <= self.TIMED_OPS, f"setup in timed run: {timed - self.TIMED_OPS}"
-        assert "aten.index.Tensor" in primed
+        assert "aten._to_copy.default" not in gqa
+        assert gqa == mha
+
+    def test_stats_match_unhoisted_reference(self) -> None:
+        torch.manual_seed(7)
+        tensors = self._tensors(2, 2)
+        pytorch_ops.execute_graph(self._graph(stats=True, causal_mask=True), tensors)
+
+        k = tensors[2].repeat_interleave(4, dim=-3)
+        scores = (tensors[1] @ k.transpose(-2, -1)) * 0.5
+        causal = torch.ones(4, 4, dtype=torch.bool).tril()
+        expected = torch.logsumexp(
+            scores.masked_fill(~causal, float("-inf")), dim=-1, keepdim=True
+        )
+        torch.testing.assert_close(tensors[5], expected)
+
+    def test_computed_input_is_not_timed(self) -> None:
+        """Cached setup assumes the inputs repeat unchanged. A K computed by an
+        earlier node breaks that, so the benchmark path refuses the graph; the
+        one-shot reference path still computes it."""
+        graph = self._graph()
+        graph["tensors"] = [{"uid": 2, "virtual": True}]
+        tensors = self._tensors(2, 2)
+
+        with pytest.raises(UnsupportedGraphError, match=r"inputs \[2\] are computed"):
+            pytorch_ops.compile_graph(graph).execute(pytorch_ops.ReplayTensors(tensors))
+        pytorch_ops.execute_graph(graph, tensors)
+        assert tensors[4].shape == (1, 8, 4, 16)
 
 
 class TestDefaultSdpaAvoidsMath:

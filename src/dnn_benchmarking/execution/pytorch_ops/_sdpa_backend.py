@@ -185,14 +185,14 @@ def _sdpa_kwargs(
     scale: Optional[float],
     enable_gqa: bool,
 ) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = dict(
-        attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+    # enable_gqa needs torch >= 2.5, the documented floor (docs/setup.md).
+    return dict(
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
     )
-    # Pass enable_gqa only when it is needed: torch < 2.5 has no such
-    # keyword, and equal-head graphs must still run there.
-    if enable_gqa:
-        kwargs["enable_gqa"] = True
-    return kwargs
 
 
 def default_sdpa_avoids_math(

@@ -3,7 +3,7 @@
 
 """Scaled-dot-product-attention forward/backward reference handlers."""
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -397,33 +397,51 @@ def _plan_paged_sdpa(
     return segments, enable_gqa
 
 
-def _sdpa_stats(
+def _sdpa_stats_operands(
     q: torch.Tensor,
     k: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
     is_causal: bool,
-    scale: Optional[float],
     rep_k: int,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """fp32 Q, fp32 K^T at the query head count, and the fp32 additive mask.
+
+    These depend only on the inputs, so the benchmark path builds them once.
+    A causal mask becomes an additive ``-inf`` mask; ``attn_mask`` and
+    ``is_causal`` never come together (``_plan_sdpa_common``).
+    """
     q_float = q.to(dtype=torch.float32)
     k_float = k.to(dtype=torch.float32)
     if rep_k > 1:
         k_float = k_float.repeat_interleave(rep_k, dim=-3)
-    scale_value = 1.0 if scale is None else scale
-    scores = torch.matmul(q_float, k_float.transpose(-2, -1)) * scale_value
-    if attn_mask is not None:
-        scores = scores + attn_mask.to(dtype=torch.float32)
+    mask = None if attn_mask is None else attn_mask.to(dtype=torch.float32)
     if is_causal:
-        length_q = scores.shape[-2]
-        length_k = scores.shape[-1]
-        causal = torch.ones(
-            length_q,
-            length_k,
-            dtype=torch.bool,
-            device=scores.device,
-        ).tril()
-        scores = scores.masked_fill(~causal, float("-inf"))
+        length_q, length_k = int(q.shape[-2]), int(k.shape[-2])
+        keep = torch.ones(length_q, length_k, dtype=torch.bool, device=q.device).tril()
+        mask = torch.zeros(
+            length_q, length_k, dtype=torch.float32, device=q.device
+        ).masked_fill(~keep, float("-inf"))
+    return q_float, k_float.transpose(-2, -1), mask
+
+
+def _sdpa_stats(
+    q_float: torch.Tensor,
+    k_float_t: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    scale: Optional[float],
+) -> torch.Tensor:
+    """Log-sum-exp of the masked, scaled scores (``_sdpa_stats_operands``)."""
+    scores = torch.matmul(q_float, k_float_t) * (1.0 if scale is None else scale)
+    if mask is not None:
+        scores = scores + mask
     return torch.logsumexp(scores, dim=-1, keepdim=True)
+
+
+def _is_virtual(graph_json: Dict[str, Any], uid: int) -> bool:
+    return any(
+        t.get("uid") == uid and bool(t.get("virtual"))
+        for t in graph_json.get("tensors", [])
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -443,8 +461,9 @@ def compile_sdpa(
     paged graph is gathered through its page table into dense per-sequence K/V
     and then run one sequence at a time. ``--validate pytorch`` walks these very
     handlers with CPU tensors, so there is no reference-side shortcut. On the
-    benchmark path (``ReplayTensors``) the gather, K/V head expansion and masks
-    are built once during priming, so the timed region holds only the op work.
+    benchmark path (``ReplayTensors``) the gather, K/V head expansion, masks and
+    the stats operands are built once during priming, so the timed region holds
+    only the op work.
     """
     _sdpa_unsupported_if_present(
         node,
@@ -483,13 +502,45 @@ def compile_sdpa(
         if stats_uid is not None:
             raise ValueError("Paged SDPA stats output is not supported")
 
+    # Setup is cached on the assumption that its inputs repeat unchanged every
+    # replay. A tensor computed by an earlier node breaks that assumption.
+    computed_inputs = [
+        uid
+        for uid in (
+            q_uid,
+            k_uid,
+            v_uid,
+            mask_uid,
+            scale_uid,
+            page_table_k_uid,
+            page_table_v_uid,
+            seq_len_q_uid,
+            seq_len_kv_uid,
+        )
+        if uid is not None and _is_virtual(graph_json, uid)
+    ]
+
+    def setup(tensors: Dict[int, torch.Tensor], build: Callable[[], Any]) -> Any:
+        if computed_inputs and isinstance(tensors, ReplayTensors):
+            raise UnsupportedGraphError(
+                f"SDPA inputs {computed_inputs} are computed inside the graph, so "
+                "the PyTorch baseline cannot build their setup outside the timed "
+                "region"
+            )
+        return _replay_constant(tensors, ("sdpa", o_uid), build)
+
     def prepare_dense(
         tensors: Dict[int, torch.Tensor],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> Tuple[
-        Optional[torch.Tensor], Optional[float], int, torch.Tensor, torch.Tensor, bool
+        Optional[torch.Tensor],
+        Optional[float],
+        torch.Tensor,
+        torch.Tensor,
+        bool,
+        Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     ]:
         attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
             node, tensors, q, k, v, mask_uid, scale_uid, attn_scale_value
@@ -505,7 +556,12 @@ def compile_sdpa(
         _require_fused_default_sdpa(
             tensors, q, k_op, v_op, attn_mask, dropout_p, is_causal, scale, enable_gqa
         )
-        return attn_mask, scale, rep_k, k_op, v_op, enable_gqa
+        stats_operands = (
+            None
+            if stats_uid is None
+            else _sdpa_stats_operands(q, k, attn_mask, is_causal, rep_k)
+        )
+        return attn_mask, scale, k_op, v_op, enable_gqa, stats_operands
 
     def prepare_paged(
         tensors: Dict[int, torch.Tensor],
@@ -538,14 +594,15 @@ def compile_sdpa(
 
     # Everything derived from the constant inputs is built once per replay
     # map, during priming. Timed iterations run only the SDPA call(s), the
-    # stats and, for paged graphs, the per-sequence loop and re-pack.
+    # stats matmul and log-sum-exp and, for paged graphs, the per-sequence loop
+    # and re-pack.
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         q = _tensor(tensors, q_uid, node)
         k = _tensor(tensors, k_uid, node)
         v = _tensor(tensors, v_uid, node)
         if is_paged:
-            segments, scale, enable_gqa = _replay_constant(
-                tensors, ("sdpa", o_uid), lambda: prepare_paged(tensors, q, k, v)
+            segments, scale, enable_gqa = setup(
+                tensors, lambda: prepare_paged(tensors, q, k, v)
             )
             outputs = [
                 execute_selected_sdpa(
@@ -564,8 +621,8 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, torch.cat(outputs, dim=-2))
             return
 
-        attn_mask, scale, rep_k, k_op, v_op, enable_gqa = _replay_constant(
-            tensors, ("sdpa", o_uid), lambda: prepare_dense(tensors, q, k, v)
+        attn_mask, scale, k_op, v_op, enable_gqa, stats_operands = setup(
+            tensors, lambda: prepare_dense(tensors, q, k, v)
         )
         o = execute_selected_sdpa(
             q,
@@ -579,14 +636,8 @@ def compile_sdpa(
         )
         _store_tensor(tensors, o_uid, o)
 
-        if stats_uid is not None:
-            # Stats are graph output work, so they stay timed; they take the
-            # original K and expand it themselves.
-            _store_tensor(
-                tensors,
-                stats_uid,
-                _sdpa_stats(q, k, attn_mask, is_causal, scale, rep_k),
-            )
+        if stats_operands is not None:
+            _store_tensor(tensors, stats_uid, _sdpa_stats(*stats_operands, scale))
 
     return run
 

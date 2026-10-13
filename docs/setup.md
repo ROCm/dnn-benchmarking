@@ -103,6 +103,10 @@ dnn-benchmarking finds the engine plugins in
 A CPU-only PyTorch never enables `--runtime pytorch`. It is only for
 `--validate pytorch`. `--runtime pytorch` needs a ROCm or CUDA build.
 
+Every mode that provides PyTorch needs PyTorch 2.5 or later: the SDPA
+reference passes `enable_gqa` to `F.scaled_dot_product_attention`.
+`--torch-mode existing` does not check the version.
+
 The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
 `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
 `--reuse-artifacts` they build hipDNN and the providers from source and
