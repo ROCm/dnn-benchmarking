@@ -1408,6 +1408,45 @@ class TestPyTorchOpsNewHandlers:
                 graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
             )
 
+    @pytest.mark.parametrize(
+        "optional_input,attributes,match",
+        [
+            (None, {"causal_mask_bottom_right": True}, "bottom-right"),
+            (None, {"left_bound": 0, "right_bound": 0}, "sliding-window"),
+            ("sink_token_tensor_uid", {}, "sink_token_tensor_uid"),
+        ],
+    )
+    def test_sdpa_backward_rejects_forward_only_features(
+        self, optional_input, attributes, match
+    ) -> None:
+        inputs = {
+            "q_tensor_uid": 1,
+            "k_tensor_uid": 2,
+            "v_tensor_uid": 3,
+            "o_tensor_uid": 4,
+            "do_tensor_uid": 5,
+            "stats_tensor_uid": 6,
+        }
+        if optional_input is not None:
+            inputs[optional_input] = 7
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": inputs,
+                    "outputs": {
+                        "dq_tensor_uid": 10,
+                        "dk_tensor_uid": 11,
+                        "dv_tensor_uid": 12,
+                    },
+                    "attributes": attributes,
+                }
+            ]
+        }
+
+        with pytest.raises(UnsupportedGraphError, match=match):
+            pytorch_ops.compile_graph(graph_json)
+
     def test_sdpa_backward_independent_kv_heads(self) -> None:
         # Hq == Hk but Hv < Hq: regression for the single-flag GQA bug that
         # skipped V expansion/reduction whenever Hq == Hk.
@@ -2260,6 +2299,42 @@ class TestPyTorchSdpaPaged:
 
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    def test_paged_decode_bottom_right_sink_matches_explicit_softmax(self) -> None:
+        q = torch.zeros(1, self.HQ, 1, self.D)
+        k_pages = torch.zeros(1, self.HKV, self.PAGE, self.D)
+        v_pages = torch.zeros_like(k_pages)
+        v_pages[0, :, :4, 0] = torch.arange(1, 5, dtype=torch.float32)
+        page_table = torch.zeros(1, 1, dtype=torch.int32)
+        sink = torch.arange(2, self.HQ + 2, dtype=torch.float32).log()
+        graph = self._graph(causal_mask_bottom_right=True)
+        graph["nodes"][0]["inputs"]["sink_token_tensor_uid"] = 9
+        tensors = {
+            1: q,
+            2: k_pages,
+            3: v_pages,
+            5: page_table,
+            6: page_table,
+            7: torch.tensor([1], dtype=torch.int32),
+            8: torch.tensor([4], dtype=torch.int32),
+            9: sink,
+        }
+
+        pytorch_ops.execute_graph(graph, tensors)
+
+        dense_v = (
+            v_pages[0, :, :4, :]
+            .repeat_interleave(self.HQ // self.HKV, dim=0)
+            .unsqueeze(0)
+        )
+        scores = torch.zeros(1, self.HQ, 1, 4)
+        log_denom = torch.logaddexp(
+            torch.logsumexp(scores, dim=-1, keepdim=True),
+            sink.reshape(1, self.HQ, 1, 1),
+        )
+        expected = torch.exp(scores - log_denom) @ dense_v
+
+        torch.testing.assert_close(tensors[4], expected)
 
     def test_paged_sliding_window_masks_each_sequence(self) -> None:
         """A width-1 band (left/right bound 0) lets query i of each sequence see
