@@ -2555,7 +2555,7 @@ class TestSdpaTimedRegion:
     @staticmethod
     def _expected_stats(tensors, causal: bool):
         """Log-sum-exp of the scaled scores, computed without any hoisting."""
-        k = tensors[2].repeat_interleave(4, dim=-3)
+        k = tensors[2].repeat_interleave(8 // tensors[2].shape[-3], dim=-3)
         scores = (tensors[1] @ k.transpose(-2, -1)) * 0.5
         if causal:
             keep = torch.ones(4, 4, dtype=torch.bool).tril()
@@ -2572,9 +2572,14 @@ class TestSdpaTimedRegion:
     @pytest.mark.parametrize("causal", [False, True])
     def test_stats_come_from_fused_kernel(self, causal: bool) -> None:
         """The fused SDPA forward emits the log-sum-exp, as in a training step,
-        so a timed run must not compute it again with a score matmul."""
+        so a timed run must not compute it again with a score matmul.
+
+        MHA, because CPU Flash takes GQA only in newer torch; older torch
+        sends CPU GQA to math, which is the fallback tested below. Fused GQA
+        is covered by the GPU test in test_pytorch_benchmark.py.
+        """
         torch.manual_seed(3)
-        tensors = self._tensors(2, 2)
+        tensors = self._tensors(8, 8)
         replay = pytorch_ops.ReplayTensors(tensors)
         graph = pytorch_ops.compile_graph(self._graph(stats=True, causal_mask=causal))
         graph.execute(replay)
