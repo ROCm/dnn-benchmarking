@@ -188,3 +188,90 @@ def test_sdpa_stats_come_from_fused_kernel(torch_gpu, q_heads: int) -> None:
         scores.masked_fill(~keep, float("-inf")), dim=-1, keepdim=True
     )
     torch.testing.assert_close(tensors[5].float(), expected, rtol=1e-3, atol=1e-3)
+
+
+def test_pytorch_row_returns_vram_after_oom(torch_gpu) -> None:
+    """A PyTorch row that runs out of memory must not keep VRAM reserved.
+
+    hipDNN rows of the same graph allocate with hipMalloc, outside PyTorch's
+    caching allocator, so memory PyTorch keeps cached is lost to them. The
+    graph chains two 1 GiB intermediates under a cap that fits only one, so
+    the row fails while the first is still referenced.
+    """
+    import io
+    from pathlib import Path
+
+    from dnn_benchmarking.config import SuiteConfig
+    from dnn_benchmarking.execution import suite_runner
+    from dnn_benchmarking.graph import GraphLoader
+    from dnn_benchmarking.reporting.reporter import Reporter
+
+    torch = torch_gpu
+    m, k = 16384, 256  # an M x M fp32 tensor is 1 GiB
+
+    def tensor(uid, dims, virtual=False):
+        return {
+            "uid": uid,
+            "name": f"t{uid}",
+            "dims": dims,
+            "strides": [dims[1], 1],
+            "data_type": "float",
+            "virtual": virtual,
+        }
+
+    def relu(name, x, y):
+        return {
+            "name": name,
+            "type": "PointwiseAttributes",
+            "compute_data_type": "float",
+            "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": x},
+            "outputs": {"out_0_tensor_uid": y},
+        }
+
+    graph_json = {
+        "name": "oom_chain",
+        "compute_data_type": "float",
+        "io_data_type": "float",
+        "intermediate_data_type": "float",
+        "tensors": [
+            tensor(1, [m, k]),
+            tensor(2, [k, m]),
+            tensor(3, [m, m], virtual=True),
+            tensor(4, [m, m], virtual=True),
+            tensor(5, [m, m]),
+        ],
+        "nodes": [
+            {
+                "name": "mm",
+                "type": "MatmulAttributes",
+                "compute_data_type": "float",
+                "inputs": {"a_tensor_uid": 1, "b_tensor_uid": 2},
+                "outputs": {"c_tensor_uid": 3},
+            },
+            relu("relu1", 3, 4),
+            relu("relu2", 4, 5),
+        ],
+    }
+    infos = GraphLoader().extract_tensor_info(graph_json)
+    ctx = suite_runner._graph_context(
+        Path("oom_chain.json"),
+        graph_json,
+        infos,
+        SuiteConfig(runtime="pytorch"),
+        Reporter(io.StringIO()),
+    )
+
+    torch.cuda.empty_cache()
+    reserved_before = torch.cuda.memory_reserved()
+    total = torch.cuda.get_device_properties(0).total_memory
+    # Inputs and output (~1.1 GiB), one intermediate, and some slack.
+    cap = reserved_before + 2.6 * (1 << 30)
+    torch.cuda.set_per_process_memory_fraction(cap / total)
+    try:
+        row, _ = suite_runner._run_pytorch_row(ctx, "engine")
+    finally:
+        torch.cuda.set_per_process_memory_fraction(1.0)
+
+    assert "out of memory" in (row.error_message or ""), row
+    assert torch.cuda.memory_reserved() <= reserved_before
+    assert "at row start the GPU had" in row.error_message
