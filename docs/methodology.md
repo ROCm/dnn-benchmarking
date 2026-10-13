@@ -95,9 +95,11 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
 - Sliding-window masks and the dense per-sequence K and V of paged graphs are
   built once. A timed paged iteration does one SDPA call per sequence and one
   `torch.cat`.
-- For the `stats` output (log-sum-exp), the fp32 copies of Q and K, the K
-  expansion and the mask are built once. Each iteration computes the score
-  matmul and the log-sum-exp.
+- The `stats` output (log-sum-exp) comes from the fused kernel, as in a
+  PyTorch training step. Q, K and V go into the call with `requires_grad`, and
+  the tool reads the log-sum-exp that the kernel saves for the backward pass.
+  The math backend saves no log-sum-exp. With math, the tool computes it with
+  a separate score matmul, which is timed. Its fp32 operands are built once.
 
 With the default backend selection, a GQA call that no fused kernel (Flash
 or memory-efficient) accepts would use the math backend. That backend copies
@@ -110,6 +112,14 @@ architectures can differ, because the result depends on the torch build.
 The setup is built once on the assumption that the inputs do not change
 between iterations. When a graph node computes an SDPA input, the tool skips
 the PyTorch row instead of timing the setup.
+
+Some SDPA features have no native PyTorch form. For these rows the timing
+includes a workaround, and the row gets a reference warning:
+
+- Paged KV: one SDPA call per sequence and a `torch.cat`.
+- Sliding window: the kernel reads an additive mask tensor.
+- Different K and V head counts: the kernel reads K and V expanded to the
+  query head count.
 
 ## Warmup
 

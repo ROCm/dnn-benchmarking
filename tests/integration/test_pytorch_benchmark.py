@@ -149,3 +149,42 @@ def test_gqa_math_fallback_is_skipped_not_timed(torch_gpu) -> None:
         executor.benchmark(tensors)
     executor.execute_once(tensors)
     assert tensors[4].shape == (1, 8, 128, 64)
+
+
+@pytest.mark.parametrize("q_heads", [8, 2])
+def test_sdpa_stats_come_from_fused_kernel(torch_gpu, q_heads: int) -> None:
+    """The stats output is the log-sum-exp the fused kernel saved for backward.
+
+    Guards its layout on this torch build: query length 100 is not a multiple
+    of any kernel block, so a padded or transposed log-sum-exp shows up here.
+    """
+    torch = torch_gpu
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 5},
+                "attributes": {"attn_scale_value": 0.125, "causal_mask": True},
+            }
+        ]
+    }
+    torch.manual_seed(0)
+    tensors = {
+        uid: torch.randn(2, heads, 100, 64, device="cuda", dtype=torch.bfloat16)
+        for uid, heads in ((1, q_heads), (2, 2), (3, 2))
+    }
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+    executor.benchmark(tensors)
+    executor.execute_once(tensors)
+
+    k = tensors[2].float().repeat_interleave(q_heads // 2, dim=-3)
+    scores = (tensors[1].float() @ k.transpose(-2, -1)) * 0.125
+    keep = torch.ones(100, 100, dtype=torch.bool, device="cuda").tril()
+    expected = torch.logsumexp(
+        scores.masked_fill(~keep, float("-inf")), dim=-1, keepdim=True
+    )
+    torch.testing.assert_close(tensors[5].float(), expected, rtol=1e-3, atol=1e-3)

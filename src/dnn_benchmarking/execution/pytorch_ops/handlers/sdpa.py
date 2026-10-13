@@ -14,6 +14,7 @@ from .._registry import CompiledOp, register_handler
 from .._sdpa_backend import (
     default_sdpa_avoids_math,
     execute_selected_sdpa,
+    fused_logsumexp,
     strict_sdpa_selection,
 )
 
@@ -406,9 +407,11 @@ def _sdpa_stats_operands(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """fp32 Q, fp32 K^T at the query head count, and the fp32 additive mask.
 
-    These depend only on the inputs, so the benchmark path builds them once.
-    A causal mask becomes an additive ``-inf`` mask; ``attn_mask`` and
-    ``is_causal`` never come together (``_plan_sdpa_common``).
+    Used only when the SDPA backend saved no log-sum-exp (math), so the stats
+    need their own score matmul. These depend only on the inputs, so the
+    benchmark path builds them once. A causal mask becomes an additive
+    ``-inf`` mask; ``attn_mask`` and ``is_causal`` never come together
+    (``_plan_sdpa_common``).
     """
     q_float = q.to(dtype=torch.float32)
     k_float = k.to(dtype=torch.float32)
@@ -461,9 +464,13 @@ def compile_sdpa(
     paged graph is gathered through its page table into dense per-sequence K/V
     and then run one sequence at a time. ``--validate pytorch`` walks these very
     handlers with CPU tensors, so there is no reference-side shortcut. On the
-    benchmark path (``ReplayTensors``) the gather, K/V head expansion, masks and
-    the stats operands are built once during priming, so the timed region holds
-    only the op work.
+    benchmark path (``ReplayTensors``) the gather, K/V head expansion and masks
+    are built once during priming, so the timed region holds only the op work.
+
+    The ``stats`` output (log-sum-exp) comes from the fused kernel, as in a
+    training forward: Q/K/V go in with ``requires_grad`` and the kernel's saved
+    log-sum-exp is read back (``fused_logsumexp``). Only a backend that saves
+    none (math) gets a separate score matmul.
     """
     _sdpa_unsupported_if_present(
         node,
@@ -520,14 +527,16 @@ def compile_sdpa(
         if uid is not None and _is_virtual(graph_json, uid)
     ]
 
-    def setup(tensors: Dict[int, torch.Tensor], build: Callable[[], Any]) -> Any:
+    def setup(
+        tensors: Dict[int, torch.Tensor], part: str, build: Callable[[], Any]
+    ) -> Any:
         if computed_inputs and isinstance(tensors, ReplayTensors):
             raise UnsupportedGraphError(
                 f"SDPA inputs {computed_inputs} are computed inside the graph, so "
                 "the PyTorch baseline cannot build their setup outside the timed "
                 "region"
             )
-        return _replay_constant(tensors, ("sdpa", o_uid), build)
+        return _replay_constant(tensors, ("sdpa", o_uid, part), build)
 
     def prepare_dense(
         tensors: Dict[int, torch.Tensor],
@@ -537,10 +546,11 @@ def compile_sdpa(
     ) -> Tuple[
         Optional[torch.Tensor],
         Optional[float],
+        int,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         bool,
-        Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     ]:
         attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
             node, tensors, q, k, v, mask_uid, scale_uid, attn_scale_value
@@ -553,15 +563,23 @@ def compile_sdpa(
                 int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
             )
         k_op, v_op, enable_gqa = _sdpa_kv_operands(k, v, rep_k, rep_v)
+        q_op = q
+        if stats_uid is not None:
+            # A forward that autograd records makes the fused kernel emit the
+            # log-sum-exp, the way a training step gets it.
+            q_op, k_op, v_op = (t.detach().requires_grad_() for t in (q_op, k_op, v_op))
         _require_fused_default_sdpa(
-            tensors, q, k_op, v_op, attn_mask, dropout_p, is_causal, scale, enable_gqa
+            tensors,
+            q_op,
+            k_op,
+            v_op,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            scale,
+            enable_gqa,
         )
-        stats_operands = (
-            None
-            if stats_uid is None
-            else _sdpa_stats_operands(q, k, attn_mask, is_causal, rep_k)
-        )
-        return attn_mask, scale, k_op, v_op, enable_gqa, stats_operands
+        return attn_mask, scale, rep_k, q_op, k_op, v_op, enable_gqa
 
     def prepare_paged(
         tensors: Dict[int, torch.Tensor],
@@ -593,16 +611,15 @@ def compile_sdpa(
         return segments, scale, enable_gqa
 
     # Everything derived from the constant inputs is built once per replay
-    # map, during priming. Timed iterations run only the SDPA call(s), the
-    # stats matmul and log-sum-exp and, for paged graphs, the per-sequence loop
-    # and re-pack.
+    # map, during priming. Timed iterations run only the SDPA call(s) and, for
+    # paged graphs, the per-sequence loop and re-pack.
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         q = _tensor(tensors, q_uid, node)
         k = _tensor(tensors, k_uid, node)
         v = _tensor(tensors, v_uid, node)
         if is_paged:
             segments, scale, enable_gqa = setup(
-                tensors, lambda: prepare_paged(tensors, q, k, v)
+                tensors, "paged", lambda: prepare_paged(tensors, q, k, v)
             )
             outputs = [
                 execute_selected_sdpa(
@@ -621,23 +638,37 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, torch.cat(outputs, dim=-2))
             return
 
-        attn_mask, scale, k_op, v_op, enable_gqa, stats_operands = setup(
-            tensors, lambda: prepare_dense(tensors, q, k, v)
+        attn_mask, scale, rep_k, q_op, k_op, v_op, enable_gqa = setup(
+            tensors, "dense", lambda: prepare_dense(tensors, q, k, v)
         )
-        o = execute_selected_sdpa(
-            q,
-            k_op,
-            v_op,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=scale,
-            enable_gqa=enable_gqa,
-        )
-        _store_tensor(tensors, o_uid, o)
+        with torch.enable_grad():
+            o = execute_selected_sdpa(
+                q_op,
+                k_op,
+                v_op,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+        if stats_uid is None:
+            _store_tensor(tensors, o_uid, o)
+            return
 
-        if stats_operands is not None:
-            _store_tensor(tensors, stats_uid, _sdpa_stats(*stats_operands, scale))
+        stats = fused_logsumexp(o, int(q.shape[-2]))
+        _store_tensor(tensors, o_uid, o.detach())
+        if stats is None:
+            # The math backend saves no log-sum-exp; a math user computes it.
+            stats = _sdpa_stats(
+                *setup(
+                    tensors,
+                    "stats",
+                    lambda: _sdpa_stats_operands(q, k, attn_mask, is_causal, rep_k),
+                ),
+                scale,
+            )
+        _store_tensor(tensors, stats_uid, stats)
 
     return run
 

@@ -1219,6 +1219,43 @@ class TestPyTorchOpsNewHandlers:
         assert any("AVGPOOL_EXCLUDE_PADDING" in w for w in warnings)
         assert any("SdpaBackwardAttributes" in w for w in warnings)
 
+    def test_sdpa_forward_warns_for_unexpressible_features(self) -> None:
+        """Paged KV, sliding windows and Hk != Hv have no native PyTorch SDPA
+        spelling, so those rows time a workaround. Plain GQA does not."""
+
+        def node(name, k_uid, v_uid, **extra):
+            inputs = {"q_tensor_uid": 1, "k_tensor_uid": k_uid, "v_tensor_uid": v_uid}
+            inputs.update(extra.pop("inputs", {}))
+            return {
+                "name": name,
+                "type": "SdpaAttributes",
+                "inputs": inputs,
+                "outputs": {"o_tensor_uid": 9},
+                "attributes": extra,
+            }
+
+        graph_json = {
+            "tensors": [
+                {"uid": 1, "dims": [1, 8, 4, 16], "data_type": "float"},
+                {"uid": 2, "dims": [1, 2, 4, 16], "data_type": "float"},
+                {"uid": 3, "dims": [1, 1, 4, 16], "data_type": "float"},
+            ],
+            "nodes": [
+                node("gqa", 2, 2, causal_mask=True),
+                node("window", 2, 2, left_bound=3, right_bound=0),
+                node("hk_ne_hv", 2, 3),
+                node("paged", 2, 2, inputs={"page_table_k_tensor_uid": 5}),
+            ],
+        }
+
+        warnings = pytorch_ops.get_reference_warnings(graph_json)
+
+        flagged = {w.split(":")[0]: w for w in warnings}
+        assert set(flagged) == {"window", "hk_ne_hv", "paged"}
+        assert "sliding-window" in flagged["window"]
+        assert "enable_gqa cannot express" in flagged["hk_ne_hv"]
+        assert "paged SDPA" in flagged["paged"]
+
     def test_builtin_rmsnorm_reference_has_no_warning_when_available(self) -> None:
         graph_json = {
             "tensors": [{"uid": 1, "dims": [2, 3, 4]}, {"uid": 2, "dims": [4]}],
@@ -2515,18 +2552,52 @@ class TestSdpaTimedRegion:
         assert "aten._to_copy.default" not in gqa
         assert gqa == mha
 
+    @staticmethod
+    def _expected_stats(tensors, causal: bool):
+        """Log-sum-exp of the scaled scores, computed without any hoisting."""
+        k = tensors[2].repeat_interleave(4, dim=-3)
+        scores = (tensors[1] @ k.transpose(-2, -1)) * 0.5
+        if causal:
+            keep = torch.ones(4, 4, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~keep, float("-inf"))
+        return torch.logsumexp(scores, dim=-1, keepdim=True)
+
     def test_stats_match_unhoisted_reference(self) -> None:
         torch.manual_seed(7)
         tensors = self._tensors(2, 2)
         pytorch_ops.execute_graph(self._graph(stats=True, causal_mask=True), tensors)
 
-        k = tensors[2].repeat_interleave(4, dim=-3)
-        scores = (tensors[1] @ k.transpose(-2, -1)) * 0.5
-        causal = torch.ones(4, 4, dtype=torch.bool).tril()
-        expected = torch.logsumexp(
-            scores.masked_fill(~causal, float("-inf")), dim=-1, keepdim=True
-        )
-        torch.testing.assert_close(tensors[5], expected)
+        torch.testing.assert_close(tensors[5], self._expected_stats(tensors, True))
+
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_stats_come_from_fused_kernel(self, causal: bool) -> None:
+        """The fused SDPA forward emits the log-sum-exp, as in a training step,
+        so a timed run must not compute it again with a score matmul."""
+        torch.manual_seed(3)
+        tensors = self._tensors(2, 2)
+        replay = pytorch_ops.ReplayTensors(tensors)
+        graph = pytorch_ops.compile_graph(self._graph(stats=True, causal_mask=causal))
+        graph.execute(replay)
+        timed = _record_aten_ops(lambda: graph.execute(replay))
+
+        recomputed = {"aten.logsumexp.default", "aten.bmm.default", "aten.mm.default"}
+        assert not recomputed & set(timed), f"stats recomputed in timed run: {timed}"
+        torch.testing.assert_close(replay[5], self._expected_stats(tensors, causal))
+
+    def test_math_backend_stats_are_computed(self) -> None:
+        """The math backend saves no log-sum-exp, so the handler computes it."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        torch.manual_seed(5)
+        tensors = self._tensors(2, 2)
+        replay = pytorch_ops.ReplayTensors(tensors)
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
+        with pytorch_ops.use_pytorch_sdpa_backend(state):
+            pytorch_ops.compile_graph(
+                self._graph(stats=True, causal_mask=True)
+            ).execute(replay)
+
+        torch.testing.assert_close(replay[5], self._expected_stats(tensors, True))
 
     def test_computed_input_is_not_timed(self) -> None:
         """Cached setup assumes the inputs repeat unchanged. A K computed by an

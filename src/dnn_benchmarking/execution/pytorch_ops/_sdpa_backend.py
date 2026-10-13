@@ -233,6 +233,28 @@ def default_sdpa_avoids_math(
     return True
 
 
+# Where each fused forward saves its log-sum-exp for backward: Flash (GPU and
+# CPU) uses ``logsumexp``, memory-efficient uses ``log_sumexp``.
+_SAVED_LOGSUMEXP_ATTRS = ("_saved_logsumexp", "_saved_log_sumexp")
+
+
+def fused_logsumexp(output: torch.Tensor, q_len: int) -> Optional[torch.Tensor]:
+    """The log-sum-exp the fused SDPA forward saved for backward, ``[..., q_len, 1]``.
+
+    A forward with ``requires_grad`` inputs makes PyTorch compute the
+    log-sum-exp inside the attention kernel, as a training step does. It is
+    read back from ``output.grad_fn``. ``None`` when the backend saves none
+    (the math backend) or the call recorded no autograd node.
+    """
+    grad_fn = output.grad_fn
+    for name in _SAVED_LOGSUMEXP_ATTRS:
+        lse = getattr(grad_fn, name, None)
+        if isinstance(lse, torch.Tensor):
+            # The memory-efficient kernel may pad the query axis.
+            return lse.detach()[..., :q_len].unsqueeze(-1)
+    return None
+
+
 def execute_selected_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
