@@ -29,6 +29,11 @@ def _sdpa_forward_workarounds(
         return _node_uid(node, key, ("inputs",), required=False)
 
     reasons: List[str] = []
+    if uid("sink_token_tensor_uid") is not None:
+        reasons.append(
+            "PyTorch SDPA has no attention-sink input, so attention runs as "
+            "separate fp32 matmul, softmax and matmul ops instead of an SDPA kernel"
+        )
     if uid("page_table_k_tensor_uid") is not None:
         reasons.append(
             "PyTorch has no paged SDPA, so K/V are gathered into dense "
@@ -36,13 +41,18 @@ def _sdpa_forward_workarounds(
             "call, re-packed with torch.cat"
         )
     try:
-        _, window = _sdpa_derive_mask(node)
+        _, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError:
-        window = None
+        window, bottom_right = None, False
     if window is not None:
         reasons.append(
             "PyTorch SDPA has no sliding-window option, so the window is passed "
             "as an additive mask tensor that the kernel reads"
+        )
+    elif bottom_right:
+        reasons.append(
+            "the bottom-right causal mask is passed as an additive mask tensor "
+            "that the kernel reads (is_causal is top-left only)"
         )
     k_shape = _tensor_shape(graph_json, uid("k_tensor_uid"))
     v_shape = _tensor_shape(graph_json, uid("v_tensor_uid"))

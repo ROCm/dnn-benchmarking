@@ -3,7 +3,7 @@
 
 """Scaled-dot-product-attention forward/backward reference handlers."""
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -61,17 +61,28 @@ def _sdpa_head_repeat(q_heads: int, kv_heads: int, label: str) -> int:
     return q_heads // kv_heads
 
 
+class _SdpaPlan(NamedTuple):
+    mask_uid: Optional[int]
+    dropout_p: float
+    is_causal: bool
+    scale_uid: Optional[int]
+    attn_scale_value: Any
+    window: Optional[int]
+    bottom_right: bool
+    sink_uid: Optional[int]
+
+
 def _plan_sdpa_common(
     node: Dict[str, Any],
     allow_paged: bool = False,
-) -> Tuple[Optional[int], float, bool, Optional[int], Any, Optional[int]]:
+    allow_sink: bool = False,
+) -> _SdpaPlan:
     unsupported = [
         "seed_tensor_uid",
         "offset_tensor_uid",
         "dropout_mask_tensor_uid",
         "dropout_scale_tensor_uid",
         "block_mask_tensor_uid",
-        "sink_token_tensor_uid",
         "descale_q_tensor_uid",
         "descale_k_tensor_uid",
         "descale_v_tensor_uid",
@@ -79,6 +90,8 @@ def _plan_sdpa_common(
         "scale_s_tensor_uid",
         "scale_o_tensor_uid",
     ]
+    if not allow_sink:
+        unsupported.append("sink_token_tensor_uid")
     if not allow_paged:
         # The paged/varlen inputs are served by the forward handler only: it
         # gathers the page table into dense per-sequence K/V before calling
@@ -96,13 +109,6 @@ def _plan_sdpa_common(
         raise ValueError(
             "SDPA alibi/padding masks are not supported by the PyTorch reference"
         )
-    if _sdpa_bool(node, "causal_mask_bottom_right"):
-        raise ValueError(
-            "SDPA bottom-right causal mask is not supported by the PyTorch reference"
-        )
-    diagonal_alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
-    if diagonal_alignment not in ("TOP_LEFT", 0, None):
-        raise ValueError("Only TOP_LEFT SDPA diagonal alignment is supported")
 
     dropout_probability = _node_param(node, "dropout_probability", 0.0)
     dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
@@ -112,35 +118,52 @@ def _plan_sdpa_common(
         )
 
     mask_uid = _optional_uid(node, "attn_mask_tensor_uid")
-    is_causal, window = _sdpa_derive_mask(node)
-    if mask_uid is not None and (is_causal or window is not None):
+    is_causal, window, bottom_right = _sdpa_derive_mask(node)
+    if mask_uid is not None and (is_causal or window is not None or bottom_right):
         raise ValueError(
             "PyTorch SDPA reference does not support both attn_mask and causal_mask"
         )
 
     scale_uid = _optional_uid(node, "scale_tensor_uid")
     attn_scale_value = _node_param(node, "attn_scale_value", None)
-    return mask_uid, dropout_p, is_causal, scale_uid, attn_scale_value, window
+    sink_uid = _optional_uid(node, "sink_token_tensor_uid")
+    return _SdpaPlan(
+        mask_uid=mask_uid,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale_uid=scale_uid,
+        attn_scale_value=attn_scale_value,
+        window=window,
+        bottom_right=bottom_right,
+        sink_uid=sink_uid,
+    )
 
 
-def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
-    """Resolve (is_causal, sliding_window_width) the way hipDNN does.
+def _sdpa_derive_mask(
+    node: Dict[str, Any],
+) -> Tuple[bool, Optional[int], bool]:
+    """Resolve ``(is_causal, window_width, bottom_right)`` as hipDNN does.
 
-    Mirrors hipDNN's ``extractDiagonalBandParams`` (CPU reference) and the
-    ASM SDPA engine's ``getMaskType``:
-
-      * **The deprecated ``causal_mask`` wins**: it means top-left causal and
-        the bounds are ignored.
-      * Otherwise row ``q`` keeps ``q - left_bound <= k <= q + right_bound``,
-        an unset or ``-1`` bound being unbounded. The shipped ``quick/SdpaFwd``
-        bundles spell causality as ``left_bound=-1, right_bound=0``, while the
-        model traces set ``causal_mask: true``; both must resolve the same.
-
-    The window WIDTH is ``left_bound + 1`` (the band includes the current
-    token). Only causal bands (``right_bound == 0``) are expressible here.
+    The deprecated causal booleans take precedence over the modern bounds and
+    alignment. Otherwise, bounds describe a diagonal band, with ``-1`` meaning
+    unbounded. ``is_causal`` is reserved for PyTorch's native top-left mask;
+    bottom-right masks are materialized as additive masks.
     """
-    if _sdpa_bool(node, "causal_mask"):
-        return True, None
+    causal = _sdpa_bool(node, "causal_mask")
+    bottom_right_causal = _sdpa_bool(node, "causal_mask_bottom_right")
+    if causal and bottom_right_causal:
+        raise ValueError(
+            "SDPA causal_mask and causal_mask_bottom_right are mutually exclusive"
+        )
+    if causal:
+        return True, None, False
+    if bottom_right_causal:
+        return False, None, True
+
+    alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
+    if alignment not in ("TOP_LEFT", "BOTTOM_RIGHT", 0, 1, None):
+        raise ValueError(f"Unsupported SDPA diagonal_alignment {alignment!r}")
+    bottom_right = alignment in ("BOTTOM_RIGHT", 1)
 
     unbounded = -1
     left = _node_param(node, "left_bound", unbounded)
@@ -152,14 +175,14 @@ def _sdpa_derive_mask(node: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
         raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
     if right != 0:
         if right == unbounded and left == unbounded:
-            return False, None
+            return False, None, False
         raise ValueError(
             f"SDPA right_bound {right} is a forward-looking band the reference "
             "cannot express"
         )
     if left == unbounded:
-        return True, None
-    return False, left + 1
+        return (False, None, True) if bottom_right else (True, None, False)
+    return False, left + 1, bottom_right
 
 
 def _sdpa_resolve(
@@ -171,7 +194,7 @@ def _sdpa_resolve(
     mask_uid: Optional[int],
     scale_uid: Optional[int],
     attn_scale_value: Any,
-) -> Tuple[Optional[torch.Tensor], Optional[float], int, int]:
+) -> Tuple[Optional[torch.Tensor], float, int, int]:
     attn_mask = _tensor(tensors, mask_uid, node) if mask_uid is not None else None
     scale = _sdpa_resolve_scale(node, tensors, scale_uid, attn_scale_value)
     if q.ndim < 3 or k.ndim < 3 or v.ndim < 3:
@@ -182,21 +205,62 @@ def _sdpa_resolve(
     return attn_mask, scale, rep_k, rep_v
 
 
-def _sliding_window_mask(
+def _diagonal_band_mask(
     q_len: int,
     kv_len: int,
-    width: int,
+    width: Optional[int],
+    *,
+    bottom_right: bool,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Additive mask for a causal band of ``width`` tokens INCLUDING the current
-    one, i.e. the kernel's ``q - W + 1 <= k <= q``. Rows are aligned top-left,
-    matching the only diagonal alignment this reference accepts."""
+    """Build the additive diagonal-band mask used by hipDNN SDPA.
+
+    Bottom-right alignment shifts the diagonal by ``kv_len - q_len``. A
+    ``None`` width leaves the lower edge unbounded, producing a causal mask.
+    """
     q_idx = torch.arange(q_len, device=device).unsqueeze(-1)
     k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
-    keep = (k_idx <= q_idx) & (k_idx > q_idx - width)
+    diagonal = q_idx + (kv_len - q_len if bottom_right else 0)
+    keep = k_idx <= diagonal
+    if width is not None:
+        keep &= k_idx > diagonal - width
     mask = torch.zeros((q_len, kv_len), device=device, dtype=dtype)
     return mask.masked_fill(~keep, float("-inf"))
+
+
+def _band_mask_for(
+    q_len: int,
+    kv_len: int,
+    window: Optional[int],
+    bottom_right: bool,
+    like: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """The additive band mask a window or bottom-right alignment needs, else
+    ``None``. torch's SDPA spells only top-left causal natively
+    (``is_causal``); is_causal is False whenever this returns a mask."""
+    if window is None and not bottom_right:
+        return None
+    return _diagonal_band_mask(
+        q_len,
+        kv_len,
+        window,
+        bottom_right=bottom_right,
+        device=like.device,
+        dtype=like.dtype,
+    )
+
+
+def _sink_logits(sink: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """fp32 sink logits shaped to broadcast against scores shaped like ``like``
+    (``[..., heads, q_len, kv_len]``)."""
+    heads = int(like.shape[-3])
+    if sink.numel() != heads:
+        raise ValueError(
+            f"SDPA sink tensor has {sink.numel()} values for {heads} query heads"
+        )
+    shape = (1,) * (like.ndim - 3) + (heads, 1, 1)
+    return sink.to(dtype=torch.float32).reshape(shape)
 
 
 def _sdpa_kv_operands(
@@ -275,10 +339,12 @@ def _plan_paged_sdpa(
     attn_mask: Optional[torch.Tensor],
     dropout_p: float,
     is_causal: bool,
-    scale: Optional[float],
+    scale: float,
     rep_k: int,
     rep_v: int,
     window: Optional[int],
+    bottom_right: bool,
+    sink: Optional[torch.Tensor],
 ) -> Tuple[List[_PagedSegment], bool]:
     """Gather a paged KV cache into dense per-sequence K/V and masks.
 
@@ -366,18 +432,21 @@ def _plan_paged_sdpa(
         if q_seq.ndim == 4:
             k_seq = k_seq.unsqueeze(0)
             v_seq = v_seq.unsqueeze(0)
+        seq_q_len = int(q_seq.shape[-2])
+        seq_mask = _band_mask_for(seq_q_len, kv_len, window, bottom_right, q)
+        if sink is not None:
+            # Sinks run the manual fp32 attention: its operands replace K/V.
+            k_t, seq_mask = _score_operands(
+                k_seq, seq_mask, is_causal, seq_q_len, rep_k
+            )
+            segments.append(
+                (q_start, q_len, k_t, _fp32_at_query_heads(v_seq, rep_v), seq_mask)
+            )
+            q_start += q_len
+            continue
+
         k_seq, v_seq, enable_gqa = _sdpa_kv_operands(
             k_seq.contiguous(), v_seq.contiguous(), rep_k, rep_v
-        )
-
-        # A sliding window has no boolean spelling in torch's SDPA, so it is
-        # expressed as the additive mask it actually is. is_causal is already
-        # False here: a window is derived only when causal_mask is unset.
-        seq_q_len = int(q_seq.shape[-2])
-        seq_mask = (
-            None
-            if window is None
-            else _sliding_window_mask(seq_q_len, kv_len, window, q.device, q.dtype)
         )
         # Dispatch depends on shapes, not values: probe each shape once.
         if (seq_q_len, kv_len) not in probed:
@@ -398,46 +467,76 @@ def _plan_paged_sdpa(
     return segments, enable_gqa
 
 
-def _sdpa_stats_operands(
-    q: torch.Tensor,
+def _fp32_at_query_heads(t: torch.Tensor, rep: int) -> torch.Tensor:
+    t = t.to(dtype=torch.float32)
+    return t.repeat_interleave(rep, dim=-3) if rep > 1 else t
+
+
+def _score_operands(
     k: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
     is_causal: bool,
+    q_len: int,
     rep_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """fp32 Q, fp32 K^T at the query head count, and the fp32 additive mask.
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """fp32 K^T at the query head count and the fp32 additive mask.
 
-    Used only when the SDPA backend saved no log-sum-exp (math), so the stats
-    need their own score matmul. These depend only on the inputs, so the
-    benchmark path builds them once. A causal mask becomes an additive
-    ``-inf`` mask; ``attn_mask`` and ``is_causal`` never come together
-    (``_plan_sdpa_common``).
+    For the score matmul of the manual paths (stats under math, sinks). These
+    depend only on the inputs, so the benchmark path builds them once. A
+    causal mask becomes an additive ``-inf`` mask; ``attn_mask`` and
+    ``is_causal`` never come together (``_plan_sdpa_common``).
     """
-    q_float = q.to(dtype=torch.float32)
-    k_float = k.to(dtype=torch.float32)
-    if rep_k > 1:
-        k_float = k_float.repeat_interleave(rep_k, dim=-3)
     mask = None if attn_mask is None else attn_mask.to(dtype=torch.float32)
     if is_causal:
-        length_q, length_k = int(q.shape[-2]), int(k.shape[-2])
-        keep = torch.ones(length_q, length_k, dtype=torch.bool, device=q.device).tril()
-        mask = torch.zeros(
-            length_q, length_k, dtype=torch.float32, device=q.device
-        ).masked_fill(~keep, float("-inf"))
-    return q_float, k_float.transpose(-2, -1), mask
+        mask = _diagonal_band_mask(
+            q_len,
+            int(k.shape[-2]),
+            None,
+            bottom_right=False,
+            device=k.device,
+            dtype=torch.float32,
+        )
+    return _fp32_at_query_heads(k, rep_k).transpose(-2, -1), mask
+
+
+def _scores(
+    q_float: torch.Tensor,
+    k_float_t: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    scale: float,
+) -> torch.Tensor:
+    scores = torch.matmul(q_float, k_float_t) * scale
+    return scores if mask is None else scores + mask
 
 
 def _sdpa_stats(
     q_float: torch.Tensor,
     k_float_t: torch.Tensor,
     mask: Optional[torch.Tensor],
-    scale: Optional[float],
+    scale: float,
 ) -> torch.Tensor:
-    """Log-sum-exp of the masked, scaled scores (``_sdpa_stats_operands``)."""
-    scores = torch.matmul(q_float, k_float_t) * (1.0 if scale is None else scale)
-    if mask is not None:
-        scores = scores + mask
-    return torch.logsumexp(scores, dim=-1, keepdim=True)
+    """Log-sum-exp of the masked, scaled scores (``_score_operands``)."""
+    return torch.logsumexp(_scores(q_float, k_float_t, mask, scale), -1, keepdim=True)
+
+
+def _sink_attention(
+    q_float: torch.Tensor,
+    k_float_t: torch.Tensor,
+    v_float: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    sink_logits: torch.Tensor,
+    scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp32 attention with sink logits in the softmax denominator.
+
+    PyTorch's SDPA has no sink input, so this is computed by hand. Returns
+    the fp32 output and the log-sum-exp including the sinks (the stats).
+    """
+    scores = _scores(q_float, k_float_t, mask, scale)
+    log_denom = torch.logaddexp(
+        torch.logsumexp(scores, dim=-1, keepdim=True), sink_logits
+    )
+    return torch.matmul(torch.exp(scores - log_denom), v_float), log_denom
 
 
 def _is_virtual(graph_json: Dict[str, Any], uid: int) -> bool:
@@ -471,6 +570,10 @@ def compile_sdpa(
     training forward: Q/K/V go in with ``requires_grad`` and the kernel's saved
     log-sum-exp is read back (``fused_logsumexp``). Only a backend that saves
     none (math) gets a separate score matmul.
+
+    PyTorch's SDPA has no attention-sink input, so a graph with sinks runs a
+    manual fp32 attention (``_sink_attention``); its fp32 operands are built
+    once too, and its softmax denominator is the stats output.
     """
     _sdpa_unsupported_if_present(
         node,
@@ -486,14 +589,8 @@ def compile_sdpa(
     k_uid = _required_input_uid(node, "k_tensor_uid")
     v_uid = _required_input_uid(node, "v_tensor_uid")
     o_uid = _required_output_uid(node, "o_tensor_uid")
-    (
-        mask_uid,
-        dropout_p,
-        is_causal,
-        scale_uid,
-        attn_scale_value,
-        window,
-    ) = _plan_sdpa_common(node, allow_paged=True)
+    plan = _plan_sdpa_common(node, allow_paged=True, allow_sink=True)
+    dropout_p, is_causal = plan.dropout_p, plan.is_causal
     stats_uid = _optional_uid(node, "stats_tensor_uid")
 
     page_table_k_uid = _optional_uid(node, "page_table_k_tensor_uid")
@@ -517,8 +614,9 @@ def compile_sdpa(
             q_uid,
             k_uid,
             v_uid,
-            mask_uid,
-            scale_uid,
+            plan.mask_uid,
+            plan.scale_uid,
+            plan.sink_uid,
             page_table_k_uid,
             page_table_v_uid,
             seq_len_q_uid,
@@ -538,30 +636,47 @@ def compile_sdpa(
             )
         return _replay_constant(tensors, ("sdpa", o_uid, part), build)
 
+    def resolve(tensors, q, k, v):
+        attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
+            node,
+            tensors,
+            q,
+            k,
+            v,
+            plan.mask_uid,
+            plan.scale_uid,
+            plan.attn_scale_value,
+        )
+        sink = None
+        if plan.sink_uid is not None:
+            sink = _sink_logits(_tensor(tensors, plan.sink_uid, node), q)
+        return attn_mask, scale, rep_k, rep_v, sink
+
     def prepare_dense(
         tensors: Dict[int, torch.Tensor],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-    ) -> Tuple[
-        Optional[torch.Tensor],
-        Optional[float],
-        int,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        bool,
-    ]:
-        attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
-            node, tensors, q, k, v, mask_uid, scale_uid, attn_scale_value
+    ) -> Tuple[Any, ...]:
+        attn_mask, scale, rep_k, rep_v, sink = resolve(tensors, q, k, v)
+        band = _band_mask_for(
+            int(q.shape[-2]), int(k.shape[-2]), plan.window, plan.bottom_right, q
         )
-        if window is not None:
-            # A sliding window has no boolean spelling in torch's SDPA; build
-            # the additive band mask once so O and stats see the same mask.
-            # is_causal is already False: windows exclude causal_mask.
-            attn_mask = _sliding_window_mask(
-                int(q.shape[-2]), int(k.shape[-2]), window, q.device, q.dtype
+        if band is not None:
+            attn_mask = band
+        if sink is not None:
+            k_t, mask = _score_operands(
+                k, attn_mask, is_causal, int(q.shape[-2]), rep_k
             )
+            return (
+                scale,
+                q.to(dtype=torch.float32),
+                k_t,
+                _fp32_at_query_heads(v, rep_v),
+                mask,
+                sink,
+            )
+
         k_op, v_op, enable_gqa = _sdpa_kv_operands(k, v, rep_k, rep_v)
         q_op = q
         if stats_uid is not None:
@@ -586,10 +701,8 @@ def compile_sdpa(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-    ) -> Tuple[List[_PagedSegment], Optional[float], bool]:
-        attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
-            node, tensors, q, k, v, mask_uid, scale_uid, attn_scale_value
-        )
+    ) -> Tuple[Any, ...]:
+        attn_mask, scale, rep_k, rep_v, sink = resolve(tensors, q, k, v)
         segments, enable_gqa = _plan_paged_sdpa(
             node,
             tensors,
@@ -606,9 +719,12 @@ def compile_sdpa(
             scale,
             rep_k,
             rep_v,
-            window,
+            plan.window,
+            plan.bottom_right,
+            sink,
         )
-        return segments, scale, enable_gqa
+        q_float = None if sink is None else q.to(dtype=torch.float32)
+        return segments, scale, enable_gqa, q_float, sink
 
     # Everything derived from the constant inputs is built once per replay
     # map, during priming. Timed iterations run only the SDPA call(s) and, for
@@ -618,24 +734,49 @@ def compile_sdpa(
         k = _tensor(tensors, k_uid, node)
         v = _tensor(tensors, v_uid, node)
         if is_paged:
-            segments, scale, enable_gqa = setup(
+            segments, scale, enable_gqa, q_float, sink = setup(
                 tensors, "paged", lambda: prepare_paged(tensors, q, k, v)
             )
-            outputs = [
-                execute_selected_sdpa(
-                    q[..., start : start + length, :],
-                    k_seq,
-                    v_seq,
-                    attn_mask=seq_mask,
-                    dropout_p=dropout_p,
-                    is_causal=is_causal,
-                    scale=scale,
-                    enable_gqa=enable_gqa,
-                )
-                for start, length, k_seq, v_seq, seq_mask in segments
-            ]
-            # Re-pack along the query axis in the order the sequences were laid out.
-            _store_tensor(tensors, o_uid, torch.cat(outputs, dim=-2))
+            if sink is not None:
+                outputs = [
+                    _sink_attention(
+                        q_float[..., start : start + length, :],
+                        k_t,
+                        v_float,
+                        seq_mask,
+                        sink,
+                        scale,
+                    )[0]
+                    for start, length, k_t, v_float, seq_mask in segments
+                ]
+                o = torch.cat(outputs, dim=-2).to(dtype=q.dtype)
+            else:
+                outputs = [
+                    execute_selected_sdpa(
+                        q[..., start : start + length, :],
+                        k_seq,
+                        v_seq,
+                        attn_mask=seq_mask,
+                        dropout_p=dropout_p,
+                        is_causal=is_causal,
+                        scale=scale,
+                        enable_gqa=enable_gqa,
+                    )
+                    for start, length, k_seq, v_seq, seq_mask in segments
+                ]
+                o = torch.cat(outputs, dim=-2)
+            # Re-packed along the query axis in the order the sequences were laid out.
+            _store_tensor(tensors, o_uid, o)
+            return
+
+        if plan.sink_uid is not None:
+            scale, q_float, k_t, v_float, mask, sink = setup(
+                tensors, "sink", lambda: prepare_dense(tensors, q, k, v)
+            )
+            o, stats = _sink_attention(q_float, k_t, v_float, mask, sink, scale)
+            _store_tensor(tensors, o_uid, o.to(dtype=q.dtype))
+            if stats_uid is not None:
+                _store_tensor(tensors, stats_uid, stats)
             return
 
         attn_mask, scale, rep_k, q_op, k_op, v_op, enable_gqa = setup(
@@ -664,7 +805,12 @@ def compile_sdpa(
                 *setup(
                     tensors,
                     "stats",
-                    lambda: _sdpa_stats_operands(q, k, attn_mask, is_causal, rep_k),
+                    lambda: (
+                        q.to(dtype=torch.float32),
+                        *_score_operands(
+                            k, attn_mask, is_causal, int(q.shape[-2]), rep_k
+                        ),
+                    ),
                 ),
                 scale,
             )
@@ -703,18 +849,12 @@ def compile_sdpa_backward(
     dq_uid = _required_output_uid(node, "dq_tensor_uid")
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
-    (
-        mask_uid,
-        _dropout_p,
-        is_causal,
-        scale_uid,
-        attn_scale_value,
-        window,
-    ) = _plan_sdpa_common(node)
-    if window is not None:
+    plan = _plan_sdpa_common(node)
+    is_causal = plan.is_causal
+    if plan.window is not None or plan.bottom_right:
         raise ValueError(
-            "SDPA sliding-window bounds are not supported by the PyTorch reference "
-            "backward"
+            "SDPA bottom-right/sliding-window bounds are not supported by the "
+            "PyTorch reference backward"
         )
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
@@ -725,7 +865,14 @@ def compile_sdpa_backward(
         do = _tensor(tensors, do_uid, node)
         stats = _tensor(tensors, stats_uid, node)
         attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
-            node, tensors, q, k, v, mask_uid, scale_uid, attn_scale_value
+            node,
+            tensors,
+            q,
+            k,
+            v,
+            plan.mask_uid,
+            plan.scale_uid,
+            plan.attn_scale_value,
         )
 
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -739,7 +886,7 @@ def compile_sdpa_backward(
         stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
 
         head_dim = int(q.shape[-1])
-        scale_value = 1.0 if scale is None else float(scale)
+        scale_value = float(scale)
         k_heads = int(k.shape[1])
         v_heads = int(v.shape[1])
         if rep_k > 1:

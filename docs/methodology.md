@@ -92,14 +92,18 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
 - When K and V have different head counts, or with
   `--pytorch-sdpa-backend math`, the tool expands K and V to the query head
   count once, before the timed loop.
-- Sliding-window masks and the dense per-sequence K and V of paged graphs are
-  built once. A timed paged iteration does one SDPA call per sequence and one
-  `torch.cat`.
+- Sliding-window and bottom-right causal masks and the dense per-sequence K
+  and V of paged graphs are built once. A timed paged iteration does one SDPA
+  call per sequence and one `torch.cat`.
 - The `stats` output (log-sum-exp) comes from the fused kernel, as in a
   PyTorch training step. Q, K and V go into the call with `requires_grad`, and
   the tool reads the log-sum-exp that the kernel saves for the backward pass.
   The math backend saves no log-sum-exp. With math, the tool computes it with
   a separate score matmul, which is timed. Its fp32 operands are built once.
+- Attention sinks have no PyTorch SDPA input. These graphs run attention as
+  separate fp32 ops (score matmul, softmax with the sinks, output matmul).
+  The fp32 copies of Q, K and V, the K/V expansion, the mask and the sink
+  logits are built once. The softmax denominator is also the `stats` output.
 
 With the default backend selection, a GQA call that no fused kernel (Flash
 or memory-efficient) accepts would use the math backend. That backend copies
@@ -117,7 +121,9 @@ Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
 - Paged KV: one SDPA call per sequence and a `torch.cat`.
-- Sliding window: the kernel reads an additive mask tensor.
+- Sliding window or bottom-right causal: the kernel reads an additive mask
+  tensor.
+- Attention sinks: separate fp32 ops instead of an SDPA kernel.
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.
 
@@ -393,11 +399,11 @@ The tool does not do these things yet:
   the dtype of the graph. For fp16 and bf16 graphs the reference then has the
   same precision as the result under test, and the tolerances must be loose.
   An fp32 reference needs new tolerances for all workloads.
-- SDPA reference for every mask. The PyTorch reference follows hipDNN mask
-  semantics: the deprecated `causal_mask` wins over left and right bounds
-  (top-left causal). A bounded left window is supported only with
-  `right_bound = 0`. Other masks make the reference decline the graph as
-  unsupported.
+- SDPA reference for every mask. The PyTorch reference supports top-left and
+  bottom-right causal bands, bounded left windows with `right_bound = 0`, and
+  attention-sink logits. It follows hipDNN precedence: the deprecated causal
+  booleans override the modern bounds and diagonal alignment. Other masks make
+  the reference decline the graph as unsupported.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
