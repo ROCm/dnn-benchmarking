@@ -175,11 +175,13 @@ failure and prints the first failures with their error messages.
 Both levels also fail an SDPA node (forward or backward) that sets neither
 `attn_scale_value` nor `scale_tensor_uid`: write the scale the workload's source
 used, usually `1/sqrt(head_dim)`, rather than relying on a backend default.
-They also fail a causal SDPA node with Sq = 1 whose effective diagonal is
-top-left (it attends only to key 0; a decode step is unmasked or bottom-right),
-and print a warning for other effective top-left causal nodes with Sq != Skv,
-because decode and chunked prefill workloads almost always use bottom-right
-alignment.
+A causal SDPA node with Sq = 1 whose effective diagonal is top-left attends
+only to key 0, which no decode step means (a decode step is unmasked or
+bottom-right). 80 graphs in the shipped corpus are written that way, so the
+check prints them as `DECODE` and still exits 0; pass `--strict-decode-mask`
+to make them failures once those graphs are regenerated. Other effective
+top-left causal nodes with Sq != Skv print a warning, because decode and
+chunked prefill workloads almost always use bottom-right alignment.
 
 "Effective" is the mask hipDNN resolves, which is not always the one the JSON
 names. `causal_mask: true` forces `left_bound = -1`, `right_bound = 0` and a

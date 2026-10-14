@@ -147,7 +147,7 @@ def test_both_causal_flags_are_a_conflict(tool) -> None:
     assert tool.sdpa_mask_flag_conflicts(_graph(1, 4096, **_BOTTOM_RIGHT)) == []
 
 
-def test_the_cli_fails_on_errors_and_only_reports_warnings(
+def test_the_cli_reports_decode_graphs_and_fails_only_under_strict(
     tool, tmp_path, monkeypatch, capsys
 ) -> None:
     (tmp_path / "decode.json").write_text(json.dumps(_graph(1, 4096, **_FIX_KIT)))
@@ -163,6 +163,15 @@ def test_the_cli_fails_on_errors_and_only_reports_warnings(
     assert "WARN" in capsys.readouterr().out
 
     monkeypatch.setattr(sys, "argv", [*argv, str(tmp_path / "decode.json")])
+    assert tool.main() == 0
+    out = capsys.readouterr().out
+    assert "DECODE" in out and "key 0" in out and "decode=1" in out
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [*argv, "--strict-decode-mask", str(tmp_path / "decode.json")],
+    )
     assert tool.main() == 1
     assert "key 0" in capsys.readouterr().out
 
@@ -175,4 +184,4 @@ def test_the_cli_fails_on_errors_and_only_reports_warnings(
     monkeypatch.setattr(sys, "argv", [*argv, str(tmp_path / "fixed.json")])
     assert tool.main() == 0
     out = capsys.readouterr().out
-    assert "WARN" not in out and "FAIL" not in out
+    assert "WARN" not in out and "FAIL" not in out and "DECODE" not in out

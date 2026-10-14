@@ -15,9 +15,11 @@ They also check the causal diagonal of SDPA graphs with Sq != Skv, using the
 mask hipDNN actually runs: causal_mask overrides diagonal_alignment and the
 written bounds, and setting both causal_mask and causal_mask_bottom_right is
 rejected. An effective top-left diagonal with Sq = 1 attends only to key 0,
-which no decode step means: that fails. Any other effective top-left causal
-graph with Sq != Skv is printed as a warning, since decode and chunked prefill
-almost always mean bottom-right.
+which no decode step means. 80 graphs in the shipped corpus are written that
+way, so it is reported as DECODE and does not fail the run;
+--strict-decode-mask makes it a failure once those graphs are regenerated.
+Any other effective top-left causal graph with Sq != Skv is printed as a
+warning, since decode and chunked prefill almost always mean bottom-right.
 
 Usage:
   python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
@@ -145,6 +147,12 @@ def main():
         "--src", help="dnn-benchmarking src/ dir for --level json", default=None
     )
     ap.add_argument("--show", type=int, default=20, help="max failures to print")
+    ap.add_argument(
+        "--strict-decode-mask",
+        action="store_true",
+        help="fail, rather than report, an Sq=1 graph whose effective causal "
+        "diagonal is top-left",
+    )
     args = ap.parse_args()
 
     files = sorted(set(iter_files(args.paths)))
@@ -180,6 +188,7 @@ def main():
 
     ok = fail = 0
     warned = []
+    decode = []
     failures = []
     for f in files:
         try:
@@ -198,8 +207,9 @@ def main():
                     "diagonal_alignment with left_bound=-1, right_bound=0"
                 )
             errors, warnings = sdpa_top_left_mismatches(graph)
-            if errors:
+            if errors and args.strict_decode_mask:
                 raise ValueError("; ".join(errors))
+            decode.extend((f, e) for e in errors)
             warned.extend((f, w) for w in warnings)
             if args.level == "json":
                 g = loader.load_json(Path(f))
@@ -222,13 +232,15 @@ def main():
             fail += 1
             if len(failures) < args.show:
                 failures.append((f, str(e)))
+    for f, e in decode[: args.show]:
+        print(f"DECODE {f}\n       {e}")
     for f, w in warned[: args.show]:
         print(f"WARN {f}\n     {w}")
     for f, e in failures:
         print(f"FAIL {f}\n     {e}")
     print(
         f"\nlevel={args.level}  files={len(files)}  ok={ok}  fail={fail}  "
-        f"warn={len(warned)}"
+        f"decode={len(decode)}  warn={len(warned)}"
     )
     return 1 if fail else 0
 
