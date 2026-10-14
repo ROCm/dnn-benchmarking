@@ -1188,18 +1188,14 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[6].data, expected_stats, rtol=1e-5)
 
     @pytest.mark.parametrize(
-        "parameters,match",
+        "parameters",
         [
-            ({"causal_mask_bottom_right": True}, "bottom-right causal"),
-            (
-                {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
-                "TOP_LEFT",
-            ),
+            {"causal_mask_bottom_right": True},
+            {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
         ],
+        ids=["boolean", "alignment"],
     )
-    def test_sdpa_backward_still_rejects_bottom_right(
-        self, parameters: dict, match: str
-    ) -> None:
+    def test_sdpa_backward_still_rejects_bottom_right(self, parameters: dict) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.zeros((1, 1, 2, 2), dtype=np.float32)
         stats = np.zeros((1, 1, 2, 1), dtype=np.float32)
@@ -1225,7 +1221,7 @@ class TestPyTorchProviderNewOps:
             ],
         }
 
-        with pytest.raises(UnsupportedGraphError, match=match):
+        with pytest.raises(UnsupportedGraphError, match="backward"):
             provider.compute_reference(
                 graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
             )
@@ -1507,6 +1503,109 @@ class TestPyTorchProviderNewOps:
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
 
+    def test_sdpa_bottom_right_causal_aligns_to_sequence_end(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 4, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [2.0], [3.0], [4.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "left_bound": -1,
+                        "right_bound": 0,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
+        np.testing.assert_allclose(outputs[6].data, [[[[np.log(3.0)], [np.log(4.0)]]]])
+
+    def test_sdpa_deprecated_causal_mask_overrides_bottom_right_alignment(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 4, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [2.0], [3.0], [4.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {
+                        "causal_mask": True,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[1.0], [1.5]]]])
+
+    def test_sdpa_attention_sink_gqa_and_bottom_right_match_explicit_softmax(
+        self,
+    ) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array(
+            [[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]]],
+            dtype=np.float32,
+        )
+        k = np.array(
+            [[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, -1.0]]]],
+            dtype=np.float32,
+        )
+        v = np.array(
+            [[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]],
+            dtype=np.float32,
+        )
+        sink = np.log(np.array([2.0, 4.0], dtype=np.float32))
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "sink_token_tensor_uid": 5,
+                    },
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "attn_scale_value": 0.5,
+                        "left_bound": -1,
+                        "right_bound": 0,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v, 5: sink})
+
+        q_t = torch.from_numpy(q)
+        k_t = torch.from_numpy(k).repeat_interleave(2, dim=1)
+        v_t = torch.from_numpy(v).repeat_interleave(2, dim=1)
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * 0.5
+        bottom_right = torch.ones(2, 4, dtype=torch.bool).tril(diagonal=2)
+        scores = scores.masked_fill(~bottom_right, float("-inf"))
+        log_denom = torch.logaddexp(
+            torch.logsumexp(scores, dim=-1, keepdim=True),
+            torch.from_numpy(sink).reshape(1, 2, 1, 1),
+        )
+        expected = torch.exp(scores - log_denom) @ v_t
+
+        np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
+        np.testing.assert_allclose(outputs[6].data, log_denom.numpy(), rtol=1e-6)
+
     def test_sdpa_bfloat16_uses_graph_dtype(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[0.10, 0.20], [0.30, 0.40]]]], dtype=np.float32)
@@ -1580,7 +1679,6 @@ class TestPyTorchProviderNewOps:
             "dropout_mask_tensor_uid",
             "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
-            "sink_token_tensor_uid",
             "descale_q_tensor_uid",
             "descale_k_tensor_uid",
             "descale_v_tensor_uid",
@@ -1687,13 +1785,14 @@ class TestPyTorchProviderNewOps:
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
             ({"right_bound": 1}, "forward-looking band"),
-            ({"left_bound": 1}, "requires right_bound=0"),
-            ({"left_bound": 1, "right_bound": 1}, "requires right_bound=0"),
+            ({"left_bound": 1}, "forward-looking band"),
+            ({"left_bound": 1, "right_bound": 1}, "forward-looking band"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
             (
                 {"causal_mask": True, "causal_mask_bottom_right": True},
                 "mutually exclusive",
             ),
+            ({"diagonal_alignment": "CENTER"}, "diagonal_alignment"),
         ],
     )
     def test_sdpa_forward_rejects_unsupported_attributes(
@@ -1715,7 +1814,14 @@ class TestPyTorchProviderNewOps:
         with pytest.raises(UnsupportedGraphError, match=match):
             provider.compute_reference(graph_json, {1: q, 2: q, 3: q})
 
-    def test_sdpa_forward_rejects_attn_mask_with_causal_mask(self) -> None:
+    @pytest.mark.parametrize(
+        "mask_attributes",
+        [{"causal_mask": True}, {"causal_mask_bottom_right": True}],
+        ids=["top-left", "bottom-right"],
+    )
+    def test_sdpa_forward_rejects_attn_mask_with_derived_mask(
+        self, mask_attributes: dict
+    ) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
         graph_json = {
@@ -1729,7 +1835,7 @@ class TestPyTorchProviderNewOps:
                         "attn_mask_tensor_uid": 5,
                     },
                     "outputs": {"o_tensor_uid": 4},
-                    "attributes": {"causal_mask": True, "dropout_probability": 0.0},
+                    "attributes": {"dropout_probability": 0.0, **mask_attributes},
                 }
             ],
         }
