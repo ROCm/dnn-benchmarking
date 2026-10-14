@@ -2728,3 +2728,103 @@ class TestPyTorchSdpaMaskDerivation:
 
         with pytest.raises(ValueError, match=match):
             _sdpa_derive_mask(self._node(**attributes))
+
+
+class TestPyTorchSdpaCausalBandHandoff:
+    """What the handler hands torch: an explicit band costs the flash backend,
+    which takes no attn_mask, so it is built only where is_causal cannot say
+    the same thing."""
+
+    @staticmethod
+    def _graph(sq: int, skv: int, **attributes):
+        return {
+            "tensors": [],
+            "nodes": [
+                {
+                    "name": "sdpa",
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"attn_scale_value": 0.25, **attributes},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _call_kwargs(graph, sq: int, skv: int):
+        tensors = {
+            1: torch.zeros(1, 1, sq, 2),
+            2: torch.zeros(1, 1, skv, 2),
+            3: torch.zeros(1, 1, skv, 2),
+        }
+        seen = {}
+
+        def recording_sdpa(query, key, value, **kwargs):
+            seen.update(kwargs)
+            return torch.zeros(1, 1, sq, 2)
+
+        with patch.object(
+            torch.nn.functional,
+            "scaled_dot_product_attention",
+            side_effect=recording_sdpa,
+        ):
+            pytorch_ops.execute_graph(graph, tensors)
+        return seen
+
+    def test_square_bottom_right_keeps_the_boolean_causal_path(self) -> None:
+        """Sq == Skv: the bottom-right diagonal IS the top-left one. The shipped
+        quick/SdpaFwd hd128_causal bundles are this case, and an attn_mask there
+        would make --pytorch-sdpa-backend flash fail."""
+        kwargs = self._call_kwargs(
+            self._graph(256, 256, right_bound=0, diagonal_alignment="BOTTOM_RIGHT"),
+            256,
+            256,
+        )
+
+        assert kwargs["attn_mask"] is None
+        assert kwargs["is_causal"] is True
+
+    def test_non_square_bottom_right_needs_the_explicit_band(self) -> None:
+        kwargs = self._call_kwargs(
+            self._graph(3, 5, right_bound=0, diagonal_alignment="BOTTOM_RIGHT"), 3, 5
+        )
+
+        assert kwargs["is_causal"] is False
+        keep = kwargs["attn_mask"] == 0
+        assert torch.equal(
+            keep,
+            torch.tensor(
+                [
+                    [True, True, True, False, False],
+                    [True, True, True, True, False],
+                    [True, True, True, True, True],
+                ]
+            ),
+        )
+
+    def test_square_causal_mask_keeps_the_boolean_causal_path(self) -> None:
+        kwargs = self._call_kwargs(
+            self._graph(256, 256, causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"),
+            256,
+            256,
+        )
+
+        assert kwargs["attn_mask"] is None
+        assert kwargs["is_causal"] is True
+
+    def test_bottom_right_with_more_queries_than_keys_is_declined(self) -> None:
+        """The shifted diagonal starts above row 0, so the first queries would
+        see no key at all and softmax would return NaN instead of failing."""
+        graph = self._graph(5, 3, right_bound=0, diagonal_alignment="BOTTOM_RIGHT")
+        tensors = {
+            1: torch.zeros(1, 1, 5, 2),
+            2: torch.zeros(1, 1, 3, 2),
+            3: torch.zeros(1, 1, 3, 2),
+        }
+
+        with pytest.raises(UnsupportedGraphError, match="leaves queries with no keys"):
+            pytorch_ops.execute_graph(graph, tensors)
