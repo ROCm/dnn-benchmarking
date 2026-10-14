@@ -24,14 +24,18 @@ stages are:
 3. `dnn-benchmarking package`: install dnn-benchmarking (editable unless
    `--no-editable`).
 4. `rocm-libraries sources`: fetch `rocm-libraries` if it is absent (see
-   [rocm-libraries source](#rocm-libraries-source)).
+   [rocm-libraries source](#rocm-libraries-source)). Skipped with
+   `--reuse-artifacts`, which builds nothing from these sources.
 5. `Build dependencies`: pip packages the source build needs. Skipped with
    `--reuse-artifacts`.
 6. `hipDNN and provider plugins`: build hipDNN and the MIOpen, hipBLASLt and
    hip-kernel providers, and install them into the ROCm SDK prefix. With
    `--reuse-artifacts`, only check that hipDNN is in the prefix.
 7. `hipDNN Python bindings`: build `hipdnn_frontend` against that prefix.
-   With `--reuse-artifacts`, only warn if it does not import.
+   With `--reuse-artifacts`, build nothing and instead check that the venv
+   has the `hipdnn_frontend` package, without importing it (its native
+   libraries may need a GPU this host has not got). Setup fails when the
+   package is absent.
 8. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
    and link the wheel rocprofiler libraries.
 9. `Verify installation`.
@@ -54,7 +58,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--torch-index-url URL` | pip index URL for PyTorch. |
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
-| `--reuse-artifacts` | Do not build hipDNN, the providers or the `hipdnn_frontend` bindings. Use what is installed in the selected prefix and venv. Setup fails if hipDNN is absent from the prefix. |
+| `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
 | `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
@@ -96,22 +100,39 @@ dnn-benchmarking finds the engine plugins in
 |---|---|---|---|
 | `rocm` (default) | ROCm nightly for the detected architecture | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
 | `cuda` | CUDA PyTorch from PyPI, or `--torch-index-url` | Not built. No bindings, no amdsmi, no `ROCM_PATH` | `--runtime pytorch` on NVIDIA GPUs. |
-| `cpu` | CPU-only PyTorch | Built from source and installed into `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm`. With `--reuse-artifacts`, uses the hipDNN installed there. | CI and `--validate pytorch` with a system ROCm. |
+| `cpu` | CPU-only PyTorch | Built from source, or reused from the installed prefix with a prepared CPU venv and `--reuse-artifacts`. | CI and `--validate pytorch` with a system ROCm. |
 | `existing` | Keep the PyTorch in the venv | ROCm PyTorch: its SDK libraries. CUDA PyTorch: the `cuda` path. CPU PyTorch: the installed ROCm. | Reuse a venv. |
-| `none` | Not installed | Same as `cpu` | hipDNN backend without PyTorch. |
+| `none` | Not installed | Same prefix as `cpu`; reuse requires a prepared venv without torch. | hipDNN backend without PyTorch. |
 
 A CPU-only PyTorch never enables `--runtime pytorch`. It is only for
 `--validate pytorch`. `--runtime pytorch` needs a ROCm or CUDA build.
 
 The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
 `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
-`--reuse-artifacts` they build hipDNN and the providers from source and
-install them into that prefix, over any hipDNN it already holds. To use the
-hipDNN of a system ROCm, pass `--reuse-artifacts`:
+`--reuse-artifacts`, they build hipDNN and the providers from source.
+To reuse an installed hipDNN, first prepare a venv with the matching
+PyTorch mode and a compatible `hipdnn_frontend` package. The selected
+prefix must contain hipDNN CMake configurations. Setup keeps that venv,
+PyTorch and the bindings, but reinstalls the dnn-benchmarking package.
+It rejects a fresh hipDNN reuse venv, `--clean` or a different torch
+mode before changing the workspace. In `cpu` and `rocm` modes, setup
+checks a recorded torch source. It rejects mismatched explicit
+`--torch-index-url` and ROCm `--gpu-arch` flags before modifying the venv.
+For example, after preparing `.workspace/.venv` with CPU PyTorch and
+the bindings:
 
 ```bash
-python3 setup_env.py --torch-mode cpu --rocm-prefix /opt/rocm --reuse-artifacts
+python3 setup_env.py --workspace .workspace --torch-mode cpu --rocm-prefix /opt/rocm --reuse-artifacts -y
 ```
+
+Use `--torch-mode existing` to keep the venv's installed PyTorch without
+specifying its mode. This mode does not compare torch source flags with
+the venv's record. `--torch-mode none` requires an existing venv without
+torch. The bindings check only checks package presence. On a host with
+a usable ROCm runtime, import `hipdnn_frontend` to check its native libraries.
+
+ROCm wheel reuse without `--rocm-prefix` also needs the venv's devel SDK.
+Setup does not download that SDK in reuse mode.
 
 ## CUDA hosts
 
@@ -148,14 +169,18 @@ sources.
 
 - When `rocm-libraries/` is absent, setup does a sparse, blobless clone of
   the pinned submodule commit (`git rev-parse HEAD:rocm-libraries`). The clone
-  contains only `cmake`, `projects/hipdnn` and `dnn-providers`, not the full
-  monorepo.
+  contains only `cmake`, `shared/ctest`, `projects/hipdnn` and
+  `dnn-providers`, not the full monorepo. `shared/ctest` carries the CMake
+  file that declares hipDNN's test categories; the rest of `shared/` (Tensile
+  and friends) stays out.
 - Where no git metadata exists (Docker builds, source tarballs), give
   `--rocm-libraries-ref SHA`. Without it, setup uses the moving
   `.gitmodules` branch and shows a warning.
 - Setup uses an existing checkout as it is. A checkout from
   `git submodule update --init` also works. Setup shows a warning when the
-  checkout is not at the pinned commit.
+  checkout is not at the pinned commit. When that checkout is sparse and was
+  made by an older setup, the root directories added since are added to its
+  sparse set; a full checkout is left alone.
 
 To build against a different commit, check it out directly:
 
@@ -163,6 +188,17 @@ To build against a different commit, check it out directly:
 git -C rocm-libraries fetch --depth 1 origin <ref>
 git -C rocm-libraries checkout FETCH_HEAD
 ```
+
+Setup builds only from `rocm-libraries/` in this directory. To benchmark a
+revision you already have in another checkout, add it there as a worktree
+(`rocm-libraries/` must be absent or empty):
+
+```bash
+git -C <your-checkout> worktree add <dnn-benchmarking>/rocm-libraries <rev>
+```
+
+Each run replaces the build and install in this checkout, so comparing two
+revisions needs two `dnn-benchmarking` checkouts.
 
 ## Extra CMake defines
 
