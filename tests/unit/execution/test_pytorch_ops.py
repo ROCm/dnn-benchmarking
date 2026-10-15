@@ -1359,9 +1359,15 @@ class TestPyTorchOpsNewHandlers:
         torch.testing.assert_close(dv, dv_ref, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.parametrize("causal", [False, True])
-    def test_sdpa_across_query_blocks_matches_autograd(self, causal: bool) -> None:
+    def test_sdpa_across_query_blocks_matches_autograd(
+        self, causal: bool, monkeypatch
+    ) -> None:
         """150 query rows span three 64-row blocks, the last one partial; the
         causal mask must use absolute query indices in every block."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        # Scores of one query row: 4 heads x 150 keys x 4 bytes.
+        monkeypatch.setattr(sdpa, "_SCORE_BLOCK_BYTES", 64 * 4 * 150 * 4)
         torch.manual_seed(3)
         scale = 1.0 / (8**0.5)
         q = torch.randn(1, 4, 150, 8)
@@ -1409,10 +1415,14 @@ class TestPyTorchOpsNewHandlers:
         ids=["sink-causal", "bottom-right", "window", "sink-window"],
     )
     def test_sdpa_masks_and_sink_across_query_blocks(
-        self, attrs, sink, bottom_right, width
+        self, attrs, sink, bottom_right, width, monkeypatch
     ) -> None:
         """150 query rows span three 64-row blocks; every block must see its
         own rows of the mask. 170 keys make bottom-right differ from top-left."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        # Scores of one query row: 2 heads x 170 keys x 4 bytes.
+        monkeypatch.setattr(sdpa, "_SCORE_BLOCK_BYTES", 64 * 2 * 170 * 4)
         torch.manual_seed(7)
         scale = 1.0 / (8**0.5)
         q_len, kv_len = 150, 170

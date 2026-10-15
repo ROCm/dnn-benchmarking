@@ -72,7 +72,7 @@ def _sdpa_scratch_bytes(
     node counts the KV length its page table can address.
     """
     from ...execution.pytorch_ops.handlers.sdpa import (
-        _QUERY_BLOCK,
+        _SCORE_BLOCK_BYTES,
         _sdpa_derive_mask,
     )
 
@@ -86,7 +86,9 @@ def _sdpa_scratch_bytes(
     page_table = _dims(_uid_tensor(inputs, "page_table_k_tensor_uid", tensors))
     if len(page_table) >= 2:
         kv_len *= page_table[1]  # pages per sequence * page size
-    block = rows * min(q_len, _QUERY_BLOCK) * kv_len * 4 * 3
+    row_bytes = rows * kv_len * 4  # one query row of float32 scores
+    block_rows = min(q_len, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
+    block = row_bytes * block_rows * 3
     expanded = rows * kv_len * head_dim * 4 * 2
     if node.get("type") == "SdpaBackwardAttributes":
         expanded *= 2

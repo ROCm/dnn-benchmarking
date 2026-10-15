@@ -219,21 +219,27 @@ def _diagonal_band_mask(
     return mask.masked_fill(~keep, float("-inf"))
 
 
-#: Query rows per block in the explicit (non-fused) SDPA paths on the host.
-#: One block's scores are ``[..., 64, kv_len]`` float32, so the CPU reference
-#: memory grows with ``kv_len`` instead of ``q_len * kv_len``.
-_QUERY_BLOCK = 64
+#: Bytes of one float32 score block in the explicit (non-fused) SDPA paths on
+#: the host. A block takes every query row that fits, so a small graph runs as
+#: one block, and a large one keeps a few score-sized temporaries instead of
+#: ``q_len * kv_len`` ones. On an MI210 host, 2 GiB blocks ran a B1 H32 S16384
+#: causal backward in 28 s with 5 GiB; 64-row blocks took 113 s with 2 GiB, and
+#: one full-size block took 32 s with 162 GiB.
+_SCORE_BLOCK_BYTES = 2 << 30
 
 
-def _query_blocks(q_len: int, device: torch.device) -> Sequence[Tuple[int, int]]:
-    """``(start, end)`` row ranges; one empty range when ``q_len`` is 0.
+def _query_blocks(q: torch.Tensor, kv_len: int) -> Sequence[Tuple[int, int]]:
+    """``(start, end)`` query row ranges; one empty range when ``q_len`` is 0.
 
     Only host tensors are split. On a GPU the timed PyTorch row and the GPU
-    reference keep one block: many small launches would double the reference
-    time of SDPA backward, and a GPU out-of-memory error already falls back
-    to the CPU reference.
+    reference keep one block: smaller launches would slow the timed row, and
+    a GPU out-of-memory error already falls back to the CPU reference.
     """
-    step = _QUERY_BLOCK if device.type == "cpu" else max(q_len, 1)
+    q_len = int(q.shape[-2])
+    step = max(q_len, 1)
+    if q.device.type == "cpu":
+        row_bytes = q.shape[:-2].numel() * kv_len * 4  # one query row of scores
+        step = min(step, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
     return [
         (start, min(start + step, q_len)) for start in range(0, max(q_len, 1), step)
     ]
@@ -310,7 +316,7 @@ def _sink_attention(
     k_f = _expand_heads(k, rep_k)
     v_f = _expand_heads(v, rep_v)
     outputs, stats = [], []
-    for start, end in _query_blocks(int(q.shape[-2]), q.device):
+    for start, end in _query_blocks(q, int(k_f.shape[-2])):
         scores = _block_scores(
             q[..., start:end, :],
             k_f,
@@ -524,7 +530,7 @@ def _sdpa_stats(
                 dim=-1,
                 keepdim=True,
             )
-            for start, end in _query_blocks(int(q.shape[-2]), q.device)
+            for start, end in _query_blocks(q, int(k_f.shape[-2]))
         ],
         dim=-2,
     )
@@ -728,13 +734,13 @@ def compile_sdpa_backward(
         k_f = _expand_heads(k, rep_k)
         v_f = _expand_heads(v, rep_v)
 
-        # One query block at a time: a block's probs and d_scores are
-        # [B, H, 64, kv_len], so memory does not grow with q_len * kv_len.
+        # One query block at a time: a block's probs and d_scores are at most
+        # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
         # dQ rows are independent; dK and dV sum over every query row.
         dq = torch.empty_like(q_f)
         dk_full = torch.zeros_like(k_f)
         dv_full = torch.zeros_like(v_f)
-        for start, end in _query_blocks(int(q.shape[-2]), q.device):
+        for start, end in _query_blocks(q, int(k_f.shape[-2])):
             q_block = q_f[..., start:end, :]
             do_block = do_f[..., start:end, :]
             scores = _block_scores(
