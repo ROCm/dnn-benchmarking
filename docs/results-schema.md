@@ -251,7 +251,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 
 | Key | Type | Meaning |
 |---|---|---|
-| `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch, or when validation was requested but no usable reference exists (`message` gives the reason). `null` when no comparison ran. |
+| `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch, or when validation was requested but no usable reference exists (`message` gives the reason). `null` when no comparison ran, also when the tool skipped validation because the CPU reference would not fit in host memory (`message` gives the estimate). |
 | `rtol` | float | Relative tolerance applied, the largest over outputs. For `fp8_e8m0` outputs it applies to log2 values. When no comparison ran (`match` is `false`, `message` is set and `n_total` is `null`), this is `--rtol` when given, else the fp32 default 1e-5, not the tolerance of the output dtype. |
 | `atol` | float | Absolute tolerance applied, with the same rules as `rtol`. When no comparison ran, this is `--atol` when given, else 1e-6. |
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
@@ -346,7 +346,7 @@ it.
 | `reference` | `role` is `reference` and the row ran. |
 | `failed` | Validation found a mismatch, or validation was requested but no usable reference exists. |
 | `passed` | Validation ran and every output is within tolerance. |
-| `unchecked` | The row ran, but no validation result exists. This is not a pass. |
+| `unchecked` | The row ran, but no validation result exists. This is not a pass. Validation that the tool skipped because of the host memory estimate also gives `unchecked`. |
 
 The checks apply in the order of the table. The CLI exit code follows from the
 verdicts of the `engine` rows; `reference` rows do not count. See

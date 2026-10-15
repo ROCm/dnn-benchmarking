@@ -219,31 +219,70 @@ def _diagonal_band_mask(
     return mask.masked_fill(~keep, float("-inf"))
 
 
-def _sdpa_scores(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    attn_mask: Optional[torch.Tensor],
+#: Bytes of one float32 score block in the explicit (non-fused) SDPA paths on
+#: the host. A block takes every query row that fits, so a small graph runs as
+#: one block, and a large one keeps a few score-sized temporaries instead of
+#: ``q_len * kv_len`` ones. On an MI210 host, 2 GiB blocks ran a B1 H32 S16384
+#: causal backward in 28 s with 5 GiB; 64-row blocks took 113 s with 2 GiB, and
+#: one full-size block took 32 s with 162 GiB.
+_SCORE_BLOCK_BYTES = 2 << 30
+
+
+def _query_blocks(q: torch.Tensor, kv_len: int) -> Sequence[Tuple[int, int]]:
+    """``(start, end)`` query row ranges; one empty range when ``q_len`` is 0.
+
+    Only host tensors are split. On a GPU the timed PyTorch row and the GPU
+    reference keep one block: smaller launches would slow the timed row, and
+    a GPU out-of-memory error already falls back to the CPU reference.
+    """
+    q_len = int(q.shape[-2])
+    step = max(q_len, 1)
+    if q.device.type == "cpu":
+        row_bytes = q.shape[:-2].numel() * kv_len * 4  # one query row of scores
+        step = min(step, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
+    return [
+        (start, min(start + step, q_len)) for start in range(0, max(q_len, 1), step)
+    ]
+
+
+def _rows(
+    tensor: Optional[torch.Tensor], start: int, end: int
+) -> Optional[torch.Tensor]:
+    """Query rows ``start:end`` of a per-row tensor; a broadcast row stays whole."""
+    if tensor is None or tensor.ndim < 2 or tensor.shape[-2] == 1:
+        return tensor
+    return tensor[..., start:end, :]
+
+
+def _expand_heads(t: torch.Tensor, repeat: int) -> torch.Tensor:
+    """``t`` in float32 with each head repeated ``repeat`` times (GQA)."""
+    t = t.to(dtype=torch.float32)
+    return t.repeat_interleave(repeat, dim=-3) if repeat > 1 else t
+
+
+def _block_scores(
+    q_block: torch.Tensor,
+    k_f: torch.Tensor,
+    mask_block: Optional[torch.Tensor],
     is_causal: bool,
+    start: int,
     scale: float,
-    rep_k: int,
 ) -> torch.Tensor:
-    q_float = q.to(dtype=torch.float32)
-    k_float = k.to(dtype=torch.float32)
-    if rep_k > 1:
-        k_float = k_float.repeat_interleave(rep_k, dim=-3)
-    scores = torch.matmul(q_float, k_float.transpose(-2, -1))
+    """float32 scores of query rows ``start:start+len`` against every key.
+
+    The causal mask uses absolute query indices, so key ``j`` is visible to
+    query ``i`` only when ``j <= i`` (top-left alignment).
+    """
+    scores = torch.matmul(q_block.to(dtype=torch.float32), k_f.transpose(-2, -1))
     scores *= scale
-    if attn_mask is not None:
-        scores += attn_mask.to(dtype=torch.float32)
+    if mask_block is not None:
+        scores += mask_block.to(dtype=torch.float32)
     if is_causal:
-        scores += _diagonal_band_mask(
-            int(scores.shape[-2]),
-            int(scores.shape[-1]),
-            None,
-            bottom_right=False,
-            device=scores.device,
-            dtype=scores.dtype,
-        )
+        rows = torch.arange(
+            start, start + int(scores.shape[-2]), device=scores.device
+        ).unsqueeze(-1)
+        cols = torch.arange(int(scores.shape[-1]), device=scores.device).unsqueeze(0)
+        scores.masked_fill_(cols > rows, float("-inf"))
     return scores
 
 
@@ -255,6 +294,45 @@ def _sink_logits(sink: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         )
     shape = (1,) * (scores.ndim - 3) + (heads, 1, 1)
     return sink.to(dtype=torch.float32).reshape(shape)
+
+
+def _sink_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+    rep_k: int,
+    rep_v: int,
+    sink: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Attention with sink logits: ``(output, stats)``.
+
+    ``stats`` is the log of the softmax denominator, sink included. The work
+    runs one query block at a time, and the probabilities overwrite the
+    block's scores.
+    """
+    k_f = _expand_heads(k, rep_k)
+    v_f = _expand_heads(v, rep_v)
+    outputs, stats = [], []
+    for start, end in _query_blocks(q, int(k_f.shape[-2])):
+        scores = _block_scores(
+            q[..., start:end, :],
+            k_f,
+            _rows(attn_mask, start, end),
+            is_causal,
+            start,
+            scale,
+        )
+        log_denom = torch.logaddexp(
+            torch.logsumexp(scores, dim=-1, keepdim=True),
+            _sink_logits(sink, scores),
+        )
+        probabilities = scores.sub_(log_denom).exp_()
+        outputs.append(torch.matmul(probabilities, v_f).to(dtype=q.dtype))
+        stats.append(log_denom)
+    return torch.cat(outputs, dim=-2), torch.cat(stats, dim=-2)
 
 
 def _call_sdpa(
@@ -270,15 +348,9 @@ def _call_sdpa(
     sink: Optional[torch.Tensor],
 ) -> torch.Tensor:
     if sink is not None:
-        scores = _sdpa_scores(q, k, attn_mask, is_causal, scale, rep_k)
-        log_denom = torch.logaddexp(
-            torch.logsumexp(scores, dim=-1, keepdim=True),
-            _sink_logits(sink, scores),
-        )
-        probabilities = torch.exp(scores - log_denom)
-        if rep_v > 1:
-            v = v.repeat_interleave(rep_v, dim=-3)
-        return torch.matmul(probabilities, v.to(dtype=torch.float32)).to(dtype=q.dtype)
+        return _sink_attention(
+            q, k, v, attn_mask, is_causal, scale, rep_k, rep_v, sink
+        )[0]
 
     # Expand K and V independently to the query head count. PyTorch's
     # enable_gqa only models equal K/V head counts, so explicit repeat is the
@@ -441,13 +513,27 @@ def _sdpa_stats(
     is_causal: bool,
     scale: float,
     rep_k: int,
-    sink: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    scores = _sdpa_scores(q, k, attn_mask, is_causal, scale, rep_k)
-    stats = torch.logsumexp(scores, dim=-1, keepdim=True)
-    if sink is not None:
-        stats = torch.logaddexp(stats, _sink_logits(sink, scores))
-    return stats
+    """Log-sum-exp of the scores, one query block at a time."""
+    k_f = _expand_heads(k, rep_k)
+    return torch.cat(
+        [
+            torch.logsumexp(
+                _block_scores(
+                    q[..., start:end, :],
+                    k_f,
+                    _rows(attn_mask, start, end),
+                    is_causal,
+                    start,
+                    scale,
+                ),
+                dim=-1,
+                keepdim=True,
+            )
+            for start, end in _query_blocks(q, int(k_f.shape[-2]))
+        ],
+        dim=-2,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -549,26 +635,31 @@ def compile_sdpa(
                 device=q.device,
                 dtype=q.dtype,
             )
-        o = _call_sdpa(
-            q,
-            k,
-            v,
-            attn_mask,
-            plan.dropout_p,
-            plan.is_causal,
-            scale,
-            rep_k,
-            rep_v,
-            sink,
-        )
+        if sink is not None:
+            # One score computation serves the output and the stats.
+            o, stats = _sink_attention(
+                q, k, v, attn_mask, plan.is_causal, scale, rep_k, rep_v, sink
+            )
+        else:
+            o = _call_sdpa(
+                q,
+                k,
+                v,
+                attn_mask,
+                plan.dropout_p,
+                plan.is_causal,
+                scale,
+                rep_k,
+                rep_v,
+                None,
+            )
+            stats = None
         _store_tensor(tensors, o_uid, o)
 
         if stats_uid is not None:
-            _store_tensor(
-                tensors,
-                stats_uid,
-                _sdpa_stats(q, k, attn_mask, plan.is_causal, scale, rep_k, sink),
-            )
+            if stats is None:
+                stats = _sdpa_stats(q, k, attn_mask, plan.is_causal, scale, rep_k)
+            _store_tensor(tensors, stats_uid, stats)
 
     return run
 
@@ -632,8 +723,6 @@ def compile_sdpa_backward(
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
 
         q_f = q.to(dtype=torch.float32)
-        k_f = k.to(dtype=torch.float32)
-        v_f = v.to(dtype=torch.float32)
         o_f = o.to(dtype=torch.float32)
         do_f = do.to(dtype=torch.float32)
         stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
@@ -642,32 +731,35 @@ def compile_sdpa_backward(
         scale_value = float(scale)
         k_heads = int(k.shape[1])
         v_heads = int(v.shape[1])
-        if rep_k > 1:
-            k_f = k_f.repeat_interleave(rep_k, dim=1)
-        if rep_v > 1:
-            v_f = v_f.repeat_interleave(rep_v, dim=1)
+        k_f = _expand_heads(k, rep_k)
+        v_f = _expand_heads(v, rep_v)
 
-        scores = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale_value
-        if attn_mask is not None:
-            scores = scores + attn_mask.to(dtype=torch.float32)
-        if plan.is_causal:
-            causal = torch.ones(
-                scores.shape[-2],
-                scores.shape[-1],
-                dtype=torch.bool,
-                device=scores.device,
-            ).tril()
-            scores = scores.masked_fill(~causal, float("-inf"))
-
-        probs = torch.exp(scores - stats_f)
-        row_dot = (do_f * o_f).sum(dim=-1, keepdim=True)
-        d_probs = torch.matmul(do_f, v_f.transpose(-2, -1))
-        d_scores = probs * (d_probs - row_dot)
-        d_scores_scaled = d_scores * scale_value
-
-        dq = torch.matmul(d_scores_scaled, k_f)
-        dk_full = torch.matmul(d_scores_scaled.transpose(-2, -1), q_f)
-        dv_full = torch.matmul(probs.transpose(-2, -1), do_f)
+        # One query block at a time: a block's probs and d_scores are at most
+        # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
+        # dQ rows are independent; dK and dV sum over every query row.
+        dq = torch.empty_like(q_f)
+        dk_full = torch.zeros_like(k_f)
+        dv_full = torch.zeros_like(v_f)
+        for start, end in _query_blocks(q, int(k_f.shape[-2])):
+            q_block = q_f[..., start:end, :]
+            do_block = do_f[..., start:end, :]
+            scores = _block_scores(
+                q_block,
+                k_f,
+                _rows(attn_mask, start, end),
+                plan.is_causal,
+                start,
+                scale_value,
+            )
+            probs = scores.sub_(_rows(stats_f, start, end)).exp_()
+            row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
+            # d_scores = probs * (do @ v^T - row_dot) * scale
+            d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
+            d_scores.sub_(row_dot).mul_(probs).mul_(scale_value)
+            dq[..., start:end, :] = torch.matmul(d_scores, k_f)
+            dk_full += torch.matmul(d_scores.transpose(-2, -1), q_block)
+            dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
+            del scores, probs, d_scores
 
         batch, seq_kv = dk_full.shape[0], dk_full.shape[2]
         if rep_k > 1:

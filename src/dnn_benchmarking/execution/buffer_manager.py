@@ -15,9 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..common.blocks import iter_blocks
 from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
+
 
 # fp8 formats as (exponent bits, mantissa bits); E8M0 is a special case.
 _FP8_FORMATS = {
@@ -138,25 +140,63 @@ def _storage_view(storage: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     return storage.reshape(tensor_info.dims)
 
 
-def _encode_to_storage_bytes(data: np.ndarray, tensor_info: TensorInfo) -> bytes:
-    """Encode dense logical data into raw storage bytes using graph strides."""
-    storage = np.zeros(
-        tensor_info.storage_elements, dtype=_storage_dtype(tensor_info.dtype)
-    )
-    _storage_view(storage, tensor_info)[...] = _encode(data, tensor_info.dtype)
-    return storage.tobytes()
+def _is_packed(tensor_info: TensorInfo) -> bool:
+    """True when the graph strides are the dense C-order strides of the dims."""
+    if not tensor_info.strides:
+        return True
+    if len(tensor_info.strides) != len(tensor_info.dims):
+        return False  # storage_elements reports the malformed entry
+    expected = 1
+    for dim, stride in zip(reversed(tensor_info.dims), reversed(tensor_info.strides)):
+        if dim != 1 and stride != expected:
+            return False
+        expected *= dim
+    return True
 
 
-def _decode_storage_bytes(data_bytes: bytes, tensor_info: TensorInfo) -> np.ndarray:
-    """Decode raw storage bytes into a dense logical ndarray."""
+def _encode_to_storage(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
+    """Encode dense logical data into 1-D storage words in the graph layout.
+
+    Data that already holds the storage words in a packed layout is returned
+    as a flat view, without a copy. Otherwise the words are encoded block by
+    block straight into the storage array, so no full-size encoded copy or
+    conversion temporary exists.
+    """
+    storage_dtype = _storage_dtype(tensor_info.dtype)
+    data = np.asarray(data)
+    if (
+        data.dtype == storage_dtype
+        and data.shape == tuple(tensor_info.dims)
+        and data.flags.c_contiguous
+        and _is_packed(tensor_info)
+    ):
+        return data.reshape(-1)
+    storage = np.zeros(tensor_info.storage_elements, dtype=storage_dtype)
+    view = _storage_view(storage, tensor_info)
+    data = np.broadcast_to(data, view.shape)
+    for index in iter_blocks(view.shape):
+        view[index] = _encode(data[index], tensor_info.dtype)
+    return storage
+
+
+def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
+    """Decode raw storage into a dense logical ndarray.
+
+    ``raw`` is any buffer-protocol object (``bytes``, a NumPy array). The
+    words are decoded block by block into the result.
+    """
     storage = np.frombuffer(
-        data_bytes,
+        raw,
         dtype=_storage_dtype(tensor_info.dtype),
         count=tensor_info.storage_elements,
     )
-    return np.ascontiguousarray(
-        _decode(_storage_view(storage, tensor_info), tensor_info.dtype)
-    )
+    view = _storage_view(storage, tensor_info)
+    if storage.dtype == tensor_info.dtype.numpy:
+        return np.ascontiguousarray(view)
+    out = np.empty(view.shape, dtype=tensor_info.dtype.numpy)
+    for index in iter_blocks(view.shape):
+        out[index] = _decode(view[index], tensor_info.dtype)
+    return out
 
 
 def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
@@ -286,8 +326,14 @@ def generate_input_data(
             # per-role structured generation (e.g. MoE offsets) is the upgrade path.
             input_data[tensor_info.uid] = np.zeros(tensor_info.dims, dtype=dtype.numpy)
         else:
-            data = rng.random(tensor_info.dims, dtype=np.float32)
-            input_data[tensor_info.uid] = _decode(_encode(data, dtype), dtype)
+            # Draw and round one block at a time straight into the result, so
+            # no full-size float32 draw or conversion temporary exists. The
+            # blocks are drawn in C order, so the values match one full draw.
+            data = np.empty(tensor_info.dims, dtype=dtype.numpy)
+            for index in iter_blocks(data.shape):
+                block = rng.random(data[index].shape, dtype=np.float32)
+                data[index] = _decode(_encode(block, dtype), dtype)
+            input_data[tensor_info.uid] = data
 
     return input_data
 
@@ -371,18 +417,19 @@ class BufferManager:
             return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
         return {uid: buffer.data_ptr() for uid, buffer in self._buffers.items()}
 
-    def _write_bytes(self, buffer: Any, raw_bytes: bytes) -> None:
-        """Copy graph-layout bytes from the host into one buffer."""
+    def _write_storage(self, buffer: Any, storage: np.ndarray) -> None:
+        """Copy 1-D graph-layout storage words from the host into one buffer."""
         if self._device is None:
-            buffer.copy_from_host(raw_bytes)
+            # DeviceBuffer.copy_from_host accepts only ``bytes``.
+            buffer.copy_from_host(storage.tobytes())
             return
         import torch
 
         with warnings.catch_warnings():
             # copy_ only reads the source, so a read-only view is safe and
-            # avoids a second host copy of the input.
+            # avoids a host copy of the input.
             warnings.simplefilter("ignore", UserWarning)
-            source = torch.frombuffer(raw_bytes, dtype=torch.uint8)
+            source = torch.frombuffer(storage, dtype=torch.uint8)
         buffer.copy_(source)
 
     def load_input_data(self, input_data: Dict[int, np.ndarray]) -> None:
@@ -413,7 +460,7 @@ class BufferManager:
                 )
             buffer = self._buffers.get(tensor_info.uid)
             if buffer is not None:
-                self._write_bytes(buffer, _encode_to_storage_bytes(data, tensor_info))
+                self._write_storage(buffer, _encode_to_storage(data, tensor_info))
 
     def zero_outputs(self) -> None:
         """Zero output tensor buffers.
@@ -455,10 +502,10 @@ class BufferManager:
             return None
 
         if self._device is None:
-            data_bytes = buffer.copy_to_host()
+            raw = buffer.copy_to_host()
         else:
-            data_bytes = buffer.cpu().numpy().tobytes()
-        return _decode_storage_bytes(data_bytes, tensor_info)
+            raw = buffer.cpu().numpy()
+        return _decode_storage(raw, tensor_info)
 
     def get_output_tensor(self, uid: int) -> Optional["torch.Tensor"]:
         """Return a typed logical view of an output buffer without a copy.

@@ -19,16 +19,31 @@ if TYPE_CHECKING:
 class ReferenceOutput:
     """Output from a reference provider for a single tensor.
 
+    At least one of ``data`` and ``device_data`` is set.
+
     Attributes:
-        data: The computed output data as numpy array.
+        data: The computed output data as numpy array, or None when only
+            ``device_data`` holds the values (see :meth:`host_data`).
         tensor_uid: UID of the tensor in the graph.
         device_data: Same logical values as ``data`` as a torch GPU tensor,
             or None when only host data exists.
     """
 
-    data: "np.ndarray"
+    data: Optional["np.ndarray"]
     tensor_uid: int
     device_data: Optional[Any] = None
+
+    def host_data(self) -> "np.ndarray":
+        """Return the values as a dense host array in the validation representation.
+
+        A device-only reference is copied to the host on each call and the
+        copy is not kept, so the host holds it only during one comparison.
+        """
+        if self.data is not None:
+            return self.data
+        from ..execution.pytorch_buffer_manager import host_numpy
+
+        return host_numpy(self.device_data)
 
 
 class ReferenceProvider(ABC):
@@ -85,6 +100,15 @@ class ReferenceProvider(ABC):
             True if all operations are supported.
         """
         return True  # Default: assume supported, let compute_reference fail if not
+
+    def estimate_host_bytes(self, graph_json: Dict[str, Any]) -> Optional[int]:
+        """Estimate the host memory ``compute_reference`` needs beyond its inputs.
+
+        Returns:
+            Bytes, or None when the provider has no estimate (the caller then
+            runs the reference without a memory check).
+        """
+        return None
 
 
 class ReferenceProviderRegistry:

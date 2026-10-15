@@ -80,6 +80,15 @@ code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
 log2 values of e8m0 outputs. The source is `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
+The reference comes from the timed PyTorch `reference` row on the GPU. If
+that row cannot run (for example, no GPU or a GPU out-of-memory error), and
+no strict `--pytorch-sdpa-backend` is set, the tool computes the reference on
+the CPU. Before it does, it estimates the host memory of the CPU reference.
+If the estimate is more than 80 % of the available host memory, the tool
+does not validate the graph. It prints a warning, and the engine rows of the
+graph get the verdict `unchecked` with the reason in `correctness.message`.
+These rows do not fail validation (no exit code 3).
+
 ### Comparison
 
 | Option | Default | Description |
