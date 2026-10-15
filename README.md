@@ -120,17 +120,20 @@ The `Workloads/` directory holds benchmark workload tarballs tracked with
 [DVC](https://dvc.org/). The public DVC remote in `.dvc/config` allows
 anonymous reads.
 
-- `Workloads/headline/`: the curated set for regression monitoring
+- `Workloads/headline/`: the small, curated set for regression monitoring
   (`conv`, `bnorm`, `attn`, `hipblaslt`, `moe`, `norm`). No ROCm engine
   implements RMSNorm or LayerNorm yet, so `norm.tar.gz` has no applicable
   engines today.
 - `Workloads/microbench/`: larger shape sweeps and per-source collections.
 - `Workloads/models/`: workloads for each model.
+- `Workloads/corpus/`: reference collections across models with minimal graph
+  overlap inside each collection. The current collection covers convolution.
 
 ```bash
 python -m pip install "dvc[s3]"
-dvc pull                                   # every workload
-dvc pull Workloads/headline/conv.tar.gz.dvc  # one workload
+dvc pull                                      # every workload
+dvc pull Workloads/headline/conv.tar.gz.dvc   # one headline workload
+dvc pull Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz.dvc  # corpus
 ```
 
 Keep credentials in `.dvc/config.local`, which git ignores.
