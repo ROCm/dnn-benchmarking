@@ -219,17 +219,23 @@ def _diagonal_band_mask(
     return mask.masked_fill(~keep, float("-inf"))
 
 
-#: Query rows per block in the explicit (non-fused) SDPA paths. One block's
-#: scores are ``[..., 64, kv_len]`` float32, so the reference memory grows
-#: with ``kv_len`` instead of ``q_len * kv_len``.
+#: Query rows per block in the explicit (non-fused) SDPA paths on the host.
+#: One block's scores are ``[..., 64, kv_len]`` float32, so the CPU reference
+#: memory grows with ``kv_len`` instead of ``q_len * kv_len``.
 _QUERY_BLOCK = 64
 
 
-def _query_blocks(q_len: int) -> Sequence[Tuple[int, int]]:
-    """``(start, end)`` row ranges; one empty range when ``q_len`` is 0."""
+def _query_blocks(q_len: int, device: torch.device) -> Sequence[Tuple[int, int]]:
+    """``(start, end)`` row ranges; one empty range when ``q_len`` is 0.
+
+    Only host tensors are split. On a GPU the timed PyTorch row and the GPU
+    reference keep one block: many small launches would double the reference
+    time of SDPA backward, and a GPU out-of-memory error already falls back
+    to the CPU reference.
+    """
+    step = _QUERY_BLOCK if device.type == "cpu" else max(q_len, 1)
     return [
-        (start, min(start + _QUERY_BLOCK, q_len))
-        for start in range(0, max(q_len, 1), _QUERY_BLOCK)
+        (start, min(start + step, q_len)) for start in range(0, max(q_len, 1), step)
     ]
 
 
@@ -304,7 +310,7 @@ def _sink_attention(
     k_f = _expand_heads(k, rep_k)
     v_f = _expand_heads(v, rep_v)
     outputs, stats = [], []
-    for start, end in _query_blocks(int(q.shape[-2])):
+    for start, end in _query_blocks(int(q.shape[-2]), q.device):
         scores = _block_scores(
             q[..., start:end, :],
             k_f,
@@ -518,7 +524,7 @@ def _sdpa_stats(
                 dim=-1,
                 keepdim=True,
             )
-            for start, end in _query_blocks(int(q.shape[-2]))
+            for start, end in _query_blocks(int(q.shape[-2]), q.device)
         ],
         dim=-2,
     )
@@ -728,7 +734,7 @@ def compile_sdpa_backward(
         dq = torch.empty_like(q_f)
         dk_full = torch.zeros_like(k_f)
         dv_full = torch.zeros_like(v_f)
-        for start, end in _query_blocks(int(q.shape[-2])):
+        for start, end in _query_blocks(int(q.shape[-2]), q.device):
             q_block = q_f[..., start:end, :]
             do_block = do_f[..., start:end, :]
             scores = _block_scores(
