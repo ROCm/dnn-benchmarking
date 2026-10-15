@@ -66,10 +66,15 @@ def _sdpa_scratch_bytes(
     """float32 scratch of one SDPA node beyond its graph tensors.
 
     Per query block: scores/probabilities, d_scores and one reduction
-    temporary. For the whole node: K and V expanded to the query heads, and
-    the backward dK/dV accumulators.
+    temporary. For the whole node: K and V expanded to the query heads, the
+    backward dK/dV accumulators and, for bottom-right or windowed masks, the
+    full ``[q_len, kv_len]`` band mask with its boolean temporaries. A paged
+    node counts the KV length its page table can address.
     """
-    from ...execution.pytorch_ops.handlers.sdpa import _QUERY_BLOCK
+    from ...execution.pytorch_ops.handlers.sdpa import (
+        _QUERY_BLOCK,
+        _sdpa_derive_mask,
+    )
 
     inputs = node.get("inputs") or {}
     q = _dims(_uid_tensor(inputs, "q_tensor_uid", tensors))
@@ -78,11 +83,20 @@ def _sdpa_scratch_bytes(
         return 0
     rows = prod(q[:-3]) * q[-3]  # batch * query heads
     q_len, kv_len, head_dim = q[-2], k[-2], q[-1]
+    page_table = _dims(_uid_tensor(inputs, "page_table_k_tensor_uid", tensors))
+    if len(page_table) >= 2:
+        kv_len *= page_table[1]  # pages per sequence * page size
     block = rows * min(q_len, _QUERY_BLOCK) * kv_len * 4 * 3
     expanded = rows * kv_len * head_dim * 4 * 2
     if node.get("type") == "SdpaBackwardAttributes":
         expanded *= 2
-    return block + expanded
+    try:
+        _, window, bottom_right = _sdpa_derive_mask(node)
+    except ValueError:
+        window, bottom_right = None, False  # the reference declines the node
+    # Two float32 masks (zeros, then masked_fill) and two bool masks.
+    band = q_len * kv_len * (2 * 4 + 2) if window is not None or bottom_right else 0
+    return block + expanded + band
 
 
 def estimate_reference_host_bytes(graph_json: Dict[str, Any]) -> int:

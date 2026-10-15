@@ -103,6 +103,25 @@ def test_non_finite_values_fail(side: str, bad: float) -> None:
         assert result.message == f"{name} contains NaN or Inf values"
 
 
+@pytest.mark.parametrize("side, bad", [("actual", np.nan), ("expected", np.inf)])
+def test_non_finite_value_in_a_later_block_fails(
+    monkeypatch, side: str, bad: float
+) -> None:
+    """The finite checks must cover every block, not only the first."""
+    from dnn_benchmarking.common import blocks
+
+    monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 4)
+    good = np.arange(1.0, 13.0, dtype=np.float32).reshape(3, 4)
+    poisoned = good.copy()
+    poisoned[-1, -1] = bad
+    actual, expected = (poisoned, good) if side == "actual" else (good, poisoned)
+
+    for result in _both(actual, expected, rtol=1.0, atol=1.0):
+        assert not result.passed
+        name = "output" if side == "actual" else "reference"
+        assert result.message == f"{name} contains NaN or Inf values"
+
+
 def test_shape_mismatch_fails() -> None:
     for result in _both(np.zeros((2, 3)), np.zeros((3, 2)), rtol=1.0, atol=1.0):
         assert not result.passed

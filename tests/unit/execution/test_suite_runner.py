@@ -690,6 +690,83 @@ def test_cpu_reference_that_fits_in_host_memory_runs(fake_torch, monkeypatch):
     assert [e.verdict for e in engines] == ["passed", "passed"]
 
 
+@pytest.mark.parametrize("unknown", ["estimate", "available_memory"])
+def test_cpu_reference_runs_when_host_memory_cannot_be_judged(
+    fake_torch, monkeypatch, unknown
+):
+    """Without an estimate or a memory reading the reference runs as before."""
+    import psutil
+
+    def virtual_memory():
+        if unknown == "available_memory":
+            raise RuntimeError("no /proc/meminfo")
+        return SimpleNamespace(available=10 << 30)
+
+    monkeypatch.setattr(psutil, "virtual_memory", virtual_memory)
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = (
+        None if unknown == "estimate" else 9 << 30
+    )
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+
+
+def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
+    torch = pytest.importorskip("torch")
+    base = torch.arange(12, dtype=torch.float32)
+    view = base[4:8]
+
+    kept = suite_runner._owned(view)
+
+    assert torch.equal(kept, torch.tensor([4.0, 5.0, 6.0, 7.0]))
+    assert kept.untyped_storage().nbytes() == 4 * kept.element_size()
+    assert suite_runner._owned(base) is base
+
+
+@pytest.mark.parametrize("keep_device", [True, False])
+def test_pytorch_reference_outputs_keep_a_gpu_output_on_the_device(keep_device):
+    torch = pytest.importorskip("torch")
+    values = torch.arange(4, dtype=torch.float32)
+    host_reads = []
+
+    class GpuTensor:
+        """A CUDA output on a CPU-only torch: detach() gives its values."""
+
+        is_cuda = True
+
+        def detach(self):
+            return values
+
+    class Buffers:
+        def get_tensors(self):
+            return {2: GpuTensor()}
+
+        def get_output_tensors(self):
+            return [_tensor(2, is_output=True)]
+
+        def get_output_data(self, uid):
+            host_reads.append(uid)
+            return REF.copy()
+
+    (output,) = suite_runner._pytorch_reference_outputs_from_buffer(
+        Buffers(), keep_device=keep_device
+    ).values()
+
+    if keep_device:
+        assert output.data is None
+        assert torch.equal(output.device_data, values)
+        assert host_reads == []
+    else:
+        assert output.device_data is None
+        np.testing.assert_array_equal(output.data, REF)
+        assert host_reads == [2]
+    np.testing.assert_array_equal(output.host_data(), REF)
+
+
 def test_hipdnn_buffers_use_torch_storage_only_with_a_device_reference():
     host = suite_runner.ReferenceOutput(data=REF, tensor_uid=2)
     device = suite_runner.ReferenceOutput(data=REF, tensor_uid=3, device_data=REF)

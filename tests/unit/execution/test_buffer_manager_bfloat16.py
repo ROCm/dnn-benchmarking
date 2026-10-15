@@ -306,6 +306,66 @@ class TestPyTorchHostNumpy:
             output, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
         )
 
+    def test_bfloat16_tensor_of_several_blocks_is_copied_whole(
+        self, monkeypatch
+    ) -> None:
+        torch = pytest.importorskip("torch")
+        from dnn_benchmarking.common import blocks
+        from dnn_benchmarking.execution.pytorch_buffer_manager import host_numpy
+
+        monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 8)  # two rows per block
+        values = np.arange(1.0, 41.0, dtype=np.float32).reshape(10, 4)
+
+        output = host_numpy(torch.from_numpy(values).to(torch.bfloat16))
+
+        assert output.dtype == np.float32
+        np.testing.assert_array_equal(output, values)
+
+
+class TestPyTorchLoadInputData:
+    """PyTorchCudaBufferManager on a CPU device: inputs reach the tensors."""
+
+    @staticmethod
+    def _load(monkeypatch, tensors, input_data):
+        pytest.importorskip("torch")
+        from dnn_benchmarking.common import blocks
+        from dnn_benchmarking.execution.pytorch_buffer_manager import (
+            PyTorchCudaBufferManager,
+        )
+
+        monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 8)  # two rows per block
+        manager = PyTorchCudaBufferManager(tensors, device="cpu")
+        manager.allocate_all()
+        for tensor in manager.get_tensors().values():
+            tensor.fill_(-1)
+        manager.load_input_data(input_data)
+        return manager.get_tensors()
+
+    @pytest.mark.parametrize("data_type", ["float", "bfloat16"])
+    def test_every_block_of_a_multi_block_input_is_uploaded(
+        self, monkeypatch, data_type
+    ) -> None:
+        tensor = _tensor(1, data_type, dims=(10, 4))
+        values = np.arange(1.0, 41.0, dtype=np.float32).reshape(10, 4)
+
+        loaded = self._load(monkeypatch, [tensor], {1: values})
+
+        np.testing.assert_array_equal(loaded[1].float().numpy(), values)
+
+    def test_input_of_another_shape_is_broadcast_into_the_tensor(
+        self, monkeypatch
+    ) -> None:
+        row = _tensor(1, dims=(10, 4))
+        scalar = _tensor(2, dims=(1,), strides=(1,), value=2.0)
+        values = np.arange(1.0, 5.0, dtype=np.float32)
+
+        loaded = self._load(
+            monkeypatch, [row, scalar], {1: values, 2: np.asarray(5.0, np.float32)}
+        )
+
+        np.testing.assert_array_equal(loaded[1].numpy(), np.tile(values, (10, 1)))
+        assert loaded[2].tolist() == [5.0]
+
 
 class TestPagedInputGeneration:
     """Page tables and sequence lengths are integer inputs with invariants
