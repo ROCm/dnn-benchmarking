@@ -1,29 +1,33 @@
 # hipDNN Convolution Models Corpus
 
-This hipDNN workload comes from the **Convolution Models Corpus**.
-
-The source package described the model coverage in `CORPUS_MODELS 4.md`. The source shape table was `conv_shapes 1.csv`.
-
 The shape table captures convolution workloads from 31 AI models. It includes inference and training workloads across eight model families.
 
 ## Contents
 
-This directory contains:
-
-- `Explanation.md`: this hipDNN corpus description;
-- `files.tar.gz`: 9,471 unique hipDNN convolution geometries.
-
-All graphs contain one convolution node. The archive contains no batch
-normalization, attention, matrix multiplication, or normalization graphs.
+- `files.tar.gz`: contains 9,471 unique hipDNN convolution geometries.
 
 `dnn-benchmark` extracts and runs every JSON file in the archive. Extract the
 archive before you select a direction, model, or other subset.
+
+## Model coverage
+
+| Family | Models |
+|---|---|
+| Image classification and backbones | `convnext_base`, `efficientnet_v2_s`, `hrnet_w32`, `inception_v3`, `mobilefacenet`, `mobilenet_v3_large`, `regnet_y_8gf`, `resnet50`, `resnext101_32x8d`, `resnext50_32x4d`, `vit_patch_embed` |
+| Detection and instance segmentation | `maskrcnn_resnet50_fpn`, `retinanet_resnet50_fpn`, `ssd300_vgg16`, `yolo11` |
+| Diffusion and image generation | `flux_vae`, `sd15_unet`, `sdxl_unet`, `sdxl_vae`, `stylegan2` |
+| Semantic segmentation | `deeplabv3_resnet50`, `unet2d` |
+| Super-resolution | `realesrgan`, `superres` |
+| Video and 3-D vision | `ir_csn_50`, `r2plus1d_18`, `resnext3d_50`, `wan_vae` |
+| Medical imaging | `nnunet3d` |
+| Speech and audio | `conformer`, `hifigan` |
+
+Audio workloads use 2-D graphs with `H=1`. The corpus also covers pointwise, dense, grouped, depthwise, dilated, strided, transposed, and 3-D geometry.
 
 ## Coverage
 
 | Property | Coverage |
 |---|---:|
-| Source rows | 11,697 |
 | Unique executable geometries | 9,471 |
 | Models | 31 |
 | Model families | 8 |
@@ -45,9 +49,6 @@ archive before you select a direction, model, or other subset.
 
 ### Source convolution classes
 
-The source CSV `conv_type` field classifies each row. These source-row counts
-precede geometry deduplication.
-
 | Class | Source rows |
 |---|---:|
 | Pointwise | 5,160 |
@@ -59,21 +60,6 @@ precede geometry deduplication.
 | Transposed | 254 |
 
 A transposed source operation can map to a backward-data graph. The `from_transpose` metadata field preserves this source information.
-
-## Model coverage
-
-| Family | Models |
-|---|---|
-| Image classification and backbones | `convnext_base`, `efficientnet_v2_s`, `hrnet_w32`, `inception_v3`, `mobilefacenet`, `mobilenet_v3_large`, `regnet_y_8gf`, `resnet50`, `resnext101_32x8d`, `resnext50_32x4d`, `vit_patch_embed` |
-| Detection and instance segmentation | `maskrcnn_resnet50_fpn`, `retinanet_resnet50_fpn`, `ssd300_vgg16`, `yolo11` |
-| Diffusion and image generation | `flux_vae`, `sd15_unet`, `sdxl_unet`, `sdxl_vae`, `stylegan2` |
-| Semantic segmentation | `deeplabv3_resnet50`, `unet2d` |
-| Super-resolution | `realesrgan`, `superres` |
-| Video and 3-D vision | `ir_csn_50`, `r2plus1d_18`, `resnext3d_50`, `wan_vae` |
-| Medical imaging | `nnunet3d` |
-| Speech and audio | `conformer`, `hifigan` |
-
-Audio workloads use 2-D graphs with `H=1`. The corpus also covers pointwise, dense, grouped, depthwise, dilated, strided, transposed, and 3-D geometry.
 
 ## Archive layout
 
@@ -108,9 +94,6 @@ one existing source `shape_id`. The source data has exactly one unique
 Geometry identity is the SHA-256 of canonical graph JSON after removal of the
 top-level `name` and `metadata` keys. Canonical JSON sorts object keys, uses
 stable separators, and rejects non-finite numbers.
-
-The 11,697 source rows produce 9,471 files. Deduplication removes 2,226 repeated
-executions while retaining their metadata as unioned tag values.
 
 ## Graph format
 
@@ -168,14 +151,6 @@ bounded keys are:
 - `size`: source workload size label;
 - `from_transpose`: `true` or `false`.
 
-Metadata does not include source-row identifiers or `count`. It also excludes
-values derivable from the graph, such as tensor bytes and operation cost.
-
-Deduplication unions every tag value observed for one geometry. This preserves
-aggregate filtering but not source-row correlations. A query can therefore
-match a combination of values that did not occur together in one source row.
-The corpus permits 1,023 such combinations across 180 geometries.
-
 ## Run with dnn-benchmark
 
 Run all graphs from the repository root:
@@ -219,15 +194,7 @@ The archive interface runs all 9,471 geometries. Complete these steps to run onl
      -o fwd-results.json
    ```
 
-Quote the glob so `dnn-benchmark` expands it consistently.
-
 ## Conversion provenance
-
-The source table was converted with
-`projects/hipdnn/tools/dnn-convert-shapes` from ROCm libraries commit
-`5b4ef282c328b96e27b44b4b78539a38c487783b`. The source
-`conv_shapes 1.csv` SHA-256 is
-`914d01cb505343b864658584cdc13f4cd1af419ca1b14db250cbf6cff0305b5e`.
 
 Conversion derives layout from executable activation strides when the layout
 is observable and uses the source layout only for stride-ambiguous geometries.
@@ -251,12 +218,3 @@ The generated corpus passed these checks:
 
 Operation support depends on the installed hipDNN providers and target GPU. A valid graph can still have no applicable engine on a specific system.
 
-## Scope and limitations
-
-- The corpus contains convolution graphs only.
-- The corpus describes captured geometry. It does not contain model weights or
-  input data.
-- Unioned tags do not preserve correlations between source rows.
-- The archive does not guarantee that every provider supports every graph.
-- Benchmark results depend on provider versions, GPU architecture, clocks, and
-  timing configuration.
