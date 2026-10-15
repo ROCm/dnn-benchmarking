@@ -18,8 +18,8 @@ from dnn_benchmarking.common.exceptions import ExecutionError
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
     _decode,
-    _decode_storage_bytes,
-    _encode_to_storage_bytes,
+    _decode_storage,
+    _encode_to_storage,
     _f32_to_bf16,
     generate_input_data,
 )
@@ -155,7 +155,7 @@ class TestStridedStorage:
             dtype=np.float32,
         )
 
-        raw = _encode_to_storage_bytes(data, tensor)
+        raw = _encode_to_storage(data, tensor).tobytes()
 
         storage = np.frombuffer(raw, dtype=np.uint16)
         words = _f32_to_bf16(data)
@@ -164,7 +164,7 @@ class TestStridedStorage:
         assert storage[3] == 0
         np.testing.assert_array_equal(storage[4:7], words[1])
         np.testing.assert_array_equal(
-            _decode_storage_bytes(raw, tensor), _decode(words, BF16)
+            _decode_storage(raw, tensor), _decode(words, BF16)
         )
 
     def test_bfloat16_get_output_data_decodes_device_bytes(self) -> None:
@@ -198,9 +198,7 @@ class TestLoadInputData:
 
         for t in tensors:
             raw = buffers[t.uid].copy_from_host.call_args[0][0]
-            np.testing.assert_array_equal(
-                _decode_storage_bytes(raw, t), input_data[t.uid]
-            )
+            np.testing.assert_array_equal(_decode_storage(raw, t), input_data[t.uid])
 
     def test_pass_by_value_scalar_has_no_device_buffer(self) -> None:
         scalar = _tensor(23, "double", dims=(1,), strides=(1,), value=1e-5)
@@ -223,6 +221,30 @@ class TestLoadInputData:
 
         with pytest.raises(ExecutionError, match="UID 5"):
             buffer_manager.load_input_data({})
+
+
+class TestBlockedConversion:
+    """Conversions run in blocks; block boundaries must not change any value."""
+
+    @pytest.mark.parametrize("data_type", ["bfloat16", "fp8_e4m3", "half", "float"])
+    def test_small_blocks_match_one_block(self, monkeypatch, data_type) -> None:
+        from dnn_benchmarking.common import blocks
+
+        # Padded strides: rows of 5 in 6 slots, so blocks cross the gaps.
+        tensor = _tensor(1, data_type, dims=(3, 4, 5), strides=(24, 6, 1))
+
+        def run():
+            data = generate_input_data([tensor], seed=7)[tensor.uid]
+            storage = _encode_to_storage(data, tensor)
+            return data, storage, _decode_storage(storage.tobytes(), tensor)
+
+        whole = run()
+        monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 12)  # two rows per block
+        blocked = run()
+
+        for expected, actual in zip(whole, blocked):
+            np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(blocked[2], blocked[0])
 
 
 class TestGenerateInputData:

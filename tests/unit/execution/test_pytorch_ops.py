@@ -1358,6 +1358,46 @@ class TestPyTorchOpsNewHandlers:
         torch.testing.assert_close(dk, dk_ref, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(dv, dv_ref, rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_sdpa_across_query_blocks_matches_autograd(self, causal: bool) -> None:
+        """150 query rows span three 64-row blocks, the last one partial; the
+        causal mask must use absolute query indices in every block."""
+        torch.manual_seed(3)
+        scale = 1.0 / (8**0.5)
+        q = torch.randn(1, 4, 150, 8)
+        k = torch.randn(1, 2, 150, 8)
+        v = torch.randn(1, 2, 150, 8)
+        do = torch.randn(1, 4, 150, 8)
+        o, lse, dq_ref, dk_ref, dv_ref = self._sdpa_autograd_reference(
+            q, k, v, do, scale, causal, 2, 2
+        )
+        attrs = {"attn_scale_value": scale, "causal_mask": causal}
+
+        dq, dk, dv = self._run_sdpa_backward(q, k, v, o, do, lse, attrs)
+        forward = {1: q, 2: k, 3: v}
+        pytorch_ops.execute_graph(
+            {
+                "nodes": [
+                    {
+                        "type": "SdpaAttributes",
+                        "inputs": {
+                            "q_tensor_uid": 1,
+                            "k_tensor_uid": 2,
+                            "v_tensor_uid": 3,
+                        },
+                        "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 5},
+                        "attributes": attrs,
+                    }
+                ]
+            },
+            forward,
+        )
+
+        torch.testing.assert_close(forward[5], lse, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dq, dq_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dk, dk_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dv, dv_ref, rtol=1e-4, atol=1e-4)
+
     def test_sdpa_backward_consumes_stats_input(self) -> None:
         torch.manual_seed(2)
         scale = 1.0 / (8**0.5)
@@ -2133,6 +2173,42 @@ class TestNodeParamNullAttributes:
         tensors = {1: torch.tensor([-1.0, 0.5, 7.0])}
         pytorch_ops.execute_graph(graph_json, tensors)
         torch.testing.assert_close(tensors[2], torch.zeros(3))
+
+
+class TestVirtualTensorRelease:
+    """Virtual tensors leave the map after their last reader."""
+
+    @staticmethod
+    def _pointwise(operation, inputs, out):
+        node_inputs = {"operation": operation}
+        node_inputs.update({f"in_{i}_tensor_uid": uid for i, uid in enumerate(inputs)})
+        return {
+            "type": "PointwiseAttributes",
+            "inputs": node_inputs,
+            "outputs": {"out_0_tensor_uid": out},
+        }
+
+    def test_intermediates_reach_readers_then_leave_the_map(self) -> None:
+        # x(1) -> relu -> v(2); v + x -> y(3); x -> relu -> dead(4), never read.
+        graph_json = {
+            "tensors": [
+                {"uid": 1, "virtual": False},
+                {"uid": 2, "virtual": True},
+                {"uid": 3, "virtual": False},
+                {"uid": 4, "virtual": True},
+            ],
+            "nodes": [
+                self._pointwise("relu_fwd", [1], 2),
+                self._pointwise("relu_fwd", [1], 4),
+                self._pointwise("add", [2, 1], 3),
+            ],
+        }
+        tensors = {1: torch.tensor([-1.0, 2.0])}
+
+        pytorch_ops.execute_graph(graph_json, tensors)
+
+        assert set(tensors) == {1, 3}
+        torch.testing.assert_close(tensors[3], torch.tensor([-1.0, 4.0]))
 
 
 class TestPyTorchSdpaPaged:

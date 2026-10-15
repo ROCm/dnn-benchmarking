@@ -72,6 +72,17 @@ def mismatch(config: SuiteConfig, message: str) -> CorrectnessResult:
     )
 
 
+def unchecked(config: SuiteConfig, message: str) -> CorrectnessResult:
+    """No verdict: validation was skipped on purpose, with ``message`` as reason."""
+    rtol, atol = config.validation.tolerance_override or DEFAULT_TOLERANCE
+    return CorrectnessResult(
+        tolerance_match=None,
+        rtol=rtol,
+        atol=atol,
+        error_message=message,
+    )
+
+
 def _compare_output(
     buffer_manager: Any,
     tensor_info: TensorInfo,
@@ -99,7 +110,7 @@ def _compare_output(
         return None
     return compare(
         _compared(actual, tensor_info),
-        _compared(ref.data, tensor_info),
+        _compared(ref.host_data(), tensor_info),
         rtol=rtol,
         atol=atol,
     )

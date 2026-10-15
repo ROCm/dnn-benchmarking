@@ -190,3 +190,25 @@ def test_torch_fp8_actual_is_compared(name: str) -> None:
     assert result.n_mismatch == 1 and result.worst_index == (2,)
     assert result.max_abs_diff == 0.25
     assert compare(actual[:2], expected[:2], rtol=0.0, atol=0.0).passed
+
+
+@pytest.mark.parametrize("block_elements", [1, 4, 7, 1 << 22])
+def test_block_boundaries_do_not_change_the_result(monkeypatch, block_elements) -> None:
+    """compare() works one block at a time; the statistics, the first worst
+    index and the caller's reference must not depend on the block size."""
+    from dnn_benchmarking.common import blocks
+
+    monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", block_elements)
+    expected = np.arange(1.0, 25.0, dtype=np.float16).reshape(2, 3, 4)
+    actual = expected.astype(np.float32)
+    actual[0, 2, 1] += 0.5  # the first of two equal worst differences
+    actual[1, 1, 3] += 0.5
+    actual[1, 0, 0] += 0.25
+    reference = expected.copy()
+
+    for result in _both(actual, expected, rtol=0.0, atol=0.1):
+        assert (result.n_mismatch, result.n_total) == (3, 24)
+        assert result.max_abs_diff == 0.5
+        assert result.worst_index == (0, 2, 1)
+        assert result.max_rel_diff == pytest.approx(0.5 / 10.0)
+    np.testing.assert_array_equal(expected, reference)

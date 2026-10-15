@@ -253,8 +253,16 @@ def fake_torch(fake, monkeypatch):
             return REF.copy() if fake.torch_outputs_written else np.zeros_like(REF)
 
     class CpuReference:
+        estimated_bytes = 0
+
+        def estimate_host_bytes(self, graph_json):
+            return self.estimated_bytes
+
         def compute_reference(self, graph_json, input_data):
+            fake.events.append("cpu_reference")
             return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+
+    fake.cpu_reference = CpuReference()
 
     monkeypatch.setattr(pytorch_executor, "PyTorchCudaExecutor", TorchExecutor)
     monkeypatch.setattr(
@@ -263,7 +271,7 @@ def fake_torch(fake, monkeypatch):
     monkeypatch.setattr(
         suite_runner,
         "_reference_provider",
-        lambda config, graph_json: (CpuReference(), None),
+        lambda config, graph_json: (fake.cpu_reference, None),
     )
     return fake
 
@@ -621,6 +629,9 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
     fake_torch, monkeypatch
 ):
     class FailingReference:
+        def estimate_host_bytes(self, graph_json):
+            return 0
+
         def compute_reference(self, graph_json, input_data):
             raise RuntimeError("cpu reference exploded")
 
@@ -640,6 +651,43 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
         (1, "failed", "cpu reference exploded"),
         (2, "failed", "cpu reference exploded"),
     ]
+
+
+def test_cpu_reference_too_large_for_host_memory_leaves_rows_unchecked(
+    fake_torch, monkeypatch
+):
+    """A CPU reference that would exhaust host memory is not run, and its
+    absence is not a validation failure."""
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = 9 << 30  # over 80% of 10 GiB
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert "cpu_reference" not in fake_torch.events
+    assert [e.verdict for e in engines] == ["unchecked", "unchecked"]
+    assert all("host memory" in e.ootb.correctness.error_message for e in engines)
+
+
+def test_cpu_reference_that_fits_in_host_memory_runs(fake_torch, monkeypatch):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = 7 << 30
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
 
 
 def test_hipdnn_buffers_use_torch_storage_only_with_a_device_reference():
@@ -840,6 +888,35 @@ def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
     assert {r.ootb.timing.mode for r in graph.results} == {"events"}
     assert all("stall gate failed" in " ".join(r.warnings) for r in graph.results)
     assert "remeasuring every row of this graph without stalling" in progress
+
+
+def test_stall_rerun_releases_the_first_attempt():
+    """The rerun must not keep the failed attempt's inputs, references and
+    buffers alive: on large graphs that doubles host and device memory."""
+    import gc
+    import weakref
+
+    class Inputs:
+        pass
+
+    first_attempt = []
+    alive_during_rerun = []
+
+    def run(config):
+        if not first_attempt:
+            inputs = Inputs()  # a local of the failing frame, like ctx
+            first_attempt.append(weakref.ref(inputs))
+            raise StallFallbackError("stall watchdog invalidated the measurement")
+        gc.collect()
+        alive_during_rerun.append(first_attempt[0]() is not None)
+        return "rerun"
+
+    result = suite_runner._with_stall_fallback(
+        run, SuiteConfig(), Reporter(io.StringIO())
+    )
+
+    assert result == "rerun"
+    assert alive_during_rerun == [False]
 
 
 def test_pytorch_buffers_share_the_executor_device(fake_torch):

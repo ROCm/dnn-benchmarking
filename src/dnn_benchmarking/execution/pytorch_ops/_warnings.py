@@ -74,7 +74,8 @@ def get_reference_warnings(graph_json: Dict[str, Any]) -> List[str]:
         elif op_type == "SdpaBackwardAttributes":
             warnings.append(
                 f"{name}: SdpaBackwardAttributes uses a manual flash-attention "
-                "backward formula that consumes hipDNN's saved stats (log-sum-exp); "
+                "backward formula, run in blocks of 64 query rows, that consumes "
+                "hipDNN's saved stats (log-sum-exp); "
                 "torch.nn.functional.scaled_dot_product_attention autograd cannot "
                 "consume external stats, so PyTorch reference timing is not solely "
                 "built-in PyTorch operator time."
