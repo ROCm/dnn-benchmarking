@@ -29,6 +29,11 @@ launch and, if you ask, compares the output with a PyTorch reference.
 - Optional: amdsmi for GPU clocks and throttle status; `rocprofv3`, `perf`
   and `rocprof-compute` for the profiling flags.
 
+With ROCm torch and a separate `--rocm-prefix`, two hipDNN backends can be
+visible in one process. Read the
+[mixed-prefix guidance](docs/setup.md#mixed-rocm-torch-and-hipdnn-prefixes)
+before using `--validate pytorch` with that setup.
+
 ## Quick start
 
 1. Set up the environment (ROCm host). See [docs/setup.md](docs/setup.md)
