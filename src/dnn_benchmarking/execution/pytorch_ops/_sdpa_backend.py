@@ -3,7 +3,7 @@
 
 """Strict PyTorch SDPA backend selection for a scoped graph execution."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from threading import RLock
 from typing import Iterator, Optional, Tuple
@@ -40,6 +40,27 @@ _ACTIVE_SDPA_BACKEND: ContextVar[Optional[PyTorchSdpaBackendState]] = ContextVar
 # process-wide PyTorch state. Serialize every SDPA call so a default call cannot
 # overlap and observe another thread's temporary selected-backend flags.
 _SDPA_SELECTION_LOCK = RLock()
+
+# The fused ROCm SDPA kernels (AOTriton flash and efficient) are not bitwise
+# repeatable. On gfx950, fp16 D128 S4096 inputs that are identical run to run
+# came back 0.8 to 7.8 fp16 ULP from an fp32 SDPA, a different amount each
+# run, while MATH stayed at 0.5 ULP every run. A reference must not move, so
+# the default-dispatch reference pass uses MATH. Strict selections keep the
+# backend the user asked for.
+_REFERENCE_PASS: ContextVar[bool] = ContextVar(
+    "pytorch_sdpa_reference_pass",
+    default=False,
+)
+
+
+@contextmanager
+def reference_sdpa_pass() -> Iterator[None]:
+    """Run default-dispatch SDPA calls on the repeatable MATH backend."""
+    token = _REFERENCE_PASS.set(True)
+    try:
+        yield
+    finally:
+        _REFERENCE_PASS.reset(token)
 
 
 @contextmanager
@@ -183,7 +204,11 @@ def execute_selected_sdpa(
     """Execute SDPA with the current strict selection, if one is active."""
     state = _ACTIVE_SDPA_BACKEND.get()
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
-        with _SDPA_SELECTION_LOCK:
+        backend_scope = nullcontext()
+        if _REFERENCE_PASS.get():
+            sdpa_kernel, math = _selected_sdp_backend(PyTorchSdpaBackendName.MATH)
+            backend_scope = sdpa_kernel(math)
+        with _SDPA_SELECTION_LOCK, backend_scope:
             return torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,

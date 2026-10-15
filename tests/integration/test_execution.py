@@ -14,6 +14,7 @@ import pytest
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.config import (
     MetricsConfig,
+    PyTorchSdpaBackendName,
     SuiteConfig,
     TimingPolicy,
     ValidationConfig,
@@ -176,6 +177,113 @@ def test_engines_validate_against_pytorch(
         Reporter(output=io.StringIO()),
     )
     _assert_engines_match_reference(result, require_engine)
+
+
+def test_sdpa_validation_grades_with_repeatable_math_on_gpu(hipdnn, torch_gpu) -> None:
+    """The real engine is graded against MATH, while strict Flash stays Flash."""
+    from torch.profiler import ProfilerActivity, profile
+
+    path, graph_json, _ = load_graph("sample_sdpa.json")
+    graph_json["name"] = "gpu_reference_bf16_b1_h16_s512_d128_causal"
+    for tensor in graph_json["tensors"]:
+        tensor["dims"] = [1, 16, 512, 128]
+        tensor["strides"] = [1048576, 128, 2048, 1]  # BSHD
+    graph_json["nodes"][0]["attributes"]["causal_mask"] = True
+    graph_json["nodes"][0]["attributes"]["attn_scale_value"] = 128**-0.5
+    tensor_infos = GraphLoader().extract_tensor_info(graph_json)
+    config = _validate_config()
+    with profile(activities=[ProfilerActivity.CPU]) as timed_trace:
+        result = run_graph_all_providers(
+            path,
+            graph_json,
+            tensor_infos,
+            config,
+            hipdnn.Handle(),
+            Reporter(output=io.StringIO()),
+        )
+    _assert_engines_match_reference(result, require_engine=True)
+    timed_ops = [
+        event.name
+        for event in timed_trace.events()
+        if event.name.startswith("aten::_scaled_dot_product_")
+    ]
+    assert timed_ops and timed_ops[-1] == "aten::_scaled_dot_product_attention_math"
+
+    reference_outputs = []
+    first_inputs = None
+    for _ in range(3):
+        ctx = suite_runner._graph_context(
+            path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
+        )
+        reference_row = suite_runner._prepare_references(ctx)
+        assert reference_row is not None and reference_row.status == "success"
+        assert ctx.reference_outputs is not None
+        output = ctx.reference_outputs[4].device_data
+        assert output is not None and output.is_cuda
+        if first_inputs is None:
+            first_inputs = ctx.input_data
+        else:
+            for uid in (1, 2, 3):
+                np.testing.assert_array_equal(ctx.input_data[uid], first_inputs[uid])
+        reference_outputs.append(output)
+    assert torch_gpu.equal(reference_outputs[0], reference_outputs[1])
+    assert torch_gpu.equal(reference_outputs[1], reference_outputs[2])
+    assert first_inputs is not None
+
+    q, k, v = (
+        torch_gpu.as_tensor(first_inputs[uid], device="cuda", dtype=torch_gpu.bfloat16)
+        for uid in (1, 2, 3)
+    )
+    scale_attr = graph_json["nodes"][0]["attributes"]["attn_scale_value"]
+    scale = 1.0 if scale_attr is None else float(scale_attr)
+    unmasked_scores = (q.float() @ k.float().transpose(-2, -1)) * scale
+    rows = torch_gpu.arange(q.shape[-2], device="cuda")[:, None]
+    columns = torch_gpu.arange(k.shape[-2], device="cuda")[None, :]
+    scores = unmasked_scores.masked_fill(columns > rows, float("-inf"))
+    expected = (torch_gpu.softmax(scores, dim=-1) @ v.float()).to(q.dtype)
+    wrong = (torch_gpu.softmax(unmasked_scores, dim=-1) @ v.float()).to(q.dtype)
+    with pytest.raises(AssertionError):
+        torch_gpu.testing.assert_close(wrong, expected, rtol=3e-2, atol=1e-3)
+    torch_gpu.testing.assert_close(reference_outputs[0], expected, rtol=3e-2, atol=1e-3)
+
+    strict = SuiteConfig(
+        warmup_iters=1,
+        benchmark_iters=2,
+        validation=ValidationConfig(provider="pytorch"),
+        metrics=MetricsConfig(basic=False),
+        pytorch_sdpa_backend=PyTorchSdpaBackendName.FLASH,
+    )
+    strict_ctx = suite_runner._graph_context(
+        path, graph_json, tensor_infos, strict, Reporter(output=io.StringIO())
+    )
+    with profile(activities=[ProfilerActivity.CPU]) as strict_trace:
+        strict_row = suite_runner._prepare_references(strict_ctx)
+    assert strict_row is not None and strict_row.status == "success"
+    strict_ops = [
+        event.name
+        for event in strict_trace.events()
+        if event.name.startswith("aten::_scaled_dot_product_")
+    ]
+    assert strict_ops and all("_flash_attention" in name for name in strict_ops)
+
+
+def test_strict_flash_rejects_fp64_without_math_fallback(torch_gpu) -> None:
+    """A dtype supported by MATH cannot silently pass strict Flash."""
+    from dnn_benchmarking.execution import pytorch_ops
+
+    q = torch_gpu.randn(1, 1, 4, 64, device="cuda", dtype=torch_gpu.float64)
+    assert torch_gpu.isfinite(
+        torch_gpu.nn.functional.scaled_dot_product_attention(q, q, q)
+    ).all()
+    with pytest.raises(
+        pytorch_ops.PyTorchSdpaBackendUnavailableError, match="no fallback"
+    ):
+        with pytorch_ops.use_pytorch_sdpa_backend(
+            pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.FLASH)
+        ):
+            pytorch_ops.execute_selected_sdpa(
+                q, q, q, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+            )
 
 
 def test_paged_sdpa_sample_passes_hipdnn_graph_validation(hipdnn) -> None:

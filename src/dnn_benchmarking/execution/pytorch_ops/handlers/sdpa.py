@@ -219,6 +219,42 @@ def _diagonal_band_mask(
     return mask.masked_fill(~keep, float("-inf"))
 
 
+def _causal_band(
+    q_len: int,
+    kv_len: int,
+    width: Optional[int],
+    is_causal: bool,
+    bottom_right: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    """Choose between torch's native top-left ``is_causal`` and an explicit band.
+
+    An explicit ``attn_mask`` costs the call its flash backend, which takes no
+    mask, so the band is materialized only where ``is_causal`` cannot say the
+    same thing. With Sq == Skv the bottom-right diagonal IS the top-left one,
+    and the shipped ``quick/SdpaFwd`` causal bundles are that case.
+    """
+    if width is None and not (bottom_right and q_len != kv_len):
+        return None, is_causal or bottom_right
+    if bottom_right and q_len > kv_len:
+        raise ValueError(
+            f"Bottom-right causal SDPA with Sq {q_len} > Skv {kv_len} leaves "
+            "queries with no keys"
+        )
+    return (
+        _diagonal_band_mask(
+            q_len,
+            kv_len,
+            width,
+            bottom_right=bottom_right,
+            device=device,
+            dtype=dtype,
+        ),
+        False,
+    )
+
+
 def _sdpa_scores(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -403,17 +439,14 @@ def _run_paged_sdpa(
             v_seq = v_seq.unsqueeze(0)
         q_start += q_len
 
-        seq_mask = (
-            _diagonal_band_mask(
-                int(q_seq.shape[-2]),
-                kv_len,
-                window,
-                bottom_right=bottom_right,
-                device=q.device,
-                dtype=q.dtype,
-            )
-            if window is not None or bottom_right
-            else None
+        seq_mask, seq_is_causal = _causal_band(
+            int(q_seq.shape[-2]),
+            kv_len,
+            window,
+            is_causal,
+            bottom_right,
+            q.device,
+            q.dtype,
         )
         outputs.append(
             _call_sdpa(
@@ -422,7 +455,7 @@ def _run_paged_sdpa(
                 v_seq,
                 seq_mask,
                 dropout_p,
-                is_causal,
+                seq_is_causal,
                 scale,
                 rep_k,
                 rep_v,
@@ -540,22 +573,24 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, o)
             return
 
-        if plan.window is not None or plan.bottom_right:
-            attn_mask = _diagonal_band_mask(
-                int(q.shape[-2]),
-                int(k.shape[-2]),
-                plan.window,
-                bottom_right=plan.bottom_right,
-                device=q.device,
-                dtype=q.dtype,
-            )
+        band, is_causal = _causal_band(
+            int(q.shape[-2]),
+            int(k.shape[-2]),
+            plan.window,
+            plan.is_causal,
+            plan.bottom_right,
+            q.device,
+            q.dtype,
+        )
+        if band is not None:
+            attn_mask = band
         o = _call_sdpa(
             q,
             k,
             v,
             attn_mask,
             plan.dropout_p,
-            plan.is_causal,
+            is_causal,
             scale,
             rep_k,
             rep_v,
@@ -564,10 +599,11 @@ def compile_sdpa(
         _store_tensor(tensors, o_uid, o)
 
         if stats_uid is not None:
+            # The band O used, so stats and O agree on the mask.
             _store_tensor(
                 tensors,
                 stats_uid,
-                _sdpa_stats(q, k, attn_mask, plan.is_causal, scale, rep_k, sink),
+                _sdpa_stats(q, k, attn_mask, is_causal, scale, rep_k, sink),
             )
 
     return run

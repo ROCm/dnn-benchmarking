@@ -68,6 +68,15 @@ sets `ROCM_PATH`.
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 
+With `--pytorch-sdpa-backend default`, the timed PyTorch `reference` row
+uses PyTorch's default SDPA dispatch. A separate MATH SDPA pass produces
+the outputs used to grade hipDNN engines. The row's timing does not measure
+that MATH pass. MATH can hold a score array for every query and key pair,
+for each batch and head. This can exhaust device memory on large graphs.
+If the output pass fails, the row says `Reference output pass failed`, and
+the tool tries a CPU reference. An explicit SDPA backend applies to both
+passes. An unavailable explicit backend does not fall back to the CPU.
+
 The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
 1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3,
 2^-10), fp8 e5m2 (2^-2, 2^-16), fp8 e5m2 fnuz (2^-2, 2^-17), any other dtype
@@ -170,6 +179,22 @@ dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch \
 (`preferred_rocm_fa_library`). PyTorch rejects an unknown library. PyTorch
 can use a different Flash implementation when the preferred one does not
 support an input.
+
+The forward SDPA reference reads a graph's causal diagonal the way hipDNN
+resolves it. `causal_mask: true` is top-left and overrides both
+`diagonal_alignment` and any bounds written beside it; bottom-right is
+`causal_mask_bottom_right: true`, or `right_bound: 0` with
+`diagonal_alignment: BOTTOM_RIGHT`. Setting both booleans is an error, as it
+is in hipDNN. A bottom-right diagonal is applied as an explicit additive
+mask, which the flash backend cannot take, so it is only built when Sq
+differs from Skv: with Sq equal to Skv the two diagonals coincide and the
+boolean `is_causal` path (and `--pytorch-sdpa-backend flash`) still works.
+
+A bounded-left window needs `right_bound: 0` in this PyTorch reference. A
+bare `left_bound` is a valid right-open hipDNN band, which the reference
+rejects instead of silently adding a causal right edge. The hipDNN graph
+checker, `tools/check_deserialize.py`, may still accept it: it checks hipDNN
+deserialization, not whether this optional PyTorch reference can serve it.
 
 ### PyTorch kernel selection
 
