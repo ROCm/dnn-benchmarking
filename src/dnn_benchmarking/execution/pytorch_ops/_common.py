@@ -72,6 +72,7 @@ class ReplayTensors(dict):
         self._scalar_cache: Dict[int, float] = {}
         self._int_cache: Dict[int, List[int]] = {}
         self._derived_cache: Dict[Hashable, Any] = {}
+        self.notes: List[str] = []
 
     def host_ints(self, uid: int) -> List[int]:
         """Return tensor ``uid`` flattened to host ints, resolved once."""
@@ -90,6 +91,12 @@ class ReplayTensors(dict):
         if key not in self._derived_cache:
             self._derived_cache[key] = build()
         return self._derived_cache[key]
+
+    def note(self, text: str) -> None:
+        """Record a row warning found while priming (a handler's runtime
+        finding that static graph metadata cannot show). Repeats are dropped."""
+        if text not in self.notes:
+            self.notes.append(text)
 
 
 def _as_tuple(

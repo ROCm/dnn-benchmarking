@@ -88,18 +88,24 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
 
 - GQA and MQA graphs with equal K and V head counts call
   `F.scaled_dot_product_attention(..., enable_gqa=True)` on K and V at their
-  real head count. This needs PyTorch 2.5 or later.
-- When K and V have different head counts, or with
-  `--pytorch-sdpa-backend math`, the tool expands K and V to the query head
-  count once, before the timed loop.
-- Sliding-window and bottom-right causal masks and the dense per-sequence K
-  and V of paged graphs are built once. A timed paged iteration does one SDPA
-  call per sequence and one `torch.cat`.
+  real head count, with the default backend selection and with
+  `--pytorch-sdpa-backend flash`. This needs PyTorch 2.5 or later.
+- In all other cases the tool expands K and V to the query head count once,
+  before the timed loop: when K and V have different head counts, and with
+  `--pytorch-sdpa-backend math`, `efficient`, `cudnn` or `overrideable`. Those
+  strict backends can reject `enable_gqa`, and a row that does not use it
+  still runs.
+- Sliding-window and bottom-right masks, where a graph needs one, and the
+  dense per-sequence K and V of paged graphs are built once. A timed paged
+  iteration does one SDPA call per sequence and one `torch.cat`.
 - The `stats` output (log-sum-exp) comes from the fused kernel, as in a
   PyTorch training step. Q, K and V go into the call with `requires_grad`, and
   the tool reads the log-sum-exp that the kernel saves for the backward pass.
   The math backend saves no log-sum-exp. With math, the tool computes it with
   a separate score matmul, which is timed. Its fp32 operands are built once.
+  If the kernel saves none under another selection, the tool does the same
+  and the row gets a warning, because the timed region then includes that
+  matmul.
 - Attention sinks have no PyTorch SDPA input. These graphs run attention as
   separate fp32 ops (score matmul, softmax with the sinks, output matmul).
   The fp32 copies of Q, K and V, the K/V expansion, the mask and the sink
@@ -108,10 +114,20 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
 With the default backend selection, a GQA call that no fused kernel (Flash
 or memory-efficient) accepts would use the math backend. That backend copies
 K and V to the query head count inside the call. The tool skips these rows
-as unsupported and does not time them. On ROCm this includes GQA graphs with
-a sliding window and causal GQA graphs where the query and
-KV lengths differ. On MI210 (gfx90a), fp32 GQA graphs are skipped too. Other
-architectures can differ, because the result depends on the torch build.
+as unsupported and does not time them. On ROCm, Flash rejects any
+`attn_mask` and memory-efficient rejects GQA, so the skipped rows are the
+GQA graphs that need a mask tensor:
+
+- a sliding window (any `left_bound`);
+- bottom-right causal with a query length above 1 that differs from the KV
+  length;
+- an explicit `attn_mask` input;
+- causal (top-left) with query and KV lengths that differ.
+
+Bounds that equal a native form need no mask and are timed: bottom-right
+causal with one query (decode) or with equal query and KV lengths. On MI210
+(gfx90a), fp32 GQA graphs are skipped too. Other architectures can differ,
+because the result depends on the torch build.
 
 The setup is built once on the assumption that the inputs do not change
 between iterations. When a graph node computes an SDPA input, the tool skips
@@ -121,8 +137,8 @@ Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
 - Paged KV: one SDPA call per sequence and a `torch.cat`.
-- Sliding window or bottom-right causal: the kernel reads an additive mask
-  tensor.
+- Sliding window or bottom-right causal with a query length above 1 that
+  differs from the KV length: the kernel reads an additive mask tensor.
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.

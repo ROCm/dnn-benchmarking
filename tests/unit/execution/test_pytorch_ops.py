@@ -2198,19 +2198,22 @@ def _record_aten_ops(fn) -> Counter:
     return ops
 
 
-def _replay_sdpa(graph_json, tensors, selection=None):
+def _replay_sdpa(graph_json, tensors, selection=None, bounds=None):
     """Prime a ReplayTensors map once, then record a second (timed) run.
 
     The SDPA call is stubbed so its own decomposition stays out of the
     recorded ops. Returns (priming ops, timed ops, stub calls), each call as
-    (K heads, V heads, enable_gqa).
+    (K heads, V heads, enable_gqa). When ``bounds`` is a list, each call also
+    appends ``(attn_mask is not None, is_causal)`` to it.
     """
     from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
 
     calls = []
 
-    def fake_sdpa(q, k, v, *, enable_gqa, **_):
+    def fake_sdpa(q, k, v, *, enable_gqa, attn_mask=None, is_causal=False, **_):
         calls.append((int(k.shape[-3]), int(v.shape[-3]), enable_gqa))
+        if bounds is not None:
+            bounds.append((attn_mask is not None, is_causal))
         return q
 
     replay = pytorch_ops.ReplayTensors(tensors)
@@ -2595,11 +2598,13 @@ class TestSdpaTimedRegion:
         }
 
     @staticmethod
-    def _tensors(hk: int, hv: int, dtype=torch.float32):
+    def _tensors(
+        hk: int, hv: int, dtype=torch.float32, q_len: int = 4, kv_len: int = 4
+    ):
         return {
-            1: torch.randn(1, 8, 4, 16, dtype=dtype),
-            2: torch.randn(1, hk, 4, 16, dtype=dtype),
-            3: torch.randn(1, hv, 4, 16, dtype=dtype),
+            1: torch.randn(1, 8, q_len, 16, dtype=dtype),
+            2: torch.randn(1, hk, kv_len, 16, dtype=dtype),
+            3: torch.randn(1, hv, kv_len, 16, dtype=dtype),
         }
 
     @pytest.mark.parametrize(
@@ -2611,8 +2616,9 @@ class TestSdpaTimedRegion:
             (2, 1, {}, (8, 8, False), True),
             # Sliding window: the additive mask is built untimed.
             (2, 2, {"left_bound": 1, "right_bound": 0}, (2, 2, True), True),
-            # Bottom-right causal: is_causal is top-left only; mask built untimed.
-            (2, 2, {"causal_mask_bottom_right": True}, (2, 2, True), True),
+            # Bottom-right causal with q_len == kv_len is top-left causal:
+            # native is_causal, no mask to build.
+            (2, 2, {"causal_mask_bottom_right": True}, (2, 2, True), False),
         ],
     )
     def test_timed_run_has_no_setup(
@@ -2626,17 +2632,77 @@ class TestSdpaTimedRegion:
         assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
         assert bool(set(primed) - _SDPA_TIMED_OPS) == priming_builds_setup
 
-    def test_strict_math_expands_untimed(self) -> None:
-        """Math with enable_gqa expands K/V inside the call, so a strict math
-        selection gets the expansion up front instead."""
+    @pytest.mark.parametrize(
+        ("selection", "expected_call"),
+        [
+            # Strict Flash takes enable_gqa on the real-size K/V.
+            ("FLASH", (2, 2, True)),
+            # Math would expand inside the call; efficient, cuDNN and
+            # overrideable may reject enable_gqa. All get K/V expanded untimed.
+            ("MATH", (8, 8, False)),
+            ("EFFICIENT", (8, 8, False)),
+            ("CUDNN", (8, 8, False)),
+            ("OVERRIDEABLE", (8, 8, False)),
+        ],
+    )
+    def test_strict_selection_picks_gqa_form(self, selection, expected_call) -> None:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
         _, timed, calls = _replay_sdpa(
-            self._graph(), self._tensors(2, 2), PyTorchSdpaBackendName.MATH
+            self._graph(), self._tensors(2, 2), PyTorchSdpaBackendName[selection]
         )
 
-        assert calls == [(8, 8, False), (8, 8, False)]
+        assert calls == [expected_call, expected_call]
         assert set(timed) <= _SDPA_TIMED_OPS
+
+    @pytest.mark.parametrize(
+        ("q_len", "kv_len", "attributes", "expected"),
+        [
+            # (has mask, is_causal) as the SDPA call receives them.
+            (4, 4, {"causal_mask_bottom_right": True}, (False, True)),
+            (1, 6, {"causal_mask_bottom_right": True}, (False, False)),
+            (4, 6, {"causal_mask_bottom_right": True}, (True, False)),
+            (
+                1,
+                6,
+                {"diagonal_alignment": "BOTTOM_RIGHT", "right_bound": 0},
+                (False, False),
+            ),
+            # A window bounds the keys even for one query.
+            (1, 6, {"left_bound": 2, "right_bound": 0}, (True, False)),
+            # Top-left causal stays native.
+            (4, 6, {"causal_mask": True}, (False, True)),
+        ],
+    )
+    def test_bounds_use_native_forms_when_equivalent(
+        self, q_len, kv_len, attributes, expected
+    ) -> None:
+        """Flash rejects any attn_mask, so a mask the bounds do not need would
+        send a GQA row to math and get it skipped."""
+        bounds: list = []
+        _replay_sdpa(
+            self._graph(**attributes),
+            self._tensors(2, 2, q_len=q_len, kv_len=kv_len),
+            bounds=bounds,
+        )
+
+        assert bounds == [expected, expected]
+
+    @pytest.mark.parametrize(("q_len", "kv_len"), [(4, 4), (1, 6), (4, 6)])
+    def test_bottom_right_output_matches_explicit_mask(self, q_len, kv_len) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _diagonal_band_mask,
+        )
+
+        torch.manual_seed(11)
+        tensors = self._tensors(8, 8, q_len=q_len, kv_len=kv_len)
+        pytorch_ops.execute_graph(self._graph(causal_mask_bottom_right=True), tensors)
+
+        mask = _diagonal_band_mask(
+            q_len, kv_len, None, bottom_right=True, device="cpu", dtype=torch.float32
+        )
+        scores = (tensors[1] @ tensors[2].transpose(-2, -1)) * 0.5 + mask
+        torch.testing.assert_close(tensors[4], scores.softmax(-1) @ tensors[3])
 
     @pytest.mark.parametrize("attributes", [{}, {"causal_mask": True}])
     def test_stats_timed_run_matches_equal_heads(self, attributes) -> None:
@@ -2724,17 +2790,50 @@ class TestSdpaTimedRegion:
         torch.testing.assert_close(replay[5], self._expected_stats(tensors, True))
 
     def test_computed_input_is_not_timed(self) -> None:
-        """Cached setup assumes the inputs repeat unchanged. A K computed by an
+        """Cached setup assumes the inputs repeat unchanged. A K written by an
         earlier node breaks that, so the benchmark path refuses the graph; the
-        one-shot reference path still computes it."""
+        one-shot reference path still computes it. The tensor is not marked
+        virtual: being a node output is what counts."""
         graph = self._graph()
-        graph["tensors"] = [{"uid": 2, "virtual": True}]
+        graph["nodes"].insert(
+            0,
+            {
+                "type": "PointwiseAttributes",
+                "inputs": {
+                    "operation": "add",
+                    "in_0_tensor_uid": 7,
+                    "in_1_tensor_uid": 7,
+                },
+                "outputs": {"out_0_tensor_uid": 2},
+            },
+        )
         tensors = self._tensors(2, 2)
+        tensors[7] = torch.randn(1, 2, 4, 16)
 
         with pytest.raises(UnsupportedGraphError, match=r"inputs \[2\] are computed"):
             pytorch_ops.compile_graph(graph).execute(pytorch_ops.ReplayTensors(tensors))
         pytorch_ops.execute_graph(graph, tensors)
         assert tensors[4].shape == (1, 8, 4, 16)
+
+    @pytest.mark.parametrize(
+        ("selection", "noted"),
+        [(None, True), ("FLASH", True), ("MATH", False)],
+    )
+    def test_stats_fallback_is_noted_unless_math(self, selection, noted) -> None:
+        """Only math saves no log-sum-exp by design. Under another selection
+        the fallback puts a score matmul in the timed region, so the row says so."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        replay = pytorch_ops.ReplayTensors(self._tensors(8, 8))
+        chosen = None if selection is None else PyTorchSdpaBackendName[selection]
+        with (
+            patch.object(sdpa, "execute_selected_sdpa", lambda q, *a, **kw: q),
+            patch.object(sdpa, "strict_sdpa_selection", return_value=chosen),
+        ):
+            pytorch_ops.compile_graph(self._graph(stats=True)).execute(replay)
+
+        assert bool(replay.notes) is noted
 
 
 class TestDefaultSdpaAvoidsMath:

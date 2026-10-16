@@ -187,7 +187,67 @@ def test_sdpa_stats_come_from_fused_kernel(torch_gpu, q_heads: int) -> None:
     expected = torch.logsumexp(
         scores.masked_fill(~keep, float("-inf")), dim=-1, keepdim=True
     )
+    # Inputs are bf16 (about 3 significant digits) and the reference is fp32,
+    # so the kernel's log-sum-exp matches it to about 1e-3, not to fp32 rounding.
     torch.testing.assert_close(tensors[5].float(), expected, rtol=1e-3, atol=1e-3)
+    assert executor.notes == [], "stats fell back to a separate score matmul"
+
+
+def _gqa_graph(**attributes) -> dict:
+    return {
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                "outputs": {"o_tensor_uid": 4},
+                "attributes": {"attn_scale_value": 0.125, **attributes},
+            }
+        ]
+    }
+
+
+def _gqa_tensors(torch, q_len: int, kv_len: int, kv_heads: int = 2):
+    return {
+        1: torch.randn(2, 8, q_len, 64, device="cuda", dtype=torch.bfloat16),
+        2: torch.randn(2, kv_heads, kv_len, 64, device="cuda", dtype=torch.bfloat16),
+        3: torch.randn(2, kv_heads, kv_len, 64, device="cuda", dtype=torch.bfloat16),
+    }
+
+
+def test_bottom_right_gqa_decode_is_timed_by_default(torch_gpu) -> None:
+    """One query over a long cache with bottom-right causal bounds needs no
+    mask, so default dispatch keeps a fused kernel and the row is timed."""
+    executor = PyTorchCudaExecutor(
+        _gqa_graph(causal_mask_bottom_right=True),
+        POLICY,
+        pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT,
+    )
+    executor.prepare()
+
+    executor.benchmark(_gqa_tensors(torch_gpu, 1, 256))
+
+
+def test_strict_efficient_runs_gqa_graph(torch_gpu) -> None:
+    """Efficient rejects enable_gqa, so a strict efficient row gets K/V
+    expanded up front, as before enable_gqa was used."""
+    from dnn_benchmarking.execution.pytorch_ops import (
+        PyTorchSdpaBackendUnavailableError,
+    )
+
+    def run(kv_heads: int) -> None:
+        executor = PyTorchCudaExecutor(
+            _gqa_graph(),
+            POLICY,
+            pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT,
+        )
+        executor.prepare()
+        executor.benchmark(_gqa_tensors(torch_gpu, 64, 64, kv_heads))
+
+    try:
+        run(8)
+    except PyTorchSdpaBackendUnavailableError:
+        pytest.skip("strict efficient attention is unavailable on this build")
+    run(2)
 
 
 def test_pytorch_row_returns_vram_after_oom(torch_gpu) -> None:

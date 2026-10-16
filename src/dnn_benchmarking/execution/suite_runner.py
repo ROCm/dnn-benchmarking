@@ -401,6 +401,7 @@ def _time_pytorch_row(
             bm.zero_outputs()
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
+            row.warnings = (row.warnings or []) + executor.notes
             if role == "reference":
                 bm.zero_outputs()
                 executor.execute_once(tensors)
