@@ -3,6 +3,7 @@
 
 """Unit tests for PyTorch operation handlers error paths."""
 
+from collections import Counter
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
@@ -1218,6 +1219,47 @@ class TestPyTorchOpsNewHandlers:
         assert any("AVGPOOL_EXCLUDE_PADDING" in w for w in warnings)
         assert any("SdpaBackwardAttributes" in w for w in warnings)
 
+    def test_sdpa_forward_warns_for_unexpressible_features(self) -> None:
+        """Paged KV, sliding windows, bottom-right causal, sinks and Hk != Hv
+        each make the row time a workaround. Plain GQA does not."""
+
+        def node(name, k_uid, v_uid, **extra):
+            inputs = {"q_tensor_uid": 1, "k_tensor_uid": k_uid, "v_tensor_uid": v_uid}
+            inputs.update(extra.pop("inputs", {}))
+            return {
+                "name": name,
+                "type": "SdpaAttributes",
+                "inputs": inputs,
+                "outputs": {"o_tensor_uid": 9},
+                "attributes": extra,
+            }
+
+        graph_json = {
+            "tensors": [
+                {"uid": 1, "dims": [1, 8, 4, 16], "data_type": "float"},
+                {"uid": 2, "dims": [1, 2, 4, 16], "data_type": "float"},
+                {"uid": 3, "dims": [1, 1, 4, 16], "data_type": "float"},
+            ],
+            "nodes": [
+                node("gqa", 2, 2, causal_mask=True),
+                node("window", 2, 2, left_bound=3, right_bound=0),
+                node("hk_ne_hv", 2, 3),
+                node("paged", 2, 2, inputs={"page_table_k_tensor_uid": 5}),
+                node("bottom_right", 2, 2, causal_mask_bottom_right=True),
+                node("sink", 2, 2, inputs={"sink_token_tensor_uid": 6}),
+            ],
+        }
+
+        warnings = pytorch_ops.get_reference_warnings(graph_json)
+
+        flagged = {w.split(":")[0]: w for w in warnings}
+        assert set(flagged) == {"window", "hk_ne_hv", "paged", "bottom_right", "sink"}
+        assert "sliding-window" in flagged["window"]
+        assert "enable_gqa cannot express" in flagged["hk_ne_hv"]
+        assert "paged SDPA" in flagged["paged"]
+        assert "bottom-right" in flagged["bottom_right"]
+        assert "attention-sink" in flagged["sink"]
+
     def test_builtin_rmsnorm_reference_has_no_warning_when_available(self) -> None:
         graph_json = {
             "tensors": [{"uid": 1, "dims": [2, 3, 4]}, {"uid": 2, "dims": [4]}],
@@ -2135,6 +2177,56 @@ class TestNodeParamNullAttributes:
         torch.testing.assert_close(tensors[2], torch.zeros(3))
 
 
+# Ops a timed SDPA forward iteration may run besides the (stubbed) SDPA call:
+# Q slicing and the paged re-pack.
+_SDPA_TIMED_OPS = {"aten.slice.Tensor", "aten.cat.default"}
+
+
+def _record_aten_ops(fn) -> Counter:
+    """Count the aten ops ``fn`` dispatches, e.g. ``aten.slice.Tensor``."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ops: Counter = Counter()
+
+    class Recorder(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            ops[str(func)] += 1
+            return func(*args, **(kwargs or {}))
+
+    with Recorder():
+        fn()
+    return ops
+
+
+def _replay_sdpa(graph_json, tensors, selection=None, bounds=None):
+    """Prime a ReplayTensors map once, then record a second (timed) run.
+
+    The SDPA call is stubbed so its own decomposition stays out of the
+    recorded ops. Returns (priming ops, timed ops, stub calls), each call as
+    (K heads, V heads, enable_gqa). When ``bounds`` is a list, each call also
+    appends ``(attn_mask is not None, is_causal)`` to it.
+    """
+    from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+    calls = []
+
+    def fake_sdpa(q, k, v, *, enable_gqa, attn_mask=None, is_causal=False, **_):
+        calls.append((int(k.shape[-3]), int(v.shape[-3]), enable_gqa))
+        if bounds is not None:
+            bounds.append((attn_mask is not None, is_causal))
+        return q
+
+    replay = pytorch_ops.ReplayTensors(tensors)
+    graph = pytorch_ops.compile_graph(graph_json)
+    with (
+        patch.object(sdpa, "execute_selected_sdpa", fake_sdpa),
+        patch.object(sdpa, "strict_sdpa_selection", return_value=selection),
+    ):
+        primed = _record_aten_ops(lambda: graph.execute(replay))
+        timed = _record_aten_ops(lambda: graph.execute(replay))
+    return primed, timed, calls
+
+
 class TestPyTorchSdpaPaged:
     """Paged (KV-cache) SDPA support.
 
@@ -2410,6 +2502,41 @@ class TestPyTorchSdpaPaged:
         with pytest.raises(UnsupportedGraphError, match="page table holds"):
             pytorch_ops.execute_graph(self._graph(), tensors)
 
+    @pytest.mark.parametrize(
+        "attributes",
+        [{}, {"left_bound": 3, "right_bound": 0}, {"causal_mask_bottom_right": True}],
+    )
+    def test_timed_run_has_no_gather(self, attributes) -> None:
+        """The gather and masks are built once; a timed run only slices Q,
+        calls SDPA per sequence and re-packs."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        primed, timed, calls = _replay_sdpa(
+            self._graph(**attributes), self._tensors(q, k_pages, v_pages, page_table)
+        )
+
+        heads = (self.HKV, self.HKV, True)
+        assert calls == [heads] * (2 * len(self.KV_LENS))
+        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        assert "aten.index.Tensor" in primed
+
+    def test_sink_timed_run_has_no_setup(self) -> None:
+        """Sinks run a manual fp32 attention per sequence. The gather, casts,
+        K/V expansion, masks and sink logits are built once; a timed run only
+        slices Q, does the attention math and re-packs."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        graph = self._graph(causal_mask_bottom_right=True)
+        graph["nodes"][0]["inputs"]["sink_token_tensor_uid"] = 9
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        tensors[9] = torch.randn(self.HQ)
+
+        primed, timed, _ = _replay_sdpa(graph, tensors)
+
+        # A K/V expansion copies (clone); matmul's own broadcast is an expand view.
+        setup = ("index", "clone", "_to_copy", "arange", "masked_fill")
+        leaked = [op for op in timed if op.split(".")[1] in setup]
+        assert not leaked, f"setup in timed run: {leaked}"
+        assert "aten.index.Tensor" in primed
+
     def test_backward_still_refuses_paged(self) -> None:
         """Only the forward handler gathers. A paged backward would otherwise
         compute a dense gradient and call it correct."""
@@ -2444,6 +2571,326 @@ class TestPyTorchSdpaPaged:
         }
         with pytest.raises(UnsupportedGraphError, match="page_table"):
             pytorch_ops.compile_graph(graph)
+
+
+class TestSdpaTimedRegion:
+    """After priming, a replayed dense SDPA forward runs only the op itself.
+
+    K/V head expansion, sliding-window masks and the stats operands derive
+    from constant inputs. The benchmark path builds them once, so they must not
+    reappear in timed iterations.
+    """
+
+    @staticmethod
+    def _graph(stats: bool = False, **attributes):
+        outputs = {"o_tensor_uid": 4}
+        if stats:
+            outputs["stats_tensor_uid"] = 5
+        return {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": outputs,
+                    "attributes": {"attn_scale_value": 0.5, **attributes},
+                }
+            ]
+        }
+
+    @staticmethod
+    def _tensors(
+        hk: int, hv: int, dtype=torch.float32, q_len: int = 4, kv_len: int = 4
+    ):
+        return {
+            1: torch.randn(1, 8, q_len, 16, dtype=dtype),
+            2: torch.randn(1, hk, kv_len, 16, dtype=dtype),
+            3: torch.randn(1, hv, kv_len, 16, dtype=dtype),
+        }
+
+    @pytest.mark.parametrize(
+        ("hk", "hv", "attributes", "expected_call", "priming_builds_setup"),
+        [
+            # Equal K/V heads: PyTorch's enable_gqa on the real-size K/V.
+            (2, 2, {}, (2, 2, True), False),
+            # Hk != Hv: enable_gqa cannot express it; expanded untimed.
+            (2, 1, {}, (8, 8, False), True),
+            # Sliding window: the additive mask is built untimed.
+            (2, 2, {"left_bound": 1, "right_bound": 0}, (2, 2, True), True),
+            # Bottom-right causal with q_len == kv_len is top-left causal:
+            # native is_causal, no mask to build.
+            (2, 2, {"causal_mask_bottom_right": True}, (2, 2, True), False),
+        ],
+    )
+    def test_timed_run_has_no_setup(
+        self, hk, hv, attributes, expected_call, priming_builds_setup
+    ) -> None:
+        primed, timed, calls = _replay_sdpa(
+            self._graph(**attributes), self._tensors(hk, hv)
+        )
+
+        assert calls == [expected_call, expected_call]
+        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        assert bool(set(primed) - _SDPA_TIMED_OPS) == priming_builds_setup
+
+    @pytest.mark.parametrize(
+        ("selection", "expected_call"),
+        [
+            # Strict Flash takes enable_gqa on the real-size K/V.
+            ("FLASH", (2, 2, True)),
+            # Math would expand inside the call; efficient, cuDNN and
+            # overrideable may reject enable_gqa. All get K/V expanded untimed.
+            ("MATH", (8, 8, False)),
+            ("EFFICIENT", (8, 8, False)),
+            ("CUDNN", (8, 8, False)),
+            ("OVERRIDEABLE", (8, 8, False)),
+        ],
+    )
+    def test_strict_selection_picks_gqa_form(self, selection, expected_call) -> None:
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        _, timed, calls = _replay_sdpa(
+            self._graph(), self._tensors(2, 2), PyTorchSdpaBackendName[selection]
+        )
+
+        assert calls == [expected_call, expected_call]
+        assert set(timed) <= _SDPA_TIMED_OPS
+
+    @pytest.mark.parametrize(
+        ("q_len", "kv_len", "attributes", "expected"),
+        [
+            # (has mask, is_causal) as the SDPA call receives them.
+            (4, 4, {"causal_mask_bottom_right": True}, (False, True)),
+            (1, 6, {"causal_mask_bottom_right": True}, (False, False)),
+            (4, 6, {"causal_mask_bottom_right": True}, (True, False)),
+            (
+                1,
+                6,
+                {"diagonal_alignment": "BOTTOM_RIGHT", "right_bound": 0},
+                (False, False),
+            ),
+            # A window bounds the keys even for one query.
+            (1, 6, {"left_bound": 2, "right_bound": 0}, (True, False)),
+            # Top-left causal stays native.
+            (4, 6, {"causal_mask": True}, (False, True)),
+        ],
+    )
+    def test_bounds_use_native_forms_when_equivalent(
+        self, q_len, kv_len, attributes, expected
+    ) -> None:
+        """Flash rejects any attn_mask, so a mask the bounds do not need would
+        send a GQA row to math and get it skipped."""
+        bounds: list = []
+        _replay_sdpa(
+            self._graph(**attributes),
+            self._tensors(2, 2, q_len=q_len, kv_len=kv_len),
+            bounds=bounds,
+        )
+
+        assert bounds == [expected, expected]
+
+    @pytest.mark.parametrize(("q_len", "kv_len"), [(4, 4), (1, 6), (4, 6)])
+    def test_bottom_right_output_matches_explicit_mask(self, q_len, kv_len) -> None:
+        from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
+            _diagonal_band_mask,
+        )
+
+        torch.manual_seed(11)
+        tensors = self._tensors(8, 8, q_len=q_len, kv_len=kv_len)
+        pytorch_ops.execute_graph(self._graph(causal_mask_bottom_right=True), tensors)
+
+        mask = _diagonal_band_mask(
+            q_len, kv_len, None, bottom_right=True, device="cpu", dtype=torch.float32
+        )
+        scores = (tensors[1] @ tensors[2].transpose(-2, -1)) * 0.5 + mask
+        torch.testing.assert_close(tensors[4], scores.softmax(-1) @ tensors[3])
+
+    @pytest.mark.parametrize("attributes", [{}, {"causal_mask": True}])
+    def test_stats_timed_run_matches_equal_heads(self, attributes) -> None:
+        """With stats, a bf16 GQA timed run does exactly the work of an MHA run
+        of the same size: no K expansion and no fp32 casts."""
+        _, gqa, _ = _replay_sdpa(
+            self._graph(stats=True, **attributes),
+            self._tensors(2, 2, torch.bfloat16),
+        )
+        _, mha, _ = _replay_sdpa(
+            self._graph(stats=True, **attributes),
+            self._tensors(8, 8, torch.bfloat16),
+        )
+
+        assert "aten._to_copy.default" not in gqa
+        assert gqa == mha
+
+    def test_sink_timed_run_matches_equal_heads(self) -> None:
+        """Sinks run a manual fp32 attention. Its casts, K/V expansion and mask
+        are built once, so a bf16 GQA timed run does exactly the work of an MHA
+        run of the same size, and the only cast left is the output's."""
+
+        def timed_ops(kv_heads: int) -> Counter:
+            graph = self._graph(stats=True, causal_mask_bottom_right=True)
+            graph["nodes"][0]["inputs"]["sink_token_tensor_uid"] = 6
+            tensors = self._tensors(kv_heads, kv_heads, torch.bfloat16)
+            tensors[6] = torch.randn(8)
+            return _replay_sdpa(graph, tensors)[1]
+
+        gqa = timed_ops(2)
+
+        assert gqa == timed_ops(8)
+        assert gqa["aten._to_copy.default"] == 1, gqa
+
+    @staticmethod
+    def _expected_stats(tensors, causal: bool):
+        """Log-sum-exp of the scaled scores, computed without any hoisting."""
+        k = tensors[2].repeat_interleave(8 // tensors[2].shape[-3], dim=-3)
+        scores = (tensors[1] @ k.transpose(-2, -1)) * 0.5
+        if causal:
+            keep = torch.ones(4, 4, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~keep, float("-inf"))
+        return torch.logsumexp(scores, dim=-1, keepdim=True)
+
+    def test_stats_match_unhoisted_reference(self) -> None:
+        torch.manual_seed(7)
+        tensors = self._tensors(2, 2)
+        pytorch_ops.execute_graph(self._graph(stats=True, causal_mask=True), tensors)
+
+        torch.testing.assert_close(tensors[5], self._expected_stats(tensors, True))
+
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_stats_come_from_fused_kernel(self, causal: bool) -> None:
+        """The fused SDPA forward emits the log-sum-exp, as in a training step,
+        so a timed run must not compute it again with a score matmul.
+
+        MHA, because CPU Flash takes GQA only in newer torch; older torch
+        sends CPU GQA to math, which is the fallback tested below. Fused GQA
+        is covered by the GPU test in test_pytorch_benchmark.py.
+        """
+        torch.manual_seed(3)
+        tensors = self._tensors(8, 8)
+        replay = pytorch_ops.ReplayTensors(tensors)
+        graph = pytorch_ops.compile_graph(self._graph(stats=True, causal_mask=causal))
+        graph.execute(replay)
+        timed = _record_aten_ops(lambda: graph.execute(replay))
+
+        recomputed = {"aten.logsumexp.default", "aten.bmm.default", "aten.mm.default"}
+        assert not recomputed & set(timed), f"stats recomputed in timed run: {timed}"
+        torch.testing.assert_close(replay[5], self._expected_stats(tensors, causal))
+
+    def test_math_backend_stats_are_computed(self) -> None:
+        """The math backend saves no log-sum-exp, so the handler computes it."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        torch.manual_seed(5)
+        tensors = self._tensors(2, 2)
+        replay = pytorch_ops.ReplayTensors(tensors)
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
+        with pytorch_ops.use_pytorch_sdpa_backend(state):
+            pytorch_ops.compile_graph(
+                self._graph(stats=True, causal_mask=True)
+            ).execute(replay)
+
+        torch.testing.assert_close(replay[5], self._expected_stats(tensors, True))
+
+    def test_computed_input_is_not_timed(self) -> None:
+        """Cached setup assumes the inputs repeat unchanged. A K written by an
+        earlier node breaks that, so the benchmark path refuses the graph; the
+        one-shot reference path still computes it. The tensor is not marked
+        virtual: being a node output is what counts."""
+        graph = self._graph()
+        graph["nodes"].insert(
+            0,
+            {
+                "type": "PointwiseAttributes",
+                "inputs": {
+                    "operation": "add",
+                    "in_0_tensor_uid": 7,
+                    "in_1_tensor_uid": 7,
+                },
+                "outputs": {"out_0_tensor_uid": 2},
+            },
+        )
+        tensors = self._tensors(2, 2)
+        tensors[7] = torch.randn(1, 2, 4, 16)
+
+        with pytest.raises(UnsupportedGraphError, match=r"inputs \[2\] are computed"):
+            pytorch_ops.compile_graph(graph).execute(pytorch_ops.ReplayTensors(tensors))
+        pytorch_ops.execute_graph(graph, tensors)
+        assert tensors[4].shape == (1, 8, 4, 16)
+
+    @pytest.mark.parametrize(
+        ("selection", "noted"),
+        [(None, True), ("FLASH", True), ("MATH", False)],
+    )
+    def test_stats_fallback_is_noted_unless_math(self, selection, noted) -> None:
+        """Only math saves no log-sum-exp by design. Under another selection
+        the fallback puts a score matmul in the timed region, so the row says so."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        replay = pytorch_ops.ReplayTensors(self._tensors(8, 8))
+        chosen = None if selection is None else PyTorchSdpaBackendName[selection]
+        with (
+            patch.object(sdpa, "execute_selected_sdpa", lambda q, *a, **kw: q),
+            patch.object(sdpa, "strict_sdpa_selection", return_value=chosen),
+        ):
+            pytorch_ops.compile_graph(self._graph(stats=True)).execute(replay)
+
+        assert bool(replay.notes) is noted
+
+
+class TestDefaultSdpaAvoidsMath:
+    """The probe that keeps math-fallback GQA calls out of the timed baseline."""
+
+    @staticmethod
+    def _probe(sdpa):
+        from dnn_benchmarking.execution.pytorch_ops._sdpa_backend import (
+            default_sdpa_avoids_math,
+        )
+
+        x = torch.rand(1, 2, 2, 4)
+        with patch.object(torch.nn.functional, "scaled_dot_product_attention", sdpa):
+            return default_sdpa_avoids_math(
+                x,
+                x[:, :1],
+                x[:, :1],
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+                enable_gqa=True,
+            )
+
+    def test_fused_kernel_accepts(self) -> None:
+        from torch.nn import attention
+
+        selected = []
+
+        def fake_sdpa_kernel(backends):
+            selected.append(set(backends))
+            return nullcontext()
+
+        sdpa = MagicMock(side_effect=lambda q, *args, **kwargs: q)
+        with patch.object(attention, "sdpa_kernel", side_effect=fake_sdpa_kernel):
+            assert self._probe(sdpa) is True
+
+        # Math is never among the backends the probe allows.
+        assert selected == [
+            {
+                attention.SDPBackend.FLASH_ATTENTION,
+                attention.SDPBackend.EFFICIENT_ATTENTION,
+            }
+        ]
+        assert sdpa.call_args.kwargs["enable_gqa"] is True
+
+    def test_no_fused_kernel_means_math(self) -> None:
+        def sdpa(*args, **kwargs):
+            raise RuntimeError("No available kernel. Aborting execution.")
+
+        assert self._probe(sdpa) is False
+
+    def test_other_failures_propagate(self) -> None:
+        failure = RuntimeError("HIP error: out of memory")
+        with pytest.raises(RuntimeError) as caught:
+            self._probe(MagicMock(side_effect=failure))
+        assert caught.value is failure
 
 
 class TestPyTorchSdpaMaskDerivation:
