@@ -224,7 +224,8 @@ def test_bottom_right_gqa_decode_is_timed_by_default(torch_gpu) -> None:
     )
     executor.prepare()
 
-    executor.benchmark(_gqa_tensors(torch_gpu, 1, 256))
+    m = executor.benchmark(_gqa_tensors(torch_gpu, 1, 256))
+    assert m.kernel_ms[0] > 0
 
 
 def test_strict_efficient_runs_gqa_graph(torch_gpu) -> None:
