@@ -1,11 +1,12 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for tools/check_deserialize.py's SDPA scale requirement.
+"""Tests for tools/check_deserialize.py's SDPA scale rule.
 
-A graph whose SDPA node omits the scale runs at the backend's default, which
-need not be the scale its source benchmarked, and engines that require an
-explicit scale decline it. The corpus check must name such graphs.
+hipDNN reads an absent SDPA scale as 1.0, the same as cuDNN, so such a graph is
+valid and the corpus check only reports it. A benchmark graph that omits the
+scale measures 1.0 rather than the scale its source used, so the check must
+still name it, and --strict-scale must turn that into a failure.
 """
 
 import importlib.util
@@ -59,10 +60,30 @@ def test_an_sdpa_node_without_a_scale_is_named(tool, backward) -> None:
     assert tool.sdpa_nodes_without_scale(_sdpa_graph(backward=backward)) == ["sdpa"]
 
 
-def test_the_cli_fails_and_names_the_unscaled_file(tool, tmp_path, monkeypatch, capsys):
+def test_the_cli_reports_the_unscaled_file_and_exits_zero(
+    tool, tmp_path, monkeypatch, capsys
+):
     (tmp_path / "unscaled.json").write_text(json.dumps(_sdpa_graph()))
     monkeypatch.setattr(
         sys, "argv", ["check_deserialize.py", "--level", "json", str(tmp_path)]
+    )
+
+    assert tool.main() == 0
+    out = capsys.readouterr().out
+    assert "NOSCALE" in out
+    assert "unscaled.json" in out
+    assert "attn_scale_value" in out
+    assert "noscale=1" in out
+
+
+def test_strict_scale_fails_and_names_the_unscaled_file(
+    tool, tmp_path, monkeypatch, capsys
+):
+    (tmp_path / "unscaled.json").write_text(json.dumps(_sdpa_graph()))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["check_deserialize.py", "--level", "json", "--strict-scale", str(tmp_path)],
     )
 
     assert tool.main() == 1

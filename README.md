@@ -172,9 +172,11 @@ Run this after adding new workload graphs to confirm hipDNN can load them. Paths
 be globs, directories, or tarball-extracted trees; the script exits non-zero on any
 failure and prints the first failures with their error messages.
 
-Both levels also fail an SDPA node (forward or backward) that sets neither
-`attn_scale_value` nor `scale_tensor_uid`: write the scale the workload's source
-used, usually `1/sqrt(head_dim)`, rather than relying on a backend default.
+Both levels also report an SDPA node (forward or backward) that sets neither
+`attn_scale_value` nor `scale_tensor_uid`. hipDNN reads an absent scale as 1.0,
+the same as cuDNN, so the graph is valid; it just measures 1.0 instead of the
+scale its source used, usually `1/sqrt(head_dim)`. Such nodes print as
+`NOSCALE` and still exit 0; pass `--strict-scale` to make them failures.
 A causal SDPA node with Sq = 1 whose effective diagonal is top-left attends
 only to key 0, which no decode step means (a decode step is unmasked or
 bottom-right). 80 graphs in the shipped corpus are written that way, so the

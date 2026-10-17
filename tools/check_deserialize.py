@@ -7,9 +7,12 @@ Levels:
                    i.e. assemble and finalize the backend operation-graph descriptor
                    (NO plan build, NO kernel execution). Needs a built hipDNN.
 
-Both levels also require every SDPA node to state its scale (an
-attn_scale_value or a scale tensor): an absent scale is the backend's default,
-not necessarily the scale the workload's source measured.
+Both levels also expect every SDPA node to state its scale (an
+attn_scale_value or a scale tensor). An absent scale is legal: hipDNN reads it
+as 1.0, the same as cuDNN, and every engine and reference agrees since
+rocm-libraries #12926. It is reported as NOSCALE and does not fail the run,
+because a benchmark graph that omits it is measuring 1.0 rather than the scale
+its source used. --strict-scale makes it a failure.
 
 They also check the causal diagonal of SDPA graphs with Sq != Skv, using the
 mask hipDNN actually runs: causal_mask overrides diagonal_alignment and the
@@ -153,6 +156,11 @@ def main():
         help="fail, rather than report, an Sq=1 graph whose effective causal "
         "diagonal is top-left",
     )
+    ap.add_argument(
+        "--strict-scale",
+        action="store_true",
+        help="fail, rather than report, an SDPA node that states no scale",
+    )
     args = ap.parse_args()
 
     files = sorted(set(iter_files(args.paths)))
@@ -189,16 +197,21 @@ def main():
     ok = fail = 0
     warned = []
     decode = []
+    noscale = []
     failures = []
     for f in files:
         try:
             graph = json.loads(Path(f).read_text())
             unscaled = sdpa_nodes_without_scale(graph)
             if unscaled:
-                raise ValueError(
+                message = (
                     f"SDPA node(s) {unscaled} set neither attn_scale_value nor "
-                    "scale_tensor_uid; write the scale the workload used"
+                    "scale_tensor_uid, so hipDNN applies 1.0; write the scale "
+                    "the workload used"
                 )
+                if args.strict_scale:
+                    raise ValueError(message)
+                noscale.append((f, message))
             conflicting = sdpa_mask_flag_conflicts(graph)
             if conflicting:
                 raise ValueError(
@@ -232,6 +245,8 @@ def main():
             fail += 1
             if len(failures) < args.show:
                 failures.append((f, str(e)))
+    for f, e in noscale[: args.show]:
+        print(f"NOSCALE {f}\n        {e}")
     for f, e in decode[: args.show]:
         print(f"DECODE {f}\n       {e}")
     for f, w in warned[: args.show]:
@@ -240,7 +255,7 @@ def main():
         print(f"FAIL {f}\n     {e}")
     print(
         f"\nlevel={args.level}  files={len(files)}  ok={ok}  fail={fail}  "
-        f"decode={len(decode)}  warn={len(warned)}"
+        f"decode={len(decode)}  noscale={len(noscale)}  warn={len(warned)}"
     )
     return 1 if fail else 0
 
