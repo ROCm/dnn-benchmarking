@@ -1,5 +1,5 @@
 outs:
-- md5: 4e05432cc31e061680ffbfc5f3a9a26b
-  size: 100396
+- md5: 53e8da2c9e41a52da1ee5f9500adb2f7
+  size: 85094
   hash: md5
   path: pytorch.tar.gz
