@@ -1,5 +1,5 @@
 outs:
-- md5: dcf71b28367a91ed61cae6fb556f8d6c
-  size: 2052
+- md5: 898bfa14d6d8a0f36787f50d47c2fba7
+  size: 1897
   hash: md5
   path: qwen3_32b.tar.gz
