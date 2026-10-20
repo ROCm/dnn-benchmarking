@@ -10,7 +10,10 @@ Every row is timed by ``timing.measure`` (through the executors) and, with
 """
 
 import copy
+import gc
 import json
+import re
+import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -302,6 +305,75 @@ def _torch_version() -> str:
 def _run_pytorch_row(
     ctx: _GraphContext, role: Literal["engine", "reference"]
 ) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
+    """Time the graph through PyTorch as one row (``_time_pytorch_row``).
+
+    Then return PyTorch's cached VRAM to the device. The buffer manager
+    empties the cache on exit, but the row's locals (and, after a failure,
+    the exception's frames) still hold the executor and its intermediates at
+    that point. They reach the cache only once the row returns. Without this
+    release, hipDNN's own allocations (``hipMalloc``) for the same graph can
+    fail although the device has room.
+    """
+    try:
+        return _time_pytorch_row(ctx, role)
+    finally:
+        _release_torch_cache()
+
+
+def _release_torch_cache() -> None:
+    """Free the tensors no longer referenced, then return PyTorch's cached VRAM.
+
+    ``gc.collect()`` frees tensors held only by reference cycles, which
+    ``empty_cache()`` alone cannot release.
+    """
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_initialized():
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+_OUT_OF_MEMORY = re.compile(r"out ?of ?memory", re.IGNORECASE)
+
+
+def _gpu_memory_at_row_start() -> Optional[str]:
+    """Device memory as a row starts, reported if the row runs out of memory.
+
+    Read only when torch has already initialized the GPU: initializing it
+    here would itself take VRAM in a run that has no PyTorch rows. The
+    device-free figure counts every process on the GPU; the PyTorch cache
+    figure counts only this process.
+    """
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_initialized():
+            return None
+        free, total = torch.cuda.mem_get_info()
+        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    except Exception:
+        return None
+    gib = float(1 << 30)
+    return (
+        f"at row start the GPU had {free / gib:.1f} of {total / gib:.1f} GiB free "
+        f"(all processes) and this process's PyTorch cache held "
+        f"{cached / gib:.1f} GiB unused"
+    )
+
+
+def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
+    """``Type: message``, plus the row-start memory for out-of-memory errors."""
+    message = f"{type(error).__name__}: {error}"
+    if memory_at_start is not None and _OUT_OF_MEMORY.search(message):
+        message = f"{message} [{memory_at_start}]"
+    return message
+
+
+def _time_pytorch_row(
+    ctx: _GraphContext, role: Literal["engine", "reference"]
+) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
     """Time the graph through PyTorch as one row.
 
     ``role="reference"`` additionally extracts reference outputs for the
@@ -322,6 +394,7 @@ def _run_pytorch_row(
         engine_version=_torch_version(),
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    memory_at_start = _gpu_memory_at_row_start()
     try:
         from . import pytorch_ops
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
@@ -341,6 +414,7 @@ def _run_pytorch_row(
             bm.zero_outputs()
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
+            row.warnings = (row.warnings or []) + executor.notes
             if role == "reference":
                 bm.zero_outputs()
                 executor.execute_once(tensors)
@@ -369,7 +443,8 @@ def _run_pytorch_row(
         return _failed_row(_error_or_skip(strict), row, str(e)), None
     except Exception as e:
         fatal = role == "engine" or strict
-        return _failed_row(_error_or_skip(fatal), row, f"{type(e).__name__}: {e}"), None
+        message = _failure_message(e, memory_at_start)
+        return _failed_row(_error_or_skip(fatal), row, message), None
     return row, outputs
 
 
@@ -392,6 +467,7 @@ def run_single_provider_engine(
         engine_version=engine_version,
         plugin_path=plugin,
     )
+    memory_at_start = _gpu_memory_at_row_start()
     try:
         if tuned_in_process(ctx.graph_id, engine_id):
             # Typically the stall-fallback rerun of a graph whose first
@@ -472,7 +548,9 @@ def run_single_provider_engine(
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
         return _failed_row(
-            ProviderEngineResult.error_row, row, f"{type(e).__name__}: {e}"
+            ProviderEngineResult.error_row,
+            row,
+            _failure_message(e, memory_at_start),
         )
 
     # Profiling re-runs the workload after the timed pass, so profiler

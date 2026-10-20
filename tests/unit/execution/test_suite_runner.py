@@ -213,6 +213,7 @@ def fake_torch(fake, monkeypatch):
             self.policy = policy
             fake.torch_options.append((pytorch_sdpa_backend, pytorch_rocm_fa_library))
             self.device = "cuda:3"  # not the buffer manager's cuda:0 default
+            self.notes = []
 
         def prepare(self):
             if fake.torch_error:

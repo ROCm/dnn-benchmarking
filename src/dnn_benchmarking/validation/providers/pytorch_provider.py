@@ -65,10 +65,14 @@ def _sdpa_scratch_bytes(
 ) -> int:
     """float32 scratch of one SDPA node beyond its graph tensors.
 
-    Per query block: scores/probabilities, d_scores and one reduction
-    temporary. For the whole node: K and V expanded to the query heads, the
-    backward dK/dV accumulators and, for bottom-right or windowed masks, the
-    full ``[q_len, kv_len]`` band mask with its boolean temporaries. A paged
+    A forward without sinks calls torch's fused SDPA, which keeps no score
+    matrix on the host. Backward and a forward with sinks compute scores by
+    hand, one query block at a time: scores/probabilities, d_scores and one
+    reduction temporary. For the whole node: K and V expanded to the query
+    heads, the backward dK/dV accumulators, the full ``[q_len, kv_len]`` band
+    mask of a windowed or bottom-right node with its boolean temporaries
+    (torch takes bottom-right bounds natively when ``q_len == kv_len`` or
+    ``q_len == 1``), and the float32 mask of a sink node with bounds. A paged
     node counts the KV length its page table can address.
     """
     from ...execution.pytorch_ops.handlers.sdpa import (
@@ -86,19 +90,25 @@ def _sdpa_scratch_bytes(
     page_table = _dims(_uid_tensor(inputs, "page_table_k_tensor_uid", tensors))
     if len(page_table) >= 2:
         kv_len *= page_table[1]  # pages per sequence * page size
+    backward = node.get("type") == "SdpaBackwardAttributes"
+    has_sink = _uid_tensor(inputs, "sink_token_tensor_uid", tensors) is not None
+    try:
+        causal, window, bottom_right = _sdpa_derive_mask(node)
+    except ValueError:
+        causal, window, bottom_right = False, None, False  # reference declines
+
     row_bytes = rows * kv_len * 4  # one query row of float32 scores
     block_rows = min(q_len, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
-    block = row_bytes * block_rows * 3
+    block = row_bytes * block_rows * 3 if backward or has_sink else 0
     expanded = rows * kv_len * head_dim * 4 * 2
-    if node.get("type") == "SdpaBackwardAttributes":
+    if backward:
         expanded *= 2
-    try:
-        _, window, bottom_right = _sdpa_derive_mask(node)
-    except ValueError:
-        window, bottom_right = None, False  # the reference declines the node
+    needs_band = window is not None or (bottom_right and q_len not in (1, kv_len))
     # Two float32 masks (zeros, then masked_fill) and two bool masks.
-    band = q_len * kv_len * (2 * 4 + 2) if window is not None or bottom_right else 0
-    return block + expanded + band
+    band = q_len * kv_len * (2 * 4 + 2) if needs_band and not backward else 0
+    has_bounds = causal or window is not None or bottom_right
+    sink_mask = q_len * kv_len * 4 if has_sink and has_bounds else 0
+    return block + expanded + band + sink_mask
 
 
 def estimate_reference_host_bytes(graph_json: Dict[str, Any]) -> int:
