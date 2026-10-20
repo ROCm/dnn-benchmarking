@@ -6,7 +6,7 @@
 import numpy as np
 import pytest
 
-from dnn_benchmarking.validation import compare
+from dnn_benchmarking.validation import compare, compare_normalized_rms
 
 
 def _both(actual: np.ndarray, expected: np.ndarray, **tol):
@@ -116,6 +116,17 @@ def test_empty_and_scalar_arrays() -> None:
     assert not scalar.passed
     assert scalar.max_abs_diff == 2.0 and scalar.worst_index == ()
 
+
+
+def test_normalized_rms_matches_miopen_formula() -> None:
+    expected = np.array([3.0, 4.0], dtype=np.float32)
+    actual = np.array([3.0, 8.0], dtype=np.float32)
+
+    result = compare_normalized_rms(actual, expected, tolerance=0.71)
+
+    assert result.passed
+    assert result.comparison_method == "normalized_rms"
+    assert result.normalized_rms_error == pytest.approx(2**-0.5)
 
 def test_fp16_difference_does_not_overflow() -> None:
     """fp16 subtraction would give inf; the float32 compare dtype stays finite."""

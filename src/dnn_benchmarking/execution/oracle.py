@@ -149,6 +149,7 @@ def run_tuned_plan(
     graph_id: str,
     engine_id: int,
     graph_name: str,
+    graph_json: Dict[str, Any],
     config: SuiteConfig,
     bm: Any,
     variant_pack: Dict[int, int],
@@ -191,6 +192,7 @@ def run_tuned_plan(
                     reference_outputs,
                     config.validation.provider.value,
                     config,
+                    graph_json,
                 )
                 if oracle.correctness.explicitly_failed:
                     warn_once(

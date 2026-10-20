@@ -3,7 +3,7 @@
 
 """Validation module for dnn-benchmarking."""
 
-from .comparison import ComparisonResult, compare
+from .comparison import ComparisonResult, compare, compare_normalized_rms
 from .reference_provider import (
     ReferenceOutput,
     ReferenceProvider,
@@ -19,4 +19,5 @@ __all__ = [
     "ReferenceProvider",
     "ReferenceProviderRegistry",
     "compare",
+    "compare_normalized_rms",
 ]

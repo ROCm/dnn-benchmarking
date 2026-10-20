@@ -167,6 +167,19 @@ more, also when `--warmup 0` is given. In block mode it is the priming
 launches plus `--warmup` for every sample, the discarded first sample
 included.
 
+## Input data
+
+The seed creates one logical input map for each graph. Both runtimes use the
+same map. Convolution data and output-gradient tensors use `U[0, 0.01)`.
+Convolution weights use MIOpen's scaled weight distribution: fp16 uses
+`0.01 * U[-1/3, 0.5)`, and other standard floating-point types use
+`0.01 * U[-0.5, 0.5)`.
+
+Other floating-point inputs use `[0, 1)`. This range keeps values such as
+batch-normalization variances valid. Paged SDPA inputs use structured page
+tables and valid sequence lengths instead of random integers.
+
+
 ## Cache modes
 
 | Mode | Behavior |
@@ -427,9 +440,6 @@ The tool does not do these things yet:
   available with `--timing-block`.
 - Rotating input buffers. `--cache-mode cold` controls the cache state, but
   the rocKE runbook also advises rotating buffers for bandwidth work.
-- Signed input distribution. Floating-point inputs are uniform in [0, 1),
-  because BatchNorm variance inputs must not be negative. Signed data needs a
-  role for each tensor first.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with

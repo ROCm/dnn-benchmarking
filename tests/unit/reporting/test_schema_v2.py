@@ -67,7 +67,8 @@ TIMING_KEYS = {
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
-    "n_total", "worst_output_uid", "message",
+    "n_total", "worst_output_uid", "comparison_method", "normalized_rms_tolerance",
+    "normalized_rms_error", "message",
 }  # fmt: skip
 ORACLE_KEYS = PLAN_KEYS | {"tuning_available"}
 
@@ -244,6 +245,9 @@ def test_full_row_values() -> None:
         "n_mismatch": 0,
         "n_total": 4096,
         "worst_output_uid": 7,
+        "comparison_method": "elementwise",
+        "normalized_rms_tolerance": None,
+        "normalized_rms_error": None,
         "message": "note",
     }
     stats_keys = {"kernel", "host"}
@@ -271,6 +275,9 @@ def test_full_row_values() -> None:
             "n_mismatch": 5,
             "n_total": 64,
             "worst_output_uid": 9,
+            "comparison_method": "elementwise",
+            "normalized_rms_tolerance": None,
+            "normalized_rms_error": None,
             "message": "off",
         },
     }

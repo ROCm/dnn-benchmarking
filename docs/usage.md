@@ -68,16 +68,34 @@ sets `ROCM_PATH`.
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 
-The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
-1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3,
-2^-10), fp8 e5m2 (2^-2, 2^-16), fp8 e5m2 fnuz (2^-2, 2^-17), any other dtype
-(1e-5, 1e-6). An element passes when `|actual - expected| <= atol + rtol *
-|expected|`. For fp8, rtol is one ULP at the bottom of the binade of
-`|expected|` and atol is the smallest subnormal of the format, so an element
-that rounds one ULP the other way still passes. fp8 e8m0 holds only powers of
-two, so it compares log2 values (the code distance) with (0, 1): at most one
-code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
-log2 values of e8m0 outputs. The source is `TOLERANCES` in
+By default, convolution outputs use MIOpen's normalized root-mean-square
+(RMS) comparison:
+
+`sqrt(mean((actual - expected)^2)) / max(abs(expected))`
+
+An all-zero reference uses `1` as the normalizer. The default RMS tolerances
+are:
+
+| Direction | fp16 | bf16 | fp32 |
+|---|---:|---:|---:|
+| Forward | `8.2e-3` | `6.56e-2` | `1.5e-6` |
+| Data gradient | `8.2e-3` | `6.56e-2` | `1.5e-6` |
+| Weight gradient | `1.64e-2` | `1.312e-1` | `3e-6` |
+
+Other outputs use elementwise comparison. The data type defaults are bf16
+`(3e-2, 1e-3)`, fp16 `(1e-3, 1e-3)`, and all other standard types
+`(1e-5, 1e-6)`.
+
+FP8 e4m3 uses `(2^-3, 2^-9)`. FP8 e4m3 fnuz uses `(2^-3, 2^-10)`.
+FP8 e5m2 uses `(2^-2, 2^-16)`. FP8 e5m2 fnuz uses `(2^-2, 2^-17)`.
+An element passes when `|actual - expected| <= atol + rtol * |expected|`.
+For FP8, `rtol` is one unit in the last place (ULP) at the binade bottom.
+The `atol` value is the smallest subnormal value of the format. FP8 e8m0
+compares log2 values with `(0, 1)`, which permits one code step.
+
+`--rtol` and `--atol` select elementwise comparison and override all default
+tolerances. The values also apply to the log2 values of e8m0 outputs. The
+sources are `TOLERANCES` and `CONVOLUTION_RMS_TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
 ### Comparison
