@@ -322,7 +322,8 @@ Example structure:
     "model": ["conformer"],
     "mode": ["inference", "training"],
     "size": ["200"],
-    "from_transpose": ["false"]
+    "from_transpose": ["false"],
+    "convolution_type": ["pointwise"]
   }
 }
 ```
@@ -332,18 +333,22 @@ the archive contain complete graph definitions.
 
 ## Metadata tags
 
-Every metadata value is a sorted array of unique lowercase strings. The nine
+Every metadata value is a sorted array of unique lowercase strings. The ten
 bounded keys are:
 
 - `operation`: `convolution`;
 - `direction`: `fwd`, `dgrad`, or `wgrad`;
 - `dtype`: `bfloat16`, `float16`, or `float32`;
+- `convolution_type`: source `conv_type` classification;
 - `layout`: `nchw` or `nhwc`;
 - `model_family`: source workload family;
 - `model`: source model name;
 - `mode`: inference or training capture mode;
 - `size`: source workload size label;
 - `from_transpose`: `true` or `false`.
+
+Deduplication unions `convolution_type` values from every source row for one
+geometry. A graph can therefore belong to more than one convolution class.
 
 ## Run with dnn-benchmark
 
@@ -451,7 +456,7 @@ The generated corpus passed these checks:
 - 11,697 source rows resolve to 9,471 unique geometries;
 - no two files have the same executable geometry identity;
 - every filename and graph name uses an existing source shape ID;
-- every graph has all nine metadata keys;
+- every graph has all ten metadata keys;
 - every metadata value is a sorted array of unique lowercase strings;
 - every graph has a nonempty `operation` tag;
 - every graph has a valid operation node;
