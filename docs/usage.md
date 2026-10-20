@@ -68,23 +68,17 @@ sets `ROCM_PATH`.
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 
-By default, convolution outputs use MIOpen's normalized root-mean-square
-(RMS) comparison:
-
-`sqrt(mean((actual - expected)^2)) / max(abs(expected))`
-
-An all-zero reference uses `1` as the normalizer. The default RMS tolerances
-are:
+The default depends on the output operation and data type. Convolution
+outputs use these `(rtol, atol)` values:
 
 | Direction | fp16 | bf16 | fp32 |
-|---|---:|---:|---:|
-| Forward | `8.2e-3` | `6.56e-2` | `1.5e-6` |
-| Data gradient | `8.2e-3` | `6.56e-2` | `1.5e-6` |
-| Weight gradient | `1.64e-2` | `1.312e-1` | `3e-6` |
+|---|---|---|---|
+| Forward | `(3e-2, 1e-3)` | `(3e-2, 1e-3)` | `(2e-5, 1e-6)` |
+| Data gradient | `(5e-3, 1e-3)` | `(3e-2, 1e-3)` | `(1e-5, 1e-6)` |
+| Weight gradient | `(2e-2, 1e-3)` | `(4e-2, 1e-3)` | `(2e-3, 1e-6)` |
 
-Other outputs use elementwise comparison. The data type defaults are bf16
-`(3e-2, 1e-3)`, fp16 `(1e-3, 1e-3)`, and all other standard types
-`(1e-5, 1e-6)`.
+Other outputs use the data type default: bf16 `(3e-2, 1e-3)`, fp16
+`(1e-3, 1e-3)`, and all other standard types `(1e-5, 1e-6)`.
 
 FP8 e4m3 uses `(2^-3, 2^-9)`. FP8 e4m3 fnuz uses `(2^-3, 2^-10)`.
 FP8 e5m2 uses `(2^-2, 2^-16)`. FP8 e5m2 fnuz uses `(2^-2, 2^-17)`.
@@ -93,9 +87,9 @@ For FP8, `rtol` is one unit in the last place (ULP) at the binade bottom.
 The `atol` value is the smallest subnormal value of the format. FP8 e8m0
 compares log2 values with `(0, 1)`, which permits one code step.
 
-`--rtol` and `--atol` select elementwise comparison and override all default
-tolerances. The values also apply to the log2 values of e8m0 outputs. The
-sources are `TOLERANCES` and `CONVOLUTION_RMS_TOLERANCES` in
+`--rtol` and `--atol` override these defaults. They also apply to the log2
+values of e8m0 outputs. The source is `TOLERANCES` and
+`CONVOLUTION_TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
 ### Comparison

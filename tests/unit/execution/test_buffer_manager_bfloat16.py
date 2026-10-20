@@ -251,27 +251,24 @@ class TestGenerateInputData:
         assert len(np.unique(data)) > 1
 
     @pytest.mark.parametrize(
-        "node_type, inputs, weight_uid",
+        "node_type, inputs",
         [
             (
                 "ConvolutionFwdAttributes",
                 {"x_tensor_uid": 1, "w_tensor_uid": 2},
-                2,
             ),
             (
                 "ConvolutionBwdAttributes",
                 {"dy_tensor_uid": 1, "w_tensor_uid": 2},
-                2,
             ),
             (
                 "ConvolutionWrwAttributes",
                 {"x_tensor_uid": 1, "dy_tensor_uid": 2},
-                None,
             ),
         ],
     )
-    def test_convolution_inputs_match_miopen_ranges(
-        self, node_type, inputs, weight_uid
+    def test_convolution_inputs_are_centered_without_changing_other_inputs(
+        self, node_type, inputs
     ) -> None:
         tensors = [_tensor(uid, "half", dims=(4096,)) for uid in (1, 2, 3)]
         graph = {
@@ -287,13 +284,9 @@ class TestGenerateInputData:
         data = generate_input_data(tensors, seed=7, graph_json=graph)
         generic = generate_input_data(tensors, seed=7)
 
-        data_uids = set(inputs.values()) - ({weight_uid} if weight_uid is not None else set())
-        for uid in data_uids:
-            assert data[uid].min() >= 0.0 and data[uid].max() <= 0.01
-        if weight_uid is not None:
-            assert data[weight_uid].min() < 0.0 < data[weight_uid].max()
-            assert data[weight_uid].min() >= -0.01 / 3
-            assert data[weight_uid].max() <= 0.005
+        for uid in (1, 2):
+            assert data[uid].min() < 0.0 < data[uid].max()
+            assert data[uid].min() >= -0.5 and data[uid].max() <= 0.5
         np.testing.assert_array_equal(data[3], generic[3])
 
     @pytest.mark.parametrize(

@@ -180,9 +180,6 @@ class CorrectnessResult:
     n_mismatch: Optional[int] = None
     n_total: Optional[int] = None
     worst_output_uid: Optional[int] = None
-    comparison_method: str = "elementwise"
-    normalized_rms_tolerance: Optional[float] = None
-    normalized_rms_error: Optional[float] = None
 
     @property
     def passed(self) -> bool:
@@ -211,9 +208,6 @@ class CorrectnessResult:
             "n_mismatch": self.n_mismatch,
             "n_total": self.n_total,
             "worst_output_uid": self.worst_output_uid,
-            "comparison_method": self.comparison_method,
-            "normalized_rms_tolerance": self.normalized_rms_tolerance,
-            "normalized_rms_error": self.normalized_rms_error,
             "message": self.error_message,
         }
 

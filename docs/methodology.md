@@ -170,10 +170,9 @@ included.
 ## Input data
 
 The seed creates one logical input map for each graph. Both runtimes use the
-same map. Convolution data and output-gradient tensors use `U[0, 0.01)`.
-Convolution weights use MIOpen's scaled weight distribution: fp16 uses
-`0.01 * U[-1/3, 0.5)`, and other standard floating-point types use
-`0.01 * U[-0.5, 0.5)`.
+same map. Convolution data, weight, and gradient tensors use values from
+`[-0.5, 0.5)`. This centered range prevents large biased reductions in
+weight-gradient graphs.
 
 Other floating-point inputs use `[0, 1)`. This range keeps values such as
 batch-normalization variances valid. Paged SDPA inputs use structured page

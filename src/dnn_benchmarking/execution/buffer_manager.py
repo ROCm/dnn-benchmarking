@@ -211,37 +211,26 @@ def _paged_metadata(
     return 0, 0
 
 
-_CONVOLUTION_INPUT_ROLES = {
-    "ConvolutionFwdAttributes": {
-        "x_tensor_uid": "data",
-        "w_tensor_uid": "weight",
-    },
-    "ConvolutionBwdAttributes": {
-        "dy_tensor_uid": "data",
-        "w_tensor_uid": "weight",
-    },
-    "ConvolutionWrwAttributes": {
-        "x_tensor_uid": "data",
-        "dy_tensor_uid": "data",
-    },
+_CONVOLUTION_NODE_TYPES = {
+    "ConvolutionFwdAttributes",
+    "ConvolutionBwdAttributes",
+    "ConvolutionWrwAttributes",
 }
 
 
-def _convolution_input_roles(
+def _convolution_input_uids(
     graph_json: Optional[Dict[str, Any]],
-) -> Dict[int, str]:
-    """Map convolution input UIDs to their MIOpen generator roles."""
-    roles: Dict[int, str] = {}
+) -> set[int]:
+    """Return root tensor UIDs consumed by a convolution node."""
     if not graph_json:
-        return roles
-    for node in graph_json.get("nodes", []) or []:
-        role_keys = _CONVOLUTION_INPUT_ROLES.get(node.get("type"), {})
-        inputs = node.get("inputs") or {}
-        for key, role in role_keys.items():
-            uid = inputs.get(key)
-            if uid is not None:
-                roles[int(uid)] = role
-    return roles
+        return set()
+    return {
+        int(uid)
+        for node in graph_json.get("nodes", []) or []
+        if node.get("type") in _CONVOLUTION_NODE_TYPES
+        for uid in (node.get("inputs") or {}).values()
+        if uid is not None
+    }
 
 
 def _generate_paged_input(
@@ -283,22 +272,23 @@ def generate_input_data(
     """Generate one graph-scoped logical input map.
 
     Returned arrays are dense logical ndarrays keyed by tensor UID, consumed
-    by both hipDNN buffers and reference providers. Convolution data and
-    gradient inputs use ``U[0, 0.01)``. Convolution weights use MIOpen's
-    scaled weight distribution. Other floating-point inputs stay non-negative
-    so values such as batch-normalization variances remain valid. Values are
-    drawn as float32 and rounded to the graph type; bfloat16 and fp8 values are
-    returned as exactly representable float32 values. Integer and boolean
-    inputs are zeros, except paged-SDPA roles.
+    by both hipDNN buffers and reference providers. Convolution inputs use
+    U[-0.5, 0.5) to avoid the large biased reductions that U[0, 1) produces,
+    especially for weight gradients. Other floating-point inputs stay
+    non-negative so values such as batch-normalization variances remain valid.
+    Values are drawn as float32 and rounded to the graph type; bfloat16 and fp8
+    values are returned as exactly representable float32 values. Integer and
+    boolean inputs are zeros, except paged-SDPA roles.
 
     ``graph_json`` selects operation-specific input policies. Paged SDPA inputs
-    satisfy page-table and sequence-length invariants.
+    satisfy page-table and sequence-length invariants. Convolution data,
+    weight, and gradient inputs use the centered distribution.
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
     page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
-    convolution_roles = _convolution_input_roles(graph_json)
+    convolution_inputs = _convolution_input_uids(graph_json)
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -322,12 +312,8 @@ def generate_input_data(
             input_data[tensor_info.uid] = np.zeros(tensor_info.dims, dtype=dtype.numpy)
         else:
             data = rng.random(tensor_info.dims, dtype=np.float32)
-            role = convolution_roles.get(tensor_info.uid)
-            if role == "data":
-                data *= np.float32(0.01)
-            elif role == "weight":
-                lower = np.float32(-1.0 / 3.0 if dtype.name == "half" else -0.5)
-                data = (data * (np.float32(0.5) - lower) + lower) * np.float32(0.01)
+            if tensor_info.uid in convolution_inputs:
+                data -= np.float32(0.5)
             input_data[tensor_info.uid] = _decode(_encode(data, dtype), dtype)
 
     return input_data

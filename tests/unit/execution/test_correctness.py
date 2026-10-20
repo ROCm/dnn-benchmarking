@@ -7,11 +7,7 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
-from dnn_benchmarking.execution.correctness import (
-    check_correctness,
-    normalized_rms_tolerance_for,
-    tolerance_for,
-)
+from dnn_benchmarking.execution.correctness import check_correctness, tolerance_for
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.validation import ReferenceOutput
 
@@ -63,21 +59,9 @@ def _ref(data):
 def test_tolerance_by_dtype_and_override(data_type, rtol, atol, expected):
     assert tolerance_for(_config(rtol, atol), _out(1, data_type)) == expected
 
-@pytest.mark.parametrize(
-    "node_type, data_type, expected",
-    [
-        ("ConvolutionFwdAttributes", "half", 8.2e-3),
-        ("ConvolutionFwdAttributes", "float", 1.5e-6),
-        ("ConvolutionBwdAttributes", "half", 8.2e-3),
-        ("ConvolutionWrwAttributes", "half", 1.64e-2),
-        ("ConvolutionWrwAttributes", "bfloat16", 1.312e-1),
-        ("ConvolutionWrwAttributes", "float", 3e-6),
-    ],
-)
-def test_convolution_rms_tolerance_by_direction_and_dtype(
-    node_type, data_type, expected
-):
-    graph = {
+
+def _convolution_graph(node_type="ConvolutionFwdAttributes"):
+    return {
         "nodes": [
             {
                 "type": node_type,
@@ -87,56 +71,41 @@ def test_convolution_rms_tolerance_by_direction_and_dtype(
         ]
     }
 
-    assert normalized_rms_tolerance_for(
-        _config(), _out(1, data_type), graph
-    ) == expected
 
+def test_convolution_output_uses_its_elementwise_policy():
+    ref = {1: _ref([1.0, 1.0, 1.0, 1.0])}
+    bm = _HostBM({1: np.array([1.02, 1.0, 1.0, 1.0], np.float32)})
 
-def test_explicit_tolerance_overrides_convolution_default():
-    graph = {
-        "nodes": [
-            {
-                "type": "ConvolutionWrwAttributes",
-                "inputs": {},
-                "outputs": {"dw_tensor_uid": 1},
-            }
-        ]
-    }
-
-    assert normalized_rms_tolerance_for(
-        _config(rtol=0.25), _out(1, "half"), graph
-    ) is None
-    assert tolerance_for(_config(rtol=0.25), _out(1, "half"), graph) == (0.25, 0.25)
-
-
-def test_convolution_uses_normalized_rms_instead_of_elementwise_allclose():
-    graph = {
-        "nodes": [
-            {
-                "type": "ConvolutionFwdAttributes",
-                "inputs": {},
-                "outputs": {"y_tensor_uid": 1},
-            }
-        ]
-    }
-    reference = np.ones(1000, dtype=np.float32)
-    actual = reference.copy()
-    actual[0] += 0.1
-
-    c = check_correctness(
-        _HostBM({1: actual}),
+    generic = check_correctness(bm, [_out(1, "half")], ref, "pytorch", _config())
+    convolution = check_correctness(
+        bm,
         [_out(1, "half")],
-        {1: _ref(reference)},
+        ref,
         "pytorch",
         _config(),
-        graph,
+        _convolution_graph(),
     )
 
-    assert c.passed
-    assert c.comparison_method == "normalized_rms"
-    assert c.normalized_rms_error == pytest.approx(0.1 / np.sqrt(1000))
-    assert c.normalized_rms_tolerance == 8.2e-3
-    assert c.n_mismatch is None
+    assert generic.tolerance_match is False
+    assert convolution.tolerance_match is True
+    assert convolution.n_mismatch == 0
+
+
+def test_explicit_tolerance_overrides_convolution_policy():
+    ref = {1: _ref([1.0, 1.0, 1.0, 1.0])}
+    bm = _HostBM({1: np.array([1.02, 1.0, 1.0, 1.0], np.float32)})
+
+    result = check_correctness(
+        bm,
+        [_out(1, "half")],
+        ref,
+        "pytorch",
+        _config(rtol=1e-3, atol=1e-3),
+        _convolution_graph(),
+    )
+
+    assert result.tolerance_match is False
+    assert result.n_mismatch == 1
 
 
 @pytest.mark.parametrize(
