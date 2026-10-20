@@ -3,7 +3,7 @@
 
 """PyTorch GPU executor for graph benchmarking."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -61,6 +61,8 @@ class PyTorchCudaExecutor:
         )
         self._stream: Optional[Any] = None
         self._compiled: Optional[pytorch_ops.CompiledGraph] = None
+        # Row warnings that handlers found while priming the last benchmark().
+        self.notes: List[str] = []
 
     def prepare(self) -> None:
         """Validate and compile the graph and pin the execution stream.
@@ -107,6 +109,7 @@ class PyTorchCudaExecutor:
         """
         stream = self._get_stream()
         replay = pytorch_ops.ReplayTensors(tensors)
+        self.notes = replay.notes
         # One stream context around the whole loop: entering it per iteration
         # would put its host cost inside the submit bracket.
         with torch.cuda.device(self._device), torch.cuda.stream(stream):

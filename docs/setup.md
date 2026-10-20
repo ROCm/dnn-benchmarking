@@ -107,6 +107,10 @@ dnn-benchmarking finds the engine plugins in
 A CPU-only PyTorch never enables `--runtime pytorch`. It is only for
 `--validate pytorch`. `--runtime pytorch` needs a ROCm or CUDA build.
 
+Every mode that provides PyTorch needs PyTorch 2.5 or later: the SDPA
+reference passes `enable_gqa` to `F.scaled_dot_product_attention`.
+`--torch-mode existing` does not check the version.
+
 The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
 `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
 `--reuse-artifacts`, they build hipDNN and the providers from source.
@@ -133,6 +137,25 @@ a usable ROCm runtime, import `hipdnn_frontend` to check its native libraries.
 
 ROCm wheel reuse without `--rocm-prefix` also needs the venv's devel SDK.
 Setup does not download that SDK in reuse mode.
+
+### Mixed ROCm torch and hipDNN prefixes
+
+ROCm torch wheels can contain their own `libhipdnn_backend.so` alongside HIP
+and COMGR. When `--rocm-prefix` selects a different hipDNN install, the
+hipDNN CLI imports `hipdnn_frontend` before probing an optional PyTorch
+reference. This gives the selected prefix's hipDNN library on
+`LD_LIBRARY_PATH` the first chance to bind. `--runtime pytorch` imports torch
+first. On ROCm its optional HIP event timer can import the bindings later;
+the backend that torch mapped first remains loaded. A CPU or CUDA PyTorch
+build does not require hipDNN.
+
+Import order does not make different HIP or COMGR versions compatible. On
+Linux, check `/proc/self/maps` in the benchmark process for
+`libhipdnn_backend`, `libamdhip64` and `libamd_comgr`; finding a package on
+disk does not show which shared library is loaded. Prefer a matching ROCm
+torch wheel and hipDNN install. Do not use `LD_PRELOAD` to force a different
+hipDNN backend: loading two LLVM runtimes can abort the process with
+`LLVM ERROR: support is already registered`.
 
 ## CUDA hosts
 

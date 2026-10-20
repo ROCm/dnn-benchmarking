@@ -38,8 +38,8 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
         RuntimeStartupError: runtime unavailable (exit 1) or an explicit
             ``--engine`` that no loaded plugin provides (exit 2).
     """
-    _check_reference_provider(config)
     if config.runtime is RuntimeName.PYTORCH:
+        _check_reference_provider(config)
         # torch.cuda is the authoritative GPU check here: a CPU-only torch
         # cannot run these benchmarks even when ROCm tools see a device.
         if not torch_support.module_available():
@@ -56,7 +56,13 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
             path, graph_json, infos, config, reporter
         )
 
-    handle = _create_hipdnn_handle(config)
+    # The reference-provider availability check imports torch. A ROCm torch
+    # wheel may preload another libhipdnn_backend, so bind the selected
+    # hipDNN frontend first. Defer reporting load errors until after the
+    # reference check, preserving its startup error when both are unavailable.
+    hipdnn, load_error = _load_hipdnn_bindings()
+    _check_reference_provider(config)
+    handle = _create_hipdnn_handle(config, hipdnn, load_error)
     return lambda path, graph_json, infos: run_graph_all_providers(
         path, graph_json, infos, config, handle, reporter
     )
@@ -77,7 +83,19 @@ def _check_reference_provider(config: SuiteConfig) -> None:
         )
 
 
-def _create_hipdnn_handle(config: SuiteConfig) -> Any:
+def _load_hipdnn_bindings() -> tuple[Any, Optional[Exception]]:
+    """Load bindings before a ROCm torch reference probe can load its backend."""
+    try:
+        initialize_pip_rocm_runtime()
+        import hipdnn_frontend as hipdnn
+    except (ImportError, OSError, RuntimeError) as e:
+        return None, e
+    return hipdnn, None
+
+
+def _create_hipdnn_handle(
+    config: SuiteConfig, hipdnn: Any, load_error: Optional[Exception]
+) -> Any:
     """Create the shared hipDNN handle; None when plugin paths are per engine.
 
     Handle creation is the authoritative GPU/runtime check for hipDNN.
@@ -89,10 +107,16 @@ def _create_hipdnn_handle(config: SuiteConfig) -> Any:
             "(check --plugin-path)",
             exit_code=2,
         )
+    if load_error is not None:
+        if isinstance(load_error, ImportError):
+            raise RuntimeStartupError(
+                f"hipdnn_frontend is not importable ({load_error}); install the hipDNN "
+                "Python bindings or use --runtime pytorch"
+            ) from load_error
+        raise RuntimeStartupError(
+            f"hipDNN handle creation failed: {load_error}"
+        ) from load_error
     try:
-        initialize_pip_rocm_runtime()
-        import hipdnn_frontend as hipdnn
-
         if config.plugin_paths is not None and len(config.plugin_paths) > 1:
             # The runner creates one handle per engine/plugin pair; check each
             # pair now so a bad engine or directory fails before any graph.
