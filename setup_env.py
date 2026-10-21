@@ -42,6 +42,15 @@ IS_WINDOWS = platform.system() == "Windows"
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
+PROVIDER_DESCRIPTOR_ROOT = (
+    ROCM_LIBRARIES_DIR
+    / "dnn-providers"
+    / "hip-kernel-provider"
+    / "src"
+    / "engines"
+    / "kernel_ingestor_engine"
+    / "descriptors"
+)
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
@@ -647,9 +656,20 @@ class Setup:
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
         if (ROCM_LIBRARIES_DIR / ".git").exists():
+            sparse_paths = []
+            if not (ROCM_LIBRARIES_DIR / ".dvc" / "config").is_file():
+                sparse_paths.append(".dvc")
             if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
+                sparse_paths.append("cmake")
+            if sparse_paths:
                 run_git(
-                    ["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "add", "cmake"]
+                    [
+                        "-C",
+                        str(ROCM_LIBRARIES_DIR),
+                        "sparse-checkout",
+                        "add",
+                        *sparse_paths,
+                    ]
                 )
             # An existing checkout is reused as-is, so a pin bump or a broken
             # sparse clone would otherwise go unnoticed.
@@ -677,7 +697,7 @@ class Setup:
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
         print(
             f"Fetching rocm-libraries ({ref}) via sparse checkout "
-            "(cmake, projects/hipdnn, dnn-providers)..."
+            "(.dvc, cmake, projects/hipdnn, dnn-providers)..."
         )
         # Clone beside the target and move it in only once checked out: a
         # failed or interrupted fetch must not leave a .git directory behind
@@ -708,6 +728,7 @@ class Setup:
                     *git,
                     "sparse-checkout",
                     "set",
+                    ".dvc",
                     "cmake",
                     "projects/hipdnn",
                     "dnn-providers",
@@ -1244,8 +1265,32 @@ class Setup:
         # pulled in.
         deps = ["build"]
         if not IS_WINDOWS:
-            deps += ["msgpack>=1.0.0", "zstandard>=0.20.0"]
+            deps += [
+                "dvc[s3]>=3,<4",
+                "msgpack>=1.0.0",
+                "zstandard>=0.20.0",
+            ]
         self.pip("install", *deps)
+
+    def pull_provider_artifacts(self) -> None:
+        """Materialize every DVC-backed kernel-ingestor descriptor."""
+        pointers = sorted(PROVIDER_DESCRIPTOR_ROOT.glob("**/*.dvc"))
+        if not pointers:
+            return
+        targets = [
+            pointer.relative_to(ROCM_LIBRARIES_DIR).as_posix()
+            for pointer in pointers
+        ]
+        env = dict(self.env)
+        ca_bundle = env.get("PIP_CERT") or env.get("SSL_CERT_FILE")
+        if ca_bundle:
+            env.setdefault("AWS_CA_BUNDLE", ca_bundle)
+        print(f"Pulling {len(targets)} provider descriptor artifact(s)...")
+        run(
+            [self.py, "-m", "dvc", "pull", *targets],
+            cwd=ROCM_LIBRARIES_DIR,
+            env=env,
+        )
 
     def rocke_args(self, toolchain_prefix: str) -> list[str]:
         """Configure defines that build rocKE and its ingestor engines.
@@ -1635,7 +1680,10 @@ class Setup:
                 ("rocm-libraries sources", self.ensure_rocm_libraries_checkout)
             )
             if self.do_build:
-                stages.append(("Build dependencies", self.install_build_deps))
+                stages += [
+                    ("Build dependencies", self.install_build_deps),
+                    ("Provider descriptor artifacts", self.pull_provider_artifacts),
+                ]
             stages += [
                 ("hipDNN and provider plugins", self.build_hipdnn),
                 ("hipDNN Python bindings", self.install_bindings),

@@ -372,6 +372,7 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
         pytest.skip("git unavailable")
     src = tmp_path / "src"
     for rel in (
+        ".dvc/config",
         "CMakePresets.json",
         "cmake/x.cmake",
         "projects/hipdnn/CMakeLists.txt",
@@ -417,6 +418,7 @@ def test_failed_fetch_leaves_no_checkout_to_reuse(
     setup.rocm_libraries_ref = "main"
     setup.ensure_rocm_libraries_checkout()
     assert (rocm_libraries / "CMakePresets.json").is_file()
+    assert (rocm_libraries / ".dvc" / "config").is_file()
     assert (rocm_libraries / "projects" / "hipdnn" / "CMakeLists.txt").is_file()
     assert not (rocm_libraries / "projects" / "other").exists()
 
@@ -479,6 +481,58 @@ def test_rocm_libraries_ref_pins_the_fetched_commit(
     ).ensure_rocm_libraries_checkout()
     assert _head(rocm_libraries) == pinned
     assert f"not the pinned {tip[:12]}" in capsys.readouterr().err
+
+
+def test_provider_descriptor_artifacts_are_pulled_before_build(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    rocm_libraries = tmp_path / "rocm-libraries"
+    descriptor_root = rocm_libraries / "descriptors"
+    pointers = [
+        descriptor_root / "rocKE" / "gfx950_attention_dense" / "artifacts.dvc",
+        descriptor_root / "other" / "future_artifacts.dvc",
+    ]
+    for pointer in pointers:
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text("outs: []\n")
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
+    monkeypatch.setattr(setup_env, "PROVIDER_DESCRIPTOR_ROOT", descriptor_root)
+    setup = _setup(setup_env, tmp_path)
+    setup.env["PIP_CERT"] = "/etc/ssl/certs/ca-certificates.crt"
+    calls = []
+    monkeypatch.setattr(
+        setup_env,
+        "run",
+        lambda cmd, **kwargs: calls.append((list(cmd), kwargs)),
+    )
+
+    setup.pull_provider_artifacts()
+
+    command, kwargs = calls[0]
+    assert command == [
+        setup.py,
+        "-m",
+        "dvc",
+        "pull",
+        "descriptors/other/future_artifacts.dvc",
+        "descriptors/rocKE/gfx950_attention_dense/artifacts.dvc",
+    ]
+    assert kwargs["cwd"] == rocm_libraries
+    assert (
+        kwargs["env"]["AWS_CA_BUNDLE"]
+        == "/etc/ssl/certs/ca-certificates.crt"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="rocKE is Linux-only")
+def test_build_dependencies_include_dvc(setup_env, tmp_path, monkeypatch) -> None:
+    setup = _setup(setup_env, tmp_path)
+    installed = []
+    monkeypatch.setattr(setup, "pip", lambda *args: installed.extend(args))
+
+    setup.install_build_deps()
+
+    assert "dvc[s3]>=3,<4" in installed
 
 
 # --- venv reuse ----------------------------------------------------------------
@@ -706,6 +760,7 @@ _STAGE_METHODS = (
     "install_package",
     "ensure_rocm_libraries_checkout",
     "install_build_deps",
+    "pull_provider_artifacts",
     "build_hipdnn",
     "install_bindings",
     "install_runtime_extras",
@@ -713,7 +768,11 @@ _STAGE_METHODS = (
 )
 _CUDA_PLAN = ["setup_venv", "install_torch", "install_package", "verify"]
 _FULL_PLAN = list(_STAGE_METHODS)
-_REUSE_PLAN = [m for m in _STAGE_METHODS if m != "install_build_deps"]
+_REUSE_PLAN = [
+    method
+    for method in _STAGE_METHODS
+    if method not in {"install_build_deps", "pull_provider_artifacts"}
+]
 
 
 @pytest.mark.parametrize(
