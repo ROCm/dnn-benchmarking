@@ -138,7 +138,7 @@ anonymous reads.
 python -m pip install "dvc[s3]"
 dvc pull                                      # every workload
 dvc pull Workloads/headline/conv.tar.gz.dvc   # one headline workload
-dvc pull Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz.dvc  # corpus
+dvc pull Workloads/corpus/Convolution/files.tar.gz.dvc  # corpus
 ```
 
 Keep credentials in `.dvc/config.local`, which git ignores.

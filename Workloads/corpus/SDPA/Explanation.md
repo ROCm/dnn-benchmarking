@@ -51,5 +51,5 @@ SDPA/
 Run all graphs:
 
 ```bash
-dnn-benchmark -g Workloads/corpus/rocke/SDPA/files.tar.gz
+dnn-benchmark -g Workloads/corpus/SDPA/files.tar.gz
 ```

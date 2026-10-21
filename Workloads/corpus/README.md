@@ -9,7 +9,7 @@ The goal is to represent all hipDNN workloads with the smallest practical
 number of graphs. This goal is an admission rule for the folder. It is not a
 claim about the current coverage.
 
-Today, the folder contains one collection. `ConvolutionModelsCorpus/` contains
+Today, the folder contains one collection. `Convolution/` contains
 9,471 unique convolution geometries from 31 models.
 
 ## Golden standard
@@ -41,7 +41,7 @@ workload class across many representative models.
 
 | Collection | Scope | Documentation |
 |---|---|---|
-| `ConvolutionModelsCorpus/` | 9,471 unique convolution geometries from 31 models | [Convolution corpus guide](ConvolutionModelsCorpus/Explanation.md) |
+| `Convolution/` | 9,471 unique convolution geometries from 31 models | [Convolution corpus guide](Convolution/Explanation.md) |
 
 The convolution collection includes forward, backward-data, and
 backward-weight graphs. It covers 2-D, 3-D, audio, image, and video workloads.
@@ -78,14 +78,14 @@ python -m pip install "dvc[s3]"
 From the repository root, get the convolution corpus:
 
 ```bash
-dvc pull Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz.dvc
+dvc pull Workloads/corpus/Convolution/files.tar.gz.dvc
 ```
 
 Run all convolution graphs:
 
 ```bash
 dnn-benchmark \
-  -g Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz \
+  -g Workloads/corpus/Convolution/files.tar.gz \
   -o corpus-results.json
 ```
 

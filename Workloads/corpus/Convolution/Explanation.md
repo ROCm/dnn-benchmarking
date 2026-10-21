@@ -258,7 +258,7 @@ A transposed source operation can map to a backward-data graph. The
 ## Archive layout
 
 ```text
-ConvolutionModelsCorpus/
+Convolution/
 ├── Explanation.md
 └── files.tar.gz
     └── conv/
@@ -355,14 +355,14 @@ geometry. A graph can therefore belong to more than one convolution class.
 Run all graphs from the repository root:
 
 ```bash
-dnn-benchmark -g Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz -o corpus-results.json
+dnn-benchmark -g Workloads/corpus/Convolution/files.tar.gz -o corpus-results.json
 ```
 
 Run with one engine:
 
 ```bash
 dnn-benchmark \
-  -g Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz \
+  -g Workloads/corpus/Convolution/files.tar.gz \
   -e MIOPEN_ENGINE \
   -o corpus-miopen-results.json
 ```
@@ -371,7 +371,7 @@ Validate engine output against PyTorch:
 
 ```bash
 dnn-benchmark \
-  -g Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz \
+  -g Workloads/corpus/Convolution/files.tar.gz \
   --validate pytorch \
   -o corpus-validation-results.json
 ```
@@ -382,7 +382,7 @@ The archive interface runs all 9,471 geometries. Complete these steps to run onl
 
    ```bash
    mkdir -p /tmp/hipdnn-conv-corpus
-   tar -xzf Workloads/corpus/ConvolutionModelsCorpus/files.tar.gz \
+   tar -xzf Workloads/corpus/Convolution/files.tar.gz \
      -C /tmp/hipdnn-conv-corpus
    ```
 
