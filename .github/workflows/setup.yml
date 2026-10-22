@@ -121,10 +121,11 @@ jobs:
           source .ci-gpu-workspace/.venv/bin/activate
           pip install -e ".[test]"
           python -c "import dnn_benchmarking; print('dnn_benchmarking OK')"
-          # Otherwise every hipDNN or PyTorch GPU test skips and the job still
-          # passes. pytest's -ra (pyproject.toml) prints every skip reason.
+          # Otherwise every hipDNN, PyTorch or rocKE GPU test skips and the job
+          # still passes. pytest's -ra (pyproject.toml) prints every skip reason.
           python -c "import hipdnn_frontend as h; assert h.hip_get_device_count() > 0, 'hipdnn_frontend sees no HIP device'; h.Handle(); print('hipdnn_frontend OK')"
           python -c "import torch; assert torch.cuda.is_available(), 'torch sees no GPU'"
+          python -c "import rocke, builders, kernels.gfx950.attention_dense, dispatch.attention; print('rocKE OK')"
           dnn-benchmark --help
           pytest -q
 

@@ -10,7 +10,7 @@ rocKE launch synchronizes the host after every call.
 """
 
 import hashlib
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -29,6 +29,45 @@ def device_arch(device: torch.device) -> str:
 def device_num_cus(device: torch.device) -> int:
     """Compute-unit count, which rocKE's dispatcher uses to size grids."""
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+class PagedViews(NamedTuple):
+    """Unified-attention arguments over packed BSHD tensors, without a copy."""
+
+    q_tokens: torch.Tensor  # [B*Sq, Hq, D]
+    o_tokens: torch.Tensor  # [B*Sq, Hq, D]
+    k_cache: torch.Tensor  # [num_blocks, block_size, Hkv, D]
+    v_cache: torch.Tensor  # [num_blocks, block_size, Hkv, D]
+    cu_seqlens_q: torch.Tensor  # [B+1] int32
+    seqused_k: torch.Tensor  # [B] int32
+    block_table: torch.Tensor  # [B, Skv / block_size] int32
+
+
+def paged_views(p: SdpaProblem, block_size: int, q, k, v, o) -> PagedViews:
+    """Map contiguous ``[B, S, H, D]`` Q/K/V/O onto rocKE's paged-KV ABI.
+
+    Packed BSHD K/V is a paged cache whose pages are in order: page ``j`` of
+    sequence ``b`` is block ``b * (Skv / block_size) + j``.
+    """
+    blocks_per_seq = p.seqlen_kv // block_size
+    device = q.device
+    return PagedViews(
+        q_tokens=q.view(p.batch * p.seqlen_q, p.num_query_heads, p.head_size),
+        o_tokens=o.view(p.batch * p.seqlen_q, p.num_query_heads, p.head_size),
+        k_cache=k.view(
+            p.batch * blocks_per_seq, block_size, p.num_kv_heads, p.head_size
+        ),
+        v_cache=v.view(
+            p.batch * blocks_per_seq, block_size, p.num_kv_heads, p.head_size
+        ),
+        cu_seqlens_q=torch.arange(
+            0, (p.batch + 1) * p.seqlen_q, p.seqlen_q, dtype=torch.int32, device=device
+        ),
+        seqused_k=torch.full((p.batch,), p.seqlen_kv, dtype=torch.int32, device=device),
+        block_table=torch.arange(
+            p.batch * blocks_per_seq, dtype=torch.int32, device=device
+        ).view(p.batch, blocks_per_seq),
+    )
 
 
 class RockeExecutor:
@@ -150,8 +189,6 @@ class RockeExecutor:
         assert isinstance(kernel, AutoKernel)
         p = self._problem
         bs = kernel.block_size
-        blocks_per_seq = p.seqlen_kv // bs
-        device = q.device
         problem = UnifiedAttentionProblem(
             total_q=p.batch * p.seqlen_q,
             num_seqs=p.batch,
@@ -164,21 +201,7 @@ class RockeExecutor:
             dtype=p.dtype,
             num_cus=device_num_cus(self._device),
         )
-        # Packed BSHD K/V is a paged cache whose pages are in order: page j of
-        # sequence b is block b * blocks_per_seq + j. No copy is needed.
-        q_tokens = q.view(p.batch * p.seqlen_q, p.num_query_heads, p.head_size)
-        o_tokens = o.view(p.batch * p.seqlen_q, p.num_query_heads, p.head_size)
-        k_cache = k.view(p.batch * blocks_per_seq, bs, p.num_kv_heads, p.head_size)
-        v_cache = v.view(p.batch * blocks_per_seq, bs, p.num_kv_heads, p.head_size)
-        cu_seqlens_q = torch.arange(
-            0, (p.batch + 1) * p.seqlen_q, p.seqlen_q, dtype=torch.int32, device=device
-        )
-        seqused_k = torch.full(
-            (p.batch,), p.seqlen_kv, dtype=torch.int32, device=device
-        )
-        block_table = torch.arange(
-            p.batch * blocks_per_seq, dtype=torch.int32, device=device
-        ).view(p.batch, blocks_per_seq)
+        views = paged_views(p, bs, q, k, v, o)
         # Force the dispatcher's path: "auto" would fall back to rocKE's
         # scalar correctness kernel when the tiled path declines.
         backend = "tiled" if kernel.path == "2d" else "3d"
@@ -187,14 +210,14 @@ class RockeExecutor:
         def launch() -> None:
             run_unified_attention_torch(
                 problem=problem,
-                q=q_tokens,
-                k=k_cache,
-                v=v_cache,
-                out=o_tokens,
-                cu_seqlens_q=cu_seqlens_q,
-                seqused_k=seqused_k,
+                q=views.q_tokens,
+                k=views.k_cache,
+                v=views.v_cache,
+                out=views.o_tokens,
+                cu_seqlens_q=views.cu_seqlens_q,
+                seqused_k=views.seqused_k,
                 softmax_scale=p.scale,
-                block_table=block_table,
+                block_table=views.block_table,
                 softcap=0.0,
                 backend=backend,
                 stream=stream,

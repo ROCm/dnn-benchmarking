@@ -47,7 +47,7 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime {hipdnn,pytorch,rocke}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE SDPA kernels directly. See [rocKE runtime](#rocke-runtime). |
+| `-r`, `--runtime {hipdnn,pytorch,rocke}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). See [rocKE runtime](#rocke-runtime). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
@@ -257,7 +257,7 @@ Read the rows as follows:
 Requirements and limits:
 
 - A ROCm build of PyTorch and the rocKE Python packages (`rocke`, `kernels`,
-  `dispatch`). `setup_env.py` installs them on Linux from the `rocm-libraries`
+  `builders`, `dispatch`). `setup_env.py` installs them on Linux from the `rocm-libraries`
   checkout that it builds the plugins from.
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding

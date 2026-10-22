@@ -182,11 +182,15 @@ def sdpa_problem(
             f"rocKE runtime does not support SDPA features: {', '.join(present)}"
         )
     try:
-        causal, window = _sdpa_derive_mask(node)
+        causal, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError as e:
         raise UnsupportedGraphError(str(e)) from e
     if window is not None:
         raise UnsupportedGraphError("rocKE runtime does not support sliding windows")
+    if bottom_right:
+        raise UnsupportedGraphError(
+            "rocKE runtime does not support bottom-right diagonal alignment"
+        )
 
     infos = {info.uid: info for info in tensor_infos}
     uids = {}
@@ -327,12 +331,16 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
             seqlen_q=problem.seqlen_q,
             seqlen_kv=problem.seqlen_kv,
         )
+        # rocKE reports a tile that does not divide the sequence lengths (and
+        # other unsupported spec values) as ValueError. A TypeError means the
+        # descriptor names a spec field this rocKE does not know: a rocKE
+        # version mismatch, which must reach the graph error, not hide here.
         try:
             ok, _ = supports_attention_dense(
                 Gfx950AttentionDenseSpec(**shaped), arch=DENSE_ARCH
             )
-        except (TypeError, ValueError):
-            ok = False  # The tile does not divide the sequence lengths.
+        except ValueError:
+            ok = False
         if ok:
             found.append(CatalogKernel(f"rocke:{name}", shaped, sha))
     return found
