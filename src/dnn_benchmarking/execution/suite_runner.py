@@ -43,6 +43,14 @@ from .oracle import (
     run_tuned_plan,
     tuned_in_process,
 )
+from .rocke_sdpa import (
+    Catalog,
+    RockeKernel,
+    SdpaProblem,
+    auto_kernel,
+    catalog_kernels,
+    sdpa_problem,
+)
 
 
 @dataclass
@@ -293,11 +301,11 @@ def _graph_context(
     return ctx
 
 
-def _torch_version() -> str:
+def _package_version(distribution: str) -> str:
     try:
         from importlib.metadata import version
 
-        return version("torch")
+        return version(distribution)
     except Exception:
         return "unavailable"
 
@@ -391,7 +399,7 @@ def _time_pytorch_row(
         engine_name="pytorch",
         status="success",
         role=role,
-        engine_version=_torch_version(),
+        engine_version=_package_version("torch"),
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
     memory_at_start = _gpu_memory_at_row_start()
@@ -913,3 +921,185 @@ def _run_graph_pytorch(
         _report_row(reporter, "pytorch", lambda: _run_pytorch_row(ctx, "engine")[0])
     )
     return graph
+
+
+@dataclass(frozen=True)
+class RockeSession:
+    """Per-suite rocKE state: the shipped-kernel catalog and the device.
+
+    Attributes:
+        catalog: hipDNN-shipped rocKE variants for ``arch``.
+        arch: GPU architecture name (``gfx950``).
+        num_cus: Compute-unit count for rocKE's dispatcher.
+        version: Installed ``rocke`` package version.
+    """
+
+    catalog: Catalog
+    arch: str
+    num_cus: int
+    version: str
+
+
+def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
+    """Read the device and the shipped rocKE catalog once per suite.
+
+    Raises:
+        OSError, ValueError: A descriptor file is unreadable or not JSON.
+    """
+    import torch
+
+    from .rocke_executor import device_arch, device_num_cus
+    from .rocke_sdpa import descriptor_files, load_catalog
+
+    device = torch.device("cuda")
+    arch = device_arch(device)
+    catalog = load_catalog(descriptor_files(config.plugin_paths or [], arch))
+    if catalog.missing_provenance:
+        reporter.warning(
+            f"{catalog.missing_provenance} packed rocKE variants record no rocKE "
+            "spec; the rocKE runtime cannot rebuild them"
+        )
+    if not catalog.kernels:
+        reporter.warning(
+            f"no hipDNN-shipped rocKE kernels for {arch} under the plugin path; "
+            "only the rocKE auto kernel runs"
+        )
+    return RockeSession(
+        catalog=catalog,
+        arch=arch,
+        num_cus=device_num_cus(device),
+        version=_package_version("rocke"),
+    )
+
+
+def run_graph_rocke(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+    session: RockeSession,
+) -> GraphResult:
+    """Run a single SDPA graph through every applicable rocKE kernel.
+
+    One row for each hipDNN-shipped variant that runs the graph, then one row
+    for rocKE's auto kernel. A graph that no rocKE kernel runs has status
+    ``no_engines``. ``--validate pytorch`` adds the PyTorch reference row.
+    """
+    return _with_stall_fallback(
+        lambda cfg: _run_graph_rocke(
+            graph_path, graph_json, tensor_infos, cfg, reporter, session
+        ),
+        config,
+        reporter,
+    )
+
+
+def _run_graph_rocke(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+    session: RockeSession,
+) -> GraphResult:
+    graph = GraphResult(
+        graph_name=graph_json.get("name", graph_path.stem),
+        graph_path=str(graph_path),
+        results=[],
+        graph_id=graph_id_for(graph_json),
+    )
+    try:
+        problem = sdpa_problem(graph_json, tensor_infos)
+        kernels: List[RockeKernel] = list(catalog_kernels(session.catalog, problem))
+        reasons = [] if kernels else ["no hipDNN-shipped rocKE variant matches"]
+        try:
+            kernels.append(auto_kernel(problem, session.arch, session.num_cus))
+        except UnsupportedGraphError as e:
+            reasons.append(str(e))
+    except UnsupportedGraphError as e:
+        graph.message = str(e)
+        return graph
+    except Exception as e:
+        graph.error = f"rocKE kernel selection failed: {type(e).__name__}: {e}"
+        return graph
+    if not kernels:
+        graph.message = "; ".join(reasons)
+        return graph
+    # No hipDNN engine IDs: one 0 sentinel per row, as for PyTorch.
+    graph.engine_ids = [0] * len(kernels)
+
+    try:
+        ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
+    except Exception as e:
+        graph.error = f"Input data generation failed: {type(e).__name__}: {e}"
+        return graph
+
+    if config.validation.enabled:
+        reference_row = _prepare_references(ctx)
+        if reference_row is not None:
+            graph.results.append(reference_row)
+
+    for kernel in kernels:
+        graph.results.append(
+            _report_row(
+                reporter,
+                kernel.name,
+                lambda k=kernel: _run_rocke_row(ctx, k, problem, session),
+            )
+        )
+    return graph
+
+
+def _run_rocke_row(
+    ctx: _GraphContext,
+    kernel: RockeKernel,
+    problem: SdpaProblem,
+    session: RockeSession,
+) -> ProviderEngineResult:
+    """Build, time and validate one rocKE kernel."""
+    config = ctx.config
+    row = ProviderEngineResult(
+        runtime="rocke",
+        engine_id=None,
+        engine_name=kernel.name,
+        status="success",
+        engine_version=session.version,
+    )
+    try:
+        from .pytorch_buffer_manager import PyTorchCudaBufferManager
+        from .rocke_executor import RockeExecutor
+
+        executor = RockeExecutor(kernel, problem, config.timing_policy)
+        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
+            bm.allocate_all()
+            bm.load_input_data(ctx.input_data)
+            bm.zero_outputs()
+            executor.prepare(bm.get_tensors())
+            row.ootb.cpu_build_time_ms = executor.build_time_ms
+            row.warnings = list(executor.warnings)
+            _measure_row(row, ctx, executor.benchmark)
+
+            if ctx.reference_outputs is not None:
+                bm.zero_outputs()
+                executor.execute_once()
+                row.ootb.correctness = check_correctness(
+                    bm,
+                    ctx.tensor_infos,
+                    ctx.reference_outputs,
+                    config.validation.provider.value,
+                    config,
+                )
+            elif config.validation.enabled:
+                row.ootb.correctness = mismatch(
+                    config, ctx.reference_error or "Reference outputs unavailable"
+                )
+    except StallFallbackError:
+        raise  # run_graph_rocke remeasures the whole graph unstalled.
+    except UnsupportedGraphError as e:
+        return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
+    except Exception as e:
+        return _failed_row(
+            ProviderEngineResult.error_row, row, f"{type(e).__name__}: {e}"
+        )
+    return row

@@ -51,9 +51,9 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | `hipdnn` or `pytorch`. |
+| `runtime` | string | `hipdnn`, `pytorch` or `rocke`. |
 | `engine_filter` | array of string or null | `--engine` selections as hex engine IDs (same format as `engine.id`). `null` means all discovered engines. |
-| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. |
+| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
@@ -146,7 +146,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | Runtime that produced the row: `hipdnn` or `pytorch`. |
+| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch` or `rocke`. A `rocke` row has `engine.id` `null`, `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. |
 | `role` | string | `engine` for a benchmarked engine. `reference` for the timed reference row that `--validate pytorch` adds. |
 | `engine` | object | See [engine](#engine). |
 | `status` | string | `success`, `error` or `skipped`. |
