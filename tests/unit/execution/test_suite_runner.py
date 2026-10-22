@@ -671,8 +671,10 @@ def test_a_failed_reference_pass_keeps_its_timings_and_names_the_right_step(
     reference, engine = _validate()[0].results
 
     assert reference.status == "skipped"
+    # On a GPU host _failure_message appends the row-start memory to any
+    # out-of-memory reason, so the step prefix is all this can pin.
     assert reference.skip_reason.startswith(
-        "Reference output pass failed (RuntimeError: HIP out of memory)."
+        "Reference output pass failed (RuntimeError: HIP out of memory"
     )
     assert "Timing skipped" not in reference.skip_reason
     assert "still validated" in reference.skip_reason
