@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.config import PyTorchSdpaBackendName, TimingPolicy
+from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.pytorch_buffer_manager import PyTorchCudaBufferManager
 from dnn_benchmarking.execution.pytorch_executor import PyTorchCudaExecutor
@@ -97,28 +98,54 @@ def test_benchmark_times_every_iteration(
     assert m.mode == "staged" or m.fallback_reason, m
 
 
+_NO_COPY = {"aten::copy_", "aten::convolution"}
+
+
 @pytest.mark.parametrize(
-    "graph_name, asymmetric, forbidden",
+    "graph_name, asymmetric, channels_last, forbidden",
     [
-        ("sample_conv_dgrad.json", False, {"aten::copy_", "aten::convolution"}),
-        ("sample_conv_dgrad.json", True, {"aten::copy_", "aten::convolution"}),
+        pytest.param("sample_conv_dgrad.json", False, False, _NO_COPY, id="dgrad"),
+        pytest.param("sample_conv_dgrad.json", True, False, _NO_COPY, id="dgrad-asym"),
+        pytest.param("sample_conv_dgrad.json", False, True, _NO_COPY, id="dgrad-nhwc"),
+        pytest.param(
+            "sample_conv_dgrad.json", True, True, _NO_COPY, id="dgrad-asym-nhwc"
+        ),
         # Asymmetric wgrad must pad x, and that pad copies x.
-        ("sample_conv_wgrad.json", True, {"aten::convolution"}),
+        pytest.param(
+            "sample_conv_wgrad.json",
+            True,
+            False,
+            {"aten::convolution"},
+            id="wgrad-asym",
+        ),
     ],
 )
 def test_conv_backward_iteration_runs_only_the_backward_conv(
-    torch_gpu, graph_name: str, asymmetric: bool, forbidden: set
+    torch_gpu,
+    monkeypatch,
+    graph_name: str,
+    asymmetric: bool,
+    channels_last: bool,
+    forbidden: set,
 ) -> None:
     """A timed dgrad or wgrad iteration runs one backward conv and no extra work.
 
     A copy or a forward conv in the iteration adds to the PyTorch time and
     gives a false hipDNN speedup.
     """
-    _, graph_json, tensor_infos = load_graph(graph_name)
+    _, graph_json, _ = load_graph(graph_name)
     if asymmetric:
         # Same output size as the symmetric [1, 1] padding of the sample.
         params = graph_json["nodes"][0]["parameters"]
         params["pre_padding"], params["post_padding"] = [0, 0], [2, 2]
+    if channels_last:
+        # NHWC on every tensor, as in the graphs of the reported defect. The
+        # MIOpen path keeps NHWC only with this flag, which the CLI sets.
+        monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+        for tensor in graph_json["tensors"]:
+            _, c, h, w = tensor["dims"]
+            tensor["strides"] = [h * w * c, 1, w * c, c]
+    tensor_infos = GraphLoader().extract_tensor_info(graph_json)
     executor = PyTorchCudaExecutor(
         graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
     )
