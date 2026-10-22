@@ -779,15 +779,29 @@ class Setup:
             self.write_activate_local()
 
     def write_activate_local(
-        self, rocm_prefix: str = "", lib_dirs: tuple[str, ...] = ()
+        self,
+        rocm_prefix: str = "",
+        lib_dirs: tuple[str, ...] = (),
+        rocke_comgr: Path | None = None,
     ) -> None:
-        """Write the venv's activate.local and make activate source it."""
+        """Write the venv's activate.local and make activate source it.
+
+        ``rocke_comgr`` is the comgr that rocKE's pack step used. The rocKE
+        runtime builds hipDNN's variants with it in a child process, so the
+        code objects match the shipped ones byte for byte. It is not
+        ROCKE_COMGR_LIB: a process that has loaded torch must keep torch's
+        comgr, and rocKE refuses a second one there.
+        """
         lines = [
             f"export PYTHONPYCACHEPREFIX={shlex.quote(str(self.workspace / 'pycache'))}",
             f"export DNN_BENCH_WORKSPACE={shlex.quote(str(self.workspace))}",
         ]
         if rocm_prefix:
             lines.append(f"export ROCM_PATH={shlex.quote(rocm_prefix)}")
+        if rocke_comgr:
+            lines.append(
+                f"export DNN_BENCH_ROCKE_COMGR_LIB={shlex.quote(str(rocke_comgr))}"
+            )
         for lib_dir in reversed(lib_dirs):
             lines += [
                 'case ":${LD_LIBRARY_PATH:-}:" in',
@@ -1518,7 +1532,9 @@ class Setup:
             existing = current.split(":") if current else []
             ordered = [path for path in lib_dirs if path not in existing] + existing
             self.env["LD_LIBRARY_PATH"] = ":".join(ordered)
-            self.write_activate_local(install_prefix, lib_dirs)
+            self.write_activate_local(
+                install_prefix, lib_dirs, self._comgr_lib(toolchain_prefix)
+            )
 
     def install_bindings(self) -> None:
         if self.do_build:

@@ -90,6 +90,7 @@ src/dnn_benchmarking/
 │   ├── pytorch_executor.py   # PyTorch executor
 │   ├── rocke_sdpa.py         # rocKE runtime: SDPA problem, shipped-variant catalog, auto kernel
 │   ├── rocke_executor.py     # rocKE runtime: build and launch one rocKE kernel
+│   ├── rocke_build.py        # rocKE runtime: torch-free child that builds catalog variants
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers

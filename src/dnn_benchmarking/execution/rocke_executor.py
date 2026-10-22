@@ -17,6 +17,7 @@ import torch
 from ..common import torch_support
 from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import TimingPolicy
+from .rocke_build import COMGR_ENV, BuiltKernel
 from .rocke_sdpa import DENSE_ARCH, AutoKernel, CatalogKernel, RockeKernel, SdpaProblem
 from .timing import Measurement, Timer, is_hip_available, measure
 
@@ -73,9 +74,11 @@ def paged_views(p: SdpaProblem, block_size: int, q, k, v, o) -> PagedViews:
 class RockeExecutor:
     """Launch one rocKE kernel on graph tensors.
 
-    ``build_time_ms`` is the host time to build and load the kernel. For the
-    auto kernel it also includes the first launch, because rocKE compiles the
-    unified kernel inside its launch call. ``warnings`` holds row warnings.
+    ``build_time_ms`` is the host time to build and load the kernel. For a
+    catalog kernel the build ran in the child (``rocke_build``), and ``built``
+    carries its code object. For the auto kernel it also includes the first
+    launch, because rocKE compiles the unified kernel inside its launch call.
+    ``warnings`` holds row warnings.
     """
 
     def __init__(
@@ -84,11 +87,13 @@ class RockeExecutor:
         problem: SdpaProblem,
         policy: TimingPolicy,
         device: Optional[torch.device] = None,
+        built: Optional[BuiltKernel] = None,
     ) -> None:
         self._kernel = kernel
         self._problem = problem
         self._policy = policy
         self._device = device if device is not None else torch.device("cuda")
+        self._built = built
         # Same choice as the PyTorch executor: rocKE and ROCm torch share the
         # HIP runtime, so HIP events can bracket the torch stream.
         self._timer = (
@@ -130,39 +135,34 @@ class RockeExecutor:
             attention_dense_block,
             attention_dense_grid,
             attention_dense_signature,
-            build_attention_dense,
         )
-        from rocke.helpers.compile import compile_kernel
         from rocke.runtime import KernelLauncher, LaunchConfig
 
         kernel = self._kernel
         assert isinstance(kernel, CatalogKernel)
+        built = self._built
+        if built is None:
+            raise ExecutionError("catalog kernel has no child-built code object")
         p = self._problem
+        spec = Gfx950AttentionDenseSpec(**kernel.spec)
         with Timer() as t:
-            spec = Gfx950AttentionDenseSpec(**kernel.spec)
-            # backend="python" is the lowering hipDNN's pack step pins.
-            art = compile_kernel(
-                build_attention_dense(spec, arch=DENSE_ARCH),
-                arch=DENSE_ARCH,
-                backend="python",
-                capture_ir_text=False,
-            )
             launcher = KernelLauncher(
-                hsaco=art.hsaco,
-                kernel_name=art.kernel_name,
+                hsaco=built.hsaco,
+                kernel_name=built.kernel_name,
                 signature=attention_dense_signature(spec),
             )
-        self.build_time_ms = t.elapsed_ms
+        self.build_time_ms = built.compile_ms + t.elapsed_ms
 
-        built = hashlib.sha256(art.hsaco).hexdigest()
+        digest = hashlib.sha256(built.hsaco).hexdigest()
         if kernel.shipped_sha256 is None:
             self.warnings.append(
                 "hipDNN code-object hash unavailable; parity not checked"
             )
-        elif built != kernel.shipped_sha256:
+        elif digest != kernel.shipped_sha256:
             self.warnings.append(
-                f"code object differs from hipDNN's (rocKE {built[:12]}, hipDNN "
-                f"{kernel.shipped_sha256[:12]}): rocKE revision or comgr differs"
+                f"code object differs from hipDNN's (rocKE {digest[:12]}, hipDNN "
+                f"{kernel.shipped_sha256[:12]}, comgr {built.comgr}): set "
+                f"{COMGR_ENV} to the comgr that built the plugin"
             )
 
         values = {
