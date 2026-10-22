@@ -949,15 +949,24 @@ def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
     import torch
 
     from .rocke_executor import device_arch, device_num_cus
-    from .rocke_sdpa import descriptor_files, load_catalog
+    from .rocke_sdpa import authored_descriptor_root, descriptor_files, load_catalog
 
     device = torch.device("cuda")
     arch = device_arch(device)
-    catalog = load_catalog(descriptor_files(config.plugin_paths or [], arch))
-    if catalog.missing_provenance:
+    authored_root = authored_descriptor_root()
+    authored = sorted(authored_root.rglob("*.kdp.json")) if authored_root else []
+    catalog = load_catalog(descriptor_files(config.plugin_paths or [], arch), authored)
+    if catalog.unmatched:
+        where = authored_root or "the rocm-libraries checkout of the rocke package"
         reporter.warning(
-            f"{catalog.missing_provenance} packed rocKE variants record no rocKE "
-            "spec; the rocKE runtime cannot rebuild them"
+            f"no authored rocKE descriptor in {where} matches the installed "
+            f"{', '.join(catalog.unmatched)}; run `dvc pull -r ingestor` there, "
+            "or install rocke from the checkout that built the plugins"
+        )
+    if catalog.missing_spec:
+        reporter.warning(
+            f"{catalog.missing_spec} shipped rocKE variants are absent from the "
+            "authored descriptors; the checkout differs from the plugin build"
         )
     if not catalog.kernels:
         reporter.warning(

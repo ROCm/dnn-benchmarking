@@ -123,8 +123,10 @@ Data flow (PyTorch): the same, with `run_graph_pytorch`,
 `runtime = "pytorch"` row per graph. No engine discovery or plugins.
 
 Data flow (rocKE): the same, with `run_graph_rocke`, `RockeExecutor` and
-`PyTorchCudaBufferManager`. The catalog comes from the installed
-hip-kernel-provider descriptors, read once per suite (`rocke_session`).
+`PyTorchCudaBufferManager`. The catalog joins the installed hip-kernel-provider
+descriptors (shipped code-object hashes) with the authored descriptors in the
+checkout of the installed `rocke` package (rocKE specs), once per suite
+(`rocke_session`).
 One `runtime = "rocke"` row per applicable kernel.
 
 Rules that keep the design intact:
