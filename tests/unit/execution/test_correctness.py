@@ -60,54 +60,6 @@ def test_tolerance_by_dtype_and_override(data_type, rtol, atol, expected):
     assert tolerance_for(_config(rtol, atol), _out(1, data_type)) == expected
 
 
-def _convolution_graph(node_type="ConvolutionFwdAttributes"):
-    return {
-        "nodes": [
-            {
-                "type": node_type,
-                "inputs": {},
-                "outputs": {"y_tensor_uid": 1},
-            }
-        ]
-    }
-
-
-def test_convolution_output_uses_its_elementwise_policy():
-    ref = {1: _ref([1.0, 1.0, 1.0, 1.0])}
-    bm = _HostBM({1: np.array([1.02, 1.0, 1.0, 1.0], np.float32)})
-
-    generic = check_correctness(bm, [_out(1, "half")], ref, "pytorch", _config())
-    convolution = check_correctness(
-        bm,
-        [_out(1, "half")],
-        ref,
-        "pytorch",
-        _config(),
-        _convolution_graph(),
-    )
-
-    assert generic.tolerance_match is False
-    assert convolution.tolerance_match is True
-    assert convolution.n_mismatch == 0
-
-
-def test_explicit_tolerance_overrides_convolution_policy():
-    ref = {1: _ref([1.0, 1.0, 1.0, 1.0])}
-    bm = _HostBM({1: np.array([1.02, 1.0, 1.0, 1.0], np.float32)})
-
-    result = check_correctness(
-        bm,
-        [_out(1, "half")],
-        ref,
-        "pytorch",
-        _config(rtol=1e-3, atol=1e-3),
-        _convolution_graph(),
-    )
-
-    assert result.tolerance_match is False
-    assert result.n_mismatch == 1
-
-
 @pytest.mark.parametrize(
     "data_type, one_ulp_up",
     [

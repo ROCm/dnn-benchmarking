@@ -126,8 +126,8 @@ class ValidationConfig:
     Attributes:
         provider: Reference provider for correctness checking.
         rtol: Optional relative tolerance override. If only one of rtol/atol
-            is set, it is used for both. If neither is set, validation uses
-            operation-aware and data type-aware defaults.
+            is set, it is used for both; if neither is set, validation uses
+            dtype-aware defaults.
         atol: Optional absolute tolerance override.
     """
 
@@ -153,7 +153,7 @@ class ValidationConfig:
 
     @property
     def tolerance_override(self) -> Optional[tuple[float, float]]:
-        """Return an override, or None to select operation and data type defaults."""
+        """Return explicit validation tolerances, or None for dtype-aware defaults."""
         if self.rtol is None and self.atol is None:
             return None
         value = self.rtol if self.rtol is not None else self.atol

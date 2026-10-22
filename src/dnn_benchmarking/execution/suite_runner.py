@@ -503,7 +503,6 @@ def run_single_provider_engine(
                     ctx.reference_outputs,
                     config.validation.provider.value,
                     config,
-                    ctx.graph_json,
                 )
             elif config.validation.enabled:
                 # Validation was requested but no reference is usable: keep
@@ -519,7 +518,6 @@ def run_single_provider_engine(
                     graph_id=ctx.graph_id,
                     engine_id=engine_id,
                     graph_name=ctx.graph_name,
-                    graph_json=ctx.graph_json,
                     config=config,
                     bm=bm,
                     variant_pack=variant_pack,

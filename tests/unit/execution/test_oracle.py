@@ -163,7 +163,6 @@ def _run(row=None, refs=None, bm=None, config=None):
         graph_id="g",
         engine_id=5,
         graph_name="g",
-        graph_json={},
         config=config,
         bm=bm or _BM(),
         variant_pack={},

@@ -44,31 +44,6 @@ TOLERANCES = {
     "fp8_e8m0": (0.0, 1.0),
 }
 
-# The convolution corpus uses larger reductions than the generic dtype
-# defaults cover. These limits cover the finite MIOpen/PyTorch differences in
-# the 9,471-shape corpus while retaining tighter limits by direction.
-CONVOLUTION_TOLERANCES = {
-    ("ConvolutionFwdAttributes", "half"): (3e-2, 1e-3),
-    ("ConvolutionFwdAttributes", "float"): (2e-5, 1e-6),
-    ("ConvolutionBwdAttributes", "half"): (5e-3, 1e-3),
-    ("ConvolutionWrwAttributes", "half"): (2e-2, 1e-3),
-    ("ConvolutionWrwAttributes", "bfloat16"): (4e-2, 1e-3),
-    ("ConvolutionWrwAttributes", "float"): (2e-3, 1e-6),
-}
-
-
-def _producer_type(
-    graph_json: Optional[Dict[str, Any]], output_uid: int
-) -> Optional[str]:
-    """Return the node type that produces an output tensor."""
-    if not graph_json:
-        return None
-    for node in graph_json.get("nodes", []) or []:
-        outputs = (node.get("outputs") or {}).values()
-        if output_uid in outputs:
-            return str(node.get("type", ""))
-    return None
-
 
 def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     """The values compare() sees: log2 for e8m0 (see TOLERANCES), else ``data``."""
@@ -79,18 +54,10 @@ def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     return np.log2(np.asarray(data, dtype=np.float32))
 
 
-def tolerance_for(
-    config: SuiteConfig,
-    tensor_info: TensorInfo,
-    graph_json: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, float]:
-    """Return the explicit override or the output's operation-aware default."""
-    if config.validation.tolerance_override is not None:
-        return config.validation.tolerance_override
-    producer = _producer_type(graph_json, tensor_info.uid)
-    return CONVOLUTION_TOLERANCES.get(
-        (producer, tensor_info.dtype.name),
-        TOLERANCES.get(tensor_info.dtype.name, DEFAULT_TOLERANCE),
+def tolerance_for(config: SuiteConfig, tensor_info: TensorInfo) -> Tuple[float, float]:
+    """``--rtol/--atol`` when given, else the dtype default for this output."""
+    return config.validation.tolerance_override or TOLERANCES.get(
+        tensor_info.dtype.name, DEFAULT_TOLERANCE
     )
 
 
@@ -144,7 +111,6 @@ def check_correctness(
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
     config: SuiteConfig,
-    graph_json: Optional[Dict[str, Any]] = None,
 ) -> CorrectnessResult:
     """Compare every graph output against the precomputed reference outputs.
 
@@ -164,7 +130,7 @@ def check_correctness(
                     f"Reference provider '{reference_provider_name}' did not "
                     f"produce output tensor UID {ti.uid}",
                 )
-            rtol, atol = tolerance_for(config, ti, graph_json)
+            rtol, atol = tolerance_for(config, ti)
             result = _compare_output(buffer_manager, ti, ref, rtol, atol)
             if result is not None:
                 compared.append((ti.uid, rtol, atol, result))

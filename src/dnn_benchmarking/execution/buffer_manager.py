@@ -211,28 +211,6 @@ def _paged_metadata(
     return 0, 0
 
 
-_CONVOLUTION_NODE_TYPES = {
-    "ConvolutionFwdAttributes",
-    "ConvolutionBwdAttributes",
-    "ConvolutionWrwAttributes",
-}
-
-
-def _convolution_input_uids(
-    graph_json: Optional[Dict[str, Any]],
-) -> set[int]:
-    """Return root tensor UIDs consumed by a convolution node."""
-    if not graph_json:
-        return set()
-    return {
-        int(uid)
-        for node in graph_json.get("nodes", []) or []
-        if node.get("type") in _CONVOLUTION_NODE_TYPES
-        for uid in (node.get("inputs") or {}).values()
-        if uid is not None
-    }
-
-
 def _generate_paged_input(
     tensor_info: TensorInfo,
     role: str,
@@ -272,23 +250,20 @@ def generate_input_data(
     """Generate one graph-scoped logical input map.
 
     Returned arrays are dense logical ndarrays keyed by tensor UID, consumed
-    by both hipDNN buffers and reference providers. Convolution inputs use
-    U[-0.5, 0.5) to avoid the large biased reductions that U[0, 1) produces,
-    especially for weight gradients. Other floating-point inputs stay
-    non-negative so values such as batch-normalization variances remain valid.
-    Values are drawn as float32 and rounded to the graph type; bfloat16 and fp8
-    values are returned as exactly representable float32 values. Integer and
-    boolean inputs are zeros, except paged-SDPA roles.
+    by both hipDNN buffers and reference providers. Floating-point inputs are
+    U[0, 1) (non-negative, so batch-norm variances stay valid), drawn as
+    float32 and rounded to the graph type; bfloat16 and fp8 values are returned
+    as the exactly representable float32 values. Integer and boolean inputs
+    are zeros, except paged-SDPA roles.
 
-    ``graph_json`` selects operation-specific input policies. Paged SDPA inputs
-    satisfy page-table and sequence-length invariants. Convolution data,
-    weight, and gradient inputs use the centered distribution.
+    ``graph_json`` only affects **paged** SDPA graphs: page tables and
+    sequence lengths have invariants random data cannot satisfy (see
+    :func:`_generate_paged_input`).
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
     page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
-    convolution_inputs = _convolution_input_uids(graph_json)
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -312,8 +287,6 @@ def generate_input_data(
             input_data[tensor_info.uid] = np.zeros(tensor_info.dims, dtype=dtype.numpy)
         else:
             data = rng.random(tensor_info.dims, dtype=np.float32)
-            if tensor_info.uid in convolution_inputs:
-                data -= np.float32(0.5)
             input_data[tensor_info.uid] = _decode(_encode(data, dtype), dtype)
 
     return input_data

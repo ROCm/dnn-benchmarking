@@ -251,45 +251,6 @@ class TestGenerateInputData:
         assert len(np.unique(data)) > 1
 
     @pytest.mark.parametrize(
-        "node_type, inputs",
-        [
-            (
-                "ConvolutionFwdAttributes",
-                {"x_tensor_uid": 1, "w_tensor_uid": 2},
-            ),
-            (
-                "ConvolutionBwdAttributes",
-                {"dy_tensor_uid": 1, "w_tensor_uid": 2},
-            ),
-            (
-                "ConvolutionWrwAttributes",
-                {"x_tensor_uid": 1, "dy_tensor_uid": 2},
-            ),
-        ],
-    )
-    def test_convolution_inputs_are_centered_without_changing_other_inputs(
-        self, node_type, inputs
-    ) -> None:
-        tensors = [_tensor(uid, "half", dims=(4096,)) for uid in (1, 2, 3)]
-        graph = {
-            "nodes": [
-                {
-                    "type": node_type,
-                    "inputs": inputs,
-                    "outputs": {"output_tensor_uid": 0},
-                }
-            ]
-        }
-
-        data = generate_input_data(tensors, seed=7, graph_json=graph)
-        generic = generate_input_data(tensors, seed=7)
-
-        for uid in (1, 2):
-            assert data[uid].min() < 0.0 < data[uid].max()
-            assert data[uid].min() >= -0.5 and data[uid].max() <= 0.5
-        np.testing.assert_array_equal(data[3], generic[3])
-
-    @pytest.mark.parametrize(
         "data_type", ["int8", "uint8", "int32", "int64", "boolean"]
     )
     def test_integer_inputs_are_zero_so_indices_stay_in_bounds(self, data_type) -> None:
