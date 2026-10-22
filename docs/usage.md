@@ -68,14 +68,15 @@ sets `ROCM_PATH`.
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 
-With `--pytorch-sdpa-backend default`, the timed PyTorch `reference` row
-uses PyTorch's default SDPA dispatch. A separate MATH SDPA pass produces
-the outputs used to grade hipDNN engines. The row's timing does not measure
-that MATH pass. MATH can hold a score array for every query and key pair,
-for each batch and head. This can exhaust device memory on large graphs.
-If the output pass fails, the row says `Reference output pass failed`, and
-the tool tries a CPU reference. An explicit SDPA backend applies to both
-passes. An unavailable explicit backend does not fall back to the CPU.
+The timed PyTorch `reference` row is timed on the backend
+`--pytorch-sdpa-backend` selects. The outputs that grade hipDNN engines come
+from a separate MATH SDPA pass, whatever that option says, so a rerun of the
+same graph grades against the same numbers. The row's timing does not measure
+that MATH pass. MATH can hold a score array for every query and key pair, for
+each batch and head. This can exhaust device memory on large graphs. If the
+output pass fails, the row says `Reference output pass failed` and keeps its
+timings, and the tool tries a CPU reference. An unavailable explicit backend
+does not fall back to the CPU.
 
 The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
 1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3,

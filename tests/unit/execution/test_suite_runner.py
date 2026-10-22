@@ -659,9 +659,12 @@ def test_a_skipped_timed_reference_says_engines_are_still_graded(fake_torch):
     assert "CPU" in reference.skip_reason
 
 
-def test_a_failed_reference_pass_is_not_reported_as_skipped_timing(fake_torch):
+def test_a_failed_reference_pass_keeps_its_timings_and_names_the_right_step(
+    fake_torch,
+):
     """Timing can finish and only the MATH output pass fail, out of memory on
-    a large graph for instance. Saying "Timing skipped" there is wrong."""
+    a large graph for instance. Saying "Timing skipped" there is wrong, and the
+    numbers the timed loop measured are still real."""
     fake_torch.discovered = [1]
     fake_torch.torch_execute_error = RuntimeError("HIP out of memory")
 
@@ -673,6 +676,7 @@ def test_a_failed_reference_pass_is_not_reported_as_skipped_timing(fake_torch):
     )
     assert "Timing skipped" not in reference.skip_reason
     assert "still validated" in reference.skip_reason
+    assert reference.ootb.gpu_kernel_stats is not None
     # The timed loop ran, so the row's own failure did not cost the grading.
     assert engine.verdict == "passed"
 

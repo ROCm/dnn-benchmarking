@@ -2024,12 +2024,29 @@ class TestPyTorchSdpaBackendSelection:
             state, reference_pass=False
         )
 
-    def test_reference_pass_keeps_a_strict_selection(self) -> None:
+    @pytest.mark.parametrize(
+        "selection", ["FLASH", "EFFICIENT", "CUDNN", "OVERRIDEABLE"]
+    )
+    def test_reference_pass_overrides_a_strict_selection(self, selection: str) -> None:
+        """--pytorch-sdpa-backend chooses what is timed. The graded outputs come
+        from MATH whatever it asked for, so they do not move with it."""
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
-        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.FLASH)
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName[selection])
 
-        assert self._enabled_backends_at_call(state, reference_pass=True) == {"flash"}
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"math"}
+
+    def test_strict_selection_reads_as_math_inside_a_reference_pass(self) -> None:
+        """The handler builds its operands for the backend that will run."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops._sdpa_backend import (
+            strict_sdpa_selection,
+        )
+
+        assert strict_sdpa_selection() is None
+        with pytorch_ops.reference_sdpa_pass():
+            assert strict_sdpa_selection() is PyTorchSdpaBackendName.MATH
+        assert strict_sdpa_selection() is None
 
     @pytest.mark.parametrize("missing", ["sdpa_kernel", "backend_member"])
     def test_missing_public_api_or_backend_member_does_not_call_sdpa(

@@ -3,7 +3,7 @@
 
 """Strict PyTorch SDPA backend selection for a scoped graph execution."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import RLock
 from typing import Any, Dict, Iterator, Optional, Tuple
@@ -45,8 +45,9 @@ _SDPA_SELECTION_LOCK = RLock()
 # repeatable. On gfx950, fp16 D128 S4096 inputs that are identical run to run
 # came back 0.8 to 7.8 fp16 ULP from an fp32 SDPA, a different amount each
 # run, while MATH stayed at 0.5 ULP every run. A reference must not move, so
-# the default-dispatch reference pass uses MATH. Strict selections keep the
-# backend the user asked for.
+# every reference output pass runs on MATH, whatever the row being timed
+# selected: ``--pytorch-sdpa-backend`` chooses what is timed, not what the
+# engines are graded against.
 _REFERENCE_PASS: ContextVar[bool] = ContextVar(
     "pytorch_sdpa_reference_pass",
     default=False,
@@ -55,7 +56,7 @@ _REFERENCE_PASS: ContextVar[bool] = ContextVar(
 
 @contextmanager
 def reference_sdpa_pass() -> Iterator[None]:
-    """Run default-dispatch SDPA calls on the repeatable MATH backend."""
+    """Run the SDPA calls of this scope on the repeatable MATH backend."""
     token = _REFERENCE_PASS.set(True)
     try:
         yield
@@ -192,7 +193,13 @@ def _is_backend_unavailable_error(error: RuntimeError) -> bool:
 
 
 def strict_sdpa_selection() -> Optional[PyTorchSdpaBackendName]:
-    """The active strict SDPA category, or ``None`` under default dispatch."""
+    """The active strict SDPA category, or ``None`` under default dispatch.
+
+    A reference output pass runs on MATH whatever the timed row selected, so
+    the operands a handler builds for it follow MATH as well.
+    """
+    if _REFERENCE_PASS.get():
+        return PyTorchSdpaBackendName.MATH
     state = _ACTIVE_SDPA_BACKEND.get()
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
         return None
@@ -289,17 +296,29 @@ def execute_selected_sdpa(
 ) -> torch.Tensor:
     """Execute SDPA with the current strict selection, if one is active.
 
+    A reference output pass (``reference_sdpa_pass``) overrides that selection
+    and runs on MATH, so the graded outputs are the same whatever the timed
+    row asked for.
+
     ``enable_gqa`` lets K/V carry fewer heads than Q (one shared count),
     PyTorch's own grouped-query path.
     """
     kwargs = _sdpa_kwargs(attn_mask, dropout_p, is_causal, scale, enable_gqa)
     state = _ACTIVE_SDPA_BACKEND.get()
+    if _REFERENCE_PASS.get():
+        sdpa_kernel, math = _selected_sdp_backend(PyTorchSdpaBackendName.MATH)
+        with _SDPA_SELECTION_LOCK, sdpa_kernel(math):
+            result = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, **kwargs
+            )
+        if state is not None:
+            # The strict selection applies to the timed row, which is what has
+            # to prove it reached a native forward SDPA call. This pass makes
+            # one too, so it counts for that check.
+            state._native_forward_sdpa_executed = True
+        return result
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
-        backend_scope = nullcontext()
-        if _REFERENCE_PASS.get():
-            sdpa_kernel, math = _selected_sdp_backend(PyTorchSdpaBackendName.MATH)
-            backend_scope = sdpa_kernel(math)
-        with _SDPA_SELECTION_LOCK, backend_scope:
+        with _SDPA_SELECTION_LOCK:
             return torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **kwargs
             )

@@ -180,7 +180,7 @@ def test_engines_validate_against_pytorch(
 
 
 def test_sdpa_validation_grades_with_repeatable_math_on_gpu(hipdnn, torch_gpu) -> None:
-    """The real engine is graded against MATH, while strict Flash stays Flash."""
+    """Engines are graded against MATH, whether or not the timed row is strict."""
     from torch.profiler import ProfilerActivity, profile
 
     path, graph_json, _ = load_graph("sample_sdpa.json")
@@ -264,7 +264,11 @@ def test_sdpa_validation_grades_with_repeatable_math_on_gpu(hipdnn, torch_gpu) -
         for event in strict_trace.events()
         if event.name.startswith("aten::_scaled_dot_product_")
     ]
-    assert strict_ops and all("_flash_attention" in name for name in strict_ops)
+    # Flash for every timed call, then the one MATH reference output pass.
+    assert strict_ops[-1] == "aten::_scaled_dot_product_attention_math"
+    assert strict_ops[:-1] and all(
+        "_flash_attention" in name for name in strict_ops[:-1]
+    )
 
 
 def test_strict_flash_rejects_fp64_without_math_fallback(torch_gpu) -> None:
