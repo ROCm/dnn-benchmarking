@@ -694,6 +694,7 @@ def test_interrupt_with_failed_write_claims_no_partial_file(tmp_path, runtime) -
 def test_unavailable_reference_provider_fails_before_any_graph(
     tmp_path, monkeypatch
 ) -> None:
+    _fake_hipdnn(monkeypatch)
     unavailable = types.SimpleNamespace(is_available=lambda: False)
     monkeypatch.setattr(
         runtimes.ReferenceProviderRegistry, "get_provider", lambda name: unavailable
