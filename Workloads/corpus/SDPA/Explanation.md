@@ -1,7 +1,7 @@
 # rocKE SDPA Corpus
 
 This collection contains scaled dot-product attention (SDPA) graphs from the
-[rocKE SDPA Solera performance set](https://github.com/AMD-ROCm-Internal/mlse-tools-internal/blob/2e0ee4f0cfd0f385b26a128e1a800bf15a066ce4/solera/rocke_scheduled_attn_runs/attention_shapes_llm.txt).
+rocKE SDPA Solera performance set.
 The source file SHA-256 value is
 `948f7fce7bb16bbf8a91f307c44dc1709e91a2277a6e540af692f3e2488d3c79`.
 
