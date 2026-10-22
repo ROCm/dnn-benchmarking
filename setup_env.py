@@ -1292,8 +1292,7 @@ class Setup:
         if not pointers:
             return
         targets = [
-            pointer.relative_to(ROCM_LIBRARIES_DIR).as_posix()
-            for pointer in pointers
+            pointer.relative_to(ROCM_LIBRARIES_DIR).as_posix() for pointer in pointers
         ]
         env = dict(self.env)
         ca_bundle = env.get("PIP_CERT") or env.get("SSL_CERT_FILE")
