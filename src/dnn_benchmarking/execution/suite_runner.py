@@ -371,15 +371,18 @@ def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
     return message
 
 
-#: What a reference row was doing when it failed. It has two steps, and
-#: "Timing skipped" is the wrong thing to say about a failure of the second.
-#: A failure after both ("post": the tuned run, the reference warnings) is
-#: neither, so it keeps the plain message.
-_ROW_STEPS = {
-    "timing": "Timing skipped",
-    "reference": "Reference output pass failed",
-    "post": None,
-}
+def _row_step(stage: str, fatal: bool) -> Optional[str]:
+    """What a reference row was doing when it failed, or None after both steps.
+
+    The row has two steps, and naming the timed loop is the wrong thing to say
+    about a failure of the second one. A failure after both (``post``: the
+    tuned run, the reference warnings) is neither step.
+    """
+    if stage == "timing":
+        return "Timing failed" if fatal else "Timing skipped"
+    if stage == "reference":
+        return "Reference output pass failed"
+    return None
 
 
 def _failed_pytorch_row(
@@ -395,7 +398,7 @@ def _failed_pytorch_row(
     are real, so a later failure leaves them on the row instead of replacing
     it with a reason-only row.
     """
-    step = _ROW_STEPS[stage] if role == "reference" else None
+    step = _row_step(stage, fatal) if role == "reference" else None
     if step is not None:
         message = f"{step} ({message})."
     if stage == "timing":

@@ -620,9 +620,9 @@ def test_missing_reference_fails_validation_with_the_reason(fake, monkeypatch):
         (
             "math",
             "error",
-            "ExecutionError: PyTorch GPU not available",
+            "Timing failed (ExecutionError: PyTorch GPU not available).",
             "failed",
-            "ExecutionError: PyTorch GPU not available",
+            "Timing failed (ExecutionError: PyTorch GPU not available).",
         ),
     ],
 )
