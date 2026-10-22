@@ -164,6 +164,7 @@ def _run(row=None, refs=None, bm=None, config=None):
         engine_id=5,
         graph_name="g",
         config=config,
+        graph_json={},
         bm=bm or _BM(),
         variant_pack={},
         tensor_infos=[out],

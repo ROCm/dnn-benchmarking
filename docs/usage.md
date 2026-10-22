@@ -65,20 +65,35 @@ sets `ROCM_PATH`.
 | Option | Default | Description |
 |---|---|---|
 | `--validate {none,pytorch}` | none | Compare each engine output with a PyTorch reference. `pytorch` also adds a timed `reference` row. |
-| `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
-| `--atol TOL` | dtype-aware | Absolute tolerance. |
+| `--rtol TOL` | operation/dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
+| `--atol TOL` | operation/dtype-aware | Absolute tolerance. |
 
-The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
-1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3,
-2^-10), fp8 e5m2 (2^-2, 2^-16), fp8 e5m2 fnuz (2^-2, 2^-17), any other dtype
-(1e-5, 1e-6). An element passes when `|actual - expected| <= atol + rtol *
+The defaults first use the operation that produces the output. The
+operation-specific (rtol, atol) values are:
+
+| Operation | Output type | Default |
+|---|---|---|
+| Convolution forward | fp16 | (3e-2, 1e-1) |
+| Convolution forward | fp32 | (2e-5, 1e-5) |
+| Convolution backward-data | fp16 | (1e-2, 2e-2) |
+| Convolution weight-gradient | bf16 | (4e-2, 2e-1) |
+| Convolution weight-gradient | fp16 | (2e-2, 2e-1) |
+| Convolution weight-gradient | fp32 | (2e-3, 2e-4) |
+
+These values cover the finite OOTB errors in the full Solera convolution corpus.
+The absolute bounds follow the static hipDNN integration-test tolerances. An
+operation-specific value can only loosen the output dtype default.
+
+Other defaults follow the output dtype: bf16 (3e-2, 1e-3), fp16 (1e-3,
+1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3, 2^-10), fp8 e5m2
+(2^-2, 2^-16), fp8 e5m2 fnuz (2^-2, 2^-17), and any other dtype (1e-5,
+1e-6). An element passes when `|actual - expected| <= atol + rtol *
 |expected|`. For fp8, rtol is one ULP at the bottom of the binade of
-`|expected|` and atol is the smallest subnormal of the format, so an element
+`|expected|`. Atol is the smallest subnormal of the format. Thus, an element
 that rounds one ULP the other way still passes. fp8 e8m0 holds only powers of
-two, so it compares log2 values (the code distance) with (0, 1): at most one
-code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
-log2 values of e8m0 outputs. The source is `TOLERANCES` in
-`src/dnn_benchmarking/execution/correctness.py`.
+two. It compares log2 values with (0, 1), which permits one code step in
+either direction. `--rtol` and `--atol` also apply to the log2 values of e8m0.
+The sources are `OPERATION_TOLERANCES` and `TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
 
 The reference comes from the timed PyTorch `reference` row on the GPU. If
 that row cannot run (for example, no GPU or a GPU out-of-memory error), and

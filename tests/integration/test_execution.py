@@ -145,7 +145,9 @@ def test_compare_matches_pytorch_reference(
     reference = provider.compute_reference(sample_conv_fwd_json, inputs)[0].data
     # The product gate: the dtype tolerance `--validate pytorch` applies.
     output_info = next(t for t in tensor_infos if t.is_output)
-    rtol, atol = correctness.tolerance_for(SuiteConfig(), output_info)
+    rtol, atol = correctness.tolerance_for(
+        SuiteConfig(), sample_conv_fwd_json, output_info
+    )
     result = compare(output, reference, rtol=rtol, atol=atol)
     assert result.passed, result.message
 

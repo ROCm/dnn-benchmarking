@@ -61,7 +61,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `timing_block` | int | `--timing-block`. `1` = one launch per sample; `N > 1` = rocKE block timing. |
 | `seed` | int | Input data seed. |
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
-| `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
+| `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses operation- and dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
