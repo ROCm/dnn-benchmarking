@@ -297,9 +297,12 @@ def _attention_bounds(
     Passing those natively keeps the fused kernels eligible, since Flash
     rejects any ``attn_mask``.
 
-    More queries than keys shifts the bottom-right diagonal above row 0, which
-    leaves the first queries no key at all. The band would be an all ``-inf``
-    row and softmax would return NaN, so the graph is declined instead.
+    More queries than keys shifts the bottom-right diagonal above row 0, so the
+    first queries get an all ``-inf`` band row and no key at all. There is no
+    reference answer for such a row: torch's safe softmax returns zeros, while
+    the row's log-sum-exp is 0 from a fused kernel's saved statistics and
+    ``-inf`` from the handler's own fallback. The graph is declined rather than
+    graded against a number that depends on the backend.
     """
     if window is None and not bottom_right:
         return None, is_causal

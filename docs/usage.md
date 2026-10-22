@@ -194,9 +194,10 @@ flash backend cannot take, so the SDPA reference builds one only where
 PyTorch has no native form for the same bounds. With Sq equal to Skv the two
 diagonals coincide and the native `is_causal` path still runs; with Sq equal
 to 1 (decode) every key is visible. With Sq greater than Skv the diagonal
-starts above the first query row, which leaves the first queries no key at
-all, so the reference declines the graph instead of returning the NaN a
-softmax over an all `-inf` row produces.
+starts above the first query row, so the first queries see no key at all.
+There is no reference answer for such a row, and PyTorch's own log-sum-exp
+for it is 0 from a fused kernel and `-inf` from the fallback, so the
+reference declines the graph rather than grading against either.
 
 ### PyTorch kernel selection
 

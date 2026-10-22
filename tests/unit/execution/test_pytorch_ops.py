@@ -3045,8 +3045,9 @@ class TestSdpaTimedRegion:
         self, attributes
     ) -> None:
         """The shifted diagonal starts above row 0, so the first queries see no
-        key at all. Without this the band is an all -inf row and softmax returns
-        NaN, which grades as a mismatch of the engine rather than a bad graph."""
+        key at all. Without this the row is graded against whatever the backend
+        invents: zeros from torch's safe softmax, and a log-sum-exp of 0 from a
+        fused kernel but -inf from this handler's own fallback."""
         tensors = self._tensors(8, 8, q_len=5, kv_len=3)
 
         with pytest.raises(UnsupportedGraphError, match="leaves queries with no keys"):
