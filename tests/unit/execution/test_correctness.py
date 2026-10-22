@@ -47,17 +47,55 @@ def _ref(data):
     return ReferenceOutput(data=np.asarray(data, dtype=np.float32), tensor_uid=0)
 
 
+
+def _check(buffer_manager, tensor_infos, refs, config=None, graph_json=None):
+    return check_correctness(
+        buffer_manager,
+        tensor_infos,
+        refs,
+        "pytorch",
+        config or _config(),
+        graph_json or {},
+    )
+
 @pytest.mark.parametrize(
     "data_type, rtol, atol, expected",
     [
         ("bfloat16", None, None, (3e-2, 1e-3)),
         ("half", None, None, (1e-3, 1e-3)),
         ("float", None, None, (1e-5, 1e-6)),
-        ("bfloat16", 0.5, None, (0.5, 0.5)),  # one explicit value sets both
+        ("bfloat16", 0.5, None, (0.5, 0.5)),
     ],
 )
 def test_tolerance_by_dtype_and_override(data_type, rtol, atol, expected):
-    assert tolerance_for(_config(rtol, atol), _out(1, data_type)) == expected
+    assert tolerance_for(_config(rtol, atol), {}, _out(1, data_type)) == expected
+
+
+def _conv_graph(operation_type):
+    return {
+        "nodes": [
+            {"type": operation_type, "outputs": {"output_tensor_uid": 1}}
+        ]
+    }
+
+
+def test_wrw_tolerance_accepts_observed_drift_only_for_wrw():
+    ref = {1: _ref([100.0])}
+    bm = _HostBM({1: np.array([100.9], np.float32)})
+
+    assert _check(
+        bm, [_out(1, "half")], ref, graph_json=_conv_graph("ConvolutionWrwAttributes")
+    ).passed
+    assert not _check(bm, [_out(1, "half")], ref).passed
+
+
+def test_wrw_tolerance_still_rejects_wrong_output():
+    ref = {1: _ref([100.0])}
+    bm = _HostBM({1: np.array([130.0], np.float32)})
+
+    assert not _check(
+        bm, [_out(1, "half")], ref, graph_json=_conv_graph("ConvolutionWrwAttributes")
+    ).passed
 
 
 @pytest.mark.parametrize(
@@ -76,7 +114,7 @@ def test_fp8_output_one_ulp_apart_passes(data_type, one_ulp_up):
     ref = {1: _ref([1.0, 2.0, 0.5, 4.0])}
     bm = _HostBM({1: np.array(one_ulp_up, np.float32)})
 
-    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
+    c = _check(bm, [_out(1, data_type)], ref)
 
     assert c.tolerance_match is True
 
@@ -98,7 +136,7 @@ def test_fp8_output_two_ulp_apart_fails(data_type, actual):
     ref = {1: _ref([1.0, 2.0, 0.5, 4.0])}
     bm = _HostBM({1: np.array(actual, np.float32)})
 
-    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
+    c = _check(bm, [_out(1, data_type)], ref)
 
     assert c.tolerance_match is False
     assert c.n_mismatch == 4
@@ -120,7 +158,7 @@ def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
     actual = [smallest_subnormal, -smallest_subnormal, 2 * smallest_subnormal, 0.0]
     bm = _HostBM({1: np.array(actual, np.float32)})
 
-    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
+    c = _check(bm, [_out(1, data_type)], ref)
 
     assert c.n_mismatch == 1
 
@@ -134,7 +172,7 @@ def test_aggregates_over_outputs_and_names_the_failing_output():
         }
     )
 
-    c = check_correctness(bm, [_out(1), _out(2)], ref, "pytorch", _config())
+    c = _check(bm, [_out(1), _out(2)], ref)
 
     assert c.tolerance_match is False
     assert (c.n_mismatch, c.n_total) == (3, 8)
@@ -154,7 +192,7 @@ def test_failing_output_outranks_a_passing_output_with_a_larger_diff():
         }
     )
 
-    c = check_correctness(bm, [_out(1, "bfloat16"), _out(2)], ref, "pytorch", _config())
+    c = _check(bm, [_out(1, "bfloat16"), _out(2)], ref)
 
     assert c.tolerance_match is False
     assert c.worst_output_uid == 2
@@ -167,7 +205,7 @@ def test_passing_outputs_report_diffs_without_message():
     ref = {1: _ref([1, 2, 3, 4])}
     bm = _HostBM({1: np.array([1, 2, 3, 4.00001], np.float32)})
 
-    c = check_correctness(bm, [_out(1)], ref, "pytorch", _config(rtol=1e-3))
+    c = _check(bm, [_out(1)], ref, _config(rtol=1e-3))
 
     assert c.passed
     assert c.n_mismatch == 0 and c.n_total == 4
@@ -183,7 +221,7 @@ def test_passing_outputs_report_diffs_without_message():
 )
 def test_missing_side_is_a_failure_not_a_pass(refs, outputs, reason):
     config = _config(rtol=0.1, atol=0.2)
-    c = check_correctness(_HostBM(outputs), [_out(1)], refs, "pytorch", config)
+    c = _check(_HostBM(outputs), [_out(1)], refs, config)
 
     assert c.explicitly_failed
     assert reason in c.error_message
@@ -196,7 +234,7 @@ def test_read_failure_is_a_failure_not_a_crash():
         def get_output_data(self, uid):
             raise RuntimeError("hipMemcpy failed")
 
-    c = check_correctness(FailingBM(), [_out(1)], {1: _ref([0])}, "pytorch", _config())
+    c = _check(FailingBM(), [_out(1)], {1: _ref([0])})
 
     assert c.explicitly_failed
     assert c.error_message == "hipMemcpy failed"
@@ -218,7 +256,7 @@ def test_device_reference_is_compared_without_host_copy():
         )
     }
 
-    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
+    assert _check(DeviceBM(), [_out(1)], ref).passed
 
 
 def test_device_e8m0_compares_code_steps():
@@ -241,7 +279,7 @@ def test_device_e8m0_compares_code_steps():
         )
     }
 
-    c = check_correctness(DeviceBM(), [_out(1, "fp8_e8m0")], ref, "pytorch", _config())
+    c = _check(DeviceBM(), [_out(1, "fp8_e8m0")], ref)
 
     assert c.n_mismatch == 2
 
@@ -274,4 +312,4 @@ def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
         )
     }
 
-    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
+    assert _check(DeviceBM(), [_out(1)], ref).passed

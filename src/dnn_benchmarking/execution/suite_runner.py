@@ -516,6 +516,7 @@ def run_single_provider_engine(
                     ctx.reference_outputs,
                     config.validation.provider.value,
                     config,
+                    ctx.graph_json,
                 )
             elif ctx.validation_skip_reason is not None:
                 row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
@@ -534,6 +535,7 @@ def run_single_provider_engine(
                     engine_id=engine_id,
                     graph_name=ctx.graph_name,
                     config=config,
+                    graph_json=ctx.graph_json,
                     bm=bm,
                     variant_pack=variant_pack,
                     tensor_infos=ctx.tensor_infos,

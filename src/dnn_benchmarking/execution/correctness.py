@@ -44,6 +44,33 @@ TOLERANCES = {
     "fp8_e8m0": (0.0, 1.0),
 }
 
+# Relative tolerances round the worst finite OOTB error in the full Solera
+# convolution corpus up to one significant digit. Absolute tolerances follow
+# hipDNN's static convolution bounds. The dtype default remains a floor.
+OPERATION_TOLERANCES = {
+    "ConvolutionFwdAttributes": {
+        "float": (2e-5, 1e-5),
+        "half": (3e-2, 1e-1),
+    },
+    "ConvolutionBwdAttributes": {
+        "half": (1e-2, 2e-2),
+    },
+    "ConvolutionWrwAttributes": {
+        "float": (2e-3, 2e-4),
+        "half": (2e-2, 2e-1),
+        "bfloat16": (4e-2, 2e-1),
+    },
+}
+
+
+def _output_operation(graph_json: Dict[str, Any], uid: int) -> Optional[str]:
+    """Return the operation that writes ``uid``, if the graph identifies one."""
+    for node in graph_json.get("nodes") or []:
+        for value in (node.get("outputs") or {}).values():
+            if uid == value or isinstance(value, list) and uid in value:
+                return node.get("type")
+    return None
+
 
 def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     """The values compare() sees: log2 for e8m0 (see TOLERANCES), else ``data``."""
@@ -54,11 +81,18 @@ def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     return np.log2(np.asarray(data, dtype=np.float32))
 
 
-def tolerance_for(config: SuiteConfig, tensor_info: TensorInfo) -> Tuple[float, float]:
-    """``--rtol/--atol`` when given, else the dtype default for this output."""
-    return config.validation.tolerance_override or TOLERANCES.get(
-        tensor_info.dtype.name, DEFAULT_TOLERANCE
+def tolerance_for(
+    config: SuiteConfig, graph_json: Dict[str, Any], tensor_info: TensorInfo
+) -> Tuple[float, float]:
+    """Return an explicit override, then operation- and dtype-aware defaults."""
+    if config.validation.tolerance_override is not None:
+        return config.validation.tolerance_override
+    dtype_tolerance = TOLERANCES.get(tensor_info.dtype.name, DEFAULT_TOLERANCE)
+    operation = _output_operation(graph_json, tensor_info.uid)
+    operation_tolerance = OPERATION_TOLERANCES.get(operation, {}).get(
+        tensor_info.dtype.name, dtype_tolerance
     )
+    return tuple(max(a, b) for a, b in zip(dtype_tolerance, operation_tolerance))
 
 
 def mismatch(config: SuiteConfig, message: str) -> CorrectnessResult:
@@ -122,6 +156,7 @@ def check_correctness(
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
     config: SuiteConfig,
+    graph_json: Dict[str, Any],
 ) -> CorrectnessResult:
     """Compare every graph output against the precomputed reference outputs.
 
@@ -141,7 +176,7 @@ def check_correctness(
                     f"Reference provider '{reference_provider_name}' did not "
                     f"produce output tensor UID {ti.uid}",
                 )
-            rtol, atol = tolerance_for(config, ti)
+            rtol, atol = tolerance_for(config, graph_json, ti)
             result = _compare_output(buffer_manager, ti, ref, rtol, atol)
             if result is not None:
                 compared.append((ti.uid, rtol, atol, result))
