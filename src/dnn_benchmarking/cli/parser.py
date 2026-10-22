@@ -298,7 +298,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Runtime/Selection",
         _values(RuntimeName),
         _default(SuiteConfig, "runtime"),
-        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch",
+        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
+        "rocke launches rocKE SDPA kernels directly",
     ),
     CliOption(
         flags=("--engine", "-e"),
@@ -536,6 +537,7 @@ examples:
       --plugin-path /path/to/build_a/engines,/path/to/build_b/engines
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
   dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
+  dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime rocke --timing-block 50
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
 engines:
