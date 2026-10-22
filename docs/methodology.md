@@ -143,6 +143,23 @@ includes a workaround, and the row gets a reference warning:
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.
 
+### PyTorch convolution backward
+
+A timed dgrad (`ConvolutionBwdAttributes`) or wgrad
+(`ConvolutionWrwAttributes`) iteration calls `aten::convolution_backward`
+once. That call needs the operand that it does not differentiate only for
+the shape and the memory layout. The tool gives it an uninitialized tensor
+that is dense in the graph layout of the output. Thus the call does not copy
+the operand.
+
+`convolution_backward` has no asymmetric padding (`pre_padding` different
+from `post_padding`). For these graphs:
+
+- dgrad computes the gradient of the padded input. The output is a view of
+  the unpadded part. The view adds no kernel.
+- wgrad pads x with `F.pad` inside the timed region, as the forward conv
+  does.
+
 ## Warmup
 
 `--warmup N` (default 10) is a launch count, not a time budget. The priming

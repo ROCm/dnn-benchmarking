@@ -7,6 +7,8 @@ The timer differs per platform (HIP events on ROCm, torch.cuda
 events on CUDA), so assertions use ``expected_timer()``.
 """
 
+from collections import Counter
+
 import numpy as np
 import pytest
 
@@ -93,6 +95,48 @@ def test_benchmark_times_every_iteration(
     assert m.timer == expected_timer()
     assert m.cache_mode == cache_mode
     assert m.mode == "staged" or m.fallback_reason, m
+
+
+@pytest.mark.parametrize(
+    "graph_name, asymmetric, forbidden",
+    [
+        ("sample_conv_dgrad.json", False, {"aten::copy_", "aten::convolution"}),
+        ("sample_conv_dgrad.json", True, {"aten::copy_", "aten::convolution"}),
+        # Asymmetric wgrad must pad x, and that pad copies x.
+        ("sample_conv_wgrad.json", True, {"aten::convolution"}),
+    ],
+)
+def test_conv_backward_iteration_runs_only_the_backward_conv(
+    torch_gpu, graph_name: str, asymmetric: bool, forbidden: set
+) -> None:
+    """A timed dgrad or wgrad iteration runs one backward conv and no extra work.
+
+    A copy or a forward conv in the iteration adds to the PyTorch time and
+    gives a false hipDNN speedup.
+    """
+    _, graph_json, tensor_infos = load_graph(graph_name)
+    if asymmetric:
+        # Same output size as the symmetric [1, 1] padding of the sample.
+        params = graph_json["nodes"][0]["parameters"]
+        params["pre_padding"], params["post_padding"] = [0, 0], [2, 2]
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+
+    profiler = torch_gpu.profiler
+    with PyTorchCudaBufferManager(tensor_infos) as bm:
+        bm.allocate_all()
+        bm.load_input_data(generate_input_data(tensor_infos, 42, graph_json))
+        tensors = bm.get_tensors()
+        # The first call does one-time work (algorithm find, lazy init).
+        executor.execute_once(tensors)
+        with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+            executor.execute_once(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert ops["aten::convolution_backward"] == 1, ops
+    assert not forbidden & ops.keys(), ops
 
 
 def test_flash_aotriton_preference_benchmarks_sdpa(torch_gpu) -> None:
