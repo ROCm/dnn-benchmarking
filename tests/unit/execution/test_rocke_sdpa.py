@@ -112,7 +112,10 @@ def _packed(name, spec, sha="ab" * 32, provenance=True):
 
 
 def _write_descriptors(root, arch, ukds):
-    path = root / "arch_content" / "hip-kernel-provider" / arch / "rocKE" / "dense"
+    # The installed layout keeps the authored subpath, which puts the DVC
+    # bundle under <descriptor>/artifacts/.
+    path = root / "arch_content" / "hip-kernel-provider" / arch / "rocKE"
+    path = path / "dense" / "artifacts"
     path.mkdir(parents=True)
     (path / "dense.kdp.json").write_text(json.dumps({"kernelDescriptors": ukds}))
 
