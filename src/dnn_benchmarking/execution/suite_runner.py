@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import PyTorchSdpaBackendName, SuiteConfig
@@ -43,8 +43,10 @@ from .oracle import (
     run_tuned_plan,
     tuned_in_process,
 )
+from .rocke_build import BuiltKernel, build_dense_variants
 from .rocke_sdpa import (
     Catalog,
+    CatalogKernel,
     RockeKernel,
     SdpaProblem,
     auto_kernel,
@@ -1049,12 +1051,25 @@ def _run_graph_rocke(
         if reference_row is not None:
             graph.results.append(reference_row)
 
+    # One torch-free child builds every catalog variant of this graph with the
+    # pack step's comgr (see rocke_build); a failure fails only those rows.
+    catalog = [k for k in kernels if isinstance(k, CatalogKernel)]
+    built: Dict[str, Union[BuiltKernel, str]] = {}
+    if catalog:
+        try:
+            results = build_dense_variants([k.spec for k in catalog])
+            built = {k.name: b for k, b in zip(catalog, results)}
+        except Exception as e:
+            built = {k.name: f"{type(e).__name__}: {e}" for k in catalog}
+
     for kernel in kernels:
         graph.results.append(
             _report_row(
                 reporter,
                 kernel.name,
-                lambda k=kernel: _run_rocke_row(ctx, k, problem, session),
+                lambda k=kernel: _run_rocke_row(
+                    ctx, k, problem, session, built.get(k.name)
+                ),
             )
         )
     return graph
@@ -1065,8 +1080,9 @@ def _run_rocke_row(
     kernel: RockeKernel,
     problem: SdpaProblem,
     session: RockeSession,
+    built: Union[BuiltKernel, str, None],
 ) -> ProviderEngineResult:
-    """Build, time and validate one rocKE kernel."""
+    """Load, time and validate one rocKE kernel."""
     config = ctx.config
     row = ProviderEngineResult(
         runtime="rocke",
@@ -1075,11 +1091,15 @@ def _run_rocke_row(
         status="success",
         engine_version=session.version,
     )
+    if isinstance(built, str):
+        return _failed_row(
+            ProviderEngineResult.error_row, row, f"rocKE build failed: {built}"
+        )
     try:
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
         from .rocke_executor import RockeExecutor
 
-        executor = RockeExecutor(kernel, problem, config.timing_policy)
+        executor = RockeExecutor(kernel, problem, config.timing_policy, built=built)
         with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
             bm.allocate_all()
             bm.load_input_data(ctx.input_data)

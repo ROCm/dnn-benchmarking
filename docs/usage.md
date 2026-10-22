@@ -242,13 +242,20 @@ How the variant rows get the hipDNN kernel:
    the two files by descriptor id and variant id. The authored bundle is in
    DVC. `setup_env.py` pulls it. Otherwise, run `dvc pull -r ingestor` in the
    checkout. A missing or different authored bundle gives a startup warning.
-3. The tool builds the spec with the installed rocKE packages. It replaces
-   only the batch and the sequence lengths. The shipped kernels read these
-   values as kernel arguments, so they do not change the code object.
+3. A child process without torch builds the specs of each graph with the
+   installed rocKE packages. It uses the comgr in
+   `DNN_BENCH_ROCKE_COMGR_LIB`, which `setup_env.py` exports in the venv's
+   `activate` script: the comgr of rocKE's pack step. A process that has
+   loaded torch keeps torch's comgr, and a different comgr gives different
+   code-object bytes. The tool replaces only the batch and the sequence
+   lengths. The shipped kernels read these values as kernel arguments, so
+   they do not change the code object.
 4. When the SHA-256 is different, the row gets the warning
-   `code object differs from hipDNN's`. Then the rocKE packages or comgr are
-   not the ones that built the plugin, and the row does not measure the
-   hipDNN kernel.
+   `code object differs from hipDNN's`. Then the rocKE packages or the comgr
+   are not the ones that built the plugin, and the row does not measure the
+   hipDNN kernel. Set `DNN_BENCH_ROCKE_COMGR_LIB` to the `libamd_comgr` that
+   built the plugin. Do not set `ROCKE_COMGR_LIB`: the auto row compiles in
+   the main process, where rocKE refuses a second comgr.
 
 Read the rows as follows:
 
@@ -273,14 +280,13 @@ Requirements and limits:
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
   verified on gfx1250. A graph that no rocKE kernel runs reports
   `no engines applicable` with the reasons.
-- `build_ms` is the rocKE build and load time. For the auto row it also
+- `build_ms` is the rocKE build and load time. For a variant row the build
+  is the compile time in the child process. For the auto row it also
   includes the first launch, because rocKE compiles the unified kernel inside
   its launch call.
 - `--plugin-path` selects the descriptor directory. These options stop the
   run with exit code 2: `--engine`, `--oracle`, `--pmc`, `--trace`, `--perf`,
   `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
-- When the variant rows report the code-object warning, set
-  `ROCKE_COMGR_LIB` to the `libamd_comgr` that built the plugin.
 
 ```bash
 dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime rocke \
