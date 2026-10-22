@@ -1567,3 +1567,104 @@ class TestPyTorchProviderNewOps:
                 graph_json,
                 {1: q, 2: q, 3: q, 5: np.zeros((1, 1, 2, 2), dtype=np.float32)},
             )
+
+
+class TestHostMemoryEstimate:
+    """The validation gate trusts this estimate, so it must count every
+    full-size temporary of the CPU reference and no more: a forward SDPA
+    without sinks runs on the fused kernel and holds no score matrix."""
+
+    @staticmethod
+    def _sdpa(q_dims, k_dims, attributes, page_table_dims=None, sink=False):
+        def tensor(uid, dims, data_type="float"):
+            return {"uid": uid, "dims": dims, "data_type": data_type}
+
+        tensors = [
+            tensor(1, q_dims),
+            tensor(2, k_dims),
+            tensor(3, k_dims),
+            tensor(4, q_dims),
+        ]
+        inputs = {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3}
+        if sink:
+            tensors.append(tensor(8, [q_dims[1]]))
+            inputs["sink_token_tensor_uid"] = 8
+        if page_table_dims is not None:
+            tensors += [
+                tensor(5, page_table_dims, "int32"),
+                tensor(6, page_table_dims, "int32"),
+                tensor(7, [page_table_dims[0], 1, 1, 1], "int32"),
+            ]
+            inputs.update(
+                page_table_k_tensor_uid=5,
+                page_table_v_tensor_uid=6,
+                seq_len_kv_tensor_uid=7,
+            )
+        return {
+            "tensors": tensors,
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": inputs,
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": attributes,
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"causal_mask_bottom_right": True},
+            {"left_bound": 255, "right_bound": 0},
+        ],
+    )
+    def test_band_masks_count_the_full_mask(self, attributes) -> None:
+        """Bottom-right and windowed masks are built at [q_len, kv_len] in
+        float32 (twice) before SDPA runs; causal and unmasked graphs are not.
+        Bottom-right with q_len == kv_len is native causal and builds none."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        q, k = [1, 2, 1024, 16], [1, 2, 512, 16]
+        unmasked = estimate(self._sdpa(q, k, {}))
+        assert estimate(self._sdpa(q, k, {"causal_mask": True})) == unmasked
+        masked = estimate(self._sdpa(q, k, attributes))
+        assert masked - unmasked >= 1024 * 512 * 4 * 2
+        square = [1, 2, 1024, 16]
+        native = {"causal_mask_bottom_right": True}
+        assert estimate(self._sdpa(q, square, native)) == estimate(
+            self._sdpa(q, square, {})
+        )
+
+    def test_sink_forward_counts_score_blocks_and_the_float32_mask(self) -> None:
+        """A forward with sinks forms scores by hand and builds a float32 mask
+        for its bounds; the same forward without sinks holds neither."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        dims = [1, 2, 1024, 16]
+        causal = {"causal_mask": True}
+        plain = estimate(self._sdpa(dims, dims, causal))
+        with_sink = estimate(self._sdpa(dims, dims, causal, sink=True))
+        # Three score-sized buffers (2 rows * 1024 * 1024 * 4 B each) plus the
+        # 1024 * 1024 float32 mask; the sink tensor itself is negligible.
+        assert with_sink - plain >= 3 * 2 * 1024 * 1024 * 4 + 1024 * 1024 * 4
+
+    def test_paged_counts_the_kv_length_the_page_table_addresses(self) -> None:
+        """K and V of a paged graph hold pages, not sequences: the gathered KV
+        length is pages per sequence times the page size."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        q, pages = [4, 2, 64, 16], [64, 2, 16, 16]  # 64 pages of 16 rows
+        one_page = estimate(self._sdpa(q, pages, {}, page_table_dims=[4, 1], sink=True))
+        all_pages = estimate(
+            self._sdpa(q, pages, {}, page_table_dims=[4, 16], sink=True)
+        )
+        # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
+        # against 16 pages * 16 rows instead of 1 page.
+        assert all_pages - one_page >= 4 * 2 * 64 * (16 - 1) * 16 * 4
