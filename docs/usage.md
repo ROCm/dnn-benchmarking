@@ -233,7 +233,7 @@ Each graph gets these `runtime = "rocke"` rows:
 How the variant rows get the hipDNN kernel:
 
 1. The tool reads the installed descriptor files
-   (`<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/*/*.kdp.json`).
+   (`*.kdp.json` at any depth under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
    Each variant records its rocKE builder spec and the SHA-256 of the code
    object that hipDNN ships.
 2. The tool builds the spec with the installed rocKE packages. It replaces

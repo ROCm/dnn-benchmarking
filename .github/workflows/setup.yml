@@ -131,5 +131,6 @@ jobs:
 
       - name: Assert rocKE descriptor packing
         run: |
-          ls .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries*/lib/hipdnn_plugins/engines/arch_content/hip-kernel-provider/gfx950/rocKE/gfx950_attention_dense/*.kdp.json
+          # The packer keeps the authored subpath (gfx950_attention_dense/artifacts/).
+          find .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries*/lib/hipdnn_plugins/engines/arch_content/hip-kernel-provider/gfx950/rocKE/gfx950_attention_dense -name '*.kdp.json' | grep .
           ls -s .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries*/lib/hipdnn_plugins/engines/arch_content/hip-kernel-provider/gfx950/kpack/hip_kernel_provider_gfx950.kpack

@@ -257,11 +257,15 @@ def sdpa_problem(
 
 
 def descriptor_files(plugin_paths: Iterable[Path], arch: str) -> List[Path]:
-    """Installed rocKE descriptor files of the hip-kernel-provider plugin."""
+    """Installed rocKE descriptor files of the hip-kernel-provider plugin.
+
+    The packer keeps each descriptor's authored subpath (for example
+    ``gfx950_attention_dense/artifacts/``), so search the whole tree.
+    """
     files: List[Path] = []
     for root in plugin_paths:
         base = Path(root) / _DESCRIPTOR_SUBDIR / arch / "rocKE"
-        files.extend(sorted(base.glob("*/*.kdp.json")))
+        files.extend(sorted(base.rglob("*.kdp.json")))
     return files
 
 
