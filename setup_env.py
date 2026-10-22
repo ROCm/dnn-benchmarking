@@ -41,6 +41,14 @@ IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
+# Root directories that setup and the hipDNN/provider configure read. Only
+# shared/ctest supplies a file from shared; the rest of that tree is unnecessary.
+ROCM_LIBRARIES_ROOT_DIRS = (".dvc", "cmake", "shared/ctest")
+ROCM_LIBRARIES_SPARSE_DIRS = (
+    *ROCM_LIBRARIES_ROOT_DIRS,
+    "projects/hipdnn",
+    "dnn-providers",
+)
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
 PROVIDER_DESCRIPTOR_ROOT = (
     ROCM_LIBRARIES_DIR
@@ -488,10 +496,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reuse-artifacts",
         action="store_true",
         help=(
-            "Skip building hipDNN/the provider plugins from source and use "
-            "whatever is already installed in the selected ROCm prefix (e.g. a "
-            "prior build in the same workspace). Fails if hipDNN is absent there "
-            "-- this never falls back to building."
+            "Skip building hipDNN, providers and Python bindings; use the "
+            "installed hipDNN prefix and hipdnn_frontend package instead. "
+            "ROCm, CPU and none modes require a pre-existing venv with the "
+            "requested torch mode and no --clean. --torch-mode existing keeps "
+            "the installed torch; CUDA-only setups need no hipDNN bindings."
         ),
     )
     parser.add_argument(
@@ -656,20 +665,15 @@ class Setup:
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
         if (ROCM_LIBRARIES_DIR / ".git").exists():
-            sparse_paths = []
-            if not (ROCM_LIBRARIES_DIR / ".dvc" / "config").is_file():
-                sparse_paths.append(".dvc")
-            if not (ROCM_LIBRARIES_DIR / "cmake").is_dir():
-                sparse_paths.append("cmake")
-            if sparse_paths:
+            # A sparse clone made by an older setup lacks root dirs added since.
+            missing = [
+                path
+                for path in ROCM_LIBRARIES_ROOT_DIRS
+                if not (ROCM_LIBRARIES_DIR / path).is_dir()
+            ]
+            if missing and self._rocm_libraries_is_sparse():
                 run_git(
-                    [
-                        "-C",
-                        str(ROCM_LIBRARIES_DIR),
-                        "sparse-checkout",
-                        "add",
-                        *sparse_paths,
-                    ]
+                    ["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "add", *missing]
                 )
             # An existing checkout is reused as-is, so a pin bump or a broken
             # sparse clone would otherwise go unnoticed.
@@ -697,7 +701,7 @@ class Setup:
         url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
         print(
             f"Fetching rocm-libraries ({ref}) via sparse checkout "
-            "(.dvc, cmake, projects/hipdnn, dnn-providers)..."
+            f"({', '.join(ROCM_LIBRARIES_SPARSE_DIRS)})..."
         )
         # Clone beside the target and move it in only once checked out: a
         # failed or interrupted fetch must not leave a .git directory behind
@@ -723,17 +727,7 @@ class Setup:
             # CMakePresets.json. `set --cone` needs git 2.35; `init --cone` is
             # older.
             run_git([*git, "sparse-checkout", "init", "--cone"])
-            run_git(
-                [
-                    *git,
-                    "sparse-checkout",
-                    "set",
-                    ".dvc",
-                    "cmake",
-                    "projects/hipdnn",
-                    "dnn-providers",
-                ]
-            )
+            run_git([*git, "sparse-checkout", "set", *ROCM_LIBRARIES_SPARSE_DIRS])
             run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
             run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
         except BaseException:
@@ -743,6 +737,24 @@ class Setup:
         if ROCM_LIBRARIES_DIR.exists():
             rmtree(ROCM_LIBRARIES_DIR)
         os.replace(staging, ROCM_LIBRARIES_DIR)
+
+    @staticmethod
+    def _rocm_libraries_is_sparse() -> bool:
+        try:
+            return (
+                git_output(
+                    [
+                        "-C",
+                        str(ROCM_LIBRARIES_DIR),
+                        "config",
+                        "--get",
+                        "core.sparseCheckout",
+                    ]
+                )
+                == "true"
+            )
+        except subprocess.CalledProcessError:
+            return False
 
     # -- venv lifecycle -----------------------------------------------------
 
@@ -1047,7 +1059,9 @@ class Setup:
         if self.rocm_prefix:
             return self.resolve_installed_rocm_prefix()
         if self.torch_mode == "rocm":
-            return self.ensure_rocm_wheel_devel_prefix(self.resolved_torch_index_url)
+            # Reuse must not install the devel SDK into an existing venv.
+            index_url = "" if self.reuse_artifacts else self.resolved_torch_index_url
+            return self.ensure_rocm_wheel_devel_prefix(index_url)
         if self.torch_mode == "existing" and self.installed_torch_mode == "rocm":
             return self.ensure_rocm_wheel_devel_prefix("")
         return self.resolve_installed_rocm_prefix()
@@ -1510,8 +1524,28 @@ class Setup:
     def install_bindings(self) -> None:
         if self.do_build:
             self.build_and_install_bindings(self.install_prefix, self.toolchain_prefix)
-        elif self.probe("import hipdnn_frontend").returncode != 0:
-            warn("hipdnn_frontend is not importable in this environment.")
+            return
+        # --reuse-artifacts builds no bindings, so the venv has to carry them
+        # already. Look for the installed package instead of importing it: the
+        # native libraries behind it may need a GPU or a ROCm runtime that this
+        # host cannot initialise, which says nothing about the install.
+        installed = self.probe(
+            "import importlib.util, sys; "
+            "sys.exit(importlib.util.find_spec('hipdnn_frontend') is None)"
+        )
+        if installed.returncode == 0:
+            return
+        if installed.stderr.strip():
+            fail(
+                f"could not inspect {self.venv_dir} for hipdnn_frontend.",
+                installed.stderr.strip(),
+            )
+        fail(
+            "--reuse-artifacts builds no hipDNN Python bindings, and "
+            f"hipdnn_frontend is not installed in {self.venv_dir}.",
+            "Install hipdnn_frontend in this venv first, or drop "
+            "--reuse-artifacts to build hipDNN and its bindings.",
+        )
 
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
@@ -1532,12 +1566,23 @@ class Setup:
         """
         if self.auto_yes:
             return
-        if not sys.stdin.isatty():
+        if sys.stdin is None or not sys.stdin.isatty():
             fail(
                 f"setup needs confirmation to {action}, but stdin is not a terminal.",
                 "Pass -y to proceed non-interactively.",
             )
-        answer = input(f"This will {action}. Continue? [Y/n] ")
+        try:
+            answer = input(f"This will {action}. Continue? [Y/n] ")
+        except (EOFError, OSError, RuntimeError) as exc:
+            # A tty can still be closed between the check and the read. Only a
+            # genuinely lost stdin is reported this way; input() raises
+            # RuntimeError for other reasons, which must not be swallowed.
+            if isinstance(exc, RuntimeError) and "lost sys.stdin" not in str(exc):
+                raise
+            fail(
+                f"setup needs confirmation to {action}, but stdin could not be read.",
+                "Pass -y to proceed non-interactively.",
+            )
         if answer.strip().lower() not in ("", "y", "yes"):
             print("Aborted.")
             sys.exit(0)
@@ -1646,8 +1691,19 @@ class Setup:
 
     def run(self) -> int:
         self.require_python_version()
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        if venv_python(self.venv_dir).exists() and not self.clean:
+        has_venv = venv_python(self.venv_dir).exists()
+        if (
+            self.reuse_artifacts
+            and self.torch_mode != "cuda"
+            and (self.clean or not has_venv)
+        ):
+            fail(
+                f"--reuse-artifacts with --torch-mode {self.torch_mode} needs "
+                "a pre-existing virtual environment that will not be cleaned.",
+                f"No reusable venv at {self.venv_dir}. Prepare one with "
+                "hipdnn_frontend, or drop --reuse-artifacts to build its bindings.",
+            )
+        if has_venv and not self.clean:
             self.installed_torch_mode = self.get_torch_mode()
         elif self.torch_mode == "existing":
             fail(
@@ -1656,6 +1712,45 @@ class Setup:
                 "Use --torch-mode rocm or --torch-mode cpu to create one and "
                 "install torch automatically.",
             )
+        if self.reuse_artifacts and has_venv and not self.clean:
+            if self.torch_mode in ("rocm", "cpu", "cuda"):
+                if self.installed_torch_mode != self.torch_mode:
+                    fail(
+                        f"--reuse-artifacts with --torch-mode {self.torch_mode} "
+                        f"cannot reuse {self.venv_dir}: it contains torch mode "
+                        f"'{self.installed_torch_mode}'.",
+                        "Use --torch-mode existing to keep that torch, or drop "
+                        "--reuse-artifacts and pass --clean to change modes.",
+                    )
+                self.require_same_torch_source(check_arch=self.torch_mode == "rocm")
+            elif (
+                self.torch_mode == "existing" and self.installed_torch_mode == "missing"
+            ):
+                fail(
+                    "--reuse-artifacts with --torch-mode existing needs torch "
+                    f"already installed in {self.venv_dir}.",
+                    "Install torch in that venv first, or drop --reuse-artifacts.",
+                )
+            elif self.torch_mode == "none":
+                if self.installed_torch_mode != "missing":
+                    fail(
+                        "--reuse-artifacts with --torch-mode none needs a venv "
+                        f"without torch; found '{self.installed_torch_mode}'.",
+                        "Use --torch-mode existing to keep its installed torch.",
+                    )
+                # An installed but broken torch also probes as "missing".
+                torch = self.probe(
+                    "import importlib.util, sys; "
+                    "sys.exit(importlib.util.find_spec('torch') is not None)"
+                )
+                if torch.returncode:
+                    fail(
+                        "--reuse-artifacts with --torch-mode none needs a venv "
+                        "without torch.",
+                        torch.stderr.strip()
+                        or "Remove torch from this venv before reusing it.",
+                    )
+        self.workspace.mkdir(parents=True, exist_ok=True)
         # CUDA torch supports only the PyTorch execution backend: no hipDNN
         # Python bindings, engine plugins, amdsmi, or ROCm prefix.
         cuda = self.torch_mode == "cuda" or (
@@ -1676,11 +1771,9 @@ class Setup:
                 "bindings, and ROCm environment setup."
             )
         else:
-            stages.append(
-                ("rocm-libraries sources", self.ensure_rocm_libraries_checkout)
-            )
             if self.do_build:
                 stages += [
+                    ("rocm-libraries sources", self.ensure_rocm_libraries_checkout),
                     ("Build dependencies", self.install_build_deps),
                     ("Provider descriptor artifacts", self.pull_provider_artifacts),
                 ]

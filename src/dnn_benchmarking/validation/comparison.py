@@ -4,9 +4,9 @@
 """Tolerance comparison of an output against its reference.
 
 One algorithm serves NumPy arrays and torch tensors: the operations used
-(``abs``, ``isfinite``, arithmetic, boolean indexing, ``max``/``argmax``/
-``sum``) behave the same in both libraries, so torch tensors are compared on
-their own device without a host copy and host arrays use NumPy.
+(``abs``, ``isfinite``, arithmetic, ``where``, ``max``/``argmax``/``sum``)
+behave the same in both libraries, so torch tensors are compared on their own
+device without a host copy and host arrays use NumPy.
 """
 
 import math
@@ -15,14 +15,12 @@ from typing import Any, Optional, Tuple
 
 import numpy as np
 
+from ..common.blocks import global_index, iter_blocks
+
 # Comparison dtype: float32 at minimum, as hipDNN's CpuFpReferenceValidation
 # does, and float64 for dtypes float32 cannot hold exactly. Names match both
 # numpy (``dtype.name``) and torch (``str(dtype)`` without ``torch.``).
 _FLOAT64_DTYPES = frozenset({"float64", "int32", "int64", "uint32", "uint64"})
-
-# Summing a bool mask casts it to the sum dtype first; int32 costs 4 bytes
-# per element instead of int64's 8, and chunks this size cannot overflow it.
-_COUNT_CHUNK = 1 << 30
 
 
 def _compare_dtype_name(*dtypes: object) -> str:
@@ -72,9 +70,10 @@ def compare(
     there); anything else is compared as NumPy arrays. Values are compared in
     float32, or float64 when either side needs it. Any NaN or Inf fails.
 
-    Memory: at most three full-size temporaries in the compare dtype plus a
-    bool mask (13 bytes per element for float32). A torch out-of-memory
-    error propagates so the caller can fall back to host arrays.
+    Memory: the work runs one block (``common.blocks``) at a time, so the
+    temporaries (about 13 bytes per element for float32) cover one block,
+    not the whole output. A torch out-of-memory error propagates so the
+    caller can fall back to host arrays.
     """
     if hasattr(actual, "detach"):
         import torch as xp
@@ -83,64 +82,76 @@ def compare(
         ref = xp.as_tensor(expected, device=a.device)
         dtype = getattr(xp, _compare_dtype_name(a.dtype, ref.dtype))
         # torch implements no isfinite/abs/sub for float8; upcast first.
-        if a.is_floating_point() and a.element_size() == 1:
-            a = a.to(dtype)
-        e = ref.to(dtype)
+        upcast_a = a.is_floating_point() and a.element_size() == 1
+
+        def block(x: Any, index: Tuple, upcast: bool) -> Any:
+            return x[index].to(dtype) if upcast else x[index]
+
     else:
         xp = np
         a = np.asarray(actual)
         ref = np.asarray(expected)
         dtype = np.dtype(_compare_dtype_name(a.dtype, ref.dtype))
-        e = ref.astype(dtype, copy=False)
-    # A converted copy is ours to overwrite; otherwise e is the caller's data.
-    owns_e = e is not ref
-    del ref
+        upcast_a = False
+
+        def block(x: Any, index: Tuple, upcast: bool) -> Any:
+            return x[index].astype(dtype, copy=False) if upcast else x[index]
+
     shape = tuple(a.shape)
     n_total = math.prod(shape)
 
-    if tuple(e.shape) != shape:
+    if tuple(ref.shape) != shape:
         return _failure(
-            f"Shape mismatch: output={shape} vs reference={tuple(e.shape)}", n_total
+            f"Shape mismatch: output={shape} vs reference={tuple(ref.shape)}", n_total
         )
-    if not bool(xp.isfinite(a).all()):
+    if not shape:  # 0-d NumPy arithmetic yields scalars, which have no out=.
+        a, ref = a.reshape(1), ref.reshape(1)
+    blocks = list(iter_blocks(tuple(a.shape)))
+    if not all(bool(xp.isfinite(block(a, i, upcast_a)).all()) for i in blocks):
         return _failure("output contains NaN or Inf values", n_total)
-    if not bool(xp.isfinite(e).all()):
+    if not all(bool(xp.isfinite(block(ref, i, True)).all()) for i in blocks):
         return _failure("reference contains NaN or Inf values", n_total)
 
     tolerance = f"(rtol={rtol}, atol={atol})"
     if n_total == 0:
         return ComparisonResult(True, 0.0, 0.0, 0, 0, None, f"Match {tolerance}")
 
-    if not shape:  # 0-d NumPy arithmetic yields scalars, which have no out=.
-        a, e = a.reshape(1), e.reshape(1)
-
-    # e has the compare dtype, which is at least as wide as a's, so the
-    # subtraction promotes a element by element without a converted copy.
+    n_mismatch = 0
+    max_abs_diff = -math.inf
+    worst: Tuple[int, ...] = ()
+    rel_maxima = []
+    # A converted block is ours to overwrite; otherwise it views the caller's
+    # reference, which later engines compare against again.
+    owns_e = ref.dtype != dtype
     # Overflow to inf is a real mismatch, so NumPy's warning is not useful.
     with np.errstate(over="ignore"):
-        diff = a - e
-        xp.abs(diff, out=diff)
-        abs_e = xp.abs(e, out=e) if owns_e else xp.abs(e)
-        threshold = abs_e * rtol
-        threshold += atol
-        mismatch = (diff > threshold).reshape(-1)
-        del threshold
-        n_mismatch = sum(
-            int(mismatch[i : i + _COUNT_CHUNK].sum(dtype=xp.int32))
-            for i in range(0, n_total, _COUNT_CHUNK)
-        )
-        del mismatch
-        flat_worst = int(diff.argmax())
-        max_abs_diff = float(diff.reshape(-1)[flat_worst])
-        # Relative difference over |e| > atol: dividing by inf zeroes the
-        # rest, and every ratio is >= 0, so max() is 0.0 when none qualify.
-        # where() rather than mask assignment, which torch turns into an
-        # 8-byte-per-element index.
-        denominator = xp.where(abs_e > atol, abs_e, math.inf)
-        del abs_e
-        diff /= denominator
-        del denominator
-        max_rel_diff = float(diff.max())
+        for index in blocks:
+            e = block(ref, index, True)
+            # e has the compare dtype, which is at least as wide as a's, so
+            # the subtraction promotes a without a converted copy.
+            diff = block(a, index, upcast_a) - e
+            xp.abs(diff, out=diff)
+            abs_e = xp.abs(e, out=e) if owns_e else xp.abs(e)
+            del e
+            threshold = abs_e * rtol
+            threshold += atol
+            n_mismatch += int((diff > threshold).sum())
+            del threshold
+            flat = int(diff.argmax())
+            value = float(diff.reshape(-1)[flat])
+            if value > max_abs_diff:  # strict: the first maximum wins
+                max_abs_diff = value
+                worst = global_index(index, tuple(diff.shape), flat)
+            # Relative difference over |e| > atol: dividing by inf zeroes the
+            # rest, and every ratio is >= 0, so max() is 0.0 when none qualify.
+            # where() rather than mask assignment, which torch turns into an
+            # 8-byte-per-element index.
+            diff /= xp.where(abs_e > atol, abs_e, math.inf)
+            del abs_e
+            rel_maxima.append(float(diff.max()))
+            del diff
+    max_rel_diff = float(np.max(rel_maxima))  # keeps a NaN ratio, as max() did
+    flat_worst = int(np.ravel_multi_index(worst, tuple(a.shape)))
     worst_index = tuple(int(i) for i in np.unravel_index(flat_worst, shape))
 
     if n_mismatch == 0:
