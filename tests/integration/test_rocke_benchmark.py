@@ -46,8 +46,8 @@ def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> No
     session = rocke_session(config, reporter)
     if not descriptor_files([Path(p) for p in rocke_gfx950], "gfx950"):
         pytest.skip("the plugin build ships no rocKE descriptors")
-    # Descriptors present but no usable variant: provenance or parsing broke.
-    assert session.catalog.kernels, "rocKE descriptors exist but none parsed"
+    # Descriptors present but no usable variant: the authored join broke.
+    assert session.catalog.kernels, session.catalog
 
     result = run_graph_rocke(
         Path("rocke.json"), graph, infos, config, reporter, session

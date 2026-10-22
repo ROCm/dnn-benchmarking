@@ -99,64 +99,95 @@ def _spec(dtype="fp16", d=128, hq=32, hkv=8, causal=True, bm=256, bn=64):
     }
 
 
-def _packed(name, spec, sha="ab" * 32, provenance=True):
-    ukd = {"name": name, "kernel_source": {"kind": "kpack", "sha256": sha}}
-    if provenance:
-        ukd["provenance"] = {
-            "origin_kind": "rocke",
+def _packed(uid, name, sha="ab" * 32):
+    """An installed variant: packed into a kpack, no rocKE spec inline."""
+    return {
+        "id": uid,
+        "name": name,
+        "kernel_source": {"kind": "kpack", "sha256": sha},
+    }
+
+
+def _authored(uid, spec, builder=DENSE_BUILDER):
+    """A variant as authored in the rocm-libraries checkout."""
+    return {
+        "id": uid,
+        "kernel_source": {
+            "kind": "rocke",
             "source": DENSE_SOURCE,
-            "builder": DENSE_BUILDER,
+            "builder": builder,
             "spec": spec,
-        }
-    return ukd
+        },
+    }
 
 
-def _write_descriptors(root, arch, ukds):
+def _write(path, bundle_id, ukds):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"id": bundle_id, "kernelDescriptors": ukds}))
+    return path
+
+
+def _install(root, arch, bundle_id, ukds, name="dense"):
     # The installed layout keeps the authored subpath, which puts the DVC
     # bundle under <descriptor>/artifacts/.
-    path = root / "arch_content" / "hip-kernel-provider" / arch / "rocKE"
-    path = path / "dense" / "artifacts"
-    path.mkdir(parents=True)
-    (path / "dense.kdp.json").write_text(json.dumps({"kernelDescriptors": ukds}))
+    base = root / "arch_content" / "hip-kernel-provider" / arch / "rocKE"
+    _write(base / name / "artifacts" / f"{name}.kdp.json", bundle_id, ukds)
 
 
-def test_catalog_reads_spec_and_shipped_hash(tmp_path) -> None:
+def _catalog(tmp_path, specs):
+    """Install and author one dense bundle whose variants have ``specs``."""
+    names = list(specs)
+    _install(tmp_path / "plugins", "gfx950", "kdp", [_packed(n, n) for n in names])
+    authored = _write(
+        tmp_path / "src" / "dense.kdp.json",
+        "kdp",
+        [_authored(n, specs[n]) for n in names],
+    )
+    installed = descriptor_files([tmp_path / "plugins"], "gfx950")
+    return load_catalog(installed, [authored])
+
+
+def test_catalog_joins_authored_spec_with_shipped_hash(tmp_path) -> None:
     spec = _spec()
-    _write_descriptors(
-        tmp_path,
+    plugins = tmp_path / "plugins"
+    _install(
+        plugins,
         "gfx950",
+        "kdp",
         [
-            _packed("packed", spec, sha="cd" * 32),
-            _packed("no_provenance", spec, provenance=False),
-            {
-                "name": "authored",
-                "kernel_source": {
-                    "kind": "rocke",
-                    "source": DENSE_SOURCE,
-                    "builder": DENSE_BUILDER,
-                    "spec": spec,
-                },
-            },
-            {"name": "hip", "kernel_source": {"kind": "hip", "source": "x.cpp"}},
+            _packed("a", "dense_a", sha="cd" * 32),
+            _packed("other", "other_builder"),
+            _packed("gone", "not_authored"),
+            {"id": "h", "kernel_source": {"kind": "hip", "source": "x.cpp"}},
         ],
     )
-    assert descriptor_files([tmp_path], "gfx942") == []
-    catalog = load_catalog(descriptor_files([tmp_path], "gfx950"))
-    assert catalog.kernels == (("packed", spec, "cd" * 32), ("authored", spec, None))
-    assert catalog.missing_provenance == 1
+    _install(plugins, "gfx950", "unpulled", [_packed("u", "u")], name="new_bundle")
+    authored = _write(
+        tmp_path / "src" / "dense.kdp.json",
+        "kdp",
+        [_authored("a", spec), _authored("other", spec, builder="build_other")],
+    )
+
+    assert descriptor_files([plugins], "gfx942") == []
+    catalog = load_catalog(descriptor_files([plugins], "gfx950"), [authored])
+    assert catalog.kernels == (("dense_a", spec, "cd" * 32),)
+    # Another builder's variant is not a dense kernel and not a mismatch.
+    assert catalog.missing_spec == 1
+    assert catalog.unmatched == ("new_bundle.kdp.json",)
 
 
 def test_catalog_matches_problem_and_tile_divisibility(tmp_path) -> None:
     pytest.importorskip("kernels.gfx950.attention_dense")
-    ukds = [
-        _packed("bm256_bn64", _spec(bm=256, bn=64)),
-        _packed("bm128_bn32", _spec(bm=128, bn=32)),
-        _packed("full", _spec(causal=False)),
-        _packed("d64", _spec(d=64)),
-        _packed("bf16", _spec(dtype="bf16")),
-    ]
-    _write_descriptors(tmp_path, "gfx950", ukds)
-    catalog = load_catalog(descriptor_files([tmp_path], "gfx950"))
+    catalog = _catalog(
+        tmp_path,
+        {
+            "bm256_bn64": _spec(bm=256, bn=64),
+            "bm128_bn32": _spec(bm=128, bn=32),
+            "full": _spec(causal=False),
+            "d64": _spec(d=64),
+            "bf16": _spec(dtype="bf16"),
+        },
+    )
 
     found = catalog_kernels(catalog, _problem(sdpa_graph(b=2, s=2048)))
     assert [k.name for k in found] == ["rocke:bm256_bn64", "rocke:bm128_bn32"]
@@ -175,8 +206,6 @@ def test_catalog_matches_problem_and_tile_divisibility(tmp_path) -> None:
 def test_unknown_spec_field_is_not_reported_as_no_match(tmp_path) -> None:
     """A descriptor from another rocKE version must fail loudly, not match nothing."""
     pytest.importorskip("kernels.gfx950.attention_dense")
-    spec = dict(_spec(), knob_from_another_rocke=1)
-    _write_descriptors(tmp_path, "gfx950", [_packed("newer", spec)])
-    catalog = load_catalog(descriptor_files([tmp_path], "gfx950"))
+    catalog = _catalog(tmp_path, {"newer": dict(_spec(), knob_from_another_rocke=1)})
     with pytest.raises(TypeError):
         catalog_kernels(catalog, _problem(sdpa_graph()))

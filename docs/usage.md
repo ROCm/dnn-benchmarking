@@ -232,14 +232,20 @@ Each graph gets these `runtime = "rocke"` rows:
 
 How the variant rows get the hipDNN kernel:
 
-1. The tool reads the installed descriptor files
-   (`*.kdp.json` at any depth under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
-   Each variant records its rocKE builder spec and the SHA-256 of the code
-   object that hipDNN ships.
-2. The tool builds the spec with the installed rocKE packages. It replaces
+1. The tool reads the installed descriptor files (`*.kdp.json` at any depth
+   under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
+   Each shipped variant records the SHA-256 of its code object, but not its
+   rocKE spec. hipDNN installs the spec only with a test build.
+2. The tool reads each variant's rocKE builder spec from the authored
+   descriptor in the rocm-libraries checkout that holds the installed `rocke`
+   package (`src/engines/kernel_ingestor_engine/descriptors/rocKE/`). It joins
+   the two files by descriptor id and variant id. The authored bundle is in
+   DVC. `setup_env.py` pulls it. Otherwise, run `dvc pull -r ingestor` in the
+   checkout. A missing or different authored bundle gives a startup warning.
+3. The tool builds the spec with the installed rocKE packages. It replaces
    only the batch and the sequence lengths. The shipped kernels read these
    values as kernel arguments, so they do not change the code object.
-3. When the SHA-256 is different, the row gets the warning
+4. When the SHA-256 is different, the row gets the warning
    `code object differs from hipDNN's`. Then the rocKE packages or comgr are
    not the ones that built the plugin, and the row does not measure the
    hipDNN kernel.
@@ -264,7 +270,8 @@ Requirements and limits:
   window. A causal graph needs `seqlen_q == seqlen_kv`. An absent
   `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
-  a causal graph. A graph that no rocKE kernel runs reports
+  a causal graph. The auto row is verified on gfx942 and gfx950. It is not
+  verified on gfx1250. A graph that no rocKE kernel runs reports
   `no engines applicable` with the reasons.
 - `build_ms` is the rocKE build and load time. For the auto row it also
   includes the first launch, because rocKE compiles the unified kernel inside

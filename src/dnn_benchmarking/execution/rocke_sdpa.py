@@ -7,10 +7,12 @@ Two kinds of kernel apply to a graph:
 
 * Catalog kernels: the rocKE kernels that hipDNN ships for the
   ``hipkernel:Gfx950AttentionDense`` engine. The installed descriptor file
-  (``*.kdp.json`` under the plugin directory) records, for each variant, the
-  rocKE builder spec and the SHA-256 of the shipped code object. A catalog row
-  builds that spec with the installed rocKE packages and launches it directly,
-  so it runs the same code object as the hipDNN engine.
+  (``*.kdp.json`` under the plugin directory) records the SHA-256 of each
+  shipped code object. The authored descriptor in the rocm-libraries checkout
+  that holds the installed ``rocke`` package records each variant's rocKE
+  builder spec. A catalog row joins the two by descriptor id, builds the spec
+  with the installed rocKE packages and launches it directly, so it runs the
+  same code object as the hipDNN engine.
 * The auto kernel: the kernel that rocKE's own production dispatcher
   (``dispatch.attention.dispatch_attention``) selects for the problem.
 
@@ -24,13 +26,18 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from ..common.exceptions import UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
 
-#: Builder that every catalog kernel must name in its provenance.
+#: Builder that every catalog kernel must name in its authored descriptor.
 DENSE_SOURCE = "kernels/gfx950/attention_dense.py"
 DENSE_BUILDER = "build_attention_dense"
 DENSE_ARCH = "gfx950"
 
 #: Descriptor root of the hip-kernel-provider plugin, relative to a plugin path.
 _DESCRIPTOR_SUBDIR = Path("arch_content") / "hip-kernel-provider"
+
+#: Authored rocKE descriptors, relative to the hip-kernel-provider checkout.
+_AUTHORED_SUBDIR = (
+    Path("src") / "engines" / "kernel_ingestor_engine" / "descriptors" / "rocKE"
+)
 
 _ROCKE_DTYPES = {"half": "fp16", "bfloat16": "bf16"}
 
@@ -126,12 +133,15 @@ RockeKernel = Union[CatalogKernel, AutoKernel]
 class Catalog:
     """Catalog kernels found under the plugin paths for one GPU arch.
 
-    ``missing_provenance`` counts packed variants that the runtime cannot
-    rebuild because the descriptor records no rocKE spec.
+    ``unmatched`` names installed rocKE descriptor files that no authored
+    descriptor matches: the authored files are absent (not pulled from DVC)
+    or come from another checkout. ``missing_spec`` counts shipped variants
+    of a matched bundle that the authored bundle lacks.
     """
 
     kernels: Tuple[Tuple[str, Dict[str, Any], Optional[str]], ...]
-    missing_provenance: int = 0
+    unmatched: Tuple[str, ...] = ()
+    missing_spec: int = 0
 
 
 def _is_packed_bshd(dims: Sequence[int], strides: Sequence[int]) -> bool:
@@ -269,41 +279,77 @@ def descriptor_files(plugin_paths: Iterable[Path], arch: str) -> List[Path]:
     return files
 
 
-def load_catalog(files: Iterable[Path]) -> Catalog:
-    """Read every dense-attention rocKE variant from descriptor files.
+def authored_descriptor_root() -> Optional[Path]:
+    """Authored rocKE descriptors of the checkout that holds ``rocke``.
 
-    A variant packed into a kpack carries its rocKE spec in ``provenance`` and
-    the shipped code-object hash in ``kernel_source.sha256``. An authored
-    (unpacked) variant carries the spec in ``kernel_source`` itself.
+    ``setup_env.py`` installs ``rocke`` editable from
+    ``hip-kernel-provider/rocke/platform/python``, so the checkout is four
+    levels above the package. None when ``rocke`` is not installed from a
+    rocm-libraries checkout.
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("rocke")
+    if spec is None or spec.origin is None:
+        return None
+    root = Path(spec.origin).resolve().parents[4] / _AUTHORED_SUBDIR
+    return root if root.is_dir() else None
+
+
+def load_catalog(installed: Iterable[Path], authored: Iterable[Path]) -> Catalog:
+    """Read every shipped dense-attention rocKE variant.
+
+    The installed (packed) descriptor carries the code-object hash in
+    ``kernel_source.sha256`` but no rocKE spec: the packer moves that into a
+    provenance sidecar, which only a test install ships. The authored
+    descriptor carries the spec in ``kernel_source``. Packing keeps both the
+    descriptor id and each variant id, so the two join on them.
 
     Raises:
         OSError, ValueError: A descriptor file is unreadable or not JSON.
     """
     import json
 
-    kernels = []
-    missing = 0
-    for path in files:
+    authored_bundles = set()
+    authored_variants = set()
+    specs: Dict[str, Dict[str, Any]] = {}
+    for path in authored:
         with open(path, encoding="utf-8") as f:
             descriptor = json.load(f)
+        authored_bundles.add(str(descriptor.get("id")))
+        for ukd in descriptor.get("kernelDescriptors", []):
+            authored_variants.add(str(ukd.get("id")))
+            source = ukd.get("kernel_source") or {}
+            if (
+                source.get("kind") == "rocke"
+                and source.get("source") == DENSE_SOURCE
+                and source.get("builder") == DENSE_BUILDER
+            ):
+                specs[str(ukd.get("id"))] = dict(source["spec"])
+
+    kernels = []
+    unmatched = []
+    missing = 0
+    for path in installed:
+        with open(path, encoding="utf-8") as f:
+            descriptor = json.load(f)
+        if str(descriptor.get("id")) not in authored_bundles:
+            unmatched.append(path.name)
+            continue
         for ukd in descriptor.get("kernelDescriptors", []):
             source = ukd.get("kernel_source") or {}
-            if source.get("kind") == "rocke":
-                origin, sha = source, None
-            elif source.get("kind") == "kpack":
-                origin, sha = ukd.get("provenance") or {}, source.get("sha256")
-                if not origin:
-                    missing += 1
-                    continue
-            else:
+            uid = str(ukd.get("id"))
+            if source.get("kind") != "kpack":
                 continue
-            if (
-                origin.get("source") != DENSE_SOURCE
-                or origin.get("builder") != DENSE_BUILDER
-            ):
-                continue
-            kernels.append((str(ukd.get("name", "")), dict(origin["spec"]), sha))
-    return Catalog(kernels=tuple(kernels), missing_provenance=missing)
+            if uid not in authored_variants:
+                missing += 1
+            elif uid in specs:
+                kernels.append(
+                    (str(ukd.get("name", "")), specs[uid], source.get("sha256"))
+                )
+    return Catalog(
+        kernels=tuple(kernels), unmatched=tuple(unmatched), missing_spec=missing
+    )
 
 
 def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKernel]:
