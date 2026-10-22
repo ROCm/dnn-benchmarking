@@ -3,6 +3,7 @@
 
 """Runtime startup: check the selected runtime once, return a per-graph runner."""
 
+import importlib.util
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -10,8 +11,10 @@ from ..common import torch_support
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import RuntimeName, SuiteConfig
 from ..execution.suite_runner import (
+    rocke_session,
     run_graph_all_providers,
     run_graph_pytorch,
+    run_graph_rocke,
     set_plugin_path,
 )
 from ..reporting.reporter import Reporter
@@ -40,20 +43,37 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
     """
     if config.runtime is RuntimeName.PYTORCH:
         _check_reference_provider(config)
-        # torch.cuda is the authoritative GPU check here: a CPU-only torch
-        # cannot run these benchmarks even when ROCm tools see a device.
-        if not torch_support.module_available():
-            raise RuntimeStartupError(
-                "--runtime pytorch: PyTorch is not importable; install a ROCm "
-                "or CUDA build of torch"
-            )
-        if not torch_support.gpu_available():
-            raise RuntimeStartupError(
-                "--runtime pytorch: PyTorch sees no GPU (torch.cuda.is_available() "
-                "is False); install a ROCm or CUDA build of torch"
-            )
+        _check_torch_gpu("pytorch")
         return lambda path, graph_json, infos: run_graph_pytorch(
             path, graph_json, infos, config, reporter
+        )
+    if config.runtime is RuntimeName.ROCKE:
+        _check_reference_provider(config)
+        _check_torch_gpu("rocke")
+        if not torch_support.is_rocm_build():
+            raise RuntimeStartupError(
+                "--runtime rocke: rocKE kernels need a ROCm build of torch"
+            )
+        missing = [
+            name
+            for name in ("rocke", "kernels", "builders", "dispatch")
+            if importlib.util.find_spec(name) is None
+        ]
+        if missing:
+            raise RuntimeStartupError(
+                f"--runtime rocke: rocKE Python packages are not importable "
+                f"({', '.join(missing)}); run setup_env.py on Linux, or "
+                "pip install -e rocke/platform and rocke/library from "
+                "rocm-libraries/dnn-providers/hip-kernel-provider"
+            )
+        try:
+            session = rocke_session(config, reporter)
+        except (OSError, ValueError) as e:
+            raise RuntimeStartupError(
+                f"--runtime rocke: cannot read the rocKE descriptors: {e}"
+            ) from e
+        return lambda path, graph_json, infos: run_graph_rocke(
+            path, graph_json, infos, config, reporter, session
         )
 
     # The reference-provider availability check imports torch. A ROCm torch
@@ -66,6 +86,24 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
     return lambda path, graph_json, infos: run_graph_all_providers(
         path, graph_json, infos, config, handle, reporter
     )
+
+
+def _check_torch_gpu(runtime: str) -> None:
+    """Require a GPU-capable torch; torch.cuda is the authoritative check.
+
+    A CPU-only torch cannot run these benchmarks even when ROCm tools see a
+    device.
+    """
+    if not torch_support.module_available():
+        raise RuntimeStartupError(
+            f"--runtime {runtime}: PyTorch is not importable; install a ROCm "
+            "or CUDA build of torch"
+        )
+    if not torch_support.gpu_available():
+        raise RuntimeStartupError(
+            f"--runtime {runtime}: PyTorch sees no GPU (torch.cuda.is_available() "
+            "is False); install a ROCm or CUDA build of torch"
+        )
 
 
 def _check_reference_provider(config: SuiteConfig) -> None:

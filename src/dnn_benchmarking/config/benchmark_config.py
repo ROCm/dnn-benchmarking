@@ -22,6 +22,7 @@ class RuntimeName(str, Enum):
 
     HIPDNN = "hipdnn"
     PYTORCH = "pytorch"
+    ROCKE = "rocke"
 
 
 class PyTorchSdpaBackendName(str, Enum):
@@ -306,7 +307,8 @@ class SuiteConfig:
             probes and no extra runs.
         runtime: Runtime that executes the graph (``hipdnn`` runs discovered
             engine plugins, ``pytorch`` runs the graph through the PyTorch executor as a single
-            engine row per graph).
+            engine row per graph, ``rocke`` launches rocKE kernels directly
+            (SDPA forward today), one row per kernel).
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
@@ -352,8 +354,9 @@ class SuiteConfig:
         """Build a suite config from merged CLI/config-file arguments.
 
         ``args`` must hold every public option (``apply_config_file`` merges
-        the defaults). hipDNN runs without ``--plugin-path`` fall back to the
-        ROCm install's plugin directory.
+        the defaults). hipDNN and rocKE runs without ``--plugin-path`` fall
+        back to the ROCm install's plugin directory; rocKE reads the
+        hip-kernel-provider descriptors there.
         """
         plugin_paths = args.plugin_path
         if plugin_paths is None and args.runtime != RuntimeName.PYTORCH:
@@ -439,27 +442,34 @@ class SuiteConfig:
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
         )
+        hipdnn_only = [
+            ("--engine", self.engine_filter is not None),
+            ("--pmc", self.metrics.pmc_set is not None),
+            ("--trace", self.metrics.trace),
+            ("--perf", self.metrics.perf),
+            ("--roofline", self.metrics.roofline),
+            ("--autotune", self.autotune),
+            ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
+        ]
         if self.runtime is RuntimeName.PYTORCH:
-            rejected = [
-                ("--engine", self.engine_filter is not None),
+            rejected = hipdnn_only + [
                 ("--plugin-path", self.plugin_paths is not None),
                 (
                     "--validate pytorch",
                     self.validation.provider is ReferenceProviderName.PYTORCH,
                 ),
-                ("--pmc", self.metrics.pmc_set is not None),
-                ("--trace", self.metrics.trace),
-                ("--perf", self.metrics.perf),
-                ("--roofline", self.metrics.roofline),
-                ("--autotune", self.autotune),
-                ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ]
-            flags = [flag for flag, present in rejected if present]
-            if flags:
-                raise ValueError(
-                    f"{', '.join(flags)} not supported with --runtime pytorch "
-                    "(hipDNN-only options)"
-                )
+        elif self.runtime is RuntimeName.ROCKE:
+            # --plugin-path stays: it locates the shipped rocKE descriptors.
+            rejected = hipdnn_only + [("--oracle", self.oracle)]
+        else:
+            rejected = []
+        flags = [flag for flag, present in rejected if present]
+        if flags:
+            raise ValueError(
+                f"{', '.join(flags)} not supported with --runtime "
+                f"{self.runtime.value} (hipDNN-only options)"
+            )
 
     @property
     def plugin_path(self) -> Optional[Path]:

@@ -47,7 +47,7 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime {hipdnn,pytorch}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). |
+| `-r`, `--runtime {hipdnn,pytorch,rocke}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). See [rocKE runtime](#rocke-runtime). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
@@ -216,6 +216,89 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
 
 The tool does not set `MIOPEN_FIND_MODE` or `MIOPEN_FIND_ENFORCE`. The hipDNN
 MIOpen plugin reads them too, so they would also change the hipDNN rows.
+
+## rocKE runtime
+
+`--runtime rocke` launches rocKE SDPA forward kernels directly, without
+hipDNN. Use it to compare rocKE with hipDNN on the same graphs. The rows use
+the same inputs, timed loop, FLOP count and result schema as the hipDNN rows.
+
+Each graph gets these `runtime = "rocke"` rows:
+
+| Row | Kernel |
+|---|---|
+| `rocke:<variant>` | One row for each variant that hipDNN ships for `hipkernel:Gfx950AttentionDense` and that runs the graph. `<variant>` is the hipDNN kernel descriptor name, for example `attention_dense.fp16_d128_hq32_kv8_c1_bm256_bn64.gfx950`. |
+| `rocke:auto:<kernel>` | The kernel that rocKE's production dispatcher (`dispatch_attention`) selects. At the pinned rocm-libraries commit this is unified 2D or 3D attention. |
+
+How the variant rows get the hipDNN kernel:
+
+1. The tool reads the installed descriptor files (`*.kdp.json` at any depth
+   under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
+   Each shipped variant records the SHA-256 of its code object, but not its
+   rocKE spec. hipDNN installs the spec only with a test build.
+2. The tool reads each variant's rocKE builder spec from the authored
+   descriptor in the rocm-libraries checkout that holds the installed `rocke`
+   package (`src/engines/kernel_ingestor_engine/descriptors/rocKE/`). It joins
+   the two files by descriptor id and variant id. The authored bundle is in
+   DVC. `setup_env.py` pulls it. Otherwise, run `dvc pull -r ingestor` in the
+   checkout. A missing or different authored bundle gives a startup warning.
+3. A child process without torch builds the specs of each graph with the
+   installed rocKE packages. It uses the comgr in
+   `DNN_BENCH_ROCKE_COMGR_LIB`, which `setup_env.py` exports in the venv's
+   `activate` script: the comgr of rocKE's pack step. A process that has
+   loaded torch keeps torch's comgr, and a different comgr gives different
+   code-object bytes. The tool replaces only the batch and the sequence
+   lengths. The shipped kernels read these values as kernel arguments, so
+   they do not change the code object.
+4. When the SHA-256 is different, the row gets the warning
+   `code object differs from hipDNN's`. Then the rocKE packages or the comgr
+   are not the ones that built the plugin, and the row does not measure the
+   hipDNN kernel. Set `DNN_BENCH_ROCKE_COMGR_LIB` to the `libamd_comgr` that
+   built the plugin. Do not set `ROCKE_COMGR_LIB`: the auto row compiles in
+   the main process, where rocKE refuses a second comgr.
+
+Read the rows as follows:
+
+- The variant row with the tile that hipDNN selects is the parity check. Its
+  median must agree with the `hipkernel:Gfx950AttentionDense` hipDNN row
+  within noise.
+- The fastest variant row minus the hipDNN row is the loss from hipDNN's tile
+  selection.
+- The auto row minus the fastest variant row is the loss from the kernels
+  that hipDNN does not ship.
+
+Requirements and limits:
+
+- A ROCm build of PyTorch and the rocKE Python packages (`rocke`, `kernels`,
+  `builders`, `dispatch`). `setup_env.py` installs them on Linux from the `rocm-libraries`
+  checkout that it builds the plugins from.
+- Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
+  Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
+  window. A causal graph needs `seqlen_q == seqlen_kv`. An absent
+  `attn_scale_value` is 1.0, as in hipDNN.
+- Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
+  a causal graph. The auto row is verified on gfx942 and gfx950. It is not
+  verified on gfx1250. A graph that no rocKE kernel runs reports
+  `no engines applicable` with the reasons.
+- `build_ms` is the rocKE build and load time. For a variant row the build
+  is the compile time in the child process. For the auto row it also
+  includes the first launch, because rocKE compiles the unified kernel inside
+  its launch call.
+- `--plugin-path` selects the descriptor directory. These options stop the
+  run with exit code 2: `--engine`, `--oracle`, `--pmc`, `--trace`, `--perf`,
+  `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
+
+```bash
+dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime rocke \
+  --timing-block 50 -o rocke.json
+dnn-benchmark -g Workloads/microbench/rocke.tar.gz \
+  -e hipkernel:Gfx950AttentionDense --timing-block 50 -o hipdnn.json
+dnn-benchmark compare hipdnn.json rocke.json
+```
+
+`compare --by best` pairs the fastest rocKE row with the hipDNN row. `--by
+engine` does not pair them, because the row key includes the runtime. Read the
+per-variant rows in the rocKE result file.
 
 ## Kernel selection (`--autotune`, `--hipdnn-cache-dir`)
 
@@ -432,7 +515,7 @@ with code 143 without it. The file then holds the last periodic write.
 | Code | Meaning |
 |---|---|
 | 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
-| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a runtime that is not available at startup (hipDNN, PyTorch or the reference provider). |
+| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a runtime that is not available at startup (hipDNN, PyTorch, rocKE or the reference provider). |
 | 2 | Usage error: a bad flag, a bad config file, an option that the runtime does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
@@ -502,6 +585,8 @@ dnn-benchmark compare base.json new.json
 
 To compare a ROCm host with a CUDA host, run `--runtime pytorch -o` on each
 host, then compare the two files on one host.
+
+To compare rocKE with hipDNN, see [rocKE runtime](#rocke-runtime).
 
 ## Profiling
 

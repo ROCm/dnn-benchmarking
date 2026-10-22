@@ -779,15 +779,29 @@ class Setup:
             self.write_activate_local()
 
     def write_activate_local(
-        self, rocm_prefix: str = "", lib_dirs: tuple[str, ...] = ()
+        self,
+        rocm_prefix: str = "",
+        lib_dirs: tuple[str, ...] = (),
+        rocke_comgr: Path | None = None,
     ) -> None:
-        """Write the venv's activate.local and make activate source it."""
+        """Write the venv's activate.local and make activate source it.
+
+        ``rocke_comgr`` is the comgr that rocKE's pack step used. The rocKE
+        runtime builds hipDNN's variants with it in a child process, so the
+        code objects match the shipped ones byte for byte. It is not
+        ROCKE_COMGR_LIB: a process that has loaded torch must keep torch's
+        comgr, and rocKE refuses a second one there.
+        """
         lines = [
             f"export PYTHONPYCACHEPREFIX={shlex.quote(str(self.workspace / 'pycache'))}",
             f"export DNN_BENCH_WORKSPACE={shlex.quote(str(self.workspace))}",
         ]
         if rocm_prefix:
             lines.append(f"export ROCM_PATH={shlex.quote(rocm_prefix)}")
+        if rocke_comgr:
+            lines.append(
+                f"export DNN_BENCH_ROCKE_COMGR_LIB={shlex.quote(str(rocke_comgr))}"
+            )
         for lib_dir in reversed(lib_dirs):
             lines += [
                 'case ":${LD_LIBRARY_PATH:-}:" in',
@@ -1518,7 +1532,9 @@ class Setup:
             existing = current.split(":") if current else []
             ordered = [path for path in lib_dirs if path not in existing] + existing
             self.env["LD_LIBRARY_PATH"] = ":".join(ordered)
-            self.write_activate_local(install_prefix, lib_dirs)
+            self.write_activate_local(
+                install_prefix, lib_dirs, self._comgr_lib(toolchain_prefix)
+            )
 
     def install_bindings(self) -> None:
         if self.do_build:
@@ -1545,6 +1561,27 @@ class Setup:
             "Install hipdnn_frontend in this venv first, or drop "
             "--reuse-artifacts to build hipDNN and its bindings.",
         )
+
+    def install_rocke_packages(self) -> None:
+        """Editable-install rocKE's Python packages for ``--runtime rocke``.
+
+        They come from the rocm-libraries checkout that the plugins build
+        from, so the runtime rebuilds the code objects hipDNN ships. The
+        library package provides the generic top-level names ``kernels``,
+        ``builders`` and ``dispatch``; rocKE keeps them in a dedicated venv.
+        """
+        rocke = ROCM_LIBRARIES_DIR / "dnn-providers" / "hip-kernel-provider" / "rocke"
+        if not (rocke / "library" / "pyproject.toml").is_file():
+            warn(
+                f"rocKE sources not found under {rocke}.",
+                "--runtime rocke needs them; check the rocm-libraries checkout.",
+            )
+            return
+        # compat mode writes a .pth to the source root, as rocKE's BUILDING.md
+        # requires. The library resolves `rocke` from the platform install.
+        compat = ("--config-settings", "editable_mode=compat")
+        self.pip("install", *compat, "-e", str(rocke / "platform"))
+        self.pip("install", *compat, "--no-deps", "-e", str(rocke / "library"))
 
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
@@ -1779,8 +1816,13 @@ class Setup:
             stages += [
                 ("hipDNN and provider plugins", self.build_hipdnn),
                 ("hipDNN Python bindings", self.install_bindings),
-                ("amdsmi and rocprofiler libraries", self.install_runtime_extras),
             ]
+            if not IS_WINDOWS:
+                # The Windows ROCm build of rocKE is untested (see rocke_args).
+                stages.append(("rocKE Python packages", self.install_rocke_packages))
+            stages.append(
+                ("amdsmi and rocprofiler libraries", self.install_runtime_extras)
+            )
         stages.append(("Verify installation", self.verify))
 
         self.n_stages = len(stages)

@@ -17,6 +17,11 @@ file that `dnn-benchmark compare` can compare with a ROCm result. The package
 stays importable without `hipdnn_frontend`: every hipDNN import is lazy. The
 hipDNN backend does not import `torch` at startup.
 
+`--runtime rocke` launches rocKE SDPA forward kernels directly through the
+rocKE Python packages: each hipDNN-shipped `Gfx950AttentionDense` variant
+that applies, plus rocKE's auto-dispatched kernel. It shares the same timed
+loop and result schema, and compares with the hipDNN rows of the same graphs.
+
 User documentation:
 
 - `README.md`: quick start.
@@ -83,6 +88,9 @@ src/dnn_benchmarking/
 │   ├── timing.py             # measure(): the one timed loop (staged / events)
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
+│   ├── rocke_sdpa.py         # rocKE runtime: SDPA problem, shipped-variant catalog, auto kernel
+│   ├── rocke_executor.py     # rocKE runtime: build and launch one rocKE kernel
+│   ├── rocke_build.py        # rocKE runtime: torch-free child that builds catalog variants
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
@@ -114,6 +122,13 @@ profiling -> `GraphResult` -> `Reporter` and `SuiteResult.write`.
 Data flow (PyTorch): the same, with `run_graph_pytorch`,
 `PyTorchCudaExecutor` and `PyTorchCudaBufferManager`. One
 `runtime = "pytorch"` row per graph. No engine discovery or plugins.
+
+Data flow (rocKE): the same, with `run_graph_rocke`, `RockeExecutor` and
+`PyTorchCudaBufferManager`. The catalog joins the installed hip-kernel-provider
+descriptors (shipped code-object hashes) with the authored descriptors in the
+checkout of the installed `rocke` package (rocKE specs), once per suite
+(`rocke_session`).
+One `runtime = "rocke"` row per applicable kernel.
 
 Rules that keep the design intact:
 

@@ -248,6 +248,13 @@ On Linux, rocKE and its descriptor-backed engines are on by default
 you turn an engine option off, setup still installs the plugin `.so`. Graphs
 that only that engine supports then report `no engines applicable`.
 
+On Linux, setup also installs the rocKE Python packages (`rocke`, `kernels`,
+`builders`, `dispatch`) into the venv as editable installs from
+`rocm-libraries/dnn-providers/hip-kernel-provider/rocke`. `--runtime rocke`
+needs them. They come from the same checkout as the plugins. The venv's
+`activate` script exports `DNN_BENCH_ROCKE_COMGR_LIB`, the comgr of rocKE's
+pack step, so the runtime builds the same code objects that hipDNN ships.
+
 ## Rebuild from zero
 
 ```bash
