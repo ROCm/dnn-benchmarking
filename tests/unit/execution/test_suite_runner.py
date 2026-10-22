@@ -215,6 +215,7 @@ def fake_torch(fake, monkeypatch):
             self.policy = policy
             fake.torch_options.append((pytorch_sdpa_backend, pytorch_rocm_fa_library))
             self.device = "cuda:3"  # not the buffer manager's cuda:0 default
+            self.notes = []
 
         def prepare(self):
             if fake.torch_error:
@@ -257,8 +258,16 @@ def fake_torch(fake, monkeypatch):
             return REF.copy() if fake.torch_outputs_written else np.zeros_like(REF)
 
     class CpuReference:
+        estimated_bytes = 0
+
+        def estimate_host_bytes(self, graph_json):
+            return self.estimated_bytes
+
         def compute_reference(self, graph_json, input_data):
+            fake.events.append("cpu_reference")
             return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+
+    fake.cpu_reference = CpuReference()
 
     monkeypatch.setattr(pytorch_executor, "PyTorchCudaExecutor", TorchExecutor)
     monkeypatch.setattr(
@@ -267,7 +276,7 @@ def fake_torch(fake, monkeypatch):
     monkeypatch.setattr(
         suite_runner,
         "_reference_provider",
-        lambda config, graph_json: (CpuReference(), None),
+        lambda config, graph_json: (fake.cpu_reference, None),
     )
     return fake
 
@@ -719,6 +728,9 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
     fake_torch, monkeypatch
 ):
     class FailingReference:
+        def estimate_host_bytes(self, graph_json):
+            return 0
+
         def compute_reference(self, graph_json, input_data):
             raise RuntimeError("cpu reference exploded")
 
@@ -738,6 +750,120 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
         (1, "failed", "cpu reference exploded"),
         (2, "failed", "cpu reference exploded"),
     ]
+
+
+def test_cpu_reference_too_large_for_host_memory_leaves_rows_unchecked(
+    fake_torch, monkeypatch
+):
+    """A CPU reference that would exhaust host memory is not run, and its
+    absence is not a validation failure."""
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = 9 << 30  # over 80% of 10 GiB
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert "cpu_reference" not in fake_torch.events
+    assert [e.verdict for e in engines] == ["unchecked", "unchecked"]
+    assert all("host memory" in e.ootb.correctness.error_message for e in engines)
+
+
+def test_cpu_reference_that_fits_in_host_memory_runs(fake_torch, monkeypatch):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = 7 << 30
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize("unknown", ["estimate", "available_memory"])
+def test_cpu_reference_runs_when_host_memory_cannot_be_judged(
+    fake_torch, monkeypatch, unknown
+):
+    """Without an estimate or a memory reading the reference runs as before."""
+    import psutil
+
+    def virtual_memory():
+        if unknown == "available_memory":
+            raise RuntimeError("no /proc/meminfo")
+        return SimpleNamespace(available=10 << 30)
+
+    monkeypatch.setattr(psutil, "virtual_memory", virtual_memory)
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = (
+        None if unknown == "estimate" else 9 << 30
+    )
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+
+
+def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
+    torch = pytest.importorskip("torch")
+    base = torch.arange(12, dtype=torch.float32)
+    view = base[4:8]
+
+    kept = suite_runner._owned(view)
+
+    assert torch.equal(kept, torch.tensor([4.0, 5.0, 6.0, 7.0]))
+    assert kept.untyped_storage().nbytes() == 4 * kept.element_size()
+    assert suite_runner._owned(base) is base
+
+
+@pytest.mark.parametrize("keep_device", [True, False])
+def test_pytorch_reference_outputs_keep_a_gpu_output_on_the_device(keep_device):
+    torch = pytest.importorskip("torch")
+    values = torch.arange(4, dtype=torch.float32)
+    host_reads = []
+
+    class GpuTensor:
+        """A CUDA output on a CPU-only torch: detach() gives its values."""
+
+        is_cuda = True
+
+        def detach(self):
+            return values
+
+    class Buffers:
+        def get_tensors(self):
+            return {2: GpuTensor()}
+
+        def get_output_tensors(self):
+            return [_tensor(2, is_output=True)]
+
+        def get_output_data(self, uid):
+            host_reads.append(uid)
+            return REF.copy()
+
+    (output,) = suite_runner._pytorch_reference_outputs_from_buffer(
+        Buffers(), keep_device=keep_device
+    ).values()
+
+    if keep_device:
+        assert output.data is None
+        assert torch.equal(output.device_data, values)
+        assert host_reads == []
+    else:
+        assert output.device_data is None
+        np.testing.assert_array_equal(output.data, REF)
+        assert host_reads == [2]
+    np.testing.assert_array_equal(output.host_data(), REF)
 
 
 def test_hipdnn_buffers_use_torch_storage_only_with_a_device_reference():
@@ -938,6 +1064,35 @@ def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
     assert {r.ootb.timing.mode for r in graph.results} == {"events"}
     assert all("stall gate failed" in " ".join(r.warnings) for r in graph.results)
     assert "remeasuring every row of this graph without stalling" in progress
+
+
+def test_stall_rerun_releases_the_first_attempt():
+    """The rerun must not keep the failed attempt's inputs, references and
+    buffers alive: on large graphs that doubles host and device memory."""
+    import gc
+    import weakref
+
+    class Inputs:
+        pass
+
+    first_attempt = []
+    alive_during_rerun = []
+
+    def run(config):
+        if not first_attempt:
+            inputs = Inputs()  # a local of the failing frame, like ctx
+            first_attempt.append(weakref.ref(inputs))
+            raise StallFallbackError("stall watchdog invalidated the measurement")
+        gc.collect()
+        alive_during_rerun.append(first_attempt[0]() is not None)
+        return "rerun"
+
+    result = suite_runner._with_stall_fallback(
+        run, SuiteConfig(), Reporter(io.StringIO())
+    )
+
+    assert result == "rerun"
+    assert alive_during_rerun == [False]
 
 
 def test_pytorch_buffers_share_the_executor_device(fake_torch):

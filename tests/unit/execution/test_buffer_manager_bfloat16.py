@@ -18,8 +18,8 @@ from dnn_benchmarking.common.exceptions import ExecutionError
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
     _decode,
-    _decode_storage_bytes,
-    _encode_to_storage_bytes,
+    _decode_storage,
+    _encode_to_storage,
     _f32_to_bf16,
     generate_input_data,
 )
@@ -155,7 +155,7 @@ class TestStridedStorage:
             dtype=np.float32,
         )
 
-        raw = _encode_to_storage_bytes(data, tensor)
+        raw = _encode_to_storage(data, tensor).tobytes()
 
         storage = np.frombuffer(raw, dtype=np.uint16)
         words = _f32_to_bf16(data)
@@ -164,7 +164,7 @@ class TestStridedStorage:
         assert storage[3] == 0
         np.testing.assert_array_equal(storage[4:7], words[1])
         np.testing.assert_array_equal(
-            _decode_storage_bytes(raw, tensor), _decode(words, BF16)
+            _decode_storage(raw, tensor), _decode(words, BF16)
         )
 
     def test_bfloat16_get_output_data_decodes_device_bytes(self) -> None:
@@ -198,9 +198,7 @@ class TestLoadInputData:
 
         for t in tensors:
             raw = buffers[t.uid].copy_from_host.call_args[0][0]
-            np.testing.assert_array_equal(
-                _decode_storage_bytes(raw, t), input_data[t.uid]
-            )
+            np.testing.assert_array_equal(_decode_storage(raw, t), input_data[t.uid])
 
     def test_pass_by_value_scalar_has_no_device_buffer(self) -> None:
         scalar = _tensor(23, "double", dims=(1,), strides=(1,), value=1e-5)
@@ -223,6 +221,30 @@ class TestLoadInputData:
 
         with pytest.raises(ExecutionError, match="UID 5"):
             buffer_manager.load_input_data({})
+
+
+class TestBlockedConversion:
+    """Conversions run in blocks; block boundaries must not change any value."""
+
+    @pytest.mark.parametrize("data_type", ["bfloat16", "fp8_e4m3", "half", "float"])
+    def test_small_blocks_match_one_block(self, monkeypatch, data_type) -> None:
+        from dnn_benchmarking.common import blocks
+
+        # Padded strides: rows of 5 in 6 slots, so blocks cross the gaps.
+        tensor = _tensor(1, data_type, dims=(3, 4, 5), strides=(24, 6, 1))
+
+        def run():
+            data = generate_input_data([tensor], seed=7)[tensor.uid]
+            storage = _encode_to_storage(data, tensor)
+            return data, storage, _decode_storage(storage.tobytes(), tensor)
+
+        whole = run()
+        monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 12)  # two rows per block
+        blocked = run()
+
+        for expected, actual in zip(whole, blocked):
+            np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(blocked[2], blocked[0])
 
 
 class TestGenerateInputData:
@@ -283,6 +305,66 @@ class TestPyTorchHostNumpy:
         np.testing.assert_array_equal(
             output, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
         )
+
+    def test_bfloat16_tensor_of_several_blocks_is_copied_whole(
+        self, monkeypatch
+    ) -> None:
+        torch = pytest.importorskip("torch")
+        from dnn_benchmarking.common import blocks
+        from dnn_benchmarking.execution.pytorch_buffer_manager import host_numpy
+
+        monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 8)  # two rows per block
+        values = np.arange(1.0, 41.0, dtype=np.float32).reshape(10, 4)
+
+        output = host_numpy(torch.from_numpy(values).to(torch.bfloat16))
+
+        assert output.dtype == np.float32
+        np.testing.assert_array_equal(output, values)
+
+
+class TestPyTorchLoadInputData:
+    """PyTorchCudaBufferManager on a CPU device: inputs reach the tensors."""
+
+    @staticmethod
+    def _load(monkeypatch, tensors, input_data):
+        pytest.importorskip("torch")
+        from dnn_benchmarking.common import blocks
+        from dnn_benchmarking.execution.pytorch_buffer_manager import (
+            PyTorchCudaBufferManager,
+        )
+
+        monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 8)  # two rows per block
+        manager = PyTorchCudaBufferManager(tensors, device="cpu")
+        manager.allocate_all()
+        for tensor in manager.get_tensors().values():
+            tensor.fill_(-1)
+        manager.load_input_data(input_data)
+        return manager.get_tensors()
+
+    @pytest.mark.parametrize("data_type", ["float", "bfloat16"])
+    def test_every_block_of_a_multi_block_input_is_uploaded(
+        self, monkeypatch, data_type
+    ) -> None:
+        tensor = _tensor(1, data_type, dims=(10, 4))
+        values = np.arange(1.0, 41.0, dtype=np.float32).reshape(10, 4)
+
+        loaded = self._load(monkeypatch, [tensor], {1: values})
+
+        np.testing.assert_array_equal(loaded[1].float().numpy(), values)
+
+    def test_input_of_another_shape_is_broadcast_into_the_tensor(
+        self, monkeypatch
+    ) -> None:
+        row = _tensor(1, dims=(10, 4))
+        scalar = _tensor(2, dims=(1,), strides=(1,), value=2.0)
+        values = np.arange(1.0, 5.0, dtype=np.float32)
+
+        loaded = self._load(
+            monkeypatch, [row, scalar], {1: values, 2: np.asarray(5.0, np.float32)}
+        )
+
+        np.testing.assert_array_equal(loaded[1].numpy(), np.tile(values, (10, 1)))
+        assert loaded[2].tolist() == [5.0]
 
 
 class TestPagedInputGeneration:

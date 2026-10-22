@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from ..common import torch_support
+from ..common.blocks import iter_blocks
 from ..graph.tensor_info import TensorInfo
 
 # Floating dtypes NumPy can hold; the rest (bfloat16, fp8) go to host as float32.
@@ -16,11 +17,20 @@ _NUMPY_FLOATS = (torch.float16, torch.float32, torch.float64)
 
 
 def host_numpy(tensor: torch.Tensor) -> np.ndarray:
-    """Copy a tensor to a dense host array in the validation representation."""
-    host = tensor.detach().cpu()
-    if host.dtype.is_floating_point and host.dtype not in _NUMPY_FLOATS:
-        host = host.float()
-    return host.contiguous().numpy()
+    """Copy a tensor to a dense host array in the validation representation.
+
+    bfloat16 and fp8 tensors become float32. They are copied and converted
+    one block at a time into the result, so no full-size host copy in the
+    source dtype exists next to it.
+    """
+    tensor = tensor.detach()
+    if not tensor.dtype.is_floating_point or tensor.dtype in _NUMPY_FLOATS:
+        return tensor.cpu().contiguous().numpy()
+    shape = tuple(tensor.shape)
+    host = torch.empty(shape, dtype=torch.float32)
+    for index in iter_blocks(shape):
+        host[index] = tensor[index].cpu()
+    return host.numpy()
 
 
 class PyTorchCudaBufferManager:
@@ -102,8 +112,17 @@ class PyTorchCudaBufferManager:
                 raise ValueError(f"Missing input data for tensor UID {tensor_info.uid}")
 
             tensor = self._tensors.get(tensor_info.uid)
-            if tensor is not None:
-                tensor.copy_(torch.from_numpy(np.asarray(data)))
+            if tensor is None:
+                continue
+            source = torch.from_numpy(np.asarray(data))
+            if tuple(source.shape) != tuple(tensor.shape):
+                tensor.copy_(source)  # broadcast copy
+                continue
+            # A host-to-device copy_ that changes the dtype (float32 -> bfloat16
+            # or fp8) converts on the host first. Copying in blocks keeps that
+            # temporary at block size instead of the full tensor.
+            for index in iter_blocks(tuple(source.shape)):
+                tensor[index].copy_(source[index])
 
     def zero_outputs(self) -> None:
         """Zero output tensor buffers."""

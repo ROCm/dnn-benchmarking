@@ -11,7 +11,7 @@ import pytest
 from dnn_benchmarking.common.exceptions import ExecutionError
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
-    _encode_to_storage_bytes,
+    _encode_to_storage,
 )
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 
@@ -40,7 +40,7 @@ class TestTorchBackend:
         x_data = np.arange(6, dtype=np.float32).reshape(2, 3)
         bm.load_input_data({x.uid: x_data})
         out = np.array([[1.0, -2.5, 3.25], [0.5, 4.0, -6.0]], dtype=np.float32)
-        bm._write_bytes(bm._buffers[y.uid], _encode_to_storage_bytes(out, y))
+        bm._write_storage(bm._buffers[y.uid], _encode_to_storage(out, y))
 
         x_view = bm.get_output_tensor(x.uid)
         y_view = bm.get_output_tensor(y.uid)

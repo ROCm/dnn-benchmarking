@@ -52,7 +52,7 @@ the same output format.
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
 | `--hipdnn-cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
-| `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. |
+| `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
 When `--plugin-path` is not given, the tool uses
@@ -88,6 +88,15 @@ two, so it compares log2 values (the code distance) with (0, 1): at most one
 code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
 log2 values of e8m0 outputs. The source is `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
+
+The reference comes from the timed PyTorch `reference` row on the GPU. If
+that row cannot run (for example, no GPU or a GPU out-of-memory error), and
+no strict `--pytorch-sdpa-backend` is set, the tool computes the reference on
+the CPU. Before it does, it estimates the host memory of the CPU reference.
+If the estimate is more than 80 % of the available host memory, the tool
+does not validate the graph. It prints a warning, and the engine rows of the
+graph get the verdict `unchecked` with the reason in `correctness.message`.
+These rows do not fail validation (no exit code 3).
 
 ### Comparison
 
@@ -180,21 +189,14 @@ dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch \
 can use a different Flash implementation when the preferred one does not
 support an input.
 
-The forward SDPA reference reads a graph's causal diagonal the way hipDNN
-resolves it. `causal_mask: true` is top-left and overrides both
-`diagonal_alignment` and any bounds written beside it; bottom-right is
-`causal_mask_bottom_right: true`, or `right_bound: 0` with
-`diagonal_alignment: BOTTOM_RIGHT`. Setting both booleans is an error, as it
-is in hipDNN. A bottom-right diagonal is applied as an explicit additive
-mask, which the flash backend cannot take, so it is only built when Sq
-differs from Skv: with Sq equal to Skv the two diagonals coincide and the
-boolean `is_causal` path (and `--pytorch-sdpa-backend flash`) still works.
-
-A bounded-left window needs `right_bound: 0` in this PyTorch reference. A
-bare `left_bound` is a valid right-open hipDNN band, which the reference
-rejects instead of silently adding a causal right edge. The hipDNN graph
-checker, `tools/check_deserialize.py`, may still accept it: it checks hipDNN
-deserialization, not whether this optional PyTorch reference can serve it.
+A bottom-right causal diagonal needs an explicit additive mask, which the
+flash backend cannot take, so the SDPA reference builds one only where
+PyTorch has no native form for the same bounds. With Sq equal to Skv the two
+diagonals coincide and the native `is_causal` path still runs; with Sq equal
+to 1 (decode) every key is visible. With Sq greater than Skv the diagonal
+starts above the first query row, which leaves the first queries no key at
+all, so the reference declines the graph instead of returning the NaN a
+softmax over an all `-inf` row produces.
 
 ### PyTorch kernel selection
 

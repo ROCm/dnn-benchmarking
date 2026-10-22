@@ -10,7 +10,10 @@ Every row is timed by ``timing.measure`` (through the executors) and, with
 """
 
 import copy
+import gc
 import json
+import re
+import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +36,7 @@ from ..reporting.suite_results import (
     graph_id_for,
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
-from .correctness import check_correctness, mismatch
+from .correctness import check_correctness, mismatch, unchecked
 from .oracle import (
     build_tuned_plan,
     run_pytorch_tuned,
@@ -72,6 +75,8 @@ class _GraphContext:
     io_bytes: Optional[int] = None
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
     reference_error: Optional[str] = None
+    # Set when validation was skipped on purpose (rows stay unchecked).
+    validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
     graph_id: str = ""  # hipDNN runs only
 
@@ -238,28 +243,39 @@ def _pytorch_reference_outputs_from_buffer(
 ) -> Dict[int, ReferenceOutput]:
     """Collect reference outputs from a PyTorch buffer manager.
 
-    ``data`` is always a host copy (one per output per graph); the host
-    fallback comparison needs it. With ``keep_device``, a device clone is
-    also kept so each engine can compare on the GPU without a host copy of
-    its own output.
+    With ``keep_device``, a GPU output stays on the device only: each engine
+    compares on the GPU, and the rare host fallback copies it to the host for
+    one comparison (``ReferenceOutput.host_data``). Otherwise ``data`` is a
+    host copy.
     """
     outputs: Dict[int, ReferenceOutput] = {}
     tensors = buffer_manager.get_tensors()
     for tensor_info in buffer_manager.get_output_tensors():
-        data = buffer_manager.get_output_data(tensor_info.uid)
-        if data is not None:
-            tensor = tensors.get(tensor_info.uid)
-            outputs[tensor_info.uid] = ReferenceOutput(
-                data=data,
-                tensor_uid=tensor_info.uid,
-                # Clone: the buffer manager frees its tensors on exit.
-                device_data=(
-                    tensor.detach().clone()
-                    if keep_device and tensor is not None and tensor.is_cuda
-                    else None
-                ),
+        uid = tensor_info.uid
+        tensor = tensors.get(uid)
+        if tensor is None:
+            continue
+        if keep_device and tensor.is_cuda:
+            outputs[uid] = ReferenceOutput(
+                data=None, tensor_uid=uid, device_data=_owned(tensor.detach())
+            )
+        else:
+            outputs[uid] = ReferenceOutput(
+                data=buffer_manager.get_output_data(uid), tensor_uid=uid
             )
     return outputs
+
+
+def _owned(tensor: Any) -> Any:
+    """``tensor`` itself, or a compact copy when it is a view of a larger storage.
+
+    The buffer manager only drops its references on exit, so a kept tensor
+    stays valid without a copy. A view would keep its whole base allocation
+    alive, which can be larger than a copy of the view.
+    """
+    if tensor.untyped_storage().nbytes() > tensor.numel() * tensor.element_size():
+        return tensor.clone()
+    return tensor
 
 
 def _graph_context(
@@ -304,6 +320,75 @@ def _torch_version() -> str:
 def _run_pytorch_row(
     ctx: _GraphContext, role: Literal["engine", "reference"]
 ) -> _TimedPytorchRow:
+    """Time the graph through PyTorch as one row (``_time_pytorch_row``).
+
+    Then return PyTorch's cached VRAM to the device. The buffer manager
+    empties the cache on exit, but the row's locals (and, after a failure,
+    the exception's frames) still hold the executor and its intermediates at
+    that point. They reach the cache only once the row returns. Without this
+    release, hipDNN's own allocations (``hipMalloc``) for the same graph can
+    fail although the device has room.
+    """
+    try:
+        return _time_pytorch_row(ctx, role)
+    finally:
+        _release_torch_cache()
+
+
+def _release_torch_cache() -> None:
+    """Free the tensors no longer referenced, then return PyTorch's cached VRAM.
+
+    ``gc.collect()`` frees tensors held only by reference cycles, which
+    ``empty_cache()`` alone cannot release.
+    """
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_initialized():
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+_OUT_OF_MEMORY = re.compile(r"out ?of ?memory", re.IGNORECASE)
+
+
+def _gpu_memory_at_row_start() -> Optional[str]:
+    """Device memory as a row starts, reported if the row runs out of memory.
+
+    Read only when torch has already initialized the GPU: initializing it
+    here would itself take VRAM in a run that has no PyTorch rows. The
+    device-free figure counts every process on the GPU; the PyTorch cache
+    figure counts only this process.
+    """
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_initialized():
+            return None
+        free, total = torch.cuda.mem_get_info()
+        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    except Exception:
+        return None
+    gib = float(1 << 30)
+    return (
+        f"at row start the GPU had {free / gib:.1f} of {total / gib:.1f} GiB free "
+        f"(all processes) and this process's PyTorch cache held "
+        f"{cached / gib:.1f} GiB unused"
+    )
+
+
+def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
+    """``Type: message``, plus the row-start memory for out-of-memory errors."""
+    message = f"{type(error).__name__}: {error}"
+    if memory_at_start is not None and _OUT_OF_MEMORY.search(message):
+        message = f"{message} [{memory_at_start}]"
+    return message
+
+
+def _time_pytorch_row(
+    ctx: _GraphContext, role: Literal["engine", "reference"]
+) -> _TimedPytorchRow:
     """Time the graph through PyTorch as one row.
 
     ``role="reference"`` additionally extracts reference outputs for the
@@ -328,6 +413,7 @@ def _run_pytorch_row(
     # reference output pass runs. Whichever one raises is what the skip reason
     # has to name.
     stage = "timing"
+    memory_at_start = _gpu_memory_at_row_start()
     try:
         from . import pytorch_ops
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
@@ -347,6 +433,7 @@ def _run_pytorch_row(
             bm.zero_outputs()
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
+            row.warnings = (row.warnings or []) + executor.notes
             if role == "reference":
                 stage = "reference"
                 bm.zero_outputs()
@@ -384,7 +471,9 @@ def _run_pytorch_row(
     except Exception as e:
         fatal = role == "engine" or strict
         return _TimedPytorchRow(
-            result=_failed_row(_error_or_skip(fatal), row, f"{type(e).__name__}: {e}"),
+            result=_failed_row(
+                _error_or_skip(fatal), row, _failure_message(e, memory_at_start)
+            ),
             reference_pass_failed=stage == "reference",
         )
     return _TimedPytorchRow(result=row, outputs=outputs)
@@ -409,6 +498,7 @@ def run_single_provider_engine(
         engine_version=engine_version,
         plugin_path=plugin,
     )
+    memory_at_start = _gpu_memory_at_row_start()
     try:
         if tuned_in_process(ctx.graph_id, engine_id):
             # Typically the stall-fallback rerun of a graph whose first
@@ -458,6 +548,8 @@ def run_single_provider_engine(
                     config.validation.provider.value,
                     config,
                 )
+            elif ctx.validation_skip_reason is not None:
+                row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
             elif config.validation.enabled:
                 # Validation was requested but no reference is usable: keep
                 # --validate a hard gate.
@@ -487,7 +579,9 @@ def run_single_provider_engine(
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
         return _failed_row(
-            ProviderEngineResult.error_row, row, f"{type(e).__name__}: {e}"
+            ProviderEngineResult.error_row,
+            row,
+            _failure_message(e, memory_at_start),
         )
 
     # Profiling re-runs the workload after the timed pass, so profiler
@@ -557,7 +651,9 @@ def _prepare_references(
 
     Sets ``ctx.reference_outputs`` or ``ctx.reference_error``. A strict
     PyTorch SDPA selection never falls back to the CPU reference after the
-    timed native path fails.
+    timed native path fails. The CPU reference is skipped when its estimated
+    host memory does not fit (``ctx.validation_skip_reason``): the engine rows
+    are then unchecked, not failed.
     """
     config = ctx.config
     provider, ctx.reference_error = _reference_provider(config, ctx.graph_json)
@@ -586,27 +682,64 @@ def _prepare_references(
             )
         )
     else:
-        with Timer() as cpu_timer:
-            cpu_outputs, cpu_error = _compute_reference_outputs_once(
-                provider, ctx.graph_json, ctx.input_data, config
-            )
-        ctx.reference_outputs, ctx.reference_error = cpu_outputs, cpu_error
-        # The timed row produced no outputs: say which of its two steps
-        # failed, that engines are still graded, and what the CPU fallback
-        # cost, since no row times it.
-        if row.status == "skipped" and ctx.reference_outputs is not None:
-            failed_step = (
-                "Reference output pass failed"
-                if timed.reference_pass_failed
-                else "Timing skipped"
-            )
-            row.skip_reason = (
-                f"{failed_step} ({row.skip_reason}). "
-                "Engine outputs are still validated against reference "
-                "outputs computed on the CPU, which took "
-                f"{cpu_timer.elapsed_ms / 1000:.1f} s."
-            )
+        ctx.validation_skip_reason = _host_memory_problem(provider, ctx.graph_json)
+        if ctx.validation_skip_reason is not None:
+            ctx.reference_error = ctx.validation_skip_reason
+            warn_once("validation", f"{ctx.graph_name}: {ctx.validation_skip_reason}")
+        else:
+            with Timer() as cpu_timer:
+                cpu_outputs, cpu_error = _compute_reference_outputs_once(
+                    provider, ctx.graph_json, ctx.input_data, config
+                )
+            ctx.reference_outputs, ctx.reference_error = cpu_outputs, cpu_error
+            # The timed row produced no outputs: say which of its two steps
+            # failed, that engines are still graded, and what the CPU fallback
+            # cost, since no row times it.
+            if row.status == "skipped" and ctx.reference_outputs is not None:
+                failed_step = (
+                    "Reference output pass failed"
+                    if timed.reference_pass_failed
+                    else "Timing skipped"
+                )
+                row.skip_reason = (
+                    f"{failed_step} ({row.skip_reason}). "
+                    "Engine outputs are still validated against reference "
+                    "outputs computed on the CPU, which took "
+                    f"{cpu_timer.elapsed_ms / 1000:.1f} s."
+                )
     return row
+
+
+#: Share of the available host memory the CPU reference may use; the rest is
+#: left for the engine rows of the same graph and for the estimate's error.
+_REFERENCE_HOST_FRACTION = 0.8
+
+
+def _host_memory_problem(
+    provider: ReferenceProvider, graph_json: Dict[str, Any]
+) -> Optional[str]:
+    """Why the CPU reference would not fit in host memory, or None.
+
+    Without an estimate or a reading of the available memory, the reference
+    runs as before.
+    """
+    needed = provider.estimate_host_bytes(graph_json)
+    if needed is None:
+        return None
+    try:
+        import psutil
+
+        available = psutil.virtual_memory().available
+    except Exception as e:
+        warn_once("validation", f"host memory reading failed: {e}")
+        return None
+    if needed <= available * _REFERENCE_HOST_FRACTION:
+        return None
+    gib = float(1 << 30)
+    return (
+        f"validation skipped: the CPU reference needs about {needed / gib:.1f} GiB "
+        f"of host memory and {available / gib:.1f} GiB is available"
+    )
 
 
 def _with_stall_fallback(
@@ -624,10 +757,14 @@ def _with_stall_fallback(
     try:
         return run(config)
     except StallFallbackError as e:
-        reporter.warning(f"{e}; remeasuring every row of this graph without stalling")
-        unstalled = copy.copy(config)
-        unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
-        return run(unstalled)
+        reason = str(e)
+    # Rerun outside the except block: the caught exception's traceback holds
+    # every frame of the first attempt, with its inputs, references, device
+    # buffers and workspaces, until the block exits.
+    reporter.warning(f"{reason}; remeasuring every row of this graph without stalling")
+    unstalled = copy.copy(config)
+    unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
+    return run(unstalled)
 
 
 def run_graph_all_providers(
@@ -687,10 +824,12 @@ def _run_graph_all_providers(
         engine_ids = list(config.engine_filter)
     else:
         try:
-            discovery = Executor(graph_json_str, config.timing_policy)
             # SuiteConfig requires --engine with several plugin paths, so the
-            # shared handle exists whenever discovery runs.
-            engine_ids = discovery.discover_engines(handle)
+            # shared handle exists whenever discovery runs. The discovery
+            # graph is a temporary: it is not kept alive for the engine rows.
+            engine_ids = Executor(
+                graph_json_str, config.timing_policy
+            ).discover_engines(handle)
         except UnsupportedGraphError as e:
             engine_ids = []
             graph.message = str(e)
