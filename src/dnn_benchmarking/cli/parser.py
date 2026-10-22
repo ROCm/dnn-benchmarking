@@ -299,7 +299,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         _values(RuntimeName),
         _default(SuiteConfig, "runtime"),
         "hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
-        "rocke launches rocKE SDPA kernels directly",
+        "rocke launches rocKE kernels directly (SDPA forward today)",
     ),
     CliOption(
         flags=("--engine", "-e"),

@@ -18,43 +18,7 @@ from dnn_benchmarking.execution.rocke_sdpa import (
     sdpa_problem,
 )
 from dnn_benchmarking.graph.loader import GraphLoader
-
-
-def _bshd(uid, name, b, h, s, d, dtype):
-    return {
-        "uid": uid,
-        "name": name,
-        "dims": [b, h, s, d],
-        "strides": [s * h * d, d, h * d, 1],
-        "data_type": dtype,
-        "virtual": False,
-    }
-
-
-def _graph(b=1, hq=32, hkv=8, s=2048, d=128, dtype="half", **attributes):
-    """An SDPA forward graph laid out like the rocKE perf-oracle workloads."""
-    attrs = {"causal_mask": True, "attn_scale_value": None}
-    attrs.update(attributes)
-    return {
-        "name": "sdpa",
-        "io_data_type": dtype,
-        "compute_data_type": "float",
-        "tensors": [
-            _bshd(1, "query", b, hq, s, d, dtype),
-            _bshd(2, "key", b, hkv, s, d, dtype),
-            _bshd(3, "value", b, hkv, s, d, dtype),
-            _bshd(4, "output", b, hq, s, d, dtype),
-        ],
-        "nodes": [
-            {
-                "name": "sdpa_node",
-                "type": "SdpaAttributes",
-                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
-                "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": None},
-                "attributes": attrs,
-            }
-        ],
-    }
+from tests.rocke_graphs import bshd_tensor, sdpa_graph
 
 
 def _problem(graph):
@@ -62,16 +26,16 @@ def _problem(graph):
 
 
 def test_problem_reads_shape_and_hipdnn_default_scale() -> None:
-    p = _problem(_graph(b=4, hq=64, hkv=8, s=1024, d=64, dtype="bfloat16"))
+    p = _problem(sdpa_graph(b=4, hq=64, hkv=8, s=1024, d=64, dtype="bfloat16"))
     assert (p.dtype, p.batch, p.num_query_heads, p.num_kv_heads) == ("bf16", 4, 64, 8)
     assert (p.seqlen_q, p.seqlen_kv, p.head_size, p.causal) == (1024, 1024, 64, True)
     # An absent attn_scale_value is 1.0 in hipDNN, not 1/sqrt(d).
     assert p.scale == 1.0
-    assert _problem(_graph(attn_scale_value=0.125)).scale == 0.125
+    assert _problem(sdpa_graph(attn_scale_value=0.125)).scale == 0.125
 
 
 def test_size_one_dimension_strides_do_not_matter() -> None:
-    graph = _graph(hq=1, hkv=1)
+    graph = sdpa_graph(hq=1, hkv=1)
     for tensor in graph["tensors"]:
         tensor["strides"][1] = 999
     assert _problem(graph).num_query_heads == 1
@@ -101,17 +65,19 @@ def test_size_one_dimension_strides_do_not_matter() -> None:
     ],
 )
 def test_unsupported_graphs_are_rejected(mutate) -> None:
-    graph = _graph()
+    graph = sdpa_graph()
     mutate(graph)
     with pytest.raises(UnsupportedGraphError):
         _problem(graph)
 
 
 def test_causal_needs_equal_sequence_lengths() -> None:
-    graph = _graph()
+    graph = sdpa_graph()
     for index in (0, 3):  # query and output: shorter seqlen_q
         tensor = graph["tensors"][index]
-        tensor.update(_bshd(tensor["uid"], tensor["name"], 1, 32, 1024, 128, "half"))
+        tensor.update(
+            bshd_tensor(tensor["uid"], tensor["name"], 1, 32, 1024, 128, "half")
+        )
     with pytest.raises(UnsupportedGraphError):
         _problem(graph)
     graph["nodes"][0]["attributes"]["causal_mask"] = False
@@ -189,15 +155,25 @@ def test_catalog_matches_problem_and_tile_divisibility(tmp_path) -> None:
     _write_descriptors(tmp_path, "gfx950", ukds)
     catalog = load_catalog(descriptor_files([tmp_path], "gfx950"))
 
-    found = catalog_kernels(catalog, _problem(_graph(b=2, s=2048)))
+    found = catalog_kernels(catalog, _problem(sdpa_graph(b=2, s=2048)))
     assert [k.name for k in found] == ["rocke:bm256_bn64", "rocke:bm128_bn32"]
     # The graph's shape replaces the descriptor's placeholder shape.
     assert {(k.spec["batch"], k.spec["seqlen_q"]) for k in found} == {(2, 2048)}
 
     # 1920 is a multiple of 128 but not of 256.
-    found = catalog_kernels(catalog, _problem(_graph(s=1920)))
+    found = catalog_kernels(catalog, _problem(sdpa_graph(s=1920)))
     assert [k.name for k in found] == ["rocke:bm128_bn32"]
 
-    graph = copy.deepcopy(_graph())
+    graph = copy.deepcopy(sdpa_graph())
     graph["nodes"][0]["attributes"]["causal_mask"] = False
     assert [k.name for k in catalog_kernels(catalog, _problem(graph))] == ["rocke:full"]
+
+
+def test_unknown_spec_field_is_not_reported_as_no_match(tmp_path) -> None:
+    """A descriptor from another rocKE version must fail loudly, not match nothing."""
+    pytest.importorskip("kernels.gfx950.attention_dense")
+    spec = dict(_spec(), knob_from_another_rocke=1)
+    _write_descriptors(tmp_path, "gfx950", [_packed("newer", spec)])
+    catalog = load_catalog(descriptor_files([tmp_path], "gfx950"))
+    with pytest.raises(TypeError):
+        catalog_kernels(catalog, _problem(sdpa_graph()))

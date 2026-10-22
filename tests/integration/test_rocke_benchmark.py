@@ -11,7 +11,7 @@ import pytest
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.graph.loader import GraphLoader
 from dnn_benchmarking.reporting.reporter import Reporter
-from tests.unit.execution.test_rocke_sdpa import _graph
+from tests.rocke_graphs import sdpa_graph
 
 pytestmark = pytest.mark.gpu
 
@@ -30,9 +30,10 @@ def rocke_gfx950(torch_gpu, plugin_paths):
 
 
 def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> None:
+    from dnn_benchmarking.execution.rocke_sdpa import descriptor_files
     from dnn_benchmarking.execution.suite_runner import rocke_session, run_graph_rocke
 
-    graph = _graph(b=1, hq=32, hkv=8, s=512, d=128)
+    graph = sdpa_graph(b=1, hq=32, hkv=8, s=512, d=128)
     infos = GraphLoader().extract_tensor_info(graph)
     config = SuiteConfig(
         runtime="rocke",
@@ -43,8 +44,10 @@ def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> No
     )
     reporter = Reporter(output=io.StringIO())
     session = rocke_session(config, reporter)
-    if not session.catalog.kernels:
+    if not descriptor_files([Path(p) for p in rocke_gfx950], "gfx950"):
         pytest.skip("the plugin build ships no rocKE descriptors")
+    # Descriptors present but no usable variant: provenance or parsing broke.
+    assert session.catalog.kernels, "rocKE descriptors exist but none parsed"
 
     result = run_graph_rocke(
         Path("rocke.json"), graph, infos, config, reporter, session

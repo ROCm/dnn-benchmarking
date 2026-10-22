@@ -307,8 +307,8 @@ class SuiteConfig:
             probes and no extra runs.
         runtime: Runtime that executes the graph (``hipdnn`` runs discovered
             engine plugins, ``pytorch`` runs the graph through the PyTorch executor as a single
-            engine row per graph, ``rocke`` launches rocKE SDPA kernels directly,
-            one row per kernel).
+            engine row per graph, ``rocke`` launches rocKE kernels directly
+            (SDPA forward today), one row per kernel).
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
