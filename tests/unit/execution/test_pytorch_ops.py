@@ -438,6 +438,111 @@ class TestPyTorchOpsNewHandlers:
             torch.nn.grad.conv2d_weight(x, (6, 2, 3, 3), dy, groups=2),
         )
 
+    # x dims, w dims, pre_padding, post_padding, stride, channels-last tensors.
+    _CONV_BACKWARD_CASES = [
+        pytest.param(
+            (2, 4, 7, 6), (3, 4, 3, 3), [1, 1], [1, 1], [1, 1], False, id="sym"
+        ),
+        pytest.param(
+            (2, 4, 7, 6), (3, 4, 3, 3), [1, 1], [1, 1], [2, 2], True, id="sym-nhwc"
+        ),
+        pytest.param(
+            (2, 4, 7, 6), (3, 4, 3, 3), [0, 1], [1, 2], [2, 2], False, id="asym"
+        ),
+        pytest.param(
+            (2, 4, 7, 6), (3, 4, 3, 2), [0, 1], [1, 0], [2, 1], True, id="asym-nhwc"
+        ),
+        pytest.param((2, 4, 9), (3, 4, 3), [2], [0], [2], False, id="asym-1d"),
+    ]
+
+    @staticmethod
+    def _autograd_conv_backward(x_shape, w_shape, pre, post, stride, channels_last):
+        """Return x, w, dy and the autograd dx, dw of conv(pad(x, pre, post), w)."""
+        torch.manual_seed(0)
+        x = torch.randn(x_shape, requires_grad=True)
+        w = torch.randn(w_shape, requires_grad=True)
+        pad = []
+        for before, after in reversed(list(zip(pre, post))):
+            pad.extend((before, after))
+        conv = {1: torch.nn.functional.conv1d, 2: torch.nn.functional.conv2d}
+        y = conv[len(pre)](torch.nn.functional.pad(x, pad), w, stride=stride)
+        dy = torch.randn_like(y)
+        y.backward(dy)
+        result = [x.detach(), w.detach(), dy, x.grad, w.grad]
+        if channels_last:
+            result = [t.contiguous(memory_format=torch.channels_last) for t in result]
+        return result
+
+    @staticmethod
+    def _conv_backward_graph(op_type, inputs, outputs, out, pre, post, stride):
+        """One-node graph whose output declares the dims and strides of ``out``."""
+        (out_uid,) = outputs.values()
+        return {
+            "tensors": [
+                {"uid": out_uid, "dims": list(out.shape), "strides": list(out.stride())}
+            ],
+            "nodes": [
+                {
+                    "type": op_type,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                    "parameters": {
+                        "conv_mode": "CROSS_CORRELATION",
+                        "pre_padding": pre,
+                        "post_padding": post,
+                        "stride": stride,
+                        "dilation": [1] * len(stride),
+                    },
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "x_shape, w_shape, pre, post, stride, channels_last", _CONV_BACKWARD_CASES
+    )
+    def test_conv_dgrad_matches_autograd(
+        self, x_shape, w_shape, pre, post, stride, channels_last
+    ) -> None:
+        _, w, dy, dx, _ = self._autograd_conv_backward(
+            x_shape, w_shape, pre, post, stride, channels_last
+        )
+        graph = self._conv_backward_graph(
+            "ConvolutionBwdAttributes",
+            {"dy_tensor_uid": 1, "w_tensor_uid": 2},
+            {"dx_tensor_uid": 3},
+            dx,
+            pre,
+            post,
+            stride,
+        )
+        tensors = {1: dy, 2: w}
+        pytorch_ops.execute_graph(graph, tensors)
+
+        torch.testing.assert_close(tensors[3], dx)
+
+    @pytest.mark.parametrize(
+        "x_shape, w_shape, pre, post, stride, channels_last", _CONV_BACKWARD_CASES
+    )
+    def test_conv_wgrad_matches_autograd(
+        self, x_shape, w_shape, pre, post, stride, channels_last
+    ) -> None:
+        x, _, dy, _, dw = self._autograd_conv_backward(
+            x_shape, w_shape, pre, post, stride, channels_last
+        )
+        graph = self._conv_backward_graph(
+            "ConvolutionWrwAttributes",
+            {"x_tensor_uid": 1, "dy_tensor_uid": 2},
+            {"dw_tensor_uid": 3},
+            dw,
+            pre,
+            post,
+            stride,
+        )
+        tensors = {1: x, 2: dy}
+        pytorch_ops.execute_graph(graph, tensors)
+
+        torch.testing.assert_close(tensors[3], dw)
+
     def test_batchnorm_backward_outputs_expected_reductions(self) -> None:
         graph_json = {
             "nodes": [
