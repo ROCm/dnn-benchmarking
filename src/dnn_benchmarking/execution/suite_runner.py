@@ -678,16 +678,26 @@ def _non_finite_reference(
 ) -> Optional[str]:
     """Why the reference outputs cannot validate an engine, or None.
 
-    A reference output with NaN or Inf has no correct finite value to compare
-    against. The input data then has no valid result for this graph (for
-    example an fp16 sum above the fp16 maximum), so a non-finite engine
-    output is no evidence of an engine bug.
+    A reference output with NaN or Inf gives no finite value to compare
+    against, so a mismatch is no evidence against the engine. One possible
+    cause is input data whose correct result is out of range, for example an
+    fp16 sum above the fp16 maximum (65504).
+
+    If the scan itself fails (for example a device out-of-memory error), the
+    references stay in use and the normal comparison decides the verdict.
     """
     for uid, ref in sorted((outputs or {}).items()):
-        if not ref.is_finite():
+        try:
+            finite = ref.is_finite()
+        except Exception as e:
+            warn_once(
+                "validation", f"finite check of reference output {uid} failed: {e}"
+            )
+            return None
+        if not finite:
             return (
                 f"reference output {uid} contains NaN or Inf values, "
-                "so no engine output can be validated for this input data"
+                "so this run cannot validate the engine outputs"
             )
     return None
 

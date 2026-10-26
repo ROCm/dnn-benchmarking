@@ -59,3 +59,19 @@ def test_reference_is_finite_checks_every_block(monkeypatch, bad) -> None:
     assert ReferenceOutput(data=data.copy(), tensor_uid=0).is_finite()
     data[-1, -1] = bad
     assert not ReferenceOutput(data=data, tensor_uid=0).is_finite()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_device_reference_is_finite_checks_every_block(monkeypatch, bad) -> None:
+    """The torch path (``device_data``) is the common one for PyTorch
+    references; a CPU tensor exercises the same code."""
+    torch = pytest.importorskip("torch")
+    from dnn_benchmarking.common import blocks
+    from dnn_benchmarking.validation import ReferenceOutput
+
+    monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 4)
+    values = torch.arange(12, dtype=torch.float16).reshape(3, 4)
+
+    assert ReferenceOutput(data=None, tensor_uid=0, device_data=values.clone()).is_finite()
+    values[-1, -1] = bad
+    assert not ReferenceOutput(data=None, tensor_uid=0, device_data=values).is_finite()

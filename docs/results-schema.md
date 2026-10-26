@@ -344,7 +344,7 @@ it.
 | `error` | `status` is `error`. |
 | `skipped` | `status` is `skipped`. |
 | `reference` | `role` is `reference` and the row ran. |
-| `failed` | Validation found a mismatch, or validation was requested but no usable reference exists. |
+| `failed` | Validation found a mismatch, or validation was requested but the reference could not be produced. |
 | `passed` | Validation ran and every output is within tolerance. |
 | `unchecked` | The row ran, but no validation result exists. This is not a pass. Validation that the tool skipped because of the host memory estimate, or because a reference output contains NaN or Inf, also gives `unchecked`. |
 
