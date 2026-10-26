@@ -444,9 +444,12 @@ The tool does not do these things yet:
   available with `--timing-block`.
 - Rotating input buffers. `--cache-mode cold` controls the cache state, but
   the rocKE runbook also advises rotating buffers for bandwidth work.
-- Signed input distribution. Floating-point inputs are uniform in [0, 1),
-  because BatchNorm variance inputs must not be negative. Signed data needs a
-  role for each tensor first.
+- Signed input distribution for all operations. Convolution operands (data,
+  filter and incoming gradient) are uniform in [-1, 1). All other
+  floating-point inputs are uniform in [0, 1), because BatchNorm variance
+  inputs must not be negative. A tensor that also feeds a non-convolution node
+  stays in [0, 1). Signed data for other operations needs a role for each
+  tensor first.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with

@@ -11,7 +11,7 @@ graph type, and are encoded to raw words only when written to device storage.
 
 import functools
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -251,6 +251,52 @@ def _paged_metadata(
     return 0, 0
 
 
+# Convolution operands that can take signed data: the data, filter and
+# incoming-gradient inputs of every convolution direction.
+_CONVOLUTION_OPERAND_KEYS = ("x_tensor_uid", "w_tensor_uid", "dy_tensor_uid")
+
+
+def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
+    """UIDs of inputs that get zero-mean U[-1, 1) data instead of U[0, 1).
+
+    Non-negative data makes every product in a convolution sum positive, so
+    the sum grows with the number of terms. A backward-weights sum over
+    N*Ho*Wo terms then passes the fp16 maximum (65504) at about 262,000
+    terms. Signed data lets the terms cancel.
+
+    Only convolution operands are signed. A tensor that also feeds a
+    non-convolution node keeps U[0, 1), because that node can need
+    non-negative values (for example a batch-norm variance).
+    """
+    if not graph_json:
+        return set()
+    convolution: Set[int] = set()
+    other: Set[int] = set()
+    for node in graph_json.get("nodes", []) or []:
+        inputs = node.get("inputs") or {}
+        if str(node.get("type", "")).startswith("Convolution"):
+            convolution.update(
+                int(inputs[key]) for key in _CONVOLUTION_OPERAND_KEYS
+                if inputs.get(key) is not None
+            )
+        else:
+            other.update(_input_tensor_uids(inputs))
+    return convolution - other
+
+
+def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:
+    """Tensor UIDs in a node's ``inputs`` map. Other keys in that map are
+    attributes (for example a pointwise ``operation``), and a ``*_tensor_uid``
+    key can hold one UID or a list of UIDs."""
+    uids: Set[int] = set()
+    for key, value in inputs.items():
+        if not key.endswith("_tensor_uid") or value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        uids.update(int(uid) for uid in values if uid is not None)
+    return uids
+
+
 def _generate_paged_input(
     tensor_info: TensorInfo,
     role: str,
@@ -293,16 +339,20 @@ def generate_input_data(
     by both hipDNN buffers and reference providers. Floating-point inputs are
     U[0, 1) (non-negative, so batch-norm variances stay valid), drawn as
     float32 and rounded to the graph type; bfloat16 and fp8 values are returned
-    as the exactly representable float32 values. Integer and boolean inputs
-    are zeros, except paged-SDPA roles.
+    as the exactly representable float32 values. Convolution operands are
+    U[-1, 1) instead (see :func:`_signed_input_uids`). Both come from the same
+    draw, so an unsigned tensor gets the same values with or without
+    ``graph_json``. Integer and boolean inputs are zeros, except paged-SDPA
+    roles.
 
-    ``graph_json`` only affects **paged** SDPA graphs: page tables and
-    sequence lengths have invariants random data cannot satisfy (see
-    :func:`_generate_paged_input`).
+    ``graph_json`` selects the signed convolution operands and the **paged**
+    SDPA roles: page tables and sequence lengths have invariants random data
+    cannot satisfy (see :func:`_generate_paged_input`).
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
+    signed_uids = _signed_input_uids(graph_json)
     page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
 
     for tensor_info in tensor_infos:
@@ -332,6 +382,8 @@ def generate_input_data(
             data = np.empty(tensor_info.dims, dtype=dtype.numpy)
             for index in iter_blocks(data.shape):
                 block = rng.random(data[index].shape, dtype=np.float32)
+                if tensor_info.uid in signed_uids:
+                    block = block * np.float32(2) - np.float32(1)
                 data[index] = _decode(_encode(block, dtype), dtype)
             input_data[tensor_info.uid] = data
 
