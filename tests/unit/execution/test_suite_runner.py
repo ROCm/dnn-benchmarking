@@ -675,6 +675,30 @@ def test_cpu_reference_too_large_for_host_memory_leaves_rows_unchecked(
     assert all("host memory" in e.ootb.correctness.error_message for e in engines)
 
 
+def test_non_finite_reference_leaves_rows_unchecked(fake_torch, monkeypatch):
+    """A reference with Inf has no correct value to compare against (for
+    example an fp16 sum above 65504). The engines are not blamed for it."""
+    poisoned = REF.copy()
+    poisoned.flat[-1] = np.inf
+    monkeypatch.setattr(
+        fake_torch.cpu_reference,
+        "compute_reference",
+        lambda graph_json, input_data: {
+            2: suite_runner.ReferenceOutput(data=poisoned, tensor_uid=2)
+        },
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+
+    graph, _ = _validate()
+
+    _, *engines = graph.results
+    assert [e.verdict for e in engines] == ["unchecked", "unchecked"]
+    assert all(
+        "reference output 2 contains NaN or Inf" in e.ootb.correctness.error_message
+        for e in engines
+    )
+
+
 def test_cpu_reference_that_fits_in_host_memory_runs(fake_torch, monkeypatch):
     import psutil
 

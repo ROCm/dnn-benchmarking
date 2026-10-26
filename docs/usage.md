@@ -89,6 +89,12 @@ does not validate the graph. It prints a warning, and the engine rows of the
 graph get the verdict `unchecked` with the reason in `correctness.message`.
 These rows do not fail validation (no exit code 3).
 
+The tool also does not validate a graph when a reference output contains NaN
+or Inf. Then the input data has no finite correct result for the graph (for
+example, an fp16 sum above the fp16 maximum of 65504). The tool prints a
+warning, and the engine rows get the verdict `unchecked` with the reason in
+`correctness.message`. These rows do not fail validation (no exit code 3).
+
 ### Comparison
 
 | Option | Default | Description |

@@ -45,3 +45,17 @@ def test_unset_input_dtype_falls_back_to_io_data_type() -> None:
     np.testing.assert_array_equal(out[2].data, [1.0, 0.0])
     with pytest.raises(UnsupportedGraphError, match="unset"):
         provider.compute_reference(_relu_graph(), {1: x})
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_reference_is_finite_checks_every_block(monkeypatch, bad) -> None:
+    """A non-finite value in a later block must count, not only the first."""
+    from dnn_benchmarking.common import blocks
+    from dnn_benchmarking.validation import ReferenceOutput
+
+    monkeypatch.setattr(blocks, "BLOCK_ELEMENTS", 4)
+    data = np.arange(12, dtype=np.float32).reshape(3, 4)
+
+    assert ReferenceOutput(data=data.copy(), tensor_uid=0).is_finite()
+    data[-1, -1] = bad
+    assert not ReferenceOutput(data=data, tensor_uid=0).is_finite()

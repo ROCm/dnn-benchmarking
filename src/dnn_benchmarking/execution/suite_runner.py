@@ -507,7 +507,9 @@ def run_single_provider_engine(
             variant_pack = bm.create_variant_pack()
             _measure_row(row, ctx, lambda: executor.benchmark(handle, variant_pack))
 
-            if ctx.reference_outputs is not None:
+            if ctx.validation_skip_reason is not None:
+                row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
+            elif ctx.reference_outputs is not None:
                 bm.zero_outputs()
                 executor.execute_once(handle, variant_pack)
                 row.ootb.correctness = check_correctness(
@@ -517,8 +519,6 @@ def run_single_provider_engine(
                     config.validation.provider.value,
                     config,
                 )
-            elif ctx.validation_skip_reason is not None:
-                row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
             elif config.validation.enabled:
                 # Validation was requested but no reference is usable: keep
                 # --validate a hard gate.
@@ -537,7 +537,10 @@ def run_single_provider_engine(
                     bm=bm,
                     variant_pack=variant_pack,
                     tensor_infos=ctx.tensor_infos,
-                    reference_outputs=ctx.reference_outputs,
+                    # As with the OOTB row: no comparison when validation is skipped.
+                    reference_outputs=(
+                        None if ctx.validation_skip_reason else ctx.reference_outputs
+                    ),
                 )
         # Release both workspaces before the profiling child allocates its own
         # VRAM; holding them roughly doubles peak VRAM on large graphs.
@@ -622,7 +625,10 @@ def _prepare_references(
     PyTorch SDPA selection never falls back to the CPU reference after the
     timed native path fails. The CPU reference is skipped when its estimated
     host memory does not fit (``ctx.validation_skip_reason``): the engine rows
-    are then unchecked, not failed.
+    are then unchecked, not failed. A reference output with NaN or Inf also
+    sets ``ctx.validation_skip_reason`` (see :func:`_non_finite_reference`).
+    ``ctx.reference_outputs`` stays set then, because it selects the device
+    of the timed buffers.
     """
     config = ctx.config
     provider, ctx.reference_error = _reference_provider(config, ctx.graph_json)
@@ -660,7 +666,30 @@ def _prepare_references(
                     provider, ctx.graph_json, ctx.input_data, config
                 )
             )
+    reason = _non_finite_reference(ctx.reference_outputs)
+    if reason is not None:
+        ctx.validation_skip_reason = reason
+        warn_once("validation", f"{ctx.graph_name}: {reason}")
     return row
+
+
+def _non_finite_reference(
+    outputs: Optional[Dict[int, ReferenceOutput]],
+) -> Optional[str]:
+    """Why the reference outputs cannot validate an engine, or None.
+
+    A reference output with NaN or Inf has no correct finite value to compare
+    against. The input data then has no valid result for this graph (for
+    example an fp16 sum above the fp16 maximum), so a non-finite engine
+    output is no evidence of an engine bug.
+    """
+    for uid, ref in sorted((outputs or {}).items()):
+        if not ref.is_finite():
+            return (
+                f"reference output {uid} contains NaN or Inf values, "
+                "so no engine output can be validated for this input data"
+            )
+    return None
 
 
 #: Share of the available host memory the CPU reference may use; the rest is

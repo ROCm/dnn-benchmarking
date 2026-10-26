@@ -45,6 +45,36 @@ class ReferenceOutput:
 
         return host_numpy(self.device_data)
 
+    def is_finite(self) -> bool:
+        """Return True when every value is finite (no NaN or Inf).
+
+        The device tensor is checked on its device, one block at a time, so
+        no host copy and no full-size temporary is made.
+        """
+        from ..common.blocks import iter_blocks
+
+        if self.device_data is not None:
+            import torch
+
+            values = self.device_data.detach()
+            # torch implements no isfinite for float8; upcast one block at a time.
+            upcast = values.is_floating_point() and values.element_size() == 1
+
+            def finite(block: Any) -> bool:
+                return bool(torch.isfinite(block.float() if upcast else block).all())
+
+        else:
+            import numpy as np
+
+            values = np.asarray(self.data)
+
+            def finite(block: Any) -> bool:
+                return bool(np.isfinite(block).all())
+
+        if values.ndim == 0:
+            return finite(values.reshape(1))
+        return all(finite(values[index]) for index in iter_blocks(tuple(values.shape)))
+
 
 class ReferenceProvider(ABC):
     """Abstract base for reference computation backends.
