@@ -3,7 +3,7 @@
 
 """Compare one engine's outputs against the cached reference outputs."""
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -45,6 +45,22 @@ TOLERANCES = {
 }
 
 
+class OutputSource(Protocol):
+    """The outputs of one run, as ``check_correctness`` reads them.
+
+    The buffer managers of the timed rows and the saved files of a tuned
+    child implement it.
+    """
+
+    def get_output_tensor(self, uid: int) -> Any:
+        """Output ``uid`` as a device tensor, or None to compare on the host."""
+        ...
+
+    def get_output_data(self, uid: int) -> Any:
+        """Output ``uid`` as a host array, or None when there is no output."""
+        ...
+
+
 def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     """The values compare() sees: log2 for e8m0 (see TOLERANCES), else ``data``."""
     if tensor_info.dtype.name != "fp8_e8m0":
@@ -84,7 +100,7 @@ def unchecked(config: SuiteConfig, message: str) -> CorrectnessResult:
 
 
 def _compare_output(
-    buffer_manager: Any,
+    outputs: OutputSource,
     tensor_info: TensorInfo,
     ref: ReferenceOutput,
     rtol: float,
@@ -92,7 +108,7 @@ def _compare_output(
 ) -> Optional[ComparisonResult]:
     """Compare on the GPU when both sides are device tensors, else on the host."""
     if ref.device_data is not None:
-        actual = buffer_manager.get_output_tensor(tensor_info.uid)
+        actual = outputs.get_output_tensor(tensor_info.uid)
         if actual is not None:
             import torch
 
@@ -105,7 +121,7 @@ def _compare_output(
                 )
             except torch.cuda.OutOfMemoryError:
                 pass  # Fall back to the host comparison.
-    actual = buffer_manager.get_output_data(tensor_info.uid)
+    actual = outputs.get_output_data(tensor_info.uid)
     if actual is None:
         return None
     return compare(
@@ -117,7 +133,7 @@ def _compare_output(
 
 
 def check_correctness(
-    buffer_manager: Any,
+    outputs: OutputSource,
     tensor_infos: List[TensorInfo],
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
@@ -142,7 +158,7 @@ def check_correctness(
                     f"produce output tensor UID {ti.uid}",
                 )
             rtol, atol = tolerance_for(config, ti)
-            result = _compare_output(buffer_manager, ti, ref, rtol, atol)
+            result = _compare_output(outputs, ti, ref, rtol, atol)
             if result is not None:
                 compared.append((ti.uid, rtol, atol, result))
     except (ValueError, RuntimeError, ExecutionError) as e:

@@ -14,16 +14,25 @@ import gc
 import json
 import re
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from ..common.exceptions import UnsupportedGraphError
-from ..config.benchmark_config import PyTorchSdpaBackendName, SuiteConfig
+from ..config.benchmark_config import (
+    PyTorchSdpaBackendName,
+    SuiteConfig,
+    TimingPolicy,
+)
 from ..execution.buffer_manager import BufferManager, generate_input_data
-from ..execution.executor import Executor
-from ..execution.timing import Measurement, StallFallbackError, Timer
+from ..execution.executor import Executor, set_plugin_path
+from ..execution.timing import (
+    Measurement,
+    StallFallbackError,
+    Timer,
+    retry_unstalled,
+)
 from ..graph.tensor_info import TensorInfo
 from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
@@ -37,7 +46,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import BENCHMARKING_KNOB, run_hipdnn_tuned, run_pytorch_tuned
+from .oracle import hipdnn_tuning_available, run_hipdnn_tuned, run_pytorch_tuned
 
 
 @dataclass
@@ -58,14 +67,6 @@ class _GraphContext:
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
-
-
-def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
-    """Set the process-wide hipDNN plugin search path for the next handle."""
-    if plugin_path is not None:
-        hipdnn.set_engine_plugin_paths(
-            [str(plugin_path)], hipdnn.PluginLoadingMode.ABSOLUTE
-        )
 
 
 def _engine_identity(handle: Any, engine_id: int) -> Tuple[str, str]:
@@ -473,7 +474,7 @@ def run_single_provider_engine(
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
         if config.oracle:
-            tuning_available = _tuning_available(row, executor, engine_id)
+            tuning_available = hipdnn_tuning_available(row, executor, engine_id)
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -534,21 +535,6 @@ def run_single_provider_engine(
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
-
-
-def _tuning_available(
-    row: ProviderEngineResult, executor: Executor, engine_id: int
-) -> Optional[bool]:
-    """Whether the engine exposes the benchmarking knob for this graph.
-
-    Without it the tuned child re-measures the OOTB configuration. A failed
-    query becomes ``row.oracle_error`` (no tuned run), never a row failure.
-    """
-    try:
-        return BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id)
-    except Exception as e:
-        row.oracle_error = f"{type(e).__name__}: {e}"
-        return None
 
 
 def _error_or_skip(fatal: bool) -> Callable[..., ProviderEngineResult]:
@@ -698,17 +684,21 @@ def _with_stall_fallback(
     graph instead of mixing staged and events rows. Each rerun row records
     the reason in ``timing.fallback_reason`` and ``warnings``.
     """
-    try:
-        return run(config)
-    except StallFallbackError as e:
-        reason = str(e)
-    # Rerun outside the except block: the caught exception's traceback holds
-    # every frame of the first attempt, with its inputs, references, device
-    # buffers and workspaces, until the block exits.
-    reporter.warning(f"{reason}; remeasuring every row of this graph without stalling")
-    unstalled = copy.copy(config)
-    unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
-    return run(unstalled)
+
+    def attempt(policy: TimingPolicy) -> GraphResult:
+        if policy is config.timing_policy:
+            return run(config)
+        unstalled = copy.copy(config)
+        unstalled.timing_policy = policy
+        return run(unstalled)
+
+    return retry_unstalled(
+        attempt,
+        config.timing_policy,
+        lambda reason: reporter.warning(
+            f"{reason}; remeasuring every row of this graph without stalling"
+        ),
+    )
 
 
 def run_graph_all_providers(
@@ -795,10 +785,11 @@ def _run_graph_all_providers(
             graph.results.append(reference_row)
 
     for selection in config.engine_selections_for(engine_ids):
-        row = _run_engine_selection(
-            ctx, handle, selection.engine_id, selection.plugin_path
+        graph.results.append(
+            _run_engine_selection(
+                ctx, handle, selection.engine_id, selection.plugin_path
+            )
         )
-        graph.results.append(row)
     return graph
 
 

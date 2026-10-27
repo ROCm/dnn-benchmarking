@@ -4,7 +4,6 @@
 """Tests for execution.oracle (tuned run in a child script next to the OOTB run)."""
 
 import subprocess
-import weakref
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,15 +12,14 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.cli import hipdnn_tuned_child, pytorch_tuned_child
-from dnn_benchmarking.common.pytorch_tuning import tuned_subprocess_env
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
     SuiteConfig,
-    TimingPolicy,
     ValidationConfig,
 )
 from dnn_benchmarking.execution import oracle as oracle_mod
-from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
+from dnn_benchmarking.execution import tuned_child
+from dnn_benchmarking.execution.timing import Measurement
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
@@ -89,10 +87,10 @@ def child(monkeypatch):
         out_dir = launch.out_dir = Path(argv[argv.index("--out-dir") + 1])
         launch.state_existed = out_dir.is_dir()
         if launch.plan is not None:
-            oracle_mod.write_result(out_dir, _measurement(), **launch.plan)
+            tuned_child.write_result(out_dir, _measurement(), **launch.plan)
         if "--save-outputs" in argv:
             for uid, data in launch.outputs.items():
-                np.save(oracle_mod.output_file(out_dir, uid), data)
+                np.save(tuned_child.output_file(out_dir, uid), data)
         return launch.proc
 
     monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
@@ -149,6 +147,13 @@ def _timeout(monkeypatch, seen):
         raise subprocess.TimeoutExpired(argv, timeout_s)
 
     monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
+
+
+def _set_tuned_env(monkeypatch, env, state_dir):
+    """Set the tuning variables of ``env`` as the parent does."""
+    built = env.build(str(state_dir))
+    for name in [*env.fixed, *env.in_dir]:
+        monkeypatch.setenv(name, built[name])
 
 
 # --- run_hipdnn_tuned -------------------------------------------------------
@@ -212,14 +217,7 @@ def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkey
     for name, value in child.env.items():
         monkeypatch.setenv(name, value)
 
-    oracle_mod.require_child_env(oracle_mod.HIPDNN_CHILD_ENV)
-
-
-def test_the_parent_env_satisfies_the_pytorch_child_check(tmp_path, monkeypatch):
-    for name, value in tuned_subprocess_env(str(tmp_path)).items():
-        monkeypatch.setenv(name, value)
-
-    oracle_mod.require_child_env(oracle_mod.PYTORCH_CHILD_ENV)
+    tuned_child.HIPDNN_TUNED_ENV.check()
 
 
 @pytest.mark.parametrize(
@@ -235,8 +233,7 @@ def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
     tmp_path, monkeypatch, name, value
 ):
     """An untuned run must not be reported as the tuned result."""
-    for var, required in oracle_mod.HIPDNN_CHILD_ENV.items():
-        monkeypatch.setenv(var, required or str(tmp_path))
+    _set_tuned_env(monkeypatch, tuned_child.HIPDNN_TUNED_ENV, tmp_path)
     if value is None:
         monkeypatch.delenv(name)
     else:
@@ -245,7 +242,7 @@ def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
     argv += ["--timing-policy", "{}", "--out-dir", str(tmp_path)]
 
     assert hipdnn_tuned_child.main(argv) == 1
-    assert not (tmp_path / oracle_mod.RESULT_FILE).exists()
+    assert not (tmp_path / tuned_child.RESULT_FILE).exists()
 
 
 @pytest.mark.parametrize(
@@ -254,14 +251,13 @@ def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
 def test_pytorch_child_refuses_to_time_without_the_tuning_env(
     tmp_path, monkeypatch, name
 ):
-    for var, required in oracle_mod.PYTORCH_CHILD_ENV.items():
-        monkeypatch.setenv(var, required or str(tmp_path))
+    _set_tuned_env(monkeypatch, tuned_child.PYTORCH_TUNED_ENV, tmp_path)
     monkeypatch.setenv(name, "0")
     argv = ["--graph", "g.json", "--seed", "0", "--timing-policy", "{}"]
     argv += ["--out-dir", str(tmp_path), "--pytorch-sdpa-backend", "default"]
 
     assert pytorch_tuned_child.main(argv) == 1
-    assert not (tmp_path / oracle_mod.RESULT_FILE).exists()
+    assert not (tmp_path / tuned_child.RESULT_FILE).exists()
 
 
 def test_hipdnn_tuned_row_comes_from_the_child_result(child, tmp_path):
@@ -481,49 +477,3 @@ def test_pytorch_child_failure_reports_its_last_stderr_line(child, tmp_path):
     assert "exited 1" in row.oracle_error
     assert row.oracle_error.endswith("RuntimeError: HIP out of memory")
     assert row.status == "success"
-
-
-# --- child stall fallback ----------------------------------------------------
-
-
-def test_child_remeasures_unstalled_when_the_stall_gate_fails() -> None:
-    """A stall-gate failure in a child still gives a tuned result, timed
-    without the gate, as the parent does for a whole graph."""
-    seen = []
-
-    def run(policy):
-        seen.append(policy.stall_gate)
-        if policy.stall_gate:
-            raise StallFallbackError("gate never opened")
-        return "measured"
-
-    result = oracle_mod.with_stall_fallback(run, TimingPolicy(stall_gate=True))
-
-    assert (result, seen) == ("measured", [True, False])
-
-
-def test_child_releases_the_first_attempt_before_the_retry() -> None:
-    """The stalled attempt's buffers must be gone before the retry allocates
-    its own; holding both doubles peak VRAM."""
-
-    class Buffers:
-        pass
-
-    first = []
-
-    def run(policy):
-        if policy.stall_gate:
-            buffers = Buffers()  # local of the failing frame only
-            first.append(weakref.ref(buffers))
-            raise StallFallbackError("gate never opened")
-        return first[0]() is None
-
-    assert oracle_mod.with_stall_fallback(run, TimingPolicy(stall_gate=True))
-
-
-def test_child_without_the_stall_gate_does_not_retry() -> None:
-    def run(policy):
-        raise StallFallbackError("events timing failed")
-
-    with pytest.raises(StallFallbackError):
-        oracle_mod.with_stall_fallback(run, TimingPolicy(stall_gate=False))

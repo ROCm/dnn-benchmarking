@@ -210,21 +210,6 @@ class CorrectnessResult:
             "message": self.error_message,
         }
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CorrectnessResult":
-        """Inverse of :meth:`to_dict` (a result file's ``correctness``)."""
-        return cls(
-            tolerance_match=data["match"],
-            rtol=data["rtol"],
-            atol=data["atol"],
-            max_abs_diff=data.get("max_abs_diff"),
-            max_rel_diff=data.get("max_rel_diff"),
-            error_message=data.get("message"),
-            n_mismatch=data.get("n_mismatch"),
-            n_total=data.get("n_total"),
-            worst_output_uid=data.get("worst_output_uid"),
-        )
-
 
 @dataclass(kw_only=True)
 class PlanResult:

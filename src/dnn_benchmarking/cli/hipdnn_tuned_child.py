@@ -6,9 +6,10 @@
 ``python -m dnn_benchmarking.cli.hipdnn_tuned_child --graph G --engine 0xHEX
 --seed S --timing-policy JSON --out-dir D [--plugin-path P] [--save-outputs]``
 
-The parent (``execution.oracle.run_hipdnn_tuned``) sets the environment:
-``HIPDNN_FORCE_BENCHMARKING=1``, ``HIPDNN_DISABLE_CACHE=1`` and a private
-``MIOPEN_USER_DB_PATH``. This script sets no tuning variable. It builds the
+The parent (``execution.oracle.run_hipdnn_tuned``) sets the environment
+``execution.tuned_child.HIPDNN_TUNED_ENV``: ``HIPDNN_FORCE_BENCHMARKING=1``,
+``HIPDNN_DISABLE_CACHE=1`` and a private ``MIOPEN_USER_DB_PATH``. This script
+checks it and sets no tuning variable. It builds the
 engine as the OOTB row does (prime, then the timed build), fills the inputs
 from the seed and times one loop with the parent's timing policy. It writes
 ``result.json`` in D. With ``--save-outputs``, it runs the graph once more
@@ -27,16 +28,14 @@ import numpy as np
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
 from ..execution.buffer_manager import BufferManager, generate_input_data
-from ..execution.executor import Executor
-from ..execution.oracle import (
-    HIPDNN_CHILD_ENV,
+from ..execution.executor import Executor, set_plugin_path
+from ..execution.timing import retry_unstalled
+from ..execution.tuned_child import (
+    HIPDNN_TUNED_ENV,
     child_parser,
     output_file,
-    require_child_env,
-    with_stall_fallback,
     write_result,
 )
-from ..execution.suite_runner import set_plugin_path
 from ..graph.loader import GraphLoader
 from ..graph.tensor_info import TensorInfo
 from ..reporting.reporter import Reporter
@@ -58,7 +57,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     reporter = Reporter(quiet=True)
     try:
-        require_child_env(HIPDNN_CHILD_ENV)
+        HIPDNN_TUNED_ENV.check()
     except RuntimeError as e:
         reporter.error(str(e))
         return 1
@@ -81,7 +80,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         def run(policy: TimingPolicy) -> None:
             _tuned_run(args, handle, graph_json, tensor_infos, policy)
 
-        with_stall_fallback(run, args.timing_policy)
+        retry_unstalled(run, args.timing_policy)
     except Exception as e:
         reporter.error(f"engine {engine_id_hex(args.engine)}: {type(e).__name__}: {e}")
         return 1

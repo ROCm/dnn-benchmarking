@@ -375,7 +375,10 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
 
 
 def _warn_oracle(reporter: Reporter) -> None:
-    """One line per condition that makes the OOTB plan non-cold."""
+    """Describe the tuned run; warn when ``HIPDNN_FORCE_BENCHMARKING`` is set.
+
+    An inherited ``HIPDNN_FORCE_BENCHMARKING`` also reaches the OOTB plan.
+    """
     reporter.info(
         "--oracle: each engine row gets a tuned run in a child process with "
         "HIPDNN_FORCE_BENCHMARKING=1 and a private MIOpen user database "

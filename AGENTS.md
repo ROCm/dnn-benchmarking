@@ -82,14 +82,15 @@ src/dnn_benchmarking/
 ├── common/                   # exceptions, dtypes registry, torch/ROCm runtime helpers
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
 ├── execution/
-│   ├── timing.py             # measure(): the one timed loop (staged / events)
+│   ├── timing.py             # measure(): the one timed loop (staged / events); retry_unstalled
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
-│   ├── oracle.py             # --oracle pass
+│   ├── oracle.py             # --oracle pass (parent side)
+│   ├── tuned_child.py        # --oracle child contract: options, result files, environment
 │   └── correctness.py        # output comparison for a row
 ├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
 ├── metrics/
@@ -138,10 +139,11 @@ Rules that keep the design intact:
 - Run every tuned pass (`--oracle`) only in a child script:
   `cli/hipdnn_tuned_child.py` for hipDNN rows, `cli/pytorch_tuned_child.py`
   for PyTorch rows. `execution/oracle.py` sets the child environment
-  (`HIPDNN_FORCE_BENCHMARKING=1`, or the TunableOp variables, and a private
-  `MIOPEN_USER_DB_PATH`) and passes the full `TimingPolicy`, `stall_gate`
-  included. The scripts set no tuning variable and parse no dnn-benchmark
-  option. The parent validates the tuned hipDNN outputs with
+  (`execution/tuned_child.py`: `HIPDNN_FORCE_BENCHMARKING=1`, or the
+  TunableOp variables, and a private `MIOPEN_USER_DB_PATH`) and passes the
+  full `TimingPolicy`, `stall_gate` included. The scripts check the
+  environment, set no tuning variable and parse no dnn-benchmark option.
+  The parent validates the tuned hipDNN outputs with
   `check_correctness`. hipDNN keeps a tuned winner in memory for the life of
   the process, and PyTorch's conv algorithm cache and MIOpen's user database
   would otherwise carry tuning into an OOTB measurement. Every run turns

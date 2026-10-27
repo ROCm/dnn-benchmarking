@@ -25,8 +25,7 @@ from pathlib import Path
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
 from ..execution.buffer_manager import BufferManager, generate_input_data
-from ..execution.executor import Executor
-from ..execution.suite_runner import set_plugin_path
+from ..execution.executor import Executor, set_plugin_path
 from ..execution.timing import device_sync
 from ..graph.loader import GraphLoader
 

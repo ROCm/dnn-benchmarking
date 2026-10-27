@@ -22,6 +22,7 @@ from dnn_benchmarking.config.benchmark_config import (
 )
 from dnn_benchmarking.execution import oracle, suite_runner
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
+from dnn_benchmarking.execution.tuned_child import output_file, write_result
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
@@ -442,9 +443,9 @@ def tuned_child(fake, monkeypatch):
         child.stall_gates.append(args.timing_policy.stall_gate)
         fake.events.append(("tuned_child", engine))
         m = _measurement(kernel_ms=[0.5] * 4, host_ms=[0.01] * 4)
-        oracle.write_result(args.out_dir, m, build_ms=7.0, workspace_bytes=64)
+        write_result(args.out_dir, m, build_ms=7.0, workspace_bytes=64)
         if args.save_outputs:
-            np.save(oracle.output_file(args.out_dir, 2), child.output)
+            np.save(output_file(args.out_dir, 2), child.output)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(oracle, "run_capped", run_capped)
@@ -1014,35 +1015,6 @@ def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
     assert {r.ootb.timing.mode for r in graph.results} == {"events"}
     assert all("stall gate failed" in " ".join(r.warnings) for r in graph.results)
     assert "remeasuring every row of this graph without stalling" in progress
-
-
-def test_stall_rerun_releases_the_first_attempt():
-    """The rerun must not keep the failed attempt's inputs, references and
-    buffers alive: on large graphs that doubles host and device memory."""
-    import gc
-    import weakref
-
-    class Inputs:
-        pass
-
-    first_attempt = []
-    alive_during_rerun = []
-
-    def run(config):
-        if not first_attempt:
-            inputs = Inputs()  # a local of the failing frame, like ctx
-            first_attempt.append(weakref.ref(inputs))
-            raise StallFallbackError("stall watchdog invalidated the measurement")
-        gc.collect()
-        alive_during_rerun.append(first_attempt[0]() is not None)
-        return "rerun"
-
-    result = suite_runner._with_stall_fallback(
-        run, SuiteConfig(), Reporter(io.StringIO())
-    )
-
-    assert result == "rerun"
-    assert alive_during_rerun == [False]
 
 
 def test_pytorch_buffers_share_the_executor_device(fake_torch):

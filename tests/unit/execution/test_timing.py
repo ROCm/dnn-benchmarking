@@ -1,10 +1,13 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""CPU-only tests for ``timing.measure`` driven through a fake HIP runtime."""
+"""CPU-only tests for ``timing``: ``measure`` through a fake HIP runtime,
+and ``retry_unstalled``."""
 
+import gc
 import sys
 import types
+import weakref
 from typing import List
 
 import pytest
@@ -16,6 +19,7 @@ from dnn_benchmarking.execution.timing import (
     StalledRegionTimer,
     StallFallbackError,
     measure,
+    retry_unstalled,
 )
 
 
@@ -603,3 +607,57 @@ def test_timer_measures_the_with_block(monkeypatch) -> None:
 
     assert timer.elapsed_ms == pytest.approx(250.0)
     assert timer.elapsed_s == pytest.approx(0.25)
+
+
+# --- retry_unstalled -------------------------------------------------------
+
+
+def test_stall_failure_reruns_unstalled_and_reports_why() -> None:
+    """A stall-gate failure still gives a result, timed without the gate."""
+    seen = []
+    reasons = []
+
+    def run(policy):
+        seen.append(policy.stall_gate)
+        if policy.stall_gate:
+            raise StallFallbackError("gate never opened")
+        return "measured"
+
+    result = retry_unstalled(run, TimingPolicy(stall_gate=True), reasons.append)
+
+    assert (result, seen, reasons) == ("measured", [True, False], ["gate never opened"])
+
+
+def test_stall_rerun_releases_the_first_attempt() -> None:
+    """The rerun must not keep the failed attempt's inputs, references and
+    buffers alive: on large graphs that doubles host and device memory."""
+
+    class Inputs:
+        pass
+
+    first_attempt = []
+    alive_during_rerun = []
+
+    def run(policy):
+        if policy.stall_gate:
+            inputs = Inputs()  # a local of the failing frame only
+            first_attempt.append(weakref.ref(inputs))
+            raise StallFallbackError("stall watchdog invalidated the measurement")
+        gc.collect()
+        alive_during_rerun.append(first_attempt[0]() is not None)
+        return "rerun"
+
+    assert retry_unstalled(run, TimingPolicy(stall_gate=True)) == "rerun"
+    assert alive_during_rerun == [False]
+
+
+def test_unstalled_run_is_not_retried() -> None:
+    calls = []
+
+    def run(policy):
+        calls.append(policy.stall_gate)
+        raise StallFallbackError("events timing failed")
+
+    with pytest.raises(StallFallbackError):
+        retry_unstalled(run, TimingPolicy(stall_gate=False))
+    assert calls == [False]
