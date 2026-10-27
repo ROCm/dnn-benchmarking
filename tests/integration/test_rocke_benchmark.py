@@ -62,7 +62,11 @@ def test_rocke_rows_launch_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> Non
     for row in rows:
         # A variant row errors unless it read hipDNN's code object (the
         # descriptor's SHA-256) and rocKE's argument list matched hipDNN's.
-        assert row.verdict == "passed", (row.engine_name, row.error_message)
+        assert row.verdict == "passed", (
+            row.engine_name,
+            row.error_message,
+            row.ootb.correctness,
+        )
         assert row.ootb.gpu_kernel_stats.median_ms > 0
 
 
