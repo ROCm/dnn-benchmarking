@@ -130,7 +130,7 @@ def test_compare_matches_pytorch_reference(
 
     provider = ReferenceProviderRegistry.get_provider("pytorch")
     tensor_infos = GraphLoader().extract_tensor_info(sample_conv_fwd_json)
-    inputs = generate_input_data(tensor_infos, seed=42)
+    inputs = generate_input_data(tensor_infos, seed=42, graph_json=sample_conv_fwd_json)
     handle = hipdnn.Handle()
     executor = Executor(json.dumps(sample_conv_fwd_json), TimingPolicy())
     executor.prepare(handle)
