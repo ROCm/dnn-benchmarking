@@ -276,7 +276,8 @@ def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
         inputs = node.get("inputs") or {}
         if str(node.get("type", "")).startswith("Convolution"):
             convolution.update(
-                int(inputs[key]) for key in _CONVOLUTION_OPERAND_KEYS
+                int(inputs[key])
+                for key in _CONVOLUTION_OPERAND_KEYS
                 if inputs.get(key) is not None
             )
         else:

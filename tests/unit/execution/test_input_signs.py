@@ -4,13 +4,14 @@
 """Sign of generated inputs: convolution operands are signed, others are not."""
 
 import numpy as np
+import pytest
 
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 
 
 def _tensor(uid: int, dims, data_type: str = "half") -> TensorInfo:
-    strides = [int(np.prod(dims[i + 1:])) for i in range(len(dims))]
+    strides = [int(np.prod(dims[i + 1 :])) for i in range(len(dims))]
     return TensorInfo(uid, f"t{uid}", list(dims), strides, data_type, is_virtual=False)
 
 
@@ -41,6 +42,41 @@ def test_fp16_backward_weights_sum_stays_finite() -> None:
     assert data[1].min() < 0 <= data[1].max() <= 1
 
 
+@pytest.mark.parametrize(
+    "node_type, inputs, output",
+    [
+        (
+            "ConvolutionFwdAttributes",
+            {"x_tensor_uid": 1, "w_tensor_uid": 2},
+            "y_tensor_uid",
+        ),
+        (
+            "ConvolutionBwdAttributes",
+            {"dy_tensor_uid": 1, "w_tensor_uid": 2},
+            "dx_tensor_uid",
+        ),
+        (
+            "ConvolutionWrwAttributes",
+            {"x_tensor_uid": 1, "dy_tensor_uid": 2},
+            "dw_tensor_uid",
+        ),
+    ],
+    ids=["fwd", "dgrad", "wgrad"],
+)
+def test_both_operands_of_each_convolution_direction_are_signed(
+    node_type: str, inputs: dict, output: str
+) -> None:
+    graph = {
+        "tensors": [],
+        "nodes": [{"type": node_type, "inputs": inputs, "outputs": {output: 3}}],
+    }
+    a, b = _tensor(1, [4096]), _tensor(2, [4096])
+
+    data = generate_input_data([a, b], seed=0, graph_json=graph)
+
+    assert data[1].min() < 0 and data[2].min() < 0
+
+
 def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
     """A batch-norm variance must not be negative, even in a graph that also
     has a convolution. A tensor that feeds both kinds of node keeps U[0, 1)."""
@@ -54,7 +90,11 @@ def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
             },
             {
                 "type": "BatchnormInferenceAttributes",
-                "inputs": {"x_tensor_uid": 3, "mean_tensor_uid": 2, "inv_variance_tensor_uid": 4},
+                "inputs": {
+                    "x_tensor_uid": 3,
+                    "mean_tensor_uid": 2,
+                    "inv_variance_tensor_uid": 4,
+                },
                 "outputs": {"y_tensor_uid": 5},
             },
         ],
