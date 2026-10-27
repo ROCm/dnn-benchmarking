@@ -27,7 +27,6 @@ from dnn_benchmarking.execution import (
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.suite_runner import run_graph_all_providers
 from dnn_benchmarking.graph import GraphLoader
-from dnn_benchmarking.metrics.analytical import convolution_terms_per_output
 from dnn_benchmarking.reporting.suite_results import GraphResult
 from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.validation import compare
@@ -131,7 +130,7 @@ def test_compare_matches_pytorch_reference(
 
     provider = ReferenceProviderRegistry.get_provider("pytorch")
     tensor_infos = GraphLoader().extract_tensor_info(sample_conv_fwd_json)
-    inputs = generate_input_data(tensor_infos, seed=42, graph_json=sample_conv_fwd_json)
+    inputs = generate_input_data(tensor_infos, seed=42)
     handle = hipdnn.Handle()
     executor = Executor(json.dumps(sample_conv_fwd_json), TimingPolicy())
     executor.prepare(handle)
@@ -146,8 +145,7 @@ def test_compare_matches_pytorch_reference(
     reference = provider.compute_reference(sample_conv_fwd_json, inputs)[0].data
     # The product gate: the dtype tolerance `--validate pytorch` applies.
     output_info = next(t for t in tensor_infos if t.is_output)
-    terms = convolution_terms_per_output(sample_conv_fwd_json)
-    rtol, atol = correctness.tolerance_for(SuiteConfig(), output_info, terms)
+    rtol, atol = correctness.tolerance_for(SuiteConfig(), output_info)
     result = compare(output, reference, rtol=rtol, atol=atol)
     assert result.passed, result.message
 

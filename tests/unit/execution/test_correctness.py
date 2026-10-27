@@ -57,49 +57,7 @@ def _ref(data):
     ],
 )
 def test_tolerance_by_dtype_and_override(data_type, rtol, atol, expected):
-    assert tolerance_for(_config(rtol, atol), _out(1, data_type), {}) == expected
-
-
-def _conv_fwd_graph(output_uid):
-    """A forward convolution that sums 16 * 3 * 3 = 144 products per output."""
-    return {
-        "tensors": [
-            {"uid": 2, "dims": [1, 16, 3, 3]},
-            {"uid": 3, "dims": [4, 16, 3, 3]},
-            {"uid": output_uid, "dims": [1, 4, 1, 1]},
-        ],
-        "nodes": [
-            {
-                "type": "ConvolutionFwdAttributes",
-                "inputs": {"x_tensor_uid": 2, "w_tensor_uid": 3},
-                "outputs": {"y_tensor_uid": output_uid},
-            }
-        ],
-    }
-
-
-@pytest.mark.parametrize(
-    "graph, config, passed",
-    [
-        (_conv_fwd_graph(1), _config(), True),
-        ({}, _config(), False),  # not a convolution output
-        (_conv_fwd_graph(9), _config(), False),  # another tensor's convolution
-        (_conv_fwd_graph(1), _config(rtol=1e-5, atol=1e-6), False),  # --atol wins
-    ],
-    ids=["conv-output", "no-conv", "other-output", "explicit-atol"],
-)
-def test_fp32_convolution_output_near_zero_allows_reduction_rounding(
-    graph, config, passed
-):
-    """Signed convolution outputs sit near zero, where only atol applies. An
-    fp32 rounding difference of 1e-5 after 144 summed products is a correct
-    result, far above the fixed fp32 atol of 1e-6."""
-    ref = {1: _ref([0.0, 1e-7, -2e-7, 0.0])}
-    bm = _HostBM({1: np.asarray([1e-5, -1e-5, 1e-5, -1e-5], np.float32)})
-
-    c = check_correctness(bm, [_out(1)], ref, "pytorch", config, graph)
-
-    assert c.passed is passed
+    assert tolerance_for(_config(rtol, atol), _out(1, data_type)) == expected
 
 
 @pytest.mark.parametrize(
@@ -118,7 +76,7 @@ def test_fp8_output_one_ulp_apart_passes(data_type, one_ulp_up):
     ref = {1: _ref([1.0, 2.0, 0.5, 4.0])}
     bm = _HostBM({1: np.array(one_ulp_up, np.float32)})
 
-    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config(), {})
+    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
 
     assert c.tolerance_match is True
 
@@ -140,7 +98,7 @@ def test_fp8_output_two_ulp_apart_fails(data_type, actual):
     ref = {1: _ref([1.0, 2.0, 0.5, 4.0])}
     bm = _HostBM({1: np.array(actual, np.float32)})
 
-    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config(), {})
+    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
 
     assert c.tolerance_match is False
     assert c.n_mismatch == 4
@@ -162,7 +120,7 @@ def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
     actual = [smallest_subnormal, -smallest_subnormal, 2 * smallest_subnormal, 0.0]
     bm = _HostBM({1: np.array(actual, np.float32)})
 
-    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config(), {})
+    c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
 
     assert c.n_mismatch == 1
 
@@ -176,7 +134,7 @@ def test_aggregates_over_outputs_and_names_the_failing_output():
         }
     )
 
-    c = check_correctness(bm, [_out(1), _out(2)], ref, "pytorch", _config(), {})
+    c = check_correctness(bm, [_out(1), _out(2)], ref, "pytorch", _config())
 
     assert c.tolerance_match is False
     assert (c.n_mismatch, c.n_total) == (3, 8)
@@ -196,9 +154,7 @@ def test_failing_output_outranks_a_passing_output_with_a_larger_diff():
         }
     )
 
-    c = check_correctness(
-        bm, [_out(1, "bfloat16"), _out(2)], ref, "pytorch", _config(), {}
-    )
+    c = check_correctness(bm, [_out(1, "bfloat16"), _out(2)], ref, "pytorch", _config())
 
     assert c.tolerance_match is False
     assert c.worst_output_uid == 2
@@ -211,7 +167,7 @@ def test_passing_outputs_report_diffs_without_message():
     ref = {1: _ref([1, 2, 3, 4])}
     bm = _HostBM({1: np.array([1, 2, 3, 4.00001], np.float32)})
 
-    c = check_correctness(bm, [_out(1)], ref, "pytorch", _config(rtol=1e-3), {})
+    c = check_correctness(bm, [_out(1)], ref, "pytorch", _config(rtol=1e-3))
 
     assert c.passed
     assert c.n_mismatch == 0 and c.n_total == 4
@@ -227,7 +183,7 @@ def test_passing_outputs_report_diffs_without_message():
 )
 def test_missing_side_is_a_failure_not_a_pass(refs, outputs, reason):
     config = _config(rtol=0.1, atol=0.2)
-    c = check_correctness(_HostBM(outputs), [_out(1)], refs, "pytorch", config, {})
+    c = check_correctness(_HostBM(outputs), [_out(1)], refs, "pytorch", config)
 
     assert c.explicitly_failed
     assert reason in c.error_message
@@ -240,9 +196,7 @@ def test_read_failure_is_a_failure_not_a_crash():
         def get_output_data(self, uid):
             raise RuntimeError("hipMemcpy failed")
 
-    c = check_correctness(
-        FailingBM(), [_out(1)], {1: _ref([0])}, "pytorch", _config(), {}
-    )
+    c = check_correctness(FailingBM(), [_out(1)], {1: _ref([0])}, "pytorch", _config())
 
     assert c.explicitly_failed
     assert c.error_message == "hipMemcpy failed"
@@ -264,9 +218,7 @@ def test_device_reference_is_compared_without_host_copy():
         )
     }
 
-    assert check_correctness(
-        DeviceBM(), [_out(1)], ref, "pytorch", _config(), {}
-    ).passed
+    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
 
 
 def test_device_e8m0_compares_code_steps():
@@ -289,9 +241,7 @@ def test_device_e8m0_compares_code_steps():
         )
     }
 
-    c = check_correctness(
-        DeviceBM(), [_out(1, "fp8_e8m0")], ref, "pytorch", _config(), {}
-    )
+    c = check_correctness(DeviceBM(), [_out(1, "fp8_e8m0")], ref, "pytorch", _config())
 
     assert c.n_mismatch == 2
 
@@ -324,6 +274,4 @@ def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
         )
     }
 
-    assert check_correctness(
-        DeviceBM(), [_out(1)], ref, "pytorch", _config(), {}
-    ).passed
+    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed

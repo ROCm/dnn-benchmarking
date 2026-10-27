@@ -19,7 +19,7 @@ are inferred from the weight shape, as the PyTorch executor also does.
 Any rank with at least one spatial dim (conv1d / 2d / 3d) is supported.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 
 def _conv_flops_impl(
@@ -127,58 +127,3 @@ def conv_wgrad_flops(
         w=tensors_by_uid.get(int(dw_uid)),
         y=tensors_by_uid.get(int(dy_uid)),
     )
-
-
-def _dims(
-    node: Dict[str, Any],
-    section: str,
-    key: str,
-    tensors_by_uid: Dict[int, Dict[str, Any]],
-) -> Optional[List[int]]:
-    uid = (node.get(section) or {}).get(key)
-    tensor = tensors_by_uid.get(int(uid)) if uid is not None else None
-    dims = [int(d) for d in (tensor or {}).get("dims") or []]
-    return dims if len(dims) >= 3 else None
-
-
-def _product(values: List[int]) -> int:
-    result = 1
-    for value in values:
-        result *= value
-    return result
-
-
-def conv_terms_per_output(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
-) -> Optional[Tuple[int, int]]:
-    """``(output UID, products summed into one output element)``, or None.
-
-    The count is the largest over the output elements:
-
-    * fwd ``y``: ``C/g * R * S``.
-    * dgrad ``dx``: ``K/g * R * S``. With a stride, some ``dx`` elements sum
-      fewer filter taps; an interior element of a stride-1 convolution sums
-      all of them.
-    * wgrad ``dw``: ``N * H_out * W_out``.
-    """
-    node_type = node.get("type", "")
-    if node_type == "ConvolutionFwdAttributes":
-        output_key = "y_tensor_uid"
-        w = _dims(node, "inputs", "w_tensor_uid", tensors_by_uid)
-        terms = _product(w[1:]) if w else None
-    elif node_type in ("ConvolutionBwdAttributes", "ConvolutionBwdDataAttributes"):
-        output_key = "dx_tensor_uid"
-        w = _dims(node, "inputs", "w_tensor_uid", tensors_by_uid)
-        dx = _dims(node, "outputs", output_key, tensors_by_uid)
-        groups = dx[1] // w[1] if w and dx and w[1] else 0
-        terms = w[0] // groups * _product(w[2:]) if w and groups else None
-    elif node_type in ("ConvolutionWrwAttributes", "ConvolutionBwdFilterAttributes"):
-        output_key = "dw_tensor_uid"
-        dy = _dims(node, "inputs", "dy_tensor_uid", tensors_by_uid)
-        terms = dy[0] * _product(dy[2:]) if dy else None
-    else:
-        return None
-    output_uid = (node.get("outputs") or {}).get(output_key)
-    if output_uid is None or not terms:
-        return None
-    return int(output_uid), terms

@@ -66,12 +66,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from ...graph.tensor_info import TensorInfo
 from .._diagnostic import warn_once
 from ._common import tensor_lookup
-from .conv import (
-    conv_dgrad_flops,
-    conv_fwd_flops,
-    conv_terms_per_output,
-    conv_wgrad_flops,
-)
+from .conv import conv_dgrad_flops, conv_fwd_flops, conv_wgrad_flops
 from .elementwise import (
     block_scale_dequantize_flops,
     block_scale_quantize_flops,
@@ -165,24 +160,6 @@ def compute_flops(graph_json: Dict[str, Any]) -> Optional[int]:
     return total
 
 
-def convolution_terms_per_output(graph_json: Dict[str, Any]) -> Dict[int, int]:
-    """Products summed into one element of each convolution output.
-
-    See :func:`.conv.conv_terms_per_output` for the count of each direction.
-
-    Returns:
-        Output tensor UID -> terms per element. A convolution whose shapes are
-        incomplete has no entry.
-    """
-    tensors_by_uid = tensor_lookup(graph_json)
-    terms: Dict[int, int] = {}
-    for node in graph_json.get("nodes") or []:
-        entry = conv_terms_per_output(node, tensors_by_uid)
-        if entry is not None:
-            terms[entry[0]] = entry[1]
-    return terms
-
-
 def compute_io_bytes(tensor_infos: Iterable[TensorInfo]) -> int:
     """Sum bytes of all non-virtual tensors (inputs + outputs + weights).
 
@@ -254,7 +231,6 @@ def list_unsupported_node_types(graph_json: Dict[str, Any]) -> List[str]:
 
 __all__ = [
     "compute_flops",
-    "convolution_terms_per_output",
     "compute_io_bytes",
     "derive_throughputs",
     "list_unsupported_node_types",

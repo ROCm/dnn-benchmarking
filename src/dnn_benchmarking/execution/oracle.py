@@ -154,7 +154,6 @@ def run_tuned_plan(
     variant_pack: Dict[int, int],
     tensor_infos: List[TensorInfo],
     reference_outputs: Optional[Dict[int, ReferenceOutput]],
-    graph_json: Dict[str, Any],
 ) -> None:
     """Time and validate the tuned plan; attach it as ``row.oracle``.
 
@@ -192,7 +191,6 @@ def run_tuned_plan(
                     reference_outputs,
                     config.validation.provider.value,
                     config,
-                    graph_json,
                 )
                 if oracle.correctness.explicitly_failed:
                     warn_once(
