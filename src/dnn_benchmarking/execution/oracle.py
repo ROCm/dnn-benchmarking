@@ -111,9 +111,6 @@ def _hipdnn_tuned_argv(
     argv = [sys.executable, "-m", "dnn_benchmarking"]
     argv += _timing_argv(graph_path, config, output)
     argv += ["--engine", engine_id_hex(engine_id), "--autotune"]
-    # A private winner cache, deleted with the output's temporary directory:
-    # the search's winners never reach a cache that an OOTB run reads.
-    argv += ["--hipdnn-cache-dir", str(output.parent / "hipdnn-cache")]
     if plugin_path is not None:
         argv += ["--plugin-path", str(plugin_path)]
     if not config.metrics.basic:

@@ -31,8 +31,7 @@ runtime = "hipdnn"   # "hipdnn" or "pytorch"
 # or the pip ROCm SDK.
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
-autotune = false     # benchmark candidate kernels and cache the winner
-# hipdnn_cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # per-run HIPDNN_CACHE_DIR
+autotune = false     # benchmark candidate kernels and use the winner
 
 pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
 # pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"

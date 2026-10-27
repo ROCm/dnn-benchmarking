@@ -327,18 +327,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Runtime/Selection",
         SuiteConfig,
         "autotune",
-        "benchmark candidate kernels on first execute and cache the winner "
-        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --hipdnn-cache-dir",
-    ),
-    CliOption(
-        flags=("--hipdnn-cache-dir",),
-        dest="hipdnn_cache_dir",
-        group="Runtime/Selection",
-        parser_type=Path,
-        metavar="PATH",
-        help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
-        config_key="hipdnn_cache_dir",
-        config_kind=ConfigKind.PATH,
+        "benchmark candidate kernels on first execute and use the winner "
+        "(HIPDNN_FORCE_BENCHMARKING=1); winners are not kept between runs",
     ),
     _choice_option(
         ("--pytorch-sdpa-backend",),

@@ -134,12 +134,12 @@ Rules that keep the design intact:
   `build_plans()`. Prime each engine with `Executor.prime` before its timed
   OOTB build.
 - Run every tuned pass (`--oracle`) only in a child process: hipDNN rows in
-  `python -m dnn_benchmarking -e <engine> --autotune` with a private
-  `--hipdnn-cache-dir`, PyTorch rows in `cli/pytorch_tuned_child.py`, each
-  with a private `MIOPEN_USER_DB_PATH`. hipDNN keeps a tuned winner in memory
-  for the life of the process, and hipDNN's disk cache, PyTorch's conv
-  algorithm cache and MIOpen's user database would otherwise carry tuning
-  into an OOTB measurement.
+  `python -m dnn_benchmarking -e <engine> --autotune`, PyTorch rows in
+  `cli/pytorch_tuned_child.py`, each with a private `MIOPEN_USER_DB_PATH`.
+  hipDNN keeps a tuned winner in memory for the life of the process, and
+  PyTorch's conv algorithm cache and MIOpen's user database would otherwise
+  carry tuning into an OOTB measurement. Every run turns hipDNN's disk cache
+  off (`HIPDNN_DISABLE_CACHE=1`).
 
 ## Tests
 

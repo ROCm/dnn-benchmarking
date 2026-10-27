@@ -50,8 +50,7 @@ the same output format.
 | `-r`, `--runtime {hipdnn,pytorch}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
-| `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
-| `--hipdnn-cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
+| `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and uses the winner. See [Kernel selection](#kernel-selection---autotune). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
@@ -162,7 +161,7 @@ format and result schema as the hipDNN backend. It runs on ROCm and on CUDA.
 
 These options are hipDNN-only. With `--runtime pytorch` they stop the run
 with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`, `--pmc`,
-`--trace`, `--perf`, `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
+`--trace`, `--perf`, `--roofline` and `--autotune`.
 `--oracle` is accepted: the PyTorch row gets a tuned run (see
 [PyTorch kernel selection](#pytorch-kernel-selection)).
 
@@ -217,32 +216,30 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
 The tool does not set `MIOPEN_FIND_MODE` or `MIOPEN_FIND_ENFORCE`. The hipDNN
 MIOpen plugin reads them too, so they would also change the hipDNN rows.
 
-## Kernel selection (`--autotune`, `--hipdnn-cache-dir`)
+## Kernel selection (`--autotune`)
 
 A hipDNN engine selects a kernel in one of two ways:
 
 - Default (heuristic): the engine uses the rank-0 kernel of its heuristic.
   The table then measures the heuristic.
 - `--autotune`: each plan benchmarks every candidate kernel on its first
-  execute and caches the winner. The table then measures the best kernel in
+  execute and uses the winner. The table then measures the best kernel in
   the kernel set.
 
 With the hipDNN backend the tool states the path on stderr, for example
-`kernel selection: heuristic; cache: shared per-user (~/.cache/hipdnn)`.
-This is an info line, so `-q` hides it.
+`kernel selection: heuristic; cache: disabled`. This is an info line, so
+`-q` hides it.
 
-The winner cache is on disk. Its key is the graph content and the device, not
-the checkout or the session. Thus a run can report a ranking that an earlier
-or a concurrent run tuned. Give each phase its own empty `--hipdnn-cache-dir`:
-
-```bash
-dnn-benchmark -g 'graphs/*.json' --hipdnn-cache-dir /tmp/cache-heuristic
-dnn-benchmark -g 'graphs/*.json' --autotune --hipdnn-cache-dir /tmp/cache-tuned
-```
+The tool sets `HIPDNN_DISABLE_CACHE=1` for every run, also when the shell
+sets another value. hipDNN then reads and writes no disk cache
+(`~/.cache/hipdnn` or `HIPDNN_CACHE_DIR`). Without this, hipDNN reads
+winners and engine rankings that an earlier `--autotune` run saved, also in
+an untuned run, and the table would not measure the heuristic. Thus each
+run measures only its own selection, and `--autotune` benchmarks again in
+every run.
 
 The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
-value in the environment without `--autotune`, and when `--autotune` has no
-`--hipdnn-cache-dir`.
+value in the environment without `--autotune`.
 
 ## Oracle
 
@@ -269,12 +266,12 @@ For each engine row:
    own output against the same reference provider.
 
 The child owns all tuning state. hipDNN keeps a tuned winner in memory until
-its process exits. The tuned search also writes the winner to the hipDNN disk
-cache and to the MIOpen user database. The child gets a private hipDNN cache
-(`--hipdnn-cache-dir`) and a private MIOpen user database
-(`MIOPEN_USER_DB_PATH`) in a temporary directory. The tool deletes that
-directory afterwards. Thus no OOTB measurement sees the tuned selection, also
-when a stall-gate fallback measures a graph again or a graph is listed twice.
+its process exits, and the tuned MIOpen search writes the MIOpen user
+database. The child's MIOpen user database (`MIOPEN_USER_DB_PATH`) is a
+temporary directory that the tool deletes afterwards. hipDNN's disk cache is
+off in every run (see [Kernel selection](#kernel-selection---autotune)), also
+in the child. Thus no OOTB measurement sees the tuned selection, also when a
+stall-gate fallback measures a graph again or a graph is listed twice.
 
 A tuned build prepares every candidate that the provider can sample, so
 `oracle.build_ms` is usually larger than `ootb.build_ms`. Providers that
@@ -304,23 +301,17 @@ failed `correctness` on either side, rows with `tuning_available: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
-The OOTB plan can still get a tuned selection from an earlier run. The
-shared hipDNN disk cache (`HIPDNN_CACHE_DIR`, or `--hipdnn-cache-dir`) can
-hold winners and engine rankings from an earlier `--autotune` run. MIOpen
-find and performance database entries in the shared `MIOPEN_USER_DB_PATH`
-can also supply tuned selections. For a cold OOTB baseline, set
-`HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` and `HIPDNN_DISABLE_CACHE=1`. The tool
-shows a warning when `HIPDNN_DISABLE_EXACT_ENGINE_CACHE` is not set, and,
-once that is set, when `HIPDNN_DISABLE_CACHE` is not set. It also shows a
-warning when `HIPDNN_FORCE_BENCHMARKING` is set in the environment: the
-providers apply that variable before the knob, so it reaches the OOTB plan
-too. `--autotune` sets that variable, so the tool rejects
-`--oracle --autotune`. `environment.selection_env` records the relevant
-variables.
+MIOpen find and performance database entries in the shared
+`MIOPEN_USER_DB_PATH` can supply tuned selections to the OOTB plan, for
+example from an earlier run with exhaustive search outside this tool. The
+tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set in the
+environment: the providers apply that variable before the knob, so it
+reaches the OOTB plan too. `--autotune` sets that variable, so the tool
+rejects `--oracle --autotune`. `environment.selection_env` records the
+relevant variables.
 
 ```bash
-HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 HIPDNN_DISABLE_CACHE=1 dnn-benchmark \
-  -g graphs/sample_conv_fwd.json --oracle -v -o oracle.json
+dnn-benchmark -g graphs/sample_conv_fwd.json --oracle -v -o oracle.json
 ```
 
 ## Config files

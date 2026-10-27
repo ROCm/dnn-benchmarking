@@ -215,7 +215,6 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "atol": config.validation.atol,
         "oracle": config.oracle,
         "autotune": config.autotune,
-        "hipdnn_cache_dir": config.hipdnn_cache_dir,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
         "metrics": metrics.basic,
@@ -377,19 +376,9 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
 
 def _warn_oracle(reporter: Reporter) -> None:
     """One line per condition that makes the OOTB plan non-cold."""
-    if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
-        reporter.warning(
-            "--oracle: exact-engine cache is on, so the OOTB timing may "
-            "replay a persisted ranking (HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for cold)"
-        )
-    elif not _truthy_env("HIPDNN_DISABLE_CACHE"):
-        reporter.warning(
-            "--oracle: provider kernel caches are on "
-            "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
-        )
     reporter.info(
         "--oracle: each engine row gets a tuned run in a child process with "
-        "--autotune and a private hipDNN cache and MIOpen user database "
+        "--autotune and a private MIOpen user database "
         "(kernel ingestor and MIOpen sample kernels; other engines re-measure "
         "the OOTB plan)"
     )
@@ -426,11 +415,13 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     Prints one info line ``kernel selection: heuristic|autotune; cache: ...``
     plus one warning per hazard.
     """
-    leaked = False
-    if config.hipdnn_cache_dir:
-        os.environ["HIPDNN_CACHE_DIR"] = config.hipdnn_cache_dir
-    cache = os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
+    # hipDNN reads benchmarked winner records (kernel winners and engine
+    # rankings) from its disk cache also without benchmarking, so a record
+    # from an earlier run would change the kernel a later run measures. Every
+    # run keeps hipDNN's disk cache off; this overrides an inherited value.
+    os.environ["HIPDNN_DISABLE_CACHE"] = "1"
 
+    leaked = False
     if config.autotune:
         os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
     elif _truthy_env("HIPDNN_FORCE_BENCHMARKING"):
@@ -442,13 +433,7 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
             "--autotune; kernels are benchmarked, not heuristic-selected"
         )
     autotune = config.autotune or leaked
-    if config.autotune and not config.hipdnn_cache_dir:
-        # The winner cache outlives the run and reads are not gated on
-        # benchmarking, so a previous session's ranking can be reported.
-        reporter.warning(
-            "--autotune without --hipdnn-cache-dir: winners cached by earlier runs "
-            "may be reported instead of measured"
-        )
     reporter.info(
-        f"kernel selection: {'autotune' if autotune else 'heuristic'}; cache: {cache}"
+        f"kernel selection: {'autotune' if autotune else 'heuristic'}; "
+        "cache: disabled"
     )

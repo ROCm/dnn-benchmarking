@@ -110,7 +110,6 @@ id = 1
             (["--perf"], "--perf"),
             (["--roofline"], "--roofline"),
             (["--autotune"], "--autotune"),
-            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
         ],
     )
     def test_pytorch_runtime_rejects_hipdnn_only_options(

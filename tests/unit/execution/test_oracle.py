@@ -178,18 +178,16 @@ def test_hipdnn_child_follows_the_metrics_switch(child, tmp_path, basic):
     assert _child_args(child).metrics is basic
 
 
-def test_hipdnn_child_tunes_into_private_caches_that_are_deleted(child, tmp_path):
-    """The search writes hipDNN's winner cache and MIOpen's user db; neither
-    may reuse earlier tuning or outlive the child, or a later OOTB run would
-    serve the tuned kernel."""
+def test_hipdnn_child_tunes_into_a_private_user_db_that_is_deleted(child, tmp_path):
+    """The search writes MIOpen's user db; it may not reuse earlier tuning or
+    outlive the child, or a later OOTB run would serve the tuned kernel. The
+    child CLI keeps hipDNN's disk cache off itself."""
     _run_hipdnn(tmp_path)
 
     state_dir = Path(child.env["MIOPEN_USER_DB_PATH"])
     output = Path(child.argv[child.argv.index("--output") + 1])
-    cache_dir = Path(SuiteConfig.from_namespace(_child_args(child)).hipdnn_cache_dir)
     assert child.state_existed
     assert output.parent == state_dir
-    assert cache_dir.is_relative_to(state_dir)
     assert not state_dir.exists()
 
 

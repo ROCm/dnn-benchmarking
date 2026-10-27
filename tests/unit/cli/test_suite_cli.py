@@ -485,7 +485,6 @@ def test_run_config_records_effective_values_that_compare_checks(
         "atol": None,
         "oracle": False,
         "autotune": False,
-        "hipdnn_cache_dir": None,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,
@@ -506,21 +505,20 @@ def test_run_config_records_non_default_selection_and_validation(
 ) -> None:
     # The run sets these process-wide; register them so teardown restores them.
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "")
-    monkeypatch.setenv("HIPDNN_CACHE_DIR", "")
     runtime(lambda path: _graph(path, [_passed()]))
-    out, cache = tmp_path / "out.json", str(tmp_path / "cache")
+    out = tmp_path / "out.json"
     _run(
         _args(
             *("-o", str(out), "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
             *("--validate", "pytorch", "--rtol", "1e-3"),
-            *("--autotune", "--hipdnn-cache-dir", cache),
+            "--autotune",
         ),
         _graphs(tmp_path, 1),
     )
     config = SuiteResult.load(out)["run"]["config"]
     picked = {k: config[k] for k in ("engine_filter", "rtol")}
     assert picked == {"engine_filter": ["0x15B46865C717A122"], "rtol": 1e-3}
-    assert (config["autotune"], config["hipdnn_cache_dir"]) == (True, cache)
+    assert config["autotune"] is True
 
 
 def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -> None:
@@ -743,49 +741,15 @@ def _warnings(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if "WARNING:" in line)
 
 
-@pytest.mark.parametrize(
-    "env, argv, expected",
-    [
-        ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-        ),
-        ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_CACHE=1",
-        ),
-        (
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "1"},
-            ["--warmup", "0"],  # priming always runs untimed: nothing to warn
-            None,
-        ),
-    ],
-    ids=[
-        "exact-cache-on",
-        "exact-cache-zero",
-        "provider-cache-on",
-        "provider-cache-zero",
-        "cold",
-    ],
-)
-def test_oracle_warns_on_non_cold_baseline(
-    tmp_path, runtime, monkeypatch, env, argv, expected
+def test_hipdnn_disk_cache_stays_off_even_when_the_shell_enables_it(
+    tmp_path, runtime, monkeypatch
 ) -> None:
-    for name in ("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "HIPDNN_DISABLE_CACHE"):
-        monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
+    # hipDNN reads "0" as on: an inherited value must not let saved winners in.
+    monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle", *argv), _graphs(tmp_path, 1))
-    warnings = _warnings(text)
-    if expected is None:
-        assert warnings == ""
-    else:
-        assert expected in warnings
+    _, text = _run(_args("--oracle", "--warmup", "0"), _graphs(tmp_path, 1))
+    assert os.environ["HIPDNN_DISABLE_CACHE"] == "1"
+    assert _warnings(text) == ""
 
 
 def test_final_write_survives_a_second_signal(

@@ -33,17 +33,16 @@ def test_default_stays_on_the_heuristic_path() -> None:
     assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
 
-def test_autotune_without_cache_dir_is_a_hazard() -> None:
-    [warning] = _warnings(autotune=True)
-    assert "--hipdnn-cache-dir" in warning
+def test_autotune_benchmarks_without_a_cache_warning() -> None:
+    lines = _lines(autotune=True)
+    assert [line for line in lines if line.startswith("WARNING")] == []
+    assert any("kernel selection: autotune; cache: disabled" in l for l in lines)
     assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
-def test_autotune_with_cache_dir_is_isolated() -> None:
-    lines = _lines(autotune=True, hipdnn_cache_dir="/tmp/phase-x")
-    assert [line for line in lines if line.startswith("WARNING")] == []
-    assert any("kernel selection: autotune;" in line for line in lines)
-    assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
+def test_hipdnn_disk_cache_is_off_for_every_run() -> None:
+    _lines()
+    assert os.environ["HIPDNN_DISABLE_CACHE"] == "1"
 
 
 @pytest.mark.parametrize(
