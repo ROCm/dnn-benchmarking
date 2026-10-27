@@ -13,9 +13,11 @@ from ..common.exceptions import GraphLoadError
 from .config_file import apply_config_file
 from .parser import create_parser
 
+#: Compiled-kernel caches, shared between runs. Selection caches (hipDNN
+#: winners, the MIOpen user database) are private to each run instead
+#: (``common.selection_env``).
 _CACHE_ENV_SUBDIRS = {
     "XDG_CACHE_HOME": "cache",
-    "MIOPEN_USER_DB_PATH": "miopen_cache",
     "MIOPEN_CUSTOM_CACHE_DIR": "miopen_cache",
     "AMD_COMGR_CACHE_DIR": "comgr_cache",
 }

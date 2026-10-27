@@ -46,6 +46,7 @@ RUN_CONFIG_KEYS = (
     "oracle",
     "autotune",
     "hipdnn_cache_dir",
+    "allow_selection_env",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
     "metrics",

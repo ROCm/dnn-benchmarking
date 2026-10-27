@@ -21,7 +21,7 @@ from dnn_benchmarking.cli import runtimes, suite_runner_cli
 from dnn_benchmarking.cli.config_file import apply_config_file
 from dnn_benchmarking.cli.main import main as cli_main
 from dnn_benchmarking.cli.parser import create_parser
-from dnn_benchmarking.common import pytorch_tuning
+from dnn_benchmarking.common import pytorch_tuning, selection_env
 from dnn_benchmarking.reporting import compare
 from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.suite_results import (
@@ -486,6 +486,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "oracle": False,
         "autotune": False,
         "hipdnn_cache_dir": None,
+        "allow_selection_env": False,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,
@@ -502,11 +503,8 @@ def test_run_config_records_effective_values_that_compare_checks(
 
 
 def test_run_config_records_non_default_selection_and_validation(
-    tmp_path, runtime, monkeypatch
+    tmp_path, runtime
 ) -> None:
-    # The run sets these process-wide; register them so teardown restores them.
-    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "")
-    monkeypatch.setenv("HIPDNN_CACHE_DIR", "")
     runtime(lambda path: _graph(path, [_passed()]))
     out, cache = tmp_path / "out.json", str(tmp_path / "cache")
     _run(
@@ -523,20 +521,21 @@ def test_run_config_records_non_default_selection_and_validation(
     assert (config["autotune"], config["hipdnn_cache_dir"]) == (True, cache)
 
 
-def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -> None:
+def test_selection_env_records_the_caches_each_run_used(tmp_path, runtime) -> None:
+    """Every run records its selection state; each run's hipDNN cache is its
+    own (deleted afterwards), so two runs never share tuned winners."""
     runtime(lambda path: _graph(path, [_passed()]))
-    plain, oracle = tmp_path / "plain.json", tmp_path / "oracle.json"
-    tuned = tmp_path / "tuned.json"
+    plain, tuned = tmp_path / "plain.json", tmp_path / "tuned.json"
     _run(_args("-o", str(plain)), _graphs(tmp_path, 1))
-    _run(_args("-o", str(oracle), "--oracle"), _graphs(tmp_path, 1))
     _run(_args("-o", str(tuned), "--autotune"), _graphs(tmp_path, 1))
 
-    assert SuiteResult.load(plain)["environment"]["selection_env"] is None
-    assert SuiteResult.load(oracle)["run"]["config"]["oracle"] is True
-    env = SuiteResult.load(oracle)["environment"]["selection_env"]
-    assert set(env) == set(suite_runner_cli._SELECTION_ENV)
-    env = SuiteResult.load(tuned)["environment"]["selection_env"]
-    assert env["HIPDNN_FORCE_BENCHMARKING"] == "1"
+    plain_env = SuiteResult.load(plain)["environment"]["selection_env"]
+    tuned_env = SuiteResult.load(tuned)["environment"]["selection_env"]
+    assert set(selection_env.SELECTION_ENV) <= set(plain_env)
+    assert plain_env["HIPDNN_FORCE_BENCHMARKING"] is None
+    assert tuned_env["HIPDNN_FORCE_BENCHMARKING"] == "1"
+    assert plain_env["HIPDNN_CACHE_DIR"] != tuned_env["HIPDNN_CACHE_DIR"]
+    assert not Path(plain_env["HIPDNN_CACHE_DIR"]).exists()
 
 
 def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
@@ -744,48 +743,19 @@ def _warnings(text: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "env, argv, expected",
-    [
-        ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-        ),
-        ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_CACHE=1",
-        ),
-        (
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "1"},
-            ["--warmup", "0"],  # priming always runs untimed: nothing to warn
-            None,
-        ),
-    ],
-    ids=[
-        "exact-cache-on",
-        "exact-cache-zero",
-        "provider-cache-on",
-        "provider-cache-zero",
-        "cold",
-    ],
+    "argv, warned",
+    [([], False), (["--hipdnn-cache-dir", "SHARED"], True)],
+    ids=["private", "shared"],
 )
-def test_oracle_warns_on_non_cold_baseline(
-    tmp_path, runtime, monkeypatch, env, argv, expected
+def test_oracle_warns_only_on_a_shared_hipdnn_cache(
+    tmp_path, runtime, argv, warned
 ) -> None:
-    for name in ("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "HIPDNN_DISABLE_CACHE"):
-        monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
+    """A private cache is empty, so the OOTB plan cannot replay an earlier
+    run's ranking; a shared one can."""
+    argv = [str(tmp_path / "cache") if a == "SHARED" else a for a in argv]
     runtime(lambda path: _graph(path, [_passed()]))
     _, text = _run(_args("--oracle", *argv), _graphs(tmp_path, 1))
-    warnings = _warnings(text)
-    if expected is None:
-        assert warnings == ""
-    else:
-        assert expected in warnings
+    assert ("shared hipDNN cache" in _warnings(text)) == warned
 
 
 def test_final_write_survives_a_second_signal(
@@ -813,7 +783,7 @@ def test_final_write_survives_a_second_signal(
 def test_oracle_states_the_tuned_plan_knob(tmp_path, runtime, flag) -> None:
     runtime(lambda path: _graph(path, [_passed()]))
     _, text = _run(_args(flag), _graphs(tmp_path, 1))
-    notice = "each engine gets a second plan built with global.benchmarking=1"
+    notice = "each engine's tuned plan (global.benchmarking=1) runs in a child process"
     assert (notice in text) == (flag == "--oracle")
 
 
@@ -827,7 +797,7 @@ def test_forced_benchmarking_warns_it_overrides_the_tuned_knob(
     if forced is not None:
         monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", forced)
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle"), _graphs(tmp_path, 1))
+    _, text = _run(_args("--oracle", "--allow-selection-env"), _graphs(tmp_path, 1))
     assert ("overrides the global.benchmarking knob" in _warnings(text)) == warned
 
 

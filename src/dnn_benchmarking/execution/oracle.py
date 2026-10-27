@@ -3,11 +3,14 @@
 
 """Oracle pass: time a tuned run next to a row's OOTB run.
 
-hipDNN rows get a second plan for the same engine, built with the
-``global.benchmarking`` knob (:func:`build_tuned_plan`) right after the OOTB
-build and timed after the OOTB loop (:func:`run_tuned_plan`). PyTorch rows get
-a tuned run in an isolated child process (:func:`run_pytorch_tuned`). A failed
-tuned run sets ``row.oracle_error`` and never fails the row.
+Every tuned run executes in a child process, so no tuning state reaches the
+benchmark process. hipDNN rows get the same engine built with the
+``global.benchmarking`` knob (:func:`run_hipdnn_tuned`,
+``execution.hipdnn_tuned_child``): hipDNN keeps a tuned winner in memory and
+serves it to every later build of the same graph and engine, so an in-process
+search would leak into later OOTB rows. PyTorch rows get a tuned run of the
+normal CLI (:func:`run_pytorch_tuned`). A failed tuned run sets
+``row.oracle_error`` and never fails the row.
 """
 
 import json
@@ -15,10 +18,11 @@ import os
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
@@ -29,26 +33,7 @@ from ..reporting.statistics import BenchmarkStats, TimingInfo
 from ..reporting.suite_results import OracleResult, ProviderEngineResult
 from ..validation import ReferenceOutput
 from .correctness import check_correctness
-from .executor import Executor
-from .timing import StallFallbackError
-
-#: hipDNN knob that makes a provider sample its candidate kernels on the first
-#: execute() and keep the fastest (kernel ingestor, MIOpen).
-BENCHMARKING_KNOB = "global.benchmarking"
-
-# A benchmarking plan writes its winner to the hipDNN disk cache, and cache
-# reads are not gated on benchmarking, so a later OOTB row would serve it.
-# ponytail: process-global guard; concurrent execution needs process isolation.
-_TUNED_ENV = {"HIPDNN_DISABLE_CACHE": "1"}
-
-# hipDNN also keeps each winner in memory for the life of the process, even
-# with HIPDNN_DISABLE_CACHE=1, and serves it to every later build of the same
-# graph content and engine, with or without the knob. An OOTB build of a pair
-# listed here would time the tuned kernel. Filled when a tuned plan executes.
-# ponytail: keyed by graph_id (exact JSON), so graphs that differ only in
-# names or UIDs still share hipDNN's content key; a child process per tuned
-# hipDNN pass removes this registry.
-_TUNED_IN_PROCESS: Set[Tuple[str, int]] = set()
+from .timing import Measurement, StallFallbackError
 
 #: Node types whose PyTorch kernel the tuned child searches: MIOpen
 #: exhaustive conv search (cudnn.benchmark) and TunableOp GEMMs.
@@ -60,35 +45,6 @@ _PYTORCH_TUNABLE_OPS = frozenset(
         "MatmulAttributes",
     }
 )
-
-
-def tuned_in_process(graph_id: str, engine_id: int) -> bool:
-    """True when this engine already executed a tuned plan for this graph."""
-    return (graph_id, engine_id) in _TUNED_IN_PROCESS
-
-
-@contextmanager
-def _tuned_env() -> Iterator[None]:
-    """Disable hipDNN disk caches and restore the prior environment."""
-    previous = {name: os.environ.get(name) for name in _TUNED_ENV}
-    os.environ.update(_TUNED_ENV)
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-
-@dataclass
-class TunedPlan:
-    """A built tuned plan waiting for :func:`run_tuned_plan`."""
-
-    executor: Executor
-    handle: Any
-    tuning_available: bool
 
 
 def _record_error(row: ProviderEngineResult, what: str, e: Exception) -> None:
@@ -104,100 +60,153 @@ def _set_throughputs(oracle: OracleResult, row: ProviderEngineResult) -> None:
     )
 
 
-def build_tuned_plan(
+def _run_child(
+    what: str,
+    argv: List[str],
+    env: Dict[str, str],
+    output: Path,
+    config: SuiteConfig,
+) -> Dict[str, Any]:
+    """Run a tuned child and return the JSON document it wrote to ``output``.
+
+    Raises:
+        RuntimeError: If the child times out (``--profiling-timeout``) or
+            writes no output; the message carries its last error line.
+    """
+    timeout_s = config.metrics.profiling_timeout_s or None
+    try:
+        proc = run_capped(argv, timeout_s, env=env)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"{what} timed out after {timeout_s} s (--profiling-timeout)"
+        ) from None
+    if not output.is_file():
+        lines = [
+            line.strip()
+            for line in f"{proc.stdout or ''}\n{proc.stderr or ''}".splitlines()
+            if line.strip()
+        ]
+        errors = [line for line in lines if "error" in line.lower()]
+        detail = (errors or lines or ["no output"])[-1]
+        raise RuntimeError(f"{what} exited {proc.returncode}: {detail}")
+    return json.loads(output.read_text())
+
+
+def hipdnn_tuned_env(state_dir: Path) -> Dict[str, str]:
+    """Environment of the tuned-hipDNN child.
+
+    hipDNN disk caches are off, so the search neither reads an earlier
+    ranking nor writes one. MIOpen's user database is private to the child,
+    so the run's OOTB rows never read the search's find results.
+    """
+    miopen = state_dir / "miopen"
+    miopen.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    env.update({"HIPDNN_DISABLE_CACHE": "1", "MIOPEN_USER_DB_PATH": str(miopen)})
+    return env
+
+
+class _ChildOutputs:
+    """The child's outputs, in the form :func:`check_correctness` reads."""
+
+    def __init__(self, arrays: Dict[int, np.ndarray]) -> None:
+        self._arrays = arrays
+
+    def get_output_tensor(self, uid: int) -> None:
+        return None  # host arrays only: compare on the host
+
+    def get_output_data(self, uid: int) -> Optional[np.ndarray]:
+        return self._arrays.get(uid)
+
+
+def run_hipdnn_tuned(
     *,
     row: ProviderEngineResult,
-    handle: Any,
-    engine_id: int,
     graph_json_str: str,
     graph_name: str,
-    config: SuiteConfig,
-) -> Optional[TunedPlan]:
-    """Build this engine's tuned plan right after its OOTB build.
-
-    The tuned plan goes through the same timed build as the OOTB plan, for
-    the same engine, with ``global.benchmarking=1``. Building it before
-    anything executes keeps both build times in the same process state: work
-    in between (the OOTB timed loop, validation) slows a later build.
-
-    Returns:
-        The plan for :func:`run_tuned_plan`, or None after recording
-        ``row.oracle_error``.
-    """
-    try:
-        with _tuned_env():
-            # Isolate MIOpen's mutable per-handle solver map from the OOTB plan.
-            oracle_handle = type(handle)()
-            oracle_handle.set_stream(handle.get_stream())
-            executor = Executor(graph_json_str, config.timing_policy)
-            executor.prepare(
-                oracle_handle, engine_id=engine_id, knobs={BENCHMARKING_KNOB: 1}
-            )
-            # hipDNN ignores a knob the engine does not expose; such a tuned
-            # run re-measures the OOTB configuration.
-            available = BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id)
-        return TunedPlan(executor, oracle_handle, available)
-    except Exception as e:
-        _record_error(row, f"{graph_name} engine {engine_id}", e)
-        return None
-
-
-def run_tuned_plan(
-    *,
-    tuned: TunedPlan,
-    row: ProviderEngineResult,
-    graph_id: str,
     engine_id: int,
-    graph_name: str,
+    plugin_path: Optional[str],
     config: SuiteConfig,
-    bm: Any,
-    variant_pack: Dict[int, int],
     tensor_infos: List[TensorInfo],
     reference_outputs: Optional[Dict[int, ReferenceOutput]],
 ) -> None:
-    """Time and validate the tuned plan; attach it as ``row.oracle``.
+    """Time and validate the engine's tuned plan in a child; set ``row.oracle``.
 
-    ``measure`` makes one untimed first launch before the warmups. With
-    benchmarking on, that launch samples every candidate and keeps the
-    fastest, so the search cost lands in ``timing.first_call_ms`` and the
-    tuned plan gets the same warmups as the OOTB plan.
+    Call after the OOTB buffers and plan are released, so the child's
+    allocations do not stack on top of them. The child regenerates the
+    inputs from the run seed. ``measure`` makes one untimed first launch
+    before the warmups; with benchmarking on, that launch samples every
+    candidate and keeps the fastest, so the search cost lands in
+    ``timing.first_call_ms`` and the tuned plan gets the same warmups as the
+    OOTB plan.
+
+    Raises:
+        StallFallbackError: The child's stall gate failed; the suite runner
+            remeasures the whole graph unstalled. Other failures set
+            ``row.oracle_error``.
     """
     try:
-        with _tuned_env():
-            if tuned.tuning_available:
-                # Before the launch: a search that fails part way may still
-                # leave a winner behind.
-                _TUNED_IN_PROCESS.add((graph_id, engine_id))
-            bm.zero_outputs()
-            m = tuned.executor.benchmark(tuned.handle, variant_pack)
-            oracle = OracleResult(
-                tuning_available=tuned.tuning_available,
-                cpu_build_time_ms=tuned.executor.build_time_ms,
-                timing=TimingInfo.from_measurement(m),
-                gpu_kernel_stats=BenchmarkStats.from_timings(m.kernel_ms),
-                host_stats=BenchmarkStats.from_timings(m.host_ms),
-                workspace_bytes=(
-                    tuned.executor.workspace_size if config.metrics.basic else None
-                ),
-            )
-            _set_throughputs(oracle, row)
-
-            if reference_outputs is not None:
-                bm.zero_outputs()
-                tuned.executor.execute_once(tuned.handle, variant_pack)
-                oracle.correctness = check_correctness(
-                    bm,
-                    tensor_infos,
-                    reference_outputs,
-                    config.validation.provider.value,
-                    config,
+        with tempfile.TemporaryDirectory(prefix="dnn-bench-hipdnn-tuned-") as d:
+            state = Path(d)
+            request = state / "request.json"
+            request.write_text(
+                json.dumps(
+                    {
+                        "graph_json": graph_json_str,
+                        "engine_id": engine_id,
+                        "plugin_path": plugin_path,
+                        "seed": config.seed,
+                        "policy": asdict(config.timing_policy),
+                        "outputs": reference_outputs is not None,
+                        "workspace": config.metrics.basic,
+                    }
                 )
-                if oracle.correctness.explicitly_failed:
-                    warn_once(
-                        "oracle_correctness",
-                        f"tuned plan for {graph_name} engine {engine_id} failed "
-                        "validation; no speedup is reported",
-                    )
+            )
+            result = _run_child(
+                "tuned hipDNN child",
+                [
+                    sys.executable,
+                    "-m",
+                    "dnn_benchmarking.execution.hipdnn_tuned_child",
+                    str(request),
+                ],
+                hipdnn_tuned_env(state),
+                state / "result.json",
+                config,
+            )
+            if "stall" in result:
+                raise StallFallbackError(result["stall"])
+            if "error" in result:
+                raise RuntimeError(result["error"])
+            outputs = None
+            if reference_outputs is not None:
+                with np.load(state / "outputs.npz") as saved:
+                    outputs = {int(uid): saved[uid] for uid in saved.files}
+
+        m = Measurement(**result["measurement"])
+        oracle = OracleResult(
+            tuning_available=result["tuning_available"],
+            cpu_build_time_ms=result["cpu_build_time_ms"],
+            timing=TimingInfo.from_measurement(m),
+            gpu_kernel_stats=BenchmarkStats.from_timings(m.kernel_ms),
+            host_stats=BenchmarkStats.from_timings(m.host_ms),
+            workspace_bytes=result["workspace_bytes"],
+        )
+        _set_throughputs(oracle, row)
+        if outputs is not None:
+            oracle.correctness = check_correctness(
+                _ChildOutputs(outputs),
+                tensor_infos,
+                reference_outputs,
+                config.validation.provider.value,
+                config,
+            )
+            if oracle.correctness.explicitly_failed:
+                warn_once(
+                    "oracle_correctness",
+                    f"tuned plan for {graph_name} engine {engine_id} failed "
+                    "validation; no speedup is reported",
+                )
         row.oracle = oracle
     except StallFallbackError:
         raise  # The suite runner remeasures the whole graph unstalled.
@@ -211,7 +220,8 @@ def _pytorch_tuned_argv(
     """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle.
 
     The child's untimed first launch runs the tuning search, so it gets the
-    same warmup and sampling settings as the OOTB row.
+    same warmup and sampling settings as the OOTB row. It keeps the
+    selection variables its parent sets (``--allow-selection-env``).
     """
     argv = [
         sys.executable,
@@ -221,6 +231,7 @@ def _pytorch_tuned_argv(
         "pytorch",
         "--no-metrics",
         "--quiet",
+        "--allow-selection-env",
         "--graph",
         str(graph_path),
         "--warmup",
@@ -260,30 +271,13 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
 
     with tempfile.TemporaryDirectory(prefix="dnn-bench-pytorch-tuned-") as state_dir:
         output = Path(state_dir) / "result.json"
-        timeout_s = config.metrics.profiling_timeout_s or None
-        try:
-            proc = run_capped(
-                _pytorch_tuned_argv(graph_path, config, output),
-                timeout_s,
-                env=tuned_subprocess_env(state_dir),
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"tuned PyTorch child timed out after {timeout_s} s "
-                "(--profiling-timeout)"
-            ) from None
-        if not output.is_file():
-            lines = [
-                line.strip()
-                for line in f"{proc.stdout or ''}\n{proc.stderr or ''}".splitlines()
-                if line.strip()
-            ]
-            errors = [line for line in lines if "error" in line.lower()]
-            detail = (errors or lines or ["no output"])[-1]
-            raise RuntimeError(
-                f"tuned PyTorch child exited {proc.returncode}: {detail}"
-            )
-        document = json.loads(output.read_text())
+        document = _run_child(
+            "tuned PyTorch child",
+            _pytorch_tuned_argv(graph_path, config, output),
+            tuned_subprocess_env(state_dir),
+            output,
+            config,
+        )
     rows = [row for graph in document["graphs"] for row in graph["results"]]
     if len(rows) != 1:
         raise RuntimeError(f"tuned PyTorch child returned {len(rows)} rows")
