@@ -8,8 +8,9 @@ Benchmarking and validation tool for hipDNN graphs.
 dnn-benchmarking loads serialized hipDNN graphs (JSON). It runs each graph
 through the installed hipDNN engine plugins, through PyTorch with
 `--runtime pytorch`, or through rocKE SDPA kernels with `--runtime rocke`.
-For each engine it measures the device time of one launch and, if you ask,
-compares the output with a PyTorch reference.
+A comma list such as `--runtime hipdnn,rocke` puts the rows of each runtime
+in the same run. For each engine it measures the device time of one launch
+and, if you ask, compares the output with a PyTorch reference.
 
 - One timed loop for all runtimes. The headline number is the median device
   time per launch (`kernel_med`), measured with a stall-gated event span.

@@ -553,7 +553,7 @@ examples:
       --plugin-path /path/to/build_a/engines,/path/to/build_b/engines
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
   dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
-  dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime rocke --timing-block 50
+  dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke --timing-block 50
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
 engines:

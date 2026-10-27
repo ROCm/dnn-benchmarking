@@ -47,7 +47,7 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime {hipdnn,pytorch,rocke}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). See [rocKE runtime](#rocke-runtime). |
+| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
@@ -154,15 +154,45 @@ To list the engine names and IDs of a plugin directory, run
 
 The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 
+## Several runtimes
+
+`--runtime` takes one runtime or a comma list. With a list, each runtime adds
+its rows to the same graph, in one process and one result file:
+
+```bash
+dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+  --validate pytorch --timing-block 50 -o results.json
+```
+
+- The runtimes run in the order `hipdnn`, `pytorch`, `rocke`, whatever the
+  typed order. hipDNN loads its HIP runtime before torch does, and its rows
+  exist before a later runtime can stop the process.
+- All runtimes use the same inputs. `--validate pytorch` gives one reference
+  row per graph, and every engine row is checked against it.
+- A runtime that cannot run a graph adds no rows and does not change the
+  graph status. A graph is `no engines applicable` only when no runtime runs
+  it. The message then gives the reason of each runtime.
+- When the selection of one runtime fails, the graph is an error, and the
+  rows of the other runtimes are kept.
+- An option is accepted when one selected runtime supports it. It applies to
+  the rows of that runtime only. For example, `-e` and `--oracle` with
+  `hipdnn,rocke` select and tune hipDNN engines; the rocKE rows do not
+  change. `--validate pytorch` is not accepted when the list has `pytorch`:
+  the reference row would time the same PyTorch graph again.
+- `run.config.runtime` is the first runtime, and `run.config.runtimes` lists
+  all of them (see [results-schema.md](results-schema.md)).
+
 ## PyTorch runtime
 
 `--runtime pytorch` runs each graph through PyTorch and gives one
 `runtime = "pytorch"` row per graph. It uses the same timed loop, output
 format and result schema as the hipDNN backend. It runs on ROCm and on CUDA.
 
-These options are hipDNN-only. With `--runtime pytorch` they stop the run
-with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`, `--pmc`,
-`--trace`, `--perf`, `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
+These options are hipDNN-only. With `--runtime pytorch` alone they stop the
+run with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`,
+`--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
+`--hipdnn-cache-dir`. In a runtime list they apply to the hipDNN rows (see
+[Several runtimes](#several-runtimes)).
 `--oracle` is accepted: the PyTorch row gets a tuned run (see
 [PyTorch kernel selection](#pytorch-kernel-selection)).
 
@@ -223,7 +253,8 @@ MIOpen plugin reads them too, so they would also change the hipDNN rows.
 hipDNN. Use it to compare rocKE with hipDNN on the same graphs. The rows use
 the same inputs, timed loop, FLOP count and result schema as the hipDNN rows.
 
-Each graph gets these `runtime = "rocke"` rows:
+Each graph gets these `runtime = "rocke"` rows. The row name is also the
+row's `engine.id`:
 
 | Row | Kernel |
 |---|---|
@@ -278,27 +309,30 @@ Requirements and limits:
   `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
-  verified on gfx1250. A graph that no rocKE kernel runs reports
-  `no engines applicable` with the reasons.
+  verified on gfx1250. With `--runtime rocke` alone, a graph that no rocKE
+  kernel runs reports `no engines applicable` with the reasons. In a runtime
+  list it gets no rocKE rows.
 - `build_ms` is the rocKE build and load time. For a variant row the build
   is the compile time in the child process. For the auto row it also
   includes the first launch, because rocKE compiles the unified kernel inside
   its launch call.
-- `--plugin-path` selects the descriptor directory. These options stop the
-  run with exit code 2: `--engine`, `--oracle`, `--pmc`, `--trace`, `--perf`,
-  `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
+- `--plugin-path` selects the descriptor directory. With `--runtime rocke`
+  alone, these options stop the run with exit code 2: `--engine`, `--oracle`,
+  `--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
+  `--hipdnn-cache-dir`.
+
+To compare rocKE with hipDNN, run both runtimes in one run:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime rocke \
-  --timing-block 50 -o rocke.json
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz \
-  -e hipkernel:Gfx950AttentionDense --timing-block 50 -o hipdnn.json
-dnn-benchmark compare hipdnn.json rocke.json
+dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+  -e hipkernel:Gfx950AttentionDense --timing-block 50 -o both.json
 ```
 
-`compare --by best` pairs the fastest rocKE row with the hipDNN row. `--by
-engine` does not pair them, because the row key includes the runtime. Read the
-per-variant rows in the rocKE result file.
+`-e` selects the hipDNN engine only; every applicable rocKE row still runs.
+Each graph's table lists the hipDNN row and the rocKE rows, and `vs_best`
+compares them. Two result files, one for each runtime, also work:
+`compare --by best` pairs the fastest rocKE row with the hipDNN row.
+`--by engine` does not pair them, because the row key includes the runtime.
 
 ## Kernel selection (`--autotune`, `--hipdnn-cache-dir`)
 

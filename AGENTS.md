@@ -22,6 +22,14 @@ rocKE Python packages: each hipDNN-shipped `Gfx950AttentionDense` variant
 that applies, plus rocKE's auto-dispatched kernel. It shares the same timed
 loop and result schema, and compares with the hipDNN rows of the same graphs.
 
+`--runtime` takes a comma list (default `hipdnn`). Each runtime is a planner
+(`suite_runner.GraphPlanner`) that turns a graph into a `RuntimePlan`: its
+engines, or why none applies. `suite_runner.run_graph` composes any planners:
+one input set and one reference per graph, then the rows of each runtime. To
+add a runtime, add a `RuntimeName` member, its options in
+`benchmark_config.RUNTIME_OPTIONS`, a planner, and a starter in
+`runtimes._STARTERS`.
+
 User documentation:
 
 - `README.md`: quick start.
@@ -115,20 +123,24 @@ src/dnn_benchmarking/
 ```
 
 Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
-each graph: `GraphLoader` -> `suite_runner.run_graph_all_providers` ->
-`Executor` + `BufferManager` -> `timing.measure` -> correctness, oracle,
-profiling -> `GraphResult` -> `Reporter` and `SuiteResult.write`.
+each graph: `GraphLoader` -> `suite_runner.run_graph` with
+`hipdnn_planner` -> `Executor` + `BufferManager` -> `timing.measure` ->
+correctness, oracle, profiling -> `GraphResult` -> `Reporter` and
+`SuiteResult.write`.
 
-Data flow (PyTorch): the same, with `run_graph_pytorch`,
-`PyTorchCudaExecutor` and `PyTorchCudaBufferManager`. One
-`runtime = "pytorch"` row per graph. No engine discovery or plugins.
+Data flow (PyTorch): the same, with `pytorch_plan`, `PyTorchCudaExecutor`
+and `PyTorchCudaBufferManager`. One `runtime = "pytorch"` row per graph. No
+engine discovery or plugins.
 
-Data flow (rocKE): the same, with `run_graph_rocke`, `RockeExecutor` and
+Data flow (rocKE): the same, with `rocke_planner`, `RockeExecutor` and
 `PyTorchCudaBufferManager`. The catalog joins the installed hip-kernel-provider
 descriptors (shipped code-object hashes) with the authored descriptors in the
 checkout of the installed `rocke` package (rocKE specs), once per suite
 (`rocke_session`).
 One `runtime = "rocke"` row per applicable kernel.
+
+With several runtimes, `run_graph` gets one planner per runtime, in
+`RuntimeName` order.
 
 Rules that keep the design intact:
 
