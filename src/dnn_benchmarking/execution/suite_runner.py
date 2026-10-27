@@ -1,12 +1,12 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Per-graph engine iteration: one timed row per engine (plus PyTorch rows).
+"""Per-graph row iteration: every selected runtime adds its rows to the graph.
 
-Uses explicit ``--engine`` IDs in caller order when provided; otherwise
-discovers ranked engine IDs for the graph via ``Graph.get_ranked_engine_ids``.
-Every row is timed by ``timing.measure`` (through the executors) and, with
-``--validate``, compared against reference outputs computed once per graph.
+Each runtime turns a graph into a :class:`RuntimePlan` (its engines, or why
+none applies) before inputs exist. :func:`run_graph` then generates inputs and
+the ``--validate`` reference once, and appends each runtime's rows in run
+order. Every row is timed by ``timing.measure`` (through the executors).
 """
 
 import copy
@@ -14,10 +14,20 @@ import gc
 import json
 import re
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import PyTorchSdpaBackendName, SuiteConfig
@@ -730,6 +740,171 @@ def _with_stall_fallback(
     return run(unstalled)
 
 
+@dataclass
+class RuntimePlan:
+    """What one runtime runs for one graph, decided before inputs exist.
+
+    Attributes:
+        runtime: Runtime name; it prefixes ``message`` and ``error`` when a
+            run selects several runtimes.
+        engine_ids: Engines that apply (0 for each non-hipDNN row); empty
+            means none.
+        rows: Builds the rows. It gets the shared graph context, or None when
+            no plan of the graph needs inputs.
+        message: Why no engine applies.
+        error: Why selection failed; the runtime then adds no rows.
+        needs_inputs: The rows, or the reference row this runtime promises
+            for a graph without engines, need generated inputs.
+    """
+
+    runtime: str
+    engine_ids: List[int] = field(default_factory=list)
+    rows: Callable[[Optional[_GraphContext]], List[ProviderEngineResult]] = (
+        lambda ctx: []
+    )
+    message: Optional[str] = None
+    error: Optional[str] = None
+    needs_inputs: bool = False
+
+
+#: ``plan(graph_path, graph_json, tensor_infos, config, reporter)``. A new
+#: runtime adds one planner; :func:`run_graph` composes any of them.
+GraphPlanner = Callable[
+    [Path, Dict[str, Any], list, SuiteConfig, Reporter], RuntimePlan
+]
+
+
+def run_graph(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+    planners: Sequence[GraphPlanner],
+) -> GraphResult:
+    """Run one graph through every planner's runtime, in order.
+
+    Inputs and the ``--validate`` reference row are computed once and shared
+    by every runtime. A runtime that does not apply adds no rows; its reason
+    becomes ``GraphResult.message`` only when no runtime applies. A selection
+    failure sets ``GraphResult.error`` and the other runtimes still run. A
+    stall-gate failure reruns the whole graph without stalling
+    (``_with_stall_fallback``), so all rows share one timing mode.
+    """
+    return _with_stall_fallback(
+        lambda cfg: _run_graph(
+            graph_path, graph_json, tensor_infos, cfg, reporter, planners
+        ),
+        config,
+        reporter,
+    )
+
+
+def _run_graph(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+    planners: Sequence[GraphPlanner],
+) -> GraphResult:
+    """One attempt of :func:`run_graph` with ``config``'s policy."""
+    graph = GraphResult(
+        graph_name=graph_json.get("name", graph_path.stem),
+        graph_path=str(graph_path),
+        results=[],
+        graph_id=graph_id_for(graph_json),
+    )
+    plans = [
+        plan(graph_path, graph_json, tensor_infos, config, reporter)
+        for plan in planners
+    ]
+
+    def labelled(plan: RuntimePlan, text: str) -> str:
+        return f"{plan.runtime}: {text}" if len(plans) > 1 else text
+
+    errors = [labelled(p, p.error) for p in plans if p.error is not None]
+    graph.error = "; ".join(errors) or None
+    graph.engine_ids = [e for p in plans for e in p.engine_ids]
+    if not graph.engine_ids:
+        messages = [labelled(p, p.message) for p in plans if p.message]
+        graph.message = "; ".join(messages) or None
+
+    ctx: Optional[_GraphContext] = None
+    if any(p.needs_inputs for p in plans):
+        try:
+            ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
+        except Exception as e:
+            errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
+            graph.error = "; ".join(errors)
+            return graph
+        ctx.graph_json_str, ctx.graph_id = json.dumps(graph_json), graph.graph_id
+        if config.validation.enabled:
+            reference_row = _prepare_references(ctx)
+            if reference_row is not None:
+                graph.results.append(reference_row)
+
+    for plan in plans:
+        graph.results.extend(plan.rows(ctx))
+    return graph
+
+
+def hipdnn_planner(handle: Any) -> GraphPlanner:
+    """Plan every selected or discovered hipDNN engine.
+
+    Explicit ``--engine`` IDs run in the caller's order; otherwise the graph's
+    ranked engines are discovered. A graph without engines still needs inputs:
+    with ``--validate pytorch`` the timed PyTorch reference row is emitted
+    when PyTorch can run the graph.
+
+    Args:
+        handle: hipdnn.Handle, or None to create one per engine (per-engine
+            plugin paths).
+    """
+
+    def plan(
+        graph_path: Path,
+        graph_json: Dict[str, Any],
+        tensor_infos: list,
+        config: SuiteConfig,
+        reporter: Reporter,
+    ) -> RuntimePlan:
+        message = None
+        if config.engine_filter is not None:
+            # Explicit --engine is a selection, not a post-discovery filter.
+            # Keep the caller's order so per-engine plugin paths are
+            # deterministic.
+            engine_ids = list(config.engine_filter)
+        else:
+            try:
+                # SuiteConfig requires --engine with several plugin paths, so
+                # the shared handle exists whenever discovery runs. The
+                # discovery graph is a temporary: it is not kept alive for the
+                # engine rows.
+                engine_ids = Executor(
+                    json.dumps(graph_json), config.timing_policy
+                ).discover_engines(handle)
+            except UnsupportedGraphError as e:
+                engine_ids, message = [], str(e)
+            except Exception as e:
+                return RuntimePlan(
+                    "hipdnn", error=f"Engine discovery failed: {type(e).__name__}: {e}"
+                )
+        selections = config.engine_selections_for(engine_ids)
+        return RuntimePlan(
+            "hipdnn",
+            engine_ids=engine_ids,
+            rows=lambda ctx: [
+                _run_engine_selection(ctx, handle, s.engine_id, s.plugin_path)
+                for s in selections
+            ],
+            message=message,
+            needs_inputs=True,
+        )
+
+    return plan
+
+
 def run_graph_all_providers(
     graph_path: Path,
     graph_json: Dict[str, Any],
@@ -738,88 +913,10 @@ def run_graph_all_providers(
     handle: Any,
     reporter: Reporter,
 ) -> GraphResult:
-    """Run a single graph against every selected or discovered hipDNN engine.
-
-    An unsupported graph (no applicable engine) yields ``engine_ids=[]`` and
-    no engine rows; with ``--validate pytorch`` the timed PyTorch reference
-    row is still emitted when PyTorch can run the graph. Discovery and input
-    generation failures set ``GraphResult.error``. A stall-gate failure
-    reruns the whole graph without stalling (``_with_stall_fallback``).
-
-    Args:
-        graph_path: Path to the graph JSON file.
-        graph_json: Parsed graph JSON dictionary.
-        tensor_infos: TensorInfo objects for the graph.
-        config: Suite configuration.
-        handle: hipdnn.Handle, or None to create one per engine (per-engine
-            plugin paths).
-        reporter: Progress sink.
-    """
-    return _with_stall_fallback(
-        lambda cfg: _run_graph_all_providers(
-            graph_path, graph_json, tensor_infos, cfg, handle, reporter
-        ),
-        config,
-        reporter,
+    """Run a single graph against every selected or discovered hipDNN engine."""
+    return run_graph(
+        graph_path, graph_json, tensor_infos, config, reporter, [hipdnn_planner(handle)]
     )
-
-
-def _run_graph_all_providers(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    handle: Any,
-    reporter: Reporter,
-) -> GraphResult:
-    """One attempt of :func:`run_graph_all_providers` with ``config``'s policy."""
-    graph = GraphResult(
-        graph_name=graph_json.get("name", graph_path.stem),
-        graph_path=str(graph_path),
-        results=[],
-        graph_id=graph_id_for(graph_json),
-    )
-
-    graph_json_str = json.dumps(graph_json)
-    if config.engine_filter is not None:
-        # Explicit --engine is a selection, not a post-discovery filter. Keep
-        # the caller's order so per-engine plugin paths are deterministic.
-        engine_ids = list(config.engine_filter)
-    else:
-        try:
-            # SuiteConfig requires --engine with several plugin paths, so the
-            # shared handle exists whenever discovery runs. The discovery
-            # graph is a temporary: it is not kept alive for the engine rows.
-            engine_ids = Executor(
-                graph_json_str, config.timing_policy
-            ).discover_engines(handle)
-        except UnsupportedGraphError as e:
-            engine_ids = []
-            graph.message = str(e)
-        except Exception as e:
-            graph.error = f"Engine discovery failed: {type(e).__name__}: {e}"
-            return graph
-    graph.engine_ids = engine_ids
-
-    try:
-        ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
-        ctx.graph_json_str, ctx.graph_id = graph_json_str, graph.graph_id
-    except Exception as e:
-        graph.error = f"Input data generation failed: {type(e).__name__}: {e}"
-        return graph
-
-    if config.validation.enabled:
-        reference_row = _prepare_references(ctx)
-        if reference_row is not None:
-            graph.results.append(reference_row)
-
-    for selection in config.engine_selections_for(engine_ids):
-        graph.results.append(
-            _run_engine_selection(
-                ctx, handle, selection.engine_id, selection.plugin_path
-            )
-        )
-    return graph
 
 
 def _run_engine_selection(
@@ -858,44 +955,18 @@ def _run_engine_selection(
     )
 
 
-def run_graph_pytorch(
+def pytorch_plan(
     graph_path: Path,
     graph_json: Dict[str, Any],
     tensor_infos: list,
     config: SuiteConfig,
     reporter: Reporter,
-) -> GraphResult:
-    """Run a single graph through the PyTorch executor as the sole engine row.
+) -> RuntimePlan:
+    """Plan the graph through the PyTorch executor as one engine row.
 
-    The ``--runtime pytorch`` counterpart of :func:`run_graph_all_providers`:
-    no hipDNN engine discovery, plugins, or reference validation.
+    An unsupported operation gives an error or skipped row without inputs
+    (a static inspection).
     """
-    return _with_stall_fallback(
-        lambda cfg: _run_graph_pytorch(
-            graph_path, graph_json, tensor_infos, cfg, reporter
-        ),
-        config,
-        reporter,
-    )
-
-
-def _run_graph_pytorch(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    reporter: Reporter,
-) -> GraphResult:
-    graph = GraphResult(
-        graph_name=graph_json.get("name", graph_path.stem),
-        graph_path=str(graph_path),
-        results=[],
-        engine_ids=[0],
-        graph_id=graph_id_for(graph_json),
-    )
-
-    # Unsupported operations are an unsupported-graph signal, checked before
-    # input generation (a static inspection).
     from . import pytorch_ops
 
     unsupported = sorted(pytorch_ops.get_unsupported_operations(graph_json))
@@ -904,25 +975,38 @@ def _run_graph_pytorch(
         make = _error_or_skip(
             config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
         )
-        graph.results.append(
-            _report_row(
-                reporter,
-                "pytorch",
-                lambda: make("pytorch", None, msg, engine_name="pytorch"),
-            )
+        return RuntimePlan(
+            "pytorch",
+            engine_ids=[0],
+            rows=lambda ctx: [
+                _report_row(
+                    reporter,
+                    "pytorch",
+                    lambda: make("pytorch", None, msg, engine_name="pytorch"),
+                )
+            ],
         )
-        return graph
-
-    try:
-        ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
-    except Exception as e:
-        graph.error = f"Input data generation failed: {type(e).__name__}: {e}"
-        return graph
-
-    graph.results.append(
-        _report_row(reporter, "pytorch", lambda: _run_pytorch_row(ctx, "engine")[0])
+    return RuntimePlan(
+        "pytorch",
+        engine_ids=[0],
+        rows=lambda ctx: [
+            _report_row(reporter, "pytorch", lambda: _run_pytorch_row(ctx, "engine")[0])
+        ],
+        needs_inputs=True,
     )
-    return graph
+
+
+def run_graph_pytorch(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+) -> GraphResult:
+    """Run a single graph through the PyTorch executor as the sole engine row."""
+    return run_graph(
+        graph_path, graph_json, tensor_infos, config, reporter, [pytorch_plan]
+    )
 
 
 @dataclass(frozen=True)
@@ -983,6 +1067,70 @@ def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
     )
 
 
+def rocke_planner(session: RockeSession) -> GraphPlanner:
+    """Plan every rocKE kernel that runs an SDPA graph.
+
+    One row for each hipDNN-shipped variant that runs the graph, then one row
+    for rocKE's auto kernel. A graph that no rocKE kernel runs gets no rows
+    and no inputs; alone, its status is ``no_engines``.
+    """
+
+    def plan(
+        graph_path: Path,
+        graph_json: Dict[str, Any],
+        tensor_infos: list,
+        config: SuiteConfig,
+        reporter: Reporter,
+    ) -> RuntimePlan:
+        try:
+            problem = sdpa_problem(graph_json, tensor_infos)
+            kernels: List[RockeKernel] = list(catalog_kernels(session.catalog, problem))
+            reasons = [] if kernels else ["no hipDNN-shipped rocKE variant matches"]
+            try:
+                kernels.append(auto_kernel(problem, session.arch, session.num_cus))
+            except UnsupportedGraphError as e:
+                reasons.append(str(e))
+        except UnsupportedGraphError as e:
+            return RuntimePlan("rocke", message=str(e))
+        except Exception as e:
+            return RuntimePlan(
+                "rocke",
+                error=f"rocKE kernel selection failed: {type(e).__name__}: {e}",
+            )
+        if not kernels:
+            return RuntimePlan("rocke", message="; ".join(reasons))
+
+        def rows(ctx: Optional[_GraphContext]) -> List[ProviderEngineResult]:
+            # One torch-free child builds every catalog variant of this graph
+            # with the pack step's comgr (see rocke_build); a failure fails
+            # only those rows.
+            catalog = [k for k in kernels if isinstance(k, CatalogKernel)]
+            built: Dict[str, Union[BuiltKernel, str]] = {}
+            if catalog:
+                try:
+                    results = build_dense_variants([k.spec for k in catalog])
+                    built = {k.name: b for k, b in zip(catalog, results)}
+                except Exception as e:
+                    built = {k.name: f"{type(e).__name__}: {e}" for k in catalog}
+            return [
+                _report_row(
+                    reporter,
+                    kernel.name,
+                    lambda k=kernel: _run_rocke_row(
+                        ctx, k, problem, session, built.get(k.name)
+                    ),
+                )
+                for kernel in kernels
+            ]
+
+        # No hipDNN engine IDs: one 0 sentinel per row, as for PyTorch.
+        return RuntimePlan(
+            "rocke", engine_ids=[0] * len(kernels), rows=rows, needs_inputs=True
+        )
+
+    return plan
+
+
 def run_graph_rocke(
     graph_path: Path,
     graph_json: Dict[str, Any],
@@ -991,88 +1139,15 @@ def run_graph_rocke(
     reporter: Reporter,
     session: RockeSession,
 ) -> GraphResult:
-    """Run a single SDPA graph through every applicable rocKE kernel.
-
-    One row for each hipDNN-shipped variant that runs the graph, then one row
-    for rocKE's auto kernel. A graph that no rocKE kernel runs has status
-    ``no_engines``. ``--validate pytorch`` adds the PyTorch reference row.
-    """
-    return _with_stall_fallback(
-        lambda cfg: _run_graph_rocke(
-            graph_path, graph_json, tensor_infos, cfg, reporter, session
-        ),
+    """Run a single SDPA graph through every applicable rocKE kernel."""
+    return run_graph(
+        graph_path,
+        graph_json,
+        tensor_infos,
         config,
         reporter,
+        [rocke_planner(session)],
     )
-
-
-def _run_graph_rocke(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    reporter: Reporter,
-    session: RockeSession,
-) -> GraphResult:
-    graph = GraphResult(
-        graph_name=graph_json.get("name", graph_path.stem),
-        graph_path=str(graph_path),
-        results=[],
-        graph_id=graph_id_for(graph_json),
-    )
-    try:
-        problem = sdpa_problem(graph_json, tensor_infos)
-        kernels: List[RockeKernel] = list(catalog_kernels(session.catalog, problem))
-        reasons = [] if kernels else ["no hipDNN-shipped rocKE variant matches"]
-        try:
-            kernels.append(auto_kernel(problem, session.arch, session.num_cus))
-        except UnsupportedGraphError as e:
-            reasons.append(str(e))
-    except UnsupportedGraphError as e:
-        graph.message = str(e)
-        return graph
-    except Exception as e:
-        graph.error = f"rocKE kernel selection failed: {type(e).__name__}: {e}"
-        return graph
-    if not kernels:
-        graph.message = "; ".join(reasons)
-        return graph
-    # No hipDNN engine IDs: one 0 sentinel per row, as for PyTorch.
-    graph.engine_ids = [0] * len(kernels)
-
-    try:
-        ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
-    except Exception as e:
-        graph.error = f"Input data generation failed: {type(e).__name__}: {e}"
-        return graph
-
-    if config.validation.enabled:
-        reference_row = _prepare_references(ctx)
-        if reference_row is not None:
-            graph.results.append(reference_row)
-
-    # One torch-free child builds every catalog variant of this graph with the
-    # pack step's comgr (see rocke_build); a failure fails only those rows.
-    catalog = [k for k in kernels if isinstance(k, CatalogKernel)]
-    built: Dict[str, Union[BuiltKernel, str]] = {}
-    if catalog:
-        try:
-            results = build_dense_variants([k.spec for k in catalog])
-            built = {k.name: b for k, b in zip(catalog, results)}
-        except Exception as e:
-            built = {k.name: f"{type(e).__name__}: {e}" for k in catalog}
-
-    for kernel in kernels:
-        graph.results.append(
-            _report_row(
-                reporter,
-                kernel.name,
-                lambda k=kernel: _run_rocke_row(
-                    ctx, k, problem, session, built.get(k.name)
-                ),
-            )
-        )
-    return graph
 
 
 def _run_rocke_row(
@@ -1086,7 +1161,8 @@ def _run_rocke_row(
     config = ctx.config
     row = ProviderEngineResult(
         runtime="rocke",
-        engine_id=None,
+        # The row name is stable across runs, so it is the engine ID.
+        engine_id=kernel.name,
         engine_name=kernel.name,
         status="success",
         engine_version=session.version,

@@ -66,3 +66,33 @@ def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> No
             row.engine_name,
             row.warnings,
         )
+
+
+def test_hipdnn_and_rocke_rows_share_one_graph_run(hipdnn, rocke_gfx950) -> None:
+    """``--runtime hipdnn,rocke``: both row sets in one process and one result.
+
+    ``hipdnn`` comes first in the signature so hipDNN binds HIP before torch
+    loads, as ``start_runtime`` does.
+    """
+    from dnn_benchmarking.cli.runtimes import start_runtime
+
+    graph = sdpa_graph(b=1, hq=32, hkv=8, s=512, d=128)
+    infos = GraphLoader().extract_tensor_info(graph)
+    config = SuiteConfig(
+        runtime="hipdnn,rocke",
+        plugin_paths=rocke_gfx950,
+        warmup_iters=1,
+        benchmark_iters=3,
+        validation=ValidationConfig(provider="pytorch"),
+    )
+
+    result = start_runtime(config, Reporter(output=io.StringIO()))(
+        Path("both.json"), graph, infos
+    )
+
+    assert result.status == "ok", (result.error, result.message)
+    rows = [(r.runtime, r.role, r.engine_name, r.verdict) for r in result.results]
+    assert [r[:2] for r in rows].count(("pytorch", "reference")) == 1, rows
+    assert ("hipdnn", "engine", "hipkernel:Gfx950AttentionDense", "passed") in rows
+    rocke = [r for r in rows if r[0] == "rocke"]
+    assert rocke and all(r[3] == "passed" for r in rocke), rocke

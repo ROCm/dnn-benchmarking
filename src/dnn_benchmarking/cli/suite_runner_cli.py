@@ -143,7 +143,7 @@ def run_suite_cli(
 
     _warn_ignored_options(config, reporter)
     _apply_pytorch_environment(config, reporter)
-    if config.runtime is RuntimeName.HIPDNN:
+    if RuntimeName.HIPDNN in config.runtimes:
         _apply_tuning_environment(config, reporter)
         if config.oracle:
             _warn_oracle(reporter)
@@ -186,12 +186,13 @@ def _dir_problem(directory: Path) -> Optional[str]:
 def _run_config(config: SuiteConfig) -> Dict[str, Any]:
     """The effective configuration recorded as ``run.config``."""
     pytorch = (
-        config.runtime is RuntimeName.PYTORCH
+        RuntimeName.PYTORCH in config.runtimes
         or config.validation.provider is ReferenceProviderName.PYTORCH
     )
     metrics = config.metrics
     return {
         "runtime": config.runtime.value,
+        "runtimes": [r.value for r in config.runtimes],
         "engine_filter": (
             [engine_id_hex(e) for e in config.engine_filter]
             if config.engine_filter is not None
@@ -361,7 +362,7 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
             "--perf or --roofline"
         )
     pytorch_selected = (
-        config.runtime is RuntimeName.PYTORCH
+        RuntimeName.PYTORCH in config.runtimes
         or config.validation.provider is ReferenceProviderName.PYTORCH
     )
     sdpa_set = (
@@ -409,7 +410,7 @@ def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
     Must run before the first PyTorch conv or SDPA call.
     """
     if not (
-        config.runtime is RuntimeName.PYTORCH
+        RuntimeName.PYTORCH in config.runtimes
         or config.validation.provider is ReferenceProviderName.PYTORCH
     ):
         return

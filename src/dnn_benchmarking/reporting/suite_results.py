@@ -32,6 +32,7 @@ SUITE_RESULT_SCHEMA_VERSION = 2
 # producer did not supply them). Extra producer keys are kept as-is.
 RUN_CONFIG_KEYS = (
     "runtime",
+    "runtimes",
     "engine_filter",
     "plugin_paths",
     "warmup_iters",
@@ -290,8 +291,10 @@ class ProviderEngineResult:
     plan objects.
 
     Attributes:
-        runtime: Runtime that produced the row, ``hipdnn`` or ``pytorch``.
-        engine_id: Engine ID used; None when the row has no hipDNN engine.
+        runtime: Runtime that produced the row: ``hipdnn``, ``pytorch`` or
+            ``rocke``.
+        engine_id: hipDNN engine ID; for a rocKE row, its row name (a stable
+            string); None for PyTorch rows.
         status: One of 'success', 'error', 'skipped'.
         engine_version: Loaded provider plugin version.
         started_at: UTC timestamp immediately before this engine run.
@@ -321,7 +324,7 @@ class ProviderEngineResult:
     _VALID_ROLES = {"engine", "reference"}
 
     runtime: str
-    engine_id: Optional[int]
+    engine_id: Union[int, str, None]
     status: Literal["success", "error", "skipped"]
     engine_version: str = "unavailable"
     started_at: str = field(
@@ -358,7 +361,7 @@ class ProviderEngineResult:
     def error_row(
         cls,
         runtime: str,
-        engine_id: Optional[int],
+        engine_id: Union[int, str, None],
         message: str,
         *,
         engine_name: Optional[str] = None,
@@ -380,7 +383,7 @@ class ProviderEngineResult:
     def skipped_row(
         cls,
         runtime: str,
-        engine_id: Optional[int],
+        engine_id: Union[int, str, None],
         reason: str,
         *,
         engine_name: Optional[str] = None,
@@ -429,7 +432,11 @@ class ProviderEngineResult:
             "runtime": self.runtime,
             "role": self.role,
             "engine": {
-                "id": engine_id_hex(self.engine_id),
+                "id": (
+                    self.engine_id
+                    if isinstance(self.engine_id, str)
+                    else engine_id_hex(self.engine_id)
+                ),
                 "name": self.engine_name,
                 "version": self.engine_version,
             },

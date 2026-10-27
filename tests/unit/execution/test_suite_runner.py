@@ -1178,3 +1178,67 @@ class TestPytorchRuntime:
 
         assert row.status == status
         assert "NotARealOp" in (row.error_message or row.skip_reason)
+
+
+def _run_with(other, **config):
+    """hipDNN plus a second runtime whose planner returns ``other``."""
+    graph = suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(**config),
+        Reporter(io.StringIO()),
+        [suite_runner.hipdnn_planner(_Handle()), lambda *args: other],
+    )
+    return graph
+
+
+def test_a_runtime_that_does_not_apply_leaves_the_graph_unchanged(fake):
+    fake.discovered = [1]
+    alone, _ = _run()
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", message="not an SDPA graph"))
+
+    assert (graph.status, graph.message, graph.error) == ("ok", None, None)
+    assert [(r.runtime, r.engine_id) for r in graph.results] == [
+        (r.runtime, r.engine_id) for r in alone.results
+    ]
+
+
+def test_runtimes_share_one_reference_and_append_in_order(fake_torch):
+    fake_torch.discovered = [1]
+    seen = []
+
+    def rows(ctx):
+        seen.append(ctx.reference_outputs is not None)
+        return [suite_runner.ProviderEngineResult("rocke", "rocke:k", "success")]
+
+    graph = _run_with(
+        suite_runner.RuntimePlan("rocke", [0], rows=rows, needs_inputs=True),
+        validation=ValidationConfig(provider="pytorch"),
+    )
+
+    assert [(r.runtime, r.role) for r in graph.results] == [
+        ("pytorch", "reference"),
+        ("hipdnn", "engine"),
+        ("rocke", "engine"),
+    ]
+    assert seen == [True]  # the second runtime checks against the same reference
+
+
+def test_no_runtime_applies_joins_the_labelled_reasons(fake):
+    fake.discover_error = UnsupportedGraphError("no hipDNN engine")
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", message="not an SDPA graph"))
+
+    assert graph.status == "no_engines"
+    assert graph.message == "hipdnn: no hipDNN engine; rocke: not an SDPA graph"
+
+
+def test_a_selection_error_keeps_the_other_runtime_rows(fake):
+    fake.discovered = [1]
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", error="catalog broke"))
+
+    assert (graph.status, graph.error) == ("error", "rocke: catalog broke")
+    assert [r.runtime for r in graph.results] == ["hipdnn"]

@@ -23,7 +23,7 @@ from dnn_benchmarking.reporting.suite_results import (
 TOP_KEYS = {"schema_version", "tool", "run", "environment", "summary", "graphs"}
 RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
-    "runtime", "engine_filter", "plugin_paths", "warmup_iters", "iters",
+    "runtime", "runtimes", "engine_filter", "plugin_paths", "warmup_iters", "iters",
     "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
     "oracle", "autotune", "hipdnn_cache_dir", "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library", "metrics", "profiling",
@@ -325,3 +325,17 @@ def test_extra_metrics_serialize_on_non_success_rows() -> None:
     row = ProviderEngineResult.error_row("hipdnn", 1, "profiling crashed")
     row.extra_metrics = {"pmc": None}
     assert row.to_dict()["extra_metrics"] == {"pmc": None}
+
+
+def test_engine_id_is_hex_for_hipdnn_and_the_row_name_for_rocke() -> None:
+    """Ingestion keys rows on engine.id, so every engine row must carry one."""
+    rows = [
+        ProviderEngineResult("hipdnn", 0x15B46865C717A122, "success"),
+        ProviderEngineResult("rocke", "rocke:auto:k", "success", engine_name="x"),
+        ProviderEngineResult("pytorch", None, "success", role="reference"),
+    ]
+    assert [r.to_dict()["engine"]["id"] for r in rows] == [
+        "0x15B46865C717A122",
+        "rocke:auto:k",
+        None,
+    ]
