@@ -476,8 +476,8 @@ def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
     """OOTB kernel median / tuned kernel median, or None when not comparable.
 
     None when the row has no tuned run, either plan failed validation, the
-    two plans were timed in different modes (a stall-fallback OOTB in
-    ``events`` against a ``staged`` tuned child), or a median is missing or
+    two plans were timed in different modes (one run fell back to ``events``
+    on its own), or a median is missing or
     non-positive. Rows with ``tuning_available`` False still get a ratio;
     callers report them as "no-search" and keep them out of averages. The
     speedup is derived, never stored in the result file.

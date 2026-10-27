@@ -378,14 +378,14 @@ def _warn_oracle(reporter: Reporter) -> None:
     """One line per condition that makes the OOTB plan non-cold."""
     reporter.info(
         "--oracle: each engine row gets a tuned run in a child process with "
-        "--autotune and a private MIOpen user database "
+        "HIPDNN_FORCE_BENCHMARKING=1 and a private MIOpen user database "
         "(kernel ingestor and MIOpen sample kernels; other engines re-measure "
         "the OOTB plan)"
     )
     forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
     if forced is not None:
         # Providers apply the variable as override.value_or(knob), and the
-        # OOTB plan inherits it; the tuned child sets it to 1 (--autotune).
+        # OOTB plan inherits it; the tuned child gets 1 from the oracle pass.
         reporter.warning(
             f"--oracle with HIPDNN_FORCE_BENCHMARKING={forced} in the environment: "
             "it overrides the global.benchmarking knob for the OOTB plan, so the "

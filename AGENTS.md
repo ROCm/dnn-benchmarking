@@ -76,7 +76,9 @@ src/dnn_benchmarking/
 │   ├── config_file.py        # TOML recipe merge (defaults < config < CLI)
 │   ├── suite_runner_cli.py   # startup checks, per-graph loop, result writes, exit codes
 │   ├── runtimes.py           # runtime startup; returns the per-graph runner
-│   └── internal_profiling.py # hidden --internal-profiling-run child
+│   ├── internal_profiling.py # hidden --internal-profiling-run child
+│   ├── hipdnn_tuned_child.py # --oracle child: one tuned hipDNN engine run
+│   └── pytorch_tuned_child.py# --oracle child: one tuned PyTorch run
 ├── common/                   # exceptions, dtypes registry, torch/ROCm runtime helpers
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
 ├── execution/
@@ -133,13 +135,17 @@ Rules that keep the design intact:
   `create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
   `build_plans()`. Prime each engine with `Executor.prime` before its timed
   OOTB build.
-- Run every tuned pass (`--oracle`) only in a child process: hipDNN rows in
-  `python -m dnn_benchmarking -e <engine> --autotune`, PyTorch rows in
-  `cli/pytorch_tuned_child.py`, each with a private `MIOPEN_USER_DB_PATH`.
-  hipDNN keeps a tuned winner in memory for the life of the process, and
-  PyTorch's conv algorithm cache and MIOpen's user database would otherwise
-  carry tuning into an OOTB measurement. Every run turns hipDNN's disk cache
-  off (`HIPDNN_DISABLE_CACHE=1`).
+- Run every tuned pass (`--oracle`) only in a child script:
+  `cli/hipdnn_tuned_child.py` for hipDNN rows, `cli/pytorch_tuned_child.py`
+  for PyTorch rows. `execution/oracle.py` sets the child environment
+  (`HIPDNN_FORCE_BENCHMARKING=1`, or the TunableOp variables, and a private
+  `MIOPEN_USER_DB_PATH`) and passes the full `TimingPolicy`, `stall_gate`
+  included. The scripts set no tuning variable and parse no dnn-benchmark
+  option. The parent validates the tuned hipDNN outputs with
+  `check_correctness`. hipDNN keeps a tuned winner in memory for the life of
+  the process, and PyTorch's conv algorithm cache and MIOpen's user database
+  would otherwise carry tuning into an OOTB measurement. Every run turns
+  hipDNN's disk cache off (`HIPDNN_DISABLE_CACHE=1`).
 
 ## Tests
 

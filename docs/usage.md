@@ -92,7 +92,7 @@ These rows do not fail validation (no exit code 3).
 
 | Option | Default | Description |
 |---|---|---|
-| `--oracle`, `--no-oracle` | off | Also time a tuned run of each engine (`--autotune`, in a child process), and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
+| `--oracle`, `--no-oracle` | off | Also time a tuned run of each engine (benchmarking on, in a child process), and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
 
 ### Output
 
@@ -200,10 +200,13 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
   (`python -m dnn_benchmarking.cli.pytorch_tuned_child`). PyTorch keeps conv algorithm
   choices in a process-wide cache whose key ignores `cudnn.benchmark`, so a
   tuned run in the benchmark process would reuse or leak the OOTB choice.
-- The child keeps its TunableOp results file and `MIOPEN_USER_DB_PATH` in a
-  temporary directory. The tool deletes the directory after the run.
-- The child starts after the OOTB buffers are released. It uses the same
-  warmup and sampling settings. Its search runs in the untimed first launch.
+- The tool sets the environment of the child: TunableOp on, and the
+  TunableOp results file and `MIOPEN_USER_DB_PATH` in a temporary directory.
+  The tool deletes the directory after the run. The child sets
+  `torch.backends.cudnn.benchmark=True` itself.
+- The child starts after the OOTB buffers are released. It gets the graph,
+  `--seed`, the SDPA settings and the timing settings of the row, also the
+  stall-gate state of the graph. Its search runs in the untimed first launch.
 - The tool does not validate tuned PyTorch outputs. PyTorch rows have no plan
   build, so `build_ms` is `null`.
 - `tuning_available` is `true` only when the graph has a convolution or
@@ -258,20 +261,30 @@ For each engine row:
    `create_execution_plan_ext(engine_id, knobs)`, `check_support()` and
    `build_plans()`), times it and validates it.
 3. After the OOTB buffers are released, a child process
-   (`python -m dnn_benchmarking ... -e <engine> --autotune`) runs the same
+   (`python -m dnn_benchmarking.cli.hipdnn_tuned_child`) builds the same
    engine with benchmarking on (`HIPDNN_FORCE_BENCHMARKING=1`, the
-   process-wide form of the `global.benchmarking` knob). Its row becomes
-   `oracle`. The child gets the same timing options, `--plugin-path`,
-   `--no-metrics` and `--seed`. With `--validate`, the child validates its
-   own output against the same reference provider.
+   process-wide form of the `global.benchmarking` knob) and times it. Its
+   result becomes `oracle`. The child gets the graph, the engine,
+   `--plugin-path`, `--seed` and the timing settings of the row, also the
+   stall-gate state of the graph.
+4. With `--validate` and a usable reference, the child saves its outputs.
+   The tool compares them with the same reference outputs and tolerances as
+   the OOTB plan. The result is `oracle.correctness`. Without references,
+   `oracle.correctness` is `null`.
 
-The child owns all tuning state. hipDNN keeps a tuned winner in memory until
-its process exits, and the tuned MIOpen search writes the MIOpen user
-database. The child's MIOpen user database (`MIOPEN_USER_DB_PATH`) is a
-temporary directory that the tool deletes afterwards. hipDNN's disk cache is
-off in every run (see [Kernel selection](#kernel-selection---autotune)), also
-in the child. Thus no OOTB measurement sees the tuned selection, also when a
-stall-gate fallback measures a graph again or a graph is listed twice.
+The tool sets the environment of the child; the child sets no tuning
+variable. The child checks that environment before it builds anything. When
+a variable is missing or has another value, the child stops, and the row
+gets `oracle_error` instead of an untuned result. The child owns all tuning
+state. hipDNN keeps a tuned winner in memory until its process exits, and
+the tuned MIOpen search writes the MIOpen user database. The child's MIOpen
+user database
+(`MIOPEN_USER_DB_PATH`) is a temporary directory that the tool deletes
+afterwards. hipDNN's disk cache is off in every run (see
+[Kernel selection](#kernel-selection---autotune)), also in the child
+(`HIPDNN_DISABLE_CACHE=1`). Thus no OOTB measurement sees the tuned
+selection, also when a stall-gate fallback measures a graph again or a graph
+is listed twice.
 
 A tuned build prepares every candidate that the provider can sample, so
 `oracle.build_ms` is usually larger than `ootb.build_ms`. Providers that
@@ -280,7 +293,9 @@ candidates in the first launch of the tuned plan and keep the fastest. That
 launch is untimed and goes into `oracle.timing.first_call_ms`. Both runs get
 the same `--warmup` launches. Engines without the knob report
 `tuning_available: false`; their child re-measures the OOTB configuration.
-`--profiling-timeout` also limits each child.
+`--profiling-timeout` also limits each child. A child that fails or times out
+gives `oracle_error` and no tuned result. When the stall gate fails in the
+child, the child measures again without it, as the parent does for a graph.
 
 The `oracle` column shows `OOTB median / tuned median`. A value less than
 1.00x is a valid result. The column shows a label instead of a speedup when
@@ -289,7 +304,7 @@ no speedup applies:
 | Label | Meaning |
 |---|---|
 | `no-search` | The engine exposes no `global.benchmarking` knob, or the PyTorch graph has no conv or matmul node, so the tuned run re-measured the OOTB plan. |
-| `mixed-timing` | The two runs were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned child times in `staged` mode. |
+| `mixed-timing` | The two runs were timed in different modes (`timing.mode`), so their medians do not compare. The child uses the stall-gate state of its graph, so this happens only when one of the two runs falls back to `events` mode on its own. |
 | `invalid` | The OOTB or the tuned plan failed validation. |
 | `failed` | The tuned run did not produce a result (`oracle_error`). |
 | `n/a` | No comparison is available. |

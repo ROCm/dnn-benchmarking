@@ -289,10 +289,12 @@ the reason and `oracle` is `null`.
 |---|---|---|
 | `tuning_available` | bool | hipDNN: `true` when the engine exposes the `global.benchmarking` knob. PyTorch: `true` when the graph has a convolution or matmul node. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. `true` does not prove that a search ran: a provider can answer from its own database. |
 
-- hipDNN rows: the tuned run comes from a child process that runs the same
-  engine with benchmarking on (`--autotune`). Its first launch samples the
-  candidates, so `oracle.timing.first_call_ms` holds the search cost. With
-  `--validate`, `correctness` is the child's own check.
+- hipDNN rows: the tuned run comes from a child process that builds the same
+  engine with benchmarking on (`HIPDNN_FORCE_BENCHMARKING=1`). Its first
+  launch samples the candidates, so `oracle.timing.first_call_ms` holds the
+  search cost. With `--validate` and usable references, the tool compares
+  the child's outputs with the references of the OOTB plan, and
+  `correctness` is that check. Else `correctness` is `null`.
 - PyTorch rows: the tuned run comes from a child process (MIOpen exhaustive
   conv search and TunableOp). `build_ms` and `correctness` are `null`.
 

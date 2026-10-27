@@ -524,6 +524,8 @@ def run_single_provider_engine(
             row=row,
             graph_path=ctx.graph_path,
             graph_name=ctx.graph_name,
+            tensor_infos=ctx.tensor_infos,
+            reference_outputs=ctx.reference_outputs,
             engine_id=engine_id,
             plugin_path=plugin_path,
             tuning_available=tuning_available,

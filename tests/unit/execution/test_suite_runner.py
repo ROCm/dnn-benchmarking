@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from dnn_benchmarking.cli import hipdnn_tuned_child
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -427,30 +428,23 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
 
 @pytest.fixture
 def tuned_child(fake, monkeypatch):
-    """Fake tuned-hipDNN child: one success row, 7 ms build, 0.5 ms kernels.
+    """Fake tuned-hipDNN child: 7 ms build, 0.5 ms kernels, output ``output``.
 
-    Records each launch's engine (hex) in ``engines`` and in ``fake.events``.
+    Records each launch's engine (hex) in ``engines`` and in ``fake.events``,
+    and its timing policy's ``stall_gate`` in ``stall_gates``.
     """
-    child = SimpleNamespace(engines=[], correctness=None)
+    child = SimpleNamespace(engines=[], stall_gates=[], output=REF.copy())
 
     def run_capped(argv, timeout_s, env=None):
-        engine = argv[argv.index("--engine") + 1]
+        args = hipdnn_tuned_child.parse_args(argv[3:])
+        engine = engine_id_hex(args.engine)
         child.engines.append(engine)
+        child.stall_gates.append(args.timing_policy.stall_gate)
         fake.events.append(("tuned_child", engine))
-        timing = TimingInfo(
-            mode="staged", timer="hip", warmup_iters=2, samples=4, first_call_ms=5.0
-        )
-        plan = {
-            "build_ms": 7.0,
-            "timing": timing.to_dict(),
-            "kernel": BenchmarkStats.from_timings([0.5] * 4).to_dict(),
-            "host": BenchmarkStats.from_timings([0.01] * 4).to_dict(),
-        }
-        if child.correctness is not None:
-            plan["correctness"] = child.correctness.to_dict()
-        row = {"role": "engine", "status": "success", "message": None, "ootb": plan}
-        output = Path(argv[argv.index("--output") + 1])
-        output.write_text(json.dumps({"graphs": [{"results": [row]}]}))
+        m = _measurement(kernel_ms=[0.5] * 4, host_ms=[0.01] * 4)
+        oracle.write_result(args.out_dir, m, build_ms=7.0, workspace_bytes=64)
+        if args.save_outputs:
+            np.save(oracle.output_file(args.out_dir, 2), child.output)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(oracle, "run_capped", run_capped)
@@ -473,9 +467,6 @@ def test_oracle_tunes_each_engine_in_a_child_after_its_row_is_released(
     """The tuned child runs once per engine, after the OOTB plan is timed and
     validated and its buffers and workspace are released (tuning state must
     not reach the OOTB numbers; held VRAM would stack on the child's)."""
-    passed = CorrectnessResult(tolerance_match=True, rtol=0, atol=0)
-    tuned_child.correctness = passed
-
     graph, _ = _validate(oracle=True)
 
     assert tuned_child.engines == [engine_id_hex(1), engine_id_hex(2)]
@@ -488,6 +479,7 @@ def test_oracle_tunes_each_engine_in_a_child_after_its_row_is_released(
         assert row.status == "success" and row.oracle_error is None
         assert (row.ootb.cpu_build_time_ms, row.oracle.cpu_build_time_ms) == (2.0, 7.0)
         assert row.oracle.gpu_kernel_stats.median_ms == pytest.approx(0.5)
+        # The parent compares the child's saved outputs with its references.
         assert row.ootb.correctness.passed and row.oracle.correctness.passed
         assert oracle_speedup(row) == pytest.approx(2.0)
 
@@ -500,6 +492,8 @@ def test_tuning_available_follows_each_engines_knobs(fake, tuned_child):
     graph, _ = _run(oracle=True)
 
     assert [r.oracle.tuning_available for r in graph.results] == [True, False]
+    # No references: the tuned run is not validated either.
+    assert [r.oracle.correctness for r in graph.results] == [None, None]
 
 
 def test_failed_knob_query_is_an_oracle_error_without_a_tuned_run(fake, tuned_child):
@@ -518,7 +512,7 @@ def test_tuned_child_failing_validation_publishes_no_speedup(
 ):
     """A wrong-but-fast tuned plan keeps its own failed verdict and the OOTB
     row keeps its pass."""
-    tuned_child.correctness = CorrectnessResult(tolerance_match=False, rtol=0, atol=0)
+    tuned_child.output = REF + 1.0
 
     graph, _ = _validate(oracle=True, engine_filter=[1])
 
@@ -1074,6 +1068,8 @@ def test_stall_rerun_measures_ootb_for_every_engine_and_tunes_again(fake, tuned_
     # Engine 1 tuned before engine 2 stalled in its OOTB loop; the rerun
     # tunes both.
     assert tuned_child.engines == [engine_id_hex(e) for e in (1, 1, 2)]
+    # The tuned runs of the rerun time unstalled too, like their rows.
+    assert tuned_child.stall_gates == [True, False, False]
 
 
 def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):
