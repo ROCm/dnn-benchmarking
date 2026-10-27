@@ -80,6 +80,15 @@ code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
 log2 values of e8m0 outputs. The source is `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
+An fp32 output of a convolution node gets an atol of at least `4 * 2^-24 * K`.
+K is the number of products summed into one output element: `C/g * R * S`
+for fwd, `K/g * R * S` for dgrad and `N * H_out * W_out` for wgrad.
+Convolution inputs are zero-mean, so many outputs are close to zero. The fp32
+rounding error of a K-term sum does not get smaller with the result, and the
+fixed 1e-6 would fail correct kernels that sum in a different order. The
+factor 4 comes from CPU measurements; check it on gfx950.
+`--rtol` or `--atol` replace this value.
+
 The reference comes from the timed PyTorch `reference` row on the GPU. If
 that row cannot run (for example, no GPU or a GPU out-of-memory error), and
 no strict `--pytorch-sdpa-backend` is set, the tool computes the reference on

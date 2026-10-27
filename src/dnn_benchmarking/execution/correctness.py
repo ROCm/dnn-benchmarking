@@ -10,6 +10,7 @@ import numpy as np
 from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
+from ..metrics.analytical import convolution_terms_per_output
 from ..reporting.suite_results import CorrectnessResult
 from ..validation import ComparisonResult, ReferenceOutput, compare
 
@@ -43,6 +44,18 @@ TOLERANCES = {
     "fp8_e5m2_fnuz": (2**-2, 2**-17),
     "fp8_e8m0": (0.0, 1.0),
 }
+# fp32 convolution outputs: atol grows with the number of summed products K.
+# Convolution operands are zero-mean in [-1, 1) (generate_input_data), so many
+# outputs are close to zero and only atol applies to them. The fp32 rounding
+# error of a K-term sum does not shrink with the result, so two correct
+# kernels that sum in a different order can differ by more than the fixed
+# 1e-6 on such elements. The per-term factor is a heuristic, not an error
+# bound: PyTorch CPU fp32 against float64 needed at most 0.73 u (u = 2^-24)
+# per term over fwd, dgrad and wgrad shapes (K = 9 to 131,072, with stride,
+# 1x1, 7x7 and depthwise cases). 4 u leaves about 5x headroom for two
+# kernels that both round. A defect that changes an element by less than
+# 4 u * K (for example one wrong term in a large sum) passes.
+FP32_CONVOLUTION_ATOL_PER_TERM = 4 * 2.0**-24
 
 
 def _compared(data: Any, tensor_info: TensorInfo) -> Any:
@@ -54,11 +67,22 @@ def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     return np.log2(np.asarray(data, dtype=np.float32))
 
 
-def tolerance_for(config: SuiteConfig, tensor_info: TensorInfo) -> Tuple[float, float]:
-    """``--rtol/--atol`` when given, else the dtype default for this output."""
-    return config.validation.tolerance_override or TOLERANCES.get(
-        tensor_info.dtype.name, DEFAULT_TOLERANCE
-    )
+def tolerance_for(
+    config: SuiteConfig, tensor_info: TensorInfo, convolution_terms: Dict[int, int]
+) -> Tuple[float, float]:
+    """``--rtol/--atol`` when given, else the dtype default for this output.
+
+    An fp32 output of a convolution node gets an atol of at least
+    ``FP32_CONVOLUTION_ATOL_PER_TERM`` times its terms per element
+    (``convolution_terms``, from :func:`convolution_terms_per_output`).
+    """
+    if config.validation.tolerance_override:
+        return config.validation.tolerance_override
+    rtol, atol = TOLERANCES.get(tensor_info.dtype.name, DEFAULT_TOLERANCE)
+    terms = convolution_terms.get(tensor_info.uid)
+    if tensor_info.dtype.name == "float" and terms:
+        atol = max(atol, terms * FP32_CONVOLUTION_ATOL_PER_TERM)
+    return rtol, atol
 
 
 def mismatch(config: SuiteConfig, message: str) -> CorrectnessResult:
@@ -122,6 +146,7 @@ def check_correctness(
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
     config: SuiteConfig,
+    graph_json: Dict[str, Any],
 ) -> CorrectnessResult:
     """Compare every graph output against the precomputed reference outputs.
 
@@ -129,6 +154,7 @@ def check_correctness(
     message come from the output with the largest absolute difference (a
     failing output wins over a passing one).
     """
+    convolution_terms = convolution_terms_per_output(graph_json)
     try:
         compared: List[Tuple[int, float, float, ComparisonResult]] = []
         for ti in tensor_infos:
@@ -141,7 +167,7 @@ def check_correctness(
                     f"Reference provider '{reference_provider_name}' did not "
                     f"produce output tensor UID {ti.uid}",
                 )
-            rtol, atol = tolerance_for(config, ti)
+            rtol, atol = tolerance_for(config, ti, convolution_terms)
             result = _compare_output(buffer_manager, ti, ref, rtol, atol)
             if result is not None:
                 compared.append((ti.uid, rtol, atol, result))

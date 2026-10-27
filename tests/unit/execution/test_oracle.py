@@ -168,6 +168,7 @@ def _run(row=None, refs=None, bm=None, config=None):
         variant_pack={},
         tensor_infos=[out],
         reference_outputs=refs,
+        graph_json={},
     )
     return row
 

@@ -15,6 +15,7 @@ import pytest
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics.analytical import (
     compute_flops,
+    convolution_terms_per_output,
     compute_io_bytes,
     derive_throughputs,
     list_unsupported_node_types,
@@ -804,3 +805,70 @@ class TestListUnsupportedNodeTypes:
             "MysteryAttributes",
             "OtherUnknownAttributes",
         ]
+
+
+class TestConvolutionTermsPerOutput:
+    """x [2, 8, 10, 10], w [4, 8, 3, 3], y [2, 4, 8, 8] (no padding)."""
+
+    _TENSORS = [
+        {"uid": 1, "dims": [2, 8, 10, 10]},
+        {"uid": 2, "dims": [4, 8, 3, 3]},
+        {"uid": 3, "dims": [2, 4, 8, 8]},
+    ]
+
+    @pytest.mark.parametrize(
+        "node_type, inputs, outputs, expected",
+        [
+            # C * R * S
+            (
+                "ConvolutionFwdAttributes",
+                {"x_tensor_uid": 1, "w_tensor_uid": 2},
+                {"y_tensor_uid": 3},
+                {3: 8 * 3 * 3},
+            ),
+            # K * R * S: an interior dx element sums every filter tap
+            (
+                "ConvolutionBwdAttributes",
+                {"dy_tensor_uid": 3, "w_tensor_uid": 2},
+                {"dx_tensor_uid": 1},
+                {1: 4 * 3 * 3},
+            ),
+            # N * Ho * Wo
+            (
+                "ConvolutionWrwAttributes",
+                {"x_tensor_uid": 1, "dy_tensor_uid": 3},
+                {"dw_tensor_uid": 2},
+                {2: 2 * 8 * 8},
+            ),
+        ],
+        ids=["fwd", "dgrad", "wgrad"],
+    )
+    def test_each_direction_maps_its_output_to_its_reduction_size(
+        self, node_type, inputs, outputs, expected
+    ):
+        graph = {
+            "tensors": self._TENSORS,
+            "nodes": [{"type": node_type, "inputs": inputs, "outputs": outputs}],
+        }
+        assert convolution_terms_per_output(graph) == pytest.approx(expected)
+
+    def test_non_convolution_outputs_have_no_entry(self):
+        assert convolution_terms_per_output(_matmul_graph()) == {}
+
+    def test_grouped_dgrad_sums_one_group_of_output_channels(self):
+        """dx [1, 8, 6, 6], w [8, 2, 3, 3]: 4 groups, so K/g = 2."""
+        graph = {
+            "tensors": [
+                {"uid": 1, "dims": [1, 8, 6, 6]},
+                {"uid": 2, "dims": [8, 2, 3, 3]},
+                {"uid": 3, "dims": [1, 8, 4, 4]},
+            ],
+            "nodes": [
+                {
+                    "type": "ConvolutionBwdAttributes",
+                    "inputs": {"dy_tensor_uid": 3, "w_tensor_uid": 2},
+                    "outputs": {"dx_tensor_uid": 1},
+                }
+            ],
+        }
+        assert convolution_terms_per_output(graph) == {1: 2 * 3 * 3}
