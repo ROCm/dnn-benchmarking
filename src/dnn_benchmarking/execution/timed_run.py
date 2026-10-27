@@ -14,7 +14,7 @@ measurements cannot drift apart. Each caller then times with
 - PyTorch: :func:`pytorch_run`.
 
 This module does not import ``torch`` at startup: the hipDNN child imports
-it.
+this module and must not load torch.
 """
 
 from contextlib import contextmanager
