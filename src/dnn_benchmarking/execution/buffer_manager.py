@@ -18,6 +18,7 @@ import numpy as np
 from ..common.blocks import iter_blocks
 from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
 
 
@@ -254,6 +255,8 @@ def _paged_metadata(
 # Convolution operands that can take signed data: the data, filter and
 # incoming-gradient inputs of every convolution direction.
 _CONVOLUTION_OPERAND_KEYS = ("x_tensor_uid", "w_tensor_uid", "dy_tensor_uid")
+# The output of each convolution direction.
+_CONVOLUTION_OUTPUT_KEYS = ("y_tensor_uid", "dx_tensor_uid", "dw_tensor_uid")
 
 
 def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
@@ -262,19 +265,29 @@ def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     Non-negative data makes every product in a convolution sum positive, so
     the sum grows with the number of terms. A backward-weights sum over
     N*Ho*Wo terms then passes the fp16 maximum (65504) at about 262,000
-    terms. Signed data lets the terms cancel.
+    terms. Signed data lets the terms cancel, so the sum grows like
+    sqrt(N*Ho*Wo) instead.
 
-    Only convolution operands are signed. A tensor that also feeds a
-    non-convolution node keeps U[0, 1), because that node can need
-    non-negative values (for example a batch-norm variance).
+    Only the operands of a convolution with an fp16 output are signed: the
+    overflow happens when the sum is stored as fp16. Other convolutions keep
+    U[0, 1), so their outputs stay far from zero, where the fixed fp32 atol
+    would apply. A tensor that also feeds any other node, including a
+    convolution with a wider output, keeps U[0, 1). A non-convolution node
+    can need non-negative values (for example a batch-norm variance).
     """
     if not graph_json:
         return set()
+    tensors = {
+        int(tensor["uid"]): tensor
+        for tensor in graph_json.get("tensors", []) or []
+        if "uid" in tensor
+    }
     convolution: Set[int] = set()
     other: Set[int] = set()
     for node in graph_json.get("nodes", []) or []:
         inputs = node.get("inputs") or {}
-        if str(node.get("type", "")).startswith("Convolution"):
+        is_convolution = str(node.get("type", "")).startswith("Convolution")
+        if is_convolution and _has_fp16_output(node, tensors, graph_json):
             convolution.update(
                 int(inputs[key])
                 for key in _CONVOLUTION_OPERAND_KEYS
@@ -283,6 +296,20 @@ def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
         else:
             other.update(_input_tensor_uids(inputs))
     return convolution - other
+
+
+def _has_fp16_output(
+    node: Dict[str, Any],
+    tensors: Dict[int, Dict[str, Any]],
+    graph_json: Dict[str, Any],
+) -> bool:
+    """True when the convolution node stores its output as fp16."""
+    outputs = node.get("outputs") or {}
+    for key in _CONVOLUTION_OUTPUT_KEYS:
+        uid = outputs.get(key)
+        if uid is not None and int(uid) in tensors:
+            return tensor_data_type(tensors[int(uid)], graph_json) == "half"
+    return False
 
 
 def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:
@@ -340,8 +367,9 @@ def generate_input_data(
     by both hipDNN buffers and reference providers. Floating-point inputs are
     U[0, 1) (non-negative, so batch-norm variances stay valid), drawn as
     float32 and rounded to the graph type; bfloat16 and fp8 values are returned
-    as the exactly representable float32 values. Convolution operands are
-    U[-1, 1) instead (see :func:`_signed_input_uids`). Both come from the same
+    as the exactly representable float32 values. The operands of a
+    convolution with an fp16 output are U[-1, 1) instead (see
+    :func:`_signed_input_uids`). Both come from the same
     draw, so an unsigned tensor gets the same values with or without
     ``graph_json``. Integer and boolean inputs are zeros, except paged-SDPA
     roles.

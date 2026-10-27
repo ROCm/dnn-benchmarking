@@ -1,7 +1,8 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Sign of generated inputs: convolution operands are signed, others are not."""
+"""Sign of generated inputs: operands of fp16-output convolutions are signed,
+others are not."""
 
 import numpy as np
 import pytest
@@ -15,9 +16,13 @@ def _tensor(uid: int, dims, data_type: str = "half") -> TensorInfo:
     return TensorInfo(uid, f"t{uid}", list(dims), strides, data_type, is_virtual=False)
 
 
+def _output(uid: int, data_type: str = "half") -> dict:
+    return {"uid": uid, "data_type": data_type}
+
+
 def _wrw_graph() -> dict:
     return {
-        "tensors": [],
+        "tensors": [_output(0)],
         "nodes": [
             {
                 "type": "ConvolutionWrwAttributes",
@@ -67,7 +72,7 @@ def test_both_operands_of_each_convolution_direction_are_signed(
     node_type: str, inputs: dict, output: str
 ) -> None:
     graph = {
-        "tensors": [],
+        "tensors": [_output(3)],
         "nodes": [{"type": node_type, "inputs": inputs, "outputs": {output: 3}}],
     }
     a, b = _tensor(1, [4096]), _tensor(2, [4096])
@@ -81,7 +86,7 @@ def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
     """A batch-norm variance must not be negative, even in a graph that also
     has a convolution. A tensor that feeds both kinds of node keeps U[0, 1)."""
     graph = {
-        "tensors": [],
+        "tensors": [_output(3)],
         "nodes": [
             {
                 "type": "ConvolutionFwdAttributes",
@@ -106,6 +111,86 @@ def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
     assert data[1].min() < 0
     assert data[2].min() >= 0
     assert data[4].min() >= 0
+
+
+@pytest.mark.parametrize(
+    "operand_type, output_type, io_data_type, signed",
+    [
+        ("float", "half", None, True),  # the fp16 output overflows
+        ("half", "float", None, False),  # an fp32 output does not
+        ("float", "float", None, False),
+        ("bfloat16", "bfloat16", None, False),
+        ("half", "unset", "half", True),  # "unset" takes the graph io type
+    ],
+)
+def test_output_dtype_decides_whether_operands_are_signed(
+    operand_type: str, output_type: str, io_data_type, signed: bool
+) -> None:
+    graph = {
+        "tensors": [_output(3, output_type)],
+        "nodes": [
+            {
+                "type": "ConvolutionFwdAttributes",
+                "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
+                "outputs": {"y_tensor_uid": 3},
+            }
+        ],
+    }
+    if io_data_type:
+        graph["io_data_type"] = io_data_type
+    x, w = _tensor(1, [4096], operand_type), _tensor(2, [4096], operand_type)
+
+    data = generate_input_data([x, w], seed=0, graph_json=graph)
+
+    assert [bool(data[uid].min() < 0) for uid in (1, 2)] == [signed, signed]
+
+
+def test_fp32_output_convolution_inputs_are_unchanged_by_the_graph() -> None:
+    """fp32 convolution correctness results stay comparable across versions:
+    with an fp32 output, the operands get exactly the pre-0.3.0 values."""
+    graph = {
+        "tensors": [_output(3, "float")],
+        "nodes": [
+            {
+                "type": "ConvolutionFwdAttributes",
+                "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
+                "outputs": {"y_tensor_uid": 3},
+            }
+        ],
+    }
+    x, w = _tensor(1, [4096], "float"), _tensor(2, [4096], "float")
+
+    with_graph = generate_input_data([x, w], seed=5, graph_json=graph)
+    without = generate_input_data([x, w], seed=5)
+
+    for uid in (1, 2):
+        np.testing.assert_array_equal(with_graph[uid], without[uid])
+
+
+def test_operand_shared_with_an_fp32_output_convolution_stays_non_negative() -> None:
+    """x feeds an fp16-output and an fp32-output convolution. Signing x would
+    put the fp32 output near zero, so x keeps U[0, 1); the fp16 convolution's
+    own filter is still signed."""
+    graph = {
+        "tensors": [_output(4, "half"), _output(5, "float")],
+        "nodes": [
+            {
+                "type": "ConvolutionFwdAttributes",
+                "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
+                "outputs": {"y_tensor_uid": 4},
+            },
+            {
+                "type": "ConvolutionFwdAttributes",
+                "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 3},
+                "outputs": {"y_tensor_uid": 5},
+            },
+        ],
+    }
+    x, w16, w32 = (_tensor(uid, [4096]) for uid in (1, 2, 3))
+
+    data = generate_input_data([x, w16, w32], seed=0, graph_json=graph)
+
+    assert [bool(data[uid].min() < 0) for uid in (1, 2, 3)] == [False, True, False]
 
 
 def test_unsigned_inputs_do_not_change_when_the_graph_has_a_convolution() -> None:
