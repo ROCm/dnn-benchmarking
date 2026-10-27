@@ -10,11 +10,12 @@
 The parent (``execution.oracle.run_pytorch_tuned``) sets the environment
 ``execution.tuned_child.PYTORCH_TUNED_ENV``: TunableOp on, and a private
 ``MIOPEN_USER_DB_PATH`` and TunableOp results file. This script checks it
-and sets no tuning variable. It turns on
-PyTorch's exhaustive conv search (``torch.backends.cudnn.benchmark``), builds
-the graph as the OOTB PyTorch row does, fills the inputs from the seed and
-times one loop with the parent's timing policy. It writes ``result.json`` in
-D. On failure it writes an error on stderr and exits 1.
+and sets no tuning variable. It turns on PyTorch's exhaustive conv search
+(``torch.backends.cudnn.benchmark``). Then it builds the graph and fills the
+inputs from the seed with the same steps as the OOTB PyTorch row
+(``execution.timed_run``), and times one loop with the parent's timing
+policy. It writes ``result.json`` in D. On failure it writes an error on
+stderr and exits 1.
 """
 
 import sys
@@ -22,6 +23,7 @@ from typing import List, Optional
 
 from ..config.benchmark_config import PyTorchSdpaBackendName, TimingPolicy
 from ..execution.buffer_manager import generate_input_data
+from ..execution.timed_run import pytorch_run
 from ..execution.timing import retry_unstalled
 from ..execution.tuned_child import PYTORCH_TUNED_ENV, child_parser, write_result
 from ..graph.loader import GraphLoader
@@ -46,9 +48,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         PYTORCH_TUNED_ENV.check()
         import torch
 
-        from ..execution.pytorch_buffer_manager import PyTorchCudaBufferManager
-        from ..execution.pytorch_executor import PyTorchCudaExecutor
-
         torch.backends.cudnn.benchmark = True
 
         loader = GraphLoader()
@@ -57,19 +56,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         tensor_infos = loader.extract_tensor_info(graph_json)
 
         def run(policy: TimingPolicy) -> None:
-            executor = PyTorchCudaExecutor(
+            with pytorch_run(
                 graph_json,
+                tensor_infos,
+                generate_input_data(tensor_infos, args.seed, graph_json),
                 policy,
-                pytorch_sdpa_backend=args.pytorch_sdpa_backend,
-                pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
-            )
-            executor.prepare()
-            with PyTorchCudaBufferManager(tensor_infos, device=executor.device) as bm:
-                bm.allocate_all()
-                bm.load_input_data(
-                    generate_input_data(tensor_infos, args.seed, graph_json)
-                )
-                bm.zero_outputs()
+                args.pytorch_sdpa_backend,
+                args.pytorch_rocm_fa_library,
+            ) as (executor, bm):
                 m = executor.benchmark(bm.get_tensors())
             write_result(args.out_dir, m)
 

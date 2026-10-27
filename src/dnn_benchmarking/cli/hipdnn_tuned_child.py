@@ -9,9 +9,10 @@
 The parent (``execution.oracle.run_hipdnn_tuned``) sets the environment
 ``execution.tuned_child.HIPDNN_TUNED_ENV``: ``HIPDNN_FORCE_BENCHMARKING=1``,
 ``HIPDNN_DISABLE_CACHE=1`` and a private ``MIOPEN_USER_DB_PATH``. This script
-checks it and sets no tuning variable. It builds the
-engine as the OOTB row does (prime, then the timed build), fills the inputs
-from the seed and times one loop with the parent's timing policy. It writes
+checks it and sets no tuning variable. It builds the engine and fills the
+inputs from the seed with the same steps as the OOTB row
+(``execution.timed_run``), then times one loop with the parent's timing
+policy. It writes
 ``result.json`` in D. With ``--save-outputs``, it runs the graph once more
 and saves each output tensor in D. It does not import ``torch``.
 On failure it writes an error on stderr and exits 1.
@@ -27,8 +28,9 @@ import numpy as np
 
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
-from ..execution.buffer_manager import BufferManager, generate_input_data
-from ..execution.executor import Executor, set_plugin_path
+from ..execution.buffer_manager import generate_input_data
+from ..execution.executor import set_plugin_path
+from ..execution.timed_run import build_hipdnn_plan, hipdnn_buffers
 from ..execution.timing import retry_unstalled
 from ..execution.tuned_child import (
     HIPDNN_TUNED_ENV,
@@ -95,15 +97,9 @@ def _tuned_run(
     policy: TimingPolicy,
 ) -> None:
     """Build and time the engine with ``policy``; write the result files."""
-    graph_json_str = json.dumps(graph_json)
-    Executor(graph_json_str, policy).prime(handle, args.engine)
-    executor = Executor(graph_json_str, policy)
-    executor.prepare(handle, engine_id=args.engine)
-    with BufferManager(tensor_infos) as bm:
-        bm.allocate_all()
-        bm.load_input_data(generate_input_data(tensor_infos, args.seed, graph_json))
-        bm.zero_outputs()
-        variant_pack = bm.create_variant_pack()
+    executor = build_hipdnn_plan(handle, json.dumps(graph_json), policy, args.engine)
+    input_data = generate_input_data(tensor_infos, args.seed, graph_json)
+    with hipdnn_buffers(tensor_infos, input_data) as (bm, variant_pack):
         m = executor.benchmark(handle, variant_pack)
         if args.save_outputs:
             bm.zero_outputs()

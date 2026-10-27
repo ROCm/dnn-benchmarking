@@ -20,7 +20,7 @@ from dnn_benchmarking.config.benchmark_config import (
     SuiteConfig,
     ValidationConfig,
 )
-from dnn_benchmarking.execution import oracle, suite_runner
+from dnn_benchmarking.execution import oracle, suite_runner, timed_run
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.execution.tuned_child import output_file, write_result
 from dnn_benchmarking.graph.tensor_info import TensorInfo
@@ -178,7 +178,8 @@ def fake(monkeypatch):
             return f.clocks.pop(0) if f.clocks else None
 
     monkeypatch.setattr(suite_runner, "Executor", Executor)
-    monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
+    monkeypatch.setattr(timed_run, "Executor", Executor)
+    monkeypatch.setattr(timed_run, "BufferManager", BufferManager)
     monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
     monkeypatch.setitem(
         sys.modules,

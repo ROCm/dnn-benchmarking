@@ -25,7 +25,7 @@ from ..config.benchmark_config import (
     SuiteConfig,
     TimingPolicy,
 )
-from ..execution.buffer_manager import BufferManager, generate_input_data
+from ..execution.buffer_manager import generate_input_data
 from ..execution.executor import Executor, set_plugin_path
 from ..execution.timing import (
     Measurement,
@@ -47,6 +47,7 @@ from ..reporting.suite_results import (
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
 from .oracle import hipdnn_tuning_available, run_hipdnn_tuned, run_pytorch_tuned
+from .timed_run import build_hipdnn_plan, hipdnn_buffers, pytorch_run
 
 
 @dataclass
@@ -392,21 +393,15 @@ def _time_pytorch_row(
     memory_at_start = _gpu_memory_at_row_start()
     try:
         from . import pytorch_ops
-        from .pytorch_buffer_manager import PyTorchCudaBufferManager
-        from .pytorch_executor import PyTorchCudaExecutor
 
-        executor = PyTorchCudaExecutor(
+        with pytorch_run(
             ctx.graph_json,
+            ctx.tensor_infos,
+            ctx.input_data,
             config.timing_policy,
-            pytorch_sdpa_backend=config.pytorch_sdpa_backend,
-            pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
-        )
-        executor.prepare()
-        # The executor's device, not the buffer manager's cuda:0 default.
-        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
-            bm.allocate_all()
-            bm.load_input_data(ctx.input_data)
-            bm.zero_outputs()
+            config.pytorch_sdpa_backend,
+            config.pytorch_rocm_fa_library,
+        ) as (executor, bm):
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             row.warnings = (row.warnings or []) + executor.notes
@@ -465,24 +460,20 @@ def run_single_provider_engine(
     memory_at_start = _gpu_memory_at_row_start()
     tuning_available: Optional[bool] = None
     try:
-        # Absorb the engine's one-time build costs (provider setup, cold
-        # plugin and kernel file reads) before timing.
-        Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
-        executor = Executor(ctx.graph_json_str, config.timing_policy)
-        executor.prepare(handle, engine_id=engine_id)
+        executor = build_hipdnn_plan(
+            handle, ctx.graph_json_str, config.timing_policy, engine_id
+        )
         row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
         if config.oracle:
             tuning_available = hipdnn_tuning_available(row, executor, engine_id)
 
-        with BufferManager(
-            ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
-        ) as bm:
-            bm.allocate_all()
-            bm.load_input_data(ctx.input_data)
-            bm.zero_outputs()
-            variant_pack = bm.create_variant_pack()
+        with hipdnn_buffers(
+            ctx.tensor_infos,
+            ctx.input_data,
+            device=_hipdnn_buffer_device(ctx.reference_outputs),
+        ) as (bm, variant_pack):
             _measure_row(row, ctx, lambda: executor.benchmark(handle, variant_pack))
 
             if ctx.reference_outputs is not None:

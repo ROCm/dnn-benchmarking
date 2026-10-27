@@ -83,6 +83,7 @@ src/dnn_benchmarking/
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
 ├── execution/
 │   ├── timing.py             # measure(): the one timed loop (staged / events); retry_unstalled
+│   ├── timed_run.py          # steps before the timed loop, shared by a row and its tuned child
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
