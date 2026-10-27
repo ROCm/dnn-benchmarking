@@ -298,10 +298,10 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
-        oracle: Build and time a second plan per engine with
-            ``global.benchmarking=1``, so providers sample their candidate
-            kernels, against the OOTB plan. PyTorch rows get a tuned run in
-            an isolated subprocess. Cannot be combined with ``autotune``.
+        oracle: Also time a tuned run of each row in an isolated child
+            process: hipDNN rows run the same engine with benchmarking on,
+            so providers sample their candidate kernels; PyTorch rows run
+            tuned PyTorch. Cannot be combined with ``autotune``.
         metrics: Metric collection configuration. Defaults to the always-on
             probes and no extra runs.
         runtime: Runtime that executes the graph (``hipdnn`` runs discovered

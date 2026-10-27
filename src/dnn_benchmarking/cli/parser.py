@@ -404,8 +404,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Comparison",
         SuiteConfig,
         "oracle",
-        "also build and time a global.benchmarking=1 plan per engine, and a "
-        "tuned PyTorch run in a child process (much slower; not with --autotune)",
+        "also time a tuned run of each row in a child process: the engine with "
+        "benchmarking on, or tuned PyTorch (much slower; not with --autotune)",
     ),
     # Output
     CliOption(
@@ -512,7 +512,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_at_least(int, 0),
         default=_default(MetricsConfig, "profiling_timeout_s"),
         metavar="SECONDS",
-        help="timeout per profiler or tuned-PyTorch subprocess; 0 disables",
+        help="timeout per profiler or tuned-run subprocess; 0 disables",
         config_key="profiling_timeout",
         config_kind=ConfigKind.SCALAR,
         config_type=int,

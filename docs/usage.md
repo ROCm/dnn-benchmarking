@@ -93,7 +93,7 @@ These rows do not fail validation (no exit code 3).
 
 | Option | Default | Description |
 |---|---|---|
-| `--oracle`, `--no-oracle` | off | Also build and time a tuned (`global.benchmarking=1`) plan of each engine, and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
+| `--oracle`, `--no-oracle` | off | Also time a tuned run of each engine (`--autotune`, in a child process), and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
 
 ### Output
 
@@ -118,7 +118,7 @@ profiler, after the timed row completes. The timed numbers do not change.
 | `--perf`, `--no-perf` | off | Collect CPU cycles, instructions and IPC with `perf stat`. |
 | `--roofline`, `--no-roofline` | off | Collect HBM and compute ceilings with `rocprof-compute --roof-only` (about 3 extra runs). |
 | `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. With a profiling flag, the tool checks at startup that it can create files there. Without one, the option has no effect and the tool shows a warning. |
-| `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process and for the tuned-PyTorch child of `--oracle`. `0` disables the limit. |
+| `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process and for each tuned child process of `--oracle`. `0` disables the limit. |
 
 See [Profiling](#profiling) below.
 
@@ -247,40 +247,43 @@ value in the environment without `--autotune`, and when `--autotune` has no
 ## Oracle
 
 `--oracle` compares the default (out-of-the-box, OOTB) plan of each engine
-with a tuned plan of the same engine. Without it, the tool times the OOTB plan
+with a tuned run of the same engine. Without it, the tool times the OOTB plan
 only.
 
-The tool builds both plans through one timed path:
-`create_execution_plan_ext(engine_id, knobs)`, then `check_support()`, then
-`build_plans()`.
+For each engine row:
 
-| Plan | Knobs | Build time in JSON |
-|---|---|---|
-| OOTB | none | `ootb.build_ms` |
-| Tuned | `global.benchmarking=1` | `oracle.build_ms` |
+1. The tool builds the OOTB plan one time, untimed, and discards it (also
+   without `--oracle`). The first build of an engine in a process pays
+   one-time costs: provider setup and, on a cold page cache, the read of the
+   plugin and kernel files. The untimed plan is never executed, so no
+   provider tuning runs.
+2. The tool builds the OOTB plan (timed as `ootb.build_ms`: only
+   `create_execution_plan_ext(engine_id, knobs)`, `check_support()` and
+   `build_plans()`), times it and validates it.
+3. After the OOTB buffers are released, a child process
+   (`python -m dnn_benchmarking ... -e <engine> --autotune`) runs the same
+   engine with benchmarking on (`HIPDNN_FORCE_BENCHMARKING=1`, the
+   process-wide form of the `global.benchmarking` knob). Its row becomes
+   `oracle`. The child gets the same timing options, `--plugin-path`,
+   `--no-metrics` and `--seed`. With `--validate`, the child validates its
+   own output against the same reference provider.
 
-The build time covers only those three calls. Graph deserialization, the
-operation graph build and the workspace allocation are not timed.
+The child owns all tuning state. hipDNN keeps a tuned winner in memory until
+its process exits. The tuned search also writes the winner to the hipDNN disk
+cache and to the MIOpen user database. The child gets a private hipDNN cache
+(`--hipdnn-cache-dir`) and a private MIOpen user database
+(`MIOPEN_USER_DB_PATH`) in a temporary directory. The tool deletes that
+directory afterwards. Thus no OOTB measurement sees the tuned selection, also
+when a stall-gate fallback measures a graph again or a graph is listed twice.
 
-1. Before the timed OOTB build, every run (also without `--oracle`)
-   builds the OOTB plan of the engine one time, untimed, and discards it. The
-   first build of an engine in a process also pays one-time costs: provider
-   setup and, on a cold page cache, the read of the plugin and kernel files.
-   Without this build, those costs would go into the OOTB build time only.
-   The untimed plan is never executed, so no provider tuning runs.
-2. The tool builds the tuned plan right after the OOTB plan, before either
-   plan executes. Work between the two builds (the OOTB timed loop,
-   validation) makes a later build slower.
-3. The tool times and validates the OOTB plan, then times and validates the
-   tuned plan.
-
-A tuned build prepares every candidate that the provider can sample, so it is
-usually slower than the OOTB build. Providers that support the knob (today the
-kernel ingestor and MIOpen) sample their candidates in the first launch of
-the tuned plan and keep the fastest. That launch is untimed and goes into
-`oracle.timing.first_call_ms`, so the MIOpen search cost is there, not in
-`oracle.build_ms`. Both plans then get the same `--warmup` launches. Engines
-without the knob ignore it and report `tuning_available: false`.
+A tuned build prepares every candidate that the provider can sample, so
+`oracle.build_ms` is usually larger than `ootb.build_ms`. Providers that
+support the knob (today the kernel ingestor and MIOpen) sample their
+candidates in the first launch of the tuned plan and keep the fastest. That
+launch is untimed and goes into `oracle.timing.first_call_ms`. Both runs get
+the same `--warmup` launches. Engines without the knob report
+`tuning_available: false`; their child re-measures the OOTB configuration.
+`--profiling-timeout` also limits each child.
 
 The `oracle` column shows `OOTB median / tuned median`. A value less than
 1.00x is a valid result. The column shows a label instead of a speedup when
@@ -289,7 +292,7 @@ no speedup applies:
 | Label | Meaning |
 |---|---|
 | `no-search` | The engine exposes no `global.benchmarking` knob, or the PyTorch graph has no conv or matmul node, so the tuned run re-measured the OOTB plan. |
-| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned PyTorch child times in `staged` mode. |
+| `mixed-timing` | The two runs were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned child times in `staged` mode. |
 | `invalid` | The OOTB or the tuned plan failed validation. |
 | `failed` | The tuned run did not produce a result (`oracle_error`). |
 | `n/a` | No comparison is available. |
@@ -301,23 +304,19 @@ failed `correctness` on either side, rows with `tuning_available: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
-The tuned pass sets `HIPDNN_DISABLE_CACHE=1`, so hipDNN writes no winner to
-disk. hipDNN still keeps the winner in memory until the process exits, and
-any later build of the same graph and engine uses it, with or without the
-knob. Therefore an engine that ran a tuned search on a graph cannot give a
-second OOTB measurement of that graph in the same run. The tool reports such
-a row as an `error`. This occurs when a stall-gate fallback remeasures the
-graph, or when the same graph is listed twice. Graphs that differ only in
-names or tensor UIDs are not detected. MIOpen FindDb and performance database
-entries can also supply tuned selections, and the hipDNN tuned search writes
-to `MIOPEN_USER_DB_PATH`. For a cold OOTB baseline, set
+The OOTB plan can still get a tuned selection from an earlier run. The
+shared hipDNN disk cache (`HIPDNN_CACHE_DIR`, or `--hipdnn-cache-dir`) can
+hold winners and engine rankings from an earlier `--autotune` run. MIOpen
+find and performance database entries in the shared `MIOPEN_USER_DB_PATH`
+can also supply tuned selections. For a cold OOTB baseline, set
 `HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1` and `HIPDNN_DISABLE_CACHE=1`. The tool
 shows a warning when `HIPDNN_DISABLE_EXACT_ENGINE_CACHE` is not set, and,
 once that is set, when `HIPDNN_DISABLE_CACHE` is not set. It also shows a
 warning when `HIPDNN_FORCE_BENCHMARKING` is set in the environment: the
-providers apply that variable before the knob, so it reaches both plans.
-`--autotune` sets that variable, so the tool rejects `--oracle --autotune`.
-`environment.selection_env` records the relevant variables.
+providers apply that variable before the knob, so it reaches the OOTB plan
+too. `--autotune` sets that variable, so the tool rejects
+`--oracle --autotune`. `environment.selection_env` records the relevant
+variables.
 
 ```bash
 HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 HIPDNN_DISABLE_CACHE=1 dnn-benchmark \

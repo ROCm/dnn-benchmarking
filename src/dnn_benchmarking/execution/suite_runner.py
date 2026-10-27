@@ -37,12 +37,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import (
-    build_tuned_plan,
-    run_pytorch_tuned,
-    run_tuned_plan,
-    tuned_in_process,
-)
+from .oracle import BENCHMARKING_KNOB, run_hipdnn_tuned, run_pytorch_tuned
 
 
 @dataclass
@@ -63,7 +58,6 @@ class _GraphContext:
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
-    graph_id: str = ""  # hipDNN runs only
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -468,35 +462,18 @@ def run_single_provider_engine(
         plugin_path=plugin,
     )
     memory_at_start = _gpu_memory_at_row_start()
+    tuning_available: Optional[bool] = None
     try:
-        if tuned_in_process(ctx.graph_id, engine_id):
-            # Typically the stall-fallback rerun of a graph whose first
-            # attempt already ran this engine's search, or a repeated graph.
-            raise RuntimeError(
-                "OOTB not measurable: this engine already ran a tuned search on "
-                "this graph in this process, and hipDNN would serve its winner"
-            )
         # Absorb the engine's one-time build costs (provider setup, cold
-        # plugin and kernel file reads) before timing, so the OOTB and tuned
-        # build times start from the same state.
+        # plugin and kernel file reads) before timing.
         Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
         row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
-        tuned = (
-            build_tuned_plan(
-                row=row,
-                handle=handle,
-                engine_id=engine_id,
-                graph_json_str=ctx.graph_json_str,
-                graph_name=ctx.graph_name,
-                config=config,
-            )
-            if config.oracle
-            else None
-        )
+        if config.oracle:
+            tuning_available = _tuning_available(row, executor, engine_id)
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -525,23 +502,9 @@ def run_single_provider_engine(
                 row.ootb.correctness = mismatch(
                     config, ctx.reference_error or "Reference outputs unavailable"
                 )
-
-            if tuned is not None:
-                run_tuned_plan(
-                    tuned=tuned,
-                    row=row,
-                    graph_id=ctx.graph_id,
-                    engine_id=engine_id,
-                    graph_name=ctx.graph_name,
-                    config=config,
-                    bm=bm,
-                    variant_pack=variant_pack,
-                    tensor_infos=ctx.tensor_infos,
-                    reference_outputs=ctx.reference_outputs,
-                )
-        # Release both workspaces before the profiling child allocates its own
-        # VRAM; holding them roughly doubles peak VRAM on large graphs.
-        del executor, tuned
+        # Release the workspace before a child process allocates its own
+        # VRAM; holding it raises peak VRAM on large graphs.
+        del executor
     except StallFallbackError:
         raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
@@ -553,11 +516,37 @@ def run_single_provider_engine(
             _failure_message(e, memory_at_start),
         )
 
-    # Profiling re-runs the workload after the timed pass, so profiler
-    # overhead cannot pollute the headline numbers.
+    # The tuned run and profiling run in child processes after the timed
+    # pass, so tuning state and profiler overhead cannot reach the headline
+    # numbers.
+    if tuning_available is not None:
+        run_hipdnn_tuned(
+            row=row,
+            graph_path=ctx.graph_path,
+            graph_name=ctx.graph_name,
+            engine_id=engine_id,
+            plugin_path=plugin_path,
+            tuning_available=tuning_available,
+            config=config,
+        )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
+
+
+def _tuning_available(
+    row: ProviderEngineResult, executor: Executor, engine_id: int
+) -> Optional[bool]:
+    """Whether the engine exposes the benchmarking knob for this graph.
+
+    Without it the tuned child re-measures the OOTB configuration. A failed
+    query becomes ``row.oracle_error`` (no tuned run), never a row failure.
+    """
+    try:
+        return BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id)
+    except Exception as e:
+        row.oracle_error = f"{type(e).__name__}: {e}"
+        return None
 
 
 def _error_or_skip(fatal: bool) -> Callable[..., ProviderEngineResult]:
@@ -793,7 +782,7 @@ def _run_graph_all_providers(
 
     try:
         ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
-        ctx.graph_json_str, ctx.graph_id = graph_json_str, graph.graph_id
+        ctx.graph_json_str = graph_json_str
     except Exception as e:
         graph.error = f"Input data generation failed: {type(e).__name__}: {e}"
         return graph
@@ -804,11 +793,10 @@ def _run_graph_all_providers(
             graph.results.append(reference_row)
 
     for selection in config.engine_selections_for(engine_ids):
-        graph.results.append(
-            _run_engine_selection(
-                ctx, handle, selection.engine_id, selection.plugin_path
-            )
+        row = _run_engine_selection(
+            ctx, handle, selection.engine_id, selection.plugin_path
         )
+        graph.results.append(row)
     return graph
 
 

@@ -4,7 +4,7 @@
 """Tests for execution.suite_runner, asserted on the GraphResult it returns."""
 
 import io
-import os
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +24,13 @@ from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
-from dnn_benchmarking.reporting.suite_results import graph_id_for, oracle_speedup
+from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
+from dnn_benchmarking.reporting.suite_results import (
+    CorrectnessResult,
+    engine_id_hex,
+    graph_id_for,
+    oracle_speedup,
+)
 
 GRAPH = {"name": "g", "nodes": [], "tensors": []}
 PATH = Path("g.json")
@@ -86,9 +92,7 @@ class Fake:
         self.torch_buffer_devices = []
         self.torch_outputs_written = False
         self.policies = []
-        # (call, handle, HIPDNN_DISABLE_CACHE) per plan build/run, in order;
-        # calls on the tuned plan are prefixed "tuned.".
-        self.calls = []
+        self.knob_ids = {}  # engine id -> knob ids; default: benchmarking
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
 
 
@@ -101,13 +105,7 @@ def fake(monkeypatch):
         def __init__(self, graph_json_str, policy):
             f.policies.append(policy)
             self.policy = policy
-            self.tag = ""
             self.build_time_ms, self.workspace_size = 0.0, 0
-
-        def _call(self, name, handle):
-            f.calls.append(
-                (self.tag + name, handle, os.environ.get("HIPDNN_DISABLE_CACHE"))
-            )
 
         def discover_engines(self, handle):
             f.events.append("discover")
@@ -116,31 +114,28 @@ def fake(monkeypatch):
             return list(f.discovered)
 
         def prime(self, handle, engine_id):
-            self._call("prime", handle)
+            pass
 
         def prepare(self, handle, engine_id=None, knobs=None):
-            self.tag = "tuned." if knobs else ""
-            self._call("prepare", handle)
             self.engine_id = engine_id
             if engine_id in f.prepare_errors:
                 raise f.prepare_errors[engine_id]
-            # Distinct OOTB and tuned build times, so a row cannot report the
-            # other plan's build.
-            self.build_time_ms = 7.0 if knobs else 2.0
+            self.build_time_ms = 2.0
             self.workspace_size = 64
 
         def engine_knob_ids(self, engine_id):
-            return ["global.benchmarking"]
+            knobs = f.knob_ids.get(engine_id, ["global.benchmarking"])
+            if isinstance(knobs, Exception):
+                raise knobs
+            return list(knobs)
 
         def benchmark(self, handle, variant_pack):
-            self._call("benchmark", handle)
             f.events.append(("benchmark", self.engine_id, self.policy.stall_gate))
             if self.engine_id in f.bench_errors:
                 raise f.bench_errors[self.engine_id]
             return _stall_aware(f, self.engine_id, self.policy)
 
         def execute_once(self, handle, variant_pack):
-            self._call("execute_once", handle)
             f.events.append("execute_once")
 
         def __del__(self):
@@ -181,7 +176,6 @@ def fake(monkeypatch):
             return f.clocks.pop(0) if f.clocks else None
 
     monkeypatch.setattr(suite_runner, "Executor", Executor)
-    monkeypatch.setattr(oracle, "Executor", Executor)
     monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
     monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
     monkeypatch.setitem(
@@ -278,20 +272,13 @@ def fake_torch(fake, monkeypatch):
 
 
 class _Handle:
-    """hipdnn.Handle stand-in; the oracle builds a second one on this stream."""
+    """hipdnn.Handle stand-in."""
 
     def __init__(self, names=None):
         self.names = names or {1: "ENG_A", 2: "ENG_B"}
-        self.stream = None
 
     def get_engine_info(self, eid):
         return SimpleNamespace(engine_name=self.names.get(eid, ""), version="2.1")
-
-    def get_stream(self):
-        return self.stream
-
-    def set_stream(self, stream):
-        self.stream = stream
 
 
 def _run(handle="default", **config):
@@ -438,52 +425,100 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         assert expected in warnings
 
 
-def test_every_executor_gets_the_run_policy(fake):
+@pytest.fixture
+def tuned_child(fake, monkeypatch):
+    """Fake tuned-hipDNN child: one success row, 7 ms build, 0.5 ms kernels.
+
+    Records each launch's engine (hex) in ``engines`` and in ``fake.events``.
+    """
+    child = SimpleNamespace(engines=[], correctness=None)
+
+    def run_capped(argv, timeout_s, env=None):
+        engine = argv[argv.index("--engine") + 1]
+        child.engines.append(engine)
+        fake.events.append(("tuned_child", engine))
+        timing = TimingInfo(
+            mode="staged", timer="hip", warmup_iters=2, samples=4, first_call_ms=5.0
+        )
+        plan = {
+            "build_ms": 7.0,
+            "timing": timing.to_dict(),
+            "kernel": BenchmarkStats.from_timings([0.5] * 4).to_dict(),
+            "host": BenchmarkStats.from_timings([0.01] * 4).to_dict(),
+        }
+        if child.correctness is not None:
+            plan["correctness"] = child.correctness.to_dict()
+        row = {"role": "engine", "status": "success", "message": None, "ootb": plan}
+        output = Path(argv[argv.index("--output") + 1])
+        output.write_text(json.dumps({"graphs": [{"results": [row]}]}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(oracle, "run_capped", run_capped)
+    return child
+
+
+def test_every_executor_gets_the_run_policy(fake, tuned_child):
     config = dict(warmup_iters=3, benchmark_iters=5, cache_mode="cold")
 
     _run(oracle=True, **config)
 
-    # Discovery, then per engine the prime, the OOTB plan and the tuned plan.
-    assert fake.policies == [SuiteConfig(**config).timing_policy] * 7
+    # Discovery, then per engine the prime and the OOTB plan; the tuned run
+    # is a child process.
+    assert fake.policies == [SuiteConfig(**config).timing_policy] * 5
 
 
-def test_oracle_builds_both_plans_before_anything_runs(fake, reference, monkeypatch):
-    """Per engine: one untimed prime on the row handle absorbs the first
-    build's one-time costs, then the timed OOTB and tuned builds run back to
-    back (work in between slows a later build). The tuned plan is never
-    primed, runs on its own handle with hipDNN caches disabled, and is timed
-    only after the OOTB plan is timed and validated."""
-    monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
-    handle = _Handle()
-
-    graph, _ = _validate(handle=handle, oracle=True)
-
-    assert [(name, h is handle, cache) for name, h, cache in fake.calls] == [
-        ("prime", True, None),
-        ("prepare", True, None),
-        ("tuned.prepare", False, "1"),
-        ("benchmark", True, None),
-        ("execute_once", True, None),
-        ("tuned.benchmark", False, "1"),
-        ("tuned.execute_once", False, "1"),
-    ] * 2
-    for row in graph.results:
-        assert (row.ootb.cpu_build_time_ms, row.oracle.cpu_build_time_ms) == (2.0, 7.0)
-        assert row.ootb.correctness.passed and row.oracle.correctness.passed
-
-
-def test_tuned_plan_failing_validation_publishes_no_speedup(
-    fake, reference, monkeypatch
+def test_oracle_tunes_each_engine_in_a_child_after_its_row_is_released(
+    fake, reference, tuned_child
 ):
-    """A wrong-but-fast tuned plan is checked against the graph's reference:
-    it keeps its own failed verdict and the OOTB row keeps its pass."""
-    run_tuned_plan = suite_runner.run_tuned_plan
+    """The tuned child runs once per engine, after the OOTB plan is timed and
+    validated and its buffers and workspace are released (tuning state must
+    not reach the OOTB numbers; held VRAM would stack on the child's)."""
+    passed = CorrectnessResult(tolerance_match=True, rtol=0, atol=0)
+    tuned_child.correctness = passed
 
-    def wrong_tuned_outputs(**kw):
-        fake.engine_output = REF + 1.0
-        run_tuned_plan(**kw)
+    graph, _ = _validate(oracle=True)
 
-    monkeypatch.setattr(suite_runner, "run_tuned_plan", wrong_tuned_outputs)
+    assert tuned_child.engines == [engine_id_hex(1), engine_id_hex(2)]
+    for eid in (1, 2):
+        at = fake.events.index(("tuned_child", engine_id_hex(eid)))
+        before = fake.events[:at]
+        assert ("benchmark", eid, True) in before
+        assert before[-3:] == ["read_output", "buffers_freed", "executor_freed"]
+    for row in graph.results:
+        assert row.status == "success" and row.oracle_error is None
+        assert (row.ootb.cpu_build_time_ms, row.oracle.cpu_build_time_ms) == (2.0, 7.0)
+        assert row.oracle.gpu_kernel_stats.median_ms == pytest.approx(0.5)
+        assert row.ootb.correctness.passed and row.oracle.correctness.passed
+        assert oracle_speedup(row) == pytest.approx(2.0)
+
+
+def test_tuning_available_follows_each_engines_knobs(fake, tuned_child):
+    """hipDNN ignores a knob the engine does not expose; its tuned run then
+    re-measures the OOTB configuration and must say so."""
+    fake.knob_ids = {2: ["miopen.find_mode"]}
+
+    graph, _ = _run(oracle=True)
+
+    assert [r.oracle.tuning_available for r in graph.results] == [True, False]
+
+
+def test_failed_knob_query_is_an_oracle_error_without_a_tuned_run(fake, tuned_child):
+    fake.knob_ids = {1: ExecutionError("no knobs")}
+
+    e1, e2 = _run(oracle=True)[0].results
+
+    assert tuned_child.engines == [engine_id_hex(2)]
+    assert (e1.status, e1.oracle) == ("success", None)
+    assert e1.oracle_error and e1.ootb.gpu_kernel_stats is not None
+    assert e2.oracle is not None and e2.oracle_error is None
+
+
+def test_tuned_child_failing_validation_publishes_no_speedup(
+    fake, reference, tuned_child
+):
+    """A wrong-but-fast tuned plan keeps its own failed verdict and the OOTB
+    row keeps its pass."""
+    tuned_child.correctness = CorrectnessResult(tolerance_match=False, rtol=0, atol=0)
 
     graph, _ = _validate(oracle=True, engine_filter=[1])
 
@@ -491,6 +526,29 @@ def test_tuned_plan_failing_validation_publishes_no_speedup(
     assert (row.status, row.verdict) == ("success", "passed")
     assert row.oracle.correctness.explicitly_failed
     assert oracle_speedup(row) is None
+
+
+def test_duplicate_engine_with_a_failed_knob_query_gets_no_tuned_run(fake, tuned_child):
+    """Duplicate selections are separate rows: the second row's failed knob
+    query must not inherit the first row's tuning availability."""
+
+    class FailsSecondTime:
+        calls = 0
+
+        def __iter__(self):
+            FailsSecondTime.calls += 1
+            if FailsSecondTime.calls > 1:
+                raise ExecutionError("no knobs")
+            return iter(["global.benchmarking"])
+
+    fake.knob_ids = {1: FailsSecondTime()}
+
+    first, second = _run(oracle=True, engine_filter=[1, 1])[0].results
+
+    assert tuned_child.engines == [engine_id_hex(1)]
+    assert first.oracle is not None and first.oracle_error is None
+    assert (second.status, second.oracle) == ("success", None)
+    assert second.oracle_error
 
 
 def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
@@ -830,16 +888,12 @@ def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
     ]
 
 
-def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
-    """Without --oracle or a profiling flag, no engine gets a tuned plan
-    and no profiler child is spawned."""
+def test_default_run_skips_oracle_and_profiling(fake, tuned_child, monkeypatch):
+    """Without --oracle or a profiling flag, no tuned child and no profiler
+    child is spawned."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
     called = []
-    for name in ("build_tuned_plan", "run_tuned_plan"):
-        monkeypatch.setattr(
-            suite_runner, name, lambda name=name, **kw: called.append(name)
-        )
     monkeypatch.setattr(
         profiling_orchestrator,
         "run_profiling_passes",
@@ -848,7 +902,7 @@ def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
 
     graph, _ = _run()
 
-    assert called == []
+    assert called == [] and tuned_child.engines == []
     assert [(r.status, r.oracle, r.extra_metrics) for r in graph.results] == [
         ("success", None, None)
     ] * 2
@@ -1005,19 +1059,21 @@ def test_pytorch_buffers_share_the_executor_device(fake_torch):
     assert fake_torch.torch_buffer_devices == ["cuda:3"]
 
 
-def test_stall_rerun_reports_no_ootb_for_an_engine_that_already_tuned(fake):
-    """hipDNN keeps a tuned winner in memory and serves it to any later build
-    of the graph: engine 1 tuned before engine 2 stalled, so its rerun OOTB
-    would time the tuned kernel and must not be published."""
+def test_stall_rerun_measures_ootb_for_every_engine_and_tunes_again(fake, tuned_child):
+    """Tuning state lives in the child, so a whole-graph rerun after engine 2
+    stalled times every engine's OOTB plan again, and each row gets the tuned
+    run of the attempt it is reported from."""
     fake.stall = {2}
 
     graph, _ = _run(oracle=True)
 
-    e1, e2 = graph.results
-    assert (e1.status, e1.to_dict()["ootb"]) == ("error", None)
-    assert "already ran a tuned search" in e1.error_message
-    # Engine 2 stalled in its OOTB loop, before its own search.
-    assert e2.status == "success" and e2.oracle is not None
+    assert [(r.status, r.ootb.timing.mode) for r in graph.results] == [
+        ("success", "events")
+    ] * 2
+    assert all(r.oracle is not None for r in graph.results)
+    # Engine 1 tuned before engine 2 stalled in its OOTB loop; the rerun
+    # tunes both.
+    assert tuned_child.engines == [engine_id_hex(e) for e in (1, 1, 2)]
 
 
 def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):

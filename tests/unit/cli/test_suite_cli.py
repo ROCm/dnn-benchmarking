@@ -809,14 +809,6 @@ def test_final_write_survives_a_second_signal(
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 
-@pytest.mark.parametrize("flag", ["--no-oracle", "--oracle"])
-def test_oracle_states_the_tuned_plan_knob(tmp_path, runtime, flag) -> None:
-    runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args(flag), _graphs(tmp_path, 1))
-    notice = "each engine gets a second plan built with global.benchmarking=1"
-    assert (notice in text) == (flag == "--oracle")
-
-
 @pytest.mark.parametrize(
     "forced, warned", [(None, False), ("0", True)], ids=["unset", "env"]
 )

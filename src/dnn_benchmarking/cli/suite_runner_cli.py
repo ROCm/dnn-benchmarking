@@ -376,7 +376,7 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
 
 
 def _warn_oracle(reporter: Reporter) -> None:
-    """One line per condition that makes the OOTB or tuned plan non-cold."""
+    """One line per condition that makes the OOTB plan non-cold."""
     if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
         reporter.warning(
             "--oracle: exact-engine cache is on, so the OOTB timing may "
@@ -388,18 +388,19 @@ def _warn_oracle(reporter: Reporter) -> None:
             "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
         )
     reporter.info(
-        "--oracle: each engine gets a second plan built with "
-        "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
-        "engines re-measure the OOTB plan); MIOpen may reuse FindDb entries"
+        "--oracle: each engine row gets a tuned run in a child process with "
+        "--autotune and a private hipDNN cache and MIOpen user database "
+        "(kernel ingestor and MIOpen sample kernels; other engines re-measure "
+        "the OOTB plan)"
     )
     forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
     if forced is not None:
-        # Providers apply the variable as override.value_or(knob): it wins over
-        # the tuned plan's knob and also reaches the OOTB plan.
+        # Providers apply the variable as override.value_or(knob), and the
+        # OOTB plan inherits it; the tuned child sets it to 1 (--autotune).
         reporter.warning(
             f"--oracle with HIPDNN_FORCE_BENCHMARKING={forced} in the environment: "
-            "it overrides the global.benchmarking knob for the OOTB and the tuned "
-            "plan, so the two may not differ"
+            "it overrides the global.benchmarking knob for the OOTB plan, so the "
+            "OOTB and the tuned run may not differ"
         )
 
 

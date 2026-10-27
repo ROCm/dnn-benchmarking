@@ -211,6 +211,21 @@ class CorrectnessResult:
             "message": self.error_message,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CorrectnessResult":
+        """Inverse of :meth:`to_dict` (a result file's ``correctness``)."""
+        return cls(
+            tolerance_match=data["match"],
+            rtol=data["rtol"],
+            atol=data["atol"],
+            max_abs_diff=data.get("max_abs_diff"),
+            max_rel_diff=data.get("max_rel_diff"),
+            error_message=data.get("message"),
+            n_mismatch=data.get("n_mismatch"),
+            n_total=data.get("n_total"),
+            worst_output_uid=data.get("worst_output_uid"),
+        )
+
 
 @dataclass(kw_only=True)
 class PlanResult:
@@ -260,9 +275,9 @@ class PlanResult:
 class OracleResult(PlanResult):
     """Tuned run for one row; the row's own ``PlanResult`` is the OOTB plan.
 
-    hipDNN: the tuned plan is built for the same engine as the OOTB plan,
-    with ``global.benchmarking=1``. A benchmarking build compiles every
-    candidate the provider can sample, so its build is expected to be slower.
+    hipDNN: the tuned run comes from a child process that runs the same engine
+    with benchmarking on. A benchmarking build compiles every candidate the
+    provider can sample, so its build is expected to be slower.
     PyTorch: the tuned run comes from an isolated child process and has no
     plan build.
 
