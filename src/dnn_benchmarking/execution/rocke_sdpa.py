@@ -6,38 +6,35 @@
 Two kinds of kernel apply to a graph:
 
 * Catalog kernels: the rocKE kernels that hipDNN ships for the
-  ``hipkernel:Gfx950AttentionDense`` engine. The installed descriptor file
-  (``*.kdp.json`` under the plugin directory) records the SHA-256 of each
-  shipped code object. The authored descriptor in the rocm-libraries checkout
-  that holds the installed ``rocke`` package records each variant's rocKE
-  builder spec. A catalog row joins the two by descriptor id, builds the spec
-  with the installed rocKE packages and launches it directly, so it runs the
-  same code object as the hipDNN engine.
+  ``hipkernel:Gfx950AttentionDense`` engine. Each variant in the installed
+  descriptor file (``*.kdp.json`` under the plugin directory) records its
+  problem fields and tile in ``metadata``, and where its code object is in
+  ``kernel_source``: the kpack archive, the archive key, the symbol, the
+  SHA-256 and the argument list. A catalog row reads that code object and
+  launches it through rocKE's runtime, so it runs hipDNN's own binary.
 * The auto kernel: the kernel that rocKE's own production dispatcher
   (``dispatch.attention.dispatch_attention``) selects for the problem.
 
 This module needs neither torch nor rocKE at import time.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 
 from ..common.exceptions import UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
 
-#: Builder that every catalog kernel must name in its authored descriptor.
-DENSE_SOURCE = "kernels/gfx950/attention_dense.py"
-DENSE_BUILDER = "build_attention_dense"
 DENSE_ARCH = "gfx950"
+
+#: hipDNN engine whose descriptors make up the catalog.
+DENSE_ENGINE = "hipkernel:Gfx950AttentionDense"
 
 #: Descriptor root of the hip-kernel-provider plugin, relative to a plugin path.
 _DESCRIPTOR_SUBDIR = Path("arch_content") / "hip-kernel-provider"
 
-#: Authored rocKE descriptors, relative to the hip-kernel-provider checkout.
-_AUTHORED_SUBDIR = (
-    Path("src") / "engines" / "kernel_ingestor_engine" / "descriptors" / "rocKE"
-)
+#: Descriptor metadata stored as 0/1 that ``Gfx950AttentionDenseSpec`` takes as bool.
+_BOOL_FIELDS = ("causal", "ragged")
 
 _ROCKE_DTYPES = {"half": "fp16", "bfloat16": "bf16"}
 
@@ -102,16 +99,22 @@ class SdpaProblem:
 
 @dataclass(frozen=True)
 class CatalogKernel:
-    """One hipDNN-shipped rocKE variant, specialized to the graph's shape.
+    """One hipDNN-shipped rocKE variant.
 
-    ``spec`` holds the keyword arguments of ``Gfx950AttentionDenseSpec``.
-    ``shipped_sha256`` is the SHA-256 of hipDNN's code object, or None when
-    the descriptor does not record it.
+    ``spec`` holds the keyword arguments of ``Gfx950AttentionDenseSpec``: the
+    variant's metadata, with the graph's batch and sequence lengths once it
+    matches a graph. ``library`` is the kpack archive; ``toc_key``,
+    ``symbol``, ``sha256`` and ``arg_names`` are the archive key, the kernel
+    symbol, the code-object hash and the argument names hipDNN binds.
     """
 
     name: str
     spec: Dict[str, Any]
-    shipped_sha256: Optional[str]
+    library: Path
+    toc_key: str
+    symbol: str
+    sha256: str
+    arg_names: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -129,19 +132,7 @@ class AutoKernel:
 RockeKernel = Union[CatalogKernel, AutoKernel]
 
 
-@dataclass(frozen=True)
-class Catalog:
-    """Catalog kernels found under the plugin paths for one GPU arch.
-
-    ``unmatched`` names installed rocKE descriptor files that no authored
-    descriptor matches: the authored files are absent (not pulled from DVC)
-    or come from another checkout. ``missing_spec`` counts shipped variants
-    of a matched bundle that the authored bundle lacks.
-    """
-
-    kernels: Tuple[Tuple[str, Dict[str, Any], Optional[str]], ...]
-    unmatched: Tuple[str, ...] = ()
-    missing_spec: int = 0
+Catalog = Tuple[CatalogKernel, ...]
 
 
 def _is_packed_bshd(dims: Sequence[int], strides: Sequence[int]) -> bool:
@@ -266,90 +257,55 @@ def sdpa_problem(
     )
 
 
-def descriptor_files(plugin_paths: Iterable[Path], arch: str) -> List[Path]:
-    """Installed rocKE descriptor files of the hip-kernel-provider plugin.
+def load_catalog(plugin_paths: Iterable[Path], arch: str) -> Catalog:
+    """Read every shipped variant of the ``DENSE_ENGINE`` engine for ``arch``.
 
-    The packer keeps each descriptor's authored subpath (for example
-    ``gfx950_attention_dense/artifacts/``), so search the whole tree.
-    """
-    files: List[Path] = []
-    for root in plugin_paths:
-        base = Path(root) / _DESCRIPTOR_SUBDIR / arch / "rocKE"
-        files.extend(sorted(base.rglob("*.kdp.json")))
-    return files
-
-
-def authored_descriptor_root() -> Optional[Path]:
-    """Authored rocKE descriptors of the checkout that holds ``rocke``.
-
-    ``setup_env.py`` installs ``rocke`` editable from
-    ``hip-kernel-provider/rocke/platform/python``, so the checkout is four
-    levels above the package. None when ``rocke`` is not installed from a
-    rocm-libraries checkout.
-    """
-    import importlib.util
-
-    spec = importlib.util.find_spec("rocke")
-    if spec is None or spec.origin is None:
-        return None
-    root = Path(spec.origin).resolve().parents[4] / _AUTHORED_SUBDIR
-    return root if root.is_dir() else None
-
-
-def load_catalog(installed: Iterable[Path], authored: Iterable[Path]) -> Catalog:
-    """Read every shipped dense-attention rocKE variant.
-
-    The installed (packed) descriptor carries the code-object hash in
-    ``kernel_source.sha256`` but no rocKE spec: the packer moves that into a
-    provenance sidecar, which only a test install ships. The authored
-    descriptor carries the spec in ``kernel_source``. Packing keeps both the
-    descriptor id and each variant id, so the two join on them.
+    An engine descriptor (``*.ued.json``) holds the engine name; a variant
+    set (``*.kdp.json``) names its engine by id. The packer keeps each
+    descriptor's authored subpath (for example
+    ``gfx950_attention_dense/artifacts/``), so search the whole tree. A
+    ``kernel_source.library`` path is relative to its descriptor file.
 
     Raises:
-        OSError, ValueError: A descriptor file is unreadable or not JSON.
+        OSError, ValueError, KeyError: A descriptor file is unreadable, not
+            JSON, or lacks a field of a packed variant.
     """
     import json
 
-    authored_bundles = set()
-    authored_variants = set()
-    specs: Dict[str, Dict[str, Any]] = {}
-    for path in authored:
+    def read(path: Path) -> Dict[str, Any]:
         with open(path, encoding="utf-8") as f:
-            descriptor = json.load(f)
-        authored_bundles.add(str(descriptor.get("id")))
-        for ukd in descriptor.get("kernelDescriptors", []):
-            authored_variants.add(str(ukd.get("id")))
-            source = ukd.get("kernel_source") or {}
-            if (
-                source.get("kind") == "rocke"
-                and source.get("source") == DENSE_SOURCE
-                and source.get("builder") == DENSE_BUILDER
-            ):
-                specs[str(ukd.get("id"))] = dict(source["spec"])
+            return json.load(f)
 
     kernels = []
-    unmatched = []
-    missing = 0
-    for path in installed:
-        with open(path, encoding="utf-8") as f:
-            descriptor = json.load(f)
-        if str(descriptor.get("id")) not in authored_bundles:
-            unmatched.append(path.name)
-            continue
-        for ukd in descriptor.get("kernelDescriptors", []):
-            source = ukd.get("kernel_source") or {}
-            uid = str(ukd.get("id"))
-            if source.get("kind") != "kpack":
+    for root in plugin_paths:
+        base = Path(root) / _DESCRIPTOR_SUBDIR / arch / "rocKE"
+        engines = [read(p) for p in sorted(base.rglob("*.ued.json"))]
+        ids = {str(e.get("id")) for e in engines if e.get("name") == DENSE_ENGINE}
+        for path in sorted(base.rglob("*.kdp.json")):
+            descriptor = read(path)
+            if str(descriptor.get("engine")) not in ids:
                 continue
-            if uid not in authored_variants:
-                missing += 1
-            elif uid in specs:
+            for ukd in descriptor.get("kernelDescriptors", []):
+                source = ukd.get("kernel_source") or {}
+                if source.get("kind") != "kpack":
+                    continue
+                spec = dict(ukd["metadata"])
+                spec["dtype"] = str(spec["dtype"]).lower()
+                for field in _BOOL_FIELDS:
+                    if field in spec:
+                        spec[field] = bool(spec[field])
                 kernels.append(
-                    (str(ukd.get("name", "")), specs[uid], source.get("sha256"))
+                    CatalogKernel(
+                        name=f"rocke:{ukd['name']}",
+                        spec=spec,
+                        library=(path.parent / source["library"]).resolve(),
+                        toc_key=source["toc_key"],
+                        symbol=source["symbol"],
+                        sha256=source["sha256"],
+                        arg_names=tuple(a.get("name") for a in source["signature"]),
+                    )
                 )
-    return Catalog(
-        kernels=tuple(kernels), unmatched=tuple(unmatched), missing_spec=missing
-    )
+    return tuple(kernels)
 
 
 def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKernel]:
@@ -366,7 +322,8 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
     )
 
     found = []
-    for name, spec, sha in catalog.kernels:
+    for kernel in catalog:
+        spec = kernel.spec
         if (
             spec.get("dtype") != problem.dtype
             or spec.get("head_size") != problem.head_size
@@ -392,7 +349,7 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
         except ValueError:
             ok = False
         if ok:
-            found.append(CatalogKernel(f"rocke:{name}", shaped, sha))
+            found.append(replace(kernel, spec=shaped))
     return found
 
 

@@ -1,7 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""rocKE executor: build one rocKE SDPA kernel and launch it without hipDNN.
+"""rocKE executor: load one rocKE SDPA kernel and launch it without hipDNN.
 
 The executor launches through rocKE's own runtime (``rocke.runtime``) on the
 torch default stream, and times through ``timing.measure`` like the other
@@ -10,14 +10,14 @@ rocKE launch synchronizes the host after every call.
 """
 
 import hashlib
-from typing import Callable, Dict, List, NamedTuple, Optional
+from typing import Callable, Dict, NamedTuple, Optional
 
 import torch
 
 from ..common import torch_support
 from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import TimingPolicy
-from .rocke_build import COMGR_ENV, BuiltKernel
+from .kpack import read_kernel
 from .rocke_sdpa import DENSE_ARCH, AutoKernel, CatalogKernel, RockeKernel, SdpaProblem
 from .timing import Measurement, Timer, is_hip_available, measure
 
@@ -74,11 +74,10 @@ def paged_views(p: SdpaProblem, block_size: int, q, k, v, o) -> PagedViews:
 class RockeExecutor:
     """Launch one rocKE kernel on graph tensors.
 
-    ``build_time_ms`` is the host time to build and load the kernel. For a
-    catalog kernel the build ran in the child (``rocke_build``), and ``built``
-    carries its code object. For the auto kernel it also includes the first
-    launch, because rocKE compiles the unified kernel inside its launch call.
-    ``warnings`` holds row warnings.
+    ``build_time_ms`` is the host time to get and load the kernel. For a
+    catalog kernel that is reading hipDNN's code object from the kpack
+    archive and loading it. For the auto kernel it includes the first launch,
+    because rocKE compiles the unified kernel inside its launch call.
     """
 
     def __init__(
@@ -87,13 +86,11 @@ class RockeExecutor:
         problem: SdpaProblem,
         policy: TimingPolicy,
         device: Optional[torch.device] = None,
-        built: Optional[BuiltKernel] = None,
     ) -> None:
         self._kernel = kernel
         self._problem = problem
         self._policy = policy
         self._device = device if device is not None else torch.device("cuda")
-        self._built = built
         # Same choice as the PyTorch executor: rocKE and ROCm torch share the
         # HIP runtime, so HIP events can bracket the torch stream.
         self._timer = (
@@ -102,7 +99,6 @@ class RockeExecutor:
         self._stream = torch.cuda.default_stream(self._device)
         self._launch: Optional[Callable[[], None]] = None
         self.build_time_ms: Optional[float] = None
-        self.warnings: List[str] = []
 
     def prepare(self, tensors: Dict[int, torch.Tensor]) -> None:
         """Build the kernel and bind it to the graph tensors.
@@ -140,30 +136,30 @@ class RockeExecutor:
 
         kernel = self._kernel
         assert isinstance(kernel, CatalogKernel)
-        built = self._built
-        if built is None:
-            raise ExecutionError("catalog kernel has no child-built code object")
         p = self._problem
         spec = Gfx950AttentionDenseSpec(**kernel.spec)
+        # rocKE packs kernel arguments from its own typed signature; hipDNN
+        # binds the descriptor's. Equal names in equal order give one layout.
+        signature = attention_dense_signature(spec)
+        names = tuple(a["name"] for a in signature)
+        if names != kernel.arg_names:
+            raise ExecutionError(
+                f"rocKE's argument list {names} differs from hipDNN's "
+                f"{kernel.arg_names}"
+            )
         with Timer() as t:
+            hsaco = read_kernel(kernel.library, kernel.toc_key, DENSE_ARCH)
+            digest = hashlib.sha256(hsaco).hexdigest()
+            if digest != kernel.sha256:
+                raise ExecutionError(
+                    f"code object {kernel.toc_key} in {kernel.library} has "
+                    f"SHA-256 {digest[:12]}, the descriptor records "
+                    f"{kernel.sha256[:12]}"
+                )
             launcher = KernelLauncher(
-                hsaco=built.hsaco,
-                kernel_name=built.kernel_name,
-                signature=attention_dense_signature(spec),
+                hsaco=hsaco, kernel_name=kernel.symbol, signature=signature
             )
-        self.build_time_ms = built.compile_ms + t.elapsed_ms
-
-        digest = hashlib.sha256(built.hsaco).hexdigest()
-        if kernel.shipped_sha256 is None:
-            self.warnings.append(
-                "hipDNN code-object hash unavailable; parity not checked"
-            )
-        elif digest != kernel.shipped_sha256:
-            self.warnings.append(
-                f"code object differs from hipDNN's (rocKE {digest[:12]}, hipDNN "
-                f"{kernel.shipped_sha256[:12]}, comgr {built.comgr}): set "
-                f"{COMGR_ENV} to the comgr that built the plugin"
-            )
+        self.build_time_ms = t.elapsed_ms
 
         values = {
             "q_ptr": q.data_ptr(),

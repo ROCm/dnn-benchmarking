@@ -26,7 +26,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Union,
 )
 
 from ..common.exceptions import UnsupportedGraphError
@@ -53,10 +52,8 @@ from .oracle import (
     run_tuned_plan,
     tuned_in_process,
 )
-from .rocke_build import BuiltKernel, build_dense_variants
 from .rocke_sdpa import (
     Catalog,
-    CatalogKernel,
     RockeKernel,
     SdpaProblem,
     auto_kernel,
@@ -1030,31 +1027,18 @@ def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
     """Read the device and the shipped rocKE catalog once per suite.
 
     Raises:
-        OSError, ValueError: A descriptor file is unreadable or not JSON.
+        OSError, ValueError, KeyError: A descriptor file is unreadable or
+            malformed.
     """
     import torch
 
     from .rocke_executor import device_arch, device_num_cus
-    from .rocke_sdpa import authored_descriptor_root, descriptor_files, load_catalog
+    from .rocke_sdpa import load_catalog
 
     device = torch.device("cuda")
     arch = device_arch(device)
-    authored_root = authored_descriptor_root()
-    authored = sorted(authored_root.rglob("*.kdp.json")) if authored_root else []
-    catalog = load_catalog(descriptor_files(config.plugin_paths or [], arch), authored)
-    if catalog.unmatched:
-        where = authored_root or "the rocm-libraries checkout of the rocke package"
-        reporter.warning(
-            f"no authored rocKE descriptor in {where} matches the installed "
-            f"{', '.join(catalog.unmatched)}; run `dvc pull -r ingestor` there, "
-            "or install rocke from the checkout that built the plugins"
-        )
-    if catalog.missing_spec:
-        reporter.warning(
-            f"{catalog.missing_spec} shipped rocKE variants are absent from the "
-            "authored descriptors; the checkout differs from the plugin build"
-        )
-    if not catalog.kernels:
+    catalog = load_catalog(config.plugin_paths or [], arch)
+    if not catalog:
         reporter.warning(
             f"no hipDNN-shipped rocKE kernels for {arch} under the plugin path; "
             "only the rocKE auto kernel runs"
@@ -1101,24 +1085,11 @@ def rocke_planner(session: RockeSession) -> GraphPlanner:
             return RuntimePlan("rocke", message="; ".join(reasons))
 
         def rows(ctx: Optional[_GraphContext]) -> List[ProviderEngineResult]:
-            # One torch-free child builds every catalog variant of this graph
-            # with the pack step's comgr (see rocke_build); a failure fails
-            # only those rows.
-            catalog = [k for k in kernels if isinstance(k, CatalogKernel)]
-            built: Dict[str, Union[BuiltKernel, str]] = {}
-            if catalog:
-                try:
-                    results = build_dense_variants([k.spec for k in catalog])
-                    built = {k.name: b for k, b in zip(catalog, results)}
-                except Exception as e:
-                    built = {k.name: f"{type(e).__name__}: {e}" for k in catalog}
             return [
                 _report_row(
                     reporter,
                     kernel.name,
-                    lambda k=kernel: _run_rocke_row(
-                        ctx, k, problem, session, built.get(k.name)
-                    ),
+                    lambda k=kernel: _run_rocke_row(ctx, k, problem, session),
                 )
                 for kernel in kernels
             ]
@@ -1155,7 +1126,6 @@ def _run_rocke_row(
     kernel: RockeKernel,
     problem: SdpaProblem,
     session: RockeSession,
-    built: Union[BuiltKernel, str, None],
 ) -> ProviderEngineResult:
     """Load, time and validate one rocKE kernel."""
     config = ctx.config
@@ -1167,22 +1137,17 @@ def _run_rocke_row(
         status="success",
         engine_version=session.version,
     )
-    if isinstance(built, str):
-        return _failed_row(
-            ProviderEngineResult.error_row, row, f"rocKE build failed: {built}"
-        )
     try:
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
         from .rocke_executor import RockeExecutor
 
-        executor = RockeExecutor(kernel, problem, config.timing_policy, built=built)
+        executor = RockeExecutor(kernel, problem, config.timing_policy)
         with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
             bm.allocate_all()
             bm.load_input_data(ctx.input_data)
             bm.zero_outputs()
             executor.prepare(bm.get_tensors())
             row.ootb.cpu_build_time_ms = executor.build_time_ms
-            row.warnings = list(executor.warnings)
             _measure_row(row, ctx, executor.benchmark)
 
             if ctx.reference_outputs is not None:

@@ -97,8 +97,8 @@ src/dnn_benchmarking/
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
 │   ├── rocke_sdpa.py         # rocKE runtime: SDPA problem, shipped-variant catalog, auto kernel
-│   ├── rocke_executor.py     # rocKE runtime: build and launch one rocKE kernel
-│   ├── rocke_build.py        # rocKE runtime: torch-free child that builds catalog variants
+│   ├── rocke_executor.py     # rocKE runtime: load and launch one rocKE kernel
+│   ├── kpack.py              # rocKE runtime: read hipDNN's code objects (librocm_kpack)
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
@@ -133,10 +133,10 @@ and `PyTorchCudaBufferManager`. One `runtime = "pytorch"` row per graph. No
 engine discovery or plugins.
 
 Data flow (rocKE): the same, with `rocke_planner`, `RockeExecutor` and
-`PyTorchCudaBufferManager`. The catalog joins the installed hip-kernel-provider
-descriptors (shipped code-object hashes) with the authored descriptors in the
-checkout of the installed `rocke` package (rocKE specs), once per suite
-(`rocke_session`).
+`PyTorchCudaBufferManager`. The catalog reads the installed
+`hipkernel:Gfx950AttentionDense` descriptors once per suite
+(`rocke_session`); a variant row launches hipDNN's code object from the
+kpack archive.
 One `runtime = "rocke"` row per applicable kernel.
 
 With several runtimes, `run_graph` gets one planner per runtime, in

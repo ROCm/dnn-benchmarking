@@ -29,8 +29,7 @@ def rocke_gfx950(torch_gpu, plugin_paths):
     return plugin_paths
 
 
-def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> None:
-    from dnn_benchmarking.execution.rocke_sdpa import descriptor_files
+def test_rocke_rows_launch_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> None:
     from dnn_benchmarking.execution.suite_runner import rocke_session, run_graph_rocke
 
     graph = sdpa_graph(b=1, hq=32, hkv=8, s=512, d=128)
@@ -44,10 +43,13 @@ def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> No
     )
     reporter = Reporter(output=io.StringIO())
     session = rocke_session(config, reporter)
-    if not descriptor_files([Path(p) for p in rocke_gfx950], "gfx950"):
+    roots = [
+        Path(p) / "arch_content/hip-kernel-provider/gfx950/rocKE" for p in rocke_gfx950
+    ]
+    if not any(any(r.rglob("*.kdp.json")) for r in roots):
         pytest.skip("the plugin build ships no rocKE descriptors")
-    # Descriptors present but no usable variant: the authored join broke.
-    assert session.catalog.kernels, session.catalog
+    # Descriptors present but no dense variant: the engine lookup broke.
+    assert session.catalog
 
     result = run_graph_rocke(
         Path("rocke.json"), graph, infos, config, reporter, session
@@ -58,14 +60,10 @@ def test_rocke_rows_rebuild_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> No
     assert any(n.startswith("rocke:attention_dense.") for n in names), names
     assert any(n.startswith("rocke:auto:") for n in names), names
     for row in rows:
+        # A variant row errors unless it read hipDNN's code object (the
+        # descriptor's SHA-256) and rocKE's argument list matched hipDNN's.
         assert row.verdict == "passed", (row.engine_name, row.error_message)
         assert row.ootb.gpu_kernel_stats.median_ms > 0
-        # The plugin and the rocKE packages come from one checkout, so each
-        # variant row must launch hipDNN's own code object.
-        assert not any("code object differs" in w for w in row.warnings or []), (
-            row.engine_name,
-            row.warnings,
-        )
 
 
 def test_hipdnn_and_rocke_rows_share_one_graph_run(hipdnn, rocke_gfx950) -> None:

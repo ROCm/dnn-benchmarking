@@ -263,36 +263,28 @@ row's `engine.id`:
 
 How the variant rows get the hipDNN kernel:
 
-1. The tool reads the installed descriptor files (`*.kdp.json` at any depth
-   under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
-   Each shipped variant records the SHA-256 of its code object, but not its
-   rocKE spec. hipDNN installs the spec only with a test build.
-2. The tool reads each variant's rocKE builder spec from the authored
-   descriptor in the rocm-libraries checkout that holds the installed `rocke`
-   package (`src/engines/kernel_ingestor_engine/descriptors/rocKE/`). It joins
-   the two files by descriptor id and variant id. The authored bundle is in
-   DVC. `setup_env.py` pulls it. Otherwise, run `dvc pull -r ingestor` in the
-   checkout. A missing or different authored bundle gives a startup warning.
-3. A child process without torch builds the specs of each graph with the
-   installed rocKE packages. It uses the comgr in
-   `DNN_BENCH_ROCKE_COMGR_LIB`, which `setup_env.py` exports in the venv's
-   `activate` script: the comgr of rocKE's pack step. A process that has
-   loaded torch keeps torch's comgr, and a different comgr gives different
-   code-object bytes. The tool replaces only the batch and the sequence
-   lengths. The shipped kernels read these values as kernel arguments, so
-   they do not change the code object.
-4. When the SHA-256 is different, the row gets the warning
-   `code object differs from hipDNN's`. Then the rocKE packages or the comgr
-   are not the ones that built the plugin, and the row does not measure the
-   hipDNN kernel. Set `DNN_BENCH_ROCKE_COMGR_LIB` to the `libamd_comgr` that
-   built the plugin. Do not set `ROCKE_COMGR_LIB`: the auto row compiles in
-   the main process, where rocKE refuses a second comgr.
+1. The tool reads the installed descriptor files of the
+   `hipkernel:Gfx950AttentionDense` engine (`*.ued.json` and `*.kdp.json` at
+   any depth under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
+   Each variant records its problem fields and tile (`block_m`, `block_n`),
+   and where its code object is: the kpack archive, the archive key, the
+   symbol, the SHA-256 and the argument list.
+2. The tool makes a rocKE spec from the variant's fields and the graph's
+   batch and sequence lengths. rocKE's own checks decide whether the variant
+   runs the graph, and rocKE computes the launch grid and block. These are
+   the grid and block that hipDNN computes.
+3. The tool reads the code object from the kpack archive with ROCm's kpack
+   reader (`librocm_kpack`, the reader that the plugin uses) and launches it
+   through rocKE's runtime. It does not compile the variant. The row is an
+   error when the code object does not have the recorded SHA-256, or when
+   rocKE's argument list is not the one that hipDNN binds.
 
 Read the rows as follows:
 
-- The variant row with the tile that hipDNN selects is the parity check. Its
-  median must agree with the `hipkernel:Gfx950AttentionDense` hipDNN row
-  within noise.
+- The variant row with the tile that hipDNN selects is the parity check. It
+  runs the same code object with the same grid as the
+  `hipkernel:Gfx950AttentionDense` hipDNN row, so their medians must agree
+  within noise. A difference is the cost of the hipDNN launch path.
 - The fastest variant row minus the hipDNN row is the loss from hipDNN's tile
   selection.
 - The auto row minus the fastest variant row is the loss from the kernels
@@ -312,10 +304,10 @@ Requirements and limits:
   verified on gfx1250. With `--runtime rocke` alone, a graph that no rocKE
   kernel runs reports `no engines applicable` with the reasons. In a runtime
   list it gets no rocKE rows.
-- `build_ms` is the rocKE build and load time. For a variant row the build
-  is the compile time in the child process. For the auto row it also
-  includes the first launch, because rocKE compiles the unified kernel inside
-  its launch call.
+- `build_ms` is the time to get and load the kernel. For a variant row this
+  is the kpack read and the module load. For the auto row it also includes
+  the compile and the first launch, because rocKE compiles the unified kernel
+  inside its launch call.
 - `--plugin-path` selects the descriptor directory. With `--runtime rocke`
   alone, these options stop the run with exit code 2: `--engine`, `--oracle`,
   `--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
