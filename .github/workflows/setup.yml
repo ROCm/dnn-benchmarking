@@ -42,7 +42,7 @@ jobs:
         include:
           - os: aws-linux-scale-rocm-small
             platform: linux
-          - os: aws-windows-scale-rocm-prod
+          - os: aws-windows-scale-rocm-prod-mix
             platform: windows
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -92,7 +92,7 @@ jobs:
 
   gpu-test:
     name: gpu-tests (gfx950, full suite)
-    runs-on: linux-gfx950-1gpu-ccs-ossci-rocm
+    runs-on: linux-mi355-1gpu-ossci-rocm
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
