@@ -308,8 +308,22 @@ def _has_fp16_output(
     for key in _CONVOLUTION_OUTPUT_KEYS:
         uid = outputs.get(key)
         if uid is not None and int(uid) in tensors:
-            return tensor_data_type(tensors[int(uid)], graph_json) == "half"
+            return _output_data_type(tensors[int(uid)], graph_json) == "half"
     return False
+
+
+def _output_data_type(
+    tensor: Dict[str, Any], graph_json: Dict[str, Any]
+) -> Optional[str]:
+    """The data type a convolution stores its output in.
+
+    hipDNN fills an "unset" virtual (fused intermediate) tensor from the
+    graph's intermediate_data_type, and any other "unset" tensor from its
+    io_data_type (:func:`tensor_data_type`).
+    """
+    if tensor.get("virtual") and tensor.get("data_type") == "unset":
+        return graph_json.get("intermediate_data_type") or "unset"
+    return tensor_data_type(tensor, graph_json)
 
 
 def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:

@@ -145,6 +145,34 @@ def test_output_dtype_decides_whether_operands_are_signed(
     assert [bool(data[uid].min() < 0) for uid in (1, 2)] == [signed, signed]
 
 
+@pytest.mark.parametrize(
+    "io_data_type, intermediate_data_type, signed",
+    [("half", "float", False), ("float", "half", True)],
+)
+def test_unset_virtual_output_takes_the_intermediate_data_type(
+    io_data_type: str, intermediate_data_type: str, signed: bool
+) -> None:
+    """A fused convolution writes a virtual tensor that hipDNN fills from
+    intermediate_data_type, not io_data_type."""
+    graph = {
+        "io_data_type": io_data_type,
+        "intermediate_data_type": intermediate_data_type,
+        "tensors": [{"uid": 3, "data_type": "unset", "virtual": True}],
+        "nodes": [
+            {
+                "type": "ConvolutionFwdAttributes",
+                "inputs": {"x_tensor_uid": 1, "w_tensor_uid": 2},
+                "outputs": {"y_tensor_uid": 3},
+            }
+        ],
+    }
+    x, w = _tensor(1, [4096], io_data_type), _tensor(2, [4096], io_data_type)
+
+    data = generate_input_data([x, w], seed=0, graph_json=graph)
+
+    assert [bool(data[uid].min() < 0) for uid in (1, 2)] == [signed, signed]
+
+
 def test_fp32_output_convolution_inputs_are_unchanged_by_the_graph() -> None:
     """fp32 convolution correctness results stay comparable across versions:
     with an fp32 output, the operands get exactly the pre-0.3.0 values."""
