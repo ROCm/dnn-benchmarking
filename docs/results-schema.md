@@ -65,7 +65,8 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
+| `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`: a hipDNN cache shared between runs. `null` means the run used a private, empty cache. |
+| `allow_selection_env` | bool | `--allow-selection-env`: inherited kernel-selection variables were kept. `false` means the run inherited none. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
@@ -99,7 +100,7 @@ The CLI collects these values one time, at suite start.
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
-| `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle` or `--autotune` is set. |
+| `selection_env` | object | Kernel-selection variables and cache paths in effect for the run: every variable that `--allow-selection-env` controls (see [usage.md](usage.md#selection-environment)), `null` when unset, plus `MIOPEN_CUSTOM_CACHE_DIR`, `AMD_COMGR_CACHE_DIR` and `XDG_CACHE_HOME`. A `HIPDNN_*`, `MIOPEN_DEBUG_*` or `PYTORCH_TUNABLEOP_*` family variable is present only when set. `HIPDNN_CACHE_DIR` and `MIOPEN_USER_DB_PATH` usually name the private directories of the run, which no longer exist. `null` in files written before this key was always filled. |
 
 ## summary
 
@@ -290,9 +291,9 @@ the reason and `oracle` is `null`.
 |---|---|---|
 | `tuning_available` | bool | hipDNN: `true` when the engine exposes the `global.benchmarking` knob. PyTorch: `true` when the graph has a convolution or matmul node. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. `true` does not prove that a search ran: a provider can answer from its own database. |
 
-- hipDNN rows: the tuned plan is a second plan of the same engine, built with
-  `global.benchmarking=1` right after the OOTB plan. Its first launch samples
-  the candidates, so `oracle.timing.first_call_ms` holds the search cost.
+- hipDNN rows: the tuned plan is a plan of the same engine, built with
+  `global.benchmarking=1` in a child process. Its first launch samples the
+  candidates, so `oracle.timing.first_call_ms` holds the search cost.
 - PyTorch rows: the tuned run comes from a child process (MIOpen exhaustive
   conv search and TunableOp). `build_ms` and `correctness` are `null`.
 
