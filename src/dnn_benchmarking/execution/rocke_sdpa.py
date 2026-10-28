@@ -169,29 +169,26 @@ def sdpa_problem(
         for key in _UNSUPPORTED_INPUTS + _UNSUPPORTED_OUTPUTS
         if _optional_uid(node, key) is not None
     ]
-    for flag in ("alibi_mask", "padding_mask", "causal_mask_bottom_right"):
+    for flag in ("alibi_mask", "padding_mask"):
         if _node_param(node, flag, False):
             present.append(flag)
     if _node_param(node, "generate_stats", False):
         present.append("generate_stats")
     if float(_node_param(node, "dropout_probability", 0.0) or 0.0) != 0.0:
         present.append("dropout_probability")
-    if _node_param(node, "diagonal_alignment", "TOP_LEFT") not in ("TOP_LEFT", 0):
-        present.append("diagonal_alignment")
     if present:
         raise UnsupportedGraphError(
             f"rocKE runtime does not support SDPA features: {', '.join(present)}"
         )
+    # The mask resolves as hipDNN resolves it: the deprecated causal booleans
+    # win over the bounds and the alignment.
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError as e:
         raise UnsupportedGraphError(str(e)) from e
     if window is not None:
         raise UnsupportedGraphError("rocKE runtime does not support sliding windows")
-    if bottom_right:
-        raise UnsupportedGraphError(
-            "rocKE runtime does not support bottom-right diagonal alignment"
-        )
+    causal = causal or bottom_right
 
     infos = {info.uid: info for info in tensor_infos}
     uids = {}
@@ -233,7 +230,7 @@ def sdpa_problem(
             )
     if causal and sq != skv:
         # Catalog kernels align the diagonal top-left, the unified kernels
-        # bottom-right; the two agree only for square problems.
+        # bottom-right; the two masks are the same only for square problems.
         raise UnsupportedGraphError(
             "rocKE runtime runs causal SDPA only with seqlen_q == seqlen_kv"
         )
@@ -257,6 +254,16 @@ def sdpa_problem(
     )
 
 
+def hipdnn_grid(problem: SdpaProblem, block_m: int) -> Tuple[int, int, int]:
+    """The grid hipDNN launches a catalog variant with.
+
+    hip-kernel-provider's ``hipkernel.gfx950_attention_dense.dispatch.v1``
+    contract (``Gfx950AttentionDenseGeometry.hpp``): one CTA per query block,
+    query head and batch, with query blocks on x.
+    """
+    return (-(-problem.seqlen_q // block_m), problem.num_query_heads, problem.batch)
+
+
 def load_catalog(plugin_paths: Iterable[Path], arch: str) -> Catalog:
     """Read every shipped variant of the ``DENSE_ENGINE`` engine for ``arch``.
 
@@ -264,7 +271,9 @@ def load_catalog(plugin_paths: Iterable[Path], arch: str) -> Catalog:
     set (``*.kdp.json``) names its engine by id. The packer keeps each
     descriptor's authored subpath (for example
     ``gfx950_attention_dense/artifacts/``), so search the whole tree. A
-    ``kernel_source.library`` path is relative to its descriptor file.
+    ``kernel_source.library`` path is relative to its descriptor file. When
+    several plugin paths ship a variant of one name, the first path wins, so
+    each variant gives one row.
 
     Raises:
         OSError, ValueError, KeyError: A descriptor file is unreadable, not
@@ -276,7 +285,7 @@ def load_catalog(plugin_paths: Iterable[Path], arch: str) -> Catalog:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
 
-    kernels = []
+    kernels: Dict[str, CatalogKernel] = {}
     for root in plugin_paths:
         base = Path(root) / _DESCRIPTOR_SUBDIR / arch / "rocKE"
         engines = [read(p) for p in sorted(base.rglob("*.ued.json"))]
@@ -294,24 +303,27 @@ def load_catalog(plugin_paths: Iterable[Path], arch: str) -> Catalog:
                 for field in _BOOL_FIELDS:
                     if field in spec:
                         spec[field] = bool(spec[field])
-                kernels.append(
+                name = f"rocke:{ukd['name']}"
+                kernels.setdefault(
+                    name,
                     CatalogKernel(
-                        name=f"rocke:{ukd['name']}",
+                        name=name,
                         spec=spec,
                         library=(path.parent / source["library"]).resolve(),
                         toc_key=source["toc_key"],
                         symbol=source["symbol"],
                         sha256=source["sha256"],
                         arg_names=tuple(a.get("name") for a in source["signature"]),
-                    )
+                    ),
                 )
-    return tuple(kernels)
+    return tuple(kernels.values())
 
 
 def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKernel]:
     """Catalog variants that run ``problem``, in descriptor order.
 
-    A variant applies when its problem fields equal the graph's and rocKE
+    A variant applies when its problem fields equal the graph's, it has no
+    sliding window and no ragged layout (the graph never has them), and rocKE
     accepts the spec with the graph's batch and sequence lengths. The shipped
     kernels read those three values as kernel arguments, so the shape does not
     change the code object.
@@ -330,6 +342,8 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
             or spec.get("num_query_heads") != problem.num_query_heads
             or spec.get("num_kv_heads") != problem.num_kv_heads
             or bool(spec.get("causal")) != problem.causal
+            or spec.get("sliding_window")
+            or spec.get("ragged")
         ):
             continue
         shaped = dict(
@@ -337,6 +351,11 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
             batch=problem.batch,
             seqlen_q=problem.seqlen_q,
             seqlen_kv=problem.seqlen_kv,
+            # hipDNN launches every variant on the qb_minor grid (its
+            # dispatch.v1 contract), and the descriptor does not record the
+            # block order. rocKE's "auto" picks another order for causal
+            # problems, whose grid this code object does not decode.
+            nonpersist_decode="qb_minor",
         )
         # rocKE reports a tile that does not divide the sequence lengths (and
         # other unsupported spec values) as ValueError. A TypeError means the

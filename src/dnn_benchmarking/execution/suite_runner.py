@@ -455,7 +455,7 @@ def _time_pytorch_row(
                 config=config,
             )
     except StallFallbackError:
-        raise  # run_graph_* remeasures the whole graph unstalled.
+        raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(_error_or_skip(strict), row, str(e)), None
     except Exception as e:
@@ -524,24 +524,9 @@ def run_single_provider_engine(
             variant_pack = bm.create_variant_pack()
             _measure_row(row, ctx, lambda: executor.benchmark(handle, variant_pack))
 
-            if ctx.reference_outputs is not None:
-                bm.zero_outputs()
-                executor.execute_once(handle, variant_pack)
-                row.ootb.correctness = check_correctness(
-                    bm,
-                    ctx.tensor_infos,
-                    ctx.reference_outputs,
-                    config.validation.provider.value,
-                    config,
-                )
-            elif ctx.validation_skip_reason is not None:
-                row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
-            elif config.validation.enabled:
-                # Validation was requested but no reference is usable: keep
-                # --validate a hard gate.
-                row.ootb.correctness = mismatch(
-                    config, ctx.reference_error or "Reference outputs unavailable"
-                )
+            _validate_row(
+                row, ctx, bm, lambda: executor.execute_once(handle, variant_pack)
+            )
 
             if tuned is not None:
                 run_tuned_plan(
@@ -560,7 +545,7 @@ def run_single_provider_engine(
         # VRAM; holding them roughly doubles peak VRAM on large graphs.
         del executor, tuned
     except StallFallbackError:
-        raise  # run_graph_* remeasures the whole graph unstalled.
+        raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
@@ -575,6 +560,39 @@ def run_single_provider_engine(
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
+
+
+def _validate_row(
+    row: ProviderEngineResult,
+    ctx: _GraphContext,
+    bm: Any,
+    execute_once: Callable[[], None],
+) -> None:
+    """Set ``row.ootb.correctness`` for one engine row.
+
+    With reference outputs, run the engine once more on zeroed outputs and
+    compare. When the reference was skipped on purpose (it does not fit in
+    host memory), the row is unchecked. When ``--validate`` has no usable
+    reference for another reason, the row fails, so ``--validate`` stays a
+    hard gate.
+    """
+    config = ctx.config
+    if ctx.reference_outputs is not None:
+        bm.zero_outputs()
+        execute_once()
+        row.ootb.correctness = check_correctness(
+            bm,
+            ctx.tensor_infos,
+            ctx.reference_outputs,
+            config.validation.provider.value,
+            config,
+        )
+    elif ctx.validation_skip_reason is not None:
+        row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
+    elif config.validation.enabled:
+        row.ootb.correctness = mismatch(
+            config, ctx.reference_error or "Reference outputs unavailable"
+        )
 
 
 def _error_or_skip(fatal: bool) -> Callable[..., ProviderEngineResult]:
@@ -902,20 +920,6 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
     return plan
 
 
-def run_graph_all_providers(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    handle: Any,
-    reporter: Reporter,
-) -> GraphResult:
-    """Run a single graph against every selected or discovered hipDNN engine."""
-    return run_graph(
-        graph_path, graph_json, tensor_infos, config, reporter, [hipdnn_planner(handle)]
-    )
-
-
 def _run_engine_selection(
     ctx: _GraphContext,
     handle: Any,
@@ -993,19 +997,6 @@ def pytorch_plan(
     )
 
 
-def run_graph_pytorch(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    reporter: Reporter,
-) -> GraphResult:
-    """Run a single graph through the PyTorch executor as the sole engine row."""
-    return run_graph(
-        graph_path, graph_json, tensor_infos, config, reporter, [pytorch_plan]
-    )
-
-
 @dataclass(frozen=True)
 class RockeSession:
     """Per-suite rocKE state: the shipped-kernel catalog and the device.
@@ -1015,12 +1006,16 @@ class RockeSession:
         arch: GPU architecture name (``gfx950``).
         num_cus: Compute-unit count for rocKE's dispatcher.
         version: Installed ``rocke`` package version.
+        loaded: Code objects loaded so far, by ``(library, toc_key)``. A
+            variant loads once per suite, and every row that runs it reuses
+            the module.
     """
 
     catalog: Catalog
     arch: str
     num_cus: int
     version: str
+    loaded: Dict[Tuple[Path, str], Any] = field(default_factory=dict)
 
 
 def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
@@ -1102,25 +1097,6 @@ def rocke_planner(session: RockeSession) -> GraphPlanner:
     return plan
 
 
-def run_graph_rocke(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    reporter: Reporter,
-    session: RockeSession,
-) -> GraphResult:
-    """Run a single SDPA graph through every applicable rocKE kernel."""
-    return run_graph(
-        graph_path,
-        graph_json,
-        tensor_infos,
-        config,
-        reporter,
-        [rocke_planner(session)],
-    )
-
-
 def _run_rocke_row(
     ctx: _GraphContext,
     kernel: RockeKernel,
@@ -1141,7 +1117,9 @@ def _run_rocke_row(
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
         from .rocke_executor import RockeExecutor
 
-        executor = RockeExecutor(kernel, problem, config.timing_policy)
+        executor = RockeExecutor(
+            kernel, problem, config.timing_policy, loaded=session.loaded
+        )
         with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
             bm.allocate_all()
             bm.load_input_data(ctx.input_data)
@@ -1149,23 +1127,9 @@ def _run_rocke_row(
             executor.prepare(bm.get_tensors())
             row.ootb.cpu_build_time_ms = executor.build_time_ms
             _measure_row(row, ctx, executor.benchmark)
-
-            if ctx.reference_outputs is not None:
-                bm.zero_outputs()
-                executor.execute_once()
-                row.ootb.correctness = check_correctness(
-                    bm,
-                    ctx.tensor_infos,
-                    ctx.reference_outputs,
-                    config.validation.provider.value,
-                    config,
-                )
-            elif config.validation.enabled:
-                row.ootb.correctness = mismatch(
-                    config, ctx.reference_error or "Reference outputs unavailable"
-                )
+            _validate_row(row, ctx, bm, executor.execute_once)
     except StallFallbackError:
-        raise  # run_graph_rocke remeasures the whole graph unstalled.
+        raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:

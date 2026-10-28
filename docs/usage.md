@@ -270,14 +270,21 @@ How the variant rows get the hipDNN kernel:
    and where its code object is: the kpack archive, the archive key, the
    symbol, the SHA-256 and the argument list.
 2. The tool makes a rocKE spec from the variant's fields and the graph's
-   batch and sequence lengths. rocKE's own checks decide whether the variant
-   runs the graph, and rocKE computes the launch grid and block. These are
-   the grid and block that hipDNN computes.
+   batch and sequence lengths. Variants with a sliding window or a ragged
+   layout do not apply. rocKE's own checks decide whether the variant runs
+   the graph, and rocKE computes the launch grid and block. The spec sets
+   the `qb_minor` block order, because hipDNN launches every variant on that
+   grid and the descriptor does not record the order. The row is an error
+   when rocKE's grid differs from hipDNN's (query blocks, query heads,
+   batch).
 3. The tool reads the code object from the kpack archive with ROCm's kpack
    reader (`librocm_kpack`, the reader that the plugin uses) and launches it
    through rocKE's runtime. It does not compile the variant. The row is an
    error when the code object does not have the recorded SHA-256, or when
-   rocKE's argument list is not the one that hipDNN binds.
+   rocKE's argument list is not the one that hipDNN binds. Each code object
+   loads once per run; later rows that use it reuse the module. When
+   several `--plugin-path` directories ship a variant, the first one gives
+   its row.
 
 Read the rows as follows:
 
@@ -297,16 +304,19 @@ Requirements and limits:
   checkout that it builds the plugins from.
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
-  window. A causal graph needs `seqlen_q == seqlen_kv`. An absent
-  `attn_scale_value` is 1.0, as in hipDNN.
+  window. A causal mask (top-left or bottom-right) needs
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
+  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
   verified on gfx1250. With `--runtime rocke` alone, a graph that no rocKE
   kernel runs reports `no engines applicable` with the reasons. In a runtime
   list it gets no rocKE rows.
 - `build_ms` is the time to get and load the kernel. For a variant row this
-  is the kpack read and the module load. For the auto row it also includes
-  the compile and the first launch, because rocKE compiles the unified kernel
+  is the kpack read and the module load; a row that reuses a loaded module
+  reports the time of the first load. For the auto row it also includes the
+  compile and the first launch, because rocKE compiles the unified kernel
   inside its launch call.
 - `--plugin-path` selects the descriptor directory. With `--runtime rocke`
   alone, these options stop the run with exit code 2: `--engine`, `--oracle`,

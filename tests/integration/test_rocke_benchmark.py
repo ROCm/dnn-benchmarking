@@ -30,7 +30,11 @@ def rocke_gfx950(torch_gpu, plugin_paths):
 
 
 def test_rocke_rows_launch_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> None:
-    from dnn_benchmarking.execution.suite_runner import rocke_session, run_graph_rocke
+    from dnn_benchmarking.execution.suite_runner import (
+        rocke_planner,
+        rocke_session,
+        run_graph,
+    )
 
     graph = sdpa_graph(b=1, hq=32, hkv=8, s=512, d=128)
     infos = GraphLoader().extract_tensor_info(graph)
@@ -51,8 +55,8 @@ def test_rocke_rows_launch_hipdnn_kernels_and_match_pytorch(rocke_gfx950) -> Non
     # Descriptors present but no dense variant: the engine lookup broke.
     assert session.catalog
 
-    result = run_graph_rocke(
-        Path("rocke.json"), graph, infos, config, reporter, session
+    result = run_graph(
+        Path("rocke.json"), graph, infos, config, reporter, [rocke_planner(session)]
     )
 
     rows = [r for r in result.results if r.role == "engine"]

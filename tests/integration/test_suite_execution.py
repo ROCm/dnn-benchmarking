@@ -18,8 +18,9 @@ from dnn_benchmarking.config import (
 )
 from dnn_benchmarking.execution import Executor
 from dnn_benchmarking.execution.suite_runner import (
-    run_graph_all_providers,
-    run_graph_pytorch,
+    hipdnn_planner,
+    pytorch_plan,
+    run_graph,
 )
 from dnn_benchmarking.metrics._subprocess import run_capped
 from dnn_benchmarking.reporting.reporter import Reporter
@@ -33,13 +34,13 @@ HEX_ID = re.compile(r"0x[0-9A-F]{16}")
 
 def _run_conv(hipdnn, **config):
     path, graph_json, tensor_infos = load_graph("sample_conv_fwd.json")
-    result = run_graph_all_providers(
+    result = run_graph(
         path,
         graph_json,
         tensor_infos,
         SuiteConfig(warmup_iters=1, benchmark_iters=3, **config),
-        hipdnn.Handle(),
         Reporter(output=io.StringIO()),
+        [hipdnn_planner(hipdnn.Handle())],
     )
     assert result.error is None, result.error
     successes = [r for r in result.results if r.status == "success"]
@@ -145,8 +146,13 @@ def test_pytorch_runtime_times_graph(torch_gpu, graph_name: str) -> None:
     """--runtime pytorch: one timed pytorch row per graph, no hipDNN."""
     path, graph_json, tensor_infos = load_graph(graph_name)
     config = SuiteConfig(warmup_iters=1, benchmark_iters=2, runtime=RuntimeName.PYTORCH)
-    result = run_graph_pytorch(
-        path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
+    result = run_graph(
+        path,
+        graph_json,
+        tensor_infos,
+        config,
+        Reporter(output=io.StringIO()),
+        [pytorch_plan],
     )
 
     [row] = result.results
@@ -168,8 +174,13 @@ def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
         runtime=RuntimeName.PYTORCH,
         pytorch_sdpa_backend=PyTorchSdpaBackendName.MATH,
     )
-    result = run_graph_pytorch(
-        path, graph_json, tensor_infos, config, Reporter(output=io.StringIO())
+    result = run_graph(
+        path,
+        graph_json,
+        tensor_infos,
+        config,
+        Reporter(output=io.StringIO()),
+        [pytorch_plan],
     )
 
     [row] = result.results

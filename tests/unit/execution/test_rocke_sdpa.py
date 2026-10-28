@@ -11,7 +11,9 @@ import pytest
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.execution.rocke_sdpa import (
     DENSE_ENGINE,
+    auto_kernel,
     catalog_kernels,
+    hipdnn_grid,
     load_catalog,
     sdpa_problem,
 )
@@ -69,17 +71,67 @@ def test_unsupported_graphs_are_rejected(mutate) -> None:
         _problem(graph)
 
 
-def test_causal_needs_equal_sequence_lengths() -> None:
-    graph = sdpa_graph()
-    for index in (0, 3):  # query and output: shorter seqlen_q
+def _set_seqlen_q(graph, seqlen_q):
+    for index in (0, 3):  # query and output
         tensor = graph["tensors"][index]
         tensor.update(
-            bshd_tensor(tensor["uid"], tensor["name"], 1, 32, 1024, 128, "half")
+            bshd_tensor(tensor["uid"], tensor["name"], 1, 32, seqlen_q, 128, "half")
         )
+
+
+def test_causal_needs_equal_sequence_lengths() -> None:
+    graph = sdpa_graph()
+    _set_seqlen_q(graph, 1024)
     with pytest.raises(UnsupportedGraphError):
         _problem(graph)
     graph["nodes"][0]["attributes"]["causal_mask"] = False
     assert _problem(graph).seqlen_q == 1024
+
+
+_BOTTOM_RIGHT_BAND = dict(
+    causal_mask=False, diagonal_alignment="BOTTOM_RIGHT", right_bound=0
+)
+
+
+@pytest.mark.parametrize(
+    "attributes, causal",
+    [
+        pytest.param(
+            dict(causal_mask=False, causal_mask_bottom_right=True),
+            True,
+            id="deprecated-flag",
+        ),
+        pytest.param(_BOTTOM_RIGHT_BAND, True, id="bounds"),
+        # hipDNN reads the deprecated flag first, so this mask is top-left.
+        pytest.param(dict(diagonal_alignment="BOTTOM_RIGHT"), True, id="flag-wins"),
+        pytest.param(
+            dict(causal_mask=False, diagonal_alignment="BOTTOM_RIGHT"),
+            False,
+            id="no-bounds",
+        ),
+    ],
+)
+def test_bottom_right_alignment_is_causal_on_square_problems(
+    attributes, causal
+) -> None:
+    """On a square problem the bottom-right and top-left masks are equal."""
+    assert _problem(sdpa_graph(**attributes)).causal is causal
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [dict(causal_mask=False, causal_mask_bottom_right=True), _BOTTOM_RIGHT_BAND],
+)
+def test_bottom_right_causal_needs_equal_sequence_lengths(attributes) -> None:
+    graph = sdpa_graph(**attributes)
+    _set_seqlen_q(graph, 1024)
+    with pytest.raises(UnsupportedGraphError, match="seqlen_q == seqlen_kv"):
+        _problem(graph)
+
+
+def test_query_heads_must_be_a_multiple_of_kv_heads() -> None:
+    with pytest.raises(UnsupportedGraphError, match="Hq divisible by Hkv"):
+        _problem(sdpa_graph(hq=12, hkv=8))
 
 
 _ARGS = ("q_ptr", "k_ptr", "v_ptr", "o_ptr", "scale", "batch", "seqlen_q", "seqlen_kv")
@@ -137,6 +189,18 @@ def _catalog(tmp_path, metadata):
     return load_catalog([plugins], "gfx950")
 
 
+def test_a_variant_shipped_under_two_plugin_paths_gives_one_row(tmp_path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    _install(first, DENSE_ENGINE, [_variant("a", _metadata())])
+    second_variants = [_variant("a", _metadata()), _variant("b", _metadata())]
+    _install(second, DENSE_ENGINE, second_variants)
+
+    catalog = load_catalog([first, second], "gfx950")
+
+    assert [k.name for k in catalog] == ["rocke:a", "rocke:b"]
+    assert first in catalog[0].library.parents
+
+
 def test_catalog_reads_the_dense_engine_variants(tmp_path) -> None:
     plugins = tmp_path / "plugins"
     where = _install(
@@ -173,6 +237,10 @@ def test_catalog_matches_problem_and_tile_divisibility(tmp_path) -> None:
             "full": _metadata(causal=0),
             "d64": _metadata(d=64),
             "bf16": _metadata(dtype="BF16"),
+            "hq64": _metadata(hq=64),
+            "kv4": _metadata(hkv=4),
+            "window": dict(_metadata(), sliding_window=128),
+            "ragged": dict(_metadata(), ragged=1),
         },
     )
 
@@ -188,6 +256,46 @@ def test_catalog_matches_problem_and_tile_divisibility(tmp_path) -> None:
     graph = copy.deepcopy(sdpa_graph())
     graph["nodes"][0]["attributes"]["causal_mask"] = False
     assert [k.name for k in catalog_kernels(catalog, _problem(graph))] == ["rocke:full"]
+
+    hq64 = _problem(sdpa_graph(hq=64, hkv=8))
+    assert [k.name for k in catalog_kernels(catalog, hq64)] == ["rocke:hq64"]
+    kv4 = _problem(sdpa_graph(hq=32, hkv=4))
+    assert [k.name for k in catalog_kernels(catalog, kv4)] == ["rocke:kv4"]
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("b, hq, hkv", [(1, 32, 8), (4, 16, 16), (2, 40, 8)])
+def test_matched_variants_launch_on_hipdnns_grid(tmp_path, causal, b, hq, hkv) -> None:
+    """hipDNN launches every variant query-block-major; rocKE's auto block
+    order would put the batch on x for causal problems."""
+    dense = pytest.importorskip("kernels.gfx950.attention_dense")
+    catalog = _catalog(
+        tmp_path,
+        {
+            "bm256": _metadata(hq=hq, hkv=hkv, causal=int(causal), bm=256),
+            "bm128": _metadata(hq=hq, hkv=hkv, causal=int(causal), bm=128, bn=32),
+        },
+    )
+    problem = _problem(sdpa_graph(b=b, hq=hq, hkv=hkv, s=2048, causal_mask=causal))
+
+    found = catalog_kernels(catalog, problem)
+
+    assert len(found) == 2
+    for kernel in found:
+        spec = dense.Gfx950AttentionDenseSpec(**kernel.spec)
+        assert tuple(dense.attention_dense_grid(spec)) == hipdnn_grid(
+            problem, kernel.spec["block_m"]
+        )
+
+
+def test_auto_kernel_needs_a_tiled_arch_and_a_causal_graph() -> None:
+    """Both checks run before rocKE's dispatcher, so they need no rocKE."""
+    causal = _problem(sdpa_graph())
+    with pytest.raises(UnsupportedGraphError, match="no tiled attention kernel"):
+        auto_kernel(causal, "gfx90a", 104)
+    full = _problem(sdpa_graph(causal_mask=False))
+    with pytest.raises(UnsupportedGraphError, match="causal-only"):
+        auto_kernel(full, "gfx950", 256)
 
 
 def test_unknown_spec_field_is_not_reported_as_no_match(tmp_path) -> None:

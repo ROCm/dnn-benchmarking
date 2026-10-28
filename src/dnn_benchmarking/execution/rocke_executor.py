@@ -10,7 +10,8 @@ rocKE launch synchronizes the host after every call.
 """
 
 import hashlib
-from typing import Callable, Dict, NamedTuple, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -18,7 +19,14 @@ from ..common import torch_support
 from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import TimingPolicy
 from .kpack import read_kernel
-from .rocke_sdpa import DENSE_ARCH, AutoKernel, CatalogKernel, RockeKernel, SdpaProblem
+from .rocke_sdpa import (
+    DENSE_ARCH,
+    AutoKernel,
+    CatalogKernel,
+    RockeKernel,
+    SdpaProblem,
+    hipdnn_grid,
+)
 from .timing import Measurement, Timer, is_hip_available, measure
 
 
@@ -30,6 +38,74 @@ def device_arch(device: torch.device) -> str:
 def device_num_cus(device: torch.device) -> int:
     """Compute-unit count, which rocKE's dispatcher uses to size grids."""
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+class LoadedVariant(NamedTuple):
+    """A catalog variant ready to launch with hipDNN's geometry.
+
+    ``load_ms`` is the host time that reading and loading the code object
+    took when it first loaded.
+    """
+
+    launcher: Any  # rocke.runtime.KernelLauncher
+    load_ms: float
+    grid: Tuple[int, int, int]
+    block: Tuple[int, int, int]
+
+
+def load_variant(
+    kernel: CatalogKernel,
+    problem: SdpaProblem,
+    loaded: Dict[Tuple[Path, str], Tuple[Any, float]],
+) -> LoadedVariant:
+    """Check a catalog variant against hipDNN's launch and load its code object.
+
+    ``loaded`` maps ``(library, toc_key)`` to the launcher and the load time,
+    so each code object loads once.
+
+    Raises:
+        ExecutionError: rocKE's argument list or grid is not the one hipDNN
+            uses, or the code object does not have the recorded SHA-256.
+        OSError: The kpack archive is unreadable.
+    """
+    from kernels.gfx950.attention_dense import (
+        Gfx950AttentionDenseSpec,
+        attention_dense_block,
+        attention_dense_grid,
+        attention_dense_signature,
+    )
+    from rocke.runtime import KernelLauncher
+
+    spec = Gfx950AttentionDenseSpec(**kernel.spec)
+    # rocKE packs kernel arguments from its own typed signature; hipDNN binds
+    # the descriptor's. Equal names in equal order give one layout.
+    signature = attention_dense_signature(spec)
+    names = tuple(a["name"] for a in signature)
+    if names != kernel.arg_names:
+        raise ExecutionError(
+            f"rocKE's argument list {names} differs from hipDNN's {kernel.arg_names}"
+        )
+    grid = tuple(attention_dense_grid(spec))
+    expected = hipdnn_grid(problem, int(kernel.spec["block_m"]))
+    if grid != expected:
+        raise ExecutionError(f"rocKE's grid {grid} differs from hipDNN's {expected}")
+    key = (kernel.library, kernel.toc_key)
+    if key not in loaded:
+        with Timer() as t:
+            hsaco = read_kernel(kernel.library, kernel.toc_key, DENSE_ARCH)
+            digest = hashlib.sha256(hsaco).hexdigest()
+            if digest != kernel.sha256:
+                raise ExecutionError(
+                    f"code object {kernel.toc_key} in {kernel.library} has "
+                    f"SHA-256 {digest[:12]}, the descriptor records "
+                    f"{kernel.sha256[:12]}"
+                )
+            launcher = KernelLauncher(
+                hsaco=hsaco, kernel_name=kernel.symbol, signature=signature
+            )
+        loaded[key] = (launcher, t.elapsed_ms)
+    launcher, load_ms = loaded[key]
+    return LoadedVariant(launcher, load_ms, grid, tuple(attention_dense_block(spec)))
 
 
 class PagedViews(NamedTuple):
@@ -76,7 +152,9 @@ class RockeExecutor:
 
     ``build_time_ms`` is the host time to get and load the kernel. For a
     catalog kernel that is reading hipDNN's code object from the kpack
-    archive and loading it. For the auto kernel it includes the first launch,
+    archive and loading it. ``loaded`` caches the loaded code objects by
+    ``(library, toc_key)``, so a variant loads once; a later row reports the
+    time of that first load. For the auto kernel it includes the first launch,
     because rocKE compiles the unified kernel inside its launch call.
     """
 
@@ -86,11 +164,13 @@ class RockeExecutor:
         problem: SdpaProblem,
         policy: TimingPolicy,
         device: Optional[torch.device] = None,
+        loaded: Optional[Dict[Tuple[Path, str], Tuple[Any, float]]] = None,
     ) -> None:
         self._kernel = kernel
         self._problem = problem
         self._policy = policy
         self._device = device if device is not None else torch.device("cuda")
+        self._loaded = loaded if loaded is not None else {}
         # Same choice as the PyTorch executor: rocKE and ROCm torch share the
         # HIP runtime, so HIP events can bracket the torch stream.
         self._timer = (
@@ -126,41 +206,13 @@ class RockeExecutor:
             raise ExecutionError(f"rocKE build failed: {type(e).__name__}: {e}") from e
 
     def _prepare_catalog(self, q, k, v, o) -> None:
-        from kernels.gfx950.attention_dense import (
-            Gfx950AttentionDenseSpec,
-            attention_dense_block,
-            attention_dense_grid,
-            attention_dense_signature,
-        )
-        from rocke.runtime import KernelLauncher, LaunchConfig
+        from rocke.runtime import LaunchConfig
 
         kernel = self._kernel
         assert isinstance(kernel, CatalogKernel)
         p = self._problem
-        spec = Gfx950AttentionDenseSpec(**kernel.spec)
-        # rocKE packs kernel arguments from its own typed signature; hipDNN
-        # binds the descriptor's. Equal names in equal order give one layout.
-        signature = attention_dense_signature(spec)
-        names = tuple(a["name"] for a in signature)
-        if names != kernel.arg_names:
-            raise ExecutionError(
-                f"rocKE's argument list {names} differs from hipDNN's "
-                f"{kernel.arg_names}"
-            )
-        with Timer() as t:
-            hsaco = read_kernel(kernel.library, kernel.toc_key, DENSE_ARCH)
-            digest = hashlib.sha256(hsaco).hexdigest()
-            if digest != kernel.sha256:
-                raise ExecutionError(
-                    f"code object {kernel.toc_key} in {kernel.library} has "
-                    f"SHA-256 {digest[:12]}, the descriptor records "
-                    f"{kernel.sha256[:12]}"
-                )
-            launcher = KernelLauncher(
-                hsaco=hsaco, kernel_name=kernel.symbol, signature=signature
-            )
-        self.build_time_ms = t.elapsed_ms
-
+        variant = load_variant(kernel, p, self._loaded)
+        self.build_time_ms = variant.load_ms
         values = {
             "q_ptr": q.data_ptr(),
             "k_ptr": k.data_ptr(),
@@ -173,10 +225,10 @@ class RockeExecutor:
         }
         config = LaunchConfig(
             stream=int(self._stream.cuda_stream),
-            grid=attention_dense_grid(spec),
-            block=attention_dense_block(spec),
+            grid=variant.grid,
+            block=variant.block,
         )
-        self._launch = lambda: launcher(values, config=config)
+        self._launch = lambda: variant.launcher(values, config=config)
 
     def _prepare_auto(self, q, k, v, o) -> None:
         from kernels import UnifiedAttentionProblem, run_unified_attention_torch
