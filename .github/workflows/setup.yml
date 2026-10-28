@@ -36,15 +36,19 @@ defaults:
 
 jobs:
   setup:
+    # Branch protection requires these check names. `os` keeps the name;
+    # `runner`, when set, picks the actual runner label.
+    name: setup (${{ matrix.os }}, ${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: aws-linux-scale-rocm-small
             platform: linux
-          - os: aws-windows-scale-rocm-prod-mix
+          - os: aws-windows-scale-rocm-prod
+            runner: aws-windows-scale-rocm-prod-mix
             platform: windows
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 30
     steps:
       # No submodules: neither tested path needs rocm-libraries.
