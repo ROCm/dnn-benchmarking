@@ -266,6 +266,10 @@ Each child repeats MIOpen Find for a problem that the system database does
 not hold, and starts a new process that loads the plugins. This adds time to
 `first_call_ms` and to the run time, not to `kernel.median_ms`.
 
+A child writes its output, also MIOpen logs (`MIOPEN_LOG_LEVEL`), to the
+stderr of `dnn-benchmark`. A child that fails reports the error to the tool,
+which shows it as the row error (OOTB run) or as `oracle_error` (tuned run).
+
 PyTorch rows (`--runtime pytorch`, `--validate pytorch`) run in the
 benchmark process. They share its user database, which is empty at the
 start of each `dnn-benchmark` command.
@@ -396,7 +400,7 @@ The tool writes results and progress to different streams:
 | Stream | Content |
 |---|---|
 | stdout | Suite header (host, GPU, ROCm or CUDA version, timing settings), one table for each graph, the legend (one time), `-v` detail blocks, the summary line, the results path, the oracle summary. |
-| stderr | Graph progress (`[i/n] name`), engine progress lines, info lines (kernel selection, tarball extraction, profiling passes), `WARNING:` and `ERROR:` lines, and one-time `[metrics:<source>]` diagnostics. |
+| stderr | Graph progress (`[i/n] name`), engine progress lines, info lines (kernel selection, tarball extraction, profiling passes), `WARNING:` and `ERROR:` lines, one-time `[metrics:<source>]` diagnostics, and the output of the child processes (see [MIOpen user database](#miopen-user-database)). |
 
 Thus `dnn-benchmark ... > results.txt` keeps only the results. `-q` removes
 the progress and info lines.

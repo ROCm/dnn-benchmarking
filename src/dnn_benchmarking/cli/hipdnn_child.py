@@ -5,133 +5,104 @@
 
 ``python -m dnn_benchmarking.cli.hipdnn_child --graph G --engine 0xHEX
 --seed S --timing-policy JSON --out-dir D [--plugin-path P] [--save-outputs]
-[--tuned | [--clocks] [--query-tuning]]``
+[--clocks] [--tuned]``
 
-The parent (``execution.child_runner``) runs every hipDNN engine row in this
-script, so each run starts with a new, empty MIOpen user database in D.
+The parent (``execution.child_runner.child_run``) runs every hipDNN engine
+run in this script, so each run starts with a new, empty MIOpen user
+database in D. The OOTB run checks ``execution.child_protocol.HIPDNN_OOTB_ENV``;
+``--tuned`` checks ``HIPDNN_TUNED_ENV`` (``HIPDNN_FORCE_BENCHMARKING=1``).
+The script sets no selection variable.
 
-- OOTB (default): the parent sets ``execution.child_protocol.HIPDNN_OOTB_ENV``.
-  ``--clocks`` samples the GPU clocks right after the timed loop.
-  ``--query-tuning`` reports whether the engine exposes
-  ``global.benchmarking`` for the graph. A stall-gate failure is not retried
-  here: the parent remeasures the whole graph without the gate, so all rows
-  of the graph share one timing mode. On a skip, a stall or an error the
-  script writes ``failure.json``.
-- ``--tuned``: the parent sets ``HIPDNN_TUNED_ENV``
-  (``HIPDNN_FORCE_BENCHMARKING=1``). A stall-gate failure reruns the tuned
-  run without the gate. On an error the script writes it on stderr.
+The script builds the engine and fills the inputs from the seed with the
+same steps as every hipDNN run (``execution.timed_run``), and times one loop
+with the parent's timing policy. It writes ``result.json`` in D, with the
+GPU clocks right after the loop (``--clocks``) and whether the engine
+exposes ``global.benchmarking`` for the graph. With ``--save-outputs``, it
+runs the graph once more and saves each output tensor in D.
 
-Both modes check the environment and set no selection variable. They build
-the engine and fill the inputs from the seed with the same steps
-(``execution.timed_run``), time one loop with the parent's timing policy and
-write ``result.json`` in D. With ``--save-outputs``, the script runs the graph
-once more and saves each output tensor in D. It does not import ``torch``.
-It exits 1 on an error.
+When the stall gate fails, a tuned run times again without it. An OOTB run
+reports the failure instead: the parent then remeasures the whole graph
+without the gate, so all rows of the graph share one timing mode. Any
+failure goes to ``failure.json`` and the exit code is 1. The script does not
+import ``torch``.
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from ..common.exceptions import UnsupportedGraphError
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
 from ..execution.buffer_manager import generate_input_data
 from ..execution.child_protocol import (
     BENCHMARKING_KNOB,
-    FAILED,
     HIPDNN_OOTB_ENV,
     HIPDNN_TUNED_ENV,
-    SKIPPED,
-    STALLED,
+    TuningQuery,
     child_parser,
+    failure_text,
     output_file,
-    write_failure,
+    run_reporting_failures,
     write_result,
 )
 from ..execution.executor import Executor, set_plugin_path
 from ..execution.timed_run import build_hipdnn_plan, hipdnn_buffers
-from ..execution.timing import StallFallbackError, retry_unstalled
+from ..execution.timing import retry_unstalled
 from ..graph.loader import GraphLoader
 from ..graph.tensor_info import TensorInfo
 from ..metrics import GpuSmiProbe
-from ..reporting.reporter import Reporter
-from ..reporting.suite_results import engine_id_hex
 from .parser import parse_engine_id
 
 
-def parse_args(argv: Optional[List[str]] = None):
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse the child argv that ``execution.child_runner`` builds."""
     parser = child_parser("hipdnn_child")
     parser.add_argument("--engine", required=True, type=parse_engine_id)
     parser.add_argument("--plugin-path", type=Path)
     parser.add_argument("--save-outputs", action="store_true")
-    parser.add_argument("--tuned", action="store_true")
     parser.add_argument("--clocks", action="store_true")
-    parser.add_argument("--query-tuning", action="store_true")
+    parser.add_argument("--tuned", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Time one engine run; return the exit code."""
     args = parse_args(argv)
-    reporter = Reporter(quiet=True)
+    return run_reporting_failures(args.out_dir, lambda: _run(args))
+
+
+def _run(args: argparse.Namespace) -> None:
+    (HIPDNN_TUNED_ENV if args.tuned else HIPDNN_OOTB_ENV).check()
+    initialize_pip_rocm_runtime()
+    import hipdnn_frontend as hipdnn
+
+    set_plugin_path(hipdnn, args.plugin_path)
+    handle = hipdnn.Handle()
+
+    loader = GraphLoader()
+    graph_json = loader.load_json(args.graph)
+    loader.validate(graph_json)
+    tensor_infos = loader.extract_tensor_info(graph_json)
+
+    def run(policy: TimingPolicy) -> None:
+        _timed_run(args, handle, graph_json, tensor_infos, policy)
+
+    if args.tuned:
+        retry_unstalled(run, args.timing_policy)
+    else:
+        run(args.timing_policy)
+
+
+def _tuning_query(executor: Executor, engine_id: int) -> TuningQuery:
+    """Whether the plan exposes the benchmarking knob; never fails the run."""
     try:
-        (HIPDNN_TUNED_ENV if args.tuned else HIPDNN_OOTB_ENV).check()
-        initialize_pip_rocm_runtime()
-        import hipdnn_frontend as hipdnn
-    except (RuntimeError, ImportError) as e:
-        return _fail(args, reporter, f"{type(e).__name__}: {e}")
-
-    try:
-        set_plugin_path(hipdnn, args.plugin_path)
-        handle = hipdnn.Handle()
-
-        loader = GraphLoader()
-        graph_json = loader.load_json(args.graph)
-        loader.validate(graph_json)
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        def run(policy: TimingPolicy) -> None:
-            _timed_run(args, handle, graph_json, tensor_infos, policy)
-
-        if args.tuned:
-            retry_unstalled(run, args.timing_policy)
-        else:
-            run(args.timing_policy)
-    except StallFallbackError as e:
-        if args.tuned:
-            return _fail(args, reporter, f"{type(e).__name__}: {e}")
-        write_failure(args.out_dir, STALLED, str(e))
-    except UnsupportedGraphError as e:
-        if args.tuned:
-            return _fail(args, reporter, f"{type(e).__name__}: {e}")
-        write_failure(args.out_dir, SKIPPED, str(e))
+        return TuningQuery(BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id))
     except Exception as e:
-        return _fail(args, reporter, f"{type(e).__name__}: {e}")
-    return 0
-
-
-def _fail(args: argparse.Namespace, reporter: Reporter, message: str) -> int:
-    """Report an error: ``failure.json`` (OOTB) and stderr; return 1."""
-    if not args.tuned:
-        write_failure(args.out_dir, FAILED, message)
-    reporter.error(f"engine {engine_id_hex(args.engine)}: {message}")
-    return 1
-
-
-def _tuning_query(
-    executor: Executor, engine_id: int
-) -> Tuple[Optional[bool], Optional[str]]:
-    """``(tuning_available, error)``: whether the plan exposes the knob."""
-    try:
-        return BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id), None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        return TuningQuery(None, failure_text(e))
 
 
 def _timed_run(
@@ -143,9 +114,7 @@ def _timed_run(
 ) -> None:
     """Build and time the engine with ``policy``; write the result files."""
     executor = build_hipdnn_plan(handle, json.dumps(graph_json), policy, args.engine)
-    tuning_available, tuning_error = (
-        _tuning_query(executor, args.engine) if args.query_tuning else (None, None)
-    )
+    tuning = _tuning_query(executor, args.engine)
     input_data = generate_input_data(tensor_infos, args.seed, graph_json)
     with hipdnn_buffers(tensor_infos, input_data) as (bm, variant_pack):
         probe = GpuSmiProbe() if args.clocks else None
@@ -164,8 +133,7 @@ def _timed_run(
         build_ms=executor.build_time_ms,
         workspace_bytes=executor.workspace_size,
         clocks_after=clocks_after,
-        tuning_available=tuning_available,
-        tuning_error=tuning_error,
+        tuning=tuning,
     )
 
 

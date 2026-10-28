@@ -22,11 +22,12 @@ _WORKSPACE_CACHE_SUBDIRS = {
     "MIOPEN_CUSTOM_CACHE_DIR": "miopen_kernel_cache",
 }
 
-#: MIOpen user find-DB and perf-DB. Each run starts empty: the DB key ignores
-#: the deterministic attribute, and a stored record repeats one Find ranking in
-#: every later run. The installed system DB is read-only and stays in use.
-_PER_RUN_MIOPEN_VARS = ("MIOPEN_USER_DB_PATH",)
-_PER_RUN_MIOPEN_SUBDIR = "miopen"
+#: MIOpen user find-DB and perf-DB of this process (PyTorch rows; every hipDNN
+#: run has its own, see ``execution.child_runner``). It starts empty in each
+#: run: MIOpen keys a record without the deterministic attribute, and a stored
+#: record repeats one Find ranking in every later run. The installed system
+#: DB is read-only and stays in use.
+_MIOPEN_USER_DB = "MIOPEN_USER_DB_PATH"
 
 
 def _set_cache_dir(var: str, path: Path) -> None:
@@ -45,10 +46,9 @@ def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
     alive for the run; its finalizer removes the temporary directory.
     """
     unset_workspace = [var for var in _WORKSPACE_CACHE_SUBDIRS if var not in os.environ]
-    unset_miopen = [var for var in _PER_RUN_MIOPEN_VARS if var not in os.environ]
+    user_db_unset = _MIOPEN_USER_DB not in os.environ
     workspace = os.environ.get("DNN_BENCH_WORKSPACE")
-    needs_temp = bool(unset_miopen) or (bool(unset_workspace) and not workspace)
-    if not needs_temp:
+    if not user_db_unset and (workspace or not unset_workspace):
         for var in unset_workspace:
             _set_cache_dir(var, Path(workspace) / _WORKSPACE_CACHE_SUBDIRS[var])
         return None
@@ -58,8 +58,8 @@ def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
     workspace_base = Path(workspace) if workspace else run_dir
     for var in unset_workspace:
         _set_cache_dir(var, workspace_base / _WORKSPACE_CACHE_SUBDIRS[var])
-    for var in unset_miopen:
-        _set_cache_dir(var, run_dir / _PER_RUN_MIOPEN_SUBDIR)
+    if user_db_unset:
+        _set_cache_dir(_MIOPEN_USER_DB, run_dir / "miopen_user_db")
     return lifetime
 
 

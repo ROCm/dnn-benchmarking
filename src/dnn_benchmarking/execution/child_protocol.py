@@ -14,27 +14,32 @@ The parent (``execution.child_runner``) and each child script import this
 module. It holds:
 
 - the options that every child takes (:func:`child_parser`);
-- the files that a child writes in its private directory
-  (:func:`write_result`, :func:`write_failure`, :func:`output_file`), and that
-  the parent reads (:func:`read_plan_result`, :func:`read_failure`);
+- the files that a child writes in its private directory and that the
+  parent reads: ``result.json`` (:func:`write_result`,
+  :func:`read_child_result`), the saved outputs (:func:`output_file`), and
+  ``failure.json`` (:func:`run_reporting_failures`, :func:`read_failure`),
+  which carries a failure across the process boundary as the exception that
+  the parent raises again;
 - the environment that the parent sets and the child checks
   (:class:`ChildEnv`, :data:`HIPDNN_OOTB_ENV`, :data:`HIPDNN_TUNED_ENV`,
   :data:`PYTORCH_TUNED_ENV`).
 
-This module does not import ``torch``: the hipDNN child imports it.
+The hipDNN child imports this module, so it must not import ``torch``.
 """
 
 import argparse
 import json
 import os
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional
 
+from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
+from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats, TimingInfo
-from ..reporting.suite_results import OracleResult
-from .timing import Measurement
+from .timing import Measurement, StallFallbackError
 
 RESULT_FILE = "result.json"
 FAILURE_FILE = "failure.json"
@@ -43,12 +48,48 @@ FAILURE_FILE = "failure.json"
 #: execute() and keep the fastest (kernel ingestor, MIOpen).
 BENCHMARKING_KNOB = "global.benchmarking"
 
-#: ``failure.json`` kinds of an OOTB child: the engine does not support the
-#: graph, the stall gate failed (the parent remeasures the graph unstalled),
-#: or another error.
-SKIPPED = "skipped"
-STALLED = "stalled"
-FAILED = "failed"
+
+class ChildRunError(Exception):
+    """A child produced no result. The message is the child's own
+    ``Type: message``, or why the child gave no result."""
+
+
+class FailureKind(Enum):
+    """Why a child produced no result, as written in ``failure.json``."""
+
+    SKIPPED = "skipped"  # The engine does not support the graph.
+    STALLED = "stalled"  # The stall gate failed.
+    FAILED = "failed"  # Any other error.
+
+
+@dataclass(frozen=True)
+class ChildFailure:
+    """The content of ``failure.json``."""
+
+    kind: FailureKind
+    message: str
+
+    @classmethod
+    def from_exception(cls, e: Exception) -> "ChildFailure":
+        """The failure that the parent raises again as :meth:`exception`."""
+        if isinstance(e, UnsupportedGraphError):
+            return cls(FailureKind.SKIPPED, str(e))
+        if isinstance(e, StallFallbackError):
+            return cls(FailureKind.STALLED, str(e))
+        return cls(FailureKind.FAILED, failure_text(e))
+
+    def exception(self) -> Exception:
+        """The exception that the parent raises for this failure."""
+        if self.kind is FailureKind.SKIPPED:
+            return UnsupportedGraphError(self.message)
+        if self.kind is FailureKind.STALLED:
+            return StallFallbackError(self.message)
+        return ChildRunError(self.message)
+
+
+def failure_text(e: Exception) -> str:
+    """``Type: message``. A :class:`ChildRunError` already has that form."""
+    return str(e) if isinstance(e, ChildRunError) else f"{type(e).__name__}: {e}"
 
 
 @dataclass(frozen=True)
@@ -157,86 +198,88 @@ def output_file(out_dir: Path, uid: int) -> Path:
     return out_dir / f"output_{uid}.npy"
 
 
+def run_reporting_failures(out_dir: Path, body: Callable[[], None]) -> int:
+    """Run a child script's ``body``; return the exit code.
+
+    ``body`` writes ``result.json``. When it raises, the failure goes to
+    ``failure.json`` (and stderr), and the exit code is 1.
+    """
+    try:
+        body()
+    except Exception as e:
+        failure = ChildFailure.from_exception(e)
+        (out_dir / FAILURE_FILE).write_text(
+            json.dumps({"kind": failure.kind.value, "message": failure.message})
+        )
+        Reporter(quiet=True).error(failure.message)
+        return 1
+    return 0
+
+
+def read_failure(out_dir: Path) -> Optional[ChildFailure]:
+    """The child's ``failure.json``, or None without one."""
+    path = out_dir / FAILURE_FILE
+    if not path.is_file():
+        return None
+    failure = json.loads(path.read_text())
+    return ChildFailure(FailureKind(failure["kind"]), failure["message"])
+
+
+@dataclass(frozen=True)
+class TuningQuery:
+    """Whether the plan exposes :data:`BENCHMARKING_KNOB`, or why that is not
+    known (``available`` is then None)."""
+
+    available: Optional[bool]
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChildResult:
+    """A child's ``result.json``: one timed run and its plan values."""
+
+    timing: TimingInfo
+    kernel: BenchmarkStats
+    host: BenchmarkStats
+    build_ms: Optional[float] = None
+    workspace_bytes: Optional[int] = None
+    #: GPU clock sample right after the timed loop (``--clocks``).
+    clocks_after: Optional[Dict[str, Any]] = None
+    #: hipDNN children only.
+    tuning: Optional[TuningQuery] = None
+
+
 def write_result(
     out_dir: Path,
     m: Measurement,
     build_ms: Optional[float] = None,
     workspace_bytes: Optional[int] = None,
     clocks_after: Optional[Dict[str, Any]] = None,
-    tuning_available: Optional[bool] = None,
-    tuning_error: Optional[str] = None,
+    tuning: Optional[TuningQuery] = None,
 ) -> None:
-    """Write the timed loop and the plan values as ``result.json``.
-
-    ``clocks_after`` is the GPU clock sample right after the timed loop.
-    ``tuning_available`` / ``tuning_error`` answer the OOTB child's
-    ``--query-tuning``.
-    """
-    result = {
-        "timing": TimingInfo.from_measurement(m).to_dict(),
-        "kernel": asdict(BenchmarkStats.from_timings(m.kernel_ms)),
-        "host": asdict(BenchmarkStats.from_timings(m.host_ms)),
-        "build_ms": build_ms,
-        "workspace_bytes": workspace_bytes,
-        "clocks_after": clocks_after,
-        "tuning_available": tuning_available,
-        "tuning_error": tuning_error,
-    }
-    (out_dir / RESULT_FILE).write_text(json.dumps(result))
+    """Write the timed loop and the plan values as ``result.json``."""
+    result = ChildResult(
+        timing=TimingInfo.from_measurement(m),
+        kernel=BenchmarkStats.from_timings(m.kernel_ms),
+        host=BenchmarkStats.from_timings(m.host_ms),
+        build_ms=build_ms,
+        workspace_bytes=workspace_bytes,
+        clocks_after=clocks_after,
+        tuning=tuning,
+    )
+    (out_dir / RESULT_FILE).write_text(json.dumps(asdict(result)))
 
 
-def write_failure(out_dir: Path, kind: str, message: str) -> None:
-    """Write why an OOTB child produced no result (``SKIPPED``, ``STALLED``,
-    ``FAILED``) as ``failure.json``."""
-    (out_dir / FAILURE_FILE).write_text(json.dumps({"kind": kind, "message": message}))
-
-
-def read_failure(out_dir: Path) -> Optional[Tuple[str, str]]:
-    """``(kind, message)`` from ``failure.json``, or None without one."""
-    path = out_dir / FAILURE_FILE
-    if not path.is_file():
-        return None
-    failure = json.loads(path.read_text())
-    return failure["kind"], failure["message"]
-
-
-@dataclass(frozen=True)
-class PlanResult:
-    """A child's ``result.json``."""
-
-    timing: TimingInfo
-    kernel: BenchmarkStats
-    host: BenchmarkStats
-    build_ms: Optional[float]
-    workspace_bytes: Optional[int]
-    clocks_after: Optional[Dict[str, Any]]
-    tuning_available: Optional[bool]
-    tuning_error: Optional[str]
-
-
-def read_plan_result(out_dir: Path) -> PlanResult:
+def read_child_result(out_dir: Path) -> ChildResult:
     """The run from the ``result.json`` that :func:`write_result` wrote."""
     result = json.loads((out_dir / RESULT_FILE).read_text())
-    return PlanResult(
+    tuning = result["tuning"]
+    return ChildResult(
         timing=TimingInfo(**result["timing"]),
         kernel=BenchmarkStats(**result["kernel"]),
         host=BenchmarkStats(**result["host"]),
         build_ms=result["build_ms"],
         workspace_bytes=result["workspace_bytes"],
         clocks_after=result["clocks_after"],
-        tuning_available=result["tuning_available"],
-        tuning_error=result["tuning_error"],
-    )
-
-
-def read_result(out_dir: Path, tuning_available: bool) -> OracleResult:
-    """The tuned run from the ``result.json`` that :func:`write_result` wrote."""
-    plan = read_plan_result(out_dir)
-    return OracleResult(
-        tuning_available=tuning_available,
-        cpu_build_time_ms=plan.build_ms,
-        timing=plan.timing,
-        gpu_kernel_stats=plan.kernel,
-        host_stats=plan.host,
-        workspace_bytes=plan.workspace_bytes,
+        tuning=TuningQuery(**tuning) if tuning is not None else None,
     )

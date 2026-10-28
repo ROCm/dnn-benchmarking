@@ -42,16 +42,17 @@ from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
 from ..reporting.suite_results import (
+    CorrectnessResult,
     GraphResult,
     ProviderEngineResult,
     engine_id_hex,
     graph_id_for,
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
-from .child_protocol import PlanResult
-from .child_runner import ChildRunError, SavedOutputs, hipdnn_ootb_run
+from .child_protocol import HIPDNN_OOTB_ENV, ChildResult, failure_text
+from .child_runner import SavedOutputs, child_run, hipdnn_child_args
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import record_oracle_error, run_hipdnn_tuned, run_pytorch_tuned
+from .oracle import hipdnn_tuning_available, run_hipdnn_tuned, run_pytorch_tuned
 from .timed_run import pytorch_run
 
 
@@ -363,11 +364,7 @@ def _gpu_memory_at_row_start() -> Optional[str]:
 
 def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
     """``Type: message``, plus the row-start memory for out-of-memory errors."""
-    return _with_memory_note(f"{type(error).__name__}: {error}", memory_at_start)
-
-
-def _with_memory_note(message: str, memory_at_start: Optional[str]) -> str:
-    """``message``, plus the row-start memory for out-of-memory errors."""
+    message = failure_text(error)
     if memory_at_start is not None and _OUT_OF_MEMORY.search(message):
         message = f"{message} [{memory_at_start}]"
     return message
@@ -468,28 +465,29 @@ def run_single_provider_engine(
     )
     memory_at_start = _gpu_memory_at_row_start()
     tuning_available: Optional[bool] = None
+    args = hipdnn_child_args(
+        ctx.graph_path,
+        config,
+        engine_id,
+        plugin_path,
+        save_outputs=ctx.reference_outputs is not None,
+    )
     try:
-        with hipdnn_ootb_run(
-            graph_path=ctx.graph_path,
-            engine_id=engine_id,
-            plugin_path=plugin_path,
-            config=config,
-            save_outputs=ctx.reference_outputs is not None,
-        ) as (plan, outputs):
-            _record_plan(row, ctx, plan)
-            if config.oracle:
-                tuning_available = _tuning_available(row, ctx, engine_id, plan)
+        # No time limit, as for every timed OOTB row.
+        with child_run("hipDNN", "hipdnn_child", args, HIPDNN_OOTB_ENV, None) as (
+            ootb,
+            outputs,
+        ):
+            _record_ootb(row, ctx, ootb)
             row.ootb.correctness = _ootb_correctness(ctx, outputs)
+            if config.oracle:
+                tuning_available = hipdnn_tuning_available(
+                    row, ctx.graph_name, engine_id, ootb
+                )
     except StallFallbackError:
         raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
-    except ChildRunError as e:
-        return _failed_row(
-            ProviderEngineResult.error_row,
-            row,
-            _with_memory_note(str(e), memory_at_start),
-        )
     except Exception as e:
         return _failed_row(
             ProviderEngineResult.error_row,
@@ -517,35 +515,19 @@ def run_single_provider_engine(
     return row
 
 
-def _record_plan(
-    row: ProviderEngineResult, ctx: _GraphContext, plan: PlanResult
+def _record_ootb(
+    row: ProviderEngineResult, ctx: _GraphContext, ootb: ChildResult
 ) -> None:
     """Record the OOTB child's build, workspace and timed loop."""
-    row.ootb.cpu_build_time_ms = plan.build_ms
+    row.ootb.cpu_build_time_ms = ootb.build_ms
     if ctx.config.metrics.basic:
-        row.ootb.workspace_bytes = plan.workspace_bytes
-    _record_timing(row, ctx, plan.timing, plan.kernel, plan.host, plan.clocks_after)
+        row.ootb.workspace_bytes = ootb.workspace_bytes
+    _record_timing(row, ctx, ootb.timing, ootb.kernel, ootb.host, ootb.clocks_after)
 
 
-def _tuning_available(
-    row: ProviderEngineResult, ctx: _GraphContext, engine_id: int, plan: PlanResult
-) -> Optional[bool]:
-    """Whether the engine exposes ``global.benchmarking`` for this graph.
-
-    Without the knob, the tuned child re-measures the OOTB configuration. A
-    failed query sets ``row.oracle_error`` and returns None (no tuned run).
-    It never fails the row.
-    """
-    if plan.tuning_error is not None:
-        record_oracle_error(
-            row,
-            f"{ctx.graph_name} engine {engine_id_hex(engine_id)}",
-            plan.tuning_error,
-        )
-    return plan.tuning_available
-
-
-def _ootb_correctness(ctx: _GraphContext, outputs: SavedOutputs) -> Any:
+def _ootb_correctness(
+    ctx: _GraphContext, outputs: SavedOutputs
+) -> Optional[CorrectnessResult]:
     """Compare the OOTB child's saved outputs with the references."""
     config = ctx.config
     if ctx.reference_outputs is not None:

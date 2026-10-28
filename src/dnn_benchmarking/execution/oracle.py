@@ -28,7 +28,6 @@ This process validates the tuned hipDNN outputs that the child saves. A
 failed tuned run sets ``row.oracle_error`` and never fails the row.
 """
 
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,8 +41,13 @@ from ..reporting.suite_results import (
     engine_id_hex,
 )
 from ..validation import ReferenceOutput
-from .child_protocol import HIPDNN_TUNED_ENV, PYTORCH_TUNED_ENV, read_result
-from .child_runner import SavedOutputs, child_args, hipdnn_child_args, run_child
+from .child_protocol import (
+    HIPDNN_TUNED_ENV,
+    PYTORCH_TUNED_ENV,
+    ChildResult,
+    failure_text,
+)
+from .child_runner import child_args, child_run, hipdnn_child_args
 from .correctness import check_correctness
 
 #: Node types whose PyTorch kernel the tuned child searches: MIOpen
@@ -58,14 +62,44 @@ _PYTORCH_TUNABLE_OPS = frozenset(
 )
 
 
-def record_oracle_error(row: ProviderEngineResult, what: str, message: str) -> None:
+def _record_error(row: ProviderEngineResult, what: str, message: str) -> None:
     """Record why the row has no tuned result; never fails the row."""
     row.oracle_error = message
     warn_once("oracle", f"tuned run failed for {what}: {message}")
 
 
-def _record_error(row: ProviderEngineResult, what: str, e: Exception) -> None:
-    record_oracle_error(row, what, f"{type(e).__name__}: {e}")
+def _engine_label(graph_name: str, engine_id: int) -> str:
+    return f"{graph_name} engine {engine_id_hex(engine_id)}"
+
+
+def hipdnn_tuning_available(
+    row: ProviderEngineResult, graph_name: str, engine_id: int, ootb: ChildResult
+) -> Optional[bool]:
+    """Whether the engine exposes ``global.benchmarking`` for this graph,
+    as the OOTB child found it.
+
+    Without the knob, the tuned child re-measures the OOTB configuration. A
+    failed query sets ``row.oracle_error`` and returns None (no tuned run).
+    It never fails the row.
+    """
+    if ootb.tuning is None:
+        return None
+    if ootb.tuning.error is not None:
+        _record_error(row, _engine_label(graph_name, engine_id), ootb.tuning.error)
+    return ootb.tuning.available
+
+
+def _oracle_result(
+    tuned: ChildResult, tuning_available: bool, config: SuiteConfig
+) -> OracleResult:
+    return OracleResult(
+        tuning_available=tuning_available,
+        cpu_build_time_ms=tuned.build_ms,
+        timing=tuned.timing,
+        gpu_kernel_stats=tuned.kernel,
+        host_stats=tuned.host,
+        workspace_bytes=tuned.workspace_bytes if config.metrics.basic else None,
+    )
 
 
 def _set_throughputs(oracle: OracleResult, row: ProviderEngineResult) -> None:
@@ -97,45 +131,41 @@ def run_hipdnn_tuned(
     outputs and this process compares them with the references, as for the
     OOTB row. Never fails the row.
     """
-    what = f"{graph_name} engine {engine_id_hex(engine_id)}"
+    what = _engine_label(graph_name, engine_id)
+    args = hipdnn_child_args(
+        graph_path,
+        config,
+        engine_id,
+        plugin_path,
+        save_outputs=reference_outputs is not None,
+    )
     try:
-        with tempfile.TemporaryDirectory(prefix="dnn-bench-hipdnn-tuned-") as state:
-            out_dir = Path(state)
-            args = hipdnn_child_args(
-                graph_path,
-                config,
-                engine_id,
-                plugin_path,
-                save_outputs=reference_outputs is not None,
-            )
-            run_child(
-                "tuned hipDNN",
-                "hipdnn_child",
-                [*args, "--tuned"],
-                HIPDNN_TUNED_ENV,
-                out_dir,
-                config,
-            )
-            oracle = read_result(out_dir, tuning_available)
-            if not config.metrics.basic:
-                oracle.workspace_bytes = None
+        with child_run(
+            "tuned hipDNN",
+            "hipdnn_child",
+            [*args, "--tuned"],
+            HIPDNN_TUNED_ENV,
+            config.metrics.profiling_timeout_s or None,
+        ) as (tuned, outputs):
+            oracle = _oracle_result(tuned, tuning_available, config)
             if reference_outputs is not None:
                 oracle.correctness = check_correctness(
-                    SavedOutputs(out_dir),
+                    outputs,
                     tensor_infos,
                     reference_outputs,
                     config.validation.provider.value,
                     config,
                 )
-        if oracle.correctness is not None and oracle.correctness.explicitly_failed:
-            warn_once(
-                "oracle_correctness",
-                f"tuned plan for {what} failed validation; no speedup is reported",
-            )
-        _set_throughputs(oracle, row)
-        row.oracle = oracle
     except Exception as e:
-        _record_error(row, what, e)
+        _record_error(row, what, failure_text(e))
+        return
+    if oracle.correctness is not None and oracle.correctness.explicitly_failed:
+        warn_once(
+            "oracle_correctness",
+            f"tuned plan for {what} failed validation; no speedup is reported",
+        )
+    _set_throughputs(oracle, row)
+    row.oracle = oracle
 
 
 def run_pytorch_tuned(
@@ -157,23 +187,21 @@ def run_pytorch_tuned(
         node.get("type") in _PYTORCH_TUNABLE_OPS
         for node in graph_json.get("nodes") or []
     )
+    args = child_args(graph_path, config)
+    args += ["--pytorch-sdpa-backend", config.pytorch_sdpa_backend.value]
+    if config.pytorch_rocm_fa_library is not None:
+        args += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
     try:
-        with tempfile.TemporaryDirectory(prefix="dnn-bench-pytorch-tuned-") as state:
-            out_dir = Path(state)
-            args = child_args(graph_path, config)
-            args += ["--pytorch-sdpa-backend", config.pytorch_sdpa_backend.value]
-            if config.pytorch_rocm_fa_library is not None:
-                args += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
-            run_child(
-                "tuned PyTorch",
-                "pytorch_tuned_child",
-                args,
-                PYTORCH_TUNED_ENV,
-                out_dir,
-                config,
-            )
-            oracle = read_result(out_dir, tuning_available)
-        _set_throughputs(oracle, row)
-        row.oracle = oracle
+        with child_run(
+            "tuned PyTorch",
+            "pytorch_tuned_child",
+            args,
+            PYTORCH_TUNED_ENV,
+            config.metrics.profiling_timeout_s or None,
+        ) as (tuned, _):
+            oracle = _oracle_result(tuned, tuning_available, config)
     except Exception as e:
-        _record_error(row, f"PyTorch on {graph_name}", e)
+        _record_error(row, f"PyTorch on {graph_name}", failure_text(e))
+        return
+    _set_throughputs(oracle, row)
+    row.oracle = oracle

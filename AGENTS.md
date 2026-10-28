@@ -113,8 +113,8 @@ src/dnn_benchmarking/
 
 Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
 each graph: `GraphLoader` -> `suite_runner.run_graph_all_providers` -> per
-engine: `child_runner.hipdnn_ootb_run` -> `cli/hipdnn_child.py` (`Executor`
-+ `BufferManager` -> `timing.measure`) -> correctness, oracle, profiling ->
+engine: `child_runner.child_run` -> `cli/hipdnn_child.py` (`Executor` +
+`BufferManager` -> `timing.measure`) -> correctness, oracle, profiling ->
 `GraphResult` -> `Reporter` and `SuiteResult.write`.
 
 Data flow (PyTorch): the same, with `run_graph_pytorch`,
@@ -141,16 +141,21 @@ Rules that keep the design intact:
   OOTB build.
 - Run every hipDNN plan only in `cli/hipdnn_child.py`: the OOTB plan of each
   engine row, and with `--oracle` its tuned plan (`--tuned`). Run tuned
-  PyTorch only in `cli/pytorch_tuned_child.py`. `execution/child_runner.py`
-  starts each child in a new, empty temporary directory, which is also its
-  `MIOPEN_USER_DB_PATH`, and deletes it afterwards. MIOpen keys its user
-  database without the deterministic attribute and reads its path once per
-  process, so only a new process gives a run an empty database. The child
-  environment is in `execution/child_protocol.py` (`HIPDNN_OOTB_ENV`,
-  `HIPDNN_TUNED_ENV` with `HIPDNN_FORCE_BENCHMARKING=1`, or the TunableOp
-  variables). The parent passes the full `TimingPolicy`, `stall_gate`
-  included. The scripts check the environment, set no selection variable and
-  parse no dnn-benchmark option. The parent validates the saved outputs with
+  PyTorch only in `cli/pytorch_tuned_child.py`. Start every child with
+  `execution/child_runner.child_run`: it gives the child a new, empty
+  temporary directory, which is also its `MIOPEN_USER_DB_PATH`, and deletes
+  it afterwards. MIOpen keys its user database without the deterministic
+  attribute and reads its path once per process, so only a new process
+  gives a run an empty database. The child environment is in
+  `execution/child_protocol.py` (`HIPDNN_OOTB_ENV`, `HIPDNN_TUNED_ENV` with
+  `HIPDNN_FORCE_BENCHMARKING=1`, or the TunableOp variables). The parent
+  passes the full `TimingPolicy`, `stall_gate` included. Each script wraps
+  its body in `child_protocol.run_reporting_failures`, which writes a
+  failure to `failure.json`; `child_run` raises it again as the same
+  exception kind (`UnsupportedGraphError`, `StallFallbackError` or
+  `ChildRunError`). The scripts check the environment, set no selection
+  variable and parse no dnn-benchmark option. Child output goes to the
+  parent's stderr, uncaptured. The parent validates the saved outputs with
   `check_correctness`. Every run turns hipDNN's disk cache off
   (`HIPDNN_DISABLE_CACHE=1`).
 - Give each profiling pass a new, empty MIOpen user database

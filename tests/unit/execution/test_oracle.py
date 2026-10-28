@@ -70,7 +70,8 @@ def child(monkeypatch):
     """Fake ``run_capped``: records the child launch and writes its files.
 
     ``plan`` goes into ``result.json`` (None: no file). With
-    ``--save-outputs`` the child saves ``outputs`` (uid -> array).
+    ``--save-outputs`` the child saves ``outputs`` (uid -> array). An
+    ``error`` is raised in the child and reported as the real scripts do.
     """
     launch = SimpleNamespace(
         argv=None,
@@ -79,19 +80,25 @@ def child(monkeypatch):
         state_existed=None,
         plan={"build_ms": 7.0, "workspace_bytes": 4096},
         outputs={2: REF.copy()},
-        proc=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        error=None,
+        returncode=0,
     )
 
-    def run_capped(argv, timeout_s, env=None):
+    def body(out_dir):
+        if launch.error is not None:
+            raise launch.error
+        if launch.plan is not None:
+            child_protocol.write_result(out_dir, _measurement(), **launch.plan)
+        if "--save-outputs" in launch.argv:
+            for uid, data in launch.outputs.items():
+                np.save(child_protocol.output_file(out_dir, uid), data)
+
+    def run_capped(argv, timeout_s, env=None, capture_output=True):
         launch.argv, launch.env = argv, env
         out_dir = launch.out_dir = Path(argv[argv.index("--out-dir") + 1])
         launch.state_existed = out_dir.is_dir()
-        if launch.plan is not None:
-            child_protocol.write_result(out_dir, _measurement(), **launch.plan)
-        if "--save-outputs" in argv:
-            for uid, data in launch.outputs.items():
-                np.save(child_protocol.output_file(out_dir, uid), data)
-        return launch.proc
+        code = child_protocol.run_reporting_failures(out_dir, lambda: body(out_dir))
+        return SimpleNamespace(returncode=code or launch.returncode)
 
     monkeypatch.setattr(child_runner, "run_capped", run_capped)
     return launch
@@ -142,7 +149,7 @@ def _run_hipdnn(
 
 
 def _timeout(monkeypatch, seen):
-    def run_capped(argv, timeout_s, env=None):
+    def run_capped(argv, timeout_s, env=None, capture_output=True):
         seen.append(timeout_s)
         raise subprocess.TimeoutExpired(argv, timeout_s)
 
@@ -345,14 +352,10 @@ def test_hipdnn_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
     assert "timed out after 7 s" in row.oracle_error
 
 
-@pytest.mark.parametrize("failure", ["nonzero-exit", "no-result"])
+@pytest.mark.parametrize("failure", ["error", "no-result"])
 def test_hipdnn_child_failure_is_an_oracle_error(child, tmp_path, failure):
-    if failure == "nonzero-exit":
-        child.proc = SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr="Traceback ...\nERROR: engine 0x2: RuntimeError: HIP out of memory\n",
-        )
+    if failure == "error":
+        child.error = RuntimeError("HIP out of memory")
     else:
         child.plan = None
 
@@ -360,8 +363,8 @@ def test_hipdnn_child_failure_is_an_oracle_error(child, tmp_path, failure):
 
     assert row.oracle is None
     assert row.status == "success"
-    if failure == "nonzero-exit":
-        assert row.oracle_error.endswith("RuntimeError: HIP out of memory")
+    if failure == "error":
+        assert row.oracle_error == "RuntimeError: HIP out of memory"
     else:
         assert "exited 0" in row.oracle_error
 
@@ -464,17 +467,11 @@ def test_pytorch_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
     assert "timed out after 7 s" in row.oracle_error
 
 
-def test_pytorch_child_failure_reports_its_last_stderr_line(child, tmp_path):
-    child.plan = None
-    child.proc = SimpleNamespace(
-        returncode=1,
-        stdout="loading graph\n",
-        stderr="ERROR: RuntimeError: HIP out of memory\n  \n",
-    )
+def test_pytorch_child_failure_reports_the_child_error(child, tmp_path):
+    child.error = RuntimeError("HIP out of memory")
 
     row = _run_pytorch(tmp_path)
 
     assert row.oracle is None
-    assert "exited 1" in row.oracle_error
-    assert row.oracle_error.endswith("RuntimeError: HIP out of memory")
+    assert row.oracle_error == "RuntimeError: HIP out of memory"
     assert row.status == "success"

@@ -196,7 +196,7 @@ def fake(monkeypatch):
         def extract_tensor_info(self, graph_json):
             return TENSORS
 
-    def run_capped(argv, timeout_s, env=None):
+    def run_capped(argv, timeout_s, env=None, capture_output=True):
         """Run the real OOTB child script in this process, in its env."""
         args = argv[3:]
         if "--tuned" in args:
@@ -207,7 +207,7 @@ def fake(monkeypatch):
             for name in [*HIPDNN_OOTB_ENV.fixed, *HIPDNN_OOTB_ENV.in_dir]:
                 m.setenv(name, env[name])
             code = hipdnn_child.main(args)
-        return SimpleNamespace(returncode=code, stdout="", stderr="")
+        return SimpleNamespace(returncode=code)
 
     monkeypatch.setattr(suite_runner, "Executor", Executor)
     monkeypatch.setattr(timed_run, "Executor", Executor)
@@ -486,7 +486,7 @@ def tuned_child(fake, monkeypatch):
         write_result(args.out_dir, m, build_ms=7.0, workspace_bytes=64)
         if args.save_outputs:
             np.save(output_file(args.out_dir, 2), child.output)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0)
 
     fake.tuned_child = run_capped
     return child
@@ -535,7 +535,7 @@ def test_every_gpu_run_starts_with_its_own_empty_miopen_user_db(
     launches = []
     inner = child_runner.run_capped
 
-    def record(argv, timeout_s, env=None):
+    def record(argv, timeout_s, env=None, capture_output=True):
         db = Path(env["MIOPEN_USER_DB_PATH"])
         launches.append((db, sorted(p.name for p in db.iterdir())))
         return inner(argv, timeout_s, env)

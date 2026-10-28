@@ -6,7 +6,7 @@
 OOTB PyTorch runs in the benchmark process with layout and backend fixes only
 (:func:`apply_pytorch_environment`). Tuned PyTorch runs in a child process
 (``cli.pytorch_tuned_child``, environment
-``execution.tuned_child.PYTORCH_TUNED_ENV``) because PyTorch keeps conv
+``execution.child_protocol.PYTORCH_TUNED_ENV``) because PyTorch keeps conv
 algorithm choices in a process-wide cache whose key ignores
 ``cudnn.benchmark``, and MIOpen persists search results in its user database.
 Running both in one process would let either measurement inherit the other's
