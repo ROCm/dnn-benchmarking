@@ -34,7 +34,7 @@ def test_argv_requests_kernel_and_memcpy_pftrace(tmp_path):
 def test_records_hoisted_pftrace_path(tmp_path):
     out_dir = tmp_path / "trace_out"
 
-    def fake_run(argv, timeout_s=None):
+    def fake_run(argv, timeout_s=None, env=None):
         host_dir = Path(argv[argv.index("-d") + 1]) / "host"
         host_dir.mkdir(parents=True, exist_ok=True)
         (host_dir / "results_results.pftrace").write_bytes(b"fake-pftrace")

@@ -5,7 +5,7 @@
 
 import os
 
-from dnn_benchmarking.execution import tuned_child
+from dnn_benchmarking.execution import child_protocol
 
 
 def test_pytorch_tuned_env_forces_isolated_state(monkeypatch, tmp_path) -> None:
@@ -16,7 +16,7 @@ def test_pytorch_tuned_env_forces_isolated_state(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("DNN_BENCH_TEST_PASSTHROUGH", "kept")
     parent_before = dict(os.environ)
 
-    env = tuned_child.PYTORCH_TUNED_ENV.build(str(tmp_path))
+    env = child_protocol.PYTORCH_TUNED_ENV.build(str(tmp_path))
 
     assert env["PYTORCH_TUNABLEOP_ENABLED"] == "1"
     assert env["PYTORCH_TUNABLEOP_TUNING"] == "1"
@@ -27,7 +27,7 @@ def test_pytorch_tuned_env_forces_isolated_state(monkeypatch, tmp_path) -> None:
 
 
 def test_the_parent_env_satisfies_the_pytorch_child_check(tmp_path, monkeypatch):
-    for name, value in tuned_child.PYTORCH_TUNED_ENV.build(str(tmp_path)).items():
+    for name, value in child_protocol.PYTORCH_TUNED_ENV.build(str(tmp_path)).items():
         monkeypatch.setenv(name, value)
 
-    tuned_child.PYTORCH_TUNED_ENV.check()
+    child_protocol.PYTORCH_TUNED_ENV.check()

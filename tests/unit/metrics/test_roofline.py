@@ -24,7 +24,7 @@ def _reset(monkeypatch):
 def _run(out_dir, returncode=0, stderr="", side_effect=None):
     captured = {}
 
-    def fake_run(argv, timeout_s=None):
+    def fake_run(argv, timeout_s=None, env=None):
         captured["argv"] = argv
         if side_effect is not None:
             side_effect()

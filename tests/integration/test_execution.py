@@ -22,7 +22,6 @@ from dnn_benchmarking.execution import (
     BufferManager,
     Executor,
     correctness,
-    suite_runner,
 )
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.suite_runner import run_graph_all_providers
@@ -213,43 +212,6 @@ def test_bfloat16_conv_validates_against_pytorch(
         Reporter(output=io.StringIO()),
     )
     _assert_engines_match_reference(result)
-
-
-def test_validation_compares_on_device(
-    hipdnn,
-    torch_gpu,
-    sample_conv_fwd_json: Dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With a device reference, engine buffers live in torch and compare on GPU."""
-    compared = []
-    real_compare = correctness.compare
-
-    def spy(actual, expected, **kwargs):
-        compared.append(type(actual).__module__)
-        return real_compare(actual, expected, **kwargs)
-
-    monkeypatch.setattr(correctness, "compare", spy)
-    devices = []
-    pick = suite_runner._hipdnn_buffer_device
-    monkeypatch.setattr(
-        suite_runner,
-        "_hipdnn_buffer_device",
-        lambda refs: devices.append(pick(refs)) or devices[-1],
-    )
-
-    result = run_graph_all_providers(
-        Path("graph.json"),
-        sample_conv_fwd_json,
-        GraphLoader().extract_tensor_info(sample_conv_fwd_json),
-        _validate_config(),
-        hipdnn.Handle(),
-        Reporter(output=io.StringIO()),
-    )
-
-    _assert_engines_match_reference(result, require_engine=True)
-    assert set(devices) == {"cuda"}
-    assert compared and set(compared) == {"torch"}
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "float32"])

@@ -11,14 +11,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from dnn_benchmarking.cli import hipdnn_tuned_child, pytorch_tuned_child
+from dnn_benchmarking.cli import hipdnn_child, pytorch_tuned_child
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
     SuiteConfig,
     ValidationConfig,
 )
 from dnn_benchmarking.execution import oracle as oracle_mod
-from dnn_benchmarking.execution import tuned_child
+from dnn_benchmarking.execution import child_protocol, child_runner
 from dnn_benchmarking.execution.timing import Measurement
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.reporting.suite_results import (
@@ -87,13 +87,13 @@ def child(monkeypatch):
         out_dir = launch.out_dir = Path(argv[argv.index("--out-dir") + 1])
         launch.state_existed = out_dir.is_dir()
         if launch.plan is not None:
-            tuned_child.write_result(out_dir, _measurement(), **launch.plan)
+            child_protocol.write_result(out_dir, _measurement(), **launch.plan)
         if "--save-outputs" in argv:
             for uid, data in launch.outputs.items():
-                np.save(tuned_child.output_file(out_dir, uid), data)
+                np.save(child_protocol.output_file(out_dir, uid), data)
         return launch.proc
 
-    monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
+    monkeypatch.setattr(child_runner, "run_capped", run_capped)
     return launch
 
 
@@ -146,7 +146,7 @@ def _timeout(monkeypatch, seen):
         seen.append(timeout_s)
         raise subprocess.TimeoutExpired(argv, timeout_s)
 
-    monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
+    monkeypatch.setattr(child_runner, "run_capped", run_capped)
 
 
 def _set_tuned_env(monkeypatch, env, state_dir):
@@ -177,8 +177,9 @@ def test_hipdnn_child_times_the_row_engine_with_the_run_timing(
 
     _run_hipdnn(tmp_path, config=config, plugin_path=Path("/plugins/p.so"))
 
-    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.hipdnn_tuned_child"]
-    args = hipdnn_tuned_child.parse_args(child.argv[3:])
+    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.hipdnn_child"]
+    args = hipdnn_child.parse_args(child.argv[3:])
+    assert args.tuned
     assert args.graph == tmp_path / "g.json"
     assert args.engine == ENGINE
     assert args.plugin_path == Path("/plugins/p.so")
@@ -190,7 +191,7 @@ def test_hipdnn_child_times_the_row_engine_with_the_run_timing(
 def test_hipdnn_child_uses_the_default_plugins_without_a_plugin_path(child, tmp_path):
     _run_hipdnn(tmp_path)
 
-    assert hipdnn_tuned_child.parse_args(child.argv[3:]).plugin_path is None
+    assert hipdnn_child.parse_args(child.argv[3:]).plugin_path is None
 
 
 def test_hipdnn_child_env_forces_benchmarking_into_a_private_deleted_user_db(
@@ -217,7 +218,7 @@ def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkey
     for name, value in child.env.items():
         monkeypatch.setenv(name, value)
 
-    tuned_child.HIPDNN_TUNED_ENV.check()
+    child_protocol.HIPDNN_TUNED_ENV.check()
 
 
 @pytest.mark.parametrize(
@@ -233,16 +234,16 @@ def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
     tmp_path, monkeypatch, name, value
 ):
     """An untuned run must not be reported as the tuned result."""
-    _set_tuned_env(monkeypatch, tuned_child.HIPDNN_TUNED_ENV, tmp_path)
+    _set_tuned_env(monkeypatch, child_protocol.HIPDNN_TUNED_ENV, tmp_path)
     if value is None:
         monkeypatch.delenv(name)
     else:
         monkeypatch.setenv(name, value)
-    argv = ["--graph", "g.json", "--seed", "0", "--engine", "0x1"]
+    argv = ["--graph", "g.json", "--seed", "0", "--engine", "0x1", "--tuned"]
     argv += ["--timing-policy", "{}", "--out-dir", str(tmp_path)]
 
-    assert hipdnn_tuned_child.main(argv) == 1
-    assert not (tmp_path / tuned_child.RESULT_FILE).exists()
+    assert hipdnn_child.main(argv) == 1
+    assert not (tmp_path / child_protocol.RESULT_FILE).exists()
 
 
 @pytest.mark.parametrize(
@@ -251,13 +252,13 @@ def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
 def test_pytorch_child_refuses_to_time_without_the_tuning_env(
     tmp_path, monkeypatch, name
 ):
-    _set_tuned_env(monkeypatch, tuned_child.PYTORCH_TUNED_ENV, tmp_path)
+    _set_tuned_env(monkeypatch, child_protocol.PYTORCH_TUNED_ENV, tmp_path)
     monkeypatch.setenv(name, "0")
     argv = ["--graph", "g.json", "--seed", "0", "--timing-policy", "{}"]
     argv += ["--out-dir", str(tmp_path), "--pytorch-sdpa-backend", "default"]
 
     assert pytorch_tuned_child.main(argv) == 1
-    assert not (tmp_path / tuned_child.RESULT_FILE).exists()
+    assert not (tmp_path / child_protocol.RESULT_FILE).exists()
 
 
 def test_hipdnn_tuned_row_comes_from_the_child_result(child, tmp_path):

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from dnn_benchmarking.cli import hipdnn_tuned_child
+from dnn_benchmarking.cli import hipdnn_child
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -20,9 +20,13 @@ from dnn_benchmarking.config.benchmark_config import (
     SuiteConfig,
     ValidationConfig,
 )
-from dnn_benchmarking.execution import oracle, suite_runner, timed_run
+from dnn_benchmarking.execution import child_runner, suite_runner, timed_run
+from dnn_benchmarking.execution.child_protocol import (
+    HIPDNN_OOTB_ENV,
+    output_file,
+    write_result,
+)
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
-from dnn_benchmarking.execution.tuned_child import output_file, write_result
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
@@ -96,6 +100,8 @@ class Fake:
         self.policies = []
         self.knob_ids = {}  # engine id -> knob ids; default: benchmarking
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
+        self.tuned_child = None  # fake run_capped for --tuned children
+        self.child_envs = []  # env of each OOTB child launch
 
 
 @pytest.fixture
@@ -173,19 +179,52 @@ def fake(monkeypatch):
             f.events.append("read_output")
             return f.engine_output
 
+        def get_output_tensors(self):
+            return [t for t in TENSORS if t.is_output]
+
     class Probe:
         def clocks(self):
             return f.clocks.pop(0) if f.clocks else None
+
+    class Loader:
+        def load_json(self, path):
+            return GRAPH
+
+        def validate(self, graph_json):
+            pass
+
+        def extract_tensor_info(self, graph_json):
+            return TENSORS
+
+    def run_capped(argv, timeout_s, env=None):
+        """Run the real OOTB child script in this process, in its env."""
+        args = argv[3:]
+        if "--tuned" in args:
+            assert f.tuned_child is not None, "tuned child launched without fixture"
+            return f.tuned_child(argv, timeout_s, env)
+        f.child_envs.append(env)
+        with monkeypatch.context() as m:
+            for name in [*HIPDNN_OOTB_ENV.fixed, *HIPDNN_OOTB_ENV.in_dir]:
+                m.setenv(name, env[name])
+            code = hipdnn_child.main(args)
+        return SimpleNamespace(returncode=code, stdout="", stderr="")
 
     monkeypatch.setattr(suite_runner, "Executor", Executor)
     monkeypatch.setattr(timed_run, "Executor", Executor)
     monkeypatch.setattr(timed_run, "BufferManager", BufferManager)
     monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
+    monkeypatch.setattr(hipdnn_child, "GpuSmiProbe", Probe)
+    monkeypatch.setattr(hipdnn_child, "GraphLoader", Loader)
+    monkeypatch.setattr(hipdnn_child, "initialize_pip_rocm_runtime", lambda: None)
+    monkeypatch.setattr(child_runner, "run_capped", run_capped)
     monkeypatch.setitem(
         sys.modules,
         "hipdnn_frontend",
         SimpleNamespace(
             engine_id_to_name=lambda eid: "",
+            Handle=SimpleNamespace,
+            set_engine_plugin_paths=lambda paths, mode: None,
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE="abs"),
         ),
     )
     return f
@@ -438,7 +477,7 @@ def tuned_child(fake, monkeypatch):
     child = SimpleNamespace(engines=[], stall_gates=[], output=REF.copy())
 
     def run_capped(argv, timeout_s, env=None):
-        args = hipdnn_tuned_child.parse_args(argv[3:])
+        args = hipdnn_child.parse_args(argv[3:])
         engine = engine_id_hex(args.engine)
         child.engines.append(engine)
         child.stall_gates.append(args.timing_policy.stall_gate)
@@ -449,7 +488,7 @@ def tuned_child(fake, monkeypatch):
             np.save(output_file(args.out_dir, 2), child.output)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(oracle, "run_capped", run_capped)
+    fake.tuned_child = run_capped
     return child
 
 
@@ -484,6 +523,31 @@ def test_oracle_tunes_each_engine_in_a_child_after_its_row_is_released(
         # The parent compares the child's saved outputs with its references.
         assert row.ootb.correctness.passed and row.oracle.correctness.passed
         assert oracle_speedup(row) == pytest.approx(2.0)
+
+
+def test_every_gpu_run_starts_with_its_own_empty_miopen_user_db(
+    fake, tuned_child, monkeypatch
+):
+    """Each OOTB and tuned run gets a new, empty MIOpen user database that no
+    other run shares and that is deleted after it. MIOpen keys its records
+    without the deterministic attribute, so a shared database lets one
+    engine's Find select another engine's kernel."""
+    launches = []
+    inner = child_runner.run_capped
+
+    def record(argv, timeout_s, env=None):
+        db = Path(env["MIOPEN_USER_DB_PATH"])
+        launches.append((db, sorted(p.name for p in db.iterdir())))
+        return inner(argv, timeout_s, env)
+
+    monkeypatch.setattr(child_runner, "run_capped", record)
+
+    _run(oracle=True)
+
+    dbs = [db for db, _ in launches]
+    assert len(dbs) == 4 and len(set(dbs)) == 4  # 2 engines x (OOTB, tuned)
+    assert all(contents == [] for _, contents in launches)
+    assert not any(db.exists() for db in dbs)
 
 
 def test_tuning_available_follows_each_engines_knobs(fake, tuned_child):
@@ -822,15 +886,6 @@ def test_pytorch_reference_outputs_keep_a_gpu_output_on_the_device(keep_device):
     np.testing.assert_array_equal(output.host_data(), REF)
 
 
-def test_hipdnn_buffers_use_torch_storage_only_with_a_device_reference():
-    host = suite_runner.ReferenceOutput(data=REF, tensor_uid=2)
-    device = suite_runner.ReferenceOutput(data=REF, tensor_uid=3, device_data=REF)
-
-    assert suite_runner._hipdnn_buffer_device(None) is None
-    assert suite_runner._hipdnn_buffer_device({2: host}) is None
-    assert suite_runner._hipdnn_buffer_device({2: host, 3: device}) == "cuda"
-
-
 def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
     def no_handle():
         raise RuntimeError("plugin load failed")
@@ -856,8 +911,9 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
 
 
 def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
-    """-e 1,1 --plugin-path /a,/b: each row gets a fresh handle created after
-    its own plugin path is set, so an A/B row is not silently the default set."""
+    """-e 1,1 --plugin-path /a,/b: each row's handle, and the handle of its
+    OOTB child, is created right after that row's plugin path is set, so an
+    A/B row is not silently the default set."""
     calls = []
 
     def make_handle():
@@ -877,10 +933,13 @@ def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
 
     graph, _ = _run(handle=None, engine_filter=[1, 1], plugin_paths=[a, b])
 
-    assert calls == [([str(a)], "abs"), "Handle", ([str(b)], "abs"), "Handle"]
+    # Per row: the parent's handle (engine name), then the OOTB child's.
+    row_a = [([str(a)], "abs"), "Handle"] * 2
+    row_b = [([str(b)], "abs"), "Handle"] * 2
+    assert calls == row_a + row_b
     assert [(r.status, r.plugin_path, r.engine_name) for r in graph.results] == [
         ("success", str(a), "ENG_2"),
-        ("success", str(b), "ENG_4"),
+        ("success", str(b), "ENG_6"),
     ]
 
 

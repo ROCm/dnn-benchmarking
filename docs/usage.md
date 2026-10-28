@@ -244,6 +244,32 @@ every run.
 The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
 value in the environment without `--autotune`.
 
+## MIOpen user database
+
+MIOpen stores Find results in a user database, and the key of a record does
+not include the deterministic attribute. A `MIOPEN_ENGINE` record can thus
+select the kernel of `MIOPEN_ENGINE_DETERMINISTIC` for the same problem.
+MIOpen reads the database path once per process. Therefore the tool runs
+every GPU run of a hipDNN engine in its own child process:
+
+- the OOTB run of each engine row;
+- the tuned run of each engine row (`--oracle`);
+- each profiling pass (`--pmc`, `--trace`, `--perf`, `--roofline`).
+
+Each child gets a new, empty temporary directory as `MIOPEN_USER_DB_PATH`.
+The tool deletes the directory after the child exits. A value that you set
+in the shell does not reach these children. The children share only the
+installed MIOpen system database (read-only) and the kernel cache
+(`MIOPEN_CUSTOM_CACHE_DIR`, compiled binaries only).
+
+Each child repeats MIOpen Find for a problem that the system database does
+not hold, and starts a new process that loads the plugins. This adds time to
+`first_call_ms` and to the run time, not to `kernel.median_ms`.
+
+PyTorch rows (`--runtime pytorch`, `--validate pytorch`) run in the
+benchmark process. They share its user database, which is empty at the
+start of each `dnn-benchmark` command.
+
 ## Oracle
 
 `--oracle` compares the default (out-of-the-box, OOTB) plan of each engine
@@ -252,37 +278,38 @@ only.
 
 For each engine row:
 
-1. The tool builds the OOTB plan one time, untimed, and discards it (also
-   without `--oracle`). The first build of an engine in a process pays
+1. A child process (`python -m dnn_benchmarking.cli.hipdnn_child`) runs the
+   OOTB plan (also without `--oracle`). It builds the OOTB plan one time,
+   untimed, and discards it. The first build of an engine in a process pays
    one-time costs: provider setup and, on a cold page cache, the read of the
    plugin and kernel files. The untimed plan is never executed, so no
    provider tuning runs.
-2. The tool builds the OOTB plan (timed as `ootb.build_ms`: only
+2. The child builds the OOTB plan (timed as `ootb.build_ms`: only
    `create_execution_plan_ext(engine_id, knobs)`, `check_support()` and
-   `build_plans()`), times it and validates it.
-3. After the OOTB buffers are released, a child process
-   (`python -m dnn_benchmarking.cli.hipdnn_tuned_child`) builds the same
+   `build_plans()`) and times it. With `--validate`, it saves its outputs,
+   and the tool compares them with the reference outputs.
+3. After the OOTB child exits, a second child
+   (`python -m dnn_benchmarking.cli.hipdnn_child --tuned`) builds the same
    engine with benchmarking on (`HIPDNN_FORCE_BENCHMARKING=1`, the
    process-wide form of the `global.benchmarking` knob) and times it. Its
    result becomes `oracle`. The child gets the graph, the engine,
    `--plugin-path`, `--seed` and the timing settings of the row, also the
    stall-gate state of the graph.
-4. With `--validate` and a usable reference, the child saves its outputs.
-   The tool compares them with the same reference outputs and tolerances as
-   the OOTB plan. The result is `oracle.correctness`. Without references,
-   `oracle.correctness` is `null`.
+4. With `--validate` and a usable reference, the tuned child saves its
+   outputs. The tool compares them with the same reference outputs and
+   tolerances as the OOTB plan. The result is `oracle.correctness`. Without
+   references, `oracle.correctness` is `null`.
 
-The tool sets the environment of the child; the child sets no tuning
+The tool sets the environment of each child; the child sets no tuning
 variable. The child checks that environment before it builds anything. When
-a variable is missing or has another value, the child stops, and the row
-gets `oracle_error` instead of an untuned result. The child owns all tuning
-state. hipDNN keeps a tuned winner in memory until its process exits, and
-the tuned MIOpen search writes the MIOpen user database. The child's MIOpen
-user database
-(`MIOPEN_USER_DB_PATH`) is a temporary directory that the tool deletes
-afterwards. hipDNN's disk cache is off in every run (see
-[Kernel selection](#kernel-selection---autotune)), also in the child
-(`HIPDNN_DISABLE_CACHE=1`). Thus no OOTB measurement sees the tuned
+a variable is missing or has another value, the tuned child stops, and the
+row gets `oracle_error` instead of an untuned result. The child owns all
+tuning state. hipDNN keeps a tuned winner in memory until its process exits,
+and the tuned MIOpen search writes the MIOpen user database. Each child has
+its own empty MIOpen user database (see
+[MIOpen user database](#miopen-user-database)). hipDNN's disk cache is off in
+every run (see [Kernel selection](#kernel-selection---autotune)), also in
+the child (`HIPDNN_DISABLE_CACHE=1`). Thus no OOTB measurement sees the tuned
 selection, also when a stall-gate fallback measures a graph again or a graph
 is listed twice.
 
@@ -316,10 +343,9 @@ failed `correctness` on either side, rows with `tuning_available: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
-Each run starts with an empty MIOpen user database (see
-[setup.md](setup.md#workspace)). MIOpen find and performance database entries
-from an earlier run therefore cannot supply tuned selections to the OOTB plan,
-unless `MIOPEN_USER_DB_PATH` is set to keep them. The
+MIOpen find and performance database entries cannot supply tuned
+selections to the OOTB plan: each OOTB child starts with an empty MIOpen user
+database. The
 tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set in the
 environment: the providers apply that variable before the knob, so it
 reaches the OOTB plan too. `--autotune` sets that variable, so the tool

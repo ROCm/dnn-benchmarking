@@ -25,7 +25,7 @@ from ..config.benchmark_config import PyTorchSdpaBackendName, TimingPolicy
 from ..execution.buffer_manager import generate_input_data
 from ..execution.timed_run import pytorch_run
 from ..execution.timing import retry_unstalled
-from ..execution.tuned_child import PYTORCH_TUNED_ENV, child_parser, write_result
+from ..execution.child_protocol import PYTORCH_TUNED_ENV, child_parser, write_result
 from ..graph.loader import GraphLoader
 from ..reporting.reporter import Reporter
 
