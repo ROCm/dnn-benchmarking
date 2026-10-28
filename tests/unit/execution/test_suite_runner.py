@@ -424,6 +424,21 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
     assert ok.status == "success"
 
 
+@pytest.mark.parametrize("outcome", ["skip", "stall"])
+def test_handled_child_failures_print_no_error_line(fake, capsys, outcome):
+    """A skip or a stall-gate failure is a normal outcome: the child reports
+    it only to the parent, which turns it into a skipped row or a rerun."""
+    if outcome == "skip":
+        fake.prepare_errors[1] = UnsupportedGraphError("no plan")
+    else:
+        fake.stall = {1}
+
+    graph, _ = _run()
+
+    assert graph.results[0].status == ("skipped" if outcome == "skip" else "success")
+    assert "ERROR" not in capsys.readouterr().err
+
+
 def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch):
     monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
     fake.discovered = [1]
