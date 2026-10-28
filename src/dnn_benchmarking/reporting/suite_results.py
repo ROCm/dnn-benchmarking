@@ -43,6 +43,7 @@ RUN_CONFIG_KEYS = (
     "validate",
     "rtol",
     "atol",
+    "reference_precision",
     "oracle",
     "autotune",
     "hipdnn_cache_dir",
@@ -169,6 +170,9 @@ class CorrectnessResult:
         n_mismatch: Elements outside tolerance, summed over outputs.
         n_total: Elements compared, summed over outputs.
         worst_output_uid: Tensor UID of the output with the largest diff.
+        reference_precision: Arithmetic of the reference the outputs were
+            compared with: ``float64`` or ``native`` (the graph data types).
+            None when no comparison ran.
     """
 
     tolerance_match: Optional[bool]
@@ -180,6 +184,7 @@ class CorrectnessResult:
     n_mismatch: Optional[int] = None
     n_total: Optional[int] = None
     worst_output_uid: Optional[int] = None
+    reference_precision: Optional[str] = None
 
     @property
     def passed(self) -> bool:
@@ -208,6 +213,7 @@ class CorrectnessResult:
             "n_mismatch": self.n_mismatch,
             "n_total": self.n_total,
             "worst_output_uid": self.worst_output_uid,
+            "reference_precision": self.reference_precision,
             "message": self.error_message,
         }
 

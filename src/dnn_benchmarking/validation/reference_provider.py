@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Type
 
+from ..config.benchmark_config import ReferencePrecision
+
 if TYPE_CHECKING:
     import numpy as np
 
@@ -27,11 +29,14 @@ class ReferenceOutput:
         tensor_uid: UID of the tensor in the graph.
         device_data: Same logical values as ``data`` as a torch GPU tensor,
             or None when only host data exists.
+        precision: Arithmetic of the values: ``float64`` (float64 values of
+            a float64 computation) or ``native`` (the graph data types).
     """
 
     data: Optional["np.ndarray"]
     tensor_uid: int
     device_data: Optional[Any] = None
+    precision: str = ReferencePrecision.NATIVE.value
 
     def host_data(self) -> "np.ndarray":
         """Return the values as a dense host array in the validation representation.
@@ -73,12 +78,18 @@ class ReferenceProvider(ABC):
         self,
         graph_json: Dict[str, Any],
         input_data: Dict[int, "np.ndarray"],
+        *,
+        precision: ReferencePrecision = ReferencePrecision.NATIVE,
+        device: Optional[str] = None,
     ) -> Dict[int, ReferenceOutput]:
         """Compute reference outputs for given graph and inputs.
 
         Args:
             graph_json: The graph as a parsed JSON dictionary.
             input_data: Mapping of tensor UID to input numpy arrays.
+            precision: ``FLOAT64`` requires :meth:`supports_float64`.
+            device: Device to compute on; None is the host. Outputs computed
+                on a GPU stay there (``ReferenceOutput.device_data``).
 
         Returns:
             Mapping of output tensor UID to ReferenceOutput.
@@ -101,7 +112,15 @@ class ReferenceProvider(ABC):
         """
         return True  # Default: assume supported, let compute_reference fail if not
 
-    def estimate_host_bytes(self, graph_json: Dict[str, Any]) -> Optional[int]:
+    def supports_float64(self, graph_json: Dict[str, Any]) -> bool:
+        """True when ``compute_reference`` can compute this graph in float64."""
+        return False
+
+    def estimate_host_bytes(
+        self,
+        graph_json: Dict[str, Any],
+        precision: ReferencePrecision = ReferencePrecision.NATIVE,
+    ) -> Optional[int]:
         """Estimate the host memory ``compute_reference`` needs beyond its inputs.
 
         Returns:

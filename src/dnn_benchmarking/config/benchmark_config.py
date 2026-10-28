@@ -17,6 +17,18 @@ class ReferenceProviderName(str, Enum):
     PYTORCH = "pytorch"
 
 
+class ReferencePrecision(str, Enum):
+    """Arithmetic of the reference outputs.
+
+    ``float64`` computes convolution graphs in float64 from the same inputs.
+    ``native`` computes every graph in its own data types, with the same
+    library kernels as the engines under test.
+    """
+
+    FLOAT64 = "float64"
+    NATIVE = "native"
+
+
 class RuntimeName(str, Enum):
     """Runtimes that execute the graph."""
 
@@ -129,11 +141,14 @@ class ValidationConfig:
             is set, it is used for both; if neither is set, validation uses
             dtype-aware defaults.
         atol: Optional absolute tolerance override.
+        precision: Arithmetic of the reference for graphs that support
+            float64 (see ``pytorch_ops.float64_reference_supported``).
     """
 
     provider: ReferenceProviderName = ReferenceProviderName.NONE
     rtol: Optional[float] = None
     atol: Optional[float] = None
+    precision: ReferencePrecision = ReferencePrecision.FLOAT64
 
     def __post_init__(self) -> None:
         """Validate and normalize configuration values."""
@@ -141,6 +156,12 @@ class ValidationConfig:
             self.provider = ReferenceProviderName(self.provider)
         except ValueError as e:
             raise ValueError(_one_of("--validate", ReferenceProviderName)) from e
+        try:
+            self.precision = ReferencePrecision(self.precision)
+        except ValueError as e:
+            raise ValueError(
+                _one_of("--reference-precision", ReferencePrecision)
+            ) from e
         if self.rtol is not None and self.rtol < 0:
             raise ValueError("--rtol must be >= 0")
         if self.atol is not None and self.atol < 0:
@@ -383,7 +404,10 @@ class SuiteConfig:
                 profiling_timeout_s=args.profiling_timeout,
             ),
             validation=ValidationConfig(
-                provider=args.validate, rtol=args.rtol, atol=args.atol
+                provider=args.validate,
+                rtol=args.rtol,
+                atol=args.atol,
+                precision=args.reference_precision,
             ),
             plugin_paths=plugin_paths,
             runtime=args.runtime,

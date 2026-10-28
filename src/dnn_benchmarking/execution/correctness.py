@@ -162,5 +162,6 @@ def check_correctness(
         n_mismatch=sum(c[3].n_mismatch for c in compared),
         n_total=sum(c[3].n_total for c in compared),
         worst_output_uid=uid,
+        reference_precision=ref_outputs[uid].precision,
         error_message=None if passed else f"output {uid}: {worst.message}",
     )
