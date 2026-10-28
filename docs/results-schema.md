@@ -63,6 +63,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
+| `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
 | `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
@@ -259,6 +260,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | `n_mismatch` | int or null | Elements outside tolerance, summed over outputs. |
 | `n_total` | int or null | Elements compared, summed over outputs. |
 | `worst_output_uid` | int or null | Tensor UID of the output with the largest difference. |
+| `reference_precision` | string or null | Arithmetic of the reference that the outputs were compared with: `float64` (a float64 computation from the same inputs, not rounded to the output dtype) or `native` (the graph data types). `native` for graphs outside the float64 scope, for `--reference-precision native`, and when the float64 reference failed. `null` when no comparison ran. See [Reference precision](usage.md#reference-precision). |
 | `message` | string or null | Why `match` is `false` or `null`. |
 
 ### Row warnings
@@ -275,6 +277,7 @@ loop. Paths are relative to the row:
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
+| `float64 reference not used (<reason>); using the graph data types` | `reference` row only. The float64 reference failed or did not fit in memory, so the engine rows of the graph met the native reference. |
 
 The tool never removes samples because of a warning.
 

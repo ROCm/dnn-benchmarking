@@ -428,10 +428,12 @@ Measure again after a timing change.
 
 The tool does not do these things yet:
 
-- Independent fp32 reference. `--validate pytorch` computes the reference in
-  the dtype of the graph. For fp16 and bf16 graphs the reference then has the
-  same precision as the result under test, and the tolerances must be loose.
-  An fp32 reference needs new tolerances for all workloads.
+- Float64 reference for all operations. `--validate pytorch` computes the
+  reference of convolution graphs (convolution and pointwise nodes) in
+  float64. See [Reference precision](usage.md#reference-precision). Other
+  graphs (matmul, normalization, SDPA) still use the graph data types, so
+  for fp16 and bf16 the reference has the same precision as the result under
+  test, and the tolerances must be loose.
 - SDPA reference for every mask. The PyTorch reference supports top-left and
   bottom-right causal bands, bounded left windows with `right_bound = 0`, and
   attention-sink logits. It follows hipDNN precedence: the deprecated causal
