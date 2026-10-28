@@ -316,9 +316,10 @@ failed `correctness` on either side, rows with `tuning_available: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
-MIOpen find and performance database entries in the shared
-`MIOPEN_USER_DB_PATH` can supply tuned selections to the OOTB plan, for
-example from an earlier run with exhaustive search outside this tool. The
+Each run starts with an empty MIOpen user database (see
+[setup.md](setup.md#workspace)). MIOpen find and performance database entries
+from an earlier run therefore cannot supply tuned selections to the OOTB plan,
+unless `MIOPEN_USER_DB_PATH` is set to keep them. The
 tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set in the
 environment: the providers apply that variable before the knob, so it
 reaches the OOTB plan too. `--autotune` sets that variable, so the tool

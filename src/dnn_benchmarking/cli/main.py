@@ -13,42 +13,53 @@ from ..common.exceptions import GraphLoadError
 from .config_file import apply_config_file
 from .parser import create_parser
 
-_CACHE_ENV_SUBDIRS = {
+#: Caches that only save time. Kept in DNN_BENCH_WORKSPACE across runs. The
+#: MIOpen kernel cache holds compiled binaries: Find compiles before it times
+#: a solver, so a cache hit shortens Find but does not change the selection.
+_WORKSPACE_CACHE_SUBDIRS = {
     "XDG_CACHE_HOME": "cache",
-    "MIOPEN_USER_DB_PATH": "miopen_cache",
-    "MIOPEN_CUSTOM_CACHE_DIR": "miopen_cache",
     "AMD_COMGR_CACHE_DIR": "comgr_cache",
+    "MIOPEN_CUSTOM_CACHE_DIR": "miopen_kernel_cache",
 }
 
+#: MIOpen user find-DB and perf-DB. Each run starts empty: the DB key ignores
+#: the deterministic attribute, and a stored record repeats one Find ranking in
+#: every later run. The installed system DB is read-only and stays in use.
+_PER_RUN_MIOPEN_VARS = ("MIOPEN_USER_DB_PATH",)
+_PER_RUN_MIOPEN_SUBDIR = "miopen"
 
-def _create_cache_base(
-    workspace: str | None,
-) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
-    """Return the cache base and the fallback directory object, if allocated."""
-    if workspace:
-        return Path(workspace), None
 
-    temporary_directory = tempfile.TemporaryDirectory(prefix="dnn-bench-cache-")
-    return Path(temporary_directory.name), temporary_directory
+def _set_cache_dir(var: str, path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.environ[var] = str(path)
 
 
 def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
     """Point unset ROCm/tool cache variables away from the (network) home dir.
 
-    MIOpen, comgr and torch default to ~/.cache or ~/.miopen. Uses
-    DNN_BENCH_WORKSPACE (set by setup_env.py) or a private temporary directory,
-    allocated only when a variable is unset. Must run before any GPU runtime
-    initialises. Keep the returned object alive for the run; its finalizer
-    removes the temporary directory.
+    MIOpen, comgr and torch default to ~/.cache or ~/.miopen. The MIOpen user
+    DB goes to a private per-run temporary directory. The other caches go to
+    DNN_BENCH_WORKSPACE (set by setup_env.py), or to the same temporary
+    directory without a workspace. Variables that are already set are kept.
+    Must run before any GPU runtime initialises. Keep the returned object
+    alive for the run; its finalizer removes the temporary directory.
     """
-    unset = [var for var in _CACHE_ENV_SUBDIRS if var not in os.environ]
-    if not unset:
+    unset_workspace = [var for var in _WORKSPACE_CACHE_SUBDIRS if var not in os.environ]
+    unset_miopen = [var for var in _PER_RUN_MIOPEN_VARS if var not in os.environ]
+    workspace = os.environ.get("DNN_BENCH_WORKSPACE")
+    needs_temp = bool(unset_miopen) or (bool(unset_workspace) and not workspace)
+    if not needs_temp:
+        for var in unset_workspace:
+            _set_cache_dir(var, Path(workspace) / _WORKSPACE_CACHE_SUBDIRS[var])
         return None
-    base, lifetime = _create_cache_base(os.environ.get("DNN_BENCH_WORKSPACE"))
-    for var in unset:
-        path = base / _CACHE_ENV_SUBDIRS[var]
-        path.mkdir(parents=True, exist_ok=True)
-        os.environ[var] = str(path)
+
+    lifetime = tempfile.TemporaryDirectory(prefix="dnn-bench-cache-")
+    run_dir = Path(lifetime.name)
+    workspace_base = Path(workspace) if workspace else run_dir
+    for var in unset_workspace:
+        _set_cache_dir(var, workspace_base / _WORKSPACE_CACHE_SUBDIRS[var])
+    for var in unset_miopen:
+        _set_cache_dir(var, run_dir / _PER_RUN_MIOPEN_SUBDIR)
     return lifetime
 
 

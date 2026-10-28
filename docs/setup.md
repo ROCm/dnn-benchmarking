@@ -87,7 +87,7 @@ On Linux the venv activation script exports these variables:
 |---|---|
 | `ROCM_PATH` | The selected ROCm prefix. |
 | `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
-| `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts MIOpen, comgr and XDG caches under it when those variables are not set. |
+| `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts the comgr, XDG and MIOpen kernel caches (`MIOPEN_CUSTOM_CACHE_DIR`, in `miopen_kernel_cache`) under it when those variables are not set. The MIOpen user database does not persist: when `MIOPEN_USER_DB_PATH` is not set, each run uses an empty temporary directory and deletes it at exit. The kernel cache holds compiled binaries only; it shortens MIOpen Find but does not change the selected kernel. The installed MIOpen system database stays in use. Set `MIOPEN_USER_DB_PATH` to keep the user database across runs. |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
 
 dnn-benchmarking finds the engine plugins in
