@@ -37,7 +37,6 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
-from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats, TimingInfo
 from .timing import Measurement, StallFallbackError
 
@@ -202,7 +201,8 @@ def run_reporting_failures(out_dir: Path, body: Callable[[], None]) -> int:
     """Run a child script's ``body``; return the exit code.
 
     ``body`` writes ``result.json``. When it raises, the failure goes to
-    ``failure.json`` (and stderr), and the exit code is 1.
+    ``failure.json`` only, and the exit code is 1. The parent reports it:
+    a skip or a stall-gate failure is a normal outcome, not an error line.
     """
     try:
         body()
@@ -211,7 +211,6 @@ def run_reporting_failures(out_dir: Path, body: Callable[[], None]) -> int:
         (out_dir / FAILURE_FILE).write_text(
             json.dumps({"kind": failure.kind.value, "message": failure.message})
         )
-        Reporter(quiet=True).error(failure.message)
         return 1
     return 0
 
