@@ -111,6 +111,16 @@ Every mode that provides PyTorch needs PyTorch 2.5 or later: the SDPA
 reference passes `enable_gqa` to `F.scaled_dot_product_attention`.
 `--torch-mode existing` does not check the version.
 
+With CPU-only torch, `--validate pytorch` still grades every hipDNN engine
+row: the reference outputs are computed on the CPU. Only the timed `pytorch`
+reference row is skipped, and its `skip_reason` names which of the row's two
+steps failed ("Timing skipped" or "Reference output pass failed"), says that
+engines are still graded, and gives the CPU reference time. The CPU reference
+is much slower for large SDPA graphs (on an MI355X host with 8 cores, the CPU
+reference for B4 H48 fp16 graphs took 2.8 s at S1024, 10 s at S2048 and 65 s
+at S4096, while the whole three-graph run took about 6 s with ROCm torch), so
+use ROCm torch for large correctness runs.
+
 The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
 `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
 `--reuse-artifacts`, they build hipDNN and the providers from source.

@@ -371,6 +371,46 @@ def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
     return message
 
 
+def _row_step(stage: str, fatal: bool) -> Optional[str]:
+    """What a reference row was doing when it failed, or None after both steps.
+
+    The row has two steps, and naming the timed loop is the wrong thing to say
+    about a failure of the second one. A failure after both (``post``: the
+    tuned run, the reference warnings) is neither step.
+    """
+    if stage == "timing":
+        return "Timing failed" if fatal else "Timing skipped"
+    if stage == "reference":
+        return "Reference output pass failed"
+    return None
+
+
+def _failed_pytorch_row(
+    row: ProviderEngineResult,
+    fatal: bool,
+    message: str,
+    role: Literal["engine", "reference"],
+    stage: str,
+) -> ProviderEngineResult:
+    """The failed PyTorch row: which step failed, and its timings if it has any.
+
+    A reference row has two steps. Once the timed loop is through, its numbers
+    are real, so a later failure leaves them on the row instead of replacing
+    it with a reason-only row.
+    """
+    step = _row_step(stage, fatal) if role == "reference" else None
+    if step is not None:
+        message = f"{step} ({message})."
+    if stage == "timing":
+        return _failed_row(_error_or_skip(fatal), row, message)
+    row.status = "error" if fatal else "skipped"
+    if fatal:
+        row.error_message = message
+    else:
+        row.skip_reason = message
+    return row
+
+
 def _time_pytorch_row(
     ctx: _GraphContext, role: Literal["engine", "reference"]
 ) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
@@ -381,7 +421,8 @@ def _time_pytorch_row(
     selection is strict. Any other failure of a default-dispatch reference
     is skipped (the CPU reference may still serve); any other failure of a
     strict SDPA selection or of the ``--runtime pytorch`` engine row is an
-    error.
+    error. A reference row that timed cleanly and then failed its output
+    pass keeps the timings it measured.
     """
     config = ctx.config
     strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
@@ -394,6 +435,10 @@ def _time_pytorch_row(
         engine_version=_torch_version(),
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    # "timing" until the timed loop is done, then "reference" while the
+    # reference output pass runs. Whichever one raises is what the row has to
+    # name, and a "reference" failure leaves real timings on the row.
+    stage = "timing"
     memory_at_start = _gpu_memory_at_row_start()
     try:
         from . import pytorch_ops
@@ -416,13 +461,18 @@ def _time_pytorch_row(
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             row.warnings = (row.warnings or []) + executor.notes
             if role == "reference":
+                stage = "reference"
                 bm.zero_outputs()
-                executor.execute_once(tensors)
+                # Timing above used the selected backend; the outputs the
+                # engine rows are graded against come from repeatable SDPA.
+                with pytorch_ops.reference_sdpa_pass():
+                    executor.execute_once(tensors)
                 # A profiling child allocates its own VRAM, so profiled runs
                 # keep host-only references (and DeviceBuffer I/O).
                 outputs = _pytorch_reference_outputs_from_buffer(
                     bm, keep_device=not config.metrics.opt_in_pass_requested
                 )
+                stage = "post"
         if role == "reference":
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
                 ctx.graph_json
@@ -440,11 +490,11 @@ def _time_pytorch_row(
     except StallFallbackError:
         raise  # run_graph_* remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
-        return _failed_row(_error_or_skip(strict), row, str(e)), None
+        return _failed_pytorch_row(row, strict, str(e), role, stage), None
     except Exception as e:
         fatal = role == "engine" or strict
         message = _failure_message(e, memory_at_start)
-        return _failed_row(_error_or_skip(fatal), row, message), None
+        return _failed_pytorch_row(row, fatal, message, role, stage), None
     return row, outputs
 
 
@@ -655,11 +705,21 @@ def _prepare_references(
             ctx.reference_error = ctx.validation_skip_reason
             warn_once("validation", f"{ctx.graph_name}: {ctx.validation_skip_reason}")
         else:
-            ctx.reference_outputs, ctx.reference_error = (
-                _compute_reference_outputs_once(
+            with Timer() as cpu_timer:
+                cpu_outputs, cpu_error = _compute_reference_outputs_once(
                     provider, ctx.graph_json, ctx.input_data, config
                 )
-            )
+            ctx.reference_outputs, ctx.reference_error = cpu_outputs, cpu_error
+            # The timed row produced no outputs. Its reason already names the
+            # step that failed; add that engines are still graded and what the
+            # CPU fallback cost, since no row times it.
+            if row.status == "skipped" and ctx.reference_outputs is not None:
+                row.skip_reason = (
+                    f"{row.skip_reason} "
+                    "Engine outputs are still validated against reference "
+                    "outputs computed on the CPU, which took "
+                    f"{cpu_timer.elapsed_ms / 1000:.1f} s."
+                )
     return row
 
 
