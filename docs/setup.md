@@ -2,7 +2,9 @@
 
 `setup_env.py` creates a virtual environment, installs PyTorch, builds hipDNN
 and the provider plugins, and installs dnn-benchmarking. It requires Python
-3.12 or newer. `python3 setup_env.py --help` lists every option.
+3.12 or newer. The source build also requires `cmake` 3.26 or newer and
+`ninja` on `PATH`; setup checks the `cmake` version before its first stage.
+`python3 setup_env.py --help` lists every option.
 
 ## Quick setup (ROCm)
 

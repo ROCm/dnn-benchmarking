@@ -143,6 +143,65 @@ def test_superbuild_reuses_its_build_dir_only_for_the_same_configure_line(
     assert record == {"configure_args": configure[1:]}
 
 
+# --- cmake version -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "version, ok",
+    [
+        # 3.22 cannot read CMakePresets.json version 6 ("Unrecognized
+        # "version" field"); 3.25 cannot configure the hipDNN bindings.
+        ("3.22.1", False),
+        ("3.25.2", False),
+        ("3.26.0", True),
+        ("4.1.2", True),
+    ],
+)
+def test_cmake_below_the_build_floor_fails_before_the_build(
+    setup_env, monkeypatch, capsys, version, ok
+) -> None:
+    monkeypatch.setattr(setup_env.shutil, "which", lambda name: "/usr/bin/cmake")
+    monkeypatch.setattr(
+        setup_env.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 0, stdout=f"cmake version {version}\n\nCMake suite ...\n", stderr=""
+        ),
+    )
+    if ok:
+        assert setup_env.require_working_cmake() == "/usr/bin/cmake"
+        return
+    with pytest.raises(SystemExit):
+        setup_env.require_working_cmake()
+    err = capsys.readouterr().err
+    assert version.rsplit(".", 1)[0] in err and "3.26" in err
+
+
+def test_cmake_check_runs_before_the_first_stage(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    """A fresh workspace must not download wheels before an old cmake fails."""
+    setup = _setup(setup_env, tmp_path, "-y")
+    monkeypatch.setattr(
+        setup_env, "require_working_cmake", lambda: setup_env.fail("cmake too old")
+    )
+    monkeypatch.setattr(setup, "setup_venv", lambda: pytest.fail("a stage ran"))
+
+    with pytest.raises(SystemExit):
+        setup.run()
+
+
+def test_cmake_is_checked_once_per_setup(setup_env, tmp_path, monkeypatch) -> None:
+    checks = []
+    monkeypatch.setattr(
+        setup_env, "require_working_cmake", lambda: checks.append(1) or "cmake"
+    )
+    setup = _setup(setup_env, tmp_path)
+
+    assert (setup.cmake, setup.cmake) == ("cmake", "cmake")
+    assert checks == [1]
+
+
 # --- confirmation ------------------------------------------------------------
 
 
@@ -907,6 +966,7 @@ def test_rejected_rerun_keeps_the_venv_activate_local(
     activate_local = setup.venv_dir / "bin" / "activate.local"
     activate_local.write_text("export ROCM_PATH=/wheel/prefix\n")
     monkeypatch.setattr(setup, "get_torch_mode", lambda: "rocm")
+    monkeypatch.setattr(setup_env, "require_working_cmake", lambda: "cmake")
 
     with pytest.raises(SystemExit):
         setup.run()

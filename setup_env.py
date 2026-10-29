@@ -123,6 +123,13 @@ def run(cmd, *, env=None, check=True, **kwargs):
     return subprocess.run(list(cmd), env=env, check=check, **kwargs)
 
 
+#: Oldest CMake that builds everything setup builds. rocm-libraries needs
+#: 3.25.2 (CMakeLists.txt, CMakePresets.json "version": 6); the hipDNN Python
+#: bindings need 3.26 (projects/hipdnn/python/frontend_bindings/CMakeLists.txt).
+CMAKE_MIN_VERSION = (3, 26)
+_CMAKE_VERSION = re.compile(r"cmake version (\d+)\.(\d+)")
+
+
 def require_working_cmake() -> str:
     """Return the PATH-selected CMake executable after a startup check."""
     cmake = shutil.which("cmake")
@@ -131,7 +138,7 @@ def require_working_cmake() -> str:
     try:
         result = subprocess.run(
             [cmake, "--version"],
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
@@ -143,6 +150,19 @@ def require_working_cmake() -> str:
             f"cmake at {cmake} failed its startup check (exit {result.returncode}).",
             result.stderr.strip()
             or "Fix the selected cmake executable or PATH before retrying.",
+        )
+    floor = ".".join(map(str, CMAKE_MIN_VERSION))
+    found = _CMAKE_VERSION.search(result.stdout or "")
+    if found is None:
+        warn(f"cannot read the version of cmake at {cmake}; setup needs {floor}+.")
+    elif tuple(map(int, found.groups())) < CMAKE_MIN_VERSION:
+        # An old cmake fails later with only "Could not read presets ...:
+        # Unrecognized "version" field".
+        fail(
+            f"cmake at {cmake} is version {found.group(1)}.{found.group(2)}; "
+            f"setup needs cmake {floor} or later.",
+            f"Put a newer cmake first on PATH, for example from "
+            f"`python3 -m pip install 'cmake>={floor}'`.",
         )
     return cmake
 
@@ -840,6 +860,11 @@ class Setup:
         return arch
 
     @functools.cached_property
+    def cmake(self) -> str:
+        """The checked cmake executable; the check runs once per Setup."""
+        return require_working_cmake()
+
+    @functools.cached_property
     def hip_arch_args(self):
         """GPU_TARGETS/AMDGPU_TARGETS flags for the HIP device-code builds.
 
@@ -1387,7 +1412,7 @@ class Setup:
         record.write_text(json.dumps(wanted) + "\n")
 
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
-        cmake = require_working_cmake()
+        cmake = self.cmake
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
@@ -1435,7 +1460,7 @@ class Setup:
     def build_and_install_bindings(
         self, install_prefix: str, toolchain_prefix: str
     ) -> None:
-        cmake = require_working_cmake()
+        cmake = self.cmake
         python_dir = HIPDNN_ROOT / "python"
         bindings_source = python_dir / "frontend_bindings"
         if not bindings_source.is_dir():
@@ -1780,6 +1805,10 @@ class Setup:
         if cuda:
             self.do_build = False
         self.confirm_build()
+        if self.do_build:
+            # Before any stage downloads wheels: an old cmake fails only at
+            # the hipDNN build, many minutes later.
+            self.cmake
 
         stages = [
             ("Virtual environment", self.setup_venv),
