@@ -237,7 +237,11 @@ file does not store them.
 #### clocks
 
 amdsmi supplies these values. The object is `null` without amdsmi. A value is
-`null` when the platform does not report it.
+`null` when the platform does not report it. The tool finds the amdsmi device
+of the run by its PCI address, from PyTorch or from the loaded HIP runtime. If
+that fails while `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`,
+`CUDA_VISIBLE_DEVICES` or `GPU_DEVICE_ORDINAL` is set, the object and the
+amdsmi values of `environment` are `null`, and a warning gives the reason.
 
 | Key | Unit |
 |---|---|

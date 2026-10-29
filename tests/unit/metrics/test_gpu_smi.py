@@ -7,15 +7,20 @@ amdsmi is optional, so a fake module stands in for it. The module-level
 resolution caches are cleared around every test.
 """
 
+import sys
 import types
 
 import pytest
 
 from dnn_benchmarking.metrics import gpu_smi
+from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 
 
 @pytest.fixture(autouse=True)
-def _fresh_caches():
+def _fresh_caches(monkeypatch):
+    for var in gpu_smi._VISIBILITY_ENV:
+        monkeypatch.delenv(var, raising=False)
+    reset_warnings()
     gpu_smi._amdsmi.cache_clear()
     gpu_smi._handle_for.cache_clear()
     yield
@@ -154,6 +159,59 @@ class TestDeviceMapping:
         assert gpu_smi.GpuSmiProbe(1)._handle == "h1"
         assert gpu_smi.GpuSmiProbe(5).clocks() is None
         assert gpu_smi.GpuSmiProbe(2)._handle is None  # index == len(handles)
+
+    def test_hip_runtime_address_maps_without_torch(self, monkeypatch):
+        """A hipDNN run has no torch: the HIP runtime gives the address."""
+        monkeypatch.delitem(sys.modules, "torch", raising=False)
+        monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2")
+        fake = _fake_amdsmi(
+            handles=("h0", "h1", "h2"),
+            bdfs={"h0": "0000:03:00.0", "h1": "0000:09:00.0", "h2": "0000:0c:00.0"},
+        )
+        monkeypatch.setattr(gpu_smi, "_amdsmi", _cached(lambda: fake))
+
+        class Hip:
+            """HIP runtime with physical GPU 2 visible as device 0."""
+
+            def hipGetDevice(self, ref):
+                ref._obj.value = 0
+                return 0
+
+            def hipDeviceGetPCIBusId(self, buf, size, device):
+                buf.value = {0: b"0000:0C:00.0"}[device]
+                return 0
+
+        monkeypatch.setattr(gpu_smi, "_loaded_hip_runtime", lambda: Hip())
+        assert gpu_smi.GpuSmiProbe()._handle == "h2"
+
+    @pytest.mark.parametrize("var", gpu_smi._VISIBILITY_ENV)
+    def test_unmapped_device_under_remap_records_no_telemetry(
+        self, monkeypatch, capsys, var
+    ):
+        """The amdsmi index can name another GPU: record nothing, say why."""
+        monkeypatch.setenv(var, "1")
+        _install(monkeypatch, _fake_amdsmi(handles=("h0", "h1")))
+        probe = gpu_smi.GpuSmiProbe()
+        assert probe.clocks() is None
+        assert probe.static_info()["gpu_hbm_gb"] is None
+        assert var in capsys.readouterr().err
+
+    @pytest.mark.parametrize("mapped", [False, True])
+    def test_only_an_already_mapped_hip_runtime_is_opened(
+        self, monkeypatch, tmp_path, mapped
+    ):
+        """Loading a second HIP runtime would see other devices."""
+        lib = "/opt/x/lib/libamdhip64.so.7"
+        maps = tmp_path / "maps"
+        lines = ["7f00-7f01 r-xp 00000000 08:01 1 /usr/lib/libc.so.6\n"]
+        if mapped:
+            lines.append(f"7f02-7f03 r-xp 00000000 08:01 2 {lib}\n")
+        maps.write_text("".join(lines))
+        opened = []
+        monkeypatch.setattr(gpu_smi.ctypes, "CDLL", lambda p: opened.append(p) or p)
+
+        assert gpu_smi._loaded_hip_runtime(str(maps)) == (lib if mapped else None)
+        assert opened == ([lib] if mapped else [])
 
 
 def test_identity_reports_target_then_market_name(monkeypatch):
