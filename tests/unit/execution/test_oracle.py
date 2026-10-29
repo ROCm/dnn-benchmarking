@@ -6,8 +6,10 @@
 import dataclasses
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,9 +30,14 @@ from dnn_benchmarking.execution import (
     executor,
     hipdnn_tuned_child,
     suite_runner,
+    timing,
 )
 from dnn_benchmarking.execution import oracle as oracle_mod
-from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
+from dnn_benchmarking.execution.timing import (
+    STALL_RERUN_REASON,
+    Measurement,
+    StallFallbackError,
+)
 from dnn_benchmarking.graph.loader import GraphLoader
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
@@ -284,12 +291,15 @@ def hipdnn_child(monkeypatch):
         output=np.zeros(2, np.float32),
         timeout=None,
         proc=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        records={},
     )
 
     def run_capped(argv, timeout_s, env=None):
         launch.argv, launch.env, launch.timeout = argv, env, timeout_s
+        launch.flush_buffers = dict(timing._flush_buffers)
         launch.state = Path(argv[-1]).parent
         launch.request = json.loads(Path(argv[-1]).read_text())
+        _write_records(env, launch.records)
         if launch.result is not None:
             (launch.state / "result.json").write_text(json.dumps(launch.result))
             if launch.request["outputs"]:
@@ -298,6 +308,76 @@ def hipdnn_child(monkeypatch):
 
     monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
     return launch
+
+
+def _write_records(env, records):
+    """What the child's search leaves in its private tuning state."""
+    for name, content in records.items():
+        (Path(env["MIOPEN_USER_DB_PATH"]) / name).write_text(content)
+
+
+# A user find-db record (one benchmarked problem) and a TunableOp result row.
+_FIND_DB = "gfx90a68.HIP.3_5_1.ufdb.txt"
+_FIND_RECORD = "64-56-56-3x3-64-56-56-4-1x1-1x1-0-NCHW-FP32-F=ConvHipImplicitGemm:1\n"
+_TUNABLEOP = "tunableop_results0.csv"
+_TUNABLEOP_HEADER = "Validator,PT_VERSION,2.9.0\n"
+_TUNABLEOP_ROW = "GemmTunableOp_float_NN,nn_64_64_64,Gemm_Hipblaslt_1234,0.0123\n"
+_TUNED_GEMM = {_TUNABLEOP: _TUNABLEOP_HEADER + _TUNABLEOP_ROW}
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "recorded"),
+    [
+        (_FIND_DB, _FIND_RECORD, True),
+        (_FIND_DB, "", False),
+        ("gfx90a68.HIP.3_5_1.udb.txt", "key=ConvAsm1x1U:1,2,3\n", True),
+        (_FIND_DB + ".lock", "", False),
+        (_TUNABLEOP, _TUNABLEOP_HEADER, False),
+        (_TUNABLEOP, _TUNABLEOP_HEADER + _TUNABLEOP_ROW, True),
+    ],
+)
+def test_search_record_is_a_record_not_a_file(tmp_path, name, content, recorded):
+    """A lock file, an empty database or a header proves no search."""
+    (tmp_path / name).write_text(content)
+
+    assert oracle_mod.search_recorded(tmp_path) is recorded
+
+
+@pytest.mark.parametrize("rows", [0, 1])
+def test_sqlite_perf_db_counts_records(tmp_path, rows):
+    """MIOpen creates the perf_db table before it stores the first record."""
+    with closing(sqlite3.connect(tmp_path / "gfx90a68_3.0.0.udb")) as db:
+        db.execute("CREATE TABLE perf_db (config, solver, params)")
+        db.executemany("INSERT INTO perf_db VALUES (1, 'Conv1x1U', 'p')", [()] * rows)
+        db.commit()
+
+    assert oracle_mod.search_recorded(tmp_path) is bool(rows)
+
+
+@pytest.mark.parametrize(
+    ("engine", "available", "records", "search_ran"),
+    [
+        ("MIOPEN_ENGINE", True, {_FIND_DB: _FIND_RECORD}, True),
+        # MIOpen records every search: an empty database is a FindDb answer.
+        ("MIOPEN_ENGINE", True, {}, False),
+        # Another engine leaves no trace of its search: unknown.
+        ("OTHER_ENGINE", True, {}, None),
+        ("OTHER_ENGINE", False, {}, False),
+        # No knob: the tuned run re-measured the OOTB choice, record or not.
+        ("MIOPEN_ENGINE", False, {_FIND_DB: _FIND_RECORD}, False),
+    ],
+)
+def test_tuned_row_records_whether_a_search_ran(
+    hipdnn_child, engine, available, records, search_ran
+):
+    """tuning_available only says the knob exists; the row must also say
+    whether the tuned run searched, read after the child exits."""
+    hipdnn_child.result["tuning_available"] = available
+    hipdnn_child.records = records
+    row = _row()
+    row.engine_name = engine
+
+    assert _tuned(row=row).oracle.search_ran is search_ran
 
 
 def _tuned(row=None, refs=None, config=None, plugin_path="/plugins"):
@@ -352,6 +432,18 @@ def test_tuned_child_writes_no_selection_state_the_run_can_read(
     assert Path(env["MIOPEN_USER_DB_PATH"]).parent == hipdnn_child.state
     assert not hipdnn_child.state.exists()
     assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+
+def test_cold_flush_buffer_is_freed_before_the_hipdnn_child_starts(
+    hipdnn_child, monkeypatch
+):
+    """The child must get the device memory the OOTB row had, not 512 MiB
+    less: the parent's cold-cache flush buffer is freed before launch."""
+    monkeypatch.setattr(timing, "_flush_buffers", {"hip": object()})
+
+    _tuned(config=_config(cache_mode="cold"))
+
+    assert hipdnn_child.flush_buffers == {}
 
 
 def test_tuned_row_reports_the_child_build_timing_and_throughput(hipdnn_child):
@@ -432,13 +524,20 @@ def test_child_crash_reports_its_last_error_line(hipdnn_child):
 # --- run_pytorch_tuned ------------------------------------------------------
 
 
-def _child_row(status="success", message=None, kernel_ms=(0.25, 0.25, 0.3)):
+def _child_row(
+    status="success",
+    message=None,
+    kernel_ms=(0.25, 0.25, 0.3),
+    mode="staged",
+    fallback_reason=None,
+):
     timing = TimingInfo(
-        mode="staged",
+        mode=mode,
         timer="hip",
         warmup_iters=3,
         samples=len(kernel_ms),
         first_call_ms=40.0,
+        fallback_reason=fallback_reason,
     )
     return {
         "status": status,
@@ -459,10 +558,13 @@ def child(monkeypatch):
         env=None,
         result={"graphs": [{"results": [_child_row()]}]},
         proc=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        records={},
     )
 
     def run_capped(argv, timeout_s, env=None):
         launch.argv, launch.env = argv, env
+        _write_records(env, launch.records)
+        launch.flush_buffers = dict(timing._flush_buffers)
         if launch.result is not None:
             output = Path(argv[argv.index("--output") + 1])
             output.write_text(json.dumps(launch.result))
@@ -485,17 +587,23 @@ def _run_pytorch(tmp_path, config=None, node_type="ConvolutionFwdAttributes"):
     return row
 
 
+@pytest.mark.parametrize("stall_gate", [True, False])
 def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
-    child, tmp_path
+    child, tmp_path, stall_gate
 ):
     """The child must time with the parent's settings, or the tuned and OOTB
-    PyTorch numbers are not comparable."""
+    PyTorch numbers are not comparable. That includes the stall gate: after
+    a stall-gate fallback (``_with_stall_fallback`` replaces the policy) both
+    plans time unstalled, so the speedup is not suppressed as mixed-timing."""
     config = _pytorch_config(
         warmup_iters=3,
         benchmark_iters=5,
         min_time_ms=2.0,
         timing_block=4,
         seed=11,
+    )
+    config.timing_policy = dataclasses.replace(
+        config.timing_policy, stall_gate=stall_gate
     )
 
     _run_pytorch(tmp_path, config)
@@ -509,6 +617,70 @@ def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
     assert child_config.oracle is False
     assert child_config.timing_policy == config.timing_policy
     assert child_config.seed == 11
+
+
+def test_pytorch_child_stall_propagates_for_a_whole_graph_remeasure(child, tmp_path):
+    """The child remeasured its graph unstalled while the run still times
+    staged: the suite runner must remeasure the whole graph unstalled, as
+    for a stall in the hipDNN child, so both plans share one timing mode."""
+    child.result = {
+        "graphs": [
+            {"results": [_child_row(mode="events", fallback_reason=STALL_RERUN_REASON)]}
+        ]
+    }
+
+    with pytest.raises(StallFallbackError):
+        _run_pytorch(tmp_path)
+
+
+def test_unstalled_run_keeps_the_unstalled_pytorch_child_row(child, tmp_path):
+    child.result = {
+        "graphs": [
+            {"results": [_child_row(mode="events", fallback_reason=STALL_RERUN_REASON)]}
+        ]
+    }
+    config = _pytorch_config()
+    config.timing_policy = dataclasses.replace(config.timing_policy, stall_gate=False)
+
+    row = _run_pytorch(tmp_path, config)
+
+    assert row.oracle_error is None
+    assert row.oracle.timing.mode == "events"
+
+
+def test_cold_flush_buffer_is_freed_before_the_pytorch_child_starts(
+    child, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(timing, "_flush_buffers", {"hip": object()})
+
+    _run_pytorch(tmp_path, _pytorch_config(cache_mode="cold"))
+
+    assert child.flush_buffers == {}
+
+
+@pytest.mark.parametrize(
+    ("node_type", "rocm", "records", "search_ran"),
+    [
+        ("ConvolutionFwdAttributes", True, {_FIND_DB: _FIND_RECORD}, True),
+        # ROCm conv search goes through MIOpen Find, which records it.
+        ("ConvolutionFwdAttributes", True, {}, False),
+        # cuDNN keeps no record of its search: unknown.
+        ("ConvolutionFwdAttributes", False, {}, None),
+        ("MatmulAttributes", False, _TUNED_GEMM, True),
+        ("MatmulAttributes", False, {_TUNABLEOP: _TUNABLEOP_HEADER}, False),
+        ("SdpaFwdAttributes", True, {}, False),
+        ("SdpaFwdAttributes", True, {_FIND_DB: _FIND_RECORD}, False),
+    ],
+)
+def test_pytorch_tuned_row_records_whether_a_search_ran(
+    child, monkeypatch, tmp_path, node_type, rocm, records, search_ran
+):
+    monkeypatch.setattr(oracle_mod.torch_support, "is_rocm_build", lambda: rocm)
+    child.records = records
+
+    row = _run_pytorch(tmp_path, node_type=node_type)
+
+    assert row.oracle.search_ran is search_ran
 
 
 def test_pytorch_child_tunes_into_a_private_state_dir_that_is_deleted(child, tmp_path):

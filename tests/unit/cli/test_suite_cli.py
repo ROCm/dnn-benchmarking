@@ -827,7 +827,9 @@ def test_unsupported_tensor_dtype_is_no_engines_not_an_error(tmp_path, runtime) 
 
 
 def test_internal_flags_are_hidden_from_help() -> None:
-    assert "--internal-profiling-run" not in create_parser().format_help()
+    help_text = create_parser().format_help()
+    assert "--internal-profiling-run" not in help_text
+    assert "--no-stall-gate" not in help_text
 
 
 _PYTORCH_ENV = dict.fromkeys(pytorch_tuning.ENV_NAMES, "1")
@@ -848,6 +850,32 @@ def test_shell_value_cannot_override_pytorch_flag(tmp_path, runtime, monkeypatch
     runtime(lambda path: _graph(path, [_passed()]))
     _run(_args("-r", "pytorch"), _graphs(tmp_path, 1))
     assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
+
+
+@pytest.mark.parametrize(("shell", "warned"), [("0", True), ("1", False)])
+def test_replaced_shell_pytorch_flag_is_a_warning_under_quiet(
+    tmp_path, runtime, monkeypatch, shell, warned
+):
+    """A shell value the run replaces must stay visible with -q: the user
+    otherwise believes PyTorch rows ran with it."""
+    monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", shell)
+    runtime(lambda path: _graph(path, [_passed()]))
+    out = io.StringIO()
+
+    suite_runner_cli.run_suite_cli(
+        _args("-r", "pytorch"), _graphs(tmp_path, 1), Reporter(output=out, quiet=True)
+    )
+
+    lines = [
+        line
+        for line in _warnings(out.getvalue()).splitlines()
+        if "PYTORCH_MIOPEN_SUGGEST_NHWC" in line
+    ]
+    if warned:
+        assert len(lines) == 1
+        assert "'0'" in lines[0] and "'1'" in lines[0]
+    else:
+        assert lines == []
 
 
 def test_hipdnn_only_run_leaves_pytorch_flags_unset(tmp_path, runtime) -> None:

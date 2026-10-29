@@ -624,4 +624,13 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
         default=False,
         help=argparse.SUPPRESS,
     )
+    # Hidden: the --oracle tuned-PyTorch child of a graph that the parent
+    # remeasured after a stall-gate failure times unstalled too.
+    parser.add_argument(
+        "--no-stall-gate",
+        dest="stall_gate",
+        action="store_false",
+        default=True,
+        help=argparse.SUPPRESS,
+    )
     return parser

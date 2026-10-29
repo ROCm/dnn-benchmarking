@@ -86,6 +86,9 @@ def _install_fake_hip(
         def zeros(self) -> None:
             log.append("flush")
 
+        def __del__(self) -> None:
+            log.append("free")
+
     fake = types.SimpleNamespace(
         HipEvent=FakeEvent,
         HipStallGate=FakeGate,
@@ -255,14 +258,21 @@ def _install_fake_torch_cuda(monkeypatch, log: List[str]) -> None:
         def zero_(self) -> None:
             log.append("flush")
 
+        def __del__(self) -> None:
+            log.append("free")
+
     cuda = types.SimpleNamespace(
         Event=Event,
         current_stream=lambda: "torch-stream",
         synchronize=lambda: log.append("device_sync"),
+        empty_cache=lambda: log.append("empty_cache"),
     )
-    torch = types.SimpleNamespace(
-        cuda=cuda, uint8="uint8", empty=lambda *a, **kw: Buffer()
-    )
+
+    def empty(*args, **kwargs) -> Buffer:
+        log.append("alloc")
+        return Buffer()
+
+    torch = types.SimpleNamespace(cuda=cuda, uint8="uint8", empty=empty)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
 
@@ -316,6 +326,49 @@ def test_cold_flush_allocation_failure_names_warm_mode(monkeypatch) -> None:
             stream=7,
             policy=TimingPolicy(warmup_iters=1, iters=1, cache_mode="cold"),
         )
+
+
+@pytest.mark.parametrize("backend", ["hip", "torch"])
+def test_released_flush_buffer_is_freed_and_reallocated(monkeypatch, backend) -> None:
+    """A tuned child must not run with the parent's 512 MiB flush buffer
+    still held; the next cold loop allocates a new one."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, staged=backend == "torch")
+    if backend == "torch":
+        _install_fake_torch_cuda(monkeypatch, log)
+    policy = TimingPolicy(warmup_iters=0, iters=1, cache_mode="cold")
+
+    measure(_enqueue(log), stream=7, policy=policy, timer=backend)
+    assert "free" not in log
+
+    timing_module.release_flush_buffers()
+
+    # torch keeps freed blocks in its cache until empty_cache().
+    released = ["free", "empty_cache"] if backend == "torch" else ["free"]
+    assert log[-len(released) :] == released
+    measure(_enqueue(log), stream=7, policy=policy, timer=backend)
+    assert sum(e.startswith("alloc") for e in log) == 2
+
+
+def test_flush_buffers_get_one_exit_handler_across_releases(monkeypatch) -> None:
+    """Each row with --oracle releases and reallocates the buffer; the exit
+    handler must not pile up, and it must free the buffer held at exit."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    handlers = []
+    monkeypatch.setattr(timing_module.atexit, "register", handlers.append)
+    monkeypatch.setattr(timing_module, "_flush_exit_registered", False)
+    policy = TimingPolicy(warmup_iters=0, iters=1, cache_mode="cold")
+
+    for _ in range(3):
+        measure(_enqueue(log), stream=7, policy=policy)
+        timing_module.release_flush_buffers()
+    measure(_enqueue(log), stream=7, policy=policy)
+
+    assert len(handlers) == 1
+    handlers[0]()
+    assert log[-1] == "free"
+
 
 
 def _install_fake_torch_sync_debug(monkeypatch, modes: List[str]):

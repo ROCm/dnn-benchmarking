@@ -25,7 +25,8 @@ def _tuning_vars() -> dict:
 
 
 def test_defaults_enable_nhwc_and_aotriton() -> None:
-    effective = pytorch_tuning.apply_pytorch_environment()
+    effective, replaced = pytorch_tuning.apply_pytorch_environment()
+    assert replaced == {}
     assert effective["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
     assert effective["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] == "1"
     assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"

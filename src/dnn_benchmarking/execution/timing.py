@@ -24,6 +24,7 @@ Timers
 """
 
 import atexit
+import sys
 import time
 import warnings
 from dataclasses import dataclass
@@ -74,6 +75,10 @@ class StallFallbackError(RuntimeError):
     whole graph without stalling (see ``suite_runner``)."""
 
 
+#: ``fallback_reason`` of a row that a stall-gate failure remeasured unstalled.
+STALL_RERUN_REASON = "stall gate failed in this graph; every row remeasured unstalled"
+
+
 _HIP_API = ("HipEvent", "hip_get_device_count", "hip_device_synchronize")
 _STAGED_HIP_API = ("HipStallGate", "hip_can_use_stream_wait_value")
 
@@ -82,6 +87,8 @@ _STAGED_HIP_API = ("HipStallGate", "hip_can_use_stream_wait_value")
 _FLUSH_BYTES = 512 * 1024 * 1024
 # One cold-cache flush buffer per timer, allocated on first cold iteration.
 _flush_buffers: Dict[str, Any] = {}
+# Set when the exit handler that frees the flush buffers is registered.
+_flush_exit_registered = False
 
 # Lazily imported hipdnn_frontend module. Resolved on first HIP use so the tool
 # stays importable on hosts without hipDNN (e.g. CUDA machines running the
@@ -256,6 +263,7 @@ def device_sync(timer: str) -> None:
 
 def _flush_cache(timer: str) -> None:
     """Evict L2/MALL by zeroing the flush buffer, then drain the device."""
+    global _flush_exit_registered
     buf = _flush_buffers.get(timer)
     if buf is None:
         try:
@@ -270,16 +278,31 @@ def _flush_cache(timer: str) -> None:
                 f"Cannot allocate the {_FLUSH_BYTES >> 20} MiB cold-cache flush "
                 f"buffer ({e}); rerun with --cache-mode warm"
             ) from e
-        if not _flush_buffers:
+        if not _flush_exit_registered:
             # Free device buffers before interpreter teardown; nanobind
             # reports module-global instances still alive at exit as leaks.
+            # Once per process: release_flush_buffers() empties the dict.
             atexit.register(_flush_buffers.clear)
+            _flush_exit_registered = True
         _flush_buffers[timer] = buf
     if timer == "hip":
         buf.zeros()
     else:
         buf.zero_()
     device_sync(timer)
+
+
+def release_flush_buffers() -> None:
+    """Free the cold-cache flush buffers; the next cold iteration reallocates.
+
+    Call before a child process allocates its own device memory (the
+    ``--oracle`` tuned runs), so the child does not run with 512 MiB less.
+    The torch allocator keeps freed blocks, so also return them to the device.
+    """
+    had_torch = _flush_buffers.pop("torch", None) is not None
+    _flush_buffers.clear()
+    if had_torch:
+        sys.modules["torch"].cuda.empty_cache()
 
 
 def _probe_host_sync(enqueue: Callable[[], None]) -> Optional[str]:
@@ -379,7 +402,7 @@ def measure(
         if timer != "hip":
             reason = "staged timing requires the hip timer"
         elif not policy.stall_gate:
-            reason = "stall gate failed in this graph; every row remeasured unstalled"
+            reason = STALL_RERUN_REASON
         else:
             reason = _staged_unavailable_reason()
     if reason is None:

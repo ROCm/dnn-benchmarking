@@ -128,11 +128,11 @@ def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
     ):
         # A wrong baseline or tuned plan cannot measure a gain.
         return "invalid"
-    if pe.oracle is not None and not pe.oracle.tuning_available:
+    if pe.oracle is not None and not pe.oracle.searched:
         # One fixed configuration: the ratio is run-to-run noise.
         return "no-search"
     if timing_modes_differ(pe):
-        # Event-timed OOTB against stall-gated tuned: not one measurement.
+        # One plan fell back to events timing: not one measurement.
         return "mixed-timing"
     if oracle_speedup(pe) is not None:
         return None
@@ -686,6 +686,11 @@ class Reporter:
         lines = [", ".join(costs)] if costs else []
         if not o.tuning_available:
             lines.append("no tuning knob: re-measured the OOTB plan; speedup is noise")
+        elif o.search_ran is False:
+            lines.append(
+                "no search ran: the tuned child left no search record; "
+                "speedup is noise"
+            )
         if o.correctness is not None and o.correctness.explicitly_failed:
             detail = o.correctness.error_message or "output mismatch"
             lines.append(

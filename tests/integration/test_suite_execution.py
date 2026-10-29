@@ -5,6 +5,7 @@
 
 import io
 import json
+import os
 import re
 import sys
 
@@ -100,14 +101,15 @@ def test_engine_selection_runs_in_caller_order(hipdnn) -> None:
     assert [r.engine_id for r in result.results] == selection
 
 
-def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) -> None:
-    """--oracle builds and times a global.benchmarking plan.
+def _run_oracle(plugin_path_cli_args, tmp_path, *argv, env=None):
+    """Run ``--oracle`` on the conv sample in a child CLI; return the
+    MIOPEN_ENGINE row and the hipDNN info log.
 
-    Runs the CLI in a child process: hipDNN keeps a tuned winner in memory
+    The CLI runs in a child process: hipDNN keeps a tuned winner in memory
     for the life of the process, so an in-process run would leave later
     tests unable to time the OOTB plan of this graph.
     """
-    out = tmp_path / "oracle.json"
+    out, log = tmp_path / "oracle.json", tmp_path / "hipdnn.log"
     proc = run_capped(
         [
             sys.executable,
@@ -123,21 +125,60 @@ def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) 
             "-o",
             str(out),
             *plugin_path_cli_args,
+            *argv,
         ],
         600,
+        # The tuned child inherits this environment.
+        env={
+            **os.environ,
+            "HIPDNN_LOG_LEVEL": "info",
+            "HIPDNN_LOG_FILE": str(log),
+            **(env or {}),
+        },
     )
     assert out.is_file(), proc.stderr
     rows = [r for g in json.loads(out.read_text())["graphs"] for r in g["results"]]
-    tuned = [r for r in rows if r["status"] == "success" and r["oracle"] is not None]
-    assert tuned, [(r["engine"]["name"], r["oracle_error"]) for r in rows]
+    miopen = [r for r in rows if r["engine"]["name"] == "MIOPEN_ENGINE"]
+    assert miopen, [(r["engine"]["name"], r["status"], r["message"]) for r in rows]
+    row = miopen[0]
+    assert row["status"] == "success" and row["oracle_error"] is None, row
+    return row, log.read_text() if log.is_file() else ""
 
-    ootb, oracle = tuned[0]["ootb"], tuned[0]["oracle"]
-    assert tuned[0]["oracle_error"] is None
-    # The tuned plan is the same object as the OOTB plan, plus one key.
-    assert set(oracle) - set(ootb) == {"tuning_available"}
+
+def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) -> None:
+    """--oracle builds and times a global.benchmarking plan of the engine."""
+    row, log = _run_oracle(plugin_path_cli_args, tmp_path)
+
+    ootb, oracle = row["ootb"], row["oracle"]
+    # The tuned plan is the same object as the OOTB plan, plus two keys.
+    assert set(oracle) - set(ootb) == {"tuning_available", "search_ran"}
     # Both plans report their own plan build through the same timed path.
     assert ootb["build_ms"] > 0 and oracle["build_ms"] > 0
     assert oracle["kernel"]["median_ms"] > 0
+    # MIOPEN_ENGINE exposes the knob and records every search it runs, so
+    # the tool knows whether the tuned run searched.
+    assert oracle["tuning_available"] is True
+    assert oracle["search_ran"] in (True, False)
+    # The provider applied the knob in the tuned child (MiopenUtils.hpp
+    # ScopedTuningPolicy). A child that builds with knobs={} logs only
+    # "benchmarking=0".
+    assert "(benchmarking=1)" in log, log[-2000:]
+
+
+def test_oracle_search_signal_sees_a_find_that_ran(
+    hipdnn, plugin_path_cli_args, tmp_path
+) -> None:
+    """With MIOPEN_FIND_MODE=NORMAL, MIOpen skips its system find database
+    and benchmarks the solvers into the child's empty user database: the
+    search signal must then be true."""
+    row, _ = _run_oracle(
+        plugin_path_cli_args,
+        tmp_path,
+        "--allow-selection-env",
+        env={"MIOPEN_FIND_MODE": "NORMAL"},
+    )
+
+    assert row["oracle"]["search_ran"] is True
 
 
 @pytest.mark.parametrize("graph_name", ["sample_conv_fwd.json", "sample_relu.json"])

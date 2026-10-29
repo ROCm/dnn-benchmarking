@@ -268,16 +268,30 @@ class OracleResult(PlanResult):
     plan build.
 
     ``tuning_available`` is False when the engine exposes no tuning knob, so
-    the tuned run re-measured the OOTB configuration. ``correctness`` is the
-    tuned plan's verdict; the row keeps the OOTB verdict. Throughputs use the
-    row's analytical FLOPs and I/O bytes with the tuned kernel median.
+    the tuned run re-measured the OOTB configuration. ``search_ran`` tells
+    whether a search ran in the tuned run: True when the tuned child left a
+    search record (MIOpen user database, TunableOp results), False when no
+    search ran (no knob, or no record where every search leaves one), None
+    when this engine leaves no evidence. ``correctness`` is the tuned plan's
+    verdict; the row keeps the OOTB verdict. Throughputs use the row's
+    analytical FLOPs and I/O bytes with the tuned kernel median.
     """
 
     tuning_available: bool
+    search_ran: Optional[bool] = None
+
+    @property
+    def searched(self) -> bool:
+        """False when the tuned run is known to re-measure a fixed choice."""
+        return self.tuning_available and self.search_ran is not False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to the v2 ``oracle`` object: the plan object plus tuning."""
-        return {**self.plan_dict(), "tuning_available": self.tuning_available}
+        return {
+            **self.plan_dict(),
+            "tuning_available": self.tuning_available,
+            "search_ran": self.search_ran,
+        }
 
 
 Verdict = Literal["passed", "failed", "unchecked", "reference", "skipped", "error"]
@@ -463,11 +477,11 @@ def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
     """OOTB kernel median / tuned kernel median, or None when not comparable.
 
     None when the row has no tuned run, either plan failed validation, the
-    two plans were timed in different modes (a stall-fallback OOTB in
-    ``events`` against a ``staged`` tuned child), or a median is missing or
-    non-positive. Rows with ``tuning_available`` False still get a ratio;
-    callers report them as "no-search" and keep them out of averages. The
-    speedup is derived, never stored in the result file.
+    two plans were timed in different modes (one plan fell back to
+    ``events``), or a median is missing or
+    non-positive. Rows without a search (``OracleResult.searched`` False)
+    still get a ratio; callers report them as "no-search" and keep them out
+    of averages. The speedup is derived, never stored in the result file.
     """
     oracle = row.oracle
     if oracle is None or any(

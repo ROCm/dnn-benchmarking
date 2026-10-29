@@ -237,7 +237,7 @@ def _oracle_row(ootb: Optional[CorrectnessResult] = None, **oracle_overrides):
 
 
 def _mixed_timing_row() -> ProviderEngineResult:
-    # Stall-fallback OOTB in events mode, tuned PyTorch child staged.
+    # One plan fell back to events mode, the other timed staged.
     pe = _oracle_row(timing=TimingInfo("staged", "hip", 1, 30, 1.0))
     pe.ootb.timing = TimingInfo("events", "hip", 1, 30, 1.0)
     return pe
@@ -258,6 +258,11 @@ class TestOracleColumn:
             (_oracle_row(correctness=_verdict(False)), "invalid"),
             # No tuning knob: the tuned run re-measured OOTB, the ratio is noise.
             (_oracle_row(tuning_available=False), "no-search"),
+            # Knob set, but no search ran (a FindDb answer): the ratio is noise.
+            (_oracle_row(search_ran=False), "no-search"),
+            # A recorded search, or no evidence either way, keeps the ratio.
+            (_oracle_row(search_ran=True), "2.00x"),
+            (_oracle_row(search_ran=None), "2.00x"),
             # Events against staged medians are not one measurement.
             (_mixed_timing_row(), "mixed-timing"),
             (_row(oracle_error="tuned build exploded"), "failed"),
@@ -397,9 +402,12 @@ class TestVerboseBlock:
         assert "[reference]" in out.getvalue()
         assert "correctness" not in out.getvalue()
 
-    def test_oracle_summary_without_reportable_speedup(self) -> None:
+    @pytest.mark.parametrize(
+        "overrides", [{"tuning_available": False}, {"search_ran": False}]
+    )
+    def test_oracle_summary_without_reportable_speedup(self, overrides) -> None:
         out = io.StringIO()
-        pe = _oracle_row(tuning_available=False)
+        pe = _oracle_row(**overrides)
         Reporter(out, io.StringIO()).print_oracle_summary([_graph(pe)])
         assert "no reportable speedup" in out.getvalue()
         assert "geomean" not in out.getvalue()

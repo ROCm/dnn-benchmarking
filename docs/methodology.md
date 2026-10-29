@@ -198,9 +198,11 @@ Notes for `cold`:
 - 512 MiB is two times or more the largest last-level cache that the tool
   targets (MI300X MALL, 256 MiB). MI210 L2 is 8 MiB.
 - The tool allocates the buffer one time per process, at the first cold
-  iteration. The hipDNN path uses `hipdnn_frontend.DeviceBuffer`. The CUDA
-  path uses a PyTorch tensor. If the allocation fails, the row fails with an
-  error that tells you to use `--cache-mode warm`.
+  iteration. It frees the buffer before an `--oracle` child starts, and the
+  next cold iteration allocates it again. The hipDNN path uses
+  `hipdnn_frontend.DeviceBuffer`. The CUDA path uses a PyTorch tensor. If
+  the allocation fails, the row fails with an error that tells you to use
+  `--cache-mode warm`.
 - The zero writes leave dirty lines in the cache. The first kernel in the
   span can pay the write-back of these lines. `triton.testing.do_bench` has
   the same effect.
