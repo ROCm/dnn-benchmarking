@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from dnn_benchmarking.cli import hipdnn_child, pytorch_tuned_child
+from dnn_benchmarking.cli import hipdnn_child, pytorch_child
+from dnn_benchmarking.common.run_state import TEMP_ROOT_ENV
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
     SuiteConfig,
@@ -220,12 +221,25 @@ def test_hipdnn_child_env_forces_benchmarking_into_a_private_deleted_user_db(
     assert not state_dir.exists()
 
 
+def test_child_user_db_is_under_the_temp_root_and_deleted(child, tmp_path, monkeypatch):
+    """With --benchmark-work-dir, the child's private user db lives under
+    the work dir's ``tmp``; it is still new for the child and deleted after it."""
+    root = tmp_path / "work-dir" / "tmp"
+    monkeypatch.setenv(TEMP_ROOT_ENV, str(root))
+
+    _run_hipdnn(tmp_path)
+
+    state_dir = Path(child.env["MIOPEN_USER_DB_PATH"])
+    assert state_dir.parent == root
+    assert child.state_existed and not state_dir.exists()
+
+
 def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkeypatch):
     _run_hipdnn(tmp_path)
     for name, value in child.env.items():
         monkeypatch.setenv(name, value)
 
-    child_protocol.HIPDNN_TUNED_ENV.check()
+    child_protocol.HIPDNN_TUNED.env.check(child.out_dir)
 
 
 @pytest.mark.parametrize(
@@ -235,13 +249,15 @@ def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkey
         ("HIPDNN_FORCE_BENCHMARKING", "0"),
         ("HIPDNN_DISABLE_CACHE", "0"),
         ("MIOPEN_USER_DB_PATH", None),
+        ("MIOPEN_USER_DB_PATH", "/shared/miopen-db"),
     ],
 )
 def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
     tmp_path, monkeypatch, name, value
 ):
-    """An untuned run must not be reported as the tuned result."""
-    _set_tuned_env(monkeypatch, child_protocol.HIPDNN_TUNED_ENV, tmp_path)
+    """An untuned run must not be reported as the tuned result, and a run
+    with another run's MIOpen user database is not isolated."""
+    _set_tuned_env(monkeypatch, child_protocol.HIPDNN_TUNED.env, tmp_path)
     if value is None:
         monkeypatch.delenv(name)
     else:
@@ -264,7 +280,7 @@ def test_pytorch_child_refuses_to_time_without_the_tuning_env(
     argv = ["--graph", "g.json", "--seed", "0", "--timing-policy", "{}"]
     argv += ["--out-dir", str(tmp_path), "--pytorch-sdpa-backend", "default"]
 
-    assert pytorch_tuned_child.main(argv) == 1
+    assert pytorch_child.main([*argv, "--tuned"]) == 1
     assert not (tmp_path / child_protocol.RESULT_FILE).exists()
 
 
@@ -402,8 +418,9 @@ def test_pytorch_child_times_the_graph_with_the_run_timing(child, tmp_path, stal
 
     _run_pytorch(tmp_path, config)
 
-    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.pytorch_tuned_child"]
-    args = pytorch_tuned_child.parse_args(child.argv[3:])
+    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.pytorch_child"]
+    args = pytorch_child.parse_args(child.argv[3:])
+    assert args.tuned
     assert args.graph == tmp_path / "g.json"
     assert args.seed == 11
     assert args.timing_policy == config.timing_policy

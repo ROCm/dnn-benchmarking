@@ -331,15 +331,16 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "(HIPDNN_FORCE_BENCHMARKING=1); winners are not kept between runs",
     ),
     CliOption(
-        flags=("--benchmark-cache-dir",),
-        dest="benchmark_cache_dir",
+        flags=("--benchmark-work-dir",),
+        dest="benchmark_work_dir",
         group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
-        help="root for caches that only save time (MIOpen compiled kernels, "
-        "comgr, XDG); reuse it across calls to skip repeated compiles. "
-        "Each engine's OOTB and tuned child keeps a private MIOpen user database",
-        config_key="benchmark_cache_dir",
+        help="work directory: PATH/cache holds caches that only save time "
+        "(MIOpen compiled kernels, comgr, XDG; reuse it across calls to skip "
+        "repeated compiles); PATH/tmp holds the temporary engine state "
+        "(MIOpen user find-DBs), deleted when dnn-benchmark ends",
+        config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
     ),
     _choice_option(

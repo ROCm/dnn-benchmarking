@@ -9,8 +9,8 @@ Every tuned run executes in a child script, after the row's OOTB run:
   builds the same engine with ``HIPDNN_FORCE_BENCHMARKING=1`` (the
   process-wide form of the ``global.benchmarking`` knob), so its first launch
   samples the candidate kernels and keeps the fastest.
-- PyTorch rows (:func:`run_pytorch_tuned`): ``cli/pytorch_tuned_child.py``
-  runs the graph with exhaustive conv search and TunableOp.
+- PyTorch rows (:func:`run_pytorch_tuned`): ``cli/pytorch_child.py
+  --tuned`` runs the graph with exhaustive conv search and TunableOp.
 
 This module sets the environment of each child (``execution.child_protocol``
 holds the contract with the scripts, ``execution.child_runner`` starts
@@ -41,13 +41,8 @@ from ..reporting.suite_results import (
     engine_id_hex,
 )
 from ..validation import ReferenceOutput
-from .child_protocol import (
-    HIPDNN_TUNED_ENV,
-    PYTORCH_TUNED_ENV,
-    ChildResult,
-    failure_text,
-)
-from .child_runner import child_args, child_run, hipdnn_child_args
+from .child_protocol import HIPDNN_TUNED, PYTORCH_TUNED, ChildResult, failure_text
+from .child_runner import child_run, hipdnn_child_args, pytorch_child_args
 from .correctness import check_correctness
 
 #: Node types whose PyTorch kernel the tuned child searches: MIOpen
@@ -141,11 +136,7 @@ def run_hipdnn_tuned(
     )
     try:
         with child_run(
-            "tuned hipDNN",
-            "hipdnn_child",
-            [*args, "--tuned"],
-            HIPDNN_TUNED_ENV,
-            config.metrics.profiling_timeout_s or None,
+            HIPDNN_TUNED, args, config.metrics.profiling_timeout_s or None
         ) as (tuned, outputs):
             oracle = _oracle_result(tuned, tuning_available, config)
             if reference_outputs is not None:
@@ -178,26 +169,19 @@ def run_pytorch_tuned(
 ) -> None:
     """Attach a tuned PyTorch run as ``row.oracle``; never fails the row.
 
-    Call after the OOTB buffers are released, so the child's allocations do
-    not stack on top of them. Tuned outputs are not validated: they never
-    enter this process. ``tuning_available`` is true only when the graph has
-    a conv or matmul node, the ops the child searches.
+    Call after the OOTB child has exited, so the two runs never hold VRAM at
+    the same time. Tuned outputs are not validated: the child does not save
+    them. ``tuning_available`` is true only when the graph has a conv or
+    matmul node, the ops the child searches.
     """
     tuning_available = any(
         node.get("type") in _PYTORCH_TUNABLE_OPS
         for node in graph_json.get("nodes") or []
     )
-    args = child_args(graph_path, config)
-    args += ["--pytorch-sdpa-backend", config.pytorch_sdpa_backend.value]
-    if config.pytorch_rocm_fa_library is not None:
-        args += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
+    args = pytorch_child_args(graph_path, config, save_outputs=False)
     try:
         with child_run(
-            "tuned PyTorch",
-            "pytorch_tuned_child",
-            args,
-            PYTORCH_TUNED_ENV,
-            config.metrics.profiling_timeout_s or None,
+            PYTORCH_TUNED, args, config.metrics.profiling_timeout_s or None
         ) as (tuned, _):
             oracle = _oracle_result(tuned, tuning_available, config)
     except Exception as e:

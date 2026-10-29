@@ -10,13 +10,9 @@ from pathlib import Path
 import pytest
 
 from dnn_benchmarking.cli.main import _configure_cache_env
+from dnn_benchmarking.common.run_state import run_state_dir
 
-_CACHE_VARS = (
-    "XDG_CACHE_HOME",
-    "AMD_COMGR_CACHE_DIR",
-    "MIOPEN_USER_DB_PATH",
-    "MIOPEN_CUSTOM_CACHE_DIR",
-)
+_CACHE_VARS = ("XDG_CACHE_HOME", "AMD_COMGR_CACHE_DIR", "MIOPEN_CUSTOM_CACHE_DIR")
 
 
 @pytest.fixture
@@ -30,12 +26,11 @@ def test_configure_cache_env_only_fills_unset_variables(
     tmp_path: Path, monkeypatch, clean_cache_env
 ) -> None:
     monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
-    for var in ("XDG_CACHE_HOME", "MIOPEN_USER_DB_PATH", "MIOPEN_CUSTOM_CACHE_DIR"):
+    for var in ("XDG_CACHE_HOME", "MIOPEN_CUSTOM_CACHE_DIR"):
         monkeypatch.setenv(var, "/preset")
 
-    assert _configure_cache_env(None) is None  # MIOpen preset, workspace given
+    assert _configure_cache_env(None) is None  # workspace: nothing temporary
     assert os.environ["XDG_CACHE_HOME"] == "/preset"
-    assert os.environ["MIOPEN_USER_DB_PATH"] == "/preset"
     assert Path(os.environ["AMD_COMGR_CACHE_DIR"]).parent == tmp_path
     assert Path(os.environ["AMD_COMGR_CACHE_DIR"]).is_dir()
 
@@ -50,52 +45,43 @@ def test_all_preset_without_workspace_allocates_nothing(
     assert all(os.environ[var] == "/preset" for var in _CACHE_VARS)
 
 
-def test_miopen_state_is_fresh_per_run_and_removed_at_exit(
-    tmp_path: Path, monkeypatch, clean_cache_env
+def test_caches_without_workspace_are_private_and_removed_at_exit(
+    clean_cache_env,
 ) -> None:
-    """A workspace keeps the kernel cache, but each run gets an empty MIOpen DB."""
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
-    first = _configure_cache_env(None)
-    assert first is not None
-    first_db = Path(os.environ["MIOPEN_USER_DB_PATH"])
-    assert Path(os.environ["MIOPEN_CUSTOM_CACHE_DIR"]).parent == tmp_path
-    assert Path(os.environ["XDG_CACHE_HOME"]).parent == tmp_path
-    assert tmp_path not in first_db.parents
-    assert first_db.is_dir() and not any(first_db.iterdir())
+    lifetime = _configure_cache_env(None)
+    assert lifetime is not None
+    base = Path(lifetime.name)
+    for var in _CACHE_VARS:
+        assert Path(os.environ[var]).parent == base
     if os.name == "posix":
-        assert stat.S_IMODE(Path(first.name).stat().st_mode) == 0o700
-    (first_db / "record.ufdb.txt").write_text("stale")
-    first.cleanup()
-    assert not first_db.exists()
-
-    monkeypatch.delenv("MIOPEN_USER_DB_PATH")
-    second = _configure_cache_env(None)
-    try:
-        second_db = Path(os.environ["MIOPEN_USER_DB_PATH"])
-        assert second_db != first_db
-        assert not any(second_db.iterdir())
-    finally:
-        second.cleanup()
+        assert stat.S_IMODE(base.stat().st_mode) == 0o700
+    lifetime.cleanup()
+    assert not base.exists()
 
 
-def test_cache_root_replaces_inherited_compile_caches_only(
+def test_work_dir_keeps_caches_and_removes_temp_state_at_exit(
     tmp_path: Path, monkeypatch, clean_cache_env
 ) -> None:
-    """--benchmark-cache-dir wins over a caller's compile-cache paths, so two
-    calls share compiled kernels; the MIOpen user DB stays private per run."""
+    """--benchmark-work-dir wins over a caller's cache paths, so two calls
+    share compiled kernels under ``cache``. The command's temporary state
+    (every child's directory and MIOpen user DB) is in one run directory
+    under ``tmp``, removed when the command ends; the caches stay. The
+    parent never sets a MIOpen user DB: only children own one."""
     for var in _CACHE_VARS:
         monkeypatch.setenv(var, "/inherited")
-    root = tmp_path / "worker-cache"
+    work_dir = tmp_path / "worker"
 
-    assert _configure_cache_env(root) is None
-    for var in ("XDG_CACHE_HOME", "AMD_COMGR_CACHE_DIR", "MIOPEN_CUSTOM_CACHE_DIR"):
-        assert Path(os.environ[var]).parent == root
-        assert Path(os.environ[var]).is_dir()
-    assert os.environ["MIOPEN_USER_DB_PATH"] == "/inherited"
-
-    monkeypatch.delenv("MIOPEN_USER_DB_PATH")
-    lifetime = _configure_cache_env(root)
+    lifetime = _configure_cache_env(work_dir)
     try:
-        assert root not in Path(os.environ["MIOPEN_USER_DB_PATH"]).parents
+        for var in _CACHE_VARS:
+            assert Path(os.environ[var]).parent == work_dir / "cache"
+            assert Path(os.environ[var]).is_dir()
+        assert "MIOPEN_USER_DB_PATH" not in os.environ
+        run_dir = Path(lifetime.name)
+        assert run_dir.parent == work_dir / "tmp"
+        with run_state_dir("dnn-bench-hipdnn_child-") as child_dir:
+            assert Path(child_dir).parent == run_dir
     finally:
         lifetime.cleanup()
+    assert list((work_dir / "tmp").iterdir()) == []
+    assert (work_dir / "cache" / "miopen_kernel_cache").is_dir()

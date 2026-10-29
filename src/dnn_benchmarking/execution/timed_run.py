@@ -1,15 +1,15 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Steps before the timed loop, shared by a row and its tuned child.
+"""Steps of a child script before its timed loop.
 
-The suite runner times the OOTB row and the ``--oracle`` child scripts time
-the tuned run. Both use the functions of this module, so the two
-measurements cannot drift apart. Each caller then times with
+The OOTB and the tuned run of a row execute the same child script
+(``cli/hipdnn_child.py`` or ``cli/pytorch_child.py``, with and without
+``--tuned``), so both take these steps. Each caller then times with
 ``executor.benchmark`` and can use the same buffers after the timed loop
-(for example, to check the outputs).
+(for example, to save the outputs).
 
-- hipDNN: :func:`build_hipdnn_plan`, then :func:`hipdnn_buffers`. The row
+- hipDNN: :func:`build_hipdnn_plan`, then :func:`hipdnn_buffers`. The child
   reads the plan metrics between the two steps.
 - PyTorch: :func:`pytorch_run`.
 
@@ -42,16 +42,13 @@ def build_hipdnn_plan(
 
 @contextmanager
 def hipdnn_buffers(
-    tensor_infos: List[TensorInfo],
-    input_data: Dict[int, Any],
-    device: Optional[str] = None,
+    tensor_infos: List[TensorInfo], input_data: Dict[int, Any]
 ) -> Iterator[Tuple[BufferManager, Dict[int, int]]]:
     """Allocate the graph buffers, load the inputs and zero the outputs.
 
-    Yields the buffer manager and its variant pack. ``device`` is the torch
-    device of the buffers, or None for ``hipdnn.DeviceBuffer``.
+    Yields the buffer manager and its variant pack.
     """
-    with BufferManager(tensor_infos, device=device) as bm:
+    with BufferManager(tensor_infos) as bm:
         bm.allocate_all()
         bm.load_input_data(input_data)
         bm.zero_outputs()

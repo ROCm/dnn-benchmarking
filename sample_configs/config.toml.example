@@ -32,9 +32,11 @@ runtime = "hipdnn"   # "hipdnn" or "pytorch"
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
 autotune = false     # benchmark candidate kernels and use the winner
-# Root for caches that only save time (MIOpen compiled kernels, comgr, XDG).
-# Reuse one directory across calls to skip repeated compiles.
-# benchmark_cache_dir = "/tmp/dnn-bench-cache"
+# Work directory. cache/ holds caches that only save time (MIOpen compiled
+# kernels, comgr, XDG); they stay across calls. tmp/ holds the temporary
+# engine state (MIOpen user find-DBs); dnn-benchmark deletes it when it ends.
+# Reuse one directory to skip recompiles.
+# benchmark_work_dir = "/tmp/dnn-bench-work"
 
 pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
 # pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"

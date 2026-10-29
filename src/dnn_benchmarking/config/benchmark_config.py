@@ -330,9 +330,10 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Root of the caches that only save time (``cli.main``). ``None``: the
-    #: workspace, or a temporary directory for this run.
-    benchmark_cache_dir: Optional[str] = None
+    #: Root of the persistent compile caches and of the temporary engine state
+    #: in ``tmp/`` (``cli.main``). ``None``: the workspace or a temporary
+    #: directory for the caches, the system temporary directory for the state.
+    benchmark_work_dir: Optional[str] = None
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
@@ -389,8 +390,8 @@ class SuiteConfig:
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
             autotune=args.autotune,
-            benchmark_cache_dir=(
-                str(args.benchmark_cache_dir) if args.benchmark_cache_dir else None
+            benchmark_work_dir=(
+                str(args.benchmark_work_dir) if args.benchmark_work_dir else None
             ),
         )
 

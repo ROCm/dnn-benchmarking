@@ -16,7 +16,6 @@ failure comes back through ``failure.json``.
 import json
 import subprocess
 import sys
-import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -24,12 +23,13 @@ from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 
+from ..common.run_state import run_state_dir
 from ..config.benchmark_config import SuiteConfig
 from ..metrics._subprocess import run_capped
 from ..reporting.suite_results import engine_id_hex
 from .child_protocol import (
     RESULT_FILE,
-    ChildEnv,
+    ChildSpec,
     ChildResult,
     ChildRunError,
     output_file,
@@ -44,17 +44,17 @@ class SavedOutputs:
     def __init__(self, out_dir: Path) -> None:
         self._out_dir = out_dir
 
-    def get_output_tensor(self, uid: int) -> None:
-        return None  # Host arrays only: compare on the host.
-
     def get_output_data(self, uid: int) -> Optional[np.ndarray]:
         path = output_file(self._out_dir, uid)
         return np.load(path) if path.is_file() else None
 
 
-def child_args(graph_path: Path, config: SuiteConfig) -> List[str]:
-    """Arguments that every child script takes, except ``--out-dir``."""
-    return [
+def _common_args(
+    graph_path: Path, config: SuiteConfig, save_outputs: bool
+) -> List[str]:
+    """Arguments that every child script takes, except ``--out-dir`` and
+    ``--tuned`` (:func:`child_run` adds them)."""
+    args = [
         "--graph",
         str(graph_path),
         "--seed",
@@ -62,6 +62,11 @@ def child_args(graph_path: Path, config: SuiteConfig) -> List[str]:
         "--timing-policy",
         json.dumps(asdict(config.timing_policy)),
     ]
+    if save_outputs:
+        args.append("--save-outputs")
+    if config.metrics.basic:
+        args.append("--clocks")
+    return args
 
 
 def hipdnn_child_args(
@@ -72,28 +77,32 @@ def hipdnn_child_args(
     save_outputs: bool,
 ) -> List[str]:
     """Arguments of ``cli/hipdnn_child.py``, the same for its OOTB and tuned
-    runs (the tuned run adds ``--tuned``)."""
-    args = child_args(graph_path, config)
+    runs."""
+    args = _common_args(graph_path, config, save_outputs)
     args += ["--engine", engine_id_hex(engine_id)]
     if plugin_path is not None:
         args += ["--plugin-path", str(plugin_path)]
-    if save_outputs:
-        args.append("--save-outputs")
-    if config.metrics.basic:
-        args.append("--clocks")
+    return args
+
+
+def pytorch_child_args(
+    graph_path: Path, config: SuiteConfig, save_outputs: bool
+) -> List[str]:
+    """Arguments of ``cli/pytorch_child.py``, the same for its OOTB and tuned
+    runs."""
+    args = _common_args(graph_path, config, save_outputs)
+    args += ["--pytorch-sdpa-backend", config.pytorch_sdpa_backend.value]
+    if config.pytorch_rocm_fa_library is not None:
+        args += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
     return args
 
 
 @contextmanager
 def child_run(
-    what: str,
-    module: str,
-    args: List[str],
-    env: ChildEnv,
-    timeout_s: Optional[int],
+    spec: ChildSpec, args: List[str], timeout_s: Optional[int]
 ) -> Iterator[Tuple[ChildResult, SavedOutputs]]:
-    """Run ``python -m dnn_benchmarking.cli.<module>`` in a new, empty
-    directory and ``env``; yield its result and saved outputs.
+    """Run the script of ``spec`` in a new, empty directory, with the
+    environment of ``spec``; yield its result and saved outputs.
 
     The outputs stay readable until the context exits; then the directory
     (the child's MIOpen user database) is deleted.
@@ -105,13 +114,14 @@ def child_run(
         ChildRunError: Any other failure, a timeout, or a child that ended
             without ``result.json``.
     """
-    with tempfile.TemporaryDirectory(prefix=f"dnn-bench-{module}-") as state:
+    what = spec.label
+    with run_state_dir(f"dnn-bench-{spec.module}-") as state:
         out_dir = Path(state)
-        argv = [sys.executable, "-m", f"dnn_benchmarking.cli.{module}"]
-        argv += [*args, "--out-dir", str(out_dir)]
+        argv = [sys.executable, "-m", f"dnn_benchmarking.cli.{spec.module}"]
+        argv += [*args, *spec.flags(), "--out-dir", str(out_dir)]
         try:
             proc = run_capped(
-                argv, timeout_s, env=env.build(str(out_dir)), capture_output=False
+                argv, timeout_s, env=spec.env.build(str(out_dir)), capture_output=False
             )
         except subprocess.TimeoutExpired:
             raise ChildRunError(

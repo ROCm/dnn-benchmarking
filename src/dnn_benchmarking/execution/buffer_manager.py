@@ -10,14 +10,13 @@ graph type, and are encoded to raw words only when written to device storage.
 """
 
 import functools
-import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from ..common.blocks import iter_blocks
 from ..common.dtypes import DType
-from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..common.exceptions import ExecutionError
 from ..graph.tensor_info import TensorInfo
 
 
@@ -347,28 +346,19 @@ class BufferManager:
     - Copying pre-generated inputs to device buffers
     - Cleanup of device memory
 
-    Storage is ``hipdnn.DeviceBuffer`` by default. With a torch ``device``,
-    each buffer is a raw ``torch.uint8`` tensor, and outputs can be viewed on
-    the device without a host copy. hipDNN receives each tensor's
-    ``data_ptr()``; this manager keeps the tensors alive until ``cleanup``.
+    Storage is ``hipdnn.DeviceBuffer``; outputs reach the host through
+    :meth:`get_output_data`.
     """
 
-    def __init__(
-        self,
-        tensor_infos: List[TensorInfo],
-        device: Optional[str] = None,
-    ) -> None:
+    def __init__(self, tensor_infos: List[TensorInfo]) -> None:
         """Initialize buffer manager with tensor metadata.
 
         Args:
             tensor_infos: List of TensorInfo objects describing tensors.
-            device: Torch device for torch-backed storage (for example
-                ``"cuda"``), or None for ``hipdnn.DeviceBuffer`` storage.
         """
         self._tensor_infos = tensor_infos
         self._tensor_info_by_uid = {tensor.uid: tensor for tensor in tensor_infos}
-        self._device = device
-        self._buffers: Dict[int, Any] = {}  # UID -> DeviceBuffer or torch.Tensor
+        self._buffers: Dict[int, Any] = {}  # UID -> hipdnn.DeviceBuffer
 
     def allocate_all(self) -> None:
         """Allocate device buffers for all tensors.
@@ -376,17 +366,6 @@ class BufferManager:
         Raises:
             ExecutionError: If hipdnn_frontend is not available.
         """
-        if self._device is not None:
-            import torch
-
-            for tensor_info in self._tensor_infos:
-                if tensor_info.is_virtual or tensor_info.is_pass_by_value:
-                    continue
-                self._buffers[tensor_info.uid] = torch.empty(
-                    tensor_info.size_bytes, dtype=torch.uint8, device=self._device
-                )
-            return
-
         try:
             import hipdnn_frontend as hipdnn
         except ImportError as e:
@@ -413,24 +392,12 @@ class BufferManager:
         if not self._buffers:
             raise ExecutionError("Buffers not allocated. Call allocate_all() first.")
 
-        if self._device is None:
-            return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
-        return {uid: buffer.data_ptr() for uid, buffer in self._buffers.items()}
+        return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
 
     def _write_storage(self, buffer: Any, storage: np.ndarray) -> None:
         """Copy 1-D graph-layout storage words from the host into one buffer."""
-        if self._device is None:
-            # DeviceBuffer.copy_from_host accepts only ``bytes``.
-            buffer.copy_from_host(storage.tobytes())
-            return
-        import torch
-
-        with warnings.catch_warnings():
-            # copy_ only reads the source, so a read-only view is safe and
-            # avoids a host copy of the input.
-            warnings.simplefilter("ignore", UserWarning)
-            source = torch.frombuffer(storage, dtype=torch.uint8)
-        buffer.copy_(source)
+        # DeviceBuffer.copy_from_host accepts only ``bytes``.
+        buffer.copy_from_host(storage.tobytes())
 
     def load_input_data(self, input_data: Dict[int, np.ndarray]) -> None:
         """Copy pre-generated graph input data into device buffers.
@@ -476,19 +443,8 @@ class BufferManager:
                 continue
 
             buffer = self._buffers.get(tensor_info.uid)
-            if buffer is None:
-                continue
-            if self._device is None:
+            if buffer is not None:
                 buffer.zeros()
-            else:
-                buffer.zero_()
-
-        if self._device is not None:
-            import torch
-
-            # zero_() runs on torch's stream; hipDNN runs on the handle stream.
-            if torch.device(self._device).type == "cuda":
-                torch.cuda.synchronize()
 
     def get_output_data(self, uid: int) -> Optional[np.ndarray]:
         """Copy an output tensor to the host as a dense logical array.
@@ -501,32 +457,7 @@ class BufferManager:
         if buffer is None or tensor_info is None:
             return None
 
-        if self._device is None:
-            raw = buffer.copy_to_host()
-        else:
-            raw = buffer.cpu().numpy()
-        return _decode_storage(raw, tensor_info)
-
-    def get_output_tensor(self, uid: int) -> Optional["torch.Tensor"]:
-        """Return a typed logical view of an output buffer without a copy.
-
-        Returns None for DeviceBuffer storage, for an unknown UID, and for a
-        data type that the installed torch cannot represent.
-        """
-        if self._device is None:
-            return None
-        buffer = self._buffers.get(uid)
-        tensor_info = self._tensor_info_by_uid.get(uid)
-        if buffer is None or tensor_info is None:
-            return None
-        try:
-            torch_dtype = tensor_info.dtype.torch_dtype()
-        except UnsupportedGraphError:
-            return None
-        typed = buffer.view(torch_dtype)
-        if tensor_info.strides:
-            return typed.as_strided(tensor_info.dims, tensor_info.strides)
-        return typed[: tensor_info.num_elements].reshape(tensor_info.dims)
+        return _decode_storage(buffer.copy_to_host(), tensor_info)
 
     def get_output_tensors(self) -> List[TensorInfo]:
         """Get list of output tensor infos.
@@ -539,16 +470,6 @@ class BufferManager:
     def cleanup(self) -> None:
         """Free all device buffers."""
         self._buffers.clear()
-        if self._device is not None:
-            import torch
-
-            if torch.device(self._device).type != "cuda":
-                return
-
-            # Return the freed blocks to the driver. hipDNN workspaces and
-            # the next engine allocate with hipMalloc, which cannot reuse
-            # torch's cached blocks.
-            torch.cuda.empty_cache()
 
     def __enter__(self) -> "BufferManager":
         """Context manager entry."""

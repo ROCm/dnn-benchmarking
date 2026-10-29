@@ -3,7 +3,8 @@
 
 import pytest
 
-from dnn_benchmarking.cli.main import _MIOPEN_USER_DB, _WORKSPACE_CACHE_SUBDIRS
+from dnn_benchmarking.cli.main import _WORKSPACE_CACHE_SUBDIRS
+from dnn_benchmarking.common.run_state import TEMP_ROOT_ENV
 
 
 @pytest.fixture(autouse=True)
@@ -18,7 +19,7 @@ def _restore_cli_env(monkeypatch):
         "HIPDNN_CACHE_DIR",
         "HIPDNN_DISABLE_CACHE",
         *_WORKSPACE_CACHE_SUBDIRS,
-        _MIOPEN_USER_DB,
+        TEMP_ROOT_ENV,
     ):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)

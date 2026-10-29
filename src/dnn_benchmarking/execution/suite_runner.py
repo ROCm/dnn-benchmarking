@@ -13,10 +13,7 @@ discovers engines, computes references and assembles the rows.
 """
 
 import copy
-import gc
 import json
-import re
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,13 +28,12 @@ from ..config.benchmark_config import (
 from ..execution.buffer_manager import generate_input_data
 from ..execution.executor import Executor, set_plugin_path
 from ..execution.timing import (
-    Measurement,
     StallFallbackError,
     Timer,
     retry_unstalled,
 )
 from ..graph.tensor_info import TensorInfo
-from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
+from ..metrics import compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
@@ -49,11 +45,21 @@ from ..reporting.suite_results import (
     graph_id_for,
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
-from .child_protocol import HIPDNN_OOTB_ENV, ChildResult, failure_text
-from .child_runner import SavedOutputs, child_run, hipdnn_child_args
+from .child_protocol import (
+    HIPDNN_AUTOTUNE,
+    HIPDNN_OOTB,
+    PYTORCH_OOTB,
+    ChildResult,
+    failure_text,
+)
+from .child_runner import (
+    SavedOutputs,
+    child_run,
+    hipdnn_child_args,
+    pytorch_child_args,
+)
 from .correctness import check_correctness, mismatch, unchecked
 from .oracle import hipdnn_tuning_available, run_hipdnn_tuned, run_pytorch_tuned
-from .timed_run import pytorch_run
 
 
 @dataclass
@@ -134,25 +140,6 @@ def _throttled(after: Optional[Dict[str, Any]]) -> bool:
     return bool(after and after.get("throttle_status"))
 
 
-def _measure_row(
-    row: ProviderEngineResult,
-    ctx: _GraphContext,
-    benchmark: Callable[[], Measurement],
-) -> None:
-    """Run an in-process timed loop and record it (PyTorch rows)."""
-    probe = GpuSmiProbe() if ctx.config.metrics.basic else None
-    m = benchmark()
-    clocks_after = probe.clocks() if probe is not None else None
-    _record_timing(
-        row,
-        ctx,
-        TimingInfo.from_measurement(m),
-        BenchmarkStats.from_timings(m.kernel_ms),
-        BenchmarkStats.from_timings(m.host_ms),
-        clocks_after,
-    )
-
-
 def _record_timing(
     row: ProviderEngineResult,
     ctx: _GraphContext,
@@ -221,47 +208,6 @@ def _compute_reference_outputs_once(
         return None, str(e)
 
 
-def _pytorch_reference_outputs_from_buffer(
-    buffer_manager: Any,
-    keep_device: bool = True,
-) -> Dict[int, ReferenceOutput]:
-    """Collect reference outputs from a PyTorch buffer manager.
-
-    With ``keep_device``, a GPU output stays on the device only: each engine
-    compares on the GPU, and the rare host fallback copies it to the host for
-    one comparison (``ReferenceOutput.host_data``). Otherwise ``data`` is a
-    host copy.
-    """
-    outputs: Dict[int, ReferenceOutput] = {}
-    tensors = buffer_manager.get_tensors()
-    for tensor_info in buffer_manager.get_output_tensors():
-        uid = tensor_info.uid
-        tensor = tensors.get(uid)
-        if tensor is None:
-            continue
-        if keep_device and tensor.is_cuda:
-            outputs[uid] = ReferenceOutput(
-                data=None, tensor_uid=uid, device_data=_owned(tensor.detach())
-            )
-        else:
-            outputs[uid] = ReferenceOutput(
-                data=buffer_manager.get_output_data(uid), tensor_uid=uid
-            )
-    return outputs
-
-
-def _owned(tensor: Any) -> Any:
-    """``tensor`` itself, or a compact copy when it is a view of a larger storage.
-
-    The buffer manager only drops its references on exit, so a kept tensor
-    stays valid without a copy. A view would keep its whole base allocation
-    alive, which can be larger than a copy of the view.
-    """
-    if tensor.untyped_storage().nbytes() > tensor.numel() * tensor.element_size():
-        return tensor.clone()
-    return tensor
-
-
 def _graph_context(
     graph_path: Path,
     graph_json: Dict[str, Any],
@@ -304,83 +250,14 @@ def _torch_version() -> str:
 def _run_pytorch_row(
     ctx: _GraphContext, role: Literal["engine", "reference"]
 ) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
-    """Time the graph through PyTorch as one row (``_time_pytorch_row``).
+    """Time the graph through PyTorch as one row, in ``cli/pytorch_child.py``.
 
-    Then return PyTorch's cached VRAM to the device. The buffer manager
-    empties the cache on exit, but the row's locals (and, after a failure,
-    the exception's frames) still hold the executor and its intermediates at
-    that point. They reach the cache only once the row returns. Without this
-    release, hipDNN's own allocations (``hipMalloc``) for the same graph can
-    fail although the device has room.
-    """
-    try:
-        return _time_pytorch_row(ctx, role)
-    finally:
-        _release_torch_cache()
-
-
-def _release_torch_cache() -> None:
-    """Free the tensors no longer referenced, then return PyTorch's cached VRAM.
-
-    ``gc.collect()`` frees tensors held only by reference cycles, which
-    ``empty_cache()`` alone cannot release.
-    """
-    torch = sys.modules.get("torch")
-    try:
-        if torch is None or not torch.cuda.is_initialized():
-            return
-        gc.collect()
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
-_OUT_OF_MEMORY = re.compile(r"out ?of ?memory", re.IGNORECASE)
-
-
-def _gpu_memory_at_row_start() -> Optional[str]:
-    """Device memory as a row starts, reported if the row runs out of memory.
-
-    Read only when torch has already initialized the GPU: initializing it
-    here would itself take VRAM in a run that has no PyTorch rows. The
-    device-free figure counts every process on the GPU; the PyTorch cache
-    figure counts only this process.
-    """
-    torch = sys.modules.get("torch")
-    try:
-        if torch is None or not torch.cuda.is_initialized():
-            return None
-        free, total = torch.cuda.mem_get_info()
-        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-    except Exception:
-        return None
-    gib = float(1 << 30)
-    return (
-        f"at row start the GPU had {free / gib:.1f} of {total / gib:.1f} GiB free "
-        f"(all processes) and this process's PyTorch cache held "
-        f"{cached / gib:.1f} GiB unused"
-    )
-
-
-def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
-    """``Type: message``, plus the row-start memory for out-of-memory errors."""
-    message = failure_text(error)
-    if memory_at_start is not None and _OUT_OF_MEMORY.search(message):
-        message = f"{message} [{memory_at_start}]"
-    return message
-
-
-def _time_pytorch_row(
-    ctx: _GraphContext, role: Literal["engine", "reference"]
-) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
-    """Time the graph through PyTorch as one row.
-
-    ``role="reference"`` additionally extracts reference outputs for the
-    engine comparison. Unsupported graphs are skipped unless the SDPA
-    selection is strict. Any other failure of a default-dispatch reference
-    is skipped (the CPU reference may still serve); any other failure of a
-    strict SDPA selection or of the ``--runtime pytorch`` engine row is an
-    error.
+    ``role="reference"`` makes the child save its outputs, which become the
+    reference outputs for the engine comparison. Unsupported graphs are
+    skipped unless the SDPA selection is strict. Any other failure of a
+    default-dispatch reference is skipped (the CPU reference may still
+    serve); any other failure of a strict SDPA selection or of the
+    ``--runtime pytorch`` engine row is an error.
     """
     config = ctx.config
     strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
@@ -393,35 +270,24 @@ def _time_pytorch_row(
         engine_version=_torch_version(),
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
-    memory_at_start = _gpu_memory_at_row_start()
+    args = pytorch_child_args(ctx.graph_path, config, save_outputs=role == "reference")
     try:
-        from . import pytorch_ops
-
-        with pytorch_run(
-            ctx.graph_json,
-            ctx.tensor_infos,
-            ctx.input_data,
-            config.timing_policy,
-            config.pytorch_sdpa_backend,
-            config.pytorch_rocm_fa_library,
-        ) as (executor, bm):
-            tensors = bm.get_tensors()
-            _measure_row(row, ctx, lambda: executor.benchmark(tensors))
-            row.warnings = (row.warnings or []) + executor.notes
+        # No time limit, as for every timed OOTB row.
+        with child_run(PYTORCH_OOTB, args, None) as (result, saved):
+            _record_timing(
+                row, ctx, result.timing, result.kernel, result.host, result.clocks_after
+            )
+            row.warnings = (row.warnings or []) + result.notes
             if role == "reference":
-                bm.zero_outputs()
-                executor.execute_once(tensors)
-                # A profiling child allocates its own VRAM, so profiled runs
-                # keep host-only references (and DeviceBuffer I/O).
-                outputs = _pytorch_reference_outputs_from_buffer(
-                    bm, keep_device=not config.metrics.opt_in_pass_requested
-                )
+                outputs = _saved_reference_outputs(ctx.tensor_infos, saved)
         if role == "reference":
+            from . import pytorch_ops
+
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
                 ctx.graph_json
             )
-        # After the OOTB buffers are released, so the child's allocations do
-        # not stack on top of them.
+        # After the OOTB child has exited, so the two runs never hold VRAM at
+        # the same time.
         if config.oracle:
             run_pytorch_tuned(
                 row=row,
@@ -436,9 +302,24 @@ def _time_pytorch_row(
         return _failed_row(_error_or_skip(strict), row, str(e)), None
     except Exception as e:
         fatal = role == "engine" or strict
-        message = _failure_message(e, memory_at_start)
-        return _failed_row(_error_or_skip(fatal), row, message), None
+        return _failed_row(_error_or_skip(fatal), row, failure_text(e)), None
     return row, outputs
+
+
+def _saved_reference_outputs(
+    tensor_infos: List[TensorInfo], saved: SavedOutputs
+) -> Dict[int, ReferenceOutput]:
+    """The reference outputs that the PyTorch child saved, as host arrays."""
+    outputs: Dict[int, ReferenceOutput] = {}
+    for tensor_info in tensor_infos:
+        if not tensor_info.is_output:
+            continue
+        data = saved.get_output_data(tensor_info.uid)
+        if data is not None:
+            outputs[tensor_info.uid] = ReferenceOutput(
+                data=data, tensor_uid=tensor_info.uid
+            )
+    return outputs
 
 
 def run_single_provider_engine(
@@ -463,7 +344,6 @@ def run_single_provider_engine(
         engine_version=engine_version,
         plugin_path=plugin,
     )
-    memory_at_start = _gpu_memory_at_row_start()
     tuning_available: Optional[bool] = None
     args = hipdnn_child_args(
         ctx.graph_path,
@@ -474,10 +354,8 @@ def run_single_provider_engine(
     )
     try:
         # No time limit, as for every timed OOTB row.
-        with child_run("hipDNN", "hipdnn_child", args, HIPDNN_OOTB_ENV, None) as (
-            ootb,
-            outputs,
-        ):
+        spec = HIPDNN_AUTOTUNE if config.autotune else HIPDNN_OOTB
+        with child_run(spec, args, None) as (ootb, outputs):
             _record_ootb(row, ctx, ootb)
             row.ootb.correctness = _ootb_correctness(ctx, outputs)
             if config.oracle:
@@ -489,11 +367,7 @@ def run_single_provider_engine(
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
-        return _failed_row(
-            ProviderEngineResult.error_row,
-            row,
-            _failure_message(e, memory_at_start),
-        )
+        return _failed_row(ProviderEngineResult.error_row, row, failure_text(e))
 
     # The tuned run and profiling run in their own child processes after the
     # OOTB run, so tuning state and profiler overhead cannot reach the
@@ -591,6 +465,7 @@ def _run_profiling(
                 warmup_iters=ctx.config.warmup_iters,
                 metrics_config=ctx.config.metrics,
                 plugin_path=plugin_path,
+                autotune=ctx.config.autotune,
             )
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"

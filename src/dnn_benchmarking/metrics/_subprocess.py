@@ -24,10 +24,10 @@ naming the (graph, engine) it happened on.
 import os
 import signal
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..common.run_state import run_state_dir
 from ._diagnostic import warn_once
 
 # Lines of captured output kept in ``error_tail``.
@@ -187,7 +187,7 @@ def run_tool(
     try:
         # Each pass is a GPU run of its own: it starts with a new, empty
         # MIOpen user database, deleted after the pass.
-        with tempfile.TemporaryDirectory(prefix="dnn-bench-miopen-db-") as user_db:
+        with run_state_dir("dnn-bench-miopen-db-") as user_db:
             env = dict(os.environ, MIOPEN_USER_DB_PATH=user_db)
             proc = run_capped([binary, *args], timeout_s or None, env=env)
     except subprocess.TimeoutExpired as e:

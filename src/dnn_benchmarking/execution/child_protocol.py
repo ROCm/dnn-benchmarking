@@ -3,9 +3,11 @@
 
 """Contract between the suite runner and its child scripts.
 
-Every hipDNN engine row runs its plans in child processes: the OOTB plan in
-``cli/hipdnn_child.py`` and, with ``--oracle``, the tuned plan in the same
-script with ``--tuned``. ``cli/pytorch_tuned_child.py`` times tuned PyTorch.
+Every GPU run is a child process. A hipDNN engine row runs its OOTB plan in
+``cli/hipdnn_child.py`` and, with ``--oracle``, its tuned plan in the same
+script with ``--tuned``. A PyTorch row (``--runtime pytorch`` or the
+``--validate pytorch`` reference) runs in ``cli/pytorch_child.py`` the same
+way.
 Each child starts with a new, empty MIOpen user database (its private
 directory), so no Find result of one run reaches another. MIOpen reads the
 database path once per process, so only a new process can start empty.
@@ -16,13 +18,15 @@ module. It holds:
 - the options that every child takes (:func:`child_parser`);
 - the files that a child writes in its private directory and that the
   parent reads: ``result.json`` (:func:`write_result`,
-  :func:`read_child_result`), the saved outputs (:func:`output_file`), and
-  ``failure.json`` (:func:`run_reporting_failures`, :func:`read_failure`),
-  which carries a failure across the process boundary as the exception that
-  the parent raises again;
-- the environment that the parent sets and the child checks
-  (:class:`ChildEnv`, :data:`HIPDNN_OOTB_ENV`, :data:`HIPDNN_TUNED_ENV`,
-  :data:`PYTORCH_TUNED_ENV`).
+  :func:`read_child_result`), the saved outputs (:func:`save_outputs`,
+  :func:`output_file`), and ``failure.json`` (:func:`run_reporting_failures`,
+  :func:`read_failure`), which carries a failure across the process boundary
+  as the exception that the parent raises again;
+- the kinds of child run (:class:`ChildSpec`: :data:`HIPDNN_OOTB`,
+  :data:`HIPDNN_TUNED`, :data:`PYTORCH_OOTB`, :data:`PYTORCH_TUNED`), each
+  with the environment that the parent sets and the child checks
+  (:class:`ChildEnv`). The parent sets no selection variable in its own
+  environment.
 
 The hipDNN child imports this module, so it must not import ``torch``.
 """
@@ -30,13 +34,17 @@ The hipDNN child imports this module, so it must not import ``torch``.
 import argparse
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol
+
+import numpy as np
 
 from ..common.exceptions import UnsupportedGraphError
+from ..common.pytorch_tuning import PYTORCH_SELECTION_ENV
 from ..config.benchmark_config import TimingPolicy
+from ..graph.tensor_info import TensorInfo
 from ..reporting.statistics import BenchmarkStats, TimingInfo
 from .timing import Measurement, StallFallbackError
 
@@ -119,18 +127,22 @@ class ChildEnv:
         env.update({name: value(state_dir) for name, value in self.in_dir.items()})
         return env
 
-    def check(self) -> None:
-        """Raise unless the parent set this environment.
+    def check(self, state_dir: Path) -> None:
+        """Raise unless the parent set this environment for ``state_dir``.
 
         Raises:
-            RuntimeError: A variable is missing or empty, or a ``fixed``
-                variable has another value. The message names each one.
+            RuntimeError: A variable is missing, or has another value than
+                :meth:`build` gives for ``state_dir``. The message names
+                each one.
         """
+        expected = {
+            **self.fixed,
+            **{name: value(str(state_dir)) for name, value in self.in_dir.items()},
+        }
         wrong = [
             f"{name}={os.environ.get(name)!r}"
-            for name in [*self.fixed, *self.in_dir]
-            if not os.environ.get(name)
-            or (name in self.fixed and os.environ[name] != self.fixed[name])
+            for name, value in expected.items()
+            if os.environ.get(name) != value
         ]
         if wrong:
             raise RuntimeError(f"child environment not set by the parent: {wrong}")
@@ -140,26 +152,45 @@ def _same_dir(state_dir: str) -> str:
     return state_dir
 
 
-#: OOTB hipDNN child: no hipDNN disk cache (as in the parent) and a private,
-#: empty MIOpen user database, so the row selects its kernel on its own.
+#: OOTB hipDNN child: the heuristic selection (benchmarking forced off, so a
+#: shell value cannot turn it on), no hipDNN disk cache, and a private, empty
+#: MIOpen user database, so the row selects its kernel on its own.
 HIPDNN_OOTB_ENV = ChildEnv(
-    fixed={"HIPDNN_DISABLE_CACHE": "1"},
+    fixed={"HIPDNN_FORCE_BENCHMARKING": "0", "HIPDNN_DISABLE_CACHE": "1"},
     in_dir={"MIOPEN_USER_DB_PATH": _same_dir},
 )
 
-#: Tuned-hipDNN child: benchmarking on for every plan, no disk cache, and a
-#: private MIOpen user database. The search then neither reuses earlier
-#: tuning nor leaves entries that a later OOTB run would read.
-HIPDNN_TUNED_ENV = ChildEnv(
+#: hipDNN child that benchmarks: the ``--autotune`` row and the ``--oracle``
+#: tuned run. Benchmarking on for every plan, no disk cache, and a private
+#: MIOpen user database. The search then neither reuses earlier tuning nor
+#: leaves entries that a later OOTB run would read.
+HIPDNN_BENCHMARKING_ENV = ChildEnv(
     fixed={"HIPDNN_FORCE_BENCHMARKING": "1", "HIPDNN_DISABLE_CACHE": "1"},
     in_dir={"MIOPEN_USER_DB_PATH": _same_dir},
 )
 
-#: Tuned-PyTorch child: TunableOp tunes GEMMs on first use, into a private
-#: results file. MIOpen's user database is private for the same reason as
-#: for hipDNN.
+#: OOTB PyTorch child (a ``--runtime pytorch`` row or the ``--validate
+#: pytorch`` reference): the PyTorch selection settings, TunableOp off (a
+#: value inherited from the shell would tune or reuse results), and a
+#: private, empty MIOpen user database.
+PYTORCH_OOTB_ENV = ChildEnv(
+    fixed={
+        **PYTORCH_SELECTION_ENV,
+        "PYTORCH_TUNABLEOP_ENABLED": "0",
+        "PYTORCH_TUNABLEOP_TUNING": "0",
+    },
+    in_dir={"MIOPEN_USER_DB_PATH": _same_dir},
+)
+
+#: Tuned-PyTorch child: the PyTorch selection settings, and TunableOp tunes
+#: GEMMs on first use, into a private results file. MIOpen's user database is
+#: private for the same reason as for hipDNN.
 PYTORCH_TUNED_ENV = ChildEnv(
-    fixed={"PYTORCH_TUNABLEOP_ENABLED": "1", "PYTORCH_TUNABLEOP_TUNING": "1"},
+    fixed={
+        **PYTORCH_SELECTION_ENV,
+        "PYTORCH_TUNABLEOP_ENABLED": "1",
+        "PYTORCH_TUNABLEOP_TUNING": "1",
+    },
     in_dir={
         "PYTORCH_TUNABLEOP_FILENAME": lambda d: os.path.join(
             d, "tunableop_results.csv"
@@ -167,6 +198,97 @@ PYTORCH_TUNED_ENV = ChildEnv(
         "MIOPEN_USER_DB_PATH": _same_dir,
     },
 )
+
+
+@dataclass(frozen=True)
+class ChildSpec:
+    """One kind of child run: the script, the environment that the parent
+    sets for it, and the script flags that select it.
+
+    The parent starts a child only from a spec, and the script checks the
+    environment of the spec that its flags select (:func:`select_spec`), so
+    a script never runs with the environment of another kind.
+
+    Attributes:
+        tuned: The ``--oracle`` tuned run (``--tuned``): the script retries
+            without the stall gate instead of failing.
+        autotune: The ``--autotune`` row (``--autotune``).
+    """
+
+    label: str
+    module: str
+    env: ChildEnv
+    tuned: bool = False
+    autotune: bool = False
+
+    def flags(self) -> List[str]:
+        """The script flags that select this spec."""
+        return [
+            flag
+            for flag, on in (("--tuned", self.tuned), ("--autotune", self.autotune))
+            if on
+        ]
+
+
+HIPDNN_OOTB = ChildSpec("hipDNN", "hipdnn_child", HIPDNN_OOTB_ENV)
+HIPDNN_AUTOTUNE = ChildSpec(
+    "hipDNN autotune", "hipdnn_child", HIPDNN_BENCHMARKING_ENV, autotune=True
+)
+HIPDNN_TUNED = ChildSpec(
+    "tuned hipDNN", "hipdnn_child", HIPDNN_BENCHMARKING_ENV, tuned=True
+)
+PYTORCH_OOTB = ChildSpec("PyTorch", "pytorch_child", PYTORCH_OOTB_ENV)
+PYTORCH_TUNED = ChildSpec(
+    "tuned PyTorch", "pytorch_child", PYTORCH_TUNED_ENV, tuned=True
+)
+
+#: Every kind of child run.
+ALL_SPECS = (HIPDNN_OOTB, HIPDNN_AUTOTUNE, HIPDNN_TUNED, PYTORCH_OOTB, PYTORCH_TUNED)
+
+#: Name prefixes of variables that hipDNN, MIOpen or PyTorch read to choose
+#: a kernel. A child inherits every variable of the parent except the ones
+#: its spec sets, so a shell value with one of these prefixes reaches every
+#: run.
+_SELECTION_PREFIXES = ("HIPDNN_", "MIOPEN_", "PYTORCH_", "TORCH_ROCM_")
+
+#: Inherited names with those prefixes that do not choose a kernel: cache
+#: locations (``cli.main`` sets them) and logging.
+_NOT_SELECTION = frozenset({"MIOPEN_CUSTOM_CACHE_DIR", "HIPDNN_CACHE_DIR"})
+
+
+def inherited_selection_env() -> Dict[str, str]:
+    """Shell variables that every child inherits and that can change the
+    kernel a run selects.
+
+    Variables that a spec sets are not inherited and are not listed.
+    """
+    set_by_specs = {
+        name for spec in ALL_SPECS for name in (*spec.env.fixed, *spec.env.in_dir)
+    }
+    return {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name.startswith(_SELECTION_PREFIXES)
+        and name not in set_by_specs
+        and name not in _NOT_SELECTION
+        and "LOG" not in name
+    }
+
+
+def select_spec(args: argparse.Namespace, *specs: ChildSpec) -> ChildSpec:
+    """The spec among ``specs`` (those of one script) that the parsed flags
+    select.
+
+    Raises:
+        RuntimeError: No spec of the script has these flags.
+    """
+    for spec in specs:
+        if (spec.tuned, spec.autotune) == (args.tuned, args.autotune):
+            return spec
+    raise RuntimeError(
+        f"no {specs[0].module} run with --tuned={args.tuned} "
+        f"--autotune={args.autotune}"
+    )
 
 
 def _timing_policy(text: str) -> TimingPolicy:
@@ -177,7 +299,8 @@ def child_parser(prog: str) -> argparse.ArgumentParser:
     """Argument parser with the options that every child script takes.
 
     ``--timing-policy`` is the full ``TimingPolicy`` as a JSON object,
-    ``stall_gate`` included.
+    ``stall_gate`` included. ``--tuned`` selects the tuned spec of the script
+    (:class:`ChildSpec`).
     """
     parser = argparse.ArgumentParser(prog=prog)
     parser.add_argument("--graph", required=True, type=Path)
@@ -189,12 +312,43 @@ def child_parser(prog: str) -> argparse.ArgumentParser:
         help="TimingPolicy fields as a JSON object",
     )
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--save-outputs", action="store_true")
+    parser.add_argument("--clocks", action="store_true")
+    parser.add_argument("--tuned", action="store_true")
+    parser.add_argument("--autotune", action="store_true")
     return parser
 
 
 def output_file(out_dir: Path, uid: int) -> Path:
     """Path of the saved output tensor ``uid`` (a NumPy ``.npy`` file)."""
     return out_dir / f"output_{uid}.npy"
+
+
+class OutputBuffers(Protocol):
+    """The buffer-manager methods that :func:`save_outputs` uses (hipDNN and
+    PyTorch buffer managers)."""
+
+    def zero_outputs(self) -> None: ...
+
+    def get_output_tensors(self) -> List[TensorInfo]: ...
+
+    def get_output_data(self, uid: int) -> Optional[np.ndarray]: ...
+
+
+def save_outputs(
+    out_dir: Path, buffers: OutputBuffers, run_once: Callable[[], None]
+) -> None:
+    """Run the graph once more on zeroed outputs; save each output tensor.
+
+    The timed loop leaves the outputs of its last launch, which validation
+    must not see, so the run starts from zeros.
+    """
+    buffers.zero_outputs()
+    run_once()
+    for tensor_info in buffers.get_output_tensors():
+        data = buffers.get_output_data(tensor_info.uid)
+        if data is not None:
+            np.save(output_file(out_dir, tensor_info.uid), data)
 
 
 def run_reporting_failures(out_dir: Path, body: Callable[[], None]) -> int:
@@ -246,6 +400,8 @@ class ChildResult:
     clocks_after: Optional[Dict[str, Any]] = None
     #: hipDNN children only.
     tuning: Optional[TuningQuery] = None
+    #: Executor notes for the row's ``warnings`` (PyTorch children).
+    notes: List[str] = field(default_factory=list)
 
 
 def write_result(
@@ -255,6 +411,7 @@ def write_result(
     workspace_bytes: Optional[int] = None,
     clocks_after: Optional[Dict[str, Any]] = None,
     tuning: Optional[TuningQuery] = None,
+    notes: Optional[List[str]] = None,
 ) -> None:
     """Write the timed loop and the plan values as ``result.json``."""
     result = ChildResult(
@@ -265,6 +422,7 @@ def write_result(
         workspace_bytes=workspace_bytes,
         clocks_after=clocks_after,
         tuning=tuning,
+        notes=list(notes or []),
     )
     (out_dir / RESULT_FILE).write_text(json.dumps(asdict(result)))
 
@@ -281,4 +439,5 @@ def read_child_result(out_dir: Path) -> ChildResult:
         workspace_bytes=result["workspace_bytes"],
         clocks_after=result["clocks_after"],
         tuning=TuningQuery(**tuning) if tuning is not None else None,
+        notes=result["notes"],
     )

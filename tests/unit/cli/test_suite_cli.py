@@ -83,7 +83,7 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(suite_runner_cli, "collect_environment_info", lambda: {})
     # Runs set these process-wide. setenv records the caller's value so teardown
     # restores it; delenv then gives every test an unset starting point.
-    for name in (*pytorch_tuning.ENV_NAMES, "HIPDNN_FORCE_BENCHMARKING"):
+    for name in (*pytorch_tuning.PYTORCH_SELECTION_ENV, "HIPDNN_FORCE_BENCHMARKING"):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
@@ -485,7 +485,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "atol": None,
         "oracle": False,
         "autotune": False,
-        "benchmark_cache_dir": None,
+        "benchmark_work_dir": None,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,
@@ -522,20 +522,27 @@ def test_run_config_records_non_default_selection_and_validation(
     assert config["autotune"] is True
 
 
-def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -> None:
+def test_inherited_selection_variables_are_warned_and_recorded(
+    tmp_path, runtime, monkeypatch
+) -> None:
+    """A shell variable that every child inherits and that can change the
+    selection is named on stderr and kept in the result. Variables that a
+    child spec sets, caches and logging are not: they cannot change it."""
+    monkeypatch.setenv("MIOPEN_FIND_MODE", "1")
+    monkeypatch.setenv("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "1")
+    monkeypatch.setenv("MIOPEN_LOG_LEVEL", "6")
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "1")  # set by the hipDNN specs
     runtime(lambda path: _graph(path, [_passed()]))
-    plain, oracle = tmp_path / "plain.json", tmp_path / "oracle.json"
-    tuned = tmp_path / "tuned.json"
-    _run(_args("-o", str(plain)), _graphs(tmp_path, 1))
-    _run(_args("-o", str(oracle), "--oracle"), _graphs(tmp_path, 1))
-    _run(_args("-o", str(tuned), "--autotune"), _graphs(tmp_path, 1))
+    out = tmp_path / "out.json"
 
-    assert SuiteResult.load(plain)["environment"]["selection_env"] is None
-    assert SuiteResult.load(oracle)["run"]["config"]["oracle"] is True
-    env = SuiteResult.load(oracle)["environment"]["selection_env"]
-    assert set(env) == set(suite_runner_cli._SELECTION_ENV)
-    env = SuiteResult.load(tuned)["environment"]["selection_env"]
-    assert env["HIPDNN_FORCE_BENCHMARKING"] == "1"
+    _, text = _run(_args("-o", str(out)), _graphs(tmp_path, 1))
+
+    recorded = SuiteResult.load(out)["environment"]["selection_env"]
+    assert recorded == {
+        "HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1",
+        "MIOPEN_FIND_MODE": "1",
+    }
+    assert "MIOPEN_FIND_MODE=1" in _warnings(text)
 
 
 def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
@@ -774,20 +781,6 @@ def test_final_write_survives_a_second_signal(
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
 
 
-@pytest.mark.parametrize(
-    "forced, warned", [(None, False), ("0", True)], ids=["unset", "env"]
-)
-def test_forced_benchmarking_warns_it_overrides_the_tuned_knob(
-    tmp_path, runtime, monkeypatch, forced, warned
-) -> None:
-    # Any value overrides the knob, "0" included: providers read it as a value.
-    if forced is not None:
-        monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", forced)
-    runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle"), _graphs(tmp_path, 1))
-    assert ("overrides the global.benchmarking knob" in _warnings(text)) == warned
-
-
 def test_empty_nodes_graph_is_a_graph_error(tmp_path, runtime) -> None:
     (empty,) = _graphs(tmp_path, 1)
     doc = json.loads(empty.read_text())
@@ -817,31 +810,17 @@ def test_internal_flags_are_hidden_from_help() -> None:
     assert "--internal-profiling-run" not in create_parser().format_help()
 
 
-_PYTORCH_ENV = dict.fromkeys(pytorch_tuning.ENV_NAMES, "1")
-
-
 @pytest.mark.parametrize(
-    "argv", [["--validate", "pytorch"], ["-r", "pytorch"]], ids=["validate", "runtime"]
+    "argv",
+    [[], ["--validate", "pytorch"], ["-r", "pytorch"]],
+    ids=["hipdnn", "validate", "runtime"],
 )
-def test_pytorch_runs_set_rocm_flags(tmp_path, runtime, argv) -> None:
+def test_no_run_sets_pytorch_selection_in_this_process(tmp_path, runtime, argv):
+    """The PyTorch settings go only to the PyTorch children, so hipDNN rows
+    and the CPU reference never run under them."""
     runtime(lambda path: _graph(path, [_passed()]))
     _run(_args(*argv), _graphs(tmp_path, 1))
-    assert {n: os.environ.get(n) for n in _PYTORCH_ENV} == _PYTORCH_ENV
-
-
-def test_shell_value_cannot_override_pytorch_flag(tmp_path, runtime, monkeypatch):
-    """The command line is the only control of what PyTorch rows measure."""
-    monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", "0")
-    runtime(lambda path: _graph(path, [_passed()]))
-    _run(_args("-r", "pytorch"), _graphs(tmp_path, 1))
-    assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
-
-
-def test_hipdnn_only_run_leaves_pytorch_flags_unset(tmp_path, runtime) -> None:
-    """hipDNN rows must not run under PyTorch-only settings."""
-    runtime(lambda path: _graph(path, [_passed()]))
-    _run(_args(), _graphs(tmp_path, 1))
-    assert not any(n in os.environ for n in _PYTORCH_ENV)
+    assert not any(n in os.environ for n in pytorch_tuning.PYTORCH_SELECTION_ENV)
 
 
 @pytest.mark.parametrize(

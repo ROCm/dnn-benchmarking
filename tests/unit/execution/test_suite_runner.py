@@ -4,7 +4,6 @@
 """Tests for execution.suite_runner, asserted on the GraphResult it returns."""
 
 import io
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from dnn_benchmarking.cli import hipdnn_child
+from dnn_benchmarking.cli import child_script, hipdnn_child, pytorch_child
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -22,7 +21,9 @@ from dnn_benchmarking.config.benchmark_config import (
 )
 from dnn_benchmarking.execution import child_runner, suite_runner, timed_run
 from dnn_benchmarking.execution.child_protocol import (
-    HIPDNN_OOTB_ENV,
+    HIPDNN_AUTOTUNE,
+    HIPDNN_OOTB,
+    PYTORCH_OOTB,
     output_file,
     write_result,
 )
@@ -30,9 +31,7 @@ from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
-from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
-    CorrectnessResult,
     engine_id_hex,
     graph_id_for,
     oracle_speedup,
@@ -150,7 +149,7 @@ def fake(monkeypatch):
             f.events.append("executor_freed")
 
     class BufferManager:
-        def __init__(self, tensor_infos, device=None):
+        def __init__(self, tensor_infos):
             pass
 
         def __enter__(self):
@@ -172,9 +171,6 @@ def fake(monkeypatch):
         def create_variant_pack(self):
             return {}
 
-        def get_output_tensor(self, uid):
-            return None
-
         def get_output_data(self, uid):
             f.events.append("read_output")
             return f.engine_output
@@ -187,34 +183,39 @@ def fake(monkeypatch):
             return f.clocks.pop(0) if f.clocks else None
 
     class Loader:
-        def load_json(self, path):
-            return GRAPH
+        def load(self, path):
+            return GRAPH, TENSORS
 
-        def validate(self, graph_json):
-            pass
-
-        def extract_tensor_info(self, graph_json):
-            return TENSORS
+    untuned = {
+        (f"dnn_benchmarking.cli.{spec.module}", tuple(spec.flags())): spec
+        for spec in (HIPDNN_OOTB, HIPDNN_AUTOTUNE, PYTORCH_OOTB)
+    }
+    scripts = {
+        "dnn_benchmarking.cli.hipdnn_child": hipdnn_child,
+        "dnn_benchmarking.cli.pytorch_child": pytorch_child,
+    }
 
     def run_capped(argv, timeout_s, env=None, capture_output=True):
-        """Run the real OOTB child script in this process, in its env."""
-        args = argv[3:]
+        """Run the real untuned child script in this process, in its env."""
+        module, args = argv[2], argv[3:]
         if "--tuned" in args:
             assert f.tuned_child is not None, "tuned child launched without fixture"
             return f.tuned_child(argv, timeout_s, env)
         f.child_envs.append(env)
+        flags = tuple(a for a in args if a == "--autotune")
+        child_env = untuned[(module, flags)].env
         with monkeypatch.context() as m:
-            for name in [*HIPDNN_OOTB_ENV.fixed, *HIPDNN_OOTB_ENV.in_dir]:
+            for name in [*child_env.fixed, *child_env.in_dir]:
                 m.setenv(name, env[name])
-            code = hipdnn_child.main(args)
+            code = scripts[module].main(args)
         return SimpleNamespace(returncode=code)
 
     monkeypatch.setattr(suite_runner, "Executor", Executor)
     monkeypatch.setattr(timed_run, "Executor", Executor)
     monkeypatch.setattr(timed_run, "BufferManager", BufferManager)
-    monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
-    monkeypatch.setattr(hipdnn_child, "GpuSmiProbe", Probe)
+    monkeypatch.setattr(child_script, "GpuSmiProbe", Probe)
     monkeypatch.setattr(hipdnn_child, "GraphLoader", Loader)
+    monkeypatch.setattr(pytorch_child, "GraphLoader", Loader)
     monkeypatch.setattr(hipdnn_child, "initialize_pip_rocm_runtime", lambda: None)
     monkeypatch.setattr(child_runner, "run_capped", run_capped)
     monkeypatch.setitem(
@@ -540,6 +541,22 @@ def test_oracle_tunes_each_engine_in_a_child_after_its_row_is_released(
         assert oracle_speedup(row) == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize(
+    "autotune, shell, expected", [(False, "1", "0"), (True, "0", "1")]
+)
+def test_engine_row_benchmarks_only_with_autotune(
+    fake, monkeypatch, autotune, shell, expected
+):
+    """The command line alone decides whether a row benchmarks its candidate
+    kernels: the child spec overrides a shell value."""
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", shell)
+
+    graph, _ = _run(autotune=autotune)
+
+    assert {r.status for r in graph.results} == {"success"}
+    assert {env["HIPDNN_FORCE_BENCHMARKING"] for env in fake.child_envs} == {expected}
+
+
 def test_every_gpu_run_starts_with_its_own_empty_miopen_user_db(
     fake, tuned_child, monkeypatch
 ):
@@ -849,58 +866,6 @@ def test_cpu_reference_runs_when_host_memory_cannot_be_judged(
     assert [e.verdict for e in engines] == ["passed", "passed"]
 
 
-def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
-    torch = pytest.importorskip("torch")
-    base = torch.arange(12, dtype=torch.float32)
-    view = base[4:8]
-
-    kept = suite_runner._owned(view)
-
-    assert torch.equal(kept, torch.tensor([4.0, 5.0, 6.0, 7.0]))
-    assert kept.untyped_storage().nbytes() == 4 * kept.element_size()
-    assert suite_runner._owned(base) is base
-
-
-@pytest.mark.parametrize("keep_device", [True, False])
-def test_pytorch_reference_outputs_keep_a_gpu_output_on_the_device(keep_device):
-    torch = pytest.importorskip("torch")
-    values = torch.arange(4, dtype=torch.float32)
-    host_reads = []
-
-    class GpuTensor:
-        """A CUDA output on a CPU-only torch: detach() gives its values."""
-
-        is_cuda = True
-
-        def detach(self):
-            return values
-
-    class Buffers:
-        def get_tensors(self):
-            return {2: GpuTensor()}
-
-        def get_output_tensors(self):
-            return [_tensor(2, is_output=True)]
-
-        def get_output_data(self, uid):
-            host_reads.append(uid)
-            return REF.copy()
-
-    (output,) = suite_runner._pytorch_reference_outputs_from_buffer(
-        Buffers(), keep_device=keep_device
-    ).values()
-
-    if keep_device:
-        assert output.data is None
-        assert torch.equal(output.device_data, values)
-        assert host_reads == []
-    else:
-        assert output.device_data is None
-        np.testing.assert_array_equal(output.data, REF)
-        assert host_reads == [2]
-    np.testing.assert_array_equal(output.host_data(), REF)
-
-
 def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
     def no_handle():
         raise RuntimeError("plugin load failed")
@@ -1042,6 +1007,7 @@ def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):
             warmup_iters=3,
             metrics_config=metrics,
             plugin_path=Path("/a"),
+            autotune=False,
         )
     ]
     assert fake.events[-3:] == ["buffers_freed", "executor_freed", "profile"]

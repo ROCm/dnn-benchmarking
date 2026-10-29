@@ -65,7 +65,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `benchmark_cache_dir` | string or null | `--benchmark-cache-dir`: root of the compile caches (MIOpen kernels, comgr, XDG). `null`: the workspace or a temporary directory. |
+| `benchmark_work_dir` | string or null | `--benchmark-work-dir`. `cache/` holds the persistent compile caches (MIOpen kernels, comgr, XDG). `tmp/` holds the temporary engine state (MIOpen user find-DBs and child result files). Each engine run gets a new directory there and deletes it after the run. `dnn-benchmark` deletes its `tmp/` run directory when it ends. `null`: the compile caches go to the workspace or a temporary directory, and the engine state goes to the system temporary directory. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
@@ -99,7 +99,7 @@ The CLI collects these values one time, at suite start.
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
-| `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle` or `--autotune` is set. |
+| `selection_env` | object | Variables of the `dnn-benchmark` environment that every child run inherits and that can change a kernel selection: names that start with `HIPDNN_`, `MIOPEN_`, `PYTORCH_` or `TORCH_ROCM_`, without the variables that a child sets itself (`HIPDNN_FORCE_BENCHMARKING`, `HIPDNN_DISABLE_CACHE`, `MIOPEN_USER_DB_PATH`, the PyTorch and TunableOp settings), the cache directories and logging variables. Empty when the shell sets none. The tool also shows them in a warning at start. |
 
 ## summary
 

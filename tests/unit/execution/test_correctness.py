@@ -25,13 +25,10 @@ def _out(uid, data_type="float"):
 
 
 class _HostBM:
-    """Buffer manager whose outputs live on the host only."""
+    """Output source with host arrays, as a child's saved files."""
 
     def __init__(self, outputs):
         self._outputs = outputs
-
-    def get_output_tensor(self, uid):
-        return None
 
     def get_output_data(self, uid):
         return self._outputs.get(uid)
@@ -200,78 +197,3 @@ def test_read_failure_is_a_failure_not_a_crash():
 
     assert c.explicitly_failed
     assert c.error_message == "hipMemcpy failed"
-
-
-def test_device_reference_is_compared_without_host_copy():
-    torch = pytest.importorskip("torch")
-
-    class DeviceBM:
-        def get_output_tensor(self, uid):
-            return torch.ones(4)
-
-        def get_output_data(self, uid):
-            raise AssertionError("host copy made despite a device reference")
-
-    ref = {
-        1: ReferenceOutput(
-            data=np.ones(4, np.float32), tensor_uid=1, device_data=torch.ones(4)
-        )
-    }
-
-    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
-
-
-def test_device_e8m0_compares_code_steps():
-    torch = pytest.importorskip("torch")
-    e8m0 = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0 is None:
-        pytest.skip("torch has no float8_e8m0fnu")
-    expected = [1.0, 2.0, 0.5, 4.0]
-
-    class DeviceBM:
-        def get_output_tensor(self, uid):
-            # One step down on two elements, two steps down on the others.
-            return torch.tensor([0.5, 1.0, 0.125, 1.0]).to(e8m0)
-
-    ref = {
-        1: ReferenceOutput(
-            data=np.asarray(expected, np.float32),
-            tensor_uid=1,
-            device_data=torch.tensor(expected).to(e8m0),
-        )
-    }
-
-    c = check_correctness(DeviceBM(), [_out(1, "fp8_e8m0")], ref, "pytorch", _config())
-
-    assert c.n_mismatch == 2
-
-
-def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
-    """An OOM in the device compare is not a verdict: the host data decides,
-    with the host copy taken from a device-only reference."""
-    torch = pytest.importorskip("torch")
-    from dnn_benchmarking.execution import correctness
-
-    host_compare = correctness.compare
-
-    def compare(actual, expected, **kw):
-        if isinstance(actual, torch.Tensor):
-            raise torch.cuda.OutOfMemoryError("device compare")
-        return host_compare(actual, expected, **kw)
-
-    monkeypatch.setattr(correctness, "compare", compare)
-
-    class DeviceBM:
-        def get_output_tensor(self, uid):
-            return torch.zeros(4)
-
-        def get_output_data(self, uid):
-            return np.ones(4, np.float32)
-
-    ref = {
-        1: ReferenceOutput(
-            data=None, tensor_uid=1, device_data=torch.ones(4, dtype=torch.bfloat16)
-        )
-    }
-
-    assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed

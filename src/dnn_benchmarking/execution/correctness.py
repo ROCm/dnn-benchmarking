@@ -3,7 +3,7 @@
 
 """Compare one engine's outputs against the cached reference outputs."""
 
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -46,27 +46,18 @@ TOLERANCES = {
 
 
 class OutputSource(Protocol):
-    """The outputs of one run, as ``check_correctness`` reads them.
+    """The outputs of one run, as ``check_correctness`` reads them: the
+    files that a child saved (``child_runner.SavedOutputs``)."""
 
-    The buffer managers of the timed rows and the saved files of a tuned
-    child implement it.
-    """
-
-    def get_output_tensor(self, uid: int) -> Any:
-        """Output ``uid`` as a device tensor, or None to compare on the host."""
-        ...
-
-    def get_output_data(self, uid: int) -> Any:
+    def get_output_data(self, uid: int) -> Optional[np.ndarray]:
         """Output ``uid`` as a host array, or None when there is no output."""
         ...
 
 
-def _compared(data: Any, tensor_info: TensorInfo) -> Any:
+def _compared(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     """The values compare() sees: log2 for e8m0 (see TOLERANCES), else ``data``."""
     if tensor_info.dtype.name != "fp8_e8m0":
         return data
-    if hasattr(data, "detach"):
-        return data.detach().float().log2()
     return np.log2(np.asarray(data, dtype=np.float32))
 
 
@@ -106,27 +97,13 @@ def _compare_output(
     rtol: float,
     atol: float,
 ) -> Optional[ComparisonResult]:
-    """Compare on the GPU when both sides are device tensors, else on the host."""
-    if ref.device_data is not None:
-        actual = outputs.get_output_tensor(tensor_info.uid)
-        if actual is not None:
-            import torch
-
-            try:
-                return compare(
-                    _compared(actual, tensor_info),
-                    _compared(ref.device_data, tensor_info),
-                    rtol=rtol,
-                    atol=atol,
-                )
-            except torch.cuda.OutOfMemoryError:
-                pass  # Fall back to the host comparison.
+    """Compare output ``tensor_info`` with ``ref``; None without an output."""
     actual = outputs.get_output_data(tensor_info.uid)
     if actual is None:
         return None
     return compare(
         _compared(actual, tensor_info),
-        _compared(ref.host_data(), tensor_info),
+        _compared(ref.data, tensor_info),
         rtol=rtol,
         atol=atol,
     )
