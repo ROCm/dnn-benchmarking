@@ -859,9 +859,21 @@ class Setup:
     def _detect_gpu_arch() -> str:
         """The one GPU arch the ROCm tools report, "" when none.
 
-        gfx000 is the CPU agent. A host with several distinct archs has no
-        single right answer, so the user must choose.
+        A host with several distinct archs has no single right answer, so the
+        user must choose.
         """
+        tool, archs = Setup._detected_gpu_archs()
+        if len(archs) > 1:
+            fail(
+                f"{tool} reports several GPU architectures: {', '.join(archs)}.",
+                "Pass --gpu-arch to choose the one to install and build for.",
+            )
+        return archs[0] if archs else ""
+
+    @staticmethod
+    def _detected_gpu_archs() -> tuple:
+        """(tool, sorted GPU archs) from the first ROCm tool that reports any,
+        or ("", []). gfx000 is the CPU agent."""
         for tool in ("rocm_agent_enumerator", "rocminfo"):
             if not shutil.which(tool):
                 continue
@@ -877,14 +889,9 @@ class Setup:
                 warn(f"{tool} did not finish within {DETECT_TIMEOUT_S}s; ignoring it.")
                 continue
             archs = sorted(set(_GFX_ARCH.findall(out)) - {"gfx000"})
-            if len(archs) > 1:
-                fail(
-                    f"{tool} reports several GPU architectures: {', '.join(archs)}.",
-                    "Pass --gpu-arch to choose the one to install and build for.",
-                )
             if archs:
-                return archs[0]
-        return ""
+                return tool, archs
+        return "", []
 
     # -- ROCm wheel prefix discovery ----------------------------------------
 
@@ -1158,8 +1165,9 @@ class Setup:
         Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
         the TORCH_RECORD written when setup installed torch. A venv without
         the record (torch installed some other way) cannot be checked. With
-        ``check_arch`` and no --gpu-arch, the build uses the recorded arch;
-        with no --torch-index-url, the toolchain uses the recorded index.
+        ``check_arch`` and no --gpu-arch, the build uses the recorded arch,
+        and fails when the detected GPU has another arch; with no
+        --torch-index-url, the toolchain uses the recorded index.
         """
         try:
             record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
@@ -1171,7 +1179,21 @@ class Setup:
             and record
             and record.get("gpu_arch")
         ):
-            self.gpu_arch = record["gpu_arch"]
+            recorded = record["gpu_arch"]
+            # Detection alone, not self.gpu_arch: its Windows default is no
+            # evidence of the GPU in this host. A multi-arch host may keep a
+            # venv recorded for any of its archs.
+            _, detected = self._detected_gpu_archs()
+            if detected and recorded not in detected:
+                found = ", ".join(detected)
+                fail(
+                    f"this host has {found} GPU(s), but {self.venv_dir} was "
+                    f"set up for {recorded}.",
+                    "Pass --clean to set up the venv again (with --gpu-arch "
+                    f"when the host has several archs), or --gpu-arch {recorded} "
+                    f"to keep the {recorded} build.",
+                )
+            self.gpu_arch = recorded
             print(f"GPU arch: {self.gpu_arch} (recorded in {self.venv_dir})")
         if check_arch and not self.torch_index_url and record:
             self.resolved_torch_index_url = record.get(

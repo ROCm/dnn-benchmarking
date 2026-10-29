@@ -798,26 +798,78 @@ def test_fresh_torch_install_records_its_source(
         other.install_torch()
 
 
+def _host_gpu_archs(setup_env, monkeypatch, archs):
+    """rocm_agent_enumerator reports ``archs`` (plus the CPU agent)."""
+    real_run, real_which = setup_env.subprocess.run, setup_env.shutil.which
+
+    def which(name, *a, **kw):
+        if name in ("rocm_agent_enumerator", "rocminfo"):
+            return name if name == "rocm_agent_enumerator" and archs else None
+        return real_which(name, *a, **kw)
+
+    def run(cmd, *a, **kw):
+        if list(cmd) == ["rocm_agent_enumerator"]:
+            out = "\n".join(["gfx000", *archs]) + "\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(setup_env.shutil, "which", which)
+    monkeypatch.setattr(setup_env.subprocess, "run", run)
+
+
+@pytest.mark.parametrize(
+    "host, recorded",
+    [
+        ([], "gfx1201"),
+        (["gfx1201"], "gfx1201"),
+        # A multi-arch host keeps a venv recorded for one of its archs.
+        (["gfx90a", "gfx942"], "gfx942"),
+    ],
+    ids=["no-detection", "match", "multi-arch-match"],
+)
 def test_reused_venv_without_gpu_arch_builds_for_the_recorded_arch(
-    setup_env, tmp_path, monkeypatch
+    setup_env, tmp_path, monkeypatch, host, recorded
 ) -> None:
+    setup = _venv_recorded_for(setup_env, tmp_path, recorded)
+    _host_gpu_archs(setup_env, monkeypatch, host)
+
+    setup.install_torch()
+
+    assert setup.hip_arch_args == [
+        f"-DGPU_TARGETS={recorded}",
+        f"-DAMDGPU_TARGETS={recorded}",
+    ]
+
+
+@pytest.mark.parametrize("host", [["gfx942"], ["gfx90a", "gfx942"]])
+def test_reused_venv_refuses_a_detected_gpu_of_another_arch(
+    setup_env, tmp_path, monkeypatch, capsys, host
+) -> None:
+    setup = _venv_recorded_for(setup_env, tmp_path, "gfx1201")
+    _host_gpu_archs(setup_env, monkeypatch, host)
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: pytest.fail("pip ran"))
+
+    with pytest.raises(SystemExit) as exc:
+        setup.install_torch()
+
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert all(arch in err for arch in host) and "gfx1201" in err
+    assert "--clean" in err and "--gpu-arch gfx1201" in err
+
+
+def _venv_recorded_for(setup_env, tmp_path, arch):
+    """A Setup without --gpu-arch over a ROCm venv recorded for ``arch``."""
     args = setup_env.build_parser().parse_args(["--workspace", str(tmp_path / "ws")])
     setup = setup_env.Setup(args)
     setup.venv_dir.mkdir(parents=True)
     (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
         json.dumps(
-            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": "gfx1201"}
+            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": arch}
         )
     )
     setup.installed_torch_mode = "rocm"
-    monkeypatch.setattr(setup, "_detect_gpu_arch", lambda: "gfx942")
-
-    setup.install_torch()
-
-    assert setup.hip_arch_args == [
-        "-DGPU_TARGETS=gfx1201",
-        "-DAMDGPU_TARGETS=gfx1201",
-    ]
+    return setup
 
 
 def test_reused_venv_without_index_url_takes_the_toolchain_from_the_recorded_index(
