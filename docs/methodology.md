@@ -52,13 +52,26 @@ The stall gate has a watchdog. If the gate cannot arm, cannot be created, or
 the watchdog releases it before the host finished the enqueue, that sample
 includes host gaps and is invalid. The tool then discards every row of the
 graph and measures the whole graph again in `events` mode. A warning on
-stderr gives the cause. The rows of one graph are compared with each other,
-so they always share one mode.
+stderr gives the cause.
+
+Rows of one graph share one mode only when no per-row fallback applies.
+These cases give a graph rows in different modes:
+
+- The `--validate pytorch` reference row can fall back to `events` mode
+  alone (for example, `host sync in enqueue: ...`). The hipDNN engine rows of
+  the same graph stay in `staged` mode.
+- With `--oracle`, the tuned plan can use a different mode than the OOTB
+  plan. The oracle verdict is then `mixed-timing` (see `docs/usage.md`).
+- `--timing-block N` (N > 1) times every row of the run in `block` mode.
+
+Read `timing.mode` of each row before you compare two rows.
 
 In `events` mode each iteration records the start event, calls `enqueue()`,
-records the stop event and waits. The span then includes any host launch gap
-inside the graph. For a single short kernel the two modes agree. For a graph
-with many short kernels, `events` reads higher.
+records the stop event and waits. The device records the start event before
+the host finishes the enqueue. Thus the span includes the host submit time and
+any host launch gap inside the graph. The two modes agree only when the
+device time is much longer than the host submit time. For a short kernel or
+a graph with many short kernels, `events` reads higher.
 
 ## Submit time
 
@@ -401,28 +414,13 @@ hipDNN and `--runtime pytorch` on the same graphs, kernel median in ms:
 | relu | 0.155 | 0.156 |
 | rmsnorm | 0.010 | 0.032 |
 
-The tables above come from the review before this overhaul. The timed loop
-was already stall-gated then, but the warmup ran back to back, so the
-minimum-to-maximum ranges can include clock-ramp outliers.
+These runs used a back-to-back warmup, so the minimum-to-maximum ranges can
+include clock-ramp outliers.
 
-### Change against the previous loop (MI210, gfx90a)
-
-Every `graphs/*.json` ran on both runtimes with `--warmup 10 --iters 100`,
-once with the previous loop (`main` at 2af0454) and once with this loop,
-back to back, in two repeats (92 median pairs):
-
-- 85 of 92 medians agree within 2 %. On kernels near 14 us, 1 % is one
-  0.16 us step of the event timer.
-- The other pairs are bimodal kernels (CV 0.1 to 0.3), where the median moves
-  between the two modes. `conv_dgrad` on the PyTorch runtime read 26 % and
-  36 % lower; its mean moved less (43.1 to 43.0 us, 44.3 to 39.7 us).
-  `conv_dgrad` on `MIOPEN_ENGINE_DETERMINISTIC` read 5.4 % lower in both
-  repeats. Two other rows moved in one repeat only.
-- CV fell where the previous warmup left clock-ramp samples in the loop, for
-  example `conv_wgrad` 0.16 to 0.01 and `rmsnorm` on PyTorch 0.14 to 0.02.
-
-A time series that crosses this change can show a step on bimodal rows.
-Measure again after a timing change.
+Bimodal kernels (CV 0.1 to 0.3), for example `conv_dgrad`, have a median
+that can move between the two modes from one measurement to the next. Their
+mean moves less. Compare the mean and the CV of such a row before you report
+a change.
 
 ## Not yet
 
