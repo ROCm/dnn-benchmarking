@@ -143,6 +143,17 @@ dvc pull Workloads/corpus/Convolution/files.tar.gz.dvc  # corpus
 
 Keep credentials in `.dvc/config.local`, which git ignores.
 
+DVC keeps per-repository state in a shared site cache, `/var/tmp/dvc` on Linux.
+Where `/var/tmp` is read-only (some containers, including the hipDNN
+Slurm images), `dvc pull` fails with
+`[Errno 30] Read-only file system: '/var/tmp/dvc'`. Point the site cache at any
+writable directory:
+
+```bash
+export DVC_SITE_CACHE_DIR=/tmp/dvc-site    # or: dvc config --local core.site_cache_dir /tmp/dvc-site
+dvc pull
+```
+
 ## Tests
 
 ```bash
@@ -151,6 +162,46 @@ pytest                     # GPU host (ROCm or CUDA): unit + GPU tests
 ```
 
 See [AGENTS.md](AGENTS.md#tests) for the test tiers and markers.
+
+### Validating graphs
+
+`tools/check_deserialize.py` checks that graph JSON files deserialize and validate
+without building a plan or running a kernel. It has two validation levels:
+
+```bash
+# Pure-Python loader only (no hipDNN build required)
+python tools/check_deserialize.py --level json --src src 'Workloads/**/*.json'
+
+# Full deserialize + build/finalize the backend operation graph (needs a built hipDNN)
+python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+```
+
+Run this after adding new workload graphs to confirm hipDNN can load them. Paths may
+be globs, directories, or tarball-extracted trees; the script exits non-zero on any
+failure and prints the first failures with their error messages.
+
+Both levels also report an SDPA node (forward or backward) that sets neither
+`attn_scale_value` nor `scale_tensor_uid`. hipDNN reads an absent scale as 1.0,
+the same as cuDNN, so the graph is valid; it just measures 1.0 instead of the
+scale its source used, usually `1/sqrt(head_dim)`. Such nodes print as
+`NOSCALE` and still exit 0; pass `--strict-scale` to make them failures.
+A causal SDPA node with Sq = 1 whose effective diagonal is top-left attends
+only to key 0, which no decode step means (a decode step is unmasked or
+bottom-right). 80 graphs in the shipped corpus are written that way, so the
+check prints them as `DECODE` and still exits 0; pass `--strict-decode-mask`
+to make them failures once those graphs are regenerated. Other effective
+top-left causal nodes with Sq != Skv print a warning, because decode and
+chunked prefill workloads almost always use bottom-right alignment.
+
+"Effective" is the mask hipDNN resolves, which is not always the one the JSON
+names. `causal_mask: true` forces `left_bound = -1`, `right_bound = 0` and a
+top-left diagonal, overriding `diagonal_alignment` and any bounds written
+beside it, so `causal_mask: true` with `BOTTOM_RIGHT` still runs top-left.
+Write bottom-right as `causal_mask_bottom_right: true`, or with the bounds:
+`causal_mask: false`, `right_bound: 0`, `diagonal_alignment: BOTTOM_RIGHT`.
+Setting both causal flags fails the check, as hipDNN rejects that pair. Only
+`right_bound >= 0` masks the right side, so a node carrying a `left_bound`
+alone is a window that stays open on the right, which is never causal.
 
 ## Related tools
 
