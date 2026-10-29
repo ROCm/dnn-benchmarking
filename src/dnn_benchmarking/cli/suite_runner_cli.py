@@ -412,14 +412,20 @@ def _warn_oracle(reporter: Reporter, private: Path) -> None:
 def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
     """Set PyTorch's kernel-selection controls when PyTorch is timed or used.
 
-    Must run before the first PyTorch conv or SDPA call.
+    Must run before the first PyTorch conv or SDPA call. A replaced shell
+    value is a warning, so ``--quiet`` still shows it.
     """
     if not (
         config.runtime is RuntimeName.PYTORCH
         or config.validation.provider is ReferenceProviderName.PYTORCH
     ):
         return
-    effective = apply_pytorch_environment()
+    effective, replaced = apply_pytorch_environment()
+    for name, old in replaced.items():
+        reporter.warning(
+            f"PyTorch kernel selection: {name}={old!r} from the environment is "
+            f"replaced with {name}={effective[name]!r}"
+        )
     settings = ", ".join(f"{k}={v}" for k, v in effective.items())
     tuned = "; tuned runs use an isolated subprocess" if config.oracle else ""
     reporter.info(f"PyTorch kernel selection: {settings}{tuned}")

@@ -69,7 +69,7 @@ CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
     "n_total", "worst_output_uid", "message",
 }  # fmt: skip
-ORACLE_KEYS = PLAN_KEYS | {"tuning_available"}
+ORACLE_KEYS = PLAN_KEYS | {"tuning_available", "search_ran"}
 
 
 def _stats(median: float = 1.0) -> BenchmarkStats:
@@ -79,7 +79,8 @@ def _stats(median: float = 1.0) -> BenchmarkStats:
 def _oracle() -> OracleResult:
     # Distinct values, so a field swap in to_dict changes the output.
     return OracleResult(
-        tuning_available=False,
+        tuning_available=True,
+        search_ran=False,
         cpu_build_time_ms=7.0,
         timing=TimingInfo("events", "hip", 11, 30, 13.5),
         gpu_kernel_stats=_stats(1.0),
@@ -261,7 +262,8 @@ def test_full_row_values() -> None:
         "workspace_bytes": 2048,
         "tflops": 4.0,
         "gbps": 3000.0,
-        "tuning_available": False,
+        "tuning_available": True,
+        "search_ran": False,
         "correctness": {
             "match": False,
             "rtol": 2e-3,

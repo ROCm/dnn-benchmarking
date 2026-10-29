@@ -186,7 +186,9 @@ support an input.
 When PyTorch runs (`--runtime pytorch` or `--validate pytorch`), the CLI sets
 these PyTorch controls so the PyTorch baseline is not handicapped. The CLI
 overwrites any value already in the environment, so the command line is the
-only control. The tool prints the settings.
+only control. The tool prints the settings. When it replaces a different
+value from the environment, it shows a warning with the variable, the old
+value and the new value. `--quiet` does not hide this warning.
 
 | Setting | Why |
 |---|---|
@@ -211,6 +213,10 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
 - `tuning_available` is `true` only when the graph has a convolution or
   matmul node. The child searches no other op, so for example SDPA and
   pointwise graphs report `no-search`.
+- `search_ran` is `true` when the child left a MIOpen user database record
+  or a TunableOp result row. On ROCm, a conv or matmul graph without such a
+  record gives `false`. On CUDA, a conv graph without a record gives `null`,
+  because cuDNN keeps no record of its search.
 - `--profiling-timeout` also bounds the child. A child that times out gives
   `oracle_error` and no tuned result.
 - These settings also apply to the `--validate pytorch` reference kernels.
@@ -318,14 +324,22 @@ the tuned plan and keep the fastest. That launch is untimed and goes into
 `oracle.build_ms`. Both plans then get the same `--warmup` launches. Engines
 without the knob ignore it and report `tuning_available: false`.
 
+The knob does not guarantee a search. The MIOpen engine calls MIOpen Find,
+and MIOpen can answer from its system find database without a benchmark.
+After the child exits, the tool reads the private MIOpen user database of
+the child. MIOpen writes a record there only after a search. The result is
+`oracle.search_ran`: `true` (a record exists), `false` (no record from the
+MIOpen engine, or no knob), or `null` (the engine leaves no record, so the
+tool cannot tell).
+
 The `oracle` column shows `OOTB median / tuned median`. A value less than
 1.00x is a valid result. The column shows a label instead of a speedup when
 no speedup applies:
 
 | Label | Meaning |
 |---|---|
-| `no-search` | The engine exposes no `global.benchmarking` knob, or the PyTorch graph has no conv or matmul node, so the tuned run re-measured the OOTB plan. |
-| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned PyTorch child times in `staged` mode. |
+| `no-search` | `oracle.search_ran` is `false`. The engine exposes no `global.benchmarking` knob, the PyTorch graph has no conv or matmul node, or the tuned child left no search record where each search leaves one (for example, MIOpen answered from its system find database). The tuned run re-measured a fixed choice. |
+| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. Both tuned children use the stall-gate state of the run, so a stall-gate fallback does not cause this label. |
 | `invalid` | The OOTB or the tuned plan failed validation. |
 | `failed` | The tuned run did not produce a result (`oracle_error`). |
 | `n/a` | No comparison is available. |
@@ -333,7 +347,7 @@ no speedup applies:
 The summary shows the geometric mean of the valid speedups of the engine
 rows. The result file does not store the speedup. Divide
 `ootb.kernel.median_ms` by `oracle.kernel.median_ms`, and exclude rows with a
-failed `correctness` on either side, rows with `tuning_available: false` and
+failed `correctness` on either side, rows with `search_ran: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
@@ -359,10 +373,12 @@ dnn-benchmark -g graphs/sample_conv_fwd.json --oracle -v -o oracle.json
 ```
 
 The child needs its own buffers and workspace while the benchmark process
-holds the graph inputs and the reference outputs. `--profiling-timeout` also
-bounds the child. A child that fails or times out gives `oracle_error` and no
-tuned result. A stall-gate failure in the child remeasures the whole graph,
-like a stall in the OOTB loop.
+holds the graph inputs and the reference outputs. With `--cache-mode cold`,
+the benchmark process frees its 512 MiB flush buffer before the child starts.
+`--profiling-timeout` also bounds the child. A child that fails or times out
+gives `oracle_error` and no tuned result. A stall-gate failure in either child
+remeasures the whole graph, like a stall in the OOTB loop. After a stall-gate
+failure, both children time without the stall gate, as the OOTB rows do.
 
 ## Config files
 

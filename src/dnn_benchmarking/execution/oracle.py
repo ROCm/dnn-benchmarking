@@ -15,15 +15,18 @@ normal CLI (:func:`run_pytorch_tuned`). A failed tuned run sets
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..common import torch_support
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
 from ..metrics._diagnostic import warn_once
@@ -33,7 +36,12 @@ from ..reporting.statistics import BenchmarkStats, TimingInfo
 from ..reporting.suite_results import OracleResult, ProviderEngineResult
 from ..validation import ReferenceOutput
 from .correctness import check_correctness
-from .timing import Measurement, StallFallbackError
+from .timing import (
+    STALL_RERUN_REASON,
+    Measurement,
+    StallFallbackError,
+    release_flush_buffers,
+)
 
 #: Node types whose PyTorch kernel the tuned child searches: MIOpen
 #: exhaustive conv search (cudnn.benchmark) and TunableOp GEMMs.
@@ -45,6 +53,66 @@ _PYTORCH_TUNABLE_OPS = frozenset(
         "MatmulAttributes",
     }
 )
+
+
+#: hipDNN engine whose provider records every search it runs in the MIOpen
+#: user database. For it, an empty private database means that no search ran.
+_MIOPEN_ENGINE = "MIOPEN_ENGINE"
+
+
+def _has_records(path: Path) -> bool:
+    """True when one tuning-state file holds at least one record."""
+    name = path.name
+    if name.endswith(".udb"):
+        # SQLite user perf database; the table exists before the first record.
+        # Close it at once: an open file blocks the state directory removal
+        # on Windows.
+        try:
+            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
+                return db.execute("SELECT COUNT(*) FROM perf_db").fetchone()[0] > 0
+        except sqlite3.Error:
+            return False
+    if name.endswith((".ufdb.txt", ".udb.txt")):
+        header: Tuple[str, ...] = ()  # MIOpen text databases have no header
+    elif name.startswith("tunableop_results") and name.endswith(".csv"):
+        header = ("Validator",)
+    else:
+        return False
+    lines = path.read_text(errors="replace").splitlines()
+    return any(line.strip() and not line.startswith(header) for line in lines)
+
+
+def search_recorded(state_dir: Path) -> bool:
+    """True when a tuned child left a search record in its private state.
+
+    MIOpen writes its user database (``MIOPEN_USER_DB_PATH``) only after a
+    search: a find record (``*.ufdb.txt``) when Find benchmarks the solvers,
+    and a perf record (``*.udb.txt``, SQLite ``*.udb``) when it tunes a
+    solver. An answer from the system find database writes neither.
+    TunableOp writes one result row per tuned GEMM; ``Validator`` rows are
+    its header. Reading the files after the child exits adds nothing to the
+    timed loop.
+    """
+    return state_dir.is_dir() and any(
+        _has_records(path) for path in state_dir.iterdir() if path.is_file()
+    )
+
+
+def _search_ran(
+    recorded: bool, tuning_available: bool, every_search_recorded: bool
+) -> Optional[bool]:
+    """Three-state ``search_ran``.
+
+    Without the knob the tuned run re-measures the OOTB choice, even when the
+    provider recorded its own selection work, so that is no search. Else a
+    record proves a search, and no record where every search leaves one
+    proves none. Else unknown.
+    """
+    if not tuning_available:
+        return False
+    if recorded:
+        return True
+    return False if every_search_recorded else None
 
 
 def _record_error(row: ProviderEngineResult, what: str, e: Exception) -> None:
@@ -69,11 +137,15 @@ def _run_child(
 ) -> Dict[str, Any]:
     """Run a tuned child and return the JSON document it wrote to ``output``.
 
+    Frees this process's cold-cache flush buffer first, so the child gets the
+    device memory the OOTB row had; the next cold iteration reallocates it.
+
     Raises:
         RuntimeError: If the child times out (``--profiling-timeout``) or
             writes no output; the message carries its last error line.
     """
     timeout_s = config.metrics.profiling_timeout_s or None
+    release_flush_buffers()
     try:
         proc = run_capped(argv, timeout_s, env=env)
     except subprocess.TimeoutExpired:
@@ -182,10 +254,16 @@ def run_hipdnn_tuned(
             if reference_outputs is not None:
                 with np.load(state / "outputs.npz") as saved:
                     outputs = {int(uid): saved[uid] for uid in saved.files}
+            recorded = search_recorded(state / "miopen")
 
         m = Measurement(**result["measurement"])
         oracle = OracleResult(
             tuning_available=result["tuning_available"],
+            search_ran=_search_ran(
+                recorded,
+                result["tuning_available"],
+                every_search_recorded=row.engine_name == _MIOPEN_ENGINE,
+            ),
             cpu_build_time_ms=result["cpu_build_time_ms"],
             timing=TimingInfo.from_measurement(m),
             gpu_kernel_stats=BenchmarkStats.from_timings(m.kernel_ms),
@@ -220,8 +298,9 @@ def _pytorch_tuned_argv(
     """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle.
 
     The child's untimed first launch runs the tuning search, so it gets the
-    same warmup and sampling settings as the OOTB row. It keeps the
-    selection variables its parent sets (``--allow-selection-env``).
+    same warmup and sampling settings as the OOTB row, and the same stall-gate
+    state: after a stall-gate fallback both plans time unstalled. It keeps
+    the selection variables its parent sets (``--allow-selection-env``).
     """
     argv = [
         sys.executable,
@@ -253,15 +332,23 @@ def _pytorch_tuned_argv(
     ]
     if config.pytorch_rocm_fa_library is not None:
         argv += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
+    if not config.timing_policy.stall_gate:
+        argv.append("--no-stall-gate")
     return argv
 
 
-def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str, Any]:
-    """Time tuned PyTorch in a fresh process and return its result row.
+def _run_pytorch_tuned_child(
+    graph_path: Path, config: SuiteConfig
+) -> Tuple[Dict[str, Any], bool]:
+    """Time tuned PyTorch in a fresh process.
 
     The child owns every piece of tuning state (conv algorithm cache,
     TunableOp results, MIOpen user database), and the temporary directory
     that holds it is deleted afterwards, so no OOTB run can observe it.
+
+    Returns:
+        The child's result row, and whether the child left a search record
+        (:func:`search_recorded`).
 
     Raises:
         RuntimeError: If the child fails, times out (``--profiling-timeout``)
@@ -278,12 +365,13 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
             output,
             config,
         )
+        recorded = search_recorded(Path(state_dir))
     rows = [row for graph in document["graphs"] for row in graph["results"]]
     if len(rows) != 1:
         raise RuntimeError(f"tuned PyTorch child returned {len(rows)} rows")
     if rows[0]["status"] != "success":
         raise RuntimeError(rows[0]["message"] or rows[0]["status"])
-    return rows[0]
+    return rows[0], recorded
 
 
 def _stats(data: Optional[Dict[str, Any]], samples: int) -> Optional[BenchmarkStats]:
@@ -315,13 +403,32 @@ def run_pytorch_tuned(
     not stack on top of them. Tuned outputs are not validated: they never
     enter this process. ``tuning_available`` is true only when the graph has
     a conv or matmul node, the ops the child searches.
+
+    Raises:
+        StallFallbackError: The child remeasured its graph unstalled after a
+            stall-gate failure while this run still times staged; the suite
+            runner remeasures the whole graph unstalled. Other failures set
+            ``row.oracle_error``.
     """
     try:
-        plan = _run_pytorch_tuned_child(graph_path, config)["ootb"]
+        child_row, recorded = _run_pytorch_tuned_child(graph_path, config)
+        plan = child_row["ootb"]
+        if (
+            config.timing_policy.stall_gate
+            and plan["timing"]["fallback_reason"] == STALL_RERUN_REASON
+        ):
+            raise StallFallbackError("stall gate failed in the tuned PyTorch child")
+        node_types = {node.get("type") for node in graph_json.get("nodes") or []}
+        tuning_available = bool(node_types & _PYTORCH_TUNABLE_OPS)
+        # ROCm conv searches go through MIOpen Find, which records each one.
+        # cuDNN records nothing, so a CUDA conv search leaves no trace.
+        has_conv = any(t and t.startswith("Convolution") for t in node_types)
         oracle = OracleResult(
-            tuning_available=any(
-                node.get("type") in _PYTORCH_TUNABLE_OPS
-                for node in graph_json.get("nodes") or []
+            tuning_available=tuning_available,
+            search_ran=_search_ran(
+                recorded,
+                tuning_available,
+                every_search_recorded=not has_conv or torch_support.is_rocm_build(),
             ),
             timing=(timing := TimingInfo(**plan["timing"])),
             gpu_kernel_stats=_stats(plan["kernel"], timing.samples),
@@ -329,5 +436,7 @@ def run_pytorch_tuned(
         )
         _set_throughputs(oracle, row)
         row.oracle = oracle
+    except StallFallbackError:
+        raise  # The suite runner remeasures the whole graph unstalled.
     except Exception as e:
         _record_error(row, f"PyTorch on {graph_name}", e)

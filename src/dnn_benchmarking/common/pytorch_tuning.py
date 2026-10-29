@@ -16,7 +16,7 @@ hipDNN MIOpen plugin reads them too, so they would also change hipDNN rows.
 """
 
 import os
-from typing import Dict
+from typing import Dict, Tuple
 
 # Always on. Each value is read from the environment by PyTorch itself.
 _DEFAULT_ENV = {
@@ -31,15 +31,24 @@ _DEFAULT_ENV = {
 ENV_NAMES = tuple(_DEFAULT_ENV)
 
 
-def apply_pytorch_environment() -> Dict[str, str]:
-    """Set the always-on PyTorch ROCm controls and return them.
+def apply_pytorch_environment() -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Set the always-on PyTorch ROCm controls.
 
     Forced, not defaulted: the CLI is the only control, so a value inherited
     from the shell cannot change what PyTorch rows measure.
     Must run before the first conv or SDPA call, because PyTorch caches these.
+
+    Returns:
+        The settings in effect, and the inherited value of each setting
+        whose inherited value was different and is now replaced.
     """
+    replaced = {
+        name: os.environ[name]
+        for name, value in _DEFAULT_ENV.items()
+        if os.environ.get(name, value) != value
+    }
     os.environ.update(_DEFAULT_ENV)
-    return dict(_DEFAULT_ENV)
+    return dict(_DEFAULT_ENV), replaced
 
 
 def tuned_subprocess_env(state_dir: str) -> Dict[str, str]:

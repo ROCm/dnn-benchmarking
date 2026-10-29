@@ -285,11 +285,12 @@ The tool never removes samples because of a warning.
 tuned run produced a result. When the tuned run fails, `oracle_error` gives
 the reason and `oracle` is `null`.
 
-`oracle` is a [plan](#plan) object for the tuned run, with one key added:
+`oracle` is a [plan](#plan) object for the tuned run, with two keys added:
 
 | Key | Type | Meaning |
 |---|---|---|
-| `tuning_available` | bool | hipDNN: `true` when the engine exposes the `global.benchmarking` knob. PyTorch: `true` when the graph has a convolution or matmul node. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. `true` does not prove that a search ran: a provider can answer from its own database. |
+| `tuning_available` | bool | hipDNN: `true` when the engine exposes the `global.benchmarking` knob. PyTorch: `true` when the graph has a convolution or matmul node. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. `true` does not prove that a search ran: a provider can answer from its own database. See `search_ran`. |
+| `search_ran` | bool or null | `true` when the tuned child left a search record in its private state: a MIOpen user database record (`*.ufdb.txt`, `*.udb.txt`, `*.udb`) or a TunableOp result row. `false` when `tuning_available` is `false`, or when no record exists and each search leaves one: the hipDNN `MIOPEN_ENGINE`, and PyTorch on ROCm. `null` when the engine leaves no record, so the tool cannot tell (other hipDNN engines, a PyTorch conv on CUDA). The tool reads the files after the child exits, so the check does not change the timing. |
 
 - hipDNN rows: the tuned plan is a plan of the same engine, built with
   `global.benchmarking=1` in a child process. Its first launch samples the
@@ -299,7 +300,7 @@ the reason and `oracle` is `null`.
 
 The file does not store a speedup. Use `ootb.kernel.median_ms /
 oracle.kernel.median_ms`. Do not report a speedup when either `correctness`
-failed. Keep rows with `tuning_available: false` and `reference` rows out of
+failed. Keep rows with `search_ran: false` and `reference` rows out of
 averages.
 
 ### extra_metrics
