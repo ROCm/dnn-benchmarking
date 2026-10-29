@@ -96,6 +96,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_internal_profiling(args)
     if not args.graph:
         parser.error("--graph is required unless --config provides graphs")
+    # Report option errors as usage errors (exit 2) before a missing graph
+    # can give exit 1. run_suite_cli builds the config again from args.
+    from ..config.benchmark_config import SuiteConfig
+
+    try:
+        SuiteConfig.from_namespace(args)
+    except ValueError as e:
+        parser.error(str(e))
 
     from ..reporting.reporter import Reporter
 

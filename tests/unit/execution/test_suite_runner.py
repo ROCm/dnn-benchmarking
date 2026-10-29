@@ -84,6 +84,8 @@ class Fake:
         self.events = []
         self.torch_options = []
         self.torch_buffer_devices = []
+        self.buffer_devices = []  # device of each hipDNN BufferManager
+        self.torch_outputs_on_gpu = False
         self.torch_outputs_written = False
         self.policies = []
         # (call, handle, HIPDNN_DISABLE_CACHE) per plan build/run, in order;
@@ -148,7 +150,7 @@ def fake(monkeypatch):
 
     class BufferManager:
         def __init__(self, tensor_infos, device=None):
-            pass
+            f.buffer_devices.append(device)
 
         def __enter__(self):
             return self
@@ -244,6 +246,13 @@ def fake_torch(fake, monkeypatch):
             fake.torch_outputs_written = False
 
         def get_tensors(self):
+            if fake.torch_outputs_on_gpu:
+                import torch
+
+                return {
+                    t.uid: SimpleNamespace(is_cuda=True, detach=lambda: torch.zeros(4))
+                    for t in self._outputs
+                }
             return {t.uid: SimpleNamespace(is_cuda=False) for t in self._outputs}
 
         def get_output_tensors(self):
@@ -618,6 +627,7 @@ def test_failed_timed_reference(
 
     reference, engine = _validate(pytorch_sdpa_backend=sdpa_backend)[0].results
 
+    assert reference.role == "reference"
     assert reference.status == reference_status
     assert (reference.error_message or reference.skip_reason) == (
         "ExecutionError: PyTorch GPU not available"
@@ -879,6 +889,23 @@ def test_reference_warnings_go_on_the_reference_row_only(fake_torch, monkeypatch
 
     assert "manual op" in reference.warnings
     assert "manual op" not in (engine.warnings or [])
+
+
+@pytest.mark.parametrize("profiling, device", [(False, "cuda"), (True, None)])
+def test_profiled_run_keeps_host_only_references(
+    fake_torch, monkeypatch, profiling, device
+):
+    """A profiling child allocates its own VRAM, so a profiled run must not
+    keep the PyTorch reference (and hipDNN buffers) on the device."""
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
+    fake_torch.discovered = [1]
+    fake_torch.torch_outputs_on_gpu = True
+
+    _validate(metrics=MetricsConfig(perf=profiling))
+
+    assert fake_torch.buffer_devices == [device]
 
 
 def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):

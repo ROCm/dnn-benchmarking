@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, NoReturn, Optional
 
 from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
@@ -577,6 +577,30 @@ def _add_cli_option(
     groups[option.group].add_argument(*option.flags, **kwargs)
 
 
+#: Flags that the result schema v2 overhaul renamed or removed.
+_RENAMED_FLAGS = {
+    "--backend": "use --runtime/-r",
+    "-b": "use --runtime/-r",
+    "--emit-trace": "use --trace",
+    "--metrics-tier": "use --metrics or --no-metrics",
+    "--cache-dir": "use --hipdnn-cache-dir",
+    "--oracle-mode": "use --oracle; the plan and exhaustive modes are removed",
+}
+_UNRECOGNIZED = "unrecognized arguments: "
+
+
+class _Parser(argparse.ArgumentParser):
+    """Adds a hint to the usage error for each renamed flag."""
+
+    def error(self, message: str) -> NoReturn:
+        if message.startswith(_UNRECOGNIZED):
+            tokens = message[len(_UNRECOGNIZED) :].split()
+            for flag in dict.fromkeys(t.split("=", 1)[0] for t in tokens):
+                if flag in _RENAMED_FLAGS:
+                    message += f"\n  {flag} was renamed: {_RENAMED_FLAGS[flag]}"
+        super().error(message)
+
+
 def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser:
     """Create the argument parser for dnn-benchmark CLI.
 
@@ -585,7 +609,7 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
             the parsed namespace. The CLI entry point uses this so config-file
             values can be merged as ``defaults < config < explicit CLI``.
     """
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="dnn-benchmark",
         usage="%(prog)s -g PATH [PATH ...] [options]\n"
         "       %(prog)s --config FILE [options]\n"

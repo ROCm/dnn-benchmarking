@@ -123,6 +123,13 @@ def run(cmd, *, env=None, check=True, **kwargs):
     return subprocess.run(list(cmd), env=env, check=check, **kwargs)
 
 
+#: Oldest CMake that builds everything setup builds. rocm-libraries needs
+#: 3.25.2 (CMakeLists.txt, CMakePresets.json "version": 6); the hipDNN Python
+#: bindings need 3.26 (projects/hipdnn/python/frontend_bindings/CMakeLists.txt).
+CMAKE_MIN_VERSION = (3, 26)
+_CMAKE_VERSION = re.compile(r"cmake version (\d+)\.(\d+)")
+
+
 def require_working_cmake() -> str:
     """Return the PATH-selected CMake executable after a startup check."""
     cmake = shutil.which("cmake")
@@ -131,7 +138,7 @@ def require_working_cmake() -> str:
     try:
         result = subprocess.run(
             [cmake, "--version"],
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
@@ -143,6 +150,19 @@ def require_working_cmake() -> str:
             f"cmake at {cmake} failed its startup check (exit {result.returncode}).",
             result.stderr.strip()
             or "Fix the selected cmake executable or PATH before retrying.",
+        )
+    floor = ".".join(map(str, CMAKE_MIN_VERSION))
+    found = _CMAKE_VERSION.search(result.stdout or "")
+    if found is None:
+        warn(f"cannot read the version of cmake at {cmake}; setup needs {floor}+.")
+    elif tuple(map(int, found.groups())) < CMAKE_MIN_VERSION:
+        # An old cmake fails later with only "Could not read presets ...:
+        # Unrecognized "version" field".
+        fail(
+            f"cmake at {cmake} is version {found.group(1)}.{found.group(2)}; "
+            f"setup needs cmake {floor} or later.",
+            f"Put a newer cmake first on PATH, for example from "
+            f"`python3 -m pip install 'cmake>={floor}'`.",
         )
     return cmake
 
@@ -285,18 +305,12 @@ for root in roots:
             if not lib_dir.is_dir() or not any(lib_dir.glob("libMIOpen.so*")):
                 continue
         elif kind == "core":
+            # Not gated on how amdsmi is packaged: since about rocm 10.1 the
+            # core wheel ships share/amd_smi/amdsmi without setup.py or
+            # pyproject.toml, and comgr and rocprofiler also use this prefix.
             if not child.name.startswith("_rocm_sdk_core"):
                 continue
-            amd_smi_dir = child.joinpath("share/amd_smi")
-            if not (
-                child.joinpath("lib").is_dir()
-                and any(child.joinpath("lib").glob("libamd_smi.so*"))
-                and amd_smi_dir.is_dir()
-                and (
-                    amd_smi_dir.joinpath("setup.py").is_file()
-                    or amd_smi_dir.joinpath("pyproject.toml").is_file()
-                )
-            ):
+            if not child.joinpath("lib").is_dir():
                 continue
         else:
             print(f"ERROR: unknown ROCm wheel prefix kind: {kind}", file=sys.stderr)
@@ -840,6 +854,11 @@ class Setup:
         return arch
 
     @functools.cached_property
+    def cmake(self) -> str:
+        """The checked cmake executable; the check runs once per Setup."""
+        return require_working_cmake()
+
+    @functools.cached_property
     def hip_arch_args(self):
         """GPU_TARGETS/AMDGPU_TARGETS flags for the HIP device-code builds.
 
@@ -859,9 +878,21 @@ class Setup:
     def _detect_gpu_arch() -> str:
         """The one GPU arch the ROCm tools report, "" when none.
 
-        gfx000 is the CPU agent. A host with several distinct archs has no
-        single right answer, so the user must choose.
+        A host with several distinct archs has no single right answer, so the
+        user must choose.
         """
+        tool, archs = Setup._detected_gpu_archs()
+        if len(archs) > 1:
+            fail(
+                f"{tool} reports several GPU architectures: {', '.join(archs)}.",
+                "Pass --gpu-arch to choose the one to install and build for.",
+            )
+        return archs[0] if archs else ""
+
+    @staticmethod
+    def _detected_gpu_archs() -> tuple:
+        """(tool, sorted GPU archs) from the first ROCm tool that reports any,
+        or ("", []). gfx000 is the CPU agent."""
         for tool in ("rocm_agent_enumerator", "rocminfo"):
             if not shutil.which(tool):
                 continue
@@ -877,14 +908,9 @@ class Setup:
                 warn(f"{tool} did not finish within {DETECT_TIMEOUT_S}s; ignoring it.")
                 continue
             archs = sorted(set(_GFX_ARCH.findall(out)) - {"gfx000"})
-            if len(archs) > 1:
-                fail(
-                    f"{tool} reports several GPU architectures: {', '.join(archs)}.",
-                    "Pass --gpu-arch to choose the one to install and build for.",
-                )
             if archs:
-                return archs[0]
-        return ""
+                return tool, archs
+        return "", []
 
     # -- ROCm wheel prefix discovery ----------------------------------------
 
@@ -978,6 +1004,27 @@ class Setup:
             (path / "setup.py").is_file() or (path / "pyproject.toml").is_file()
         )
 
+    def _link_wheel_amdsmi(self, package: Path, link: Path) -> bool:
+        """Put the SDK wheel's ready-made amdsmi package on the venv path.
+
+        pip cannot install it: it has no setup.py or pyproject.toml. The
+        package loads libamd_smi relative to its resolved path, so a symlink
+        keeps that lookup and a copy would break it.
+        """
+        print(f"Linking amdsmi Python bindings from {package}...")
+        try:
+            if link.is_symlink():  # stale link from an earlier setup
+                link.unlink()
+            link.symlink_to(package, target_is_directory=True)
+        except OSError as error:
+            warn(f"cannot link {link} to {package}: {error}")
+            return False
+        if self.amdsmi_importable():
+            return True
+        link.unlink()
+        warn(f"amdsmi from {package} does not import; trying other sources.")
+        return False
+
     def maybe_install_amdsmi(self, *prefixes: str) -> None:
         if self.amdsmi_importable():
             return
@@ -985,7 +1032,14 @@ class Setup:
         candidates = []
         prefix, status = self.find_rocm_wheel_prefix("core")
         if status == 0:
-            candidates.append(Path(prefix) / "share" / "amd_smi")
+            source = Path(prefix) / "share" / "amd_smi"
+            package = source / "amdsmi"
+            if self._is_amdsmi_source(source):
+                candidates.append(source)
+            elif (package / "__init__.py").is_file() and self._link_wheel_amdsmi(
+                package, Path(prefix).parent / "amdsmi"
+            ):
+                return
         elif status != 1:
             warn("ROCm SDK core discovery failed; skipping SDK amdsmi candidate.")
         candidates += [
@@ -1158,8 +1212,9 @@ class Setup:
         Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
         the TORCH_RECORD written when setup installed torch. A venv without
         the record (torch installed some other way) cannot be checked. With
-        ``check_arch`` and no --gpu-arch, the build uses the recorded arch;
-        with no --torch-index-url, the toolchain uses the recorded index.
+        ``check_arch`` and no --gpu-arch, the build uses the recorded arch,
+        and fails when the detected GPU has another arch; with no
+        --torch-index-url, the toolchain uses the recorded index.
         """
         try:
             record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
@@ -1171,7 +1226,21 @@ class Setup:
             and record
             and record.get("gpu_arch")
         ):
-            self.gpu_arch = record["gpu_arch"]
+            recorded = record["gpu_arch"]
+            # Detection alone, not self.gpu_arch: its Windows default is no
+            # evidence of the GPU in this host. A multi-arch host may keep a
+            # venv recorded for any of its archs.
+            _, detected = self._detected_gpu_archs()
+            if detected and recorded not in detected:
+                found = ", ".join(detected)
+                fail(
+                    f"this host has {found} GPU(s), but {self.venv_dir} was "
+                    f"set up for {recorded}.",
+                    "Pass --clean to set up the venv again (with --gpu-arch "
+                    f"when the host has several archs), or --gpu-arch {recorded} "
+                    f"to keep the {recorded} build.",
+                )
+            self.gpu_arch = recorded
             print(f"GPU arch: {self.gpu_arch} (recorded in {self.venv_dir})")
         if check_arch and not self.torch_index_url and record:
             self.resolved_torch_index_url = record.get(
@@ -1365,7 +1434,7 @@ class Setup:
         record.write_text(json.dumps(wanted) + "\n")
 
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
-        cmake = require_working_cmake()
+        cmake = self.cmake
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
@@ -1413,7 +1482,7 @@ class Setup:
     def build_and_install_bindings(
         self, install_prefix: str, toolchain_prefix: str
     ) -> None:
-        cmake = require_working_cmake()
+        cmake = self.cmake
         python_dir = HIPDNN_ROOT / "python"
         bindings_source = python_dir / "frontend_bindings"
         if not bindings_source.is_dir():
@@ -1758,6 +1827,10 @@ class Setup:
         if cuda:
             self.do_build = False
         self.confirm_build()
+        if self.do_build:
+            # Before any stage downloads wheels: an old cmake fails only at
+            # the hipDNN build, many minutes later.
+            self.cmake
 
         stages = [
             ("Virtual environment", self.setup_venv),

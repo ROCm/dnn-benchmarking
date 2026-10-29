@@ -2,7 +2,9 @@
 
 `setup_env.py` creates a virtual environment, installs PyTorch, builds hipDNN
 and the provider plugins, and installs dnn-benchmarking. It requires Python
-3.12 or newer. `python3 setup_env.py --help` lists every option.
+3.12 or newer. The source build also requires `cmake` 3.26 or newer and
+`ninja` on `PATH`; setup checks the `cmake` version before its first stage.
+`python3 setup_env.py --help` lists every option.
 
 ## Quick setup (ROCm)
 
@@ -37,7 +39,10 @@ stages are:
    libraries may need a GPU this host has not got). Setup fails when the
    package is absent.
 8. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
-   and link the wheel rocprofiler libraries.
+   and link the wheel rocprofiler libraries. A rocm-sdk-core wheel that ships
+   `share/amd_smi/amdsmi` without `setup.py` or `pyproject.toml` gets a
+   symlink `site-packages/amdsmi` to that package. Other sources are
+   installed with `pip install -e`.
 9. `Verify installation`.
 
 Then setup prints the `Profiling sources:` block. See
@@ -264,7 +269,13 @@ architecture in `<workspace>/.venv/dnn-bench-torch.json`. On a later run, an
 explicit `--gpu-arch` or `--torch-index-url` that differs from the record
 stops setup with an error that asks for `--clean`. Without them, a
 `--torch-mode rocm` run builds for the recorded GPU architecture and installs
-a missing rocm-sdk-devel from the recorded index. A venv without the record
+a missing rocm-sdk-devel from the recorded index. If no detected GPU has the
+recorded architecture, setup stops with an error that names the detected and
+the recorded architectures. Then pass `--clean` to set up the venv again (add
+`--gpu-arch` on a host with several architectures), or
+`--gpu-arch <recorded arch>` to keep the recorded build. When one of the
+detected GPUs has the recorded architecture, or setup detects no GPU, setup
+uses the recorded architecture. A venv without the record
 (PyTorch installed another way) cannot be checked; setup shows a warning
 instead. A different `--torch-mode` than the one in the venv also asks for
 `--clean`, including `--torch-mode none` on a venv that has PyTorch.

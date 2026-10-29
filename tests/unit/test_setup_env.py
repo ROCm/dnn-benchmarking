@@ -143,6 +143,65 @@ def test_superbuild_reuses_its_build_dir_only_for_the_same_configure_line(
     assert record == {"configure_args": configure[1:]}
 
 
+# --- cmake version -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "version, ok",
+    [
+        # 3.22 cannot read CMakePresets.json version 6 ("Unrecognized
+        # "version" field"); 3.25 cannot configure the hipDNN bindings.
+        ("3.22.1", False),
+        ("3.25.2", False),
+        ("3.26.0", True),
+        ("4.1.2", True),
+    ],
+)
+def test_cmake_below_the_build_floor_fails_before_the_build(
+    setup_env, monkeypatch, capsys, version, ok
+) -> None:
+    monkeypatch.setattr(setup_env.shutil, "which", lambda name: "/usr/bin/cmake")
+    monkeypatch.setattr(
+        setup_env.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 0, stdout=f"cmake version {version}\n\nCMake suite ...\n", stderr=""
+        ),
+    )
+    if ok:
+        assert setup_env.require_working_cmake() == "/usr/bin/cmake"
+        return
+    with pytest.raises(SystemExit):
+        setup_env.require_working_cmake()
+    err = capsys.readouterr().err
+    assert version.rsplit(".", 1)[0] in err and "3.26" in err
+
+
+def test_cmake_check_runs_before_the_first_stage(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    """A fresh workspace must not download wheels before an old cmake fails."""
+    setup = _setup(setup_env, tmp_path, "-y")
+    monkeypatch.setattr(
+        setup_env, "require_working_cmake", lambda: setup_env.fail("cmake too old")
+    )
+    monkeypatch.setattr(setup, "setup_venv", lambda: pytest.fail("a stage ran"))
+
+    with pytest.raises(SystemExit):
+        setup.run()
+
+
+def test_cmake_is_checked_once_per_setup(setup_env, tmp_path, monkeypatch) -> None:
+    checks = []
+    monkeypatch.setattr(
+        setup_env, "require_working_cmake", lambda: checks.append(1) or "cmake"
+    )
+    setup = _setup(setup_env, tmp_path)
+
+    assert (setup.cmake, setup.cmake) == ("cmake", "cmake")
+    assert checks == [1]
+
+
 # --- confirmation ------------------------------------------------------------
 
 
@@ -798,26 +857,78 @@ def test_fresh_torch_install_records_its_source(
         other.install_torch()
 
 
+def _host_gpu_archs(setup_env, monkeypatch, archs):
+    """rocm_agent_enumerator reports ``archs`` (plus the CPU agent)."""
+    real_run, real_which = setup_env.subprocess.run, setup_env.shutil.which
+
+    def which(name, *a, **kw):
+        if name in ("rocm_agent_enumerator", "rocminfo"):
+            return name if name == "rocm_agent_enumerator" and archs else None
+        return real_which(name, *a, **kw)
+
+    def run(cmd, *a, **kw):
+        if list(cmd) == ["rocm_agent_enumerator"]:
+            out = "\n".join(["gfx000", *archs]) + "\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(setup_env.shutil, "which", which)
+    monkeypatch.setattr(setup_env.subprocess, "run", run)
+
+
+@pytest.mark.parametrize(
+    "host, recorded",
+    [
+        ([], "gfx1201"),
+        (["gfx1201"], "gfx1201"),
+        # A multi-arch host keeps a venv recorded for one of its archs.
+        (["gfx90a", "gfx942"], "gfx942"),
+    ],
+    ids=["no-detection", "match", "multi-arch-match"],
+)
 def test_reused_venv_without_gpu_arch_builds_for_the_recorded_arch(
-    setup_env, tmp_path, monkeypatch
+    setup_env, tmp_path, monkeypatch, host, recorded
 ) -> None:
+    setup = _venv_recorded_for(setup_env, tmp_path, recorded)
+    _host_gpu_archs(setup_env, monkeypatch, host)
+
+    setup.install_torch()
+
+    assert setup.hip_arch_args == [
+        f"-DGPU_TARGETS={recorded}",
+        f"-DAMDGPU_TARGETS={recorded}",
+    ]
+
+
+@pytest.mark.parametrize("host", [["gfx942"], ["gfx90a", "gfx942"]])
+def test_reused_venv_refuses_a_detected_gpu_of_another_arch(
+    setup_env, tmp_path, monkeypatch, capsys, host
+) -> None:
+    setup = _venv_recorded_for(setup_env, tmp_path, "gfx1201")
+    _host_gpu_archs(setup_env, monkeypatch, host)
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: pytest.fail("pip ran"))
+
+    with pytest.raises(SystemExit) as exc:
+        setup.install_torch()
+
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert all(arch in err for arch in host) and "gfx1201" in err
+    assert "--clean" in err and "--gpu-arch gfx1201" in err
+
+
+def _venv_recorded_for(setup_env, tmp_path, arch):
+    """A Setup without --gpu-arch over a ROCm venv recorded for ``arch``."""
     args = setup_env.build_parser().parse_args(["--workspace", str(tmp_path / "ws")])
     setup = setup_env.Setup(args)
     setup.venv_dir.mkdir(parents=True)
     (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
         json.dumps(
-            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": "gfx1201"}
+            {"torch_index_url": setup_env.ROCM_TORCH_INDEX_URL, "gpu_arch": arch}
         )
     )
     setup.installed_torch_mode = "rocm"
-    monkeypatch.setattr(setup, "_detect_gpu_arch", lambda: "gfx942")
-
-    setup.install_torch()
-
-    assert setup.hip_arch_args == [
-        "-DGPU_TARGETS=gfx1201",
-        "-DAMDGPU_TARGETS=gfx1201",
-    ]
+    return setup
 
 
 def test_reused_venv_without_index_url_takes_the_toolchain_from_the_recorded_index(
@@ -855,6 +966,7 @@ def test_rejected_rerun_keeps_the_venv_activate_local(
     activate_local = setup.venv_dir / "bin" / "activate.local"
     activate_local.write_text("export ROCM_PATH=/wheel/prefix\n")
     monkeypatch.setattr(setup, "get_torch_mode", lambda: "rocm")
+    monkeypatch.setattr(setup_env, "require_working_cmake", lambda: "cmake")
 
     with pytest.raises(SystemExit):
         setup.run()
@@ -908,6 +1020,65 @@ def _installed_venv_package(setup, name: str, source: str) -> Path:
     package.mkdir()
     (package / "__init__.py").write_text(source)
     return package
+
+
+def _wheel_core(setup, packaged: bool) -> Path:
+    """A rocm-sdk-core wheel layout in the venv. ``packaged=False`` is the
+    layout since about rocm 10.1: share/amd_smi/amdsmi with no setup.py or
+    pyproject.toml."""
+    site = setup.probe("import sysconfig; print(sysconfig.get_path('purelib'))")
+    assert site.returncode == 0, site.stderr
+    core = Path(site.stdout.strip()) / "_rocm_sdk_core"
+    (core / "lib").mkdir(parents=True)
+    (core / "lib" / "libamd_smi.so.27").write_text("")
+    package = core / "share" / "amd_smi" / "amdsmi"
+    package.mkdir(parents=True)
+    # Like the real amdsmi_wrapper: the library is found relative to the
+    # resolved package path, so a copy of the package does not import.
+    (package / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "_lib = Path(__file__).resolve().parents[3] / 'lib' / 'libamd_smi.so.27'\n"
+        "if not _lib.is_file():\n"
+        "    raise ImportError(f'{_lib} not found')\n"
+    )
+    if packaged:
+        (package.parent / "pyproject.toml").write_text("")
+    return core
+
+
+@pytest.mark.parametrize("stale_link", [False, True])
+def test_amdsmi_from_an_unpackaged_core_wheel_is_importable(
+    setup_env, tmp_path, monkeypatch, capsys, stale_link
+) -> None:
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    setup, _ = _reuse_setup(setup_env, tmp_path)
+    core = _wheel_core(setup, packaged=False)
+    if stale_link:
+        # A link left by an earlier setup to a package that no longer exists.
+        (core.parent / "amdsmi").symlink_to(tmp_path / "gone", True)
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: pytest.fail("pip ran"))
+
+    setup.maybe_install_amdsmi()
+
+    assert setup.amdsmi_importable()
+    assert "not installed" not in capsys.readouterr().err
+
+
+def test_amdsmi_from_a_packaged_core_wheel_is_pip_installed(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    setup, _ = _reuse_setup(setup_env, tmp_path)
+    core = _wheel_core(setup, packaged=True)
+    installs = []
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: installs.append(a))
+
+    setup.maybe_install_amdsmi()
+
+    assert installs == [("install", "-e", str(core / "share" / "amd_smi"))]
 
 
 def test_reuse_without_installed_bindings_fails(setup_env, tmp_path, capsys) -> None:

@@ -313,6 +313,59 @@ def _print_table(
         print(line, file=out)
 
 
+def _check_shape(path: str, doc: Dict[str, Any]) -> None:
+    """Raise ValueError naming the file, the place and the key compare needs."""
+
+    def need(obj: Any, keys: Tuple[str, ...], where: str) -> None:
+        if not isinstance(obj, dict):
+            raise ValueError(f"{path}: malformed result file: {where} is not an object")
+        for key in keys:
+            if key not in obj:
+                raise ValueError(
+                    f"{path}: malformed result file: {where} has no key {key!r}"
+                )
+
+    need(doc, ("run", "environment", "graphs"), "the document")
+    need(doc["run"], ("config",), "run")
+    need(doc["environment"], (), "environment")
+    need(doc["run"]["config"], (), "run.config")
+    if not isinstance(doc["graphs"], list):
+        raise ValueError(f"{path}: malformed result file: graphs is not a list")
+    for i, graph in enumerate(doc["graphs"]):
+        need(graph, ("graph_id", "graph_name", "results"), f"graphs[{i}]")
+        if not isinstance(graph["results"], list):
+            raise ValueError(
+                f"{path}: malformed result file: graph {graph['graph_name']!r} "
+                "results is not a list"
+            )
+        for j, row in enumerate(graph["results"]):
+            where = f"graph {graph['graph_name']!r} results[{j}]"
+            need(row, ("role", "runtime", "engine", "verdict", "ootb"), where)
+            need(row["engine"], ("id", "name"), f"{where}.engine")
+            if row["ootb"] is None:
+                continue
+            need(row["ootb"], (), f"{where}.ootb")
+            for metric in ("kernel", "host"):
+                if row["ootb"].get(metric):
+                    stats = row["ootb"][metric]
+                    need(
+                        stats,
+                        ("median_ms", "p25_ms", "p75_ms"),
+                        f"{where}.ootb.{metric}",
+                    )
+
+
+def _load(path: str) -> Dict[str, Any]:
+    try:
+        doc = SuiteResult.load(path)
+    except (KeyError, TypeError) as e:
+        raise ValueError(
+            f"{path}: malformed result file: {type(e).__name__} {e}"
+        ) from None
+    _check_shape(path, doc)
+    return doc
+
+
 def main(argv: List[str]) -> int:
     """Entry point for ``dnn-benchmark compare``; returns the exit code."""
     try:
@@ -320,8 +373,8 @@ def main(argv: List[str]) -> int:
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 2
     try:
-        a, b = SuiteResult.load(args.a), SuiteResult.load(args.b)
-    except (OSError, ValueError, KeyError, TypeError) as e:
+        a, b = _load(args.a), _load(args.b)
+    except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     for w in _config_warnings(a, b):
