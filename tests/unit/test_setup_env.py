@@ -1022,6 +1022,65 @@ def _installed_venv_package(setup, name: str, source: str) -> Path:
     return package
 
 
+def _wheel_core(setup, packaged: bool) -> Path:
+    """A rocm-sdk-core wheel layout in the venv. ``packaged=False`` is the
+    layout since about rocm 10.1: share/amd_smi/amdsmi with no setup.py or
+    pyproject.toml."""
+    site = setup.probe("import sysconfig; print(sysconfig.get_path('purelib'))")
+    assert site.returncode == 0, site.stderr
+    core = Path(site.stdout.strip()) / "_rocm_sdk_core"
+    (core / "lib").mkdir(parents=True)
+    (core / "lib" / "libamd_smi.so.27").write_text("")
+    package = core / "share" / "amd_smi" / "amdsmi"
+    package.mkdir(parents=True)
+    # Like the real amdsmi_wrapper: the library is found relative to the
+    # resolved package path, so a copy of the package does not import.
+    (package / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "_lib = Path(__file__).resolve().parents[3] / 'lib' / 'libamd_smi.so.27'\n"
+        "if not _lib.is_file():\n"
+        "    raise ImportError(f'{_lib} not found')\n"
+    )
+    if packaged:
+        (package.parent / "pyproject.toml").write_text("")
+    return core
+
+
+@pytest.mark.parametrize("stale_link", [False, True])
+def test_amdsmi_from_an_unpackaged_core_wheel_is_importable(
+    setup_env, tmp_path, monkeypatch, capsys, stale_link
+) -> None:
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    setup, _ = _reuse_setup(setup_env, tmp_path)
+    core = _wheel_core(setup, packaged=False)
+    if stale_link:
+        # A link left by an earlier setup to a package that no longer exists.
+        (core.parent / "amdsmi").symlink_to(tmp_path / "gone", True)
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: pytest.fail("pip ran"))
+
+    setup.maybe_install_amdsmi()
+
+    assert setup.amdsmi_importable()
+    assert "not installed" not in capsys.readouterr().err
+
+
+def test_amdsmi_from_a_packaged_core_wheel_is_pip_installed(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    setup, _ = _reuse_setup(setup_env, tmp_path)
+    core = _wheel_core(setup, packaged=True)
+    installs = []
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: installs.append(a))
+
+    setup.maybe_install_amdsmi()
+
+    assert installs == [("install", "-e", str(core / "share" / "amd_smi"))]
+
+
 def test_reuse_without_installed_bindings_fails(setup_env, tmp_path, capsys) -> None:
     """Reuse builds no bindings, so an absent package cannot be a warning."""
     setup, prefix = _reuse_setup(setup_env, tmp_path)

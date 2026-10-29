@@ -39,7 +39,10 @@ stages are:
    libraries may need a GPU this host has not got). Setup fails when the
    package is absent.
 8. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
-   and link the wheel rocprofiler libraries.
+   and link the wheel rocprofiler libraries. A rocm-sdk-core wheel that ships
+   `share/amd_smi/amdsmi` without `setup.py` or `pyproject.toml` gets a
+   symlink `site-packages/amdsmi` to that package. Other sources are
+   installed with `pip install -e`.
 9. `Verify installation`.
 
 Then setup prints the `Profiling sources:` block. See

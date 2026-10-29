@@ -305,18 +305,12 @@ for root in roots:
             if not lib_dir.is_dir() or not any(lib_dir.glob("libMIOpen.so*")):
                 continue
         elif kind == "core":
+            # Not gated on how amdsmi is packaged: since about rocm 10.1 the
+            # core wheel ships share/amd_smi/amdsmi without setup.py or
+            # pyproject.toml, and comgr and rocprofiler also use this prefix.
             if not child.name.startswith("_rocm_sdk_core"):
                 continue
-            amd_smi_dir = child.joinpath("share/amd_smi")
-            if not (
-                child.joinpath("lib").is_dir()
-                and any(child.joinpath("lib").glob("libamd_smi.so*"))
-                and amd_smi_dir.is_dir()
-                and (
-                    amd_smi_dir.joinpath("setup.py").is_file()
-                    or amd_smi_dir.joinpath("pyproject.toml").is_file()
-                )
-            ):
+            if not child.joinpath("lib").is_dir():
                 continue
         else:
             print(f"ERROR: unknown ROCm wheel prefix kind: {kind}", file=sys.stderr)
@@ -1010,6 +1004,27 @@ class Setup:
             (path / "setup.py").is_file() or (path / "pyproject.toml").is_file()
         )
 
+    def _link_wheel_amdsmi(self, package: Path, link: Path) -> bool:
+        """Put the SDK wheel's ready-made amdsmi package on the venv path.
+
+        pip cannot install it: it has no setup.py or pyproject.toml. The
+        package loads libamd_smi relative to its resolved path, so a symlink
+        keeps that lookup and a copy would break it.
+        """
+        print(f"Linking amdsmi Python bindings from {package}...")
+        try:
+            if link.is_symlink():  # stale link from an earlier setup
+                link.unlink()
+            link.symlink_to(package, target_is_directory=True)
+        except OSError as error:
+            warn(f"cannot link {link} to {package}: {error}")
+            return False
+        if self.amdsmi_importable():
+            return True
+        link.unlink()
+        warn(f"amdsmi from {package} does not import; trying other sources.")
+        return False
+
     def maybe_install_amdsmi(self, *prefixes: str) -> None:
         if self.amdsmi_importable():
             return
@@ -1017,7 +1032,14 @@ class Setup:
         candidates = []
         prefix, status = self.find_rocm_wheel_prefix("core")
         if status == 0:
-            candidates.append(Path(prefix) / "share" / "amd_smi")
+            source = Path(prefix) / "share" / "amd_smi"
+            package = source / "amdsmi"
+            if self._is_amdsmi_source(source):
+                candidates.append(source)
+            elif (package / "__init__.py").is_file() and self._link_wheel_amdsmi(
+                package, Path(prefix).parent / "amdsmi"
+            ):
+                return
         elif status != 1:
             warn("ROCm SDK core discovery failed; skipping SDK amdsmi candidate.")
         candidates += [
