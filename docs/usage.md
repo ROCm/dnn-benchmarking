@@ -51,6 +51,7 @@ the same output format.
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and uses the winner. See [Kernel selection](#kernel-selection---autotune). |
+| `--benchmark-cache-dir PATH` | none | Root for the caches that only save time: MIOpen compiled kernels (`MIOPEN_CUSTOM_CACHE_DIR`), comgr (`AMD_COMGR_CACHE_DIR`) and `XDG_CACHE_HOME`. Replaces inherited values and `DNN_BENCH_WORKSPACE`. Use one directory for several calls to skip repeated compiles. It does not set `HIPDNN_CACHE_DIR`: hipDNN's winner cache stays off, and each engine's OOTB and tuned child keeps a private MIOpen user database. See [MIOpen user database](#miopen-user-database). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
@@ -261,6 +262,13 @@ The tool deletes the directory after the child exits. A value that you set
 in the shell does not reach these children. The children share only the
 installed MIOpen system database (read-only) and the kernel cache
 (`MIOPEN_CUSTOM_CACHE_DIR`, compiled binaries only).
+
+The kernel cache is under `--benchmark-cache-dir` if you set it, else in
+`DNN_BENCH_WORKSPACE`, else in a temporary directory for the run. A kernel
+cache hit skips a compile, but it does not change which kernel MIOpen
+selects. Point several calls at one `--benchmark-cache-dir`, for example all the
+graphs of one batch job, to compile each kernel once. `first_call_ms` then
+depends on the graphs that ran before.
 
 Each child repeats MIOpen Find for a problem that the system database does
 not hold, and starts a new process that loads the plugins. This adds time to

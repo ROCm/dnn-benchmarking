@@ -330,6 +330,18 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "benchmark candidate kernels on first execute and use the winner "
         "(HIPDNN_FORCE_BENCHMARKING=1); winners are not kept between runs",
     ),
+    CliOption(
+        flags=("--benchmark-cache-dir",),
+        dest="benchmark_cache_dir",
+        group="Runtime/Selection",
+        parser_type=Path,
+        metavar="PATH",
+        help="root for caches that only save time (MIOpen compiled kernels, "
+        "comgr, XDG); reuse it across calls to skip repeated compiles. "
+        "Each engine's OOTB and tuned child keeps a private MIOpen user database",
+        config_key="benchmark_cache_dir",
+        config_kind=ConfigKind.PATH,
+    ),
     _choice_option(
         ("--pytorch-sdpa-backend",),
         "pytorch_sdpa_backend",

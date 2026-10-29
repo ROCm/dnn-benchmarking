@@ -215,6 +215,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "atol": config.validation.atol,
         "oracle": config.oracle,
         "autotune": config.autotune,
+        "benchmark_cache_dir": config.benchmark_cache_dir,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
         "metrics": metrics.basic,

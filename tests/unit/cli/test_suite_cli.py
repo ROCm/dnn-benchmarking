@@ -485,6 +485,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "atol": None,
         "oracle": False,
         "autotune": False,
+        "benchmark_cache_dir": None,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,

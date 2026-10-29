@@ -13,9 +13,10 @@ from ..common.exceptions import GraphLoadError
 from .config_file import apply_config_file
 from .parser import create_parser
 
-#: Caches that only save time. Kept in DNN_BENCH_WORKSPACE across runs. The
-#: MIOpen kernel cache holds compiled binaries: Find compiles before it times
-#: a solver, so a cache hit shortens Find but does not change the selection.
+#: Caches that only save time. Kept under --benchmark-cache-dir, else in
+#: DNN_BENCH_WORKSPACE across runs. The MIOpen kernel cache holds compiled
+#: binaries: Find compiles before it times a solver, so a cache hit shortens
+#: Find but does not change the selection.
 _WORKSPACE_CACHE_SUBDIRS = {
     "XDG_CACHE_HOME": "cache",
     "AMD_COMGR_CACHE_DIR": "comgr_cache",
@@ -35,16 +36,23 @@ def _set_cache_dir(var: str, path: Path) -> None:
     os.environ[var] = str(path)
 
 
-def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
-    """Point unset ROCm/tool cache variables away from the (network) home dir.
+def _configure_cache_env(
+    cache_root: Optional[Path],
+) -> tempfile.TemporaryDirectory[str] | None:
+    """Point ROCm/tool cache variables away from the (network) home dir.
 
     MIOpen, comgr and torch default to ~/.cache or ~/.miopen. The MIOpen user
     DB goes to a private per-run temporary directory. The other caches go to
-    DNN_BENCH_WORKSPACE (set by setup_env.py), or to the same temporary
-    directory without a workspace. Variables that are already set are kept.
-    Must run before any GPU runtime initialises. Keep the returned object
-    alive for the run; its finalizer removes the temporary directory.
+    ``cache_root`` (--benchmark-cache-dir), which replaces inherited values;
+    else to DNN_BENCH_WORKSPACE (set by setup_env.py), or to the same
+    temporary directory without a workspace. Other variables that are already
+    set are kept. Must run before any GPU runtime initialises. Keep the
+    returned object alive for the run; its finalizer removes the temporary
+    directory.
     """
+    if cache_root is not None:
+        for var, subdir in _WORKSPACE_CACHE_SUBDIRS.items():
+            _set_cache_dir(var, cache_root / subdir)
     unset_workspace = [var for var in _WORKSPACE_CACHE_SUBDIRS if var not in os.environ]
     user_db_unset = _MIOPEN_USER_DB not in os.environ
     workspace = os.environ.get("DNN_BENCH_WORKSPACE")
@@ -52,7 +60,6 @@ def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
         for var in unset_workspace:
             _set_cache_dir(var, Path(workspace) / _WORKSPACE_CACHE_SUBDIRS[var])
         return None
-
     lifetime = tempfile.TemporaryDirectory(prefix="dnn-bench-cache-")
     run_dir = Path(lifetime.name)
     workspace_base = Path(workspace) if workspace else run_dir
@@ -91,13 +98,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         return compare_main(argv[1:])
 
-    _cache_lifetime = _configure_cache_env()  # noqa: F841 - keeps the dir alive
     parser = create_parser(suppress_defaults=True)
     args = parser.parse_args(argv)
     try:
         apply_config_file(args)
     except ValueError as e:
         parser.error(str(e))
+    # After parsing (the root can come from the config file), before any GPU
+    # runtime initialises.
+    _cache_lifetime = _configure_cache_env(  # noqa: F841 - keeps the dir alive
+        args.benchmark_cache_dir
+    )
 
     # Runtime startup (in the suite runner) is the authoritative GPU check;
     # optional telemetry tools such as amd-smi are not gated here.

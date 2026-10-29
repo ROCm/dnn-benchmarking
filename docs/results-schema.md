@@ -65,6 +65,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
+| `benchmark_cache_dir` | string or null | `--benchmark-cache-dir`: root of the compile caches (MIOpen kernels, comgr, XDG). `null`: the workspace or a temporary directory. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
