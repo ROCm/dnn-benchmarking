@@ -112,7 +112,8 @@ distance from the exact result.
 Scope: graphs with at least one convolution node (forward, backward data or
 backward weights) and otherwise only pointwise nodes. Other graphs keep the
 native reference. The timed `reference` row does not change: it still times
-PyTorch in the graph data types.
+PyTorch in the graph data types, with MIOpen on ROCm. The float64 pass is not
+timed, so speedups against PyTorch (`vs_best`) do not change.
 
 The float64 reference runs on the GPU after the timed `reference` row. If the
 timed row cannot run, it runs on the CPU when its host memory estimate fits.
