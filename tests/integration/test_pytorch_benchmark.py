@@ -407,3 +407,42 @@ def test_pytorch_row_returns_vram_after_oom(torch_gpu) -> None:
     assert "out of memory" in (row.error_message or ""), row
     assert torch.cuda.memory_reserved() <= reserved_before
     assert "at row start the GPU had" in row.error_message
+
+
+@pytest.mark.parametrize(
+    "graph_name",
+    ["sample_conv_fwd.json", "sample_conv_dgrad.json", "sample_conv_wgrad.json"],
+)
+def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> None:
+    """With the default config, a convolution graph is validated against a
+    float64 reference computed on the GPU, and that reference equals a
+    float64 computation on the host."""
+    import io
+    from pathlib import Path
+
+    from dnn_benchmarking.config import SuiteConfig, ValidationConfig
+    from dnn_benchmarking.execution import suite_runner
+    from dnn_benchmarking.reporting.reporter import Reporter
+    from dnn_benchmarking.validation import ReferenceProviderRegistry
+    from dnn_benchmarking.validation.reference_provider import ReferencePrecision
+
+    path, graph_json, tensor_infos = load_graph(graph_name)
+    config = SuiteConfig(validation=ValidationConfig(provider="pytorch"))
+    ctx = suite_runner._graph_context(
+        Path(path), graph_json, tensor_infos, config, Reporter(io.StringIO())
+    )
+    row = suite_runner._prepare_references(ctx)
+
+    assert row is not None and row.status == "success", row
+    assert not any("float64 reference not used" in w for w in row.warnings or [])
+    assert ctx.reference_outputs
+    host = ReferenceProviderRegistry.get_provider("pytorch").compute_reference(
+        graph_json, ctx.input_data, precision=ReferencePrecision.FLOAT64
+    )
+    for uid, ref in ctx.reference_outputs.items():
+        assert ref.precision == ReferencePrecision.FLOAT64.value
+        assert ref.device_data is not None and ref.device_data.is_cuda
+        assert ref.device_data.dtype == torch_gpu.float64
+        np.testing.assert_allclose(
+            ref.host_data(), host[uid].host_data(), rtol=1e-12, atol=0
+        )

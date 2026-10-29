@@ -90,6 +90,29 @@ def get_unsupported_operations(graph_json: Dict[str, Any]) -> List[str]:
     return unsupported
 
 
+_CONVOLUTION_OPS = frozenset(
+    {
+        "ConvolutionFwdAttributes",
+        "ConvolutionBwdAttributes",
+        "ConvolutionWrwAttributes",
+    }
+)
+# Ops whose handlers compute in the dtype of their inputs and store their
+# outputs in that dtype, so float64 inputs give float64 arithmetic.
+_FLOAT64_OPS = _CONVOLUTION_OPS | {"PointwiseAttributes"}
+
+
+def float64_reference_supported(graph_json: Dict[str, Any]) -> bool:
+    """True for a graph with a convolution whose nodes all run in float64.
+
+    Fused convolution graphs (convolution plus pointwise nodes) qualify.
+    Other ops keep the graph data types: some handlers (batch norm, SDPA)
+    pin float32 statistics or scratch.
+    """
+    types = {node.get("type") for node in graph_json.get("nodes", [])}
+    return bool(types & _CONVOLUTION_OPS) and types <= _FLOAT64_OPS
+
+
 class CompiledGraph:
     """A graph compiled once into replayable per-op closures."""
 

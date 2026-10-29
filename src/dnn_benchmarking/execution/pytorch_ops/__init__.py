@@ -13,6 +13,7 @@ from ._registry import (
     OpHandler,
     compile_graph,
     execute_graph,
+    float64_reference_supported,
     get_handler,
     get_supported_operations,
     get_unsupported_operations,
@@ -56,5 +57,6 @@ __all__ = [
     "get_unsupported_operations",
     "compile_graph",
     "execute_graph",
+    "float64_reference_supported",
     "get_reference_warnings",
 ]
