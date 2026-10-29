@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from ..common import selection_env
 from ..common.exceptions import UnsupportedGraphError
 from ..common.pytorch_tuning import apply_pytorch_environment
 from ..config.benchmark_config import (
@@ -42,16 +43,6 @@ SIGTERM_GRACE_S = 30.0
 
 # Match hipDNN's documented truthy values. Notably, "0" leaves a switch off.
 _TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
-
-#: Variables that decide hipDNN kernel selection; recorded for oracle/autotune.
-_SELECTION_ENV = (
-    "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-    "HIPDNN_CACHE_DIR",
-    "HIPDNN_DISABLE_CACHE",
-    "HIPDNN_FORCE_BENCHMARKING",
-    "MIOPEN_USER_DB_PATH",
-    "MIOPEN_CUSTOM_CACHE_DIR",
-)
 
 
 class _Terminated(BaseException):
@@ -142,27 +133,43 @@ def run_suite_cli(
         return 2
 
     _warn_ignored_options(config, reporter)
-    _apply_pytorch_environment(config, reporter)
-    if config.runtime is RuntimeName.HIPDNN:
-        _apply_tuning_environment(config, reporter)
-        if config.oracle:
-            _warn_oracle(reporter)
+    inherited = selection_env.inherited(os.environ)
+    if inherited:
+        listed = ", ".join(f"{name}={value}" for name, value in inherited.items())
+        if not config.allow_selection_env:
+            reporter.error(
+                f"kernel-selection variables are set in the environment: {listed}. "
+                "They change which kernels run. Unset them, or pass "
+                "--allow-selection-env to keep them"
+            )
+            return 2
+        reporter.warning(f"--allow-selection-env: keeping {listed}")
 
-    try:
-        run_graph = start_runtime(config, reporter)
-    except RuntimeStartupError as e:
-        reporter.error(str(e))
-        return e.exit_code
+    # Each run selects kernels from a private, empty cache; the inherited
+    # environment is restored afterwards.
+    with selection_env.isolate(config.hipdnn_cache_dir) as private:
+        _apply_pytorch_environment(config, reporter)
+        if config.runtime is RuntimeName.HIPDNN:
+            _apply_tuning_environment(config, reporter, private)
+            if config.oracle:
+                _warn_oracle(reporter, private)
 
-    if tarball_source:
-        reporter.info(f"Graphs from {tarball_source}")
-    if config.metrics.extra_runs_per_engine:
-        reporter.info(
-            f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) per engine"
-        )
-    if argv is None:
-        argv = list(sys.argv)
-    return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
+        try:
+            run_graph = start_runtime(config, reporter)
+        except RuntimeStartupError as e:
+            reporter.error(str(e))
+            return e.exit_code
+
+        if tarball_source:
+            reporter.info(f"Graphs from {tarball_source}")
+        if config.metrics.extra_runs_per_engine:
+            reporter.info(
+                f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) "
+                "per engine"
+            )
+        if argv is None:
+            argv = list(sys.argv)
+        return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
 
 
 def _output_problem(path: Path) -> Optional[str]:
@@ -216,6 +223,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "oracle": config.oracle,
         "autotune": config.autotune,
         "hipdnn_cache_dir": config.hipdnn_cache_dir,
+        "allow_selection_env": config.allow_selection_env,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
         "metrics": metrics.basic,
@@ -269,8 +277,7 @@ def _run_suite(
 ) -> int:
     """Run every graph, writing results as it goes; return the exit code."""
     environment = collect_environment_info()
-    if config.oracle or config.autotune:
-        environment["selection_env"] = {n: os.environ.get(n) for n in _SELECTION_ENV}
+    environment["selection_env"] = selection_env.snapshot(os.environ)
     run_config = _run_config(config)
     total = len(graph_paths)
     reporter.print_suite_header(environment, run_config, total)
@@ -375,22 +382,21 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
         )
 
 
-def _warn_oracle(reporter: Reporter) -> None:
+def _cache_is_private(private: Path) -> bool:
+    return Path(os.environ["HIPDNN_CACHE_DIR"]).parent == private
+
+
+def _warn_oracle(reporter: Reporter, private: Path) -> None:
     """One line per condition that makes the OOTB or tuned plan non-cold."""
-    if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
+    if not _cache_is_private(private):
         reporter.warning(
-            "--oracle: exact-engine cache is on, so the OOTB timing may "
-            "replay a persisted ranking (HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for cold)"
-        )
-    elif not _truthy_env("HIPDNN_DISABLE_CACHE"):
-        reporter.warning(
-            "--oracle: provider kernel caches are on "
-            "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
+            f"--oracle with a shared hipDNN cache ({os.environ['HIPDNN_CACHE_DIR']}): "
+            "the OOTB plan may replay a ranking that an earlier run tuned"
         )
     reporter.info(
-        "--oracle: each engine gets a second plan built with "
-        "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
-        "engines re-measure the OOTB plan); MIOpen may reuse FindDb entries"
+        "--oracle: each engine's tuned plan (global.benchmarking=1) runs in a "
+        "child process with its own caches (kernel ingestor and MIOpen sample "
+        "kernels; other engines re-measure the OOTB plan)"
     )
     forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
     if forced is not None:
@@ -419,35 +425,29 @@ def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
     reporter.info(f"PyTorch kernel selection: {settings}{tuned}")
 
 
-def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
+def _apply_tuning_environment(
+    config: SuiteConfig, reporter: Reporter, private: Path
+) -> None:
     """Set the kernel-selection environment and state the path in effect.
 
     Prints one info line ``kernel selection: heuristic|autotune; cache: ...``
     plus one warning per hazard.
     """
     leaked = False
-    if config.hipdnn_cache_dir:
-        os.environ["HIPDNN_CACHE_DIR"] = config.hipdnn_cache_dir
-    cache = os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
-
     if config.autotune:
         os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
     elif _truthy_env("HIPDNN_FORCE_BENCHMARKING"):
-        # Process-wide and inherited from the shell: the run is NOT on the
-        # heuristic path even though --autotune was not passed.
+        # Kept by --allow-selection-env: the run is NOT on the heuristic path
+        # even though --autotune was not passed.
         leaked = True
         reporter.warning(
             "HIPDNN_FORCE_BENCHMARKING is set in the environment without "
             "--autotune; kernels are benchmarked, not heuristic-selected"
         )
     autotune = config.autotune or leaked
-    if config.autotune and not config.hipdnn_cache_dir:
-        # The winner cache outlives the run and reads are not gated on
-        # benchmarking, so a previous session's ranking can be reported.
-        reporter.warning(
-            "--autotune without --hipdnn-cache-dir: winners cached by earlier runs "
-            "may be reported instead of measured"
-        )
+    cache = os.environ["HIPDNN_CACHE_DIR"]
+    where = "private, removed after the run" if _cache_is_private(private) else "shared"
     reporter.info(
-        f"kernel selection: {'autotune' if autotune else 'heuristic'}; cache: {cache}"
+        f"kernel selection: {'autotune' if autotune else 'heuristic'}; "
+        f"cache: {cache} ({where})"
     )

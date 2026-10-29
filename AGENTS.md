@@ -59,7 +59,7 @@ package, run `PYTHONPATH=src python -m dnn_benchmarking ...`.
 |---|---|
 | 0 | Success. An all-skipped run is also 0. |
 | 1 | Engine row error, graph error, failed final result write (not a periodic one), no graph files, or runtime not available at startup. |
-| 2 | Usage error: argparse, config file, runtime-incompatible option, unknown `--engine`, unwritable `-o` or `--profiling-output-dir`, missing profiler tool. |
+| 2 | Usage error: argparse, config file, runtime-incompatible option, unknown `--engine`, unwritable `-o` or `--profiling-output-dir`, missing profiler tool, inherited kernel-selection variable without `--allow-selection-env`. |
 | 3 | At least one engine row failed validation. 3 wins over 1, and 1 wins over 0. Only `role == "engine"` rows count, as in `summary()`. |
 | 130 / 143 | SIGINT / SIGTERM. The result file is partial (`run.complete = false`). |
 
@@ -77,7 +77,8 @@ src/dnn_benchmarking/
 │   ├── suite_runner_cli.py   # startup checks, per-graph loop, result writes, exit codes
 │   ├── runtimes.py           # runtime startup; returns the per-graph runner
 │   └── internal_profiling.py # hidden --internal-profiling-run child
-├── common/                   # exceptions, dtypes registry, torch/ROCm runtime helpers
+├── common/                   # exceptions, dtypes registry, torch/ROCm runtime helpers,
+│                             # selection_env (inherited variables, private selection caches)
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
 ├── execution/
 │   ├── timing.py             # measure(): the one timed loop (staged / events)
@@ -87,7 +88,8 @@ src/dnn_benchmarking/
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
-│   ├── oracle.py             # --oracle pass
+│   ├── oracle.py             # --oracle pass (launches the tuned children)
+│   ├── hipdnn_tuned_child.py # tuned hipDNN plan in a child process
 │   └── correctness.py        # output comparison for a row
 ├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
 ├── metrics/
@@ -132,11 +134,17 @@ Rules that keep the design intact:
 - Build every hipDNN plan through `Executor.prepare`, which times only
   `create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
   `build_plans()`. Prime each engine with `Executor.prime` before its timed
-  OOTB build, and build the oracle's `global.benchmarking=1` plan right after
-  the OOTB build, so the two build times start from the same process state.
-- Run tuned PyTorch only in the `cli/pytorch_tuned_child.py` child process.
+  build, in the benchmark process and in the tuned child, so the OOTB and
+  tuned build times start from the same process state.
+- Run every tuned search in a child process: hipDNN in
+  `execution/hipdnn_tuned_child.py`, PyTorch in `cli/pytorch_tuned_child.py`.
+  hipDNN keeps a tuned winner in memory for the life of the process, and
   PyTorch's conv algorithm cache and MIOpen's user database would otherwise
-  carry tuning into the OOTB measurement.
+  carry tuning into a later OOTB measurement.
+- A run selects kernels only from state it created: `selection_env.isolate`
+  gives each run private, empty selection caches, and the CLI rejects
+  inherited selection variables. Add a new selection variable to
+  `common/selection_env.py`.
 
 ## Tests
 

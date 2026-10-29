@@ -32,7 +32,8 @@ runtime = "hipdnn"   # "hipdnn" or "pytorch"
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
 autotune = false     # benchmark candidate kernels and cache the winner
-# hipdnn_cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # per-run HIPDNN_CACHE_DIR
+# hipdnn_cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # share a cache between runs
+allow_selection_env = false  # keep inherited HIPDNN_*/MIOPEN_* selection variables
 
 pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
 # pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"

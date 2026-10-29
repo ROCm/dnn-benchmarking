@@ -102,7 +102,7 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 |---|---|
 | 0 | Success. |
 | 1 | Engine row error, graph error, failed final result write, no graph files, or runtime not available. |
-| 2 | Usage or config error. |
+| 2 | Usage or config error, or a kernel-selection variable inherited from the environment (see [usage.md](docs/usage.md#selection-environment)). |
 | 3 | An engine row failed validation. |
 | 130 / 143 | Interrupted by SIGINT / SIGTERM. A partial result file has `run.complete = false`. |
 

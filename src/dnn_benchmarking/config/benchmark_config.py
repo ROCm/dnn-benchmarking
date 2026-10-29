@@ -330,10 +330,13 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
-    #: job; reads are not gated on benchmarking while writes are, so without an
-    #: explicit empty root an untuned phase can replay a previous tuned ranking.
+    #: HIPDNN_CACHE_DIR to share between runs. Unset, each run gets a private,
+    #: empty one: reads are not gated on benchmarking while writes are, so a
+    #: cache that outlives a run lets a later run replay its tuned ranking.
     hipdnn_cache_dir: Optional[str] = None
+    #: Keep kernel-selection variables inherited from the environment
+    #: (``common.selection_env``). Off, the CLI rejects a run that inherits one.
+    allow_selection_env: bool = False
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
@@ -393,6 +396,7 @@ class SuiteConfig:
             hipdnn_cache_dir=(
                 str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
             ),
+            allow_selection_env=args.allow_selection_env,
         )
 
     def __post_init__(self) -> None:
