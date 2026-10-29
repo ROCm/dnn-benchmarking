@@ -462,3 +462,12 @@ The tool does not do these things yet:
   not compare runs with different values.
 - Repeats across processes (rocKE attempts). Each engine is timed in one loop
   in one process.
+- Validation of the page table. `graphs/sample_sdpa_paged.json` has one KV
+  page: K and V are `[1, 4, 64, 128]` and the page table is `[[0], [0]]`.
+  Every sequence reads page 0, so `--validate` cannot catch a kernel that
+  ignores the page table. hipDNN rejects a K or V batch size (the page count)
+  that differs from the Q batch size (`SdpaFwdNode::pre_validate_node`:
+  "batch size mismatch between Q and K"). The Q batch of the sample is 1, so
+  the sample can have only one page. In a real paged KV cache the page count
+  does not depend on the batch size (hipDNN issue ALMIOPEN-3110). Unit tests
+  check multi-page page tables in the input generator.
