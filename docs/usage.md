@@ -442,6 +442,20 @@ When more than one condition applies, 3 wins over 1, and 1 wins over 0.
 Only `engine` rows count: the `reference` row that `--validate pytorch` adds
 never changes the exit code.
 
+The tool checks the flags and their combinations before it looks for graph
+files. A bad option combination thus exits 2 also when no graph file exists.
+
+These flags were renamed in result schema version 2. The usage error names
+the replacement:
+
+| Old flag | Use |
+|---|---|
+| `--backend`, `-b` | `--runtime`, `-r` |
+| `--emit-trace` | `--trace` |
+| `--metrics-tier` | `--metrics` or `--no-metrics` |
+| `--cache-dir` | `--hipdnn-cache-dir` |
+| `--oracle-mode` | `--oracle`. The `plan` and `exhaustive` modes are removed. |
+
 ## compare
 
 `dnn-benchmark compare A.json B.json` compares two JSON result files. It

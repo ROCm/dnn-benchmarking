@@ -435,6 +435,43 @@ def test_main_without_matching_graphs_exits_1(tmp_path, monkeypatch, capsys) -> 
     assert "No graph files found" in capsys.readouterr().err
 
 
+def test_bad_option_combination_with_missing_graph_exits_2(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Usage errors win over graph resolution, which would exit 1."""
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        cli_main(["--graph", str(tmp_path / "none.json"), "-r", "pytorch", "-e", "1"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--runtime pytorch" in err
+    assert "No graph files found" not in err
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        (["--backend", "pytorch"], "--runtime"),
+        (["-b", "pytorch"], "--runtime"),
+        (["--emit-trace", "pftrace"], "--trace"),
+        (["--metrics-tier=off"], "--no-metrics"),
+        (["--cache-dir", "d"], "--hipdnn-cache-dir"),
+        (["--oracle-mode", "plan"], "--oracle"),
+    ],
+)
+def test_renamed_flag_usage_error_names_the_new_flag(
+    tmp_path, monkeypatch, capsys, old, new
+) -> None:
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        cli_main(["--graph", "g.json", *old])
+    assert exc.value.code == 2
+    # The lines after the "unrecognized arguments" line name the new flag.
+    err = capsys.readouterr().err
+    hint = err.split("unrecognized arguments:", 1)[1].split("\n", 1)[1]
+    assert old[0].split("=")[0] in hint and new in hint
+
+
 def test_main_records_its_argv_and_wires_verbose(
     tmp_path, runtime, monkeypatch, capsys
 ) -> None:
