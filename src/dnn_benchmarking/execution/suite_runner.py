@@ -657,7 +657,9 @@ def _prepare_references(
         and provider.supports_float64(ctx.graph_json)
     )
     if outputs is not None:
-        ctx.reference_outputs = outputs
+        # Drop the local name: ctx.reference_outputs then holds the only
+        # reference to the native outputs, so the float64 pass can free them.
+        ctx.reference_outputs, outputs = outputs, None
         if float64:
             # The timed row ran, so PyTorch has a GPU. The native outputs stay
             # the reference if the float64 one fails.

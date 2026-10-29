@@ -821,6 +821,110 @@ def test_cpu_reference_is_float64_when_it_fits_in_host_memory(
         assert any("host memory" in note for note in reference.warnings)
 
 
+def test_native_gpu_reference_is_freed_before_the_float64_cache_release(
+    fake_torch, monkeypatch
+):
+    """The cache release after the float64 pass must see the native outputs
+    already freed; otherwise their memory stays cached during the engine rows."""
+    import weakref
+
+    fake_torch.discovered = [1]
+    fake_torch.cpu_reference.float64 = True
+    native = []
+    run_row = suite_runner._run_pytorch_row
+
+    def tracked_row(ctx, role):
+        row, outputs = run_row(ctx, role)
+        native.extend(weakref.ref(o) for o in (outputs or {}).values())
+        return row, outputs
+
+    alive_at_release = []
+    monkeypatch.setattr(suite_runner, "_run_pytorch_row", tracked_row)
+    monkeypatch.setattr(
+        suite_runner,
+        "_release_torch_cache",
+        lambda: alive_at_release.append(sum(r() is not None for r in native)),
+    )
+
+    graph, _ = _validate()
+
+    assert native
+    assert graph.results[1].ootb.correctness.reference_precision == "float64"
+    # The last release (after the float64 pass) runs with no native output left.
+    assert alive_at_release[-1] == 0
+
+
+def test_failed_cpu_float64_reference_falls_back_to_the_native_cpu_reference(
+    fake_torch, monkeypatch
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.float64_error = MemoryError("host allocation failed")
+    fake_torch.cpu_reference.estimated_bytes = 1 << 30
+
+    graph, _ = _validate()
+
+    reference, *engines = graph.results
+    assert ("float64_reference", None) in fake_torch.events
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+    assert {e.ootb.correctness.reference_precision for e in engines} == {"native"}
+    assert any("host allocation failed" in note for note in reference.warnings)
+
+
+@pytest.mark.parametrize("profiled", [False, True])
+def test_profiled_runs_keep_the_float64_reference_on_the_host(
+    fake_torch, monkeypatch, profiled
+):
+    """Profiled runs keep host-only references, as the timed row does."""
+    import torch
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
+    fake_torch.discovered = [1]
+    reference = fake_torch.cpu_reference
+    reference.float64 = True
+
+    def device_float64(graph_json, input_data, *, precision, device):
+        if precision is NATIVE:
+            return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+        return {
+            2: suite_runner.ReferenceOutput(
+                data=None,
+                tensor_uid=2,
+                device_data=torch.from_numpy(REF.astype(np.float64)),
+                precision="float64",
+            )
+        }
+
+    monkeypatch.setattr(reference, "compute_reference", device_float64)
+    seen = []
+    check = suite_runner.check_correctness
+
+    def recording_check(bm, infos, refs, *args):
+        seen.extend(refs.values())
+        return check(bm, infos, refs, *args)
+
+    monkeypatch.setattr(suite_runner, "check_correctness", recording_check)
+    metrics = MetricsConfig(perf=True) if profiled else MetricsConfig()
+
+    graph, _ = _validate(metrics=metrics)
+
+    assert graph.results[1].verdict == "passed"
+    (ref,) = {id(r): r for r in seen}.values()
+    assert ref.precision == "float64"
+    if profiled:
+        assert ref.device_data is None
+        assert ref.data.dtype == np.float64
+    else:
+        assert ref.device_data is not None and ref.data is None
+
+
 def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
     torch = pytest.importorskip("torch")
     base = torch.arange(12, dtype=torch.float32)
