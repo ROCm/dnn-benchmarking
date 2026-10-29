@@ -25,8 +25,8 @@ RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
     "runtime", "engine_filter", "plugin_paths", "warmup_iters", "iters",
     "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
-    "oracle", "autotune", "benchmark_work_dir", "pytorch_sdpa_backend",
-    "pytorch_rocm_fa_library", "metrics", "profiling",
+    "reference_precision", "oracle", "autotune", "benchmark_work_dir",
+    "pytorch_sdpa_backend", "pytorch_rocm_fa_library", "metrics", "profiling",
 }  # fmt: skip
 PROFILING_KEYS = {"pmc", "trace", "perf", "roofline"}
 ENV_KEYS = {
@@ -67,7 +67,7 @@ TIMING_KEYS = {
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
-    "n_total", "worst_output_uid", "message",
+    "n_total", "worst_output_uid", "reference_precision", "message",
 }  # fmt: skip
 ORACLE_KEYS = PLAN_KEYS | {"tuning_available"}
 
@@ -84,7 +84,9 @@ def _oracle() -> OracleResult:
         timing=TimingInfo("events", "hip", 11, 30, 13.5),
         gpu_kernel_stats=_stats(1.0),
         host_stats=_stats(3.0),
-        correctness=CorrectnessResult(False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9),
+        correctness=CorrectnessResult(
+            False, 2e-3, 3e-5, 0.25, 0.75, "off", 5, 64, 9, "native"
+        ),
         derived_tflops_per_s=4.0,
         derived_gbytes_per_s=3000.0,
         workspace_bytes=2048,
@@ -126,6 +128,7 @@ def full_suite() -> SuiteResult:
                 n_mismatch=0,
                 n_total=4096,
                 worst_output_uid=7,
+                reference_precision="float64",
             ),
             workspace_bytes=1024,
             derived_tflops_per_s=2.0,
@@ -244,6 +247,7 @@ def test_full_row_values() -> None:
         "n_mismatch": 0,
         "n_total": 4096,
         "worst_output_uid": 7,
+        "reference_precision": "float64",
         "message": "note",
     }
     stats_keys = {"kernel", "host"}
@@ -271,6 +275,7 @@ def test_full_row_values() -> None:
             "n_mismatch": 5,
             "n_total": 64,
             "worst_output_uid": 9,
+            "reference_precision": "native",
             "message": "off",
         },
     }

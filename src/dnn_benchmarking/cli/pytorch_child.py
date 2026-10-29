@@ -25,14 +25,21 @@ executor's notes.
 
 import argparse
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from ..config.benchmark_config import PyTorchSdpaBackendName, TimingPolicy
+import numpy as np
+
+from ..config.benchmark_config import (
+    PyTorchSdpaBackendName,
+    ReferencePrecision,
+    TimingPolicy,
+)
 from ..execution.buffer_manager import generate_input_data
 from ..execution.child_protocol import (
     PYTORCH_OOTB,
     PYTORCH_TUNED,
     child_parser,
+    output_file,
     write_result,
 )
 from ..execution.timed_run import pytorch_run
@@ -48,6 +55,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--pytorch-sdpa-backend", required=True, type=PyTorchSdpaBackendName
     )
     parser.add_argument("--pytorch-rocm-fa-library")
+    parser.add_argument(
+        "--reference-precision",
+        type=ReferencePrecision,
+        default=ReferencePrecision.NATIVE,
+        help="with --save-outputs: arithmetic of the saved outputs",
+    )
     return parser.parse_args(argv)
 
 
@@ -76,10 +89,11 @@ def _timed_run(
     policy: TimingPolicy,
 ) -> None:
     """Build and time the graph with ``policy``; write the result files."""
+    input_data = generate_input_data(tensor_infos, args.seed, graph_json)
     with pytorch_run(
         graph_json,
         tensor_infos,
-        generate_input_data(tensor_infos, args.seed, graph_json),
+        input_data,
         policy,
         args.pytorch_sdpa_backend,
         args.pytorch_rocm_fa_library,
@@ -92,7 +106,57 @@ def _timed_run(
             run_once=lambda: executor.execute_once(tensors),
         )
         notes = list(executor.notes)
-    write_result(args.out_dir, m, clocks_after=clocks_after, notes=notes)
+        device = executor.device
+    precision = None
+    if args.save_outputs:
+        # After the timed buffers are released, so the two never share VRAM.
+        precision, note = _save_float64_reference(args, graph_json, input_data, device)
+        notes += [note] if note else []
+    write_result(
+        args.out_dir,
+        m,
+        clocks_after=clocks_after,
+        notes=notes,
+        output_precision=precision.value if precision else None,
+    )
+
+
+def _save_float64_reference(
+    args: argparse.Namespace,
+    graph_json: Dict[str, Any],
+    input_data: Dict[int, np.ndarray],
+    device: str,
+) -> Tuple[ReferencePrecision, Optional[str]]:
+    """Replace the saved outputs with a float64 reference when requested and
+    the graph supports it; return the precision of the saved outputs and a
+    note when the float64 reference was requested but not used.
+
+    The float64 pass computes on the GPU from the same inputs. On a failure
+    (for example an out-of-memory error) the native outputs stay.
+    """
+    if args.reference_precision is not ReferencePrecision.FLOAT64:
+        return ReferencePrecision.NATIVE, None
+    provider = _float64_provider()
+    if not provider.supports_float64(graph_json):
+        return ReferencePrecision.NATIVE, None
+    try:
+        outputs = provider.compute_reference(
+            graph_json, input_data, precision=ReferencePrecision.FLOAT64, device=device
+        )
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+        note = f"float64 reference not used ({reason}); using the graph data types"
+        return ReferencePrecision.NATIVE, note
+    for uid, ref in outputs.items():
+        np.save(output_file(args.out_dir, uid), ref.data)
+    return ReferencePrecision.FLOAT64, None
+
+
+def _float64_provider() -> Any:
+    """The PyTorch reference provider (imports torch)."""
+    from ..validation.providers.pytorch_provider import PyTorchReferenceProvider
+
+    return PyTorchReferenceProvider()
 
 
 if __name__ == "__main__":

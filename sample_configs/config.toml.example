@@ -46,6 +46,9 @@ validate = "none"    # "none" or "pytorch"
 # Tolerances default to dtype-aware values; set only to override them.
 # rtol = 1e-3
 # atol = 1e-3
+# Convolution references in float64 ("float64"), or in the graph data types
+# with the same library kernels as the engines ("native").
+reference_precision = "float64"
 
 # --- Comparison --------------------------------------------------------------
 # Also time a tuned run of each engine row (benchmarking on) and of each

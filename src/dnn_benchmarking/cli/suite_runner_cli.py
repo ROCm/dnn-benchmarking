@@ -209,6 +209,9 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         ),
         "rtol": config.validation.rtol,
         "atol": config.validation.atol,
+        "reference_precision": (
+            config.validation.precision.value if config.validation.enabled else None
+        ),
         "oracle": config.oracle,
         "autotune": config.autotune,
         "benchmark_work_dir": config.benchmark_work_dir,

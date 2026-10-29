@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
+from dnn_benchmarking.config.benchmark_config import ReferencePrecision
 from dnn_benchmarking.validation import ReferenceProviderRegistry
 
 # Skip all tests if torch is not available
@@ -1668,3 +1669,158 @@ class TestHostMemoryEstimate:
         # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
         # against 16 pages * 16 rows instead of 1 page.
         assert all_pages - one_page >= 4 * 2 * 64 * (16 - 1) * 16 * 4
+
+
+class TestFloat64Reference:
+    """The float64 reference of convolution graphs."""
+
+    PARAMS = {
+        "conv_mode": "CROSS_CORRELATION",
+        "pre_padding": [1, 1],
+        "post_padding": [1, 1],
+        "stride": [1, 1],
+        "dilation": [1, 1],
+    }
+    X, W, DY = (2, 3, 6, 6), (4, 3, 3, 3), (2, 4, 6, 6)
+
+    @classmethod
+    def _graph(cls, node_type: str, nodes=()) -> dict:
+        x, w, dy, out = {"uid": 1}, {"uid": 2}, {"uid": 3}, {"uid": 4}
+        node = {"type": node_type, "parameters": cls.PARAMS}
+        if node_type == "ConvolutionFwdAttributes":
+            node["inputs"] = {"x_tensor_uid": 1, "w_tensor_uid": 2}
+            node["outputs"] = {"y_tensor_uid": 4}
+            x["dims"], w["dims"], out["dims"] = cls.X, cls.W, cls.DY
+            tensors = [x, w, out]
+        elif node_type == "ConvolutionBwdAttributes":
+            node["inputs"] = {"dy_tensor_uid": 3, "w_tensor_uid": 2}
+            node["outputs"] = {"dx_tensor_uid": 4}
+            dy["dims"], w["dims"], out["dims"] = cls.DY, cls.W, cls.X
+            tensors = [dy, w, out]
+        else:
+            node["inputs"] = {"x_tensor_uid": 1, "dy_tensor_uid": 3}
+            node["outputs"] = {"dw_tensor_uid": 4}
+            x["dims"], dy["dims"], out["dims"] = cls.X, cls.DY, cls.W
+            tensors = [x, dy, out]
+        for tensor in tensors:
+            tensor["data_type"] = "half"
+        return {"tensors": tensors, "nodes": [node, *nodes]}
+
+    @staticmethod
+    def _inputs() -> dict:
+        rng = np.random.default_rng(0)
+        shapes = {1: TestFloat64Reference.X, 2: TestFloat64Reference.W}
+        shapes[3] = TestFloat64Reference.DY
+        return {
+            uid: rng.uniform(-1, 1, shape).astype(np.float32)
+            for uid, shape in shapes.items()
+        }
+
+    @pytest.mark.parametrize(
+        "node_type",
+        [
+            "ConvolutionFwdAttributes",
+            "ConvolutionBwdAttributes",
+            "ConvolutionWrwAttributes",
+        ],
+    )
+    def test_float64_reference_is_exact_math_on_the_graph_dtype_inputs(
+        self, node_type: str
+    ) -> None:
+        """Inputs round to fp16 as the engine sees them; the result stays
+        float64 and is not rounded to fp16."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        inputs = self._inputs()
+        # The fp16 values the engine sees, exactly, in float64.
+        x, w, dy = (torch.from_numpy(inputs[uid]).half().double() for uid in (1, 2, 3))
+        kw = {"padding": 1}
+        expected = {
+            "ConvolutionFwdAttributes": lambda: torch.nn.functional.conv2d(x, w, **kw),
+            "ConvolutionBwdAttributes": lambda: torch.nn.grad.conv2d_input(
+                self.X, w, dy, **kw
+            ),
+            "ConvolutionWrwAttributes": lambda: torch.nn.grad.conv2d_weight(
+                x, self.W, dy, **kw
+            ),
+        }[node_type]().numpy()
+
+        (out,) = provider.compute_reference(
+            self._graph(node_type), inputs, precision=ReferencePrecision.FLOAT64
+        ).values()
+
+        assert out.precision == "float64"
+        assert out.data.dtype == np.float64
+        np.testing.assert_allclose(out.data, expected, rtol=1e-12, atol=1e-12)
+        assert np.any(out.data != out.data.astype(np.float16))
+
+    def test_native_reference_keeps_the_graph_dtype(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+
+        (out,) = provider.compute_reference(
+            self._graph("ConvolutionFwdAttributes"), self._inputs()
+        ).values()
+
+        assert (out.precision, out.data.dtype) == ("native", np.float16)
+
+    def test_fused_pointwise_runs_in_float64(self) -> None:
+        relu = {
+            "type": "PointwiseAttributes",
+            "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": 4},
+            "outputs": {"out_0_tensor_uid": 5},
+        }
+        graph = self._graph("ConvolutionFwdAttributes", [relu])
+        graph["tensors"][-1]["virtual"] = True
+        graph["tensors"].append({"uid": 5, "dims": self.DY, "data_type": "half"})
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        inputs = self._inputs()
+        x, w = (torch.from_numpy(inputs[uid]).half().double() for uid in (1, 2))
+
+        outputs = provider.compute_reference(
+            graph, inputs, precision=ReferencePrecision.FLOAT64
+        )
+
+        assert list(outputs) == [5]
+        np.testing.assert_allclose(
+            outputs[5].data,
+            torch.relu(torch.nn.functional.conv2d(x, w, padding=1)).numpy(),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize(
+        "types, supported",
+        [
+            (["ConvolutionWrwAttributes"], True),
+            (["ConvolutionFwdAttributes", "PointwiseAttributes"], True),
+            (["PointwiseAttributes"], False),
+            (["ConvolutionFwdAttributes", "BatchnormAttributes"], False),
+            (["MatmulAttributes"], False),
+        ],
+    )
+    def test_float64_covers_convolution_and_pointwise_graphs_only(
+        self, types: list, supported: bool
+    ) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = {"nodes": [{"type": t} for t in types]}
+
+        assert provider.supports_float64(graph) is supported
+
+    def test_float64_request_for_an_unsupported_graph_raises(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = {
+            "tensors": [{"uid": 1, "dims": [2]}, {"uid": 2, "dims": [2]}],
+            "nodes": [
+                {
+                    "type": "PointwiseAttributes",
+                    "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": 1},
+                    "outputs": {"out_0_tensor_uid": 2},
+                }
+            ],
+        }
+
+        with pytest.raises(UnsupportedGraphError, match="float64"):
+            provider.compute_reference(
+                graph,
+                {1: np.ones(2, dtype=np.float32)},
+                precision=ReferencePrecision.FLOAT64,
+            )

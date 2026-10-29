@@ -67,6 +67,7 @@ sets `ROCM_PATH`.
 | `--validate {none,pytorch}` | none | Compare each engine output with a PyTorch reference. `pytorch` also adds a timed `reference` row. |
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
+| `--reference-precision {float64,native}` | float64 | Arithmetic of the reference for convolution graphs. `float64` computes it in float64 from the same inputs. `native` uses the graph data types, as before. See [Reference precision](#reference-precision). |
 
 The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
 1e-3), fp16 (1e-3, 1e-3), fp8 e4m3 (2^-3, 2^-9), fp8 e4m3 fnuz (2^-3,
@@ -88,6 +89,48 @@ If the estimate is more than 80 % of the available host memory, the tool
 does not validate the graph. It prints a warning, and the engine rows of the
 graph get the verdict `unchecked` with the reason in `correctness.message`.
 These rows do not fail validation (no exit code 3).
+
+#### Reference precision
+
+PyTorch on ROCm runs fp16, bf16 and fp32 convolutions with MIOpen, the same
+library that the MIOpen engines use. A native reference can thus have the
+same error as the engine under test. With `--reference-precision float64`
+(the default), the tool computes a second reference for convolution graphs:
+
+1. It rounds each input to its graph dtype, as the engine sees it.
+2. It widens the inputs to float64 without loss and runs the graph in
+   float64. PyTorch does not use MIOpen for float64 convolutions.
+3. It keeps the float64 result. It does not round it to the output dtype:
+   PyTorch converts float64 to fp16, bf16 and fp8 through float32, so that
+   cast can round twice.
+
+The tolerances do not change. An output that is correctly rounded to its
+dtype is at most 0.5 ULP from the float64 result, and every default tolerance
+is wider than 0.5 ULP. `max_abs_diff` and `max_rel_diff` then give the
+distance from the exact result.
+
+Scope: graphs with at least one convolution node (forward, backward data or
+backward weights) and otherwise only pointwise nodes. Other graphs keep the
+native reference. The timed `reference` row does not change: it still times
+PyTorch in the graph data types, with MIOpen on ROCm. The float64 pass is not
+timed, so speedups against PyTorch (`vs_best`) do not change.
+
+The child process of the timed `reference` row computes the float64
+reference on the GPU after its timed loop and saves it instead of the native
+outputs. If the timed row cannot run, `dnn-benchmark` computes it on the CPU
+when its host memory estimate fits.
+If it fails, for example with a GPU out-of-memory error, the native reference
+serves. The `reference` row then gets the note `float64 reference not used
+(<reason>); using the graph data types`. Each comparison records its reference
+in `correctness.reference_precision`.
+
+Cost: the float64 pass holds float64 copies of the inputs and outputs (8
+bytes for each element: 4 times an fp16 tensor, 2 times an fp32 tensor) and
+the PyTorch workspace. On a gfx950 GPU, it took 0.09 s to 0.32 s for each of
+seven fp16, bf16 and fp32 convolution graphs. On the largest one (fp32 wgrad,
+16x3x800x800 input, 7x7 filter), the peak PyTorch allocation of the reference
+step went from 1.45 GiB to 1.83 GiB. The float64 copies are on the GPU. The
+maximum host RSS of the process grew by 0.06 GiB to 0.2 GiB.
 
 ### Comparison
 

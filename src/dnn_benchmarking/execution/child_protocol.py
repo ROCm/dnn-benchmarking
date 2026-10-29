@@ -402,6 +402,9 @@ class ChildResult:
     tuning: Optional[TuningQuery] = None
     #: Executor notes for the row's ``warnings`` (PyTorch children).
     notes: List[str] = field(default_factory=list)
+    #: Arithmetic of the saved outputs (``--save-outputs``): ``float64`` or
+    #: ``native``; None without saved outputs.
+    output_precision: Optional[str] = None
 
 
 def write_result(
@@ -412,6 +415,7 @@ def write_result(
     clocks_after: Optional[Dict[str, Any]] = None,
     tuning: Optional[TuningQuery] = None,
     notes: Optional[List[str]] = None,
+    output_precision: Optional[str] = None,
 ) -> None:
     """Write the timed loop and the plan values as ``result.json``."""
     result = ChildResult(
@@ -423,6 +427,7 @@ def write_result(
         clocks_after=clocks_after,
         tuning=tuning,
         notes=list(notes or []),
+        output_precision=output_precision,
     )
     (out_dir / RESULT_FILE).write_text(json.dumps(asdict(result)))
 
@@ -440,4 +445,5 @@ def read_child_result(out_dir: Path) -> ChildResult:
         clocks_after=result["clocks_after"],
         tuning=TuningQuery(**tuning) if tuning is not None else None,
         notes=result["notes"],
+        output_precision=result["output_precision"],
     )

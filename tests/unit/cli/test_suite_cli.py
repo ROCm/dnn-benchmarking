@@ -483,6 +483,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "validate": "pytorch",
         "rtol": None,
         "atol": None,
+        "reference_precision": "float64",
         "oracle": False,
         "autotune": False,
         "benchmark_work_dir": None,

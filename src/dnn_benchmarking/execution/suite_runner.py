@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
     PyTorchSdpaBackendName,
+    ReferencePrecision,
     SuiteConfig,
     TimingPolicy,
 )
@@ -195,6 +196,7 @@ def _compute_reference_outputs_once(
     graph_json: Dict[str, Any],
     input_data: Dict[int, Any],
     config: SuiteConfig,
+    precision: ReferencePrecision = ReferencePrecision.NATIVE,
 ) -> Tuple[Optional[Dict[int, ReferenceOutput]], Optional[str]]:
     try:
         from .pytorch_ops import PyTorchSdpaBackendState, use_pytorch_sdpa_backend
@@ -203,7 +205,10 @@ def _compute_reference_outputs_once(
             config.pytorch_sdpa_backend, config.pytorch_rocm_fa_library
         )
         with use_pytorch_sdpa_backend(state):
-            return ref_provider.compute_reference(graph_json, input_data), None
+            outputs = ref_provider.compute_reference(
+                graph_json, input_data, precision=precision
+            )
+            return outputs, None
     except Exception as e:
         return None, str(e)
 
@@ -279,7 +284,7 @@ def _run_pytorch_row(
             )
             row.warnings = (row.warnings or []) + result.notes
             if role == "reference":
-                outputs = _saved_reference_outputs(ctx.tensor_infos, saved)
+                outputs = _saved_reference_outputs(ctx.tensor_infos, saved, result)
         if role == "reference":
             from . import pytorch_ops
 
@@ -307,9 +312,11 @@ def _run_pytorch_row(
 
 
 def _saved_reference_outputs(
-    tensor_infos: List[TensorInfo], saved: SavedOutputs
+    tensor_infos: List[TensorInfo], saved: SavedOutputs, result: ChildResult
 ) -> Dict[int, ReferenceOutput]:
-    """The reference outputs that the PyTorch child saved, as host arrays."""
+    """The reference outputs that the PyTorch child saved, as host arrays, in
+    the precision that the child computed them in."""
+    precision = result.output_precision or ReferencePrecision.NATIVE.value
     outputs: Dict[int, ReferenceOutput] = {}
     for tensor_info in tensor_infos:
         if not tensor_info.is_output:
@@ -317,7 +324,7 @@ def _saved_reference_outputs(
         data = saved.get_output_data(tensor_info.uid)
         if data is not None:
             outputs[tensor_info.uid] = ReferenceOutput(
-                data=data, tensor_uid=tensor_info.uid
+                data=data, tensor_uid=tensor_info.uid, precision=precision
             )
     return outputs
 
@@ -485,6 +492,12 @@ def _prepare_references(
     timed native path fails. The CPU reference is skipped when its estimated
     host memory does not fit (``ctx.validation_skip_reason``): the engine rows
     are then unchecked, not failed.
+
+    With ``--reference-precision float64`` (the default), a graph the provider
+    can compute in float64 gets a float64 reference: the reference child
+    computes it on the GPU after its timed loop and saves it, else this
+    process computes it on the host. If the float64 reference fails or does
+    not fit, the native reference serves and the reference row gets a note.
     """
     config = ctx.config
     provider, ctx.reference_error = _reference_provider(config, ctx.graph_json)
@@ -500,6 +513,10 @@ def _prepare_references(
         return row
 
     row = _report_row(ctx.reporter, "pytorch reference", run)
+    float64 = (
+        config.validation.precision is ReferencePrecision.FLOAT64
+        and provider.supports_float64(ctx.graph_json)
+    )
     if outputs is not None:
         ctx.reference_outputs = outputs
     elif config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT:
@@ -512,8 +529,17 @@ def _prepare_references(
             )
         )
     else:
-        ctx.validation_skip_reason = _host_memory_problem(provider, ctx.graph_json)
-        if ctx.validation_skip_reason is not None:
+        if float64:
+            shortfall = _host_memory_shortfall(
+                provider, ctx.graph_json, ReferencePrecision.FLOAT64
+            )
+            if shortfall is not None:
+                _note_native_reference(ctx, row, shortfall)
+            elif _use_float64_reference(ctx, provider, row):
+                return row
+        shortfall = _host_memory_shortfall(provider, ctx.graph_json)
+        if shortfall is not None:
+            ctx.validation_skip_reason = f"validation skipped: {shortfall}"
             ctx.reference_error = ctx.validation_skip_reason
             warn_once("validation", f"{ctx.graph_name}: {ctx.validation_skip_reason}")
         else:
@@ -525,20 +551,50 @@ def _prepare_references(
     return row
 
 
+def _use_float64_reference(
+    ctx: _GraphContext, provider: ReferenceProvider, row: ProviderEngineResult
+) -> bool:
+    """Make a host float64 reference ``ctx.reference_outputs``; False if it
+    failed. A failure adds a note to ``row``."""
+    outputs, error = _compute_reference_outputs_once(
+        provider,
+        ctx.graph_json,
+        ctx.input_data,
+        ctx.config,
+        ReferencePrecision.FLOAT64,
+    )
+    if outputs is None:
+        _note_native_reference(ctx, row, error or "no outputs")
+        return False
+    ctx.reference_outputs = outputs
+    return True
+
+
+def _note_native_reference(
+    ctx: _GraphContext, row: ProviderEngineResult, reason: str
+) -> None:
+    """Record on the reference row why the float64 reference is not used."""
+    note = f"float64 reference not used ({reason}); using the graph data types"
+    row.warnings = (row.warnings or []) + [note]
+    warn_once("validation", f"{ctx.graph_name}: {note}")
+
+
 #: Share of the available host memory the CPU reference may use; the rest is
 #: left for the engine rows of the same graph and for the estimate's error.
 _REFERENCE_HOST_FRACTION = 0.8
 
 
-def _host_memory_problem(
-    provider: ReferenceProvider, graph_json: Dict[str, Any]
+def _host_memory_shortfall(
+    provider: ReferenceProvider,
+    graph_json: Dict[str, Any],
+    precision: ReferencePrecision = ReferencePrecision.NATIVE,
 ) -> Optional[str]:
     """Why the CPU reference would not fit in host memory, or None.
 
     Without an estimate or a reading of the available memory, the reference
     runs as before.
     """
-    needed = provider.estimate_host_bytes(graph_json)
+    needed = provider.estimate_host_bytes(graph_json, precision)
     if needed is None:
         return None
     try:
@@ -551,8 +607,9 @@ def _host_memory_problem(
     if needed <= available * _REFERENCE_HOST_FRACTION:
         return None
     gib = float(1 << 30)
+    kind = "float64 " if precision is ReferencePrecision.FLOAT64 else ""
     return (
-        f"validation skipped: the CPU reference needs about {needed / gib:.1f} GiB "
+        f"the {kind}CPU reference needs about {needed / gib:.1f} GiB "
         f"of host memory and {available / gib:.1f} GiB is available"
     )
 

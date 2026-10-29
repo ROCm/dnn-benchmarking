@@ -19,6 +19,7 @@ from ..config.benchmark_config import (
     PMC_SET_CHOICES,
     PyTorchSdpaBackendName,
     ReferenceProviderName,
+    ReferencePrecision,
     SuiteConfig,
     ValidationConfig,
 )
@@ -399,6 +400,15 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_kind=ConfigKind.SCALAR,
         config_type=float,
         config_optional=True,
+    ),
+    _choice_option(
+        ("--reference-precision",),
+        "reference_precision",
+        "Validation",
+        _values(ReferencePrecision),
+        _default(ValidationConfig, "precision"),
+        "float64 computes convolution references in float64; native uses the "
+        "graph data types (the same library kernels as the engines)",
     ),
     # Comparison
     _bool_option(

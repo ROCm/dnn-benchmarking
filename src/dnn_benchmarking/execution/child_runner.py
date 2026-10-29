@@ -89,11 +89,14 @@ def pytorch_child_args(
     graph_path: Path, config: SuiteConfig, save_outputs: bool
 ) -> List[str]:
     """Arguments of ``cli/pytorch_child.py``, the same for its OOTB and tuned
-    runs."""
+    runs. A child that saves its outputs (the reference row) also gets the
+    reference precision: it saves a float64 reference when it can."""
     args = _common_args(graph_path, config, save_outputs)
     args += ["--pytorch-sdpa-backend", config.pytorch_sdpa_backend.value]
     if config.pytorch_rocm_fa_library is not None:
         args += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
+    if save_outputs:
+        args += ["--reference-precision", config.validation.precision.value]
     return args
 
 

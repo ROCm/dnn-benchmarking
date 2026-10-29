@@ -16,6 +16,7 @@ from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphE
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
     PyTorchSdpaBackendName,
+    ReferencePrecision,
     SuiteConfig,
     ValidationConfig,
 )
@@ -40,6 +41,7 @@ from dnn_benchmarking.reporting.suite_results import (
 GRAPH = {"name": "g", "nodes": [], "tensors": []}
 PATH = Path("g.json")
 REF = np.arange(4, dtype=np.float32)
+NATIVE, FLOAT64 = ReferencePrecision.NATIVE, ReferencePrecision.FLOAT64
 
 
 def _tensor(uid, is_output):
@@ -291,14 +293,33 @@ def fake_torch(fake, monkeypatch):
             return REF.copy() if fake.torch_outputs_written else np.zeros_like(REF)
 
     class CpuReference:
-        estimated_bytes = 0
+        """``estimated_bytes`` by precision: an int sets both."""
 
-        def estimate_host_bytes(self, graph_json):
+        estimated_bytes = 0
+        float64 = False  # supports_float64
+        float64_error = None  # raised by a float64 compute
+        float64_output = REF.astype(np.float64)
+
+        def supports_float64(self, graph_json):
+            return self.float64
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
+            if isinstance(self.estimated_bytes, dict):
+                return self.estimated_bytes[precision]
             return self.estimated_bytes
 
-        def compute_reference(self, graph_json, input_data):
-            fake.events.append("cpu_reference")
-            return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+        def compute_reference(self, graph_json, input_data, *, precision, device=None):
+            if precision is NATIVE:
+                fake.events.append("cpu_reference")
+                return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+            fake.events.append(("float64_reference", device))
+            if self.float64_error is not None:
+                raise self.float64_error
+            return {
+                2: suite_runner.ReferenceOutput(
+                    data=self.float64_output.copy(), tensor_uid=2, precision="float64"
+                )
+            }
 
     fake.cpu_reference = CpuReference()
 
@@ -311,6 +332,7 @@ def fake_torch(fake, monkeypatch):
         "_reference_provider",
         lambda config, graph_json: (fake.cpu_reference, None),
     )
+    monkeypatch.setattr(pytorch_child, "_float64_provider", lambda: fake.cpu_reference)
     return fake
 
 
@@ -780,10 +802,13 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
     fake_torch, monkeypatch
 ):
     class FailingReference:
-        def estimate_host_bytes(self, graph_json):
+        def supports_float64(self, graph_json):
+            return False
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
             return 0
 
-        def compute_reference(self, graph_json, input_data):
+        def compute_reference(self, graph_json, input_data, **kwargs):
             raise RuntimeError("cpu reference exploded")
 
     monkeypatch.setattr(
@@ -864,6 +889,110 @@ def test_cpu_reference_runs_when_host_memory_cannot_be_judged(
     _, *engines = graph.results
     assert "cpu_reference" in fake_torch.events
     assert [e.verdict for e in engines] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize(
+    "supported, precision, verdict, used",
+    [
+        (True, "float64", "passed", "float64"),
+        (True, "native", "failed", "native"),
+        (False, "float64", "failed", "native"),
+    ],
+)
+def test_engines_compare_against_the_float64_reference_of_a_supported_graph(
+    fake_torch, supported, precision, verdict, used
+):
+    """The engine output equals the float64 reference and is 1.0 off the
+    native one, so the verdict shows which reference the engine met."""
+    fake_torch.discovered = [1]
+    fake_torch.cpu_reference.float64 = supported
+    fake_torch.cpu_reference.float64_output = (REF + 1.0).astype(np.float64)
+    fake_torch.engine_output = REF + 1.0
+
+    graph, _ = _run(
+        validation=ValidationConfig(provider="pytorch", precision=precision)
+    )
+
+    reference, engine = graph.results
+    assert engine.verdict == verdict
+    assert engine.ootb.correctness.reference_precision == used
+    float64_calls = [e for e in fake_torch.events if e[0] == "float64_reference"]
+    # The reference child computes the float64 reference on its GPU.
+    assert float64_calls == (
+        [("float64_reference", "cuda:3")] if used == "float64" else []
+    )
+    assert not reference.warnings
+
+
+def test_failed_float64_reference_keeps_the_native_reference_with_a_note(fake_torch):
+    fake_torch.discovered = [1]
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.float64_error = RuntimeError("HIP out of memory")
+
+    graph, _ = _validate()
+
+    reference, engine = graph.results
+    assert (engine.verdict, engine.ootb.correctness.reference_precision) == (
+        "passed",
+        "native",
+    )
+    (note,) = reference.warnings
+    assert "HIP out of memory" in note
+
+
+@pytest.mark.parametrize("float64_fits", [True, False])
+def test_cpu_reference_is_float64_when_it_fits_in_host_memory(
+    fake_torch, monkeypatch, float64_fits
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.estimated_bytes = {
+        NATIVE: 1 << 30,
+        FLOAT64: (7 if float64_fits else 9) << 30,  # 80% of 10 GiB is the limit
+    }
+
+    graph, _ = _validate()
+
+    reference, *engines = graph.results
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+    used = {e.ootb.correctness.reference_precision for e in engines}
+    if float64_fits:
+        assert fake_torch.events.count(("float64_reference", None)) == 1
+        assert "cpu_reference" not in fake_torch.events
+        assert used == {"float64"}
+    else:
+        assert ("float64_reference", None) not in fake_torch.events
+        assert "cpu_reference" in fake_torch.events
+        assert used == {"native"}
+        assert any("host memory" in note for note in reference.warnings)
+
+
+def test_failed_cpu_float64_reference_falls_back_to_the_native_cpu_reference(
+    fake_torch, monkeypatch
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.float64_error = MemoryError("host allocation failed")
+    fake_torch.cpu_reference.estimated_bytes = 1 << 30
+
+    graph, _ = _validate()
+
+    reference, *engines = graph.results
+    assert ("float64_reference", None) in fake_torch.events
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+    assert {e.ootb.correctness.reference_precision for e in engines} == {"native"}
+    assert any("host allocation failed" in note for note in reference.warnings)
 
 
 def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):

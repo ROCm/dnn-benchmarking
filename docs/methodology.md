@@ -428,10 +428,12 @@ Measure again after a timing change.
 
 The tool does not do these things yet:
 
-- Independent fp32 reference. `--validate pytorch` computes the reference in
-  the dtype of the graph. For fp16 and bf16 graphs the reference then has the
-  same precision as the result under test, and the tolerances must be loose.
-  An fp32 reference needs new tolerances for all workloads.
+- Float64 reference for all operations. `--validate pytorch` computes the
+  reference of convolution graphs (convolution and pointwise nodes) in
+  float64. See [Reference precision](usage.md#reference-precision). Other
+  graphs (matmul, normalization, SDPA) still use the graph data types, so
+  for fp16 and bf16 the reference has the same precision as the result under
+  test, and the tolerances must be loose.
 - SDPA reference for every mask. The PyTorch reference supports top-left and
   bottom-right causal bands, bounded left windows with `right_bound = 0`, and
   attention-sink logits. It follows hipDNN precedence: the deprecated causal
@@ -444,9 +446,19 @@ The tool does not do these things yet:
   available with `--timing-block`.
 - Rotating input buffers. `--cache-mode cold` controls the cache state, but
   the rocKE runbook also advises rotating buffers for bandwidth work.
-- Signed input distribution. Floating-point inputs are uniform in [0, 1),
-  because BatchNorm variance inputs must not be negative. Signed data needs a
-  role for each tensor first.
+- Signed input distribution for all operations. The operands (data, filter
+  and incoming gradient) of a convolution with an fp16 output are uniform in
+  [-1, 1). With U[0, 1) data, a backward-weights sum over more than about
+  262,000 terms passes the fp16 maximum (65504). Signed data lets the terms
+  cancel. All other floating-point inputs are uniform in [0, 1), because
+  BatchNorm variance inputs must not be negative. A tensor that also feeds a
+  non-convolution node stays in [0, 1). Convolutions with an fp32 or bf16
+  output keep [0, 1): they do not overflow, and signed data puts fp32 outputs
+  near zero, where the fixed fp32 atol (1e-6) is smaller than the rounding
+  difference of two correct kernels. Signed convolution operands start at
+  tool version 0.3.0 (`tool.version` in the result file). Do not compare
+  fp16 convolution correctness results with results from earlier versions.
+  Signed data for other operations needs a role for each tensor first.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with

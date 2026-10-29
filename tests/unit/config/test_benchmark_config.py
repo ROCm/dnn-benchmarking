@@ -229,6 +229,7 @@ class TestValidationConfig:
             ({"provider": "invalid"}, "--validate"),
             ({"rtol": -1e-5}, "--rtol"),
             ({"atol": -1e-8}, "--atol"),
+            ({"precision": "float32"}, "--reference-precision"),
         ],
     )
     def test_invalid_values_name_the_flag(self, kwargs: dict, flag: str) -> None:

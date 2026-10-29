@@ -20,6 +20,8 @@ DEFAULT_TOLERANCE = (1e-5, 1e-6)
 # kernels hipDNN and PyTorch select round 2-3 ULP apart even when they pick the
 # same solver. A 1% (~1.3 ULP) rtol flags that legitimate bf16 drift as a
 # failure; 3% (~3.8 ULP) keeps validation meaningful while tolerating it.
+# That drift applies to a native reference only: convolution graphs compare
+# against a float64 reference by default (--reference-precision).
 # fp8 outputs: hipDNN and the reference round slightly different fp32
 # accumulators to the same fp8 grid, so one element rounding the other way is
 # a full ULP apart. compare() passes |a - e| <= atol + rtol * |e|. rtol is one
@@ -155,5 +157,6 @@ def check_correctness(
         n_mismatch=sum(c[3].n_mismatch for c in compared),
         n_total=sum(c[3].n_total for c in compared),
         worst_output_uid=uid,
+        reference_precision=ref_outputs[uid].precision,
         error_message=None if passed else f"output {uid}: {worst.message}",
     )
