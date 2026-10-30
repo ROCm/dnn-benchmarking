@@ -207,7 +207,7 @@ def fake(monkeypatch):
         flags = tuple(a for a in args if a == "--autotune")
         child_env = untuned[(module, flags)].env
         with monkeypatch.context() as m:
-            for name in [*child_env.fixed, *child_env.in_dir, *child_env.in_tuned_db]:
+            for name in child_env.names:
                 m.setenv(name, env[name])
             code = scripts[module].main(args)
         return SimpleNamespace(returncode=code)

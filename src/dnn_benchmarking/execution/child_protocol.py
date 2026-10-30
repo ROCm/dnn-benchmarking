@@ -39,7 +39,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol
 
 import numpy as np
 
@@ -101,6 +101,21 @@ def failure_text(e: Exception) -> str:
     return str(e) if isinstance(e, ChildRunError) else f"{type(e).__name__}: {e}"
 
 
+#: The variable through which MIOpen finds its user database.
+USER_DB_VAR = "MIOPEN_USER_DB_PATH"
+
+
+class UserDb(Enum):
+    """Which MIOpen user database a child run reads and writes."""
+
+    #: The run's own new, empty directory, deleted after it: the selection
+    #: sees no Find result of another run.
+    PRIVATE = "private"
+    #: The command's tuned database, shared by every tuned run: a search
+    #: reuses what an earlier tuned run found for the same problem.
+    TUNED = "tuned"
+
+
 @dataclass(frozen=True)
 class ChildEnv:
     """Environment that the parent sets and the child checks.
@@ -113,15 +128,19 @@ class ChildEnv:
         fixed: Variables with one exact value.
         in_dir: Variables whose value comes from the private directory of the
             run (function of the directory path).
-        in_tuned_db: Variables whose value comes from the command's tuned
-            MIOpen user database directory, shared by every tuned run of the
-            command (function of the directory path). The child is not told
-            that path, so it only checks that these are set.
+        user_db: The MIOpen user database of the run (:data:`USER_DB_VAR`).
+            The child is not told the tuned path, so for :attr:`UserDb.TUNED`
+            it checks only that the variable is set.
     """
 
     fixed: Mapping[str, str]
     in_dir: Mapping[str, Callable[[str], str]]
-    in_tuned_db: Mapping[str, Callable[[str], str]] = field(default_factory=dict)
+    user_db: UserDb
+
+    @property
+    def names(self) -> FrozenSet[str]:
+        """Every variable that this environment sets."""
+        return frozenset({*self.fixed, *self.in_dir, USER_DB_VAR})
 
     def build(self, state_dir: str, tuned_db_dir: Optional[Path]) -> Dict[str, str]:
         """``os.environ`` plus the child variables for ``state_dir`` and
@@ -131,53 +150,48 @@ class ChildEnv:
         would break the isolation of the run.
 
         Raises:
-            ValueError: The environment needs the tuned database directory
-                and ``tuned_db_dir`` is ``None``.
+            ValueError: :attr:`user_db` is :attr:`UserDb.TUNED` and
+                ``tuned_db_dir`` is ``None``.
         """
-        if self.in_tuned_db and tuned_db_dir is None:
-            raise ValueError(
-                f"a tuned child needs the tuned MIOpen user database directory "
-                f"for {sorted(self.in_tuned_db)}"
-            )
         env = dict(os.environ)
-        env.update(self.fixed)
-        env.update({name: value(state_dir) for name, value in self.in_dir.items()})
-        env.update(
-            {name: value(str(tuned_db_dir)) for name, value in self.in_tuned_db.items()}
-        )
+        env.update(self._exact(state_dir))
+        env[USER_DB_VAR] = self._user_db_path(state_dir, tuned_db_dir)
         return env
 
     def check(self, state_dir: Path) -> None:
         """Raise unless the parent set this environment for ``state_dir``.
-
-        ``fixed`` and ``in_dir`` variables must have exactly the value that
-        :meth:`build` gives; ``in_tuned_db`` variables must be set.
 
         Raises:
             RuntimeError: A variable is missing, or has another value than
                 :meth:`build` gives for ``state_dir``. The message names
                 each one.
         """
-        expected = {
-            **self.fixed,
-            **{name: value(str(state_dir)) for name, value in self.in_dir.items()},
-        }
+        expected = self._exact(str(state_dir))
+        if self.user_db is UserDb.PRIVATE:
+            expected[USER_DB_VAR] = str(state_dir)
         wrong = [
             f"{name}={os.environ.get(name)!r}"
             for name, value in expected.items()
             if os.environ.get(name) != value
         ]
-        wrong += [
-            f"{name}={os.environ.get(name)!r}"
-            for name in self.in_tuned_db
-            if not os.environ.get(name)
-        ]
+        if self.user_db is UserDb.TUNED and not os.environ.get(USER_DB_VAR):
+            wrong.append(f"{USER_DB_VAR}={os.environ.get(USER_DB_VAR)!r}")
         if wrong:
             raise RuntimeError(f"child environment not set by the parent: {wrong}")
 
+    def _exact(self, state_dir: str) -> Dict[str, str]:
+        """The variables with one exact value for ``state_dir``."""
+        return {
+            **self.fixed,
+            **{name: value(state_dir) for name, value in self.in_dir.items()},
+        }
 
-def _same_dir(state_dir: str) -> str:
-    return state_dir
+    def _user_db_path(self, state_dir: str, tuned_db_dir: Optional[Path]) -> str:
+        if self.user_db is UserDb.PRIVATE:
+            return state_dir
+        if tuned_db_dir is None:
+            raise ValueError("a tuned child needs the tuned MIOpen user database")
+        return str(tuned_db_dir)
 
 
 #: OOTB hipDNN child: the heuristic selection (benchmarking forced off, so a
@@ -185,18 +199,17 @@ def _same_dir(state_dir: str) -> str:
 #: MIOpen user database, so the row selects its kernel on its own.
 HIPDNN_OOTB_ENV = ChildEnv(
     fixed={"HIPDNN_FORCE_BENCHMARKING": "0", "HIPDNN_DISABLE_CACHE": "1"},
-    in_dir={"MIOPEN_USER_DB_PATH": _same_dir},
+    in_dir={},
+    user_db=UserDb.PRIVATE,
 )
 
 #: hipDNN child that benchmarks: the ``--autotune`` row and the ``--oracle``
-#: tuned run. Benchmarking on for every plan and no hipDNN disk cache. The
-#: MIOpen user database is the command's tuned one, shared by every tuned
-#: run: a search reuses what earlier tuned runs found for the same problem.
-#: An OOTB run never reads it.
+#: tuned run. Benchmarking on for every plan, no hipDNN disk cache, and the
+#: command's tuned MIOpen user database. An OOTB run never reads it.
 HIPDNN_BENCHMARKING_ENV = ChildEnv(
     fixed={"HIPDNN_FORCE_BENCHMARKING": "1", "HIPDNN_DISABLE_CACHE": "1"},
     in_dir={},
-    in_tuned_db={"MIOPEN_USER_DB_PATH": _same_dir},
+    user_db=UserDb.TUNED,
 )
 
 #: OOTB PyTorch child (a ``--runtime pytorch`` row or the ``--validate
@@ -209,7 +222,8 @@ PYTORCH_OOTB_ENV = ChildEnv(
         "PYTORCH_TUNABLEOP_ENABLED": "0",
         "PYTORCH_TUNABLEOP_TUNING": "0",
     },
-    in_dir={"MIOPEN_USER_DB_PATH": _same_dir},
+    in_dir={},
+    user_db=UserDb.PRIVATE,
 )
 
 #: Tuned-PyTorch child: the PyTorch selection settings, and TunableOp tunes
@@ -226,7 +240,7 @@ PYTORCH_TUNED_ENV = ChildEnv(
             d, "tunableop_results.csv"
         ),
     },
-    in_tuned_db={"MIOPEN_USER_DB_PATH": _same_dir},
+    user_db=UserDb.TUNED,
 )
 
 
@@ -292,11 +306,7 @@ def inherited_selection_env() -> Dict[str, str]:
 
     Variables that a spec sets are not inherited and are not listed.
     """
-    set_by_specs = {
-        name
-        for spec in ALL_SPECS
-        for name in (*spec.env.fixed, *spec.env.in_dir, *spec.env.in_tuned_db)
-    }
+    set_by_specs = {name for spec in ALL_SPECS for name in spec.env.names}
     return {
         name: value
         for name, value in sorted(os.environ.items())

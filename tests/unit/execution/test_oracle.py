@@ -167,7 +167,7 @@ def _timeout(monkeypatch, seen):
 def _set_tuned_env(monkeypatch, env, state_dir):
     """Set the tuning variables of ``env`` as the parent does."""
     built = env.build(str(state_dir), TUNED_DB)
-    for name in [*env.fixed, *env.in_dir, *env.in_tuned_db]:
+    for name in env.names:
         monkeypatch.setenv(name, built[name])
 
 
