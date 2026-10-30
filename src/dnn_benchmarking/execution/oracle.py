@@ -15,12 +15,13 @@ Every tuned run executes in a child script, after the row's OOTB run:
 This module sets the environment of each child (``execution.child_protocol``
 holds the contract with the scripts, ``execution.child_runner`` starts
 them). The scripts set no tuning variable and read no dnn-benchmark option.
-A child owns all tuning state. hipDNN keeps a tuned winner in memory for the
-life of its process and serves it to every later build of the same graph
-and engine. A tuned search also writes winners to MIOpen's user database.
-The child's user database is in a temporary directory that is deleted after
-the run, and hipDNN's disk cache is off. Thus no OOTB measurement, including
-a stall-fallback re-measurement, can observe the tuned selection.
+hipDNN keeps a tuned winner in memory for the life of the child process
+and serves it to every later build of the same graph and engine. A tuned
+search also writes winners to MIOpen's user database: the command's tuned
+database, which every tuned run shares, so a later tuned run reuses them.
+OOTB children never read it (each has its own empty database), and
+hipDNN's disk cache is off. Thus no OOTB measurement, including a
+stall-fallback re-measurement, can observe a tuned selection.
 
 The child gets the full timing policy, ``stall_gate`` included, so a graph
 that fell back to unstalled timing times its tuned runs the same way.

@@ -199,7 +199,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | `timer` | string | Event timer: `hip` (HIP events) or `torch` (`torch.cuda.Event`). |
 | `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
 | `samples` | int | Number of timed samples behind `kernel` and `host` (`n` below). Equal to `--iters` unless `--min-time-ms` extends the loop. |
-| `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
+| `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. A tuned run skips the find for a problem the shared tuned database already holds, so its `first_call_ms` depends on the tuned runs before it. |
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the PyTorch `enqueue()` syncs with the host. |
 
@@ -296,7 +296,8 @@ the reason and `oracle` is `null`.
 - hipDNN rows: the tuned run comes from a child process that builds the same
   engine with benchmarking on (`HIPDNN_FORCE_BENCHMARKING=1`). Its first
   launch samples the candidates, so `oracle.timing.first_call_ms` holds the
-  search cost. With `--validate` and usable references, the tool compares
+  search cost, unless the shared tuned database already holds the problem
+  (see `first_call_ms`). With `--validate` and usable references, the tool compares
   the child's outputs with the references of the OOTB plan, and
   `correctness` is that check. Else `correctness` is `null`.
 - PyTorch rows: the tuned run comes from a child process (MIOpen exhaustive

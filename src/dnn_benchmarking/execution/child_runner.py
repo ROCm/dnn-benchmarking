@@ -4,9 +4,10 @@
 """Parent side of the child scripts: start a child, read what it wrote.
 
 :func:`child_run` is the only way the suite starts a child. Each child runs
-in a new, empty temporary directory, which is also its MIOpen user database
-(``execution.child_protocol``). The directory is deleted after the parent
-has read it, so every GPU run starts with an empty MIOpen user database.
+in a new, empty temporary directory that is deleted after the parent has
+read it. For an OOTB child that directory is also its MIOpen user database,
+so every OOTB run starts empty; a tuned child uses the command's shared
+tuned database instead (``execution.child_protocol``).
 
 The child writes to this process's stdout and stderr: MIOpen and hipDNN
 logs (``MIOPEN_LOG_LEVEL``) stay visible and are not held in memory. A

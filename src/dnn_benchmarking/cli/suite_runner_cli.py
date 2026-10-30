@@ -401,9 +401,9 @@ def _warn_oracle(reporter: Reporter) -> None:
     """Describe the tuned run."""
     reporter.info(
         "--oracle: each engine row gets a tuned run in a child process with "
-        "HIPDNN_FORCE_BENCHMARKING=1 and a private MIOpen user database "
-        "(kernel ingestor and MIOpen sample kernels; other engines re-measure "
-        "the OOTB plan)"
+        "HIPDNN_FORCE_BENCHMARKING=1 and the shared tuned MIOpen user database "
+        "(kernel ingestor and MIOpen sample kernels, reusing earlier tuning; "
+        "other engines re-measure the OOTB plan)"
     )
 
 

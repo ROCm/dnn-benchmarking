@@ -392,8 +392,8 @@ For each engine row:
 The tool sets the environment of each child; the child sets no tuning
 variable. The child checks that environment before it builds anything. When
 a variable is missing or has another value, the tuned child stops, and the
-row gets `oracle_error` instead of an untuned result. The child owns all
-tuning state. hipDNN keeps a tuned winner in memory until its process exits,
+row gets `oracle_error` instead of an untuned result. hipDNN keeps a tuned
+winner in memory until the child process exits,
 and the tuned MIOpen search writes the MIOpen user database. Tuned children
 share one database and OOTB children each have their own empty one (see
 [MIOpen user database](#miopen-user-database)). hipDNN's disk cache is off in

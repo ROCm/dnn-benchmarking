@@ -7,9 +7,10 @@ Uses explicit ``--engine`` IDs in caller order when provided; otherwise
 discovers ranked engine IDs for the graph via ``Graph.get_ranked_engine_ids``.
 Every row is timed by ``timing.measure`` (through the executors) and, with
 ``--validate``, compared against reference outputs computed once per graph.
-Each hipDNN engine row runs its plan in a child process with a new, empty
-MIOpen user database (``execution.child_runner``); this process only
-discovers engines, computes references and assembles the rows.
+Each hipDNN engine row runs its plan in a child process (``execution.child_runner``):
+the OOTB plan with a new, empty MIOpen user database, the tuned plan with the
+command's shared tuned database. This process only discovers engines,
+computes references and assembles the rows.
 """
 
 import copy
