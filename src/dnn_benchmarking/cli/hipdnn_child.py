@@ -8,8 +8,9 @@
 [--clocks] [--tuned | --autotune]``
 
 The parent (``execution.child_runner.child_run``) runs every hipDNN engine
-run in this script, so each run starts with a new, empty MIOpen user
-database in D. The flags select the spec whose environment the script
+run in this script. An OOTB run starts with a new, empty MIOpen user
+database in D; a tuned or autotune run uses the command's shared tuned
+database. The flags select the spec whose environment the script
 checks (``execution.child_protocol``): ``HIPDNN_OOTB`` (benchmarking off),
 ``HIPDNN_AUTOTUNE`` (``--autotune``) or ``HIPDNN_TUNED`` (``--tuned``, the
 ``--oracle`` tuned run); the last two set ``HIPDNN_FORCE_BENCHMARKING=1``.

@@ -93,7 +93,7 @@ src/dnn_benchmarking/
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
 │   ├── oracle.py             # --oracle pass (parent side)
 │   ├── child_protocol.py     # child contract: options, result files, ChildSpec and environment
-│   ├── child_runner.py       # parent side: start a child in a new, empty MIOpen user DB
+│   ├── child_runner.py       # parent side: start a child (OOTB: new, empty MIOpen user DB; tuned: the shared tuned DB)
 │   └── correctness.py        # output comparison for a row
 ├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
 ├── metrics/
@@ -147,10 +147,13 @@ Rules that keep the design intact:
   tuned run (`--tuned`). The parent sets no selection variable in its own
   environment. Start every child with
   `execution/child_runner.child_run`: it gives the child a new, empty
-  temporary directory, which is also its `MIOPEN_USER_DB_PATH`, and deletes
-  it afterwards. MIOpen keys its user database without the deterministic
-  attribute and reads its path once per process, so only a new process
-  gives a run an empty database. `child_run` takes a `ChildSpec` from
+  temporary directory and deletes it afterwards. For an OOTB spec it is also
+  the child's `MIOPEN_USER_DB_PATH`: MIOpen keys its user database without
+  the deterministic attribute and reads its path once per process, so only
+  a new process gives a run an empty database. A tuned or autotune spec
+  gets `SuiteConfig.tuned_db_dir` as `MIOPEN_USER_DB_PATH` instead, shared by
+  every tuned run of the command; the child only checks that it is set.
+  `child_run` takes a `ChildSpec` from
   `execution/child_protocol.py` (`HIPDNN_OOTB` with
   `HIPDNN_FORCE_BENCHMARKING=0`, `HIPDNN_AUTOTUNE` and `HIPDNN_TUNED` with
   `HIPDNN_FORCE_BENCHMARKING=1`, `PYTORCH_OOTB` with the PyTorch selection
@@ -170,13 +173,16 @@ Rules that keep the design intact:
   (`HIPDNN_DISABLE_CACHE=1`).
 - Give each profiling pass a new, empty MIOpen user database
   (`metrics/_subprocess.run_tool`).
-- Create every temporary per-run directory (child state, MIOpen user
+- Create every temporary per-run directory (child state, OOTB MIOpen user
   databases) with `common.run_state.run_state_dir`. With
   `--benchmark-work-dir`, `cli/main.py` puts the compile caches in
   `<work dir>/cache` and sets `DNN_BENCH_TEMP_ROOT` to the command's own run
-  directory `<work dir>/tmp/dnn-bench-run-*`, removed at exit. The
-  `dnn-benchmark` process sets no `MIOPEN_USER_DB_PATH`; only children own
-  one.
+  directory `<work dir>/tmp/dnn-bench-run-*`, removed at exit. The tuned
+  MIOpen user database comes from `common.run_state.tuned_db_dir`, entered by
+  `cli/suite_runner_cli.run_suite_cli` before the runtime starts:
+  `<work dir>/tuned-db`, kept across commands, else a directory of the
+  command. The `dnn-benchmark` process sets no `MIOPEN_USER_DB_PATH`; only
+  children own one.
 
 ## Tests
 

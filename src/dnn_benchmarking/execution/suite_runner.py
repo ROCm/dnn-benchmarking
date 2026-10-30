@@ -278,7 +278,7 @@ def _run_pytorch_row(
     args = pytorch_child_args(ctx.graph_path, config, save_outputs=role == "reference")
     try:
         # No time limit, as for every timed OOTB row.
-        with child_run(PYTORCH_OOTB, args, None) as (result, saved):
+        with child_run(PYTORCH_OOTB, args, None, config.tuned_db_dir) as (result, saved):
             _record_timing(
                 row, ctx, result.timing, result.kernel, result.host, result.clocks_after
             )
@@ -339,7 +339,8 @@ def run_single_provider_engine(
     """Time, validate (and optionally tune/profile) one hipDNN engine.
 
     The OOTB plan, the tuned plan and each profiling pass run in separate
-    child processes, each with a new, empty MIOpen user database.
+    child processes. The OOTB plan and each profiling pass get a new, empty
+    MIOpen user database; the tuned plan uses the command's tuned database.
     """
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
@@ -362,7 +363,7 @@ def run_single_provider_engine(
     try:
         # No time limit, as for every timed OOTB row.
         spec = HIPDNN_AUTOTUNE if config.autotune else HIPDNN_OOTB
-        with child_run(spec, args, None) as (ootb, outputs):
+        with child_run(spec, args, None, config.tuned_db_dir) as (ootb, outputs):
             _record_ootb(row, ctx, ootb)
             row.ootb.correctness = _ootb_correctness(ctx, outputs)
             if config.oracle:

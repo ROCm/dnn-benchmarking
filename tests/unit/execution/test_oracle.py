@@ -105,12 +105,19 @@ def child(monkeypatch):
     return launch
 
 
+#: The command's tuned MIOpen user DB (``cli.main`` creates it). The fake
+#: children never open it.
+TUNED_DB = Path("/work-dir/tuned-db")
+
+
 def _config(**kw):
     kw.setdefault("validation", ValidationConfig(provider="pytorch"))
+    kw.setdefault("tuned_db_dir", TUNED_DB)
     return SuiteConfig(oracle=True, **kw)
 
 
 def _pytorch_config(**kw):
+    kw.setdefault("tuned_db_dir", TUNED_DB)
     return SuiteConfig(oracle=True, runtime="pytorch", **kw)
 
 
@@ -159,8 +166,8 @@ def _timeout(monkeypatch, seen):
 
 def _set_tuned_env(monkeypatch, env, state_dir):
     """Set the tuning variables of ``env`` as the parent does."""
-    built = env.build(str(state_dir))
-    for name in [*env.fixed, *env.in_dir]:
+    built = env.build(str(state_dir), TUNED_DB)
+    for name in [*env.fixed, *env.in_dir, *env.in_tuned_db]:
         monkeypatch.setenv(name, built[name])
 
 
@@ -202,36 +209,35 @@ def test_hipdnn_child_uses_the_default_plugins_without_a_plugin_path(child, tmp_
     assert hipdnn_child.parse_args(child.argv[3:]).plugin_path is None
 
 
-def test_hipdnn_child_env_forces_benchmarking_into_a_private_deleted_user_db(
+def test_hipdnn_child_env_forces_benchmarking_into_the_shared_tuned_db(
     child, tmp_path, monkeypatch
 ):
     """The parent sets the child's tuning environment, also over inherited
-    values. The search writes MIOpen's user db; it may not reuse earlier
-    tuning or outlive the child, or a later OOTB run would serve the tuned
-    kernel."""
+    values. The search reads and writes the command's tuned MIOpen user DB,
+    so a later tuned row reuses it; the child's private directory is still
+    new and deleted after it."""
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "0")
     monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/inherited/miopen-db")
 
     _run_hipdnn(tmp_path)
 
-    state_dir = Path(child.env["MIOPEN_USER_DB_PATH"])
     assert child.env["HIPDNN_FORCE_BENCHMARKING"] == "1"
     assert child.env["HIPDNN_DISABLE_CACHE"] == "1"
-    assert child.state_existed and child.out_dir == state_dir
-    assert not state_dir.exists()
+    assert child.env["MIOPEN_USER_DB_PATH"] == str(TUNED_DB)
+    assert child.state_existed and not child.out_dir.exists()
 
 
-def test_child_user_db_is_under_the_temp_root_and_deleted(child, tmp_path, monkeypatch):
-    """With --benchmark-work-dir, the child's private user db lives under
+def test_child_state_dir_is_under_the_temp_root_and_deleted(child, tmp_path, monkeypatch):
+    """With --benchmark-work-dir, the child's private directory lives under
     the work dir's ``tmp``; it is still new for the child and deleted after it."""
     root = tmp_path / "work-dir" / "tmp"
     monkeypatch.setenv(TEMP_ROOT_ENV, str(root))
 
     _run_hipdnn(tmp_path)
 
-    state_dir = Path(child.env["MIOPEN_USER_DB_PATH"])
-    assert state_dir.parent == root
-    assert child.state_existed and not state_dir.exists()
+    assert child.out_dir.parent == root
+    assert child.state_existed and not child.out_dir.exists()
 
 
 def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkeypatch):
@@ -249,7 +255,6 @@ def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkey
         ("HIPDNN_FORCE_BENCHMARKING", "0"),
         ("HIPDNN_DISABLE_CACHE", "0"),
         ("MIOPEN_USER_DB_PATH", None),
-        ("MIOPEN_USER_DB_PATH", "/shared/miopen-db"),
     ],
 )
 def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
@@ -428,17 +433,16 @@ def test_pytorch_child_times_the_graph_with_the_run_timing(child, tmp_path, stal
     assert args.pytorch_rocm_fa_library == "aotriton"
 
 
-def test_pytorch_child_tunes_into_a_private_state_dir_that_is_deleted(child, tmp_path):
-    """MIOpen's user db and TunableOp results must not outlive the child, or a
-    later OOTB run would serve the tuned selection."""
+def test_pytorch_child_tunes_into_the_shared_tuned_db(child, tmp_path):
+    """MIOpen's user DB is the command's tuned one; TunableOp results stay in
+    the private directory, deleted after the child."""
     _run_pytorch(tmp_path)
 
-    state_dir = Path(child.env["MIOPEN_USER_DB_PATH"])
-    assert child.state_existed and child.out_dir == state_dir
+    assert child.env["MIOPEN_USER_DB_PATH"] == str(TUNED_DB)
     assert child.env["PYTORCH_TUNABLEOP_ENABLED"] == "1"
     assert child.env["PYTORCH_TUNABLEOP_TUNING"] == "1"
-    assert Path(child.env["PYTORCH_TUNABLEOP_FILENAME"]).parent == state_dir
-    assert not state_dir.exists()
+    assert Path(child.env["PYTORCH_TUNABLEOP_FILENAME"]).parent == child.out_dir
+    assert child.state_existed and not child.out_dir.exists()
 
 
 def test_pytorch_tuned_row_comes_from_the_child_result(child, tmp_path):

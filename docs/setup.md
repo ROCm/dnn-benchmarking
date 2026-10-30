@@ -87,7 +87,7 @@ On Linux the venv activation script exports these variables:
 |---|---|
 | `ROCM_PATH` | The selected ROCm prefix. |
 | `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
-| `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts the comgr, XDG and MIOpen kernel caches (`MIOPEN_CUSTOM_CACHE_DIR`, in `miopen_kernel_cache`) under it when those variables are not set and `--benchmark-work-dir` is not given. The kernel cache holds compiled binaries only; it shortens MIOpen Find but does not change the selected kernel. The MIOpen user database does not persist: each GPU run gets a new, empty one in its child process (see [usage.md](usage.md#miopen-user-database)). |
+| `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts the comgr, XDG and MIOpen kernel caches (`MIOPEN_CUSTOM_CACHE_DIR`, in `miopen_kernel_cache`) under it when those variables are not set and `--benchmark-work-dir` is not given. The kernel cache holds compiled binaries only; it shortens MIOpen Find but does not change the selected kernel. The MIOpen user database is not kept in the workspace: each OOTB GPU run gets a new, empty one in its child process, and tuned runs share one that lasts for the command, or in `--benchmark-work-dir` across commands (see [usage.md](usage.md#miopen-user-database)). |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
 
 dnn-benchmarking finds the engine plugins in

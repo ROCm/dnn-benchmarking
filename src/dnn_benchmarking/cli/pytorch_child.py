@@ -9,8 +9,9 @@
 
 The parent (``execution.child_runner.child_run``) runs every PyTorch run in
 this script: the ``--runtime pytorch`` row, the ``--validate pytorch``
-reference row, and with ``--oracle`` their tuned runs (``--tuned``). Each
-run starts with a new, empty MIOpen user database in D. The OOTB run checks
+reference row, and with ``--oracle`` their tuned runs (``--tuned``). An OOTB
+run starts with a new, empty MIOpen user database in D; a tuned run uses the
+command's shared tuned database. The OOTB run checks
 the environment of ``execution.child_protocol.PYTORCH_OOTB`` (the PyTorch
 selection settings, TunableOp off); ``--tuned`` checks that of
 ``PYTORCH_TUNED`` (TunableOp on, with a results file in D) and turns on

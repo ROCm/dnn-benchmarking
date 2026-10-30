@@ -351,10 +351,16 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Root of the persistent compile caches and of the temporary engine state
-    #: in ``tmp/`` (``cli.main``). ``None``: the workspace or a temporary
+    #: Root of the persistent compile caches, of the tuned MIOpen user
+    #: database in ``tuned-db/`` and of the temporary engine state in
+    #: ``tmp/`` (``cli.main``). ``None``: the workspace or a temporary
     #: directory for the caches, the system temporary directory for the state.
     benchmark_work_dir: Optional[str] = None
+    #: MIOpen user database that every tuned child of the command shares
+    #: (``cli.main`` creates it: ``<benchmark_work_dir>/tuned-db``, else a
+    #: directory removed when the command ends). OOTB children never use it.
+    #: Required by a tuned or autotune run.
+    tuned_db_dir: Optional[Path] = None
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).

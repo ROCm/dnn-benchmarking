@@ -207,7 +207,7 @@ def fake(monkeypatch):
         flags = tuple(a for a in args if a == "--autotune")
         child_env = untuned[(module, flags)].env
         with monkeypatch.context() as m:
-            for name in [*child_env.fixed, *child_env.in_dir]:
+            for name in [*child_env.fixed, *child_env.in_dir, *child_env.in_tuned_db]:
                 m.setenv(name, env[name])
             code = scripts[module].main(args)
         return SimpleNamespace(returncode=code)
@@ -346,7 +346,13 @@ class _Handle:
         return SimpleNamespace(engine_name=self.names.get(eid, ""), version="2.1")
 
 
+#: The command's tuned MIOpen user DB (``cli.main`` creates it). Only the
+#: test that inspects it creates it.
+TUNED_DB = Path("/work-dir/tuned-db")
+
+
 def _run(handle="default", **config):
+    config.setdefault("tuned_db_dir", TUNED_DB)
     out = io.StringIO()
     graph = suite_runner.run_graph_all_providers(
         PATH,
@@ -579,29 +585,34 @@ def test_engine_row_benchmarks_only_with_autotune(
     assert {env["HIPDNN_FORCE_BENCHMARKING"] for env in fake.child_envs} == {expected}
 
 
-def test_every_gpu_run_starts_with_its_own_empty_miopen_user_db(
-    fake, tuned_child, monkeypatch
+def test_ootb_runs_get_fresh_user_dbs_and_tuned_runs_share_one(
+    fake, tuned_child, monkeypatch, tmp_path
 ):
-    """Each OOTB and tuned run gets a new, empty MIOpen user database that no
-    other run shares and that is deleted after it. MIOpen keys its records
-    without the deterministic attribute, so a shared database lets one
-    engine's Find select another engine's kernel."""
+    """Each OOTB run gets a new, empty MIOpen user database that no other run
+    shares and that is deleted after it, so OOTB measures the heuristic.
+    Tuned runs share the command's tuned database, which outlives them, so a
+    later row reuses what an earlier row tuned."""
     launches = []
     inner = child_runner.run_capped
 
     def record(argv, timeout_s, env=None, capture_output=True):
         db = Path(env["MIOPEN_USER_DB_PATH"])
-        launches.append((db, sorted(p.name for p in db.iterdir())))
+        launches.append(("--tuned" in argv, db, sorted(p.name for p in db.iterdir())))
         return inner(argv, timeout_s, env)
 
     monkeypatch.setattr(child_runner, "run_capped", record)
+    tuned_db = tmp_path / "tuned-db"
+    tuned_db.mkdir()
 
-    _run(oracle=True)
+    _run(oracle=True, tuned_db_dir=tuned_db)
 
-    dbs = [db for db, _ in launches]
-    assert len(dbs) == 4 and len(set(dbs)) == 4  # 2 engines x (OOTB, tuned)
-    assert all(contents == [] for _, contents in launches)
-    assert not any(db.exists() for db in dbs)
+    ootb = [(db, contents) for tuned, db, contents in launches if not tuned]
+    tuned = [db for is_tuned, db, _ in launches if is_tuned]
+    assert len(ootb) == 2 and len({db for db, _ in ootb}) == 2  # 2 engines
+    assert all(contents == [] for _, contents in ootb)
+    assert not any(db.exists() for db, _ in ootb)
+    assert tuned == [tuned_db, tuned_db]
+    assert tuned_db.is_dir()
 
 
 def test_tuning_available_follows_each_engines_knobs(fake, tuned_child):
@@ -1289,7 +1300,7 @@ class TestPytorchRuntime:
             PATH,
             graph_json,
             TENSORS,
-            SuiteConfig(runtime="pytorch", **config),
+            SuiteConfig(runtime="pytorch", tuned_db_dir=TUNED_DB, **config),
             Reporter(io.StringIO()),
         )
 

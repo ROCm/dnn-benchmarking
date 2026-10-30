@@ -339,8 +339,9 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         metavar="PATH",
         help="work directory: PATH/cache holds caches that only save time "
         "(MIOpen compiled kernels, comgr, XDG; reuse it across calls to skip "
-        "repeated compiles); PATH/tmp holds the temporary engine state "
-        "(MIOpen user find-DBs), deleted when dnn-benchmark ends",
+        "repeated compiles); PATH/tuned-db holds the MIOpen user DB that every "
+        "tuned run shares, kept across calls; PATH/tmp holds the temporary "
+        "engine state (OOTB MIOpen user find-DBs), deleted when dnn-benchmark ends",
         config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
     ),

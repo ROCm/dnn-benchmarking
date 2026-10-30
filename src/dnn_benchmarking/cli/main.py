@@ -18,7 +18,9 @@ from .parser import create_parser
 #: ``--benchmark-work-dir``/``cache``, else in DNN_BENCH_WORKSPACE. The MIOpen
 #: kernel cache holds compiled binaries: Find compiles before it times a
 #: solver, so a cache hit shortens Find but does not change the selection.
-#: Selection state (the MIOpen user database) belongs to each child run.
+#: Selection state (the MIOpen user database) belongs to each OOTB child run;
+#: tuned child runs share the command's tuned database
+#: (:func:`common.run_state.tuned_db_dir`).
 _WORKSPACE_CACHE_SUBDIRS = {
     "XDG_CACHE_HOME": "cache",
     "AMD_COMGR_CACHE_DIR": "comgr_cache",

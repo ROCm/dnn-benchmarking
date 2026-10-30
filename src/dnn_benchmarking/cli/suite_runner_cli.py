@@ -9,12 +9,14 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
 from ..common.pytorch_tuning import PYTORCH_SELECTION_ENV
+from ..common.run_state import tuned_db_dir
 from ..config.benchmark_config import (
     RuntimeName,
     PyTorchSdpaBackendName,
@@ -133,6 +135,29 @@ def run_suite_cli(
         if config.oracle:
             _warn_oracle(reporter)
 
+    if argv is None:
+        argv = list(sys.argv)
+    work_dir = Path(config.benchmark_work_dir) if config.benchmark_work_dir else None
+    with tuned_db_dir(work_dir) as tuned_db:
+        return _start_and_run(
+            replace(config, tuned_db_dir=tuned_db),
+            graph_paths,
+            output_path,
+            reporter,
+            tarball_source,
+            argv,
+        )
+
+
+def _start_and_run(
+    config: SuiteConfig,
+    graph_paths: List[Path],
+    output_path: Optional[Path],
+    reporter: Reporter,
+    tarball_source: Optional[str],
+    argv: List[str],
+) -> int:
+    """Start the runtime for ``config`` and run every graph; the exit code."""
     try:
         run_graph = start_runtime(config, reporter)
     except RuntimeStartupError as e:
@@ -145,8 +170,6 @@ def run_suite_cli(
         reporter.info(
             f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) per engine"
         )
-    if argv is None:
-        argv = list(sys.argv)
     return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
 
 

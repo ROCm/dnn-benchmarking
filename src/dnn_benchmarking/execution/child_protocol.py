@@ -8,9 +8,11 @@ Every GPU run is a child process. A hipDNN engine row runs its OOTB plan in
 script with ``--tuned``. A PyTorch row (``--runtime pytorch`` or the
 ``--validate pytorch`` reference) runs in ``cli/pytorch_child.py`` the same
 way.
-Each child starts with a new, empty MIOpen user database (its private
-directory), so no Find result of one run reaches another. MIOpen reads the
+An OOTB child starts with a new, empty MIOpen user database (its private
+directory), so no Find result of another run reaches it. MIOpen reads the
 database path once per process, so only a new process can start empty.
+Tuned children (``--tuned``, ``--autotune``) share the command's tuned
+database instead, so tuning carries from row to row.
 
 The parent (``execution.child_runner``) and each child script import this
 module. It holds:
@@ -111,24 +113,45 @@ class ChildEnv:
         fixed: Variables with one exact value.
         in_dir: Variables whose value comes from the private directory of the
             run (function of the directory path).
+        in_tuned_db: Variables whose value comes from the command's tuned
+            MIOpen user database directory, shared by every tuned run of the
+            command (function of the directory path). The child is not told
+            that path, so it only checks that these are set.
     """
 
     fixed: Mapping[str, str]
     in_dir: Mapping[str, Callable[[str], str]]
+    in_tuned_db: Mapping[str, Callable[[str], str]] = field(default_factory=dict)
 
-    def build(self, state_dir: str) -> Dict[str, str]:
-        """``os.environ`` plus the child variables for ``state_dir``.
+    def build(self, state_dir: str, tuned_db_dir: Optional[Path]) -> Dict[str, str]:
+        """``os.environ`` plus the child variables for ``state_dir`` and
+        ``tuned_db_dir``.
 
         The child variables replace inherited values: an inherited value
         would break the isolation of the run.
+
+        Raises:
+            ValueError: The environment needs the tuned database directory
+                and ``tuned_db_dir`` is ``None``.
         """
+        if self.in_tuned_db and tuned_db_dir is None:
+            raise ValueError(
+                f"a tuned child needs the tuned MIOpen user database directory "
+                f"for {sorted(self.in_tuned_db)}"
+            )
         env = dict(os.environ)
         env.update(self.fixed)
         env.update({name: value(state_dir) for name, value in self.in_dir.items()})
+        env.update(
+            {name: value(str(tuned_db_dir)) for name, value in self.in_tuned_db.items()}
+        )
         return env
 
     def check(self, state_dir: Path) -> None:
         """Raise unless the parent set this environment for ``state_dir``.
+
+        ``fixed`` and ``in_dir`` variables must have exactly the value that
+        :meth:`build` gives; ``in_tuned_db`` variables must be set.
 
         Raises:
             RuntimeError: A variable is missing, or has another value than
@@ -143,6 +166,11 @@ class ChildEnv:
             f"{name}={os.environ.get(name)!r}"
             for name, value in expected.items()
             if os.environ.get(name) != value
+        ]
+        wrong += [
+            f"{name}={os.environ.get(name)!r}"
+            for name in self.in_tuned_db
+            if not os.environ.get(name)
         ]
         if wrong:
             raise RuntimeError(f"child environment not set by the parent: {wrong}")
@@ -161,12 +189,14 @@ HIPDNN_OOTB_ENV = ChildEnv(
 )
 
 #: hipDNN child that benchmarks: the ``--autotune`` row and the ``--oracle``
-#: tuned run. Benchmarking on for every plan, no disk cache, and a private
-#: MIOpen user database. The search then neither reuses earlier tuning nor
-#: leaves entries that a later OOTB run would read.
+#: tuned run. Benchmarking on for every plan and no hipDNN disk cache. The
+#: MIOpen user database is the command's tuned one, shared by every tuned
+#: run: a search reuses what earlier tuned runs found for the same problem.
+#: An OOTB run never reads it.
 HIPDNN_BENCHMARKING_ENV = ChildEnv(
     fixed={"HIPDNN_FORCE_BENCHMARKING": "1", "HIPDNN_DISABLE_CACHE": "1"},
-    in_dir={"MIOPEN_USER_DB_PATH": _same_dir},
+    in_dir={},
+    in_tuned_db={"MIOPEN_USER_DB_PATH": _same_dir},
 )
 
 #: OOTB PyTorch child (a ``--runtime pytorch`` row or the ``--validate
@@ -183,8 +213,8 @@ PYTORCH_OOTB_ENV = ChildEnv(
 )
 
 #: Tuned-PyTorch child: the PyTorch selection settings, and TunableOp tunes
-#: GEMMs on first use, into a private results file. MIOpen's user database is
-#: private for the same reason as for hipDNN.
+#: GEMMs on first use, into a private results file. The MIOpen user database
+#: is the command's tuned one, as for the tuned hipDNN child.
 PYTORCH_TUNED_ENV = ChildEnv(
     fixed={
         **PYTORCH_SELECTION_ENV,
@@ -195,8 +225,8 @@ PYTORCH_TUNED_ENV = ChildEnv(
         "PYTORCH_TUNABLEOP_FILENAME": lambda d: os.path.join(
             d, "tunableop_results.csv"
         ),
-        "MIOPEN_USER_DB_PATH": _same_dir,
     },
+    in_tuned_db={"MIOPEN_USER_DB_PATH": _same_dir},
 )
 
 
@@ -263,7 +293,9 @@ def inherited_selection_env() -> Dict[str, str]:
     Variables that a spec sets are not inherited and are not listed.
     """
     set_by_specs = {
-        name for spec in ALL_SPECS for name in (*spec.env.fixed, *spec.env.in_dir)
+        name
+        for spec in ALL_SPECS
+        for name in (*spec.env.fixed, *spec.env.in_dir, *spec.env.in_tuned_db)
     }
     return {
         name: value

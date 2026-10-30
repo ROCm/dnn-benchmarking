@@ -102,15 +102,20 @@ def pytorch_child_args(
 
 @contextmanager
 def child_run(
-    spec: ChildSpec, args: List[str], timeout_s: Optional[int]
+    spec: ChildSpec,
+    args: List[str],
+    timeout_s: Optional[int],
+    tuned_db_dir: Optional[Path],
 ) -> Iterator[Tuple[ChildResult, SavedOutputs]]:
     """Run the script of ``spec`` in a new, empty directory, with the
     environment of ``spec``; yield its result and saved outputs.
 
-    The outputs stay readable until the context exits; then the directory
-    (the child's MIOpen user database) is deleted.
+    The outputs stay readable until the context exits; then the directory is
+    deleted. For an OOTB spec it is also the child's MIOpen user database; a
+    tuned spec uses ``tuned_db_dir``, the command's shared tuned database.
 
     Raises:
+        ValueError: ``spec`` is tuned and ``tuned_db_dir`` is ``None``.
         UnsupportedGraphError: The engine does not support the graph.
         StallFallbackError: The stall gate failed and the child did not
             retry without it (an OOTB run).
@@ -122,10 +127,9 @@ def child_run(
         out_dir = Path(state)
         argv = [sys.executable, "-m", f"dnn_benchmarking.cli.{spec.module}"]
         argv += [*args, *spec.flags(), "--out-dir", str(out_dir)]
+        env = spec.env.build(str(out_dir), tuned_db_dir)
         try:
-            proc = run_capped(
-                argv, timeout_s, env=spec.env.build(str(out_dir)), capture_output=False
-            )
+            proc = run_capped(argv, timeout_s, env=env, capture_output=False)
         except subprocess.TimeoutExpired:
             raise ChildRunError(
                 f"{what} child timed out after {timeout_s} s (--profiling-timeout)"

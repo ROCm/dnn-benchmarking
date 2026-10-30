@@ -136,7 +136,10 @@ def run_hipdnn_tuned(
     )
     try:
         with child_run(
-            HIPDNN_TUNED, args, config.metrics.profiling_timeout_s or None
+            HIPDNN_TUNED,
+            args,
+            config.metrics.profiling_timeout_s or None,
+            config.tuned_db_dir,
         ) as (tuned, outputs):
             oracle = _oracle_result(tuned, tuning_available, config)
             if reference_outputs is not None:
@@ -181,7 +184,10 @@ def run_pytorch_tuned(
     args = pytorch_child_args(graph_path, config, save_outputs=False)
     try:
         with child_run(
-            PYTORCH_TUNED, args, config.metrics.profiling_timeout_s or None
+            PYTORCH_TUNED,
+            args,
+            config.metrics.profiling_timeout_s or None,
+            config.tuned_db_dir,
         ) as (tuned, _):
             oracle = _oracle_result(tuned, tuning_available, config)
     except Exception as e:
