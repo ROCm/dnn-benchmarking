@@ -42,7 +42,7 @@ def _configure_cache_env(
     ``work_dir`` (--benchmark-work-dir), the caches go to ``work_dir/cache``
     and replace inherited values, and this command gets one run directory
     under ``work_dir/tmp``: every temporary per-run directory of the command
-    (MIOpen user databases, child result files) goes inside it, and the run
+    (OOTB MIOpen user databases, child result files) goes inside it, and the run
     directory is removed when the command ends. Without ``work_dir``, unset
     caches go to DNN_BENCH_WORKSPACE (set by setup_env.py), or to a temporary
     directory without a workspace. Must run before any GPU runtime

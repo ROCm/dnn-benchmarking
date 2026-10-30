@@ -69,9 +69,10 @@ def test_work_dir_keeps_caches_and_removes_temp_state_at_exit(
 ) -> None:
     """--benchmark-work-dir wins over a caller's cache paths, so two calls
     share compiled kernels under ``cache``. The command's temporary state
-    (every child's directory and MIOpen user DB) is in one run directory
+    (every child's directory and OOTB MIOpen user DB) is in one run directory
     under ``tmp``, removed when the command ends; the caches stay. The
-    parent never sets a MIOpen user DB: only children own one."""
+    parent never sets a MIOpen user DB: only children own one; the tuned DB
+    is ``tuned-db``, outside ``tmp``."""
     for var in _CACHE_VARS:
         monkeypatch.setenv(var, "/inherited")
     work_dir = tmp_path / "worker"
