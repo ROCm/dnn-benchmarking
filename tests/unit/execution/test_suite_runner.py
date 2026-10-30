@@ -346,7 +346,7 @@ class _Handle:
         return SimpleNamespace(engine_name=self.names.get(eid, ""), version="2.1")
 
 
-#: The command's tuned MIOpen user DB (``cli.main`` creates it). Only the
+#: The command's tuned MIOpen user DB (``run_suite_cli`` sets it). Only the
 #: test that inspects it creates it.
 TUNED_DB = Path("/work-dir/tuned-db")
 

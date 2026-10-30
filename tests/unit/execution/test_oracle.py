@@ -105,7 +105,7 @@ def child(monkeypatch):
     return launch
 
 
-#: The command's tuned MIOpen user DB (``cli.main`` creates it). The fake
+#: The command's tuned MIOpen user DB (``run_suite_cli`` sets it). The fake
 #: children never open it.
 TUNED_DB = Path("/work-dir/tuned-db")
 

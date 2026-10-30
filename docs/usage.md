@@ -340,18 +340,21 @@ selects. Point several calls at one `--benchmark-work-dir`, for example all
 the graphs of one batch job, to compile each kernel once and tune each
 problem once. `first_call_ms` then depends on the graphs that ran before.
 
-Each child repeats MIOpen Find for a problem that the system database does
-not hold, and starts a new process that loads the plugins. This adds time to
-`first_call_ms` and to the run time, not to `kernel.median_ms`.
+An OOTB child repeats MIOpen Find for a problem that the system database
+does not hold. A tuned child repeats it only when the tuned database does
+not hold the problem yet. Each child also starts a new process that loads
+the plugins. This adds time to `first_call_ms` and to the run time, not to
+`kernel.median_ms`.
 
 A child writes its output, also MIOpen logs (`MIOPEN_LOG_LEVEL`), to the
 stderr of `dnn-benchmark`. A child that fails reports the error to the tool,
 which shows it as the row error (OOTB run) or as `oracle_error` (tuned run).
 
 PyTorch rows (`--runtime pytorch`, `--validate pytorch`) also run in child
-processes (`cli/pytorch_child.py`). Each OOTB PyTorch child, also the
-reference, gets a new, empty MIOpen user database, as a hipDNN OOTB child
-does; a tuned PyTorch child uses the shared tuned database. The reference child saves its
+processes (`cli/pytorch_child.py`). Each OOTB PyTorch child gets a new,
+empty MIOpen user database, as a hipDNN OOTB child does. The reference child
+is an OOTB child. A tuned PyTorch child uses the shared tuned database. The
+reference child saves its
 outputs, and the tool compares the engine outputs with them on the host. When
 the PyTorch child cannot run the graph, the tool computes the reference on the
 CPU in the `dnn-benchmark` process.

@@ -356,10 +356,10 @@ class SuiteConfig:
     #: ``tmp/`` (``cli.main``). ``None``: the workspace or a temporary
     #: directory for the caches, the system temporary directory for the state.
     benchmark_work_dir: Optional[str] = None
-    #: MIOpen user database that every tuned child of the command shares
-    #: (``cli.main`` creates it: ``<benchmark_work_dir>/tuned-db``, else a
-    #: directory removed when the command ends). OOTB children never use it.
-    #: Required by a tuned or autotune run.
+    #: MIOpen user database that every tuned child of the command shares.
+    #: ``cli.suite_runner_cli.run_suite_cli`` sets it from
+    #: ``common.run_state.tuned_db_dir``. OOTB children never use it. A tuned
+    #: or autotune run fails without it.
     tuned_db_dir: Optional[Path] = None
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0

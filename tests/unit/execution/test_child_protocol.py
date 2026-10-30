@@ -84,11 +84,15 @@ def test_an_ootb_child_rejects_the_tuned_db(tmp_path, monkeypatch) -> None:
         env.check(tmp_path / "row")
 
 
-def test_a_tuned_child_rejects_a_missing_user_db(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("value", [None, ""])
+def test_a_tuned_child_rejects_a_missing_user_db(tmp_path, monkeypatch, value) -> None:
     env = child_protocol.HIPDNN_TUNED.env
-    for name, value in env.build(str(tmp_path / "row"), tmp_path / "tuned-db").items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.delenv("MIOPEN_USER_DB_PATH")
+    for name, built in env.build(str(tmp_path / "row"), tmp_path / "tuned-db").items():
+        monkeypatch.setenv(name, built)
+    if value is None:
+        monkeypatch.delenv("MIOPEN_USER_DB_PATH")
+    else:
+        monkeypatch.setenv("MIOPEN_USER_DB_PATH", value)
 
     with pytest.raises(RuntimeError):
         env.check(tmp_path / "row")
