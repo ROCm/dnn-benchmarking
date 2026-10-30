@@ -3,7 +3,7 @@
 
 """Compare one engine's outputs against the cached reference outputs."""
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -47,12 +47,19 @@ TOLERANCES = {
 }
 
 
-def _compared(data: Any, tensor_info: TensorInfo) -> Any:
+class OutputSource(Protocol):
+    """The outputs of one run, as ``check_correctness`` reads them: the
+    files that a child saved (``child_runner.SavedOutputs``)."""
+
+    def get_output_data(self, uid: int) -> Optional[np.ndarray]:
+        """Output ``uid`` as a host array, or None when there is no output."""
+        ...
+
+
+def _compared(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     """The values compare() sees: log2 for e8m0 (see TOLERANCES), else ``data``."""
     if tensor_info.dtype.name != "fp8_e8m0":
         return data
-    if hasattr(data, "detach"):
-        return data.detach().float().log2()
     return np.log2(np.asarray(data, dtype=np.float32))
 
 
@@ -86,40 +93,26 @@ def unchecked(config: SuiteConfig, message: str) -> CorrectnessResult:
 
 
 def _compare_output(
-    buffer_manager: Any,
+    outputs: OutputSource,
     tensor_info: TensorInfo,
     ref: ReferenceOutput,
     rtol: float,
     atol: float,
 ) -> Optional[ComparisonResult]:
-    """Compare on the GPU when both sides are device tensors, else on the host."""
-    if ref.device_data is not None:
-        actual = buffer_manager.get_output_tensor(tensor_info.uid)
-        if actual is not None:
-            import torch
-
-            try:
-                return compare(
-                    _compared(actual, tensor_info),
-                    _compared(ref.device_data, tensor_info),
-                    rtol=rtol,
-                    atol=atol,
-                )
-            except torch.cuda.OutOfMemoryError:
-                pass  # Fall back to the host comparison.
-    actual = buffer_manager.get_output_data(tensor_info.uid)
+    """Compare output ``tensor_info`` with ``ref``; None without an output."""
+    actual = outputs.get_output_data(tensor_info.uid)
     if actual is None:
         return None
     return compare(
         _compared(actual, tensor_info),
-        _compared(ref.host_data(), tensor_info),
+        _compared(ref.data, tensor_info),
         rtol=rtol,
         atol=atol,
     )
 
 
 def check_correctness(
-    buffer_manager: Any,
+    outputs: OutputSource,
     tensor_infos: List[TensorInfo],
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
@@ -144,7 +137,7 @@ def check_correctness(
                     f"produce output tensor UID {ti.uid}",
                 )
             rtol, atol = tolerance_for(config, ti)
-            result = _compare_output(buffer_manager, ti, ref, rtol, atol)
+            result = _compare_output(outputs, ti, ref, rtol, atol)
             if result is not None:
                 compared.append((ti.uid, rtol, atol, result))
     except (ValueError, RuntimeError, ExecutionError) as e:

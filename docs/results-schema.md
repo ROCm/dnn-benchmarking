@@ -66,7 +66,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
+| `benchmark_work_dir` | string or null | `--benchmark-work-dir`. `cache/` holds the persistent compile caches (MIOpen kernels, comgr, XDG). `tuned-db/` holds the MIOpen user database that every tuned run (`--oracle`, `--autotune`) shares; it stays after the command. `tmp/` holds the temporary engine state (OOTB MIOpen user find-DBs and child result files). Each engine run gets a new directory there and deletes it after the run. `dnn-benchmark` deletes its `tmp/` run directory when it ends. `null`: the compile caches go to the workspace or a temporary directory, the engine state and the tuned database go to the system temporary directory, and the tuned database is deleted when the command ends. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
@@ -100,7 +100,7 @@ The CLI collects these values one time, at suite start.
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
-| `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle` or `--autotune` is set. |
+| `selection_env` | object | Variables of the `dnn-benchmark` environment that every child run inherits and that can change a kernel selection: names that start with `HIPDNN_`, `MIOPEN_`, `PYTORCH_` or `TORCH_ROCM_`, without the variables that a child sets itself (`HIPDNN_FORCE_BENCHMARKING`, `HIPDNN_DISABLE_CACHE`, `MIOPEN_USER_DB_PATH`, the PyTorch and TunableOp settings), the cache directories and logging variables. Empty when the shell sets none. The tool also shows them in a warning at start. |
 
 ## summary
 
@@ -199,7 +199,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | `timer` | string | Event timer: `hip` (HIP events) or `torch` (`torch.cuda.Event`). |
 | `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
 | `samples` | int | Number of timed samples behind `kernel` and `host` (`n` below). Equal to `--iters` unless `--min-time-ms` extends the loop. |
-| `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
+| `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. A tuned run skips the find for a problem the shared tuned database already holds, so its `first_call_ms` depends on the tuned runs before it. |
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the PyTorch `enqueue()` syncs with the host. |
 
@@ -293,9 +293,13 @@ the reason and `oracle` is `null`.
 |---|---|---|
 | `tuning_available` | bool | hipDNN: `true` when the engine exposes the `global.benchmarking` knob. PyTorch: `true` when the graph has a convolution or matmul node. `false` means the tuned run re-measured the OOTB plan, so the ratio is noise. `true` does not prove that a search ran: a provider can answer from its own database. |
 
-- hipDNN rows: the tuned plan is a second plan of the same engine, built with
-  `global.benchmarking=1` right after the OOTB plan. Its first launch samples
-  the candidates, so `oracle.timing.first_call_ms` holds the search cost.
+- hipDNN rows: the tuned run comes from a child process that builds the same
+  engine with benchmarking on (`HIPDNN_FORCE_BENCHMARKING=1`). Its first
+  launch samples the candidates, so `oracle.timing.first_call_ms` holds the
+  search cost, unless the shared tuned database already holds the problem
+  (see `first_call_ms`). With `--validate` and usable references, the tool compares
+  the child's outputs with the references of the OOTB plan, and
+  `correctness` is that check. Else `correctness` is `null`.
 - PyTorch rows: the tuned run comes from a child process (MIOpen exhaustive
   conv search and TunableOp). `build_ms` and `correctness` are `null`.
 

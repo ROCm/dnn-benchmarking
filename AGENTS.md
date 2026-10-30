@@ -76,18 +76,24 @@ src/dnn_benchmarking/
 │   ├── config_file.py        # TOML recipe merge (defaults < config < CLI)
 │   ├── suite_runner_cli.py   # startup checks, per-graph loop, result writes, exit codes
 │   ├── runtimes.py           # runtime startup; returns the per-graph runner
-│   └── internal_profiling.py # hidden --internal-profiling-run child
-├── common/                   # exceptions, dtypes registry, torch/ROCm runtime helpers
+│   ├── internal_profiling.py # hidden --internal-profiling-run child
+│   ├── child_script.py       # body shared by the timed children: spec check, timed loop, saved outputs
+│   ├── hipdnn_child.py       # child: one hipDNN engine run (OOTB, --autotune, or --tuned)
+│   └── pytorch_child.py      # child: one PyTorch run (--runtime pytorch or the reference; OOTB, or --tuned)
+├── common/                   # exceptions, dtypes, torch/ROCm runtime helpers, run_state (per-run temp dirs)
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
 ├── execution/
-│   ├── timing.py             # measure(): the one timed loop (staged / events)
+│   ├── timing.py             # measure(): the one timed loop (staged / events); retry_unstalled
+│   ├── timed_run.py          # steps before the timed loop in the hipDNN and PyTorch children
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
-│   ├── oracle.py             # --oracle pass
+│   ├── oracle.py             # --oracle pass (parent side)
+│   ├── child_protocol.py     # child contract: options, result files, ChildSpec and environment
+│   ├── child_runner.py       # parent side: start a child (OOTB: new, empty MIOpen user DB; tuned: the shared tuned DB)
 │   └── correctness.py        # output comparison for a row
 ├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
 ├── metrics/
@@ -107,13 +113,15 @@ src/dnn_benchmarking/
 ```
 
 Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
-each graph: `GraphLoader` -> `suite_runner.run_graph_all_providers` ->
-`Executor` + `BufferManager` -> `timing.measure` -> correctness, oracle,
-profiling -> `GraphResult` -> `Reporter` and `SuiteResult.write`.
+each graph: `GraphLoader` -> `suite_runner.run_graph_all_providers` -> per
+engine: `child_runner.child_run` -> `cli/hipdnn_child.py` (`Executor` +
+`BufferManager` -> `timing.measure`) -> correctness, oracle, profiling ->
+`GraphResult` -> `Reporter` and `SuiteResult.write`.
 
-Data flow (PyTorch): the same, with `run_graph_pytorch`,
-`PyTorchCudaExecutor` and `PyTorchCudaBufferManager`. One
-`runtime = "pytorch"` row per graph. No engine discovery or plugins.
+Data flow (PyTorch): the same, with `run_graph_pytorch` -> `child_run` ->
+`cli/pytorch_child.py` (`PyTorchCudaExecutor` + `PyTorchCudaBufferManager` ->
+`timing.measure`). One `runtime = "pytorch"` row per graph. No engine
+discovery or plugins.
 
 Rules that keep the design intact:
 
@@ -132,11 +140,49 @@ Rules that keep the design intact:
 - Build every hipDNN plan through `Executor.prepare`, which times only
   `create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
   `build_plans()`. Prime each engine with `Executor.prime` before its timed
-  OOTB build, and build the oracle's `global.benchmarking=1` plan right after
-  the OOTB build, so the two build times start from the same process state.
-- Run tuned PyTorch only in the `cli/pytorch_tuned_child.py` child process.
-  PyTorch's conv algorithm cache and MIOpen's user database would otherwise
-  carry tuning into the OOTB measurement.
+  OOTB build.
+- Run every hipDNN plan only in `cli/hipdnn_child.py` and every PyTorch GPU
+  run only in `cli/pytorch_child.py`: the OOTB run of each row (the
+  `--validate pytorch` reference saves its outputs), and with `--oracle` its
+  tuned run (`--tuned`). The parent sets no selection variable in its own
+  environment. Start every child with
+  `execution/child_runner.child_run`: it gives the child a new, empty
+  temporary directory and deletes it afterwards. For an OOTB spec it is also
+  the child's `MIOPEN_USER_DB_PATH`: MIOpen keys its user database without
+  the deterministic attribute and reads its path once per process, so only
+  a new process gives a run an empty database. A tuned or autotune spec
+  gets `SuiteConfig.tuned_db_dir` as `MIOPEN_USER_DB_PATH` instead, shared by
+  every tuned run of the command; the child only checks that it is set.
+  `child_run` takes a `ChildSpec` from
+  `execution/child_protocol.py` (`HIPDNN_OOTB` with
+  `HIPDNN_FORCE_BENCHMARKING=0`, `HIPDNN_AUTOTUNE` and `HIPDNN_TUNED` with
+  `HIPDNN_FORCE_BENCHMARKING=1`, `PYTORCH_OOTB` with the PyTorch selection
+  settings, `PYTORCH_TUNED` with them and the TunableOp variables). The
+  spec gives the script, its environment and its flags; the script checks
+  the environment of the spec that its flags select, for its own
+  directory (`cli/child_script.run_timed_child`). The parent sets only
+  `HIPDNN_DISABLE_CACHE=1` in its own environment, for engine discovery. The parent
+  passes the full `TimingPolicy`, `stall_gate` included. Each script wraps
+  its body in `child_protocol.run_reporting_failures`, which writes a
+  failure to `failure.json`; `child_run` raises it again as the same
+  exception kind (`UnsupportedGraphError`, `StallFallbackError` or
+  `ChildRunError`). The scripts check the environment, set no selection
+  variable and parse no dnn-benchmark option. Child output goes to the
+  parent's stderr, uncaptured. The parent validates the saved outputs with
+  `check_correctness`. Every run turns hipDNN's disk cache off
+  (`HIPDNN_DISABLE_CACHE=1`).
+- Give each profiling pass a new, empty MIOpen user database
+  (`metrics/_subprocess.run_tool`).
+- Create every temporary per-run directory (child state, OOTB MIOpen user
+  databases) with `common.run_state.run_state_dir`. With
+  `--benchmark-work-dir`, `cli/main.py` puts the compile caches in
+  `<work dir>/cache` and sets `DNN_BENCH_TEMP_ROOT` to the command's own run
+  directory `<work dir>/tmp/dnn-bench-run-*`, removed at exit. The tuned
+  MIOpen user database comes from `common.run_state.tuned_db_dir`, entered by
+  `cli/suite_runner_cli.run_suite_cli` before the runtime starts:
+  `<work dir>/tuned-db`, kept across commands, else a directory of the
+  command. The `dnn-benchmark` process sets no `MIOPEN_USER_DB_PATH`; only
+  children own one.
 
 ## Tests
 

@@ -33,32 +33,29 @@ def test_default_stays_on_the_heuristic_path() -> None:
     assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
 
-def test_autotune_without_cache_dir_is_a_hazard() -> None:
-    [warning] = _warnings(autotune=True)
-    assert "--hipdnn-cache-dir" in warning
-    assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
-
-
-def test_autotune_with_cache_dir_is_isolated() -> None:
-    lines = _lines(autotune=True, hipdnn_cache_dir="/tmp/phase-x")
+def test_autotune_is_reported_and_left_to_the_child_spec() -> None:
+    """--autotune reaches the engine runs through their child spec; this
+    process sets no benchmarking variable."""
+    lines = _lines(autotune=True)
     assert [line for line in lines if line.startswith("WARNING")] == []
-    assert any("kernel selection: autotune;" in line for line in lines)
-    assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
+    assert any("kernel selection: autotune; cache: disabled" in l for l in lines)
+    assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
 
-@pytest.mark.parametrize(
-    "value, warned", [("1", True), ("0", False)], ids=["truthy-leak", "off-value"]
-)
-def test_leaked_force_benchmarking(monkeypatch, value, warned) -> None:
-    """hipDNN treats "0" as off, so only a truthy inherited value is a hazard."""
+def test_hipdnn_disk_cache_is_off_for_engine_discovery() -> None:
+    _lines()
+    assert os.environ["HIPDNN_DISABLE_CACHE"] == "1"
+
+
+@pytest.mark.parametrize("value", ["1", "0"])
+def test_shell_force_benchmarking_is_ignored_with_a_warning(monkeypatch, value) -> None:
+    """The child spec fixes the variable, so a shell value never changes the
+    selection; the user is told so."""
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", value)
     lines = _lines()
     warnings = [line for line in lines if line.startswith("WARNING")]
-    assert [("HIPDNN_FORCE_BENCHMARKING" in w) for w in warnings] == (
-        [True] if warned else []
-    )
-    path = "autotune" if warned else "heuristic"
-    assert any(f"kernel selection: {path};" in line for line in lines)
+    assert [("HIPDNN_FORCE_BENCHMARKING" in w) for w in warnings] == [True]
+    assert any("kernel selection: heuristic;" in line for line in lines)
 
 
 def test_pytorch_runtime_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) -> None:

@@ -27,6 +27,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..common.run_state import run_state_dir
 from ._diagnostic import warn_once
 
 # Lines of captured output kept in ``error_tail``.
@@ -36,6 +37,9 @@ _TAIL_LINES = 40
 # grandchild that escaped the group (its own session) can't hold the
 # pipes — and us — open forever.
 _REAP_TIMEOUT_S = 5
+
+# File descriptor of this process's stderr (also on Windows).
+_STDERR_FD = 2
 
 
 def _kill_tree(proc: "subprocess.Popen[str]") -> None:
@@ -80,11 +84,12 @@ def run_capped(
     argv: List[str],
     timeout_s: Optional[int],
     env: Optional[Dict[str, str]] = None,
+    capture_output: bool = True,
 ) -> "subprocess.CompletedProcess[str]":
-    """Run ``argv``, capturing text output, under a real wall-clock cap.
+    """Run ``argv`` under a real wall-clock cap.
 
-    Drop-in for ``subprocess.run(argv, capture_output=True, text=True,
-    check=False, timeout=timeout_s)`` — same return value, same
+    Drop-in for ``subprocess.run(argv, capture_output=capture_output,
+    text=True, check=False, timeout=timeout_s)`` — same return value, same
     exceptions — except that the timeout also applies to grandchildren.
     Any abnormal exit tears the process tree down, so cancelling the
     caller cannot leave a profiler and its GPU workload running.
@@ -93,19 +98,27 @@ def run_capped(
         argv: Command to run.
         timeout_s: Wall-clock budget in seconds; ``None`` disables it.
         env: Child environment; ``None`` passes a copy of ``os.environ``.
+        capture_output: Capture stdout/stderr as text. ``False`` sends both
+            to this process's stderr: the child's output is diagnostics, and
+            stdout holds only results.
 
     Returns:
-        The completed process with ``stdout``/``stderr`` as text.
+        The completed process; ``stdout``/``stderr`` are text when captured,
+        else None.
 
     Raises:
         subprocess.TimeoutExpired: after the process tree is killed.
         KeyboardInterrupt, SystemExit: likewise, after the kill.
         OSError: if the tool can't be spawned.
     """
+    if capture_output:
+        out_target, err_target = subprocess.PIPE, subprocess.PIPE
+    else:
+        out_target, err_target = _STDERR_FD, None
     with subprocess.Popen(
         argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=out_target,
+        stderr=err_target,
         text=True,
         start_new_session=True,
         # Explicit env, deliberately not inherited: ``os.environ`` is the
@@ -172,7 +185,11 @@ def run_tool(
     name = Path(binary).name
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        proc = run_capped([binary, *args], timeout_s or None)
+        # Each pass is a GPU run of its own: it starts with a new, empty
+        # MIOpen user database, deleted after the pass.
+        with run_state_dir("dnn-bench-miopen-db-") as user_db:
+            env = dict(os.environ, MIOPEN_USER_DB_PATH=user_db)
+            proc = run_capped([binary, *args], timeout_s or None, env=env)
     except subprocess.TimeoutExpired as e:
         msg = f"{name} timed out after {timeout_s}s"
         warn_once(source, f"{context}: {msg}; raise --profiling-timeout to extend")

@@ -328,17 +328,21 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Runtime/Selection",
         SuiteConfig,
         "autotune",
-        "benchmark candidate kernels on first execute and cache the winner "
-        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --hipdnn-cache-dir",
+        "benchmark candidate kernels on first execute and use the winner "
+        "(HIPDNN_FORCE_BENCHMARKING=1); winners are not kept between runs",
     ),
     CliOption(
-        flags=("--hipdnn-cache-dir",),
-        dest="hipdnn_cache_dir",
+        flags=("--benchmark-work-dir",),
+        dest="benchmark_work_dir",
         group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
-        help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
-        config_key="hipdnn_cache_dir",
+        help="work directory: PATH/cache holds caches that only save time "
+        "(MIOpen compiled kernels, comgr, XDG; reuse it across calls to skip "
+        "repeated compiles); PATH/tuned-db holds the MIOpen user DB that every "
+        "tuned run shares, kept across calls; PATH/tmp holds the temporary "
+        "engine state (OOTB MIOpen user find-DBs), deleted when dnn-benchmark ends",
+        config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
     ),
     _choice_option(
@@ -414,8 +418,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Comparison",
         SuiteConfig,
         "oracle",
-        "also build and time a global.benchmarking=1 plan per engine, and a "
-        "tuned PyTorch run in a child process (much slower; not with --autotune)",
+        "also time a tuned run of each row in a child process: the engine with "
+        "benchmarking on, or tuned PyTorch (much slower; not with --autotune)",
     ),
     # Output
     CliOption(
@@ -522,7 +526,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_at_least(int, 0),
         default=_default(MetricsConfig, "profiling_timeout_s"),
         metavar="SECONDS",
-        help="timeout per profiler or tuned-PyTorch subprocess; 0 disables",
+        help="timeout per profiler or tuned-run subprocess; 0 disables",
         config_key="profiling_timeout",
         config_kind=ConfigKind.SCALAR,
         config_type=int,

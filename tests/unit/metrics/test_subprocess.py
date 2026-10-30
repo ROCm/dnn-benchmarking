@@ -11,6 +11,7 @@ hangs the whole benchmark instead of skipping one pass.
 """
 
 import ctypes
+import os
 import subprocess
 import sys
 import time
@@ -227,6 +228,25 @@ class TestRunTool:
         err = capsys.readouterr().err
         assert "g/A" in err and "g/B" in err
 
+    def test_each_pass_gets_its_own_empty_miopen_user_db(self, tmp_path):
+        """A profiling pass is a GPU run: it starts with a new, empty MIOpen
+        user database that no other pass shares and that is deleted after it."""
+        script = (
+            "import os; p = os.environ['MIOPEN_USER_DB_PATH']; "
+            "print(p, len(os.listdir(p)))"
+        )
+        seen = []
+        for _ in range(2):
+            proc, _ = run_tool(
+                "src", sys.executable, ["-c", script], tmp_path, 60, "g/E"
+            )
+            path, entries = proc.stdout.split()
+            seen.append((path, entries))
+
+        assert seen[0][0] != seen[1][0]
+        assert [entries for _, entries in seen] == ["0", "0"]
+        assert not any(os.path.exists(path) for path, _ in seen)
+
 
 def _resolve_pmc(mp, binary):
     mp.setattr(rocprof_pmc, "detect_arch", lambda: "gfx942")
@@ -298,7 +318,7 @@ class TestSourceFailureModes:
         resolve(monkeypatch, "tool")
         seen = []
 
-        def wedge(argv, timeout_s):
+        def wedge(argv, timeout_s, env=None):
             seen.append(timeout_s)
             raise subprocess.TimeoutExpired(argv, timeout_s)
 

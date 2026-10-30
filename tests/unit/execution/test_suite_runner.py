@@ -4,7 +4,6 @@
 """Tests for execution.suite_runner, asserted on the GraphResult it returns."""
 
 import io
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from dnn_benchmarking.cli import child_script, hipdnn_child, pytorch_child
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -20,12 +20,23 @@ from dnn_benchmarking.config.benchmark_config import (
     SuiteConfig,
     ValidationConfig,
 )
-from dnn_benchmarking.execution import oracle, suite_runner
+from dnn_benchmarking.execution import child_runner, suite_runner, timed_run
+from dnn_benchmarking.execution.child_protocol import (
+    HIPDNN_AUTOTUNE,
+    HIPDNN_OOTB,
+    PYTORCH_OOTB,
+    output_file,
+    write_result,
+)
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
-from dnn_benchmarking.reporting.suite_results import graph_id_for, oracle_speedup
+from dnn_benchmarking.reporting.suite_results import (
+    engine_id_hex,
+    graph_id_for,
+    oracle_speedup,
+)
 
 GRAPH = {"name": "g", "nodes": [], "tensors": []}
 PATH = Path("g.json")
@@ -88,10 +99,10 @@ class Fake:
         self.torch_buffer_devices = []
         self.torch_outputs_written = False
         self.policies = []
-        # (call, handle, HIPDNN_DISABLE_CACHE) per plan build/run, in order;
-        # calls on the tuned plan are prefixed "tuned.".
-        self.calls = []
+        self.knob_ids = {}  # engine id -> knob ids; default: benchmarking
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
+        self.tuned_child = None  # fake run_capped for --tuned children
+        self.child_envs = []  # env of each OOTB child launch
 
 
 @pytest.fixture
@@ -103,13 +114,7 @@ def fake(monkeypatch):
         def __init__(self, graph_json_str, policy):
             f.policies.append(policy)
             self.policy = policy
-            self.tag = ""
             self.build_time_ms, self.workspace_size = 0.0, 0
-
-        def _call(self, name, handle):
-            f.calls.append(
-                (self.tag + name, handle, os.environ.get("HIPDNN_DISABLE_CACHE"))
-            )
 
         def discover_engines(self, handle):
             f.events.append("discover")
@@ -118,38 +123,35 @@ def fake(monkeypatch):
             return list(f.discovered)
 
         def prime(self, handle, engine_id):
-            self._call("prime", handle)
+            pass
 
         def prepare(self, handle, engine_id=None, knobs=None):
-            self.tag = "tuned." if knobs else ""
-            self._call("prepare", handle)
             self.engine_id = engine_id
             if engine_id in f.prepare_errors:
                 raise f.prepare_errors[engine_id]
-            # Distinct OOTB and tuned build times, so a row cannot report the
-            # other plan's build.
-            self.build_time_ms = 7.0 if knobs else 2.0
+            self.build_time_ms = 2.0
             self.workspace_size = 64
 
         def engine_knob_ids(self, engine_id):
-            return ["global.benchmarking"]
+            knobs = f.knob_ids.get(engine_id, ["global.benchmarking"])
+            if isinstance(knobs, Exception):
+                raise knobs
+            return list(knobs)
 
         def benchmark(self, handle, variant_pack):
-            self._call("benchmark", handle)
             f.events.append(("benchmark", self.engine_id, self.policy.stall_gate))
             if self.engine_id in f.bench_errors:
                 raise f.bench_errors[self.engine_id]
             return _stall_aware(f, self.engine_id, self.policy)
 
         def execute_once(self, handle, variant_pack):
-            self._call("execute_once", handle)
             f.events.append("execute_once")
 
         def __del__(self):
             f.events.append("executor_freed")
 
     class BufferManager:
-        def __init__(self, tensor_infos, device=None):
+        def __init__(self, tensor_infos):
             pass
 
         def __enter__(self):
@@ -171,26 +173,61 @@ def fake(monkeypatch):
         def create_variant_pack(self):
             return {}
 
-        def get_output_tensor(self, uid):
-            return None
-
         def get_output_data(self, uid):
             f.events.append("read_output")
             return f.engine_output
+
+        def get_output_tensors(self):
+            return [t for t in TENSORS if t.is_output]
 
     class Probe:
         def clocks(self):
             return f.clocks.pop(0) if f.clocks else None
 
+    class Loader:
+        def load(self, path):
+            return GRAPH, TENSORS
+
+    untuned = {
+        (f"dnn_benchmarking.cli.{spec.module}", tuple(spec.flags())): spec
+        for spec in (HIPDNN_OOTB, HIPDNN_AUTOTUNE, PYTORCH_OOTB)
+    }
+    scripts = {
+        "dnn_benchmarking.cli.hipdnn_child": hipdnn_child,
+        "dnn_benchmarking.cli.pytorch_child": pytorch_child,
+    }
+
+    def run_capped(argv, timeout_s, env=None, capture_output=True):
+        """Run the real untuned child script in this process, in its env."""
+        module, args = argv[2], argv[3:]
+        if "--tuned" in args:
+            assert f.tuned_child is not None, "tuned child launched without fixture"
+            return f.tuned_child(argv, timeout_s, env)
+        f.child_envs.append(env)
+        flags = tuple(a for a in args if a == "--autotune")
+        child_env = untuned[(module, flags)].env
+        with monkeypatch.context() as m:
+            for name in child_env.names:
+                m.setenv(name, env[name])
+            code = scripts[module].main(args)
+        return SimpleNamespace(returncode=code)
+
     monkeypatch.setattr(suite_runner, "Executor", Executor)
-    monkeypatch.setattr(oracle, "Executor", Executor)
-    monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
-    monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
+    monkeypatch.setattr(timed_run, "Executor", Executor)
+    monkeypatch.setattr(timed_run, "BufferManager", BufferManager)
+    monkeypatch.setattr(child_script, "GpuSmiProbe", Probe)
+    monkeypatch.setattr(hipdnn_child, "GraphLoader", Loader)
+    monkeypatch.setattr(pytorch_child, "GraphLoader", Loader)
+    monkeypatch.setattr(hipdnn_child, "initialize_pip_rocm_runtime", lambda: None)
+    monkeypatch.setattr(child_runner, "run_capped", run_capped)
     monkeypatch.setitem(
         sys.modules,
         "hipdnn_frontend",
         SimpleNamespace(
             engine_id_to_name=lambda eid: "",
+            Handle=SimpleNamespace,
+            set_engine_plugin_paths=lambda paths, mode: None,
+            PluginLoadingMode=SimpleNamespace(ABSOLUTE="abs"),
         ),
     )
     return f
@@ -271,7 +308,7 @@ def fake_torch(fake, monkeypatch):
                 return self.estimated_bytes[precision]
             return self.estimated_bytes
 
-        def compute_reference(self, graph_json, input_data, *, precision, device):
+        def compute_reference(self, graph_json, input_data, *, precision, device=None):
             if precision is NATIVE:
                 fake.events.append("cpu_reference")
                 return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
@@ -295,27 +332,27 @@ def fake_torch(fake, monkeypatch):
         "_reference_provider",
         lambda config, graph_json: (fake.cpu_reference, None),
     )
+    monkeypatch.setattr(pytorch_child, "_float64_provider", lambda: fake.cpu_reference)
     return fake
 
 
 class _Handle:
-    """hipdnn.Handle stand-in; the oracle builds a second one on this stream."""
+    """hipdnn.Handle stand-in."""
 
     def __init__(self, names=None):
         self.names = names or {1: "ENG_A", 2: "ENG_B"}
-        self.stream = None
 
     def get_engine_info(self, eid):
         return SimpleNamespace(engine_name=self.names.get(eid, ""), version="2.1")
 
-    def get_stream(self):
-        return self.stream
 
-    def set_stream(self, stream):
-        self.stream = stream
+#: The command's tuned MIOpen user DB (``run_suite_cli`` sets it). Only the
+#: test that inspects it creates it.
+TUNED_DB = Path("/work-dir/tuned-db")
 
 
 def _run(handle="default", **config):
+    config.setdefault("tuned_db_dir", TUNED_DB)
     out = io.StringIO()
     graph = suite_runner.run_graph_all_providers(
         PATH,
@@ -416,6 +453,21 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
     assert ok.status == "success"
 
 
+@pytest.mark.parametrize("outcome", ["skip", "stall"])
+def test_handled_child_failures_print_no_error_line(fake, capsys, outcome):
+    """A skip or a stall-gate failure is a normal outcome: the child reports
+    it only to the parent, which turns it into a skipped row or a rerun."""
+    if outcome == "skip":
+        fake.prepare_errors[1] = UnsupportedGraphError("no plan")
+    else:
+        fake.stall = {1}
+
+    graph, _ = _run()
+
+    assert graph.results[0].status == ("skipped" if outcome == "skip" else "success")
+    assert "ERROR" not in capsys.readouterr().err
+
+
 def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch):
     monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
     fake.discovered = [1]
@@ -459,52 +511,139 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         assert expected in warnings
 
 
-def test_every_executor_gets_the_run_policy(fake):
+@pytest.fixture
+def tuned_child(fake, monkeypatch):
+    """Fake tuned-hipDNN child: 7 ms build, 0.5 ms kernels, output ``output``.
+
+    Records each launch's engine (hex) in ``engines`` and in ``fake.events``,
+    and its timing policy's ``stall_gate`` in ``stall_gates``.
+    """
+    child = SimpleNamespace(engines=[], stall_gates=[], output=REF.copy())
+
+    def run_capped(argv, timeout_s, env=None):
+        args = hipdnn_child.parse_args(argv[3:])
+        engine = engine_id_hex(args.engine)
+        child.engines.append(engine)
+        child.stall_gates.append(args.timing_policy.stall_gate)
+        fake.events.append(("tuned_child", engine))
+        m = _measurement(kernel_ms=[0.5] * 4, host_ms=[0.01] * 4)
+        write_result(args.out_dir, m, build_ms=7.0, workspace_bytes=64)
+        if args.save_outputs:
+            np.save(output_file(args.out_dir, 2), child.output)
+        return SimpleNamespace(returncode=0)
+
+    fake.tuned_child = run_capped
+    return child
+
+
+def test_every_executor_gets_the_run_policy(fake, tuned_child):
     config = dict(warmup_iters=3, benchmark_iters=5, cache_mode="cold")
 
     _run(oracle=True, **config)
 
-    # Discovery, then per engine the prime, the OOTB plan and the tuned plan.
-    assert fake.policies == [SuiteConfig(**config).timing_policy] * 7
+    # Discovery, then per engine the prime and the OOTB plan; the tuned run
+    # is a child process.
+    assert fake.policies == [SuiteConfig(**config).timing_policy] * 5
 
 
-def test_oracle_builds_both_plans_before_anything_runs(fake, reference, monkeypatch):
-    """Per engine: one untimed prime on the row handle absorbs the first
-    build's one-time costs, then the timed OOTB and tuned builds run back to
-    back (work in between slows a later build). The tuned plan is never
-    primed, runs on its own handle with hipDNN caches disabled, and is timed
-    only after the OOTB plan is timed and validated."""
-    monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
-    handle = _Handle()
-
-    graph, _ = _validate(handle=handle, oracle=True)
-
-    assert [(name, h is handle, cache) for name, h, cache in fake.calls] == [
-        ("prime", True, None),
-        ("prepare", True, None),
-        ("tuned.prepare", False, "1"),
-        ("benchmark", True, None),
-        ("execute_once", True, None),
-        ("tuned.benchmark", False, "1"),
-        ("tuned.execute_once", False, "1"),
-    ] * 2
-    for row in graph.results:
-        assert (row.ootb.cpu_build_time_ms, row.oracle.cpu_build_time_ms) == (2.0, 7.0)
-        assert row.ootb.correctness.passed and row.oracle.correctness.passed
-
-
-def test_tuned_plan_failing_validation_publishes_no_speedup(
-    fake, reference, monkeypatch
+def test_oracle_tunes_each_engine_in_a_child_after_its_row_is_released(
+    fake, reference, tuned_child
 ):
-    """A wrong-but-fast tuned plan is checked against the graph's reference:
-    it keeps its own failed verdict and the OOTB row keeps its pass."""
-    run_tuned_plan = suite_runner.run_tuned_plan
+    """The tuned child runs once per engine, after the OOTB plan is timed and
+    validated and its buffers and workspace are released (tuning state must
+    not reach the OOTB numbers; held VRAM would stack on the child's)."""
+    graph, _ = _validate(oracle=True)
 
-    def wrong_tuned_outputs(**kw):
-        fake.engine_output = REF + 1.0
-        run_tuned_plan(**kw)
+    assert tuned_child.engines == [engine_id_hex(1), engine_id_hex(2)]
+    for eid in (1, 2):
+        at = fake.events.index(("tuned_child", engine_id_hex(eid)))
+        before = fake.events[:at]
+        assert ("benchmark", eid, True) in before
+        assert before[-3:] == ["read_output", "buffers_freed", "executor_freed"]
+    for row in graph.results:
+        assert row.status == "success" and row.oracle_error is None
+        assert (row.ootb.cpu_build_time_ms, row.oracle.cpu_build_time_ms) == (2.0, 7.0)
+        assert row.oracle.gpu_kernel_stats.median_ms == pytest.approx(0.5)
+        # The parent compares the child's saved outputs with its references.
+        assert row.ootb.correctness.passed and row.oracle.correctness.passed
+        assert oracle_speedup(row) == pytest.approx(2.0)
 
-    monkeypatch.setattr(suite_runner, "run_tuned_plan", wrong_tuned_outputs)
+
+@pytest.mark.parametrize(
+    "autotune, shell, expected", [(False, "1", "0"), (True, "0", "1")]
+)
+def test_engine_row_benchmarks_only_with_autotune(
+    fake, monkeypatch, autotune, shell, expected
+):
+    """The command line alone decides whether a row benchmarks its candidate
+    kernels: the child spec overrides a shell value."""
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", shell)
+
+    graph, _ = _run(autotune=autotune)
+
+    assert {r.status for r in graph.results} == {"success"}
+    assert {env["HIPDNN_FORCE_BENCHMARKING"] for env in fake.child_envs} == {expected}
+
+
+def test_ootb_runs_get_fresh_user_dbs_and_tuned_runs_share_one(
+    fake, tuned_child, monkeypatch, tmp_path
+):
+    """Each OOTB run gets a new, empty MIOpen user database that no other run
+    shares and that is deleted after it, so OOTB measures the heuristic.
+    Tuned runs share the command's tuned database, which outlives them, so a
+    later row reuses what an earlier row tuned."""
+    launches = []
+    inner = child_runner.run_capped
+
+    def record(argv, timeout_s, env=None, capture_output=True):
+        db = Path(env["MIOPEN_USER_DB_PATH"])
+        launches.append(("--tuned" in argv, db, sorted(p.name for p in db.iterdir())))
+        return inner(argv, timeout_s, env)
+
+    monkeypatch.setattr(child_runner, "run_capped", record)
+    tuned_db = tmp_path / "tuned-db"
+    tuned_db.mkdir()
+
+    _run(oracle=True, tuned_db_dir=tuned_db)
+
+    ootb = [(db, contents) for tuned, db, contents in launches if not tuned]
+    tuned = [db for is_tuned, db, _ in launches if is_tuned]
+    assert len(ootb) == 2 and len({db for db, _ in ootb}) == 2  # 2 engines
+    assert all(contents == [] for _, contents in ootb)
+    assert not any(db.exists() for db, _ in ootb)
+    assert tuned == [tuned_db, tuned_db]
+    assert tuned_db.is_dir()
+
+
+def test_tuning_available_follows_each_engines_knobs(fake, tuned_child):
+    """hipDNN ignores a knob the engine does not expose; its tuned run then
+    re-measures the OOTB configuration and must say so."""
+    fake.knob_ids = {2: ["miopen.find_mode"]}
+
+    graph, _ = _run(oracle=True)
+
+    assert [r.oracle.tuning_available for r in graph.results] == [True, False]
+    # No references: the tuned run is not validated either.
+    assert [r.oracle.correctness for r in graph.results] == [None, None]
+
+
+def test_failed_knob_query_is_an_oracle_error_without_a_tuned_run(fake, tuned_child):
+    fake.knob_ids = {1: ExecutionError("no knobs")}
+
+    e1, e2 = _run(oracle=True)[0].results
+
+    assert tuned_child.engines == [engine_id_hex(2)]
+    assert (e1.status, e1.oracle) == ("success", None)
+    assert e1.oracle_error and e1.ootb.gpu_kernel_stats is not None
+    assert e2.oracle is not None and e2.oracle_error is None
+
+
+def test_tuned_child_failing_validation_publishes_no_speedup(
+    fake, reference, tuned_child
+):
+    """A wrong-but-fast tuned plan keeps its own failed verdict and the OOTB
+    row keeps its pass."""
+    tuned_child.output = REF + 1.0
 
     graph, _ = _validate(oracle=True, engine_filter=[1])
 
@@ -512,6 +651,29 @@ def test_tuned_plan_failing_validation_publishes_no_speedup(
     assert (row.status, row.verdict) == ("success", "passed")
     assert row.oracle.correctness.explicitly_failed
     assert oracle_speedup(row) is None
+
+
+def test_duplicate_engine_with_a_failed_knob_query_gets_no_tuned_run(fake, tuned_child):
+    """Duplicate selections are separate rows: the second row's failed knob
+    query must not inherit the first row's tuning availability."""
+
+    class FailsSecondTime:
+        calls = 0
+
+        def __iter__(self):
+            FailsSecondTime.calls += 1
+            if FailsSecondTime.calls > 1:
+                raise ExecutionError("no knobs")
+            return iter(["global.benchmarking"])
+
+    fake.knob_ids = {1: FailsSecondTime()}
+
+    first, second = _run(oracle=True, engine_filter=[1, 1])[0].results
+
+    assert tuned_child.engines == [engine_id_hex(1)]
+    assert first.oracle is not None and first.oracle_error is None
+    assert (second.status, second.oracle) == ("success", None)
+    assert second.oracle_error
 
 
 def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
@@ -766,9 +928,9 @@ def test_engines_compare_against_the_float64_reference_of_a_supported_graph(
     assert engine.verdict == verdict
     assert engine.ootb.correctness.reference_precision == used
     float64_calls = [e for e in fake_torch.events if e[0] == "float64_reference"]
-    # After the timed GPU row, the float64 reference runs on the GPU.
+    # The reference child computes the float64 reference on its GPU.
     assert float64_calls == (
-        [("float64_reference", "cuda")] if used == "float64" else []
+        [("float64_reference", "cuda:3")] if used == "float64" else []
     )
     assert not reference.warnings
 
@@ -821,39 +983,6 @@ def test_cpu_reference_is_float64_when_it_fits_in_host_memory(
         assert any("host memory" in note for note in reference.warnings)
 
 
-def test_native_gpu_reference_is_freed_before_the_float64_cache_release(
-    fake_torch, monkeypatch
-):
-    """The cache release after the float64 pass must see the native outputs
-    already freed; otherwise their memory stays cached during the engine rows."""
-    import weakref
-
-    fake_torch.discovered = [1]
-    fake_torch.cpu_reference.float64 = True
-    native = []
-    run_row = suite_runner._run_pytorch_row
-
-    def tracked_row(ctx, role):
-        row, outputs = run_row(ctx, role)
-        native.extend(weakref.ref(o) for o in (outputs or {}).values())
-        return row, outputs
-
-    alive_at_release = []
-    monkeypatch.setattr(suite_runner, "_run_pytorch_row", tracked_row)
-    monkeypatch.setattr(
-        suite_runner,
-        "_release_torch_cache",
-        lambda: alive_at_release.append(sum(r() is not None for r in native)),
-    )
-
-    graph, _ = _validate()
-
-    assert native
-    assert graph.results[1].ootb.correctness.reference_precision == "float64"
-    # The last release (after the float64 pass) runs with no native output left.
-    assert alive_at_release[-1] == 0
-
-
 def test_failed_cpu_float64_reference_falls_back_to_the_native_cpu_reference(
     fake_torch, monkeypatch
 ):
@@ -875,115 +1004,6 @@ def test_failed_cpu_float64_reference_falls_back_to_the_native_cpu_reference(
     assert [e.verdict for e in engines] == ["passed", "passed"]
     assert {e.ootb.correctness.reference_precision for e in engines} == {"native"}
     assert any("host allocation failed" in note for note in reference.warnings)
-
-
-@pytest.mark.parametrize("profiled", [False, True])
-def test_profiled_runs_keep_the_float64_reference_on_the_host(
-    fake_torch, monkeypatch, profiled
-):
-    """Profiled runs keep host-only references, as the timed row does."""
-    import torch
-    from dnn_benchmarking.metrics import profiling_orchestrator
-
-    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
-    fake_torch.discovered = [1]
-    reference = fake_torch.cpu_reference
-    reference.float64 = True
-
-    def device_float64(graph_json, input_data, *, precision, device):
-        if precision is NATIVE:
-            return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
-        return {
-            2: suite_runner.ReferenceOutput(
-                data=None,
-                tensor_uid=2,
-                device_data=torch.from_numpy(REF.astype(np.float64)),
-                precision="float64",
-            )
-        }
-
-    monkeypatch.setattr(reference, "compute_reference", device_float64)
-    seen = []
-    check = suite_runner.check_correctness
-
-    def recording_check(bm, infos, refs, *args):
-        seen.extend(refs.values())
-        return check(bm, infos, refs, *args)
-
-    monkeypatch.setattr(suite_runner, "check_correctness", recording_check)
-    metrics = MetricsConfig(perf=True) if profiled else MetricsConfig()
-
-    graph, _ = _validate(metrics=metrics)
-
-    assert graph.results[1].verdict == "passed"
-    (ref,) = {id(r): r for r in seen}.values()
-    assert ref.precision == "float64"
-    if profiled:
-        assert ref.device_data is None
-        assert ref.data.dtype == np.float64
-    else:
-        assert ref.device_data is not None and ref.data is None
-
-
-def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
-    torch = pytest.importorskip("torch")
-    base = torch.arange(12, dtype=torch.float32)
-    view = base[4:8]
-
-    kept = suite_runner._owned(view)
-
-    assert torch.equal(kept, torch.tensor([4.0, 5.0, 6.0, 7.0]))
-    assert kept.untyped_storage().nbytes() == 4 * kept.element_size()
-    assert suite_runner._owned(base) is base
-
-
-@pytest.mark.parametrize("keep_device", [True, False])
-def test_pytorch_reference_outputs_keep_a_gpu_output_on_the_device(keep_device):
-    torch = pytest.importorskip("torch")
-    values = torch.arange(4, dtype=torch.float32)
-    host_reads = []
-
-    class GpuTensor:
-        """A CUDA output on a CPU-only torch: detach() gives its values."""
-
-        is_cuda = True
-
-        def detach(self):
-            return values
-
-    class Buffers:
-        def get_tensors(self):
-            return {2: GpuTensor()}
-
-        def get_output_tensors(self):
-            return [_tensor(2, is_output=True)]
-
-        def get_output_data(self, uid):
-            host_reads.append(uid)
-            return REF.copy()
-
-    (output,) = suite_runner._pytorch_reference_outputs_from_buffer(
-        Buffers(), keep_device=keep_device
-    ).values()
-
-    if keep_device:
-        assert output.data is None
-        assert torch.equal(output.device_data, values)
-        assert host_reads == []
-    else:
-        assert output.device_data is None
-        np.testing.assert_array_equal(output.data, REF)
-        assert host_reads == [2]
-    np.testing.assert_array_equal(output.host_data(), REF)
-
-
-def test_hipdnn_buffers_use_torch_storage_only_with_a_device_reference():
-    host = suite_runner.ReferenceOutput(data=REF, tensor_uid=2)
-    device = suite_runner.ReferenceOutput(data=REF, tensor_uid=3, device_data=REF)
-
-    assert suite_runner._hipdnn_buffer_device(None) is None
-    assert suite_runner._hipdnn_buffer_device({2: host}) is None
-    assert suite_runner._hipdnn_buffer_device({2: host, 3: device}) == "cuda"
 
 
 def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
@@ -1011,8 +1031,9 @@ def test_per_engine_handle_failure_is_an_error_row(fake, monkeypatch):
 
 
 def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
-    """-e 1,1 --plugin-path /a,/b: each row gets a fresh handle created after
-    its own plugin path is set, so an A/B row is not silently the default set."""
+    """-e 1,1 --plugin-path /a,/b: each row's handle, and the handle of its
+    OOTB child, is created right after that row's plugin path is set, so an
+    A/B row is not silently the default set."""
     calls = []
 
     def make_handle():
@@ -1032,23 +1053,22 @@ def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
 
     graph, _ = _run(handle=None, engine_filter=[1, 1], plugin_paths=[a, b])
 
-    assert calls == [([str(a)], "abs"), "Handle", ([str(b)], "abs"), "Handle"]
+    # Per row: the parent's handle (engine name), then the OOTB child's.
+    row_a = [([str(a)], "abs"), "Handle"] * 2
+    row_b = [([str(b)], "abs"), "Handle"] * 2
+    assert calls == row_a + row_b
     assert [(r.status, r.plugin_path, r.engine_name) for r in graph.results] == [
         ("success", str(a), "ENG_2"),
-        ("success", str(b), "ENG_4"),
+        ("success", str(b), "ENG_6"),
     ]
 
 
-def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
-    """Without --oracle or a profiling flag, no engine gets a tuned plan
-    and no profiler child is spawned."""
+def test_default_run_skips_oracle_and_profiling(fake, tuned_child, monkeypatch):
+    """Without --oracle or a profiling flag, no tuned child and no profiler
+    child is spawned."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
     called = []
-    for name in ("build_tuned_plan", "run_tuned_plan"):
-        monkeypatch.setattr(
-            suite_runner, name, lambda name=name, **kw: called.append(name)
-        )
     monkeypatch.setattr(
         profiling_orchestrator,
         "run_profiling_passes",
@@ -1057,7 +1077,7 @@ def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
 
     graph, _ = _run()
 
-    assert called == []
+    assert called == [] and tuned_child.engines == []
     assert [(r.status, r.oracle, r.extra_metrics) for r in graph.results] == [
         ("success", None, None)
     ] * 2
@@ -1127,6 +1147,7 @@ def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):
             warmup_iters=3,
             metrics_config=metrics,
             plugin_path=Path("/a"),
+            autotune=False,
         )
     ]
     assert fake.events[-3:] == ["buffers_freed", "executor_freed", "profile"]
@@ -1177,35 +1198,6 @@ def test_stall_failure_remeasures_every_engine_of_the_graph_unstalled(fake):
     assert "remeasuring every row of this graph without stalling" in progress
 
 
-def test_stall_rerun_releases_the_first_attempt():
-    """The rerun must not keep the failed attempt's inputs, references and
-    buffers alive: on large graphs that doubles host and device memory."""
-    import gc
-    import weakref
-
-    class Inputs:
-        pass
-
-    first_attempt = []
-    alive_during_rerun = []
-
-    def run(config):
-        if not first_attempt:
-            inputs = Inputs()  # a local of the failing frame, like ctx
-            first_attempt.append(weakref.ref(inputs))
-            raise StallFallbackError("stall watchdog invalidated the measurement")
-        gc.collect()
-        alive_during_rerun.append(first_attempt[0]() is not None)
-        return "rerun"
-
-    result = suite_runner._with_stall_fallback(
-        run, SuiteConfig(), Reporter(io.StringIO())
-    )
-
-    assert result == "rerun"
-    assert alive_during_rerun == [False]
-
-
 def test_pytorch_buffers_share_the_executor_device(fake_torch):
     """Buffers on another device than the executor would make every
     PyTorch row fail or silently copy across GPUs."""
@@ -1214,19 +1206,23 @@ def test_pytorch_buffers_share_the_executor_device(fake_torch):
     assert fake_torch.torch_buffer_devices == ["cuda:3"]
 
 
-def test_stall_rerun_reports_no_ootb_for_an_engine_that_already_tuned(fake):
-    """hipDNN keeps a tuned winner in memory and serves it to any later build
-    of the graph: engine 1 tuned before engine 2 stalled, so its rerun OOTB
-    would time the tuned kernel and must not be published."""
+def test_stall_rerun_measures_ootb_for_every_engine_and_tunes_again(fake, tuned_child):
+    """Tuning state lives in the child, so a whole-graph rerun after engine 2
+    stalled times every engine's OOTB plan again, and each row gets the tuned
+    run of the attempt it is reported from."""
     fake.stall = {2}
 
     graph, _ = _run(oracle=True)
 
-    e1, e2 = graph.results
-    assert (e1.status, e1.to_dict()["ootb"]) == ("error", None)
-    assert "already ran a tuned search" in e1.error_message
-    # Engine 2 stalled in its OOTB loop, before its own search.
-    assert e2.status == "success" and e2.oracle is not None
+    assert [(r.status, r.ootb.timing.mode) for r in graph.results] == [
+        ("success", "events")
+    ] * 2
+    assert all(r.oracle is not None for r in graph.results)
+    # Engine 1 tuned before engine 2 stalled in its OOTB loop; the rerun
+    # tunes both.
+    assert tuned_child.engines == [engine_id_hex(e) for e in (1, 1, 2)]
+    # The tuned runs of the rerun time unstalled too, like their rows.
+    assert tuned_child.stall_gates == [True, False, False]
 
 
 def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):
@@ -1304,7 +1300,7 @@ class TestPytorchRuntime:
             PATH,
             graph_json,
             TENSORS,
-            SuiteConfig(runtime="pytorch", **config),
+            SuiteConfig(runtime="pytorch", tuned_db_dir=TUNED_DB, **config),
             Reporter(io.StringIO()),
         )
 

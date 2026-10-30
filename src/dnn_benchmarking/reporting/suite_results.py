@@ -46,7 +46,7 @@ RUN_CONFIG_KEYS = (
     "reference_precision",
     "oracle",
     "autotune",
-    "hipdnn_cache_dir",
+    "benchmark_work_dir",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
     "metrics",
@@ -266,9 +266,9 @@ class PlanResult:
 class OracleResult(PlanResult):
     """Tuned run for one row; the row's own ``PlanResult`` is the OOTB plan.
 
-    hipDNN: the tuned plan is built for the same engine as the OOTB plan,
-    with ``global.benchmarking=1``. A benchmarking build compiles every
-    candidate the provider can sample, so its build is expected to be slower.
+    hipDNN: the tuned run comes from a child process that runs the same engine
+    with benchmarking on. A benchmarking build compiles every candidate the
+    provider can sample, so its build is expected to be slower.
     PyTorch: the tuned run comes from an isolated child process and has no
     plan build.
 
@@ -468,8 +468,8 @@ def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
     """OOTB kernel median / tuned kernel median, or None when not comparable.
 
     None when the row has no tuned run, either plan failed validation, the
-    two plans were timed in different modes (a stall-fallback OOTB in
-    ``events`` against a ``staged`` tuned child), or a median is missing or
+    two plans were timed in different modes (one run fell back to ``events``
+    on its own), or a median is missing or
     non-positive. Rows with ``tuning_available`` False still get a ratio;
     callers report them as "no-search" and keep them out of averages. The
     speedup is derived, never stored in the result file.

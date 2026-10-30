@@ -319,10 +319,10 @@ class SuiteConfig:
         engine_filter: If set, ordered engine selections to run.
         validation: Reference validation configuration (provider + tolerances).
         verbose: If True, print rich per-engine block per graph instead of summary.
-        oracle: Build and time a second plan per engine with
-            ``global.benchmarking=1``, so providers sample their candidate
-            kernels, against the OOTB plan. PyTorch rows get a tuned run in
-            an isolated subprocess. Cannot be combined with ``autotune``.
+        oracle: Also time a tuned run of each row in an isolated child
+            process: hipDNN rows run the same engine with benchmarking on,
+            so providers sample their candidate kernels; PyTorch rows run
+            tuned PyTorch. Cannot be combined with ``autotune``.
         metrics: Metric collection configuration. Defaults to the always-on
             probes and no extra runs.
         runtime: Runtime that executes the graph (``hipdnn`` runs discovered
@@ -351,10 +351,16 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
-    #: job; reads are not gated on benchmarking while writes are, so without an
-    #: explicit empty root an untuned phase can replay a previous tuned ranking.
-    hipdnn_cache_dir: Optional[str] = None
+    #: Root of the persistent compile caches, of the tuned MIOpen user
+    #: database in ``tuned-db/`` and of the temporary engine state in
+    #: ``tmp/`` (``cli.main``). ``None``: the workspace or a temporary
+    #: directory for the caches, the system temporary directory for the state.
+    benchmark_work_dir: Optional[str] = None
+    #: MIOpen user database that every tuned child of the command shares.
+    #: ``cli.suite_runner_cli.run_suite_cli`` sets it from
+    #: ``common.run_state.tuned_db_dir``. OOTB children never use it. A tuned
+    #: or autotune run fails without it.
+    tuned_db_dir: Optional[Path] = None
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
@@ -414,8 +420,8 @@ class SuiteConfig:
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
             autotune=args.autotune,
-            hipdnn_cache_dir=(
-                str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
+            benchmark_work_dir=(
+                str(args.benchmark_work_dir) if args.benchmark_work_dir else None
             ),
         )
 
@@ -476,7 +482,6 @@ class SuiteConfig:
                 ("--perf", self.metrics.perf),
                 ("--roofline", self.metrics.roofline),
                 ("--autotune", self.autotune),
-                ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ]
             flags = [flag for flag, present in rejected if present]
             if flags:
