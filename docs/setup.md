@@ -28,17 +28,21 @@ stages are:
    `--reuse-artifacts`, which builds nothing from these sources.
 5. `Build dependencies`: pip packages the source build needs. Skipped with
    `--reuse-artifacts`.
-6. `hipDNN and provider plugins`: build hipDNN and the MIOpen, hipBLASLt and
+6. `Provider descriptor artifacts`: `dvc pull` the DVC-tracked
+   kernel-ingestor descriptors. Skipped with `--reuse-artifacts`.
+7. `hipDNN and provider plugins`: build hipDNN and the MIOpen, hipBLASLt and
    hip-kernel providers, and install them into the ROCm SDK prefix. With
    `--reuse-artifacts`, only check that hipDNN is in the prefix.
-7. `hipDNN Python bindings`: build `hipdnn_frontend` against that prefix.
+8. `hipDNN Python bindings`: build `hipdnn_frontend` against that prefix.
    With `--reuse-artifacts`, build nothing and instead check that the venv
    has the `hipdnn_frontend` package, without importing it (its native
    libraries may need a GPU this host has not got). Setup fails when the
    package is absent.
-8. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
-   and link the wheel rocprofiler libraries.
-9. `Verify installation`.
+9. `rocKE Python packages`: Linux only. Install rocKE's Python packages for
+   `--runtime rocke` (see [Extra CMake defines](#extra-cmake-defines)).
+10. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
+    and link the wheel rocprofiler libraries.
+11. `Verify installation`.
 
 Then setup prints the `Profiling sources:` block. See
 [troubleshooting.md](troubleshooting.md#what-each-profiling-source-needs).
@@ -247,6 +251,16 @@ On Linux, rocKE and its descriptor-backed engines are on by default
 (`hipkernel:Gfx950AttentionDense` on gfx950). On Windows they are off. When
 you turn an engine option off, setup still installs the plugin `.so`. Graphs
 that only that engine supports then report `no engines applicable`.
+
+On Linux, setup also installs the rocKE Python packages (`rocke`, `kernels`,
+`builders`, `dispatch`) into the venv as editable installs from
+`rocm-libraries/dnn-providers/hip-kernel-provider/rocke`. `--runtime rocke`
+needs them. In a source build they come from the same checkout as the
+plugins, so rocKE's specs and runtime match the kernels that the plugin
+ships. With `--reuse-artifacts`, the plugins come from an earlier build, so
+the checkout can differ from the one they were built from. The rocKE rows
+then fail with an argument-list, grid or SHA-256 error rather than give wrong
+numbers.
 
 ## Rebuild from zero
 

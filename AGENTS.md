@@ -17,6 +17,19 @@ file that `dnn-benchmark compare` can compare with a ROCm result. The package
 stays importable without `hipdnn_frontend`: every hipDNN import is lazy. The
 hipDNN backend does not import `torch` at startup.
 
+`--runtime rocke` launches rocKE SDPA forward kernels directly through the
+rocKE Python packages: each hipDNN-shipped `Gfx950AttentionDense` variant
+that applies, plus rocKE's auto-dispatched kernel. It shares the same timed
+loop and result schema, and compares with the hipDNN rows of the same graphs.
+
+`--runtime` takes a comma list (default `hipdnn`). Each runtime is a planner
+(`suite_runner.GraphPlanner`) that turns a graph into a `RuntimePlan`: its
+engines, or why none applies. `suite_runner.run_graph` composes any planners:
+one input set and one reference per graph, then the rows of each runtime. To
+add a runtime, add a `RuntimeName` member, its options in
+`benchmark_config.RUNTIME_OPTIONS`, a planner, and a starter in
+`runtimes._STARTERS`.
+
 User documentation:
 
 - `README.md`: quick start.
@@ -83,6 +96,9 @@ src/dnn_benchmarking/
 │   ├── timing.py             # measure(): the one timed loop (staged / events)
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
+│   ├── rocke_sdpa.py         # rocKE runtime: SDPA problem, shipped-variant catalog, auto kernel
+│   ├── rocke_executor.py     # rocKE runtime: load and launch one rocKE kernel
+│   ├── kpack.py              # rocKE runtime: read hipDNN's code objects (librocm_kpack)
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
@@ -107,13 +123,24 @@ src/dnn_benchmarking/
 ```
 
 Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
-each graph: `GraphLoader` -> `suite_runner.run_graph_all_providers` ->
-`Executor` + `BufferManager` -> `timing.measure` -> correctness, oracle,
-profiling -> `GraphResult` -> `Reporter` and `SuiteResult.write`.
+each graph: `GraphLoader` -> `suite_runner.run_graph` with
+`hipdnn_planner` -> `Executor` + `BufferManager` -> `timing.measure` ->
+correctness, oracle, profiling -> `GraphResult` -> `Reporter` and
+`SuiteResult.write`.
 
-Data flow (PyTorch): the same, with `run_graph_pytorch`,
-`PyTorchCudaExecutor` and `PyTorchCudaBufferManager`. One
-`runtime = "pytorch"` row per graph. No engine discovery or plugins.
+Data flow (PyTorch): the same, with `pytorch_plan`, `PyTorchCudaExecutor`
+and `PyTorchCudaBufferManager`. One `runtime = "pytorch"` row per graph. No
+engine discovery or plugins.
+
+Data flow (rocKE): the same, with `rocke_planner`, `RockeExecutor` and
+`PyTorchCudaBufferManager`. The catalog reads the installed
+`hipkernel:Gfx950AttentionDense` descriptors once per suite
+(`rocke_session`); a variant row launches hipDNN's code object from the
+kpack archive.
+One `runtime = "rocke"` row per applicable kernel.
+
+With several runtimes, `run_graph` gets one planner per runtime, in
+`RuntimeName` order.
 
 Rules that keep the design intact:
 

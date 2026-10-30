@@ -254,7 +254,8 @@ def _describe(label: str, path: str, doc: Dict[str, Any]) -> str:
     env, cfg = doc["environment"], doc["run"]["config"]
     return (
         f"{label}: {path}  {env.get('gpu_model') or '?'} {env.get('gpu_arch') or '?'}"
-        f"  runtime={cfg.get('runtime')} cache={cfg.get('cache_mode')}"
+        f"  runtime={','.join(cfg.get('runtimes') or [str(cfg.get('runtime'))])}"
+        f" cache={cfg.get('cache_mode')}"
     )
 
 

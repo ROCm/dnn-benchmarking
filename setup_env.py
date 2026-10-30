@@ -1546,6 +1546,27 @@ class Setup:
             "--reuse-artifacts to build hipDNN and its bindings.",
         )
 
+    def install_rocke_packages(self) -> None:
+        """Editable-install rocKE's Python packages for ``--runtime rocke``.
+
+        They come from the rocm-libraries checkout that the plugins build
+        from, so rocKE's specs and runtime match the kernels hipDNN ships. The
+        library package provides the generic top-level names ``kernels``,
+        ``builders`` and ``dispatch``; rocKE keeps them in a dedicated venv.
+        """
+        rocke = ROCM_LIBRARIES_DIR / "dnn-providers" / "hip-kernel-provider" / "rocke"
+        if not (rocke / "library" / "pyproject.toml").is_file():
+            warn(
+                f"rocKE sources not found under {rocke}.",
+                "--runtime rocke needs them; check the rocm-libraries checkout.",
+            )
+            return
+        # compat mode writes a .pth to the source root, as rocKE's BUILDING.md
+        # requires. The library resolves `rocke` from the platform install.
+        compat = ("--config-settings", "editable_mode=compat")
+        self.pip("install", *compat, "-e", str(rocke / "platform"))
+        self.pip("install", *compat, "--no-deps", "-e", str(rocke / "library"))
+
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
             self.install_prefix,
@@ -1779,8 +1800,13 @@ class Setup:
             stages += [
                 ("hipDNN and provider plugins", self.build_hipdnn),
                 ("hipDNN Python bindings", self.install_bindings),
-                ("amdsmi and rocprofiler libraries", self.install_runtime_extras),
             ]
+            if not IS_WINDOWS:
+                # The Windows ROCm build of rocKE is untested (see rocke_args).
+                stages.append(("rocKE Python packages", self.install_rocke_packages))
+            stages.append(
+                ("amdsmi and rocprofiler libraries", self.install_runtime_extras)
+            )
         stages.append(("Verify installation", self.verify))
 
         self.n_stages = len(stages)

@@ -317,13 +317,13 @@ class _Handle:
 
 def _run(handle="default", **config):
     out = io.StringIO()
-    graph = suite_runner.run_graph_all_providers(
+    graph = suite_runner.run_graph(
         PATH,
         GRAPH,
         TENSORS,
         SuiteConfig(**config),
-        _Handle() if handle == "default" else handle,
         Reporter(out),
+        [suite_runner.hipdnn_planner(_Handle() if handle == "default" else handle)],
     )
     return graph, out.getvalue()
 
@@ -1300,12 +1300,13 @@ def test_reference_provider_is_usable_or_says_why_not(monkeypatch, provider, rea
 
 class TestPytorchRuntime:
     def _run(self, graph_json=GRAPH, **config):
-        return suite_runner.run_graph_pytorch(
+        return suite_runner.run_graph(
             PATH,
             graph_json,
             TENSORS,
             SuiteConfig(runtime="pytorch", **config),
             Reporter(io.StringIO()),
+            [suite_runner.pytorch_plan],
         )
 
     def test_single_timed_pytorch_row(self, fake_torch):
@@ -1387,3 +1388,208 @@ class TestPytorchRuntime:
 
         assert row.status == status
         assert "NotARealOp" in (row.error_message or row.skip_reason)
+
+
+def _run_with(other, **config):
+    """hipDNN plus a second runtime whose planner returns ``other``."""
+    graph = suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(**config),
+        Reporter(io.StringIO()),
+        [suite_runner.hipdnn_planner(_Handle()), lambda *args: other],
+    )
+    return graph
+
+
+def test_a_runtime_that_does_not_apply_leaves_the_graph_unchanged(fake):
+    fake.discovered = [1]
+    alone, _ = _run()
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", message="not an SDPA graph"))
+
+    assert (graph.status, graph.message, graph.error) == ("ok", None, None)
+    assert [(r.runtime, r.engine_id) for r in graph.results] == [
+        (r.runtime, r.engine_id) for r in alone.results
+    ]
+
+
+def test_runtimes_share_one_reference_and_append_in_order(fake_torch):
+    fake_torch.discovered = [1]
+    seen = []
+
+    def rows(ctx):
+        seen.append(ctx.reference_outputs is not None)
+        return [suite_runner.ProviderEngineResult("rocke", "rocke:k", "success")]
+
+    graph = _run_with(
+        suite_runner.RuntimePlan("rocke", [0], rows=rows, needs_inputs=True),
+        validation=ValidationConfig(provider="pytorch"),
+    )
+
+    assert [(r.runtime, r.role) for r in graph.results] == [
+        ("pytorch", "reference"),
+        ("hipdnn", "engine"),
+        ("rocke", "engine"),
+    ]
+    assert seen == [True]  # the second runtime checks against the same reference
+
+
+def test_no_runtime_applies_joins_the_labelled_reasons(fake):
+    fake.discover_error = UnsupportedGraphError("no hipDNN engine")
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", message="not an SDPA graph"))
+
+    assert graph.status == "no_engines"
+    assert graph.message == "hipdnn: no hipDNN engine; rocke: not an SDPA graph"
+
+
+def test_a_selection_error_keeps_the_other_runtime_rows(fake):
+    fake.discovered = [1]
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", error="catalog broke"))
+
+    assert (graph.status, graph.error) == ("error", "rocke: catalog broke")
+    assert [r.runtime for r in graph.results] == ["hipdnn"]
+
+
+@pytest.fixture
+def fake_rocke(fake_torch, monkeypatch):
+    """rocKE kernel selection and executor; rows validate against the
+    reference of ``fake_torch``. A kernel in ``wrong`` writes no output."""
+    from dnn_benchmarking.execution import rocke_executor
+
+    fake = fake_torch
+    fake.variants = [SimpleNamespace(name="rocke:a"), SimpleNamespace(name="rocke:b")]
+    fake.auto = SimpleNamespace(name="rocke:auto:k")
+    fake.wrong = set()
+
+    def auto_kernel(problem, arch, num_cus):
+        if isinstance(fake.auto, Exception):
+            raise fake.auto
+        return fake.auto
+
+    class RockeExecutor:
+        def __init__(self, kernel, problem, policy, loaded=None):
+            self.kernel, self.policy = kernel, policy
+            self.device = "cuda:0"
+            self.build_time_ms = 1.5
+
+        def prepare(self, tensors):
+            pass
+
+        def benchmark(self):
+            return _stall_aware(fake, self.kernel.name, self.policy)
+
+        def execute_once(self):
+            fake.torch_outputs_written = self.kernel.name not in fake.wrong
+
+    monkeypatch.setattr(suite_runner, "sdpa_problem", lambda graph, infos: "problem")
+    monkeypatch.setattr(
+        suite_runner, "catalog_kernels", lambda catalog, problem: list(fake.variants)
+    )
+    monkeypatch.setattr(suite_runner, "auto_kernel", auto_kernel)
+    monkeypatch.setattr(rocke_executor, "RockeExecutor", RockeExecutor)
+    return fake
+
+
+def _run_rocke(**config):
+    session = suite_runner.RockeSession(
+        catalog=(), arch="gfx950", num_cus=256, version="1.0"
+    )
+    return suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(validation=ValidationConfig(provider="pytorch"), **config),
+        Reporter(io.StringIO()),
+        [suite_runner.rocke_planner(session)],
+    )
+
+
+def test_rocke_rows_are_the_variants_then_the_auto_kernel(fake_rocke):
+    fake_rocke.wrong = {"rocke:b"}
+
+    graph = _run_rocke()
+
+    assert [(r.runtime, r.engine_name, r.role, r.verdict) for r in graph.results] == [
+        ("pytorch", "pytorch", "reference", "reference"),
+        ("rocke", "rocke:a", "engine", "passed"),
+        ("rocke", "rocke:b", "engine", "failed"),
+        ("rocke", "rocke:auto:k", "engine", "passed"),
+    ]
+    assert graph.results[1].engine_id == "rocke:a"
+    assert graph.results[1].ootb.cpu_build_time_ms == 1.5
+
+
+def test_rocke_without_a_variant_runs_the_auto_kernel_alone(fake_rocke):
+    fake_rocke.variants = []
+
+    graph = _run_rocke()
+
+    assert [r.engine_name for r in graph.results if r.role == "engine"] == [
+        "rocke:auto:k"
+    ]
+
+
+def test_rocke_without_any_kernel_names_both_reasons(fake_rocke):
+    fake_rocke.variants = []
+    fake_rocke.auto = UnsupportedGraphError("rocKE auto dispatch: causal-only")
+
+    graph = _run_rocke()
+
+    assert (graph.status, graph.results) == ("no_engines", [])
+    assert graph.message == (
+        "no hipDNN-shipped rocKE variant matches; rocKE auto dispatch: causal-only"
+    )
+
+
+def test_rocke_selection_failure_is_a_graph_error(fake_rocke, monkeypatch):
+    def broken(catalog, problem):
+        raise TypeError("unexpected keyword argument 'knob'")
+
+    monkeypatch.setattr(suite_runner, "catalog_kernels", broken)
+
+    graph = _run_rocke()
+
+    assert graph.status == "error"
+    assert graph.error == (
+        "rocKE kernel selection failed: TypeError: unexpected keyword argument 'knob'"
+    )
+
+
+@pytest.mark.parametrize(
+    "host_bytes, reference_error, verdict",
+    [
+        pytest.param(9 << 30, None, "unchecked", id="reference-too-large"),
+        pytest.param(0, "cpu reference exploded", "failed", id="reference-failed"),
+    ],
+)
+def test_rocke_rows_without_a_reference(
+    fake_rocke, monkeypatch, host_bytes, reference_error, verdict
+):
+    """A reference skipped for host memory leaves the rows unchecked, as for
+    hipDNN rows; any other missing reference fails them."""
+    import psutil
+
+    class Reference:
+        def estimate_host_bytes(self, graph_json):
+            return host_bytes
+
+        def compute_reference(self, graph_json, input_data):
+            raise RuntimeError(reference_error)
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    monkeypatch.setattr(
+        suite_runner, "_reference_provider", lambda c, g: (Reference(), None)
+    )
+    fake_rocke.torch_error = ExecutionError("PyTorch GPU not available")
+
+    graph = _run_rocke()
+
+    engines = [r for r in graph.results if r.role == "engine"]
+    assert [e.verdict for e in engines] == [verdict] * 3
+    assert all(e.status == "success" for e in engines)

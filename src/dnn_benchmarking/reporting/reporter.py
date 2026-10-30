@@ -313,7 +313,7 @@ class Reporter:
             f"Timing:  warmup {rc['warmup_iters']}, iters {rc['iters']} "
             f"(min-time {rc['min_time_ms']:g} ms), cache {rc['cache_mode']}, "
             + (f"block {block} launches/sample, " if block > 1 else "")
-            + f"seed {rc['seed']}, runtime {rc['runtime']}"
+            + f"seed {rc['seed']}, runtime {','.join(rc.get('runtimes') or [rc['runtime']])}"
         )
         self._print()
 
@@ -552,7 +552,8 @@ class Reporter:
             self._print()
 
     def _detail_lines(self, pe: ProviderEngineResult) -> List[str]:
-        hex_id = engine_id_hex(pe.engine_id)
+        # A rocKE row's string ID is its name, which the title already shows.
+        hex_id = engine_id_hex(pe.engine_id) if isinstance(pe.engine_id, int) else None
         title = _display_name(pe) + (f" ({hex_id})" if hex_id else "")
         if pe.role == "reference":
             title += "  [reference]"
