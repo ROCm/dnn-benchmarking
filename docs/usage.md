@@ -47,7 +47,7 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime {hipdnn,pytorch}` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). |
+| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
@@ -195,15 +195,45 @@ To list the engine names and IDs of a plugin directory, run
 
 The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 
+## Several runtimes
+
+`--runtime` takes one runtime or a comma list. With a list, each runtime adds
+its rows to the same graph, in one process and one result file:
+
+```bash
+dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+  --validate pytorch --timing-block 50 -o results.json
+```
+
+- The runtimes run in the order `hipdnn`, `pytorch`, `rocke`, whatever the
+  typed order. hipDNN loads its HIP runtime before torch does, and its rows
+  exist before a later runtime can stop the process.
+- All runtimes use the same inputs. `--validate pytorch` gives one reference
+  row per graph, and every engine row is checked against it.
+- A runtime that cannot run a graph adds no rows and does not change the
+  graph status. A graph is `no engines applicable` only when no runtime runs
+  it. The message then gives the reason of each runtime.
+- When the selection of one runtime fails, the graph is an error, and the
+  rows of the other runtimes are kept.
+- An option is accepted when one selected runtime supports it. It applies to
+  the rows of that runtime only. For example, `-e` and `--oracle` with
+  `hipdnn,rocke` select and tune hipDNN engines; the rocKE rows do not
+  change. `--validate pytorch` is not accepted when the list has `pytorch`:
+  the reference row would time the same PyTorch graph again.
+- `run.config.runtime` is the first runtime, and `run.config.runtimes` lists
+  all of them (see [results-schema.md](results-schema.md)).
+
 ## PyTorch runtime
 
 `--runtime pytorch` runs each graph through PyTorch and gives one
 `runtime = "pytorch"` row per graph. It uses the same timed loop, output
 format and result schema as the hipDNN backend. It runs on ROCm and on CUDA.
 
-These options are hipDNN-only. With `--runtime pytorch` they stop the run
-with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`, `--pmc`,
-`--trace`, `--perf`, `--roofline`, `--autotune` and `--hipdnn-cache-dir`.
+These options are hipDNN-only. With `--runtime pytorch` alone they stop the
+run with exit code 2: `--engine`, `--plugin-path`, `--validate pytorch`,
+`--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
+`--hipdnn-cache-dir`. In a runtime list they apply to the hipDNN rows (see
+[Several runtimes](#several-runtimes)).
 `--oracle` is accepted: the PyTorch row gets a tuned run (see
 [PyTorch kernel selection](#pytorch-kernel-selection)).
 
@@ -257,6 +287,95 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
 
 The tool does not set `MIOPEN_FIND_MODE` or `MIOPEN_FIND_ENFORCE`. The hipDNN
 MIOpen plugin reads them too, so they would also change the hipDNN rows.
+
+## rocKE runtime
+
+`--runtime rocke` launches rocKE SDPA forward kernels directly, without
+hipDNN. Use it to compare rocKE with hipDNN on the same graphs. The rows use
+the same inputs, timed loop, FLOP count and result schema as the hipDNN rows.
+
+Each graph gets these `runtime = "rocke"` rows. The row name is also the
+row's `engine.id`:
+
+| Row | Kernel |
+|---|---|
+| `rocke:<variant>` | One row for each variant that hipDNN ships for `hipkernel:Gfx950AttentionDense` and that runs the graph. `<variant>` is the hipDNN kernel descriptor name, for example `attention_dense.fp16_d128_hq32_kv8_c1_bm256_bn64.gfx950`. |
+| `rocke:auto:<kernel>` | The kernel that rocKE's production dispatcher (`dispatch_attention`) selects. At the pinned rocm-libraries commit this is unified 2D or 3D attention. |
+
+How the variant rows get the hipDNN kernel:
+
+1. The tool reads the installed descriptor files of the
+   `hipkernel:Gfx950AttentionDense` engine (`*.ued.json` and `*.kdp.json` at
+   any depth under `<plugin path>/arch_content/hip-kernel-provider/<arch>/rocKE/`).
+   Each variant records its problem fields and tile (`block_m`, `block_n`),
+   and where its code object is: the kpack archive, the archive key, the
+   symbol, the SHA-256 and the argument list.
+2. The tool makes a rocKE spec from the variant's fields and the graph's
+   batch and sequence lengths. Variants with a sliding window or a ragged
+   layout do not apply. rocKE's own checks decide whether the variant runs
+   the graph, and rocKE computes the launch grid and block. The spec sets
+   the `qb_minor` block order, because hipDNN launches every variant on that
+   grid and the descriptor does not record the order. The row is an error
+   when rocKE's grid differs from hipDNN's (query blocks, query heads,
+   batch).
+3. The tool reads the code object from the kpack archive with ROCm's kpack
+   reader (`librocm_kpack`, the reader that the plugin uses) and launches it
+   through rocKE's runtime. It does not compile the variant. The row is an
+   error when the code object does not have the recorded SHA-256, or when
+   rocKE's argument list is not the one that hipDNN binds. Each code object
+   loads once per run; later rows that use it reuse the module. When
+   several `--plugin-path` directories ship a variant, the first one gives
+   its row.
+
+Read the rows as follows:
+
+- The variant row with the tile that hipDNN selects is the parity check. It
+  runs the same code object with the same grid as the
+  `hipkernel:Gfx950AttentionDense` hipDNN row, so their medians must agree
+  within noise. A difference is the cost of the hipDNN launch path.
+- The fastest variant row minus the hipDNN row is the loss from hipDNN's tile
+  selection.
+- The auto row minus the fastest variant row is the loss from the kernels
+  that hipDNN does not ship.
+
+Requirements and limits:
+
+- A ROCm build of PyTorch and the rocKE Python packages (`rocke`, `kernels`,
+  `builders`, `dispatch`). `setup_env.py` installs them on Linux from the `rocm-libraries`
+  checkout that it builds the plugins from.
+- Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
+  Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
+  window. A causal mask (top-left or bottom-right) needs
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
+  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  An absent `attn_scale_value` is 1.0, as in hipDNN.
+- Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
+  a causal graph. The auto row is verified on gfx942 and gfx950. It is not
+  verified on gfx1250. With `--runtime rocke` alone, a graph that no rocKE
+  kernel runs reports `no engines applicable` with the reasons. In a runtime
+  list it gets no rocKE rows.
+- `build_ms` is the time to get and load the kernel. For a variant row this
+  is the kpack read and the module load; a row that reuses a loaded module
+  reports the time of the first load. For the auto row it also includes the
+  compile and the first launch, because rocKE compiles the unified kernel
+  inside its launch call.
+- `--plugin-path` selects the descriptor directory. With `--runtime rocke`
+  alone, these options stop the run with exit code 2: `--engine`, `--oracle`,
+  `--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
+  `--hipdnn-cache-dir`.
+
+To compare rocKE with hipDNN, run both runtimes in one run:
+
+```bash
+dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+  -e hipkernel:Gfx950AttentionDense --timing-block 50 -o both.json
+```
+
+`-e` selects the hipDNN engine only; every applicable rocKE row still runs.
+Each graph's table lists the hipDNN row and the rocKE rows, and `vs_best`
+compares them. Two result files, one for each runtime, also work:
+`compare --by best` pairs the fastest rocKE row with the hipDNN row.
+`--by engine` does not pair them, because the row key includes the runtime.
 
 ## Kernel selection (`--autotune`, `--hipdnn-cache-dir`)
 
@@ -473,7 +592,7 @@ with code 143 without it. The file then holds the last periodic write.
 | Code | Meaning |
 |---|---|
 | 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
-| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a runtime that is not available at startup (hipDNN, PyTorch or the reference provider). |
+| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a runtime that is not available at startup (hipDNN, PyTorch, rocKE or the reference provider). |
 | 2 | Usage error: a bad flag, a bad config file, an option that the runtime does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
@@ -543,6 +662,8 @@ dnn-benchmark compare base.json new.json
 
 To compare a ROCm host with a CUDA host, run `--runtime pytorch -o` on each
 host, then compare the two files on one host.
+
+To compare rocKE with hipDNN, see [rocKE runtime](#rocke-runtime).
 
 ## Profiling
 

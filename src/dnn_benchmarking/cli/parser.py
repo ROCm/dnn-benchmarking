@@ -22,6 +22,7 @@ from ..config.benchmark_config import (
     ReferencePrecision,
     SuiteConfig,
     ValidationConfig,
+    parse_runtimes,
 )
 
 
@@ -161,6 +162,15 @@ def _parse_plugin_path_list(s: str) -> List[Path]:
     return [Path(p) for p in parts]
 
 
+def _parse_runtime_list(s: str) -> str:
+    """Validate ``--runtime`` (one runtime or a comma list); keep the text."""
+    try:
+        parse_runtimes(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return s
+
+
 def _bool_option(
     flags: tuple[str, ...], dest: str, group: str, cls: type, field: str, help: str
 ) -> CliOption:
@@ -293,13 +303,20 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_type=int,
     ),
     # Runtime/Selection
-    _choice_option(
-        ("--runtime", "-r"),
-        "runtime",
-        "Runtime/Selection",
-        _values(RuntimeName),
-        _default(SuiteConfig, "runtime"),
-        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch",
+    CliOption(
+        flags=("--runtime", "-r"),
+        dest="runtime",
+        group="Runtime/Selection",
+        parser_type=_parse_runtime_list,
+        default=_default(SuiteConfig, "runtime"),
+        metavar="RUNTIMES",
+        help="comma list of " + ", ".join(_values(RuntimeName)) + ": "
+        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
+        "rocke launches rocKE kernels directly (SDPA forward today). "
+        "Several runtimes add their rows to each graph, for example hipdnn,rocke",
+        config_key="runtime",
+        config_kind=ConfigKind.SCALAR,
+        config_type=str,
     ),
     CliOption(
         flags=("--engine", "-e"),
@@ -546,6 +563,7 @@ examples:
       --plugin-path /path/to/build_a/engines,/path/to/build_b/engines
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
   dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
+  dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke --timing-block 50
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
 engines:

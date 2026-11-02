@@ -174,6 +174,56 @@ class TestSuiteConfigValidation:
     def test_runtime_string_is_normalised(self) -> None:
         assert SuiteConfig(runtime="pytorch").runtime is RuntimeName.PYTORCH
 
+    def test_default_runtime_is_hipdnn_alone(self) -> None:
+        config = SuiteConfig.from_namespace(_namespace([]))
+        assert (config.runtime, config.runtimes) == (
+            RuntimeName.HIPDNN,
+            (RuntimeName.HIPDNN,),
+        )
+
+    def test_runtime_list_runs_hipdnn_first_whatever_the_typed_order(self) -> None:
+        """hipDNN binds HIP before torch, and its rows exist before rocKE runs."""
+        config = SuiteConfig(runtime="rocke, hipdnn")
+        assert config.runtimes == (RuntimeName.HIPDNN, RuntimeName.ROCKE)
+        assert config.runtime is RuntimeName.HIPDNN
+
+    @pytest.mark.parametrize(
+        "runtime, match",
+        [("hipdnn,rocke,hipdnn", "twice"), ("hipdnn,", "must be one of"), ("x", "x")],
+    )
+    def test_bad_runtime_list_names_the_flag(self, runtime: str, match: str) -> None:
+        with pytest.raises(ValueError, match=f"--runtime .*{match}"):
+            SuiteConfig(runtime=runtime)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--oracle", "-e", "MIOPEN_ENGINE"],
+            ["--autotune", "--validate", "pytorch"],
+        ],
+    )
+    def test_an_option_one_selected_runtime_honours_is_accepted(
+        self, argv: list[str]
+    ) -> None:
+        """With hipdnn,rocke the hipDNN-only options apply to the hipDNN rows."""
+        SuiteConfig.from_namespace(_namespace(["-r", "hipdnn,rocke", *argv]))
+
+    @pytest.mark.parametrize(
+        "runtime, argv, flag",
+        [
+            ("rocke", ["--oracle"], "--oracle"),
+            ("pytorch,rocke", ["--autotune"], "--autotune"),
+            # The reference row would time the pytorch runtime's graph again.
+            ("hipdnn,pytorch", ["--validate", "pytorch"], "--validate pytorch"),
+        ],
+    )
+    def test_an_option_no_selected_runtime_honours_is_rejected(
+        self, runtime: str, argv: list[str], flag: str
+    ) -> None:
+        args = _namespace(["-r", runtime, *argv])
+        with pytest.raises(ValueError, match=f"{flag} not supported with --runtime"):
+            SuiteConfig.from_namespace(args)
+
 
 class TestSuiteConfigPluginPaths:
     """Tests for SuiteConfig engine/plugin path selection."""

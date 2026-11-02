@@ -473,6 +473,7 @@ def test_run_config_records_effective_values_that_compare_checks(
     del config["plugin_paths"]  # the default depends on the installed ROCm
     assert config == {
         "runtime": "hipdnn",
+        "runtimes": ["hipdnn"],
         "engine_filter": None,
         "warmup_iters": 3,
         "iters": 11,
@@ -582,9 +583,8 @@ def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
     a, b = _plugin_dirs(tmp_path)
     calls = _fake_hipdnn(monkeypatch, loaded={a: {1}, b: {1}})
     handles = []
-    monkeypatch.setattr(
-        runtimes, "run_graph_all_providers", lambda *args: handles.append(args[4])
-    )
+    monkeypatch.setattr(runtimes, "hipdnn_planner", handles.append)
+    monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "1,1", "--plugin-path", f"{a},{b}")
     )
@@ -633,20 +633,23 @@ def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
 
 def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
-    seen = []
+    handles, seen = [], []
     monkeypatch.setattr(
-        runtimes, "run_graph_all_providers", lambda *args: seen.append(args) or "ran"
+        runtimes, "hipdnn_planner", lambda handle: handles.append(handle) or "plan"
     )
+    monkeypatch.setattr(runtimes, "run_graph", lambda *args: seen.append(args) or "ran")
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path))
     )
     runner = runtimes.start_runtime(config, Reporter(output=io.StringIO()))
     assert runner("g.json", {}, []) == "ran"
-    # The hipDNN runner, bound to the handle that startup created and checked.
-    ((path, _, _, run_config, handle, _),) = seen
-    assert (path, run_config, handle.loaded) == (
+    # The hipDNN planner, bound to the handle that startup created and checked.
+    ((path, _, _, run_config, _, planners),) = seen
+    [handle] = handles
+    assert (path, run_config, planners, handle.loaded) == (
         "g.json",
         config,
+        ["plan"],
         (0x15B46865C717A122,),
     )
 
