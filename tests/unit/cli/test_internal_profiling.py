@@ -34,7 +34,7 @@ def stack(monkeypatch):
     monkeypatch.setattr(internal_profiling, "initialize_pip_rocm_runtime", lambda: None)
 
     loader = mocks["loader"] = MagicMock()
-    loader.return_value.load_json.return_value = {"name": "g", "nodes": []}
+    loader.return_value.load.return_value = ({"name": "g", "nodes": []}, [])
     monkeypatch.setattr(internal_profiling, "GraphLoader", loader)
 
     def make_executor(graph_json_str, policy):
@@ -64,8 +64,6 @@ def test_orchestrator_argv_drives_one_engine_warm_fixed_count(stack):
     # workspace memset).
     setup = ["allocate_all", ("load", stack["inputs"].return_value), "variant_pack"]
     assert stack["calls"] == setup + ["enqueue"] * (3 + 7) + ["hip"]
-    graph_json = {"name": "g", "nodes": []}
-    stack["loader"].return_value.validate.assert_called_once_with(graph_json)
     stack["executor"].execute_once.assert_not_called()
     stack["executor"].benchmark.assert_not_called()
     policy = stack["policy"]
@@ -73,7 +71,7 @@ def test_orchestrator_argv_drives_one_engine_warm_fixed_count(stack):
     # Same inputs as the timed pass: seed forwarded, and graph_json passed
     # so paged-SDPA page tables are valid.
     _, seed, inputs_graph_json = stack["inputs"].call_args.args
-    assert seed == 11 and inputs_graph_json == graph_json
+    assert seed == 11 and inputs_graph_json == {"name": "g", "nodes": []}
 
 
 def test_plugin_path_replaces_default_plugin_loading(stack):

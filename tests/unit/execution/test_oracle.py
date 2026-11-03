@@ -1,359 +1,396 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for execution.oracle (tuned run next to the OOTB run)."""
+"""Tests for execution.oracle (tuned run in a child script next to the OOTB run)."""
 
-import json
-import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from dnn_benchmarking.cli.parser import create_parser
-from dnn_benchmarking.common.exceptions import ExecutionError
+from dnn_benchmarking.cli import hipdnn_child, pytorch_child
+from dnn_benchmarking.common.run_state import TEMP_ROOT_ENV
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
     SuiteConfig,
-    TimingPolicy,
     ValidationConfig,
 )
 from dnn_benchmarking.execution import oracle as oracle_mod
-from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
+from dnn_benchmarking.execution import child_protocol, child_runner
+from dnn_benchmarking.execution.timing import Measurement
 from dnn_benchmarking.graph.tensor_info import TensorInfo
-from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
     PlanResult,
     ProviderEngineResult,
+    oracle_speedup,
 )
 from dnn_benchmarking.validation import ReferenceOutput
 
-CACHE = "HIPDNN_DISABLE_CACHE"
-# (call, handle) for every fake call; cleared by the ``tuned`` fixture.
-CALLS = []
+# Signed 64-bit hash, as hipDNN reports it; the child takes it in hex.
+ENGINE = -2
+REF = np.arange(4, dtype=np.float32)
 
 
-def _m(kernel_ms, host_ms=0.01):
-    return Measurement(
-        kernel_ms=list(kernel_ms),
-        host_ms=[host_ms] * len(kernel_ms),
-        mode="staged",
-        timer="hip",
-        cache_mode="warm",
-        warmup_iters=1,
-        first_call_ms=1.0,
-    )
-
-
-class _Handle:
-    def get_stream(self):
-        return 7
-
-    def set_stream(self, stream):
-        self.stream = stream
-
-
-class _BM:
-    def __init__(self, outputs=None):
-        self.outputs = outputs or {}
-
-    def zero_outputs(self):
-        CALLS.append(("zero_outputs", None))
-
-    def get_output_tensor(self, uid):
-        return None
-
-    def get_output_data(self, uid):
-        return self.outputs.get(uid)
-
-
-class _TunedExecutor:
-    """Stands in for the oracle's own Executor; records the cache env per call."""
-
-    knob_ids = [oracle_mod.BENCHMARKING_KNOB, "miopen.find_mode"]
-    kernel_ms = [0.5, 0.5, 0.5, 9.0]
-    prepare_error = None
-    benchmark_error = None
-    prepared = None
-    policy = None
-
-    def __init__(self, graph_json_str, policy):
-        self.build_time_ms = 3.0
-        self.workspace_size = 4096
-        type(self).policy = policy
-
-    def prepare(self, handle, engine_id=None, knobs=None):
-        type(self).prepared = SimpleNamespace(
-            handle=handle, engine_id=engine_id, knobs=knobs
-        )
-        self.env["prepare"] = os.environ.get(CACHE)
-        if self.prepare_error is not None:
-            raise self.prepare_error
-
-    def engine_knob_ids(self, engine_id):
-        return list(self.knob_ids)
-
-    def benchmark(self, handle, variant_pack):
-        CALLS.append(("benchmark", handle))
-        self.env["benchmark"] = os.environ.get(CACHE)
-        if self.benchmark_error is not None:
-            raise self.benchmark_error
-        return _m(self.kernel_ms, host_ms=0.2)
-
-    def execute_once(self, handle, variant_pack):
-        CALLS.append(("execute_once", handle))
-        self.env["execute_once"] = os.environ.get(CACHE)
-
-
-@pytest.fixture
-def tuned(monkeypatch):
-    cls = type("Tuned", (_TunedExecutor,), {"env": {}})
-    monkeypatch.setattr(oracle_mod, "Executor", cls)
-    CALLS.clear()
-    return cls
-
-
-def _config(**kw):
-    kw.setdefault("validation", ValidationConfig(provider="pytorch"))
-    return SuiteConfig(oracle=True, **kw)
-
-
-def _pytorch_config(**kw):
-    return SuiteConfig(oracle=True, runtime="pytorch", **kw)
-
-
-def _row(correctness=None):
-    return ProviderEngineResult(
-        runtime="hipdnn",
-        engine_id=5,
-        status="success",
-        ootb=PlanResult(correctness=correctness),
-    )
-
-
-def _build(row, handle=None, config=None):
-    return oracle_mod.build_tuned_plan(
-        row=row,
-        handle=handle or _Handle(),
-        engine_id=5,
-        graph_json_str="{}",
-        graph_name="g",
-        config=config or _config(),
-    )
-
-
-def _run(row=None, refs=None, bm=None, config=None):
-    row = row or _row()
-    config = config or _config()
-    out = TensorInfo(
-        uid=1,
-        name="y",
-        dims=[2],
+def _tensor(uid, is_output):
+    return TensorInfo(
+        uid=uid,
+        name=f"t{uid}",
+        dims=[4],
         strides=[1],
         data_type="float",
         is_virtual=False,
-        is_output=True,
+        is_output=is_output,
     )
-    oracle_mod.run_tuned_plan(
-        tuned=_build(row, config=config),
-        row=row,
-        graph_id="g",
-        engine_id=5,
-        graph_name="g",
-        config=config,
-        bm=bm or _BM(),
-        variant_pack={},
-        tensor_infos=[out],
-        reference_outputs=refs,
-    )
-    return row
 
 
-def _refs():
-    return {1: ReferenceOutput(data=np.zeros(2, np.float32), tensor_uid=1)}
+TENSORS = [_tensor(1, False), _tensor(2, True)]
 
 
-# --- build_tuned_plan -------------------------------------------------------
+def _references():
+    return {2: ReferenceOutput(data=REF.copy(), tensor_uid=2)}
 
 
-def test_tuned_plan_is_a_benchmarking_build_of_the_row_engine_on_its_own_handle(
-    tuned,
-):
-    """MIOpen's solver map is per handle; sharing the row handle would let the
-    tuned search change the OOTB plan."""
-    row_handle = _Handle()
-    config = _config(warmup_iters=3, benchmark_iters=5, min_time_ms=2.0)
-
-    plan = _build(_row(), handle=row_handle, config=config)
-
-    assert plan.handle is tuned.prepared.handle
-    assert plan.handle is not row_handle
-    assert plan.handle.stream == 7
-    assert tuned.prepared.engine_id == 5
-    assert tuned.prepared.knobs == {"global.benchmarking": 1}
-    assert tuned.policy == TimingPolicy(warmup_iters=3, iters=5, min_time_ms=2.0)
-
-
-@pytest.mark.parametrize("exposed", [True, False])
-def test_tuning_available_follows_the_engine_knobs(tuned, exposed):
-    """hipDNN ignores a knob the engine does not expose; the tuned run then
-    re-measures the OOTB configuration and must say so."""
-    if not exposed:
-        tuned.knob_ids = ["miopen.find_mode"]
-
-    assert _build(_row()).tuning_available is exposed
-
-
-@pytest.mark.parametrize("previous", [None, "0"], ids=["unset", "set"])
-def test_cache_is_disabled_for_tuned_work_and_restored(tuned, monkeypatch, previous):
-    """A benchmarking plan writes its winner to the hipDNN disk cache; a later
-    OOTB row must not read it, and the OOTB timing must keep its cache."""
-    if previous is None:
-        monkeypatch.delenv(CACHE, raising=False)
-    else:
-        monkeypatch.setenv(CACHE, previous)
-
-    _run(refs=_refs(), bm=_BM({1: np.zeros(2, np.float32)}))
-
-    assert tuned.env == {"prepare": "1", "benchmark": "1", "execute_once": "1"}
-    assert os.environ.get(CACHE) == previous
-
-
-def test_build_failure_is_an_oracle_error_and_restores_the_env(tuned, monkeypatch):
-    monkeypatch.delenv(CACHE, raising=False)
-    tuned.prepare_error = ExecutionError("boom")
-    row = _row()
-
-    assert _build(row) is None
-    assert row.oracle_error == "ExecutionError: boom"
-    assert row.status == "success"
-    assert CACHE not in os.environ
-
-
-# --- run_tuned_plan ---------------------------------------------------------
-
-
-def test_tuned_run_reports_its_own_build_timing_and_throughput(tuned):
-    """TFLOP/s and GB/s use the row's analytical FLOPs/bytes over the TUNED
-    kernel median (0.5 ms), not the mean or the OOTB median."""
-    row = _row()
-    row.analytical_flops = 10**9
-    row.analytical_io_bytes = 10**6
-
-    o = _run(row=row).oracle
-
-    assert row.oracle_error is None
-    assert o.tuning_available is True
-    assert o.cpu_build_time_ms == pytest.approx(3.0)
-    assert o.timing.first_call_ms == pytest.approx(1.0)
-    assert o.gpu_kernel_stats.median_ms == pytest.approx(0.5)
-    assert o.host_stats.median_ms == pytest.approx(0.2)
-    assert o.workspace_bytes == 4096
-    assert o.derived_tflops_per_s == pytest.approx(2.0)
-    assert o.derived_gbytes_per_s == pytest.approx(2.0)
-
-
-def test_workspace_is_not_reported_with_metrics_off(tuned):
-    o = _run(config=_config(metrics=MetricsConfig(basic=False))).oracle
-
-    assert o.workspace_bytes is None
-
-
-def test_tuned_plan_times_on_its_handle_then_validates_once_on_zeroed_outputs(
-    tuned,
-):
-    row = _run(refs=_refs(), bm=_BM({1: np.zeros(2, np.float32)}))
-
-    tuned_handle = tuned.prepared.handle
-    assert CALLS == [
-        ("zero_outputs", None),
-        ("benchmark", tuned_handle),
-        ("zero_outputs", None),
-        ("execute_once", tuned_handle),
-    ]
-    assert row.oracle.correctness.tolerance_match
-
-
-def test_no_references_means_no_tuned_validation(tuned):
-    row = _run()
-
-    assert ("execute_once", tuned.prepared.handle) not in CALLS
-    assert row.oracle.correctness is None
-
-
-def test_failing_tuned_plan_keeps_the_row_verdict(tuned):
-    passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
-
-    row = _run(row=_row(passed), refs=_refs(), bm=_BM({1: np.ones(2, np.float32)}))
-
-    assert row.oracle.correctness.explicitly_failed
-    assert row.ootb.correctness is passed
-    assert row.verdict == "passed"
-
-
-def test_stall_fallback_propagates_for_a_whole_graph_remeasure(tuned, monkeypatch):
-    monkeypatch.delenv(CACHE, raising=False)
-    tuned.benchmark_error = StallFallbackError("watchdog released the stream")
-
-    with pytest.raises(StallFallbackError):
-        _run()
-    assert CACHE not in os.environ
-
-
-def test_tuned_run_failure_is_an_oracle_error(tuned):
-    tuned.benchmark_error = ExecutionError("launch failed")
-
-    row = _run()
-
-    assert row.oracle is None
-    assert row.oracle_error == "ExecutionError: launch failed"
-    assert row.status == "success"
-
-
-# --- run_pytorch_tuned ------------------------------------------------------
-
-
-def _child_row(status="success", message=None, kernel_ms=(0.25, 0.25, 0.3)):
-    timing = TimingInfo(
+def _measurement():
+    return Measurement(
+        kernel_ms=[0.25, 0.25, 0.3],
+        host_ms=[0.5, 0.5, 0.5],
         mode="staged",
         timer="hip",
+        cache_mode="warm",
         warmup_iters=3,
-        samples=len(kernel_ms),
         first_call_ms=40.0,
     )
-    return {
-        "status": status,
-        "message": message,
-        "ootb": {
-            "timing": timing.to_dict(),
-            "kernel": BenchmarkStats.from_timings(kernel_ms).to_dict(),
-            "host": BenchmarkStats.from_timings([0.5, 0.5, 0.5]).to_dict(),
-        },
-    }
 
 
 @pytest.fixture
 def child(monkeypatch):
-    """Fake ``run_capped``: records the child launch and writes its result."""
+    """Fake ``run_capped``: records the child launch and writes its files.
+
+    ``plan`` goes into ``result.json`` (None: no file). With
+    ``--save-outputs`` the child saves ``outputs`` (uid -> array). An
+    ``error`` is raised in the child and reported as the real scripts do.
+    """
     launch = SimpleNamespace(
         argv=None,
         env=None,
-        result={"graphs": [{"results": [_child_row()]}]},
-        proc=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        out_dir=None,
+        state_existed=None,
+        plan={"build_ms": 7.0, "workspace_bytes": 4096},
+        outputs={2: REF.copy()},
+        error=None,
+        returncode=0,
     )
 
-    def run_capped(argv, timeout_s, env=None):
-        launch.argv, launch.env = argv, env
-        if launch.result is not None:
-            output = Path(argv[argv.index("--output") + 1])
-            output.write_text(json.dumps(launch.result))
-        return launch.proc
+    def body(out_dir):
+        if launch.error is not None:
+            raise launch.error
+        if launch.plan is not None:
+            child_protocol.write_result(out_dir, _measurement(), **launch.plan)
+        if "--save-outputs" in launch.argv:
+            for uid, data in launch.outputs.items():
+                np.save(child_protocol.output_file(out_dir, uid), data)
 
-    monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
+    def run_capped(argv, timeout_s, env=None, capture_output=True):
+        launch.argv, launch.env = argv, env
+        out_dir = launch.out_dir = Path(argv[argv.index("--out-dir") + 1])
+        launch.state_existed = out_dir.is_dir()
+        code = child_protocol.run_reporting_failures(out_dir, lambda: body(out_dir))
+        return SimpleNamespace(returncode=code or launch.returncode)
+
+    monkeypatch.setattr(child_runner, "run_capped", run_capped)
     return launch
+
+
+#: The command's tuned MIOpen user DB (``run_suite_cli`` sets it). The fake
+#: children never open it.
+TUNED_DB = Path("/work-dir/tuned-db")
+
+
+def _config(**kw):
+    kw.setdefault("validation", ValidationConfig(provider="pytorch"))
+    kw.setdefault("tuned_db_dir", TUNED_DB)
+    return SuiteConfig(oracle=True, **kw)
+
+
+def _pytorch_config(**kw):
+    kw.setdefault("tuned_db_dir", TUNED_DB)
+    return SuiteConfig(oracle=True, runtime="pytorch", **kw)
+
+
+def _row(correctness=None):
+    row = ProviderEngineResult(
+        runtime="hipdnn",
+        engine_id=ENGINE,
+        status="success",
+        ootb=PlanResult(correctness=correctness),
+    )
+    row.analytical_flops = 10**9
+    row.analytical_io_bytes = 10**6
+    return row
+
+
+def _run_hipdnn(
+    tmp_path,
+    row=None,
+    config=None,
+    plugin_path=None,
+    tuning_available=True,
+    references=None,
+):
+    row = row or _row()
+    oracle_mod.run_hipdnn_tuned(
+        row=row,
+        graph_path=tmp_path / "g.json",
+        graph_name="g",
+        tensor_infos=TENSORS,
+        reference_outputs=references,
+        engine_id=ENGINE,
+        plugin_path=plugin_path,
+        tuning_available=tuning_available,
+        config=config or _config(),
+    )
+    return row
+
+
+def _timeout(monkeypatch, seen):
+    def run_capped(argv, timeout_s, env=None, capture_output=True):
+        seen.append(timeout_s)
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+
+    monkeypatch.setattr(child_runner, "run_capped", run_capped)
+
+
+def _set_tuned_env(monkeypatch, env, state_dir):
+    """Set the tuning variables of ``env`` as the parent does."""
+    built = env.build(str(state_dir), TUNED_DB)
+    for name in env.names:
+        monkeypatch.setenv(name, built[name])
+
+
+# --- run_hipdnn_tuned -------------------------------------------------------
+
+
+@pytest.mark.parametrize("stall_gate", [True, False])
+def test_hipdnn_child_times_the_row_engine_with_the_run_timing(
+    child, tmp_path, stall_gate
+):
+    """The child must time the same engine, inputs and timing mode as the
+    parent, or the tuned and OOTB numbers are not comparable. A graph that
+    fell back to unstalled timing passes ``stall_gate=False`` on."""
+    config = _config(
+        warmup_iters=3,
+        benchmark_iters=5,
+        min_time_ms=2.0,
+        timing_block=4,
+        seed=11,
+    )
+    config.timing_policy = replace(config.timing_policy, stall_gate=stall_gate)
+
+    _run_hipdnn(tmp_path, config=config, plugin_path=Path("/plugins/p.so"))
+
+    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.hipdnn_child"]
+    args = hipdnn_child.parse_args(child.argv[3:])
+    assert args.tuned
+    assert args.graph == tmp_path / "g.json"
+    assert args.engine == ENGINE
+    assert args.plugin_path == Path("/plugins/p.so")
+    assert args.seed == 11
+    assert args.timing_policy == config.timing_policy
+    assert args.out_dir == child.out_dir
+
+
+def test_hipdnn_child_uses_the_default_plugins_without_a_plugin_path(child, tmp_path):
+    _run_hipdnn(tmp_path)
+
+    assert hipdnn_child.parse_args(child.argv[3:]).plugin_path is None
+
+
+def test_hipdnn_child_env_forces_benchmarking_into_the_shared_tuned_db(
+    child, tmp_path, monkeypatch
+):
+    """The parent sets the child's tuning environment, also over inherited
+    values. The search reads and writes the command's tuned MIOpen user DB,
+    so a later tuned row reuses it; the child's private directory is still
+    new and deleted after it."""
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "0")
+    monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "0")
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/inherited/miopen-db")
+
+    _run_hipdnn(tmp_path)
+
+    assert child.env["HIPDNN_FORCE_BENCHMARKING"] == "1"
+    assert child.env["HIPDNN_DISABLE_CACHE"] == "1"
+    assert child.env["MIOPEN_USER_DB_PATH"] == str(TUNED_DB)
+    assert child.state_existed and not child.out_dir.exists()
+
+
+def test_child_state_dir_is_under_the_temp_root_and_deleted(child, tmp_path, monkeypatch):
+    """With --benchmark-work-dir, the child's private directory lives under
+    the work dir's ``tmp``; it is still new for the child and deleted after it."""
+    root = tmp_path / "work-dir" / "tmp"
+    monkeypatch.setenv(TEMP_ROOT_ENV, str(root))
+
+    _run_hipdnn(tmp_path)
+
+    assert child.out_dir.parent == root
+    assert child.state_existed and not child.out_dir.exists()
+
+
+def test_the_parent_env_satisfies_the_hipdnn_child_check(child, tmp_path, monkeypatch):
+    _run_hipdnn(tmp_path)
+    for name, value in child.env.items():
+        monkeypatch.setenv(name, value)
+
+    child_protocol.HIPDNN_TUNED.env.check(child.out_dir)
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("HIPDNN_FORCE_BENCHMARKING", None),
+        ("HIPDNN_FORCE_BENCHMARKING", "0"),
+        ("HIPDNN_DISABLE_CACHE", "0"),
+        ("MIOPEN_USER_DB_PATH", None),
+    ],
+)
+def test_hipdnn_child_refuses_to_time_without_the_tuning_env(
+    tmp_path, monkeypatch, name, value
+):
+    """An untuned run must not be reported as the tuned result, and a run
+    with another run's MIOpen user database is not isolated."""
+    _set_tuned_env(monkeypatch, child_protocol.HIPDNN_TUNED.env, tmp_path)
+    if value is None:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, value)
+    argv = ["--graph", "g.json", "--seed", "0", "--engine", "0x1", "--tuned"]
+    argv += ["--timing-policy", "{}", "--out-dir", str(tmp_path)]
+
+    assert hipdnn_child.main(argv) == 1
+    assert not (tmp_path / child_protocol.RESULT_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    "name", ["PYTORCH_TUNABLEOP_ENABLED", "PYTORCH_TUNABLEOP_TUNING"]
+)
+def test_pytorch_child_refuses_to_time_without_the_tuning_env(
+    tmp_path, monkeypatch, name
+):
+    _set_tuned_env(monkeypatch, child_protocol.PYTORCH_TUNED_ENV, tmp_path)
+    monkeypatch.setenv(name, "0")
+    argv = ["--graph", "g.json", "--seed", "0", "--timing-policy", "{}"]
+    argv += ["--out-dir", str(tmp_path), "--pytorch-sdpa-backend", "default"]
+
+    assert pytorch_child.main([*argv, "--tuned"]) == 1
+    assert not (tmp_path / child_protocol.RESULT_FILE).exists()
+
+
+def test_hipdnn_tuned_row_comes_from_the_child_result(child, tmp_path):
+    """TFLOP/s and GB/s use the row's analytical FLOPs/bytes over the TUNED
+    kernel median (0.25 ms), not the OOTB median."""
+    row = _run_hipdnn(tmp_path)
+
+    o = row.oracle
+    assert row.oracle_error is None
+    assert o.tuning_available is True
+    assert o.cpu_build_time_ms == pytest.approx(7.0)
+    assert o.workspace_bytes == 4096
+    assert o.timing.first_call_ms == pytest.approx(40.0)
+    assert o.timing.samples == 3
+    assert o.gpu_kernel_stats.median_ms == pytest.approx(0.25)
+    assert o.host_stats.median_ms == pytest.approx(0.5)
+    assert o.derived_tflops_per_s == pytest.approx(4.0)
+    assert o.derived_gbytes_per_s == pytest.approx(4.0)
+
+
+def test_hipdnn_tuned_workspace_follows_the_metrics_switch(child, tmp_path):
+    row = _run_hipdnn(tmp_path, config=_config(metrics=MetricsConfig(basic=False)))
+
+    assert row.oracle.workspace_bytes is None
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_hipdnn_tuning_available_is_passed_through(child, tmp_path, available):
+    """Without the benchmarking knob the child re-measures the OOTB
+    configuration, and the row must say so."""
+    row = _run_hipdnn(tmp_path, tuning_available=available)
+
+    assert row.oracle.tuning_available is available
+
+
+def test_tuned_outputs_are_validated_against_the_row_references(child, tmp_path):
+    """A wrong-but-fast tuned kernel is caught by the same reference check
+    and tolerances as the OOTB row."""
+    row = _run_hipdnn(tmp_path, references=_references())
+
+    assert "--save-outputs" in child.argv
+    assert row.oracle.correctness.passed
+    assert row.oracle.correctness.n_total == REF.size
+
+
+def test_failing_tuned_outputs_keep_the_row_verdict(child, tmp_path):
+    passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
+    child.outputs = {2: REF + 1.0}
+
+    row = _run_hipdnn(tmp_path, row=_row(passed), references=_references())
+
+    assert row.oracle.correctness.explicitly_failed
+    assert row.ootb.correctness is passed
+    assert row.verdict == "passed"
+    assert oracle_speedup(row) is None
+
+
+def test_missing_tuned_output_fails_tuned_validation(child, tmp_path):
+    child.outputs = {}
+
+    row = _run_hipdnn(tmp_path, references=_references())
+
+    assert row.oracle.correctness.explicitly_failed
+
+
+def test_without_references_the_tuned_run_is_not_validated(child, tmp_path):
+    row = _run_hipdnn(tmp_path, config=_config(validation=ValidationConfig()))
+
+    assert "--save-outputs" not in child.argv
+    assert row.oracle is not None and row.oracle.correctness is None
+
+
+def test_hipdnn_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
+    """A wedged search must not hang the suite: --profiling-timeout bounds it."""
+    seen = []
+    _timeout(monkeypatch, seen)
+    config = _config()
+    config.metrics.profiling_timeout_s = 7
+
+    row = _run_hipdnn(tmp_path, config=config)
+
+    assert seen == [7]
+    assert row.oracle is None and row.status == "success"
+    assert "timed out after 7 s" in row.oracle_error
+
+
+@pytest.mark.parametrize("failure", ["error", "no-result"])
+def test_hipdnn_child_failure_is_an_oracle_error(child, tmp_path, failure):
+    if failure == "error":
+        child.error = RuntimeError("HIP out of memory")
+    else:
+        child.plan = None
+
+    row = _run_hipdnn(tmp_path, references=_references())
+
+    assert row.oracle is None
+    assert row.status == "success"
+    if failure == "error":
+        assert row.oracle_error == "RuntimeError: HIP out of memory"
+    else:
+        assert "exited 0" in row.oracle_error
+
+
+# --- run_pytorch_tuned ------------------------------------------------------
 
 
 def _run_pytorch(tmp_path, config=None, node_type="ConvolutionFwdAttributes"):
@@ -369,9 +406,8 @@ def _run_pytorch(tmp_path, config=None, node_type="ConvolutionFwdAttributes"):
     return row
 
 
-def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
-    child, tmp_path
-):
+@pytest.mark.parametrize("stall_gate", [True, False])
+def test_pytorch_child_times_the_graph_with_the_run_timing(child, tmp_path, stall_gate):
     """The child must time with the parent's settings, or the tuned and OOTB
     PyTorch numbers are not comparable."""
     config = _pytorch_config(
@@ -380,41 +416,44 @@ def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
         min_time_ms=2.0,
         timing_block=4,
         seed=11,
+        pytorch_sdpa_backend="flash",
+        pytorch_rocm_fa_library="aotriton",
     )
+    config.timing_policy = replace(config.timing_policy, stall_gate=stall_gate)
 
     _run_pytorch(tmp_path, config)
 
-    args = create_parser().parse_args(child.argv[3:])
-    child_config = SuiteConfig.from_namespace(args)
-    # Launching plain ``dnn_benchmarking`` would time untuned PyTorch.
-    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.pytorch_tuned_child"]
-    assert args.graph == [str(tmp_path / "g.json")]
-    assert child_config.runtime == "pytorch"
-    assert child_config.oracle is False
-    assert child_config.timing_policy == config.timing_policy
-    assert child_config.seed == 11
+    assert child.argv[1:3] == ["-m", "dnn_benchmarking.cli.pytorch_child"]
+    args = pytorch_child.parse_args(child.argv[3:])
+    assert args.tuned
+    assert args.graph == tmp_path / "g.json"
+    assert args.seed == 11
+    assert args.timing_policy == config.timing_policy
+    assert args.pytorch_sdpa_backend is config.pytorch_sdpa_backend
+    assert args.pytorch_rocm_fa_library == "aotriton"
 
 
-def test_pytorch_child_tunes_into_a_private_state_dir_that_is_deleted(child, tmp_path):
-    """MIOpen's user db and TunableOp results must not outlive the child, or a
-    later OOTB run would serve the tuned selection."""
+def test_pytorch_child_tunes_into_the_shared_tuned_db(child, tmp_path):
+    """MIOpen's user DB is the command's tuned one; TunableOp results stay in
+    the private directory, deleted after the child."""
     _run_pytorch(tmp_path)
 
-    state_dir = Path(child.env["MIOPEN_USER_DB_PATH"])
-    output = Path(child.argv[child.argv.index("--output") + 1])
-    assert output.parent == state_dir
+    assert child.env["MIOPEN_USER_DB_PATH"] == str(TUNED_DB)
     assert child.env["PYTORCH_TUNABLEOP_ENABLED"] == "1"
-    assert not state_dir.exists()
+    assert child.env["PYTORCH_TUNABLEOP_TUNING"] == "1"
+    assert Path(child.env["PYTORCH_TUNABLEOP_FILENAME"]).parent == child.out_dir
+    assert child.state_existed and not child.out_dir.exists()
 
 
-def test_pytorch_tuned_row_comes_from_the_child_ootb_plan(child, tmp_path):
+def test_pytorch_tuned_row_comes_from_the_child_result(child, tmp_path):
+    child.plan = {}
+
     row = _run_pytorch(tmp_path)
 
     o = row.oracle
     assert row.oracle_error is None
     assert o.tuning_available is True
-    assert o.cpu_build_time_ms is None
-    assert o.correctness is None
+    assert (o.cpu_build_time_ms, o.workspace_bytes, o.correctness) == (None,) * 3
     assert o.timing.first_call_ms == pytest.approx(40.0)
     assert o.gpu_kernel_stats.median_ms == pytest.approx(0.25)
     assert o.host_stats.median_ms == pytest.approx(0.5)
@@ -438,12 +477,7 @@ def test_pytorch_tuning_is_available_only_for_searched_ops(
 def test_pytorch_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
     """A wedged search must not hang the suite: --profiling-timeout bounds it."""
     seen = []
-
-    def run_capped(argv, timeout_s, env=None):
-        seen.append(timeout_s)
-        raise subprocess.TimeoutExpired(argv, timeout_s)
-
-    monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
+    _timeout(monkeypatch, seen)
     config = _pytorch_config()
     config.metrics.profiling_timeout_s = 7
 
@@ -454,28 +488,11 @@ def test_pytorch_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
     assert "timed out after 7 s" in row.oracle_error
 
 
-def test_pytorch_child_without_output_reports_its_last_error_line(child, tmp_path):
-    child.result = None
-    child.proc = SimpleNamespace(
-        returncode=1,
-        stdout="loading graph\n",
-        stderr="Traceback ...\nRuntimeError: HIP out of memory\n  \n",
-    )
+def test_pytorch_child_failure_reports_the_child_error(child, tmp_path):
+    child.error = RuntimeError("HIP out of memory")
 
     row = _run_pytorch(tmp_path)
 
     assert row.oracle is None
-    assert "exited 1" in row.oracle_error
-    assert row.oracle_error.endswith("RuntimeError: HIP out of memory")
+    assert row.oracle_error == "RuntimeError: HIP out of memory"
     assert row.status == "success"
-
-
-def test_pytorch_child_row_error_carries_its_message(child, tmp_path):
-    child.result = {
-        "graphs": [{"results": [_child_row("error", "unsupported op: sdpa")]}]
-    }
-
-    row = _run_pytorch(tmp_path)
-
-    assert row.oracle is None
-    assert row.oracle_error == "RuntimeError: unsupported op: sdpa"

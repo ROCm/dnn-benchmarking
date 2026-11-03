@@ -31,8 +31,14 @@ runtime = "hipdnn"   # "hipdnn" or "pytorch"
 # or the pip ROCm SDK.
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
-autotune = false     # benchmark candidate kernels and cache the winner
-# hipdnn_cache_dir = "/tmp/dnn-bench-hipdnn-cache"  # per-run HIPDNN_CACHE_DIR
+autotune = false     # benchmark candidate kernels and use the winner
+# Work directory. cache/ holds caches that only save time (MIOpen compiled
+# kernels, comgr, XDG); they stay across calls. tuned-db/ holds the MIOpen
+# user database that every tuned run shares; it also stays across calls.
+# tmp/ holds the temporary engine state (OOTB MIOpen user find-DBs);
+# dnn-benchmark deletes it when it ends. Reuse one directory to skip
+# recompiles and repeated tuning.
+# benchmark_work_dir = "/tmp/dnn-bench-work"
 
 pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
 # pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"
@@ -47,8 +53,8 @@ validate = "none"    # "none" or "pytorch"
 reference_precision = "float64"
 
 # --- Comparison --------------------------------------------------------------
-# Also build and time a global.benchmarking=1 plan per engine, and a tuned
-# PyTorch run in a child process. Significantly slower. Not with autotune.
+# Also time a tuned run of each engine row (benchmarking on) and of each
+# PyTorch row, each in a child process. Significantly slower. Not with autotune.
 oracle = false
 
 # --- Output ------------------------------------------------------------------

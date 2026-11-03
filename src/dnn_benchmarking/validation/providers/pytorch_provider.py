@@ -228,8 +228,8 @@ class PyTorchReferenceProvider(ReferenceProvider):
             graph_json: The graph as a parsed JSON dictionary.
             input_data: Mapping of tensor UID to input numpy arrays.
             precision: ``FLOAT64`` requires :meth:`supports_float64`.
-            device: Torch device to compute on; None is the host. GPU
-                outputs stay on the device (``ReferenceOutput.device_data``).
+            device: Torch device to compute on; None is the host. The outputs
+                are copied to the host in either case.
 
         Returns:
             Mapping of output tensor UID to ReferenceOutput.
@@ -288,16 +288,8 @@ class PyTorchReferenceProvider(ReferenceProvider):
         label = ReferencePrecision.FLOAT64 if float64 else ReferencePrecision.NATIVE
 
         def output(uid: int) -> ReferenceOutput:
-            tensor = tensors[uid]
-            if tensor.is_cuda:
-                return ReferenceOutput(
-                    data=None,
-                    tensor_uid=uid,
-                    device_data=tensor,
-                    precision=label.value,
-                )
             return ReferenceOutput(
-                data=host_numpy(tensor), tensor_uid=uid, precision=label.value
+                data=host_numpy(tensors[uid]), tensor_uid=uid, precision=label.value
             )
 
         return {

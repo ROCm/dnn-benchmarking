@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..common import torch_support
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import RuntimeName, SuiteConfig
+from ..execution.executor import set_plugin_path
 from ..execution.suite_runner import (
     GraphPlanner,
     hipdnn_planner,
@@ -17,7 +18,6 @@ from ..execution.suite_runner import (
     rocke_planner,
     rocke_session,
     run_graph,
-    set_plugin_path,
 )
 from ..reporting.reporter import Reporter
 from ..reporting.suite_results import GraphResult, engine_id_hex

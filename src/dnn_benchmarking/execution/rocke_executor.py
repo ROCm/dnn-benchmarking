@@ -10,7 +10,6 @@ rocKE launch synchronizes the host after every call.
 """
 
 import hashlib
-from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
@@ -44,7 +43,7 @@ class LoadedVariant(NamedTuple):
     """A catalog variant ready to launch with hipDNN's geometry.
 
     ``load_ms`` is the host time that reading and loading the code object
-    took when it first loaded.
+    took.
     """
 
     launcher: Any  # rocke.runtime.KernelLauncher
@@ -53,15 +52,8 @@ class LoadedVariant(NamedTuple):
     block: Tuple[int, int, int]
 
 
-def load_variant(
-    kernel: CatalogKernel,
-    problem: SdpaProblem,
-    loaded: Dict[Tuple[Path, str], Tuple[Any, float]],
-) -> LoadedVariant:
+def load_variant(kernel: CatalogKernel, problem: SdpaProblem) -> LoadedVariant:
     """Check a catalog variant against hipDNN's launch and load its code object.
-
-    ``loaded`` maps ``(library, toc_key)`` to the launcher and the load time,
-    so each code object loads once.
 
     Raises:
         ExecutionError: rocKE's argument list or grid is not the one hipDNN
@@ -89,23 +81,21 @@ def load_variant(
     expected = hipdnn_grid(problem, int(kernel.spec["block_m"]))
     if grid != expected:
         raise ExecutionError(f"rocKE's grid {grid} differs from hipDNN's {expected}")
-    key = (kernel.library, kernel.toc_key)
-    if key not in loaded:
-        with Timer() as t:
-            hsaco = read_kernel(kernel.library, kernel.toc_key, DENSE_ARCH)
-            digest = hashlib.sha256(hsaco).hexdigest()
-            if digest != kernel.sha256:
-                raise ExecutionError(
-                    f"code object {kernel.toc_key} in {kernel.library} has "
-                    f"SHA-256 {digest[:12]}, the descriptor records "
-                    f"{kernel.sha256[:12]}"
-                )
-            launcher = KernelLauncher(
-                hsaco=hsaco, kernel_name=kernel.symbol, signature=signature
+    with Timer() as t:
+        hsaco = read_kernel(kernel.library, kernel.toc_key, DENSE_ARCH)
+        digest = hashlib.sha256(hsaco).hexdigest()
+        if digest != kernel.sha256:
+            raise ExecutionError(
+                f"code object {kernel.toc_key} in {kernel.library} has "
+                f"SHA-256 {digest[:12]}, the descriptor records "
+                f"{kernel.sha256[:12]}"
             )
-        loaded[key] = (launcher, t.elapsed_ms)
-    launcher, load_ms = loaded[key]
-    return LoadedVariant(launcher, load_ms, grid, tuple(attention_dense_block(spec)))
+        launcher = KernelLauncher(
+            hsaco=hsaco, kernel_name=kernel.symbol, signature=signature
+        )
+    return LoadedVariant(
+        launcher, t.elapsed_ms, grid, tuple(attention_dense_block(spec))
+    )
 
 
 class PagedViews(NamedTuple):
@@ -152,9 +142,7 @@ class RockeExecutor:
 
     ``build_time_ms`` is the host time to get and load the kernel. For a
     catalog kernel that is reading hipDNN's code object from the kpack
-    archive and loading it. ``loaded`` caches the loaded code objects by
-    ``(library, toc_key)``, so a variant loads once; a later row reports the
-    time of that first load. For the auto kernel it includes the first launch,
+    archive and loading it. For the auto kernel it includes the first launch,
     because rocKE compiles the unified kernel inside its launch call.
     """
 
@@ -164,13 +152,11 @@ class RockeExecutor:
         problem: SdpaProblem,
         policy: TimingPolicy,
         device: Optional[torch.device] = None,
-        loaded: Optional[Dict[Tuple[Path, str], Tuple[Any, float]]] = None,
     ) -> None:
         self._kernel = kernel
         self._problem = problem
         self._policy = policy
         self._device = device if device is not None else torch.device("cuda")
-        self._loaded = loaded if loaded is not None else {}
         # Same choice as the PyTorch executor: rocKE and ROCm torch share the
         # HIP runtime, so HIP events can bracket the torch stream.
         self._timer = (
@@ -211,7 +197,7 @@ class RockeExecutor:
         kernel = self._kernel
         assert isinstance(kernel, CatalogKernel)
         p = self._problem
-        variant = load_variant(kernel, p, self._loaded)
+        variant = load_variant(kernel, p)
         self.build_time_ms = variant.load_ms
         values = {
             "q_ptr": q.data_ptr(),

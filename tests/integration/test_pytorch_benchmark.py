@@ -322,101 +322,14 @@ def test_strict_efficient_runs_gqa_graph(torch_gpu) -> None:
     run(2)
 
 
-def test_pytorch_row_returns_vram_after_oom(torch_gpu) -> None:
-    """A PyTorch row that runs out of memory must not keep VRAM reserved.
-
-    hipDNN rows of the same graph allocate with hipMalloc, outside PyTorch's
-    caching allocator, so memory PyTorch keeps cached is lost to them. The
-    graph chains two 1 GiB intermediates under a cap that fits only one, so
-    the row fails while the first is still referenced.
-    """
-    import io
-    from pathlib import Path
-
-    from dnn_benchmarking.config import SuiteConfig
-    from dnn_benchmarking.execution import suite_runner
-    from dnn_benchmarking.graph import GraphLoader
-    from dnn_benchmarking.reporting.reporter import Reporter
-
-    torch = torch_gpu
-    m, k = 16384, 256  # an M x M fp32 tensor is 1 GiB
-
-    def tensor(uid, dims, virtual=False):
-        return {
-            "uid": uid,
-            "name": f"t{uid}",
-            "dims": dims,
-            "strides": [dims[1], 1],
-            "data_type": "float",
-            "virtual": virtual,
-        }
-
-    def relu(name, x, y):
-        return {
-            "name": name,
-            "type": "PointwiseAttributes",
-            "compute_data_type": "float",
-            "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": x},
-            "outputs": {"out_0_tensor_uid": y},
-        }
-
-    graph_json = {
-        "name": "oom_chain",
-        "compute_data_type": "float",
-        "io_data_type": "float",
-        "intermediate_data_type": "float",
-        "tensors": [
-            tensor(1, [m, k]),
-            tensor(2, [k, m]),
-            tensor(3, [m, m], virtual=True),
-            tensor(4, [m, m], virtual=True),
-            tensor(5, [m, m]),
-        ],
-        "nodes": [
-            {
-                "name": "mm",
-                "type": "MatmulAttributes",
-                "compute_data_type": "float",
-                "inputs": {"a_tensor_uid": 1, "b_tensor_uid": 2},
-                "outputs": {"c_tensor_uid": 3},
-            },
-            relu("relu1", 3, 4),
-            relu("relu2", 4, 5),
-        ],
-    }
-    infos = GraphLoader().extract_tensor_info(graph_json)
-    ctx = suite_runner._graph_context(
-        Path("oom_chain.json"),
-        graph_json,
-        infos,
-        SuiteConfig(runtime="pytorch"),
-        Reporter(io.StringIO()),
-    )
-
-    torch.cuda.empty_cache()
-    reserved_before = torch.cuda.memory_reserved()
-    total = torch.cuda.get_device_properties(0).total_memory
-    # Inputs and output (~1.1 GiB), one intermediate, and some slack.
-    cap = reserved_before + 2.6 * (1 << 30)
-    torch.cuda.set_per_process_memory_fraction(cap / total)
-    try:
-        row, _ = suite_runner._run_pytorch_row(ctx, "engine")
-    finally:
-        torch.cuda.set_per_process_memory_fraction(1.0)
-
-    assert "out of memory" in (row.error_message or ""), row
-    assert torch.cuda.memory_reserved() <= reserved_before
-    assert "at row start the GPU had" in row.error_message
-
-
 @pytest.mark.parametrize(
     "graph_name",
     ["sample_conv_fwd.json", "sample_conv_dgrad.json", "sample_conv_wgrad.json"],
 )
 def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> None:
     """With the default config, a convolution graph is validated against a
-    float64 reference computed on the GPU, and that reference equals a
-    float64 computation on the host."""
+    float64 reference that the reference child computes on the GPU, and that
+    reference equals a float64 computation on the host."""
     import io
     from pathlib import Path
 
@@ -441,8 +354,5 @@ def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> 
     )
     for uid, ref in ctx.reference_outputs.items():
         assert ref.precision == ReferencePrecision.FLOAT64.value
-        assert ref.device_data is not None and ref.device_data.is_cuda
-        assert ref.device_data.dtype == torch_gpu.float64
-        np.testing.assert_allclose(
-            ref.host_data(), host[uid].host_data(), rtol=1e-12, atol=0
-        )
+        assert ref.data.dtype == np.float64
+        np.testing.assert_allclose(ref.data, host[uid].data, rtol=1e-12, atol=0)

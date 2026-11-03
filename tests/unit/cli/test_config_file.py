@@ -309,7 +309,6 @@ graphs = ["../graphs/g.json"]
 output = "results/out.json"
 plugin_path = "../plugins"
 profiling_output_dir = "profiles"
-hipdnn_cache_dir = "hipdnn-cache"
 """,
     )
 
@@ -319,7 +318,6 @@ hipdnn_cache_dir = "hipdnn-cache"
     assert args.output == config_dir / "results/out.json"
     assert args.plugin_path == [config_dir / "../plugins"]
     assert args.profiling_output_dir == config_dir / "profiles"
-    assert args.hipdnn_cache_dir == config_dir / "hipdnn-cache"
 
 
 def test_sample_configs_parse_and_cover_every_config_key() -> None:

@@ -11,22 +11,29 @@ is how kernel-trace / PMC counters scope what they record.
 
 Argv (built by ``profiling_orchestrator.build_inner_argv``):
 ``--internal-profiling-run --graph G --engine E --warmup W --iters I
---seed S [--plugin-path P]``. The child builds the one engine, fills the
-inputs exactly as the timed pass did, and dispatches ``W + I`` plain
-executions. It prints nothing on success so profiler log capture stays
-clean.
+--seed S [--plugin-path P] [--autotune]``. The child builds the one engine,
+fills the inputs exactly as the timed pass did, and dispatches ``W + I``
+plain executions. It prints nothing on success so profiler log capture
+stays clean.
+
+This child is not started through ``execution.child_runner``: a profiler
+wraps it. It applies the selection variables of the timed row's spec
+(``execution.child_protocol.HIPDNN_OOTB`` or ``HIPDNN_AUTOTUNE``) to its
+own environment before hipDNN loads, so it profiles the plan that the row
+timed.
 """
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
+from ..execution.child_protocol import HIPDNN_AUTOTUNE, HIPDNN_OOTB
 from ..execution.buffer_manager import BufferManager, generate_input_data
-from ..execution.executor import Executor
-from ..execution.suite_runner import set_plugin_path
+from ..execution.executor import Executor, set_plugin_path
 from ..execution.timing import device_sync
 from ..graph.loader import GraphLoader
 
@@ -56,6 +63,8 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
     )
 
     try:
+        spec = HIPDNN_AUTOTUNE if args.autotune else HIPDNN_OOTB
+        os.environ.update(spec.env.fixed)
         initialize_pip_rocm_runtime()
         import hipdnn_frontend as hipdnn
     except (RuntimeError, ImportError) as e:
@@ -65,10 +74,7 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
         set_plugin_path(hipdnn, plugin_path)
         handle = hipdnn.Handle()
 
-        loader = GraphLoader()
-        graph_json = loader.load_json(graph_path)
-        loader.validate(graph_json)
-        tensor_infos = loader.extract_tensor_info(graph_json)
+        graph_json, tensor_infos = GraphLoader().load(graph_path)
 
         executor = Executor(json.dumps(graph_json), policy)
         executor.prepare(handle, engine_id=engine_id)

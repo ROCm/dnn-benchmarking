@@ -47,7 +47,7 @@ def _run(tmp_path, returncode=0, stderr="", write_csv=True):
     """
     captured = {}
 
-    def fake_run(argv, timeout_s=None):
+    def fake_run(argv, timeout_s=None, env=None):
         captured["argv"] = argv
         if write_csv:
             # Write at the exact `-o` value so a moved flag fails loudly.

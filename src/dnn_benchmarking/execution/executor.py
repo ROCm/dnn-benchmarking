@@ -4,6 +4,7 @@
 """hipDNN graph build and timed execution."""
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
@@ -18,6 +19,14 @@ def _get_handle_stream(handle: Any) -> int:
     if callable(get_stream):
         return int(get_stream())
     return 0
+
+
+def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
+    """Set the process-wide hipDNN plugin search path for the next handle."""
+    if plugin_path is not None:
+        hipdnn.set_engine_plugin_paths(
+            [str(plugin_path)], hipdnn.PluginLoadingMode.ABSOLUTE
+        )
 
 
 class Executor:

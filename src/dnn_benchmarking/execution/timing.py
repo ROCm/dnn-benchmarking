@@ -26,9 +26,9 @@ Timers
 import atexit
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 
 from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import TimingPolicy
@@ -70,8 +70,43 @@ class Measurement:
 
 class StallFallbackError(RuntimeError):
     """The stall gate could not arm, or its watchdog released the stalled
-    stream, so the staged sample is invalid. The suite runner remeasures the
-    whole graph without stalling (see ``suite_runner``)."""
+    stream, so the staged sample is invalid. ``retry_unstalled`` runs the
+    work again without stalling."""
+
+
+_T = TypeVar("_T")
+
+
+def retry_unstalled(
+    run: Callable[[TimingPolicy], _T],
+    policy: TimingPolicy,
+    on_fallback: Optional[Callable[[str], None]] = None,
+) -> _T:
+    """``run(policy)``; when the stall gate fails, ``run`` again without it.
+
+    The suite runner reruns a whole graph this way, so that all rows of the
+    graph share one timing mode. Each tuned child reruns its tuned run this
+    way. A policy without the stall gate cannot fail the gate, so its
+    ``StallFallbackError`` propagates.
+
+    Args:
+        run: One attempt with the given policy.
+        policy: Policy of the first attempt.
+        on_fallback: Called with the reason of the failure before the second
+            attempt.
+    """
+    try:
+        return run(policy)
+    except StallFallbackError as e:
+        if not policy.stall_gate:
+            raise
+        reason = str(e)
+    # Retry outside the except block: the caught traceback holds every frame
+    # of the first attempt (inputs, references, buffers, workspaces) until
+    # the block exits.
+    if on_fallback is not None:
+        on_fallback(reason)
+    return run(replace(policy, stall_gate=False))
 
 
 _HIP_API = ("HipEvent", "hip_get_device_count", "hip_device_synchronize")

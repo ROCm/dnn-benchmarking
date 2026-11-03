@@ -133,21 +133,11 @@ The child runs `--warmup` + 5 iterations; `--iters` does not change it.
 
 ### Out-of-memory rows
 
-The PyTorch rows and the hipDNN rows of a graph run in one process.
-PyTorch keeps freed VRAM in its caching allocator, and hipDNN allocates
-with `hipMalloc` outside that cache. After each PyTorch row, the tool
-therefore runs `gc.collect()` and `torch.cuda.empty_cache()`, so the
-hipDNN rows get the VRAM back. This includes a PyTorch row that ran out
-of memory.
-
-When a row fails with an out-of-memory error, its message ends with the
-GPU memory at the start of that row, for example
-`[at row start the GPU had 31.2 of 64.0 GiB free (all processes) and this process's PyTorch cache held 0.0 GiB unused]`.
-The free figure counts every process on the GPU. Low free memory with an
-empty PyTorch cache means live allocations hold the VRAM: this process's
-own (for example the on-device copy of the reference outputs) or another
-process's. The note appears only after PyTorch has initialized the GPU in
-this process.
+Every GPU run of a row (hipDNN or PyTorch, OOTB or tuned) is a child
+process, and the child exits before the next run starts. A run therefore
+never shares VRAM with an earlier run of the tool. When a row fails with an
+out-of-memory error, look for another process on the GPU (`amd-smi
+process`), or reduce the problem size of the graph.
 
 ## Viewing profiling artefacts
 

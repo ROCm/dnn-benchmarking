@@ -131,31 +131,24 @@ def rocke(monkeypatch):
     return fake
 
 
-def test_a_variant_loads_hipdnns_code_object_once(rocke) -> None:
-    loaded = {}
-    first = load_variant(_kernel(), _PROBLEM, loaded)
-    again = load_variant(_kernel(), _PROBLEM, loaded)
-    load_variant(_kernel(toc_key="other"), _PROBLEM, loaded)
+def test_a_variant_loads_hipdnns_code_object(rocke) -> None:
+    loaded = load_variant(_kernel(), _PROBLEM)
 
-    assert (first.grid, first.block) == ((2, 32, 1), (512, 1, 1))
-    assert first.launcher["hsaco"] == _HSACO
-    assert first.launcher["kernel_name"] == "sym"
-    # A second row of the same code object reuses its module and load time.
-    assert again.launcher is first.launcher and again.load_ms == first.load_ms
-    assert [key for _, key, _ in rocke.reads] == ["toc", "other"]
-    assert len(rocke.launchers) == 2
+    assert (loaded.grid, loaded.block) == ((2, 32, 1), (512, 1, 1))
+    assert loaded.launcher["hsaco"] == _HSACO
+    assert loaded.launcher["kernel_name"] == "sym"
+    assert rocke.reads == [(Path("/plugins/kpack/gfx950.kpack"), "toc", "gfx950")]
 
 
 def test_a_code_object_with_another_hash_does_not_load(rocke) -> None:
-    loaded = {}
     with pytest.raises(ExecutionError, match="SHA-256"):
-        load_variant(_kernel(sha256="ab" * 32), _PROBLEM, loaded)
-    assert rocke.launchers == [] and loaded == {}
+        load_variant(_kernel(sha256="ab" * 32), _PROBLEM)
+    assert rocke.launchers == []
 
 
 def test_another_argument_list_fails_before_the_read(rocke) -> None:
     with pytest.raises(ExecutionError, match="argument list"):
-        load_variant(_kernel(args=_ARGS[:-1]), _PROBLEM, {})
+        load_variant(_kernel(args=_ARGS[:-1]), _PROBLEM)
     assert rocke.reads == []
 
 
@@ -163,5 +156,5 @@ def test_a_grid_other_than_hipdnns_fails_before_the_read(rocke) -> None:
     """rocKE's auto block order for causal problems swaps the grid axes."""
     rocke.grid = (1, 32, 2)
     with pytest.raises(ExecutionError, match=r"grid \(1, 32, 2\).*\(2, 32, 1\)"):
-        load_variant(_kernel(), _PROBLEM, {})
+        load_variant(_kernel(), _PROBLEM)
     assert rocke.reads == []

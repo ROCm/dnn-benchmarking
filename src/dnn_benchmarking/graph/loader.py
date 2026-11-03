@@ -5,7 +5,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..common.exceptions import GraphLoadError
 from .tensor_info import TensorInfo
@@ -38,6 +38,18 @@ class GraphLoader:
 
     Handles JSON loading, validation, and tensor info extraction.
     """
+
+    def load(self, path: Path) -> Tuple[Dict[str, Any], List[TensorInfo]]:
+        """Load and validate a graph file; return it with its tensors.
+
+        Raises:
+            GraphLoadError: See :meth:`load_json`, :meth:`validate` and
+                :meth:`extract_tensor_info`.
+            UnsupportedGraphError: A tensor has an unsupported data type.
+        """
+        graph_json = self.load_json(path)
+        self.validate(graph_json)
+        return graph_json, self.extract_tensor_info(graph_json)
 
     def load_json(self, path: Path) -> Dict[str, Any]:
         """Load and parse a graph JSON file.

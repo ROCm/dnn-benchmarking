@@ -190,7 +190,7 @@ class TestRunHappyPath:
         monkeypatch.setattr(rocprof_pmc, "resolve_rocm_tool", lambda name: "rocprofv3")
         out_dir = tmp_path / "pmc_out"
 
-        def fake_run(argv, timeout_s=None):
+        def fake_run(argv, timeout_s=None, env=None):
             # rocprofv3 nests under <hostname>/; the run must hoist it.
             host_dir = Path(argv[argv.index("-d") + 1]) / "host"
             host_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +250,7 @@ class TestRunHappyPath:
         monkeypatch.setattr(rocprof_pmc, "detect_arch", lambda: "gfx942")
         monkeypatch.setattr(rocprof_pmc, "resolve_rocm_tool", lambda name: "rocprofv3")
 
-        def fake_run(argv, timeout_s=None):
+        def fake_run(argv, timeout_s=None, env=None):
             db = Path(argv[argv.index("-d") + 1]) / "results.db"
             conn = sqlite3.connect(db)
             try:

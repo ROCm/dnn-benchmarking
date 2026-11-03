@@ -18,7 +18,8 @@ Two kinds of kernel apply to a graph:
 This module needs neither torch nor rocKE at import time.
 """
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 
@@ -133,6 +134,35 @@ RockeKernel = Union[CatalogKernel, AutoKernel]
 
 
 Catalog = Tuple[CatalogKernel, ...]
+
+
+def kernel_to_json(kernel: RockeKernel) -> str:
+    """``kernel`` as JSON, the form that the parent passes to the rocKE child."""
+    fields = asdict(kernel)
+    if isinstance(kernel, CatalogKernel):
+        return json.dumps({"kind": "catalog", **fields, "library": str(kernel.library)})
+    return json.dumps({"kind": "auto", **fields})
+
+
+def kernel_from_json(text: str) -> RockeKernel:
+    """The kernel that :func:`kernel_to_json` wrote.
+
+    Raises:
+        ValueError: ``kind`` is neither ``catalog`` nor ``auto``.
+    """
+    fields = json.loads(text)
+    kind = fields.pop("kind")
+    if kind == "catalog":
+        return CatalogKernel(
+            **{
+                **fields,
+                "library": Path(fields["library"]),
+                "arg_names": tuple(fields["arg_names"]),
+            }
+        )
+    if kind == "auto":
+        return AutoKernel(**fields)
+    raise ValueError(f"unknown rocKE kernel kind {kind!r}; expected 'catalog' or 'auto'")
 
 
 def _is_packed_bshd(dims: Sequence[int], strides: Sequence[int]) -> bool:

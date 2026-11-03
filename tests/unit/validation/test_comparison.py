@@ -9,16 +9,6 @@ import pytest
 from dnn_benchmarking.validation import compare
 
 
-def _both(actual: np.ndarray, expected: np.ndarray, **tol):
-    """Compare on the host, and as torch tensors when torch is installed."""
-    host = compare(actual, expected, **tol)
-    try:
-        import torch
-    except ImportError:
-        return host, host
-    return host, compare(torch.from_numpy(actual), torch.from_numpy(expected), **tol)
-
-
 def test_identical_arrays_pass() -> None:
     a = np.array([1.0, 2.0, 3.0], dtype=np.float32)
 
@@ -36,9 +26,10 @@ def test_tolerance_is_atol_plus_rtol_times_expected() -> None:
     # (1 + 0.01*102.01 = 2.0201 would admit it).
     actual = expected + [2.0, 2.5, 2.01]
 
-    for result in _both(actual, expected, rtol=0.01, atol=1.0):
-        assert result.n_mismatch == 2
-        assert result.worst_index == (1,)
+    result = compare(actual, expected, rtol=0.01, atol=1.0)
+
+    assert result.n_mismatch == 2
+    assert result.worst_index == (1,)
 
 
 def test_mismatch_count_and_worst_index() -> None:
@@ -48,16 +39,17 @@ def test_mismatch_count_and_worst_index() -> None:
     actual[2, 3] = -2.0  # worst
     actual[1, 0] = 0.05  # inside atol
 
-    for result in _both(actual, expected, rtol=0.0, atol=0.1):
-        assert not result.passed
-        assert result.n_mismatch == 2
-        assert result.n_total == 12
-        assert result.worst_index == (2, 3)
-        assert result.max_abs_diff == 2.0
-        assert result.message == (
-            "Mismatch: 2/12 elements outside tolerance, max_abs_diff=2.00e+00 "
-            "at (2, 3), max_rel_diff=0.00e+00 (rtol=0.0, atol=0.1)"
-        )
+    result = compare(actual, expected, rtol=0.0, atol=0.1)
+
+    assert not result.passed
+    assert result.n_mismatch == 2
+    assert result.n_total == 12
+    assert result.worst_index == (2, 3)
+    assert result.max_abs_diff == 2.0
+    assert result.message == (
+        "Mismatch: 2/12 elements outside tolerance, max_abs_diff=2.00e+00 "
+        "at (2, 3), max_rel_diff=0.00e+00 (rtol=0.0, atol=0.1)"
+    )
 
 
 def test_max_rel_diff_ignores_near_zero_references() -> None:
@@ -65,9 +57,10 @@ def test_max_rel_diff_ignores_near_zero_references() -> None:
     expected = np.array([1e-7, 2.0], dtype=np.float32)
     actual = np.array([0.1, 2.2], dtype=np.float32)
 
-    for result in _both(actual, expected, rtol=0.2, atol=0.2):
-        assert result.passed
-        assert result.max_rel_diff == pytest.approx(0.1, rel=1e-5)
+    result = compare(actual, expected, rtol=0.2, atol=0.2)
+
+    assert result.passed
+    assert result.max_rel_diff == pytest.approx(0.1, rel=1e-5)
 
 
 def test_max_rel_diff_is_zero_when_every_reference_is_near_zero() -> None:
@@ -95,12 +88,13 @@ def test_non_finite_values_fail(side: str, bad: float) -> None:
     poisoned[1] = bad
     actual, expected = (poisoned, good) if side == "actual" else (good, poisoned)
 
-    for result in _both(actual, expected, rtol=1.0, atol=1.0):
-        assert not result.passed
-        assert result.max_abs_diff == float("inf")
-        assert result.n_mismatch == result.n_total == 3
-        name = "output" if side == "actual" else "reference"
-        assert result.message == f"{name} contains NaN or Inf values"
+    result = compare(actual, expected, rtol=1.0, atol=1.0)
+
+    assert not result.passed
+    assert result.max_abs_diff == float("inf")
+    assert result.n_mismatch == result.n_total == 3
+    name = "output" if side == "actual" else "reference"
+    assert result.message == f"{name} contains NaN or Inf values"
 
 
 @pytest.mark.parametrize("side, bad", [("actual", np.nan), ("expected", np.inf)])
@@ -116,17 +110,19 @@ def test_non_finite_value_in_a_later_block_fails(
     poisoned[-1, -1] = bad
     actual, expected = (poisoned, good) if side == "actual" else (good, poisoned)
 
-    for result in _both(actual, expected, rtol=1.0, atol=1.0):
-        assert not result.passed
-        name = "output" if side == "actual" else "reference"
-        assert result.message == f"{name} contains NaN or Inf values"
+    result = compare(actual, expected, rtol=1.0, atol=1.0)
+
+    assert not result.passed
+    name = "output" if side == "actual" else "reference"
+    assert result.message == f"{name} contains NaN or Inf values"
 
 
 def test_shape_mismatch_fails() -> None:
-    for result in _both(np.zeros((2, 3)), np.zeros((3, 2)), rtol=1.0, atol=1.0):
-        assert not result.passed
-        assert result.max_abs_diff == float("inf")
-        assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"
+    result = compare(np.zeros((2, 3)), np.zeros((3, 2)), rtol=1.0, atol=1.0)
+
+    assert not result.passed
+    assert result.max_abs_diff == float("inf")
+    assert result.message == "Shape mismatch: output=(2, 3) vs reference=(3, 2)"
 
 
 def test_empty_and_scalar_arrays() -> None:
@@ -141,10 +137,9 @@ def test_fp16_difference_does_not_overflow() -> None:
     a = np.array([60000, 1.0], dtype=np.float16)
     e = np.array([-60000, 1.0], dtype=np.float16)
 
-    host, device = _both(a, e, rtol=1e-3, atol=1e-3)
+    result = compare(a, e, rtol=1e-3, atol=1e-3)
 
-    assert host.max_abs_diff == 120000.0
-    assert host == device
+    assert result.max_abs_diff == 120000.0
 
 
 def test_int32_compared_in_float64() -> None:
@@ -152,16 +147,15 @@ def test_int32_compared_in_float64() -> None:
     a = np.array([2**24 + 1], dtype=np.int32)
     e = np.array([2**24], dtype=np.int32)
 
-    host, device = _both(a, e, rtol=0.0, atol=0.0)
+    result = compare(a, e, rtol=0.0, atol=0.0)
 
-    assert not host.passed
-    assert host.max_abs_diff == 1.0
-    assert host == device
+    assert not result.passed
+    assert result.max_abs_diff == 1.0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
 @pytest.mark.parametrize("fails", [False, True])
-def test_strided_parity_leaves_inputs_unchanged(dtype: type, fails: bool) -> None:
+def test_strided_inputs_are_left_unchanged(dtype: type, fails: bool) -> None:
     rng = np.random.default_rng(0)
     expected = rng.standard_normal((4, 6)).astype(dtype)
     actual = (expected + dtype(1e-3)).astype(dtype)
@@ -170,45 +164,11 @@ def test_strided_parity_leaves_inputs_unchanged(dtype: type, fails: bool) -> Non
     a, e = actual[:, ::2], expected[:, ::2]
     before = (a.copy(), e.copy())
 
-    host, device = _both(a, e, rtol=1e-2, atol=1e-2)
+    result = compare(a, e, rtol=1e-2, atol=1e-2)
 
-    assert host.passed is not fails
-    assert host == device
-    # torch.from_numpy shares memory, so this covers both paths.
+    assert result.passed is not fails
     np.testing.assert_array_equal(a, before[0])
     np.testing.assert_array_equal(e, before[1])
-
-
-def test_torch_actual_accepts_numpy_expected() -> None:
-    torch = pytest.importorskip("torch")
-    expected = np.array([1.0, 2.0], dtype=np.float32)
-
-    result = compare(
-        torch.tensor([1.0, 2.5], dtype=torch.bfloat16), expected, rtol=0.0, atol=0.1
-    )
-
-    assert not result.passed
-    assert result.worst_index == (1,)
-
-
-@pytest.mark.parametrize(
-    "name", ["float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"]
-)
-def test_torch_fp8_actual_is_compared(name: str) -> None:
-    """torch has no isfinite/abs for float8, so compare() must upcast it."""
-    torch = pytest.importorskip("torch")
-    fp8 = getattr(torch, name, None)
-    if fp8 is None:
-        pytest.skip(f"torch has no {name}")
-    expected = np.array([1.0, 2.0, 0.5], dtype=np.float32)
-    actual = torch.tensor([1.0, 2.0, 0.75]).to(fp8)
-
-    result = compare(actual, expected, rtol=0.0, atol=0.1)
-
-    assert not result.passed
-    assert result.n_mismatch == 1 and result.worst_index == (2,)
-    assert result.max_abs_diff == 0.25
-    assert compare(actual[:2], expected[:2], rtol=0.0, atol=0.0).passed
 
 
 @pytest.mark.parametrize("block_elements", [1, 4, 7, 1 << 22])
@@ -225,9 +185,10 @@ def test_block_boundaries_do_not_change_the_result(monkeypatch, block_elements) 
     actual[1, 0, 0] += 0.25
     reference = expected.copy()
 
-    for result in _both(actual, expected, rtol=0.0, atol=0.1):
-        assert (result.n_mismatch, result.n_total) == (3, 24)
-        assert result.max_abs_diff == 0.5
-        assert result.worst_index == (0, 2, 1)
-        assert result.max_rel_diff == pytest.approx(0.5 / 10.0)
+    result = compare(actual, expected, rtol=0.0, atol=0.1)
+
+    assert (result.n_mismatch, result.n_total) == (3, 24)
+    assert result.max_abs_diff == 0.5
+    assert result.worst_index == (0, 2, 1)
+    assert result.max_rel_diff == pytest.approx(0.5 / 10.0)
     np.testing.assert_array_equal(expected, reference)
