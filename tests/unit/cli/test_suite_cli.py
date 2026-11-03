@@ -623,8 +623,23 @@ def test_missing_plugin_path_is_usage_error(tmp_path, monkeypatch) -> None:
     missing = tmp_path / "nonexistent"
     code, text = _run(_args("--plugin-path", str(missing)), _graphs(tmp_path, 1))
     assert code == 2
-    assert f"not a directory: {missing}" in text
+    assert f"does not exist: {missing}" in text
     assert calls == []  # rejected before any handle
+
+
+def test_plugin_library_file_loads_only_that_plugin(tmp_path, monkeypatch) -> None:
+    """Without --fast too, a --plugin-path file is the only plugin loaded."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
+    )
+
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
+
+    assert calls == [[str(plugin)], "Handle"]
 
 
 def test_fast_loads_only_the_named_plugin_file(tmp_path, monkeypatch) -> None:
@@ -661,13 +676,25 @@ def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> N
     assert calls == []  # rejected before any handle
 
 
-def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
-    tmp_path, monkeypatch, runtime
-) -> None:
-    """Every graph of a --fast run sees one new, empty MIOpen user database and
-    hipDNN's disk cache off; both are gone after the run."""
+def _fast_main(tmp_path, n_graphs: int) -> int:
+    """Run ``dnn-benchmark --fast`` on ``n_graphs`` copies of the sample."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    graphs = _graphs(tmp_path, n_graphs)
+    return cli_main(
+        [
+            *("--graph", *map(str, graphs)),
+            *("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
+        ]
+    )
+
+
+def test_fast_run_shares_one_new_user_db(tmp_path, monkeypatch, runtime) -> None:
+    """Every graph of a --fast run sees one new MIOpen user database, which
+    replaces the inherited one, starts empty and is removed after the run;
+    hipDNN's disk cache is off."""
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
-    monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
     seen = []
 
     def run(path):
@@ -677,20 +704,13 @@ def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
         return _graph(path, [_passed()])
 
     runtime(run)
-    plugin = tmp_path / "libmiopen_plugin.so"
-    plugin.write_bytes(b"")
-    code, _ = _run(
-        _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
-        _graphs(tmp_path, 2),
-    )
+    assert _fast_main(tmp_path, 2) == 0
 
-    assert code == 0
     (db, first, cache), (db2, second, _) = seen
+    assert db != Path("/shell/db")
     assert (db2, first, cache) == (db, [], "1")
     assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
     assert not db.exists()
-    assert os.environ["MIOPEN_USER_DB_PATH"] == "/shell/db"
-    assert "HIPDNN_DISABLE_CACHE" not in os.environ
 
 
 @pytest.mark.parametrize("probe_fails", [False, True], ids=["returns", "raises"])
@@ -699,8 +719,7 @@ def test_fast_destroys_the_handle_while_its_user_db_exists(
 ) -> None:
     """The one --fast handle (and its MIOpen handle) is destroyed before the
     run's MIOpen user database is removed, also when an error escapes the run."""
-    plugin = tmp_path / "libmiopen_plugin.so"
-    plugin.write_bytes(b"")
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
     calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
     monkeypatch.setattr(runtimes, "run_graph", lambda *a: _graph(a[0], [_passed()]))
     if probe_fails:
@@ -709,15 +728,12 @@ def test_fast_destroys_the_handle_while_its_user_db_exists(
             raise RuntimeError("amdsmi crashed")
 
         monkeypatch.setattr(suite_runner_cli, "collect_environment_info", probe)
-    args = _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
-
-    if probe_fails:
         with pytest.raises(RuntimeError, match="amdsmi crashed"):
-            _run(args, _graphs(tmp_path, 1))
+            _fast_main(tmp_path, 1)
     else:
-        assert _run(args, _graphs(tmp_path, 1))[0] == 0
+        assert _fast_main(tmp_path, 1) == 0
 
-    assert calls == [[str(plugin)], "Handle", ("destroy", True)]
+    assert calls[1:] == ["Handle", ("destroy", True)]
 
 
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:

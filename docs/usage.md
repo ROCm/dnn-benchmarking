@@ -49,7 +49,7 @@ the same output format.
 |---|---|---|
 | `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
-| `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. With `--fast`, the plugin library file of the engine. |
+| `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
 | `--hipdnn-cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
 | `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
@@ -190,9 +190,15 @@ dnn-benchmark -g graphs/sample_conv_fwd.json \
 
 If no loaded plugin provides an engine in `--engine`, the run stops with exit
 code 2 and names the engine. With a comma list in `--plugin-path`, the tool
-checks each engine against its own plugin directory before the first graph.
+checks each engine against its own plugin path before the first graph.
 To list the engine names and IDs of a plugin directory, run
 `hipdnn_list_engines --plugin-dir <dir>`.
+
+A `--plugin-path` entry can also name one plugin library file, for example
+`.../hipdnn_plugins/engines/libmiopen_plugin.so`. hipDNN then loads only that
+plugin, and its handle sets up no other plugin. A path that does not exist
+stops the run with exit code 2. `--runtime rocke` reads the kernel
+descriptors under the plugin directories, so it rejects a file (exit code 2).
 
 The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 

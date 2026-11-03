@@ -13,6 +13,12 @@ def _restore_cli_env(monkeypatch):
     delenv alone records nothing for an absent variable, so a direct
     os.environ write would outlive the test; setenv first records it.
     """
-    for name in ("HIPDNN_FORCE_BENCHMARKING", "HIPDNN_CACHE_DIR", *_CACHE_ENV_SUBDIRS):
+    names = (
+        "HIPDNN_FORCE_BENCHMARKING",
+        "HIPDNN_CACHE_DIR",
+        "HIPDNN_DISABLE_CACHE",
+        *_CACHE_ENV_SUBDIRS,
+    )
+    for name in names:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)

@@ -155,7 +155,7 @@ def _parse_engine_list(s: str) -> List[int]:
 
 
 def _parse_plugin_path_list(s: str) -> List[Path]:
-    """Parse --plugin-path as a comma-separated list of plugin directories."""
+    """Parse --plugin-path as a comma list of plugin directories or library files."""
     parts = [p for p in (p.strip() for p in s.split(",")) if p]
     if not parts:
         raise argparse.ArgumentTypeError("requires at least one path")
@@ -334,8 +334,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Runtime/Selection",
         parser_type=_parse_plugin_path_list,
         metavar="PATHS",
-        help="plugin dir, or comma list matching --engine order "
-        "(default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
+        help="plugin dir or plugin library file, or comma list matching --engine "
+        "order (default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
         config_key="plugin_path",
         config_kind=ConfigKind.PATH_OR_PATH_LIST,
     ),

@@ -409,8 +409,9 @@ class SuiteConfig:
     hipdnn_cache_dir: Optional[str] = None
     #: Run every graph through one engine in this process: one hipDNN handle
     #: with only the plugin under test loaded, primed once, and one MIOpen
-    #: user database for the whole run (``cli.fast_mode``). Needs one
-    #: ``--engine`` and a ``--plugin-path`` that names its plugin library.
+    #: user database for the whole run (``cli.main._configure_cache_env``).
+    #: Needs one ``--engine`` and a ``--plugin-path`` that names its plugin
+    #: library.
     fast: bool = False
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
