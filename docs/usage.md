@@ -418,8 +418,10 @@ dnn-benchmark -g 'graphs/*.json' --fast -e MIOPEN_ENGINE \
 
 What the tool does:
 
-1. It loads only the plugin library that `--plugin-path` names, so hipDNN
-   initialises no other engine.
+1. It loads only the plugin library that `--plugin-path` names: the plugin
+   that provides the selected engine. hipDNN loads no other plugin. A plugin
+   that provides several engines (for example `libhip_kernel_provider.so`)
+   still sets up its provider for all of them.
 2. It creates one hipDNN handle for the whole run and does not destroy it
    between graphs. The plugin, its provider handle (for example the MIOpen
    handle) and their in-memory caches stay loaded.
@@ -443,8 +445,10 @@ Requirements and limits:
   works; the search of each problem then runs once per run.
 - The timing settings (`--warmup`, `--iters`, the stall gate) and the GPU
   clock samples stay as configured.
-- A crash in one graph ends the run. The result file keeps the graphs that
-  finished (`run.complete = false`).
+- A crash in one graph ends the run. Only the last periodic result write
+  survives (at most every 10 s, after a graph ends), with
+  `run.complete = false`. Graphs that finished after that write, or every
+  graph of a run that crashes within its first 10 s, are not in the file.
 - The result file does not record `--fast`. A graph's numbers can depend on
   the graphs that ran before it in the same run (see
   [methodology.md](methodology.md#fast-mode)). Do not compare a `--fast`
