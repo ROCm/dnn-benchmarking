@@ -10,76 +10,59 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from ..common.exceptions import GraphLoadError
+from ..common.work_dir import (
+    COMPILE_CACHE_SUBDIRS,
+    OOTB_TEMP_SUBDIR,
+    SelectionState,
+    tuned_state,
+    uses_tuned_state,
+    work_dir,
+)
 from .config_file import apply_config_file
 from .parser import create_parser
 
-_CACHE_ENV_SUBDIRS = {
-    "XDG_CACHE_HOME": "cache",
-    "MIOPEN_USER_DB_PATH": "miopen_cache",
-    "MIOPEN_CUSTOM_CACHE_DIR": "miopen_cache",
-    "AMD_COMGR_CACHE_DIR": "comgr_cache",
-}
-
-
-def _create_cache_base(
-    workspace: str | None,
-) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
-    """Return the cache base and the fallback directory object, if allocated."""
-    if workspace:
-        return Path(workspace), None
-
-    temporary_directory = tempfile.TemporaryDirectory(prefix="dnn-bench-cache-")
-    return Path(temporary_directory.name), temporary_directory
-
 
 def _configure_cache_env(
-    fast: bool, miopen_user_db: Optional[Path] = None
+    work: Path, *, tuned: bool, replace_compile_caches: bool
 ) -> List[tempfile.TemporaryDirectory[str]]:
-    """Set the ROCm/tool cache variables; the one owner of ``MIOPEN_USER_DB_PATH``.
+    """Point the caches and the selection state into the work directory.
 
-    MIOpen, comgr and torch default to ~/.cache or ~/.miopen. Unset variables
-    point to DNN_BENCH_WORKSPACE (set by setup_env.py) or to a private
-    temporary directory, allocated only when a variable is unset.
+    The one owner of ``HIPDNN_CACHE_DIR`` and ``MIOPEN_USER_DB_PATH``
+    (``common.work_dir``):
 
-    The MIOpen user database, in order of precedence:
+    - Compile caches go to ``<work>/cache``. They fill unset variables, and
+      replace inherited values when ``replace_compile_caches``
+      (``--benchmark-work-dir`` given).
+    - With ``tuned``, the selection state is ``<work>/tuned``, kept across
+      commands. Otherwise it is a new ``<work>/ootb/temp/run-*`` directory,
+      empty and removed when the command ends. Both replace inherited values.
 
-    1. ``miopen_user_db`` (``--miopen-user-db``): created if missing and kept
-       after the run, so a later run with the same path reuses its find
-       results (a warm run).
-    2. With ``fast`` (``--fast``): a new, empty temporary directory, removed
-       after the run, so no earlier command changes the selection.
-    3. Otherwise the inherited value, or the workspace directory.
+    MIOpen reads ``MIOPEN_USER_DB_PATH`` once per process, so every graph of
+    the run shares the state. Must run before any GPU runtime initialises.
+    Keep the returned objects alive for the run, past the hipDNN handle;
+    their finalizers remove the run directory.
 
-    Both 1 and 2 replace an inherited value. MIOpen reads the variable once
-    per process, so every graph of the run shares the database. hipDNN's
-    disk cache stays as configured (``HIPDNN_CACHE_DIR``,
-    ``--hipdnn-cache-dir``).
-
-    Must run before any GPU runtime initialises. Keep the returned objects
-    alive for the run, past the hipDNN handle; their finalizers remove the
-    temporary directories.
+    Raises:
+        ValueError: A directory under ``work`` cannot be created.
     """
     lifetimes: List[tempfile.TemporaryDirectory[str]] = []
-    if miopen_user_db is not None:
-        try:
-            miopen_user_db.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            raise ValueError(f"--miopen-user-db {miopen_user_db}: {e}") from e
-        os.environ["MIOPEN_USER_DB_PATH"] = str(miopen_user_db.resolve())
-    elif fast:
-        user_db = tempfile.TemporaryDirectory(prefix="dnn-bench-fast-db-")
-        lifetimes.append(user_db)
-        os.environ["MIOPEN_USER_DB_PATH"] = user_db.name
-    unset = [var for var in _CACHE_ENV_SUBDIRS if var not in os.environ]
-    if not unset:
-        return lifetimes
-    base, lifetime = _create_cache_base(os.environ.get("DNN_BENCH_WORKSPACE"))
-    if lifetime is not None:
-        lifetimes.append(lifetime)
-    for var in unset:
-        path = base / _CACHE_ENV_SUBDIRS[var]
-        path.mkdir(parents=True, exist_ok=True)
-        os.environ[var] = str(path)
+    try:
+        for var, subdir in COMPILE_CACHE_SUBDIRS.items():
+            if replace_compile_caches or var not in os.environ:
+                path = work / "cache" / subdir
+                path.mkdir(parents=True, exist_ok=True)
+                os.environ[var] = str(path)
+        if tuned:
+            state = tuned_state(work).create()
+        else:
+            temp = work / OOTB_TEMP_SUBDIR
+            temp.mkdir(parents=True, exist_ok=True)
+            run_dir = tempfile.TemporaryDirectory(prefix="run-", dir=temp)
+            lifetimes.append(run_dir)
+            state = SelectionState.under(Path(run_dir.name)).create()
+    except OSError as e:
+        raise ValueError(f"benchmark work dir {work}: {e}") from e
+    os.environ.update(state.env())
     return lifetimes
 
 
@@ -103,8 +86,14 @@ def _resolve_graphs(args, reporter) -> tuple[list, Optional[List[str]], Optional
     return tmpdirs, files, tarball_source
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI entry point."""
+def main(argv: Optional[Sequence[str]] = None, *, tuned_child: bool = False) -> int:
+    """CLI entry point.
+
+    Args:
+        argv: Command line without the program name (default ``sys.argv``).
+        tuned_child: Set by ``cli.pytorch_tuned_child``: the run is the tuned
+            run of an ``--oracle`` row and uses the tuned selection state.
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["compare"]:
         from ..reporting.compare import main as compare_main
@@ -117,11 +106,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         apply_config_file(args)
     except ValueError as e:
         parser.error(str(e))
-    # After parsing (--fast and --miopen-user-db can come from the config
-    # file), before any GPU runtime initialises.
+    # After parsing (--fast, --autotune and --benchmark-work-dir can come from
+    # the config file), before any GPU runtime initialises. A profiling pass
+    # always starts with a new, empty OOTB state.
+    tuned = not args.internal_profiling_run and (
+        tuned_child or uses_tuned_state(bool(args.fast), bool(args.autotune))
+    )
+    work_arg = str(args.benchmark_work_dir) if args.benchmark_work_dir else None
     try:
         _cache_lifetimes = _configure_cache_env(  # noqa: F841 - keeps dirs alive
-            fast=bool(args.fast), miopen_user_db=args.miopen_user_db
+            work_dir(work_arg),
+            tuned=tuned,
+            replace_compile_caches=work_arg is not None,
         )
     except ValueError as e:
         parser.error(str(e))

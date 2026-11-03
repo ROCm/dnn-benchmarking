@@ -49,7 +49,6 @@ RUNTIME_OPTIONS: Dict[RuntimeName, frozenset] = {
             "--perf",
             "--roofline",
             "--autotune",
-            "--hipdnn-cache-dir",
             "--oracle",
             "--plugin-path",
             "--validate pytorch",
@@ -403,20 +402,14 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
-    #: job; reads are not gated on benchmarking while writes are, so without an
-    #: explicit empty root an untuned phase can replay a previous tuned ranking.
-    hipdnn_cache_dir: Optional[str] = None
-    #: MIOpen user database for the run (``--miopen-user-db``), kept after it;
-    #: ``cli.main._configure_cache_env`` points ``MIOPEN_USER_DB_PATH`` at it.
-    #: ``None``: the inherited or workspace database, or with ``fast`` a new,
-    #: empty one.
-    miopen_user_db: Optional[str] = None
+    #: ``--benchmark-work-dir``: compile caches, the kept tuned selection state
+    #: and the per-command OOTB state (``common.work_dir``). ``None``: the
+    #: default work dir.
+    benchmark_work_dir: Optional[str] = None
     #: Run every graph through one engine in this process: one hipDNN handle
-    #: with only the plugin under test loaded, primed once, and one MIOpen
-    #: user database for the whole run (``cli.main._configure_cache_env``).
-    #: Needs one ``--engine`` and a ``--plugin-path`` that names its plugin
-    #: library.
+    #: with only the plugin under test loaded, primed once, and the tuned
+    #: selection state of the work dir (``common.work_dir``). Needs one
+    #: ``--engine`` and a ``--plugin-path`` that names its plugin library.
     fast: bool = False
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
@@ -482,11 +475,8 @@ class SuiteConfig:
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
             autotune=args.autotune,
-            hipdnn_cache_dir=(
-                str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
-            ),
-            miopen_user_db=(
-                str(args.miopen_user_db) if args.miopen_user_db else None
+            benchmark_work_dir=(
+                str(args.benchmark_work_dir) if args.benchmark_work_dir else None
             ),
             fast=args.fast,
         )
@@ -543,7 +533,6 @@ class SuiteConfig:
             ("--perf", self.metrics.perf),
             ("--roofline", self.metrics.roofline),
             ("--autotune", self.autotune),
-            ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ("--oracle", self.oracle),
             ("--plugin-path", self.plugin_paths is not None),
             (

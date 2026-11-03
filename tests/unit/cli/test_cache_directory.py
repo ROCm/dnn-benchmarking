@@ -1,88 +1,92 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for CLI cache directory initialization."""
+"""Tests for the work-directory layout that ``cli.main`` sets up."""
 
 import os
-import stat
 from pathlib import Path
 
 import pytest
 
-from dnn_benchmarking.cli.main import _configure_cache_env, _create_cache_base
+from dnn_benchmarking.cli.main import _configure_cache_env
+from dnn_benchmarking.common.work_dir import work_dir
 
 
-def test_cache_base_uses_configured_workspace(tmp_path: Path) -> None:
-    cache_base, temporary_directory_lifetime = _create_cache_base(str(tmp_path))
-
-    assert cache_base == tmp_path
-    assert temporary_directory_lifetime is None
-
-
-def test_cache_base_fallback_is_private_temporary_directory() -> None:
-    cache_base, temporary_directory_lifetime = _create_cache_base(None)
-
-    assert temporary_directory_lifetime is not None
-    try:
-        assert cache_base == Path(temporary_directory_lifetime.name)
-        assert cache_base.is_dir()
-        if os.name == "posix":
-            assert stat.S_IMODE(cache_base.stat().st_mode) == 0o700
-    finally:
-        temporary_directory_lifetime.cleanup()
+def _state() -> tuple[Path, Path]:
+    return (
+        Path(os.environ["HIPDNN_CACHE_DIR"]),
+        Path(os.environ["MIOPEN_USER_DB_PATH"]),
+    )
 
 
-def test_configure_cache_env_only_fills_unset_variables(
+def test_ootb_state_is_new_empty_and_removed_after_the_command(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
-    for var in ("XDG_CACHE_HOME", "MIOPEN_USER_DB_PATH", "MIOPEN_CUSTOM_CACHE_DIR"):
-        monkeypatch.setenv(var, "/preset")
+    """An OOTB run replaces inherited state with a new, empty run directory
+    under ootb/temp; no earlier command can change its kernel selection."""
+    monkeypatch.setenv("HIPDNN_CACHE_DIR", "/preset/hipdnn")
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/preset/db")
 
-    assert _configure_cache_env(fast=False) == []  # workspace given: no temp dir
-    assert os.environ["XDG_CACHE_HOME"] == "/preset"
-    assert os.environ["MIOPEN_USER_DB_PATH"] == "/preset"
-    assert Path(os.environ["AMD_COMGR_CACHE_DIR"]).parent == tmp_path
+    [lifetime] = _configure_cache_env(
+        tmp_path, tuned=False, replace_compile_caches=False
+    )
+
+    hipdnn_cache, user_db = _state()
+    run_dir = Path(lifetime.name)
+    assert run_dir.parent == tmp_path / "ootb" / "temp"
+    assert (hipdnn_cache.parent, user_db.parent) == (run_dir, run_dir)
+    assert list(hipdnn_cache.iterdir()) == list(user_db.iterdir()) == []
+    lifetime.cleanup()
+    assert not run_dir.exists()
+
+
+def test_two_ootb_commands_never_share_state(tmp_path: Path) -> None:
+    [first] = _configure_cache_env(tmp_path, tuned=False, replace_compile_caches=False)
+    first_state = _state()
+    [second] = _configure_cache_env(tmp_path, tuned=False, replace_compile_caches=False)
+
+    assert _state() != first_state
+    first.cleanup()
+    second.cleanup()
+
+
+def test_tuned_state_is_kept_across_commands(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/preset/db")
+
+    lifetimes = _configure_cache_env(tmp_path, tuned=True, replace_compile_caches=False)
+    assert lifetimes == []
+
+    hipdnn_cache, user_db = _state()
+    assert hipdnn_cache == tmp_path / "tuned" / "hipdnn-cache"
+    assert user_db == tmp_path / "tuned" / "miopen-user-db"
+    (user_db / "record.ufdb.txt").write_text("find result")
+    _configure_cache_env(tmp_path, tuned=True, replace_compile_caches=False)
+    assert (user_db / "record.ufdb.txt").read_text() == "find result"
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_compile_caches_fill_unset_and_replace_only_for_an_explicit_work_dir(
+    tmp_path: Path, monkeypatch, replace: bool
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", "/preset")
+    monkeypatch.delenv("AMD_COMGR_CACHE_DIR", raising=False)
+
+    _configure_cache_env(tmp_path, tuned=True, replace_compile_caches=replace)
+
+    xdg = tmp_path / "cache" / "xdg"
+    assert os.environ["XDG_CACHE_HOME"] == (str(xdg) if replace else "/preset")
+    assert Path(os.environ["AMD_COMGR_CACHE_DIR"]) == tmp_path / "cache" / "comgr"
     assert Path(os.environ["AMD_COMGR_CACHE_DIR"]).is_dir()
 
 
-def test_fast_gets_a_new_empty_user_db_over_an_inherited_one(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """--fast replaces even a preset MIOpen user database with a new, empty
-    directory that its lifetime object removes."""
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/preset")
-
-    [lifetime] = _configure_cache_env(fast=True)
-
-    user_db = Path(os.environ["MIOPEN_USER_DB_PATH"])
-    assert user_db == Path(lifetime.name)
-    assert list(user_db.iterdir()) == []
-    lifetime.cleanup()
-    assert not user_db.exists()
-
-
-def test_miopen_user_db_is_created_kept_and_wins_over_fast(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """--miopen-user-db replaces both the inherited value and the new --fast
-    database, and nothing the tool removes owns it."""
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
-    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/preset")
-    user_db = tmp_path / "db" / "nested"
-
-    lifetimes = _configure_cache_env(fast=True, miopen_user_db=user_db)
-
-    assert os.environ["MIOPEN_USER_DB_PATH"] == str(user_db.resolve())
-    assert user_db.is_dir()
-    for lifetime in lifetimes:
-        lifetime.cleanup()
-    assert user_db.is_dir()
-
-
-def test_unusable_miopen_user_db_names_the_option(tmp_path: Path) -> None:
+def test_unusable_work_dir_names_it(tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("")
-    with pytest.raises(ValueError, match=f"--miopen-user-db {blocker / 'db'}"):
-        _configure_cache_env(fast=False, miopen_user_db=blocker / "db")
+    with pytest.raises(ValueError, match=f"benchmark work dir {blocker}"):
+        _configure_cache_env(blocker, tuned=False, replace_compile_caches=False)
+
+
+def test_default_work_dir_is_under_the_workspace(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    assert work_dir(None) == tmp_path / "work"
+    assert work_dir(str(tmp_path / "w")) == tmp_path / "w"

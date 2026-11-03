@@ -326,7 +326,7 @@ and the kernel name to find the engine kernel.
 ## Fast mode
 
 With `--fast`, every graph of the run uses the same hipDNN handle, the same
-loaded plugin and the same MIOpen user database (see
+loaded plugin and the tuned selection state of the work directory (see
 [usage.md](usage.md#fast-mode---fast)). This changes what some numbers of a
 graph include:
 
@@ -338,35 +338,36 @@ graph include:
   warm engine. It can include per-problem first-build costs, for example
   reading that problem's kernel files.
 - `first_call_ms` (`setup`) can be smaller than in a normal run. The MIOpen
-  kernel cache of the handle and the find records of earlier graphs carry
-  over, so a later graph with the same convolution problem skips the compile
-  and the find.
+  kernel cache of the handle and the find records of earlier graphs and
+  earlier commands carry over, so a graph with a known convolution problem
+  skips the compile and the find.
 - `kernel_med` measures the same kernel as a normal run when the selection is
-  the same. With `--autotune`, a problem that an earlier graph searched
-  reuses that search result. hipDNN's disk cache is on, as in a normal run,
-  so a ranking that an earlier command saved can also serve the run.
+  the same. With `--autotune`, a problem that an earlier graph or command
+  searched reuses that search result.
 
 The order of the graphs can thus change `build_ms` and `first_call_ms`. Do
 not compare them between a `--fast` run and a run without it, or between the
 first graph of a `--fast` run and the later ones.
 
-## Kept MIOpen user database (`--miopen-user-db`)
+## Tuned selection state
 
 MIOpen stores its find results in the user database. A convolution's first
 call runs the find when the database has no record for the problem, and the
 find can take minutes per problem: on one gfx1151 host, 7 convolution graphs
 took 475 s on an empty database and 46 s on the database of an earlier run.
 
-With `--miopen-user-db PATH`, a run reads and extends the database at `PATH`,
-so the find results of earlier commands remove that setup work. In such a
-warm run:
+`--fast` and `--autotune` runs, and the tuned runs of `--oracle`, read and
+extend the tuned state of the work directory (`<work>/tuned`, see
+[usage.md](usage.md#work-directory---benchmark-work-dir)). The find results
+and rankings of earlier commands remove that setup work. In such a warm run:
 
 - `first_call_ms` and the run's wall time are smaller; do not compare them
-  with a run on an empty database. `run.config.miopen_user_db` marks the run.
-  A `null` value does not prove a cold run: without `--fast`, a run uses the
-  inherited or workspace database, which earlier commands may have filled.
-- `kernel_med` measures the kernel that the stored find result selects. It
+  with a run on an empty state. Every other run starts on a new, empty state,
+  so its numbers do not depend on earlier commands.
+- `kernel_med` measures the kernel that the stored result selects. It
   compares with a cold run when both select the same kernel.
+
+Use a new `--benchmark-work-dir` to start a tuned run from an empty state.
 
 ## Parity with other harnesses
 

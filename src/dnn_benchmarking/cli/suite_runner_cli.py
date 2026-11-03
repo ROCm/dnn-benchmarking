@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
 from ..common.pytorch_tuning import apply_pytorch_environment
+from ..common.work_dir import tuned_state, work_dir
 from ..config.benchmark_config import (
     RuntimeName,
     PyTorchSdpaBackendName,
@@ -143,20 +144,12 @@ def run_suite_cli(
         return 2
 
     # The runtime's handles are destroyed when ``resources`` closes, on every
-    # exit path, while the MIOpen user database that ``cli.main`` owns still
+    # exit path, while the selection state that ``cli.main`` owns still
     # exists.
     with ExitStack() as resources:
+        _report_selection_state(config, reporter)
         if config.fast:
-            kind = (
-                "kept, from --miopen-user-db"
-                if config.miopen_user_db
-                else "new, removed after the run"
-            )
-            reporter.info(
-                "--fast: one process, one handle; MIOpen user database "
-                f"{os.environ.get('MIOPEN_USER_DB_PATH')} ({kind}; shared by "
-                "every graph)"
-            )
+            reporter.info("--fast: one process, one handle for every graph")
         _warn_ignored_options(config, reporter)
         _apply_pytorch_environment(config, reporter)
         if RuntimeName.HIPDNN in config.runtimes:
@@ -236,8 +229,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         ),
         "oracle": config.oracle,
         "autotune": config.autotune,
-        "hipdnn_cache_dir": config.hipdnn_cache_dir,
-        "miopen_user_db": config.miopen_user_db,
+        "benchmark_work_dir": str(work_dir(config.benchmark_work_dir)),
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
         "metrics": metrics.basic,
@@ -398,21 +390,14 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
 
 
 def _warn_oracle(reporter: Reporter) -> None:
-    """One line per condition that makes the OOTB or tuned plan non-cold."""
-    if not _truthy_env("HIPDNN_DISABLE_EXACT_ENGINE_CACHE"):
-        reporter.warning(
-            "--oracle: exact-engine cache is on, so the OOTB timing may "
-            "replay a persisted ranking (HIPDNN_DISABLE_EXACT_ENGINE_CACHE=1 for cold)"
-        )
-    elif not _truthy_env("HIPDNN_DISABLE_CACHE"):
-        reporter.warning(
-            "--oracle: provider kernel caches are on "
-            "(HIPDNN_DISABLE_CACHE=1 for a cold comparison)"
-        )
+    """State what the tuned run does, and warn when the environment overrides
+    the knob. The OOTB plans run on the command's empty selection state, so
+    no persisted ranking can reach them."""
     reporter.info(
-        "--oracle: each engine gets a second plan built with "
+        "--oracle: each engine gets a tuned run in a child, built with "
         "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
-        "engines re-measure the OOTB plan); MIOpen may reuse FindDb entries"
+        "engines re-measure the OOTB plan), on the kept tuned state of the work "
+        "dir"
     )
     forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
     if forced is not None:
@@ -441,6 +426,29 @@ def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
     reporter.info(f"PyTorch kernel selection: {settings}{tuned}")
 
 
+def _report_selection_state(config: SuiteConfig, reporter: Reporter) -> None:
+    """State where this run's hipDNN cache and MIOpen user database are (set by
+    ``cli.main``), and the tuned state that ``--oracle`` tuned runs use. The
+    label follows the paths in effect, so a tuned child reports them right."""
+    tuned = tuned_state(work_dir(config.benchmark_work_dir))
+    cache = os.environ.get("HIPDNN_CACHE_DIR")
+    user_db = os.environ.get("MIOPEN_USER_DB_PATH")
+    kind = (
+        "tuned, kept across commands"
+        if (cache, user_db) == (str(tuned.hipdnn_cache), str(tuned.miopen_user_db))
+        else "created empty for this command, removed after it"
+    )
+    oracle = (
+        f"; --oracle tuned runs use {tuned.hipdnn_cache.parent}"
+        if config.oracle
+        else ""
+    )
+    reporter.info(
+        f"selection state: hipDNN cache {cache}, MIOpen user database {user_db} "
+        f"({kind}){oracle}"
+    )
+
+
 def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     """Set the kernel-selection environment and state the path in effect.
 
@@ -448,8 +456,6 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     plus one warning per hazard.
     """
     leaked = False
-    if config.hipdnn_cache_dir:
-        os.environ["HIPDNN_CACHE_DIR"] = config.hipdnn_cache_dir
     cache_disabled = _truthy_env("HIPDNN_DISABLE_CACHE")
     if cache_disabled:
         cache = "disabled (HIPDNN_DISABLE_CACHE)"
@@ -469,12 +475,13 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
             "--autotune; kernels are benchmarked, not heuristic-selected"
         )
     autotune = config.autotune or leaked
-    if config.autotune and not config.hipdnn_cache_dir and not cache_disabled:
-        # The winner cache outlives the run and reads are not gated on
-        # benchmarking, so a previous session's ranking can be reported.
-        reporter.warning(
-            "--autotune without --hipdnn-cache-dir: winners cached by earlier runs "
-            "may be reported instead of measured"
+    if config.autotune and not cache_disabled:
+        # The tuned state outlives the command and hipDNN reads cached
+        # rankings without benchmarking again.
+        reporter.info(
+            "--autotune: rankings and find results that earlier commands saved "
+            "in the tuned state are reused; use a new --benchmark-work-dir to "
+            "search again"
         )
     reporter.info(
         f"kernel selection: {'autotune' if autotune else 'heuristic'}; cache: {cache}"

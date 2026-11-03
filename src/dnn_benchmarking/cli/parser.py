@@ -346,29 +346,19 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         SuiteConfig,
         "autotune",
         "benchmark candidate kernels on first execute and cache the winner "
-        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --hipdnn-cache-dir",
+        "(HIPDNN_FORCE_BENCHMARKING=1), in the tuned state of the work dir",
     ),
     CliOption(
-        flags=("--hipdnn-cache-dir",),
-        dest="hipdnn_cache_dir",
+        flags=("--benchmark-work-dir",),
+        dest="benchmark_work_dir",
         group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
-        help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
-        config_key="hipdnn_cache_dir",
-        config_kind=ConfigKind.PATH,
-    ),
-    CliOption(
-        flags=("--miopen-user-db",),
-        dest="miopen_user_db",
-        group="Runtime/Selection",
-        parser_type=Path,
-        metavar="PATH",
-        help="MIOpen user database (MIOPEN_USER_DB_PATH) for this run, kept "
-        "afterwards: a later run with the same PATH reuses its find results "
-        "(warm; not comparable with cold runs). Replaces the new, empty "
-        "database of --fast",
-        config_key="miopen_user_db",
+        help="work dir: cache/ (compile caches), tuned/ (hipDNN cache and MIOpen "
+        "user DB of --fast, --autotune and --oracle tuned runs, kept) and "
+        "ootb/temp/ (empty state of every other run, removed after it) "
+        "(default: $DNN_BENCH_WORKSPACE/work, else ~/.cache/dnn-benchmark/work)",
+        config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
     ),
     _bool_option(
