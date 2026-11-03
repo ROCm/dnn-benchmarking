@@ -206,9 +206,10 @@ To list the engine names and IDs of a plugin directory, run
 
 A `--plugin-path` entry can also name one plugin library file, for example
 `.../hipdnn_plugins/engines/libmiopen_plugin.so`. hipDNN then loads only that
-plugin, and its handle sets up no other plugin. A path that does not exist
-stops the run with exit code 2. `--runtime rocke` reads the kernel
-descriptors under the plugin directories, so it rejects a file (exit code 2).
+plugin, and its handle sets up no other plugin. A path that is neither a
+directory nor a file stops the run with exit code 2. `--runtime rocke` reads
+the kernel descriptors under the plugin directories, so it rejects a file
+(exit code 2), before any runtime starts.
 
 The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 
@@ -451,9 +452,10 @@ What the tool does:
    that `--autotune` saved in an earlier command can thus serve this run (see
    [Kernel selection](#kernel-selection---autotune---hipdnn-cache-dir)).
 6. After each graph it frees the plan, the workspace and the input and
-   output buffers. Each graph has its own shapes, so the next graph could
-   not reuse them; the state that makes later graphs faster (the handle,
-   the plugin, the MIOpen caches) stays.
+   output buffers. The tool builds and allocates these for each graph and
+   never reuses them for a later row, so keeping them would only hold VRAM.
+   The state that makes later graphs faster (the handle, the plugin, the
+   MIOpen caches) stays.
 
 Requirements and limits:
 
@@ -462,8 +464,10 @@ Requirements and limits:
   code 2.
 - The hipDNN runtime only. These options stop the run with exit code 2:
   `--validate`, `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline` and a
-  `--runtime` other than `hipdnn`. `--autotune` works; the search of each
-  problem then runs once per run.
+  `--runtime` other than `hipdnn`. `--autotune` and `--hipdnn-cache-dir`
+  work. With `--autotune`, each problem is searched at most once per run, and
+  not at all when the hipDNN disk cache already holds its winner. Use an
+  empty `--hipdnn-cache-dir` to search every problem again.
 - The timing settings (`--warmup`, `--iters`, the stall gate) and the GPU
   clock samples stay as configured.
 - A crash in one graph ends the run. Only the last periodic result write

@@ -83,11 +83,13 @@ def test_hipdnn_only_option_is_usage_error(flag) -> None:
     assert flag[0] in text
 
 
-def test_plugin_library_file_is_usage_error(tmp_path) -> None:
+@pytest.mark.parametrize("runtime", ["rocke", "hipdnn,rocke"])
+def test_plugin_library_file_is_usage_error(tmp_path, runtime) -> None:
     """rocKE reads descriptors under plugin directories, so a file is refused
-    before any GPU check."""
+    before any runtime starts: no GPU check, and no hipDNN handle in a mixed
+    run (the autouse guard fails any hipDNN import)."""
     plugin = tmp_path / "libhip_kernel_provider.so"
     plugin.write_bytes(b"")
-    code, text = _run("-r", "rocke", "--plugin-path", str(plugin))
+    code, text = _run("-r", runtime, "--plugin-path", str(plugin))
     assert code == 2
     assert f"--plugin-path names a file: {plugin}" in text
