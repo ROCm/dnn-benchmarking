@@ -49,7 +49,8 @@ TOLERANCES = {
 
 class OutputSource(Protocol):
     """The outputs of one run, as ``check_correctness`` reads them: the
-    files that a child saved (``child_runner.SavedOutputs``)."""
+    files that a child saved (``child_runner.SavedOutputs``), or the buffers
+    of an in-process rocKE row (``PyTorchCudaBufferManager``)."""
 
     def get_output_data(self, uid: int) -> Optional[np.ndarray]:
         """Output ``uid`` as a host array, or None when there is no output."""

@@ -24,7 +24,7 @@ from dnn_benchmarking.execution import (
     correctness,
 )
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
-from dnn_benchmarking.execution.suite_runner import run_graph_all_providers
+from dnn_benchmarking.execution.suite_runner import hipdnn_planner, run_graph
 from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.reporting.suite_results import GraphResult
 from dnn_benchmarking.reporting.reporter import Reporter
@@ -166,13 +166,13 @@ def test_engines_validate_against_pytorch(
 ) -> None:
     """--validate pytorch: every engine that runs a sample graph passes."""
     path, graph_json, tensor_infos = load_graph(graph_name)
-    result = run_graph_all_providers(
+    result = run_graph(
         path,
         graph_json,
         tensor_infos,
         _validate_config(),
-        hipdnn.Handle(),
         Reporter(output=io.StringIO()),
+        [hipdnn_planner(hipdnn.Handle())],
     )
     _assert_engines_match_reference(result, require_engine)
 
@@ -206,15 +206,16 @@ def test_bfloat16_conv_validates_against_pytorch(
     graph_path = tmp_path / "graph_bfloat16.json"
     graph_path.write_text(json.dumps(graph_json))
 
-    result = run_graph_all_providers(
+    result = run_graph(
         graph_path,
         graph_json,
         GraphLoader().extract_tensor_info(graph_json),
         _validate_config(),
-        hipdnn.Handle(),
         Reporter(output=io.StringIO()),
+        [hipdnn_planner(hipdnn.Handle())],
     )
     _assert_engines_match_reference(result)
+
 
 
 class TestHardEngineSelectBindings:
