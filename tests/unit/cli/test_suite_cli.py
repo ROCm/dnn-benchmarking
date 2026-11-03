@@ -742,6 +742,20 @@ def test_fast_with_miopen_user_db_keeps_it_for_the_next_run(
     assert config["miopen_user_db"] == str(user_db)
 
 
+def test_unusable_miopen_user_db_is_a_usage_error_before_startup(
+    tmp_path, runtime, capsys
+) -> None:
+    runtime(lambda path: _graph(path, [_passed()]))
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    graph = str(_graphs(tmp_path, 1)[0])
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main(["--graph", graph, "--miopen-user-db", str(blocker / "db")])
+    assert exit_info.value.code == 2
+    assert f"--miopen-user-db {blocker / 'db'}" in capsys.readouterr().err
+    assert runtime.calls == []  # no runtime started
+
+
 @pytest.mark.parametrize("probe_fails", [False, True], ids=["returns", "raises"])
 def test_fast_destroys_the_handle_while_its_user_db_exists(
     tmp_path, monkeypatch, probe_fails

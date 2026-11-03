@@ -363,6 +363,8 @@ warm run:
 
 - `first_call_ms` and the run's wall time are smaller; do not compare them
   with a run on an empty database. `run.config.miopen_user_db` marks the run.
+  A `null` value does not prove a cold run: without `--fast`, a run uses the
+  inherited or workspace database, which earlier commands may have filled.
 - `kernel_med` measures the kernel that the stored find result selects. It
   compares with a cold run when both select the same kernel.
 
