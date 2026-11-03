@@ -563,8 +563,7 @@ class SuiteConfig:
     def _check_fast(self) -> None:
         """Reject what ``--fast`` cannot do in one process with one engine.
 
-        Validation, the oracle and profiling need torch or other processes;
-        ``--hipdnn-cache-dir`` would set a cache that ``--fast`` turns off.
+        Validation, the oracle and profiling need torch or other processes.
         """
         rejected = [
             ("--validate", self.validation.enabled),
@@ -573,7 +572,6 @@ class SuiteConfig:
             ("--trace", self.metrics.trace),
             ("--perf", self.metrics.perf),
             ("--roofline", self.metrics.roofline),
-            ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ("--runtime other than hipdnn", self.runtimes != (RuntimeName.HIPDNN,)),
         ]
         flags = [flag for flag, present in rejected if present]

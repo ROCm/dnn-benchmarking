@@ -230,9 +230,16 @@ class TestFast:
 
     _BASE = ["--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", "/p/libmiopen.so"]
 
-    def test_one_engine_and_one_plugin_file_with_autotune_is_accepted(self) -> None:
-        config = SuiteConfig.from_namespace(_namespace([*self._BASE, "--autotune"]))
-        assert (config.fast, config.autotune) == (True, True)
+    def test_one_engine_and_one_plugin_file_is_accepted_with_selection_options(
+        self,
+    ) -> None:
+        argv = [*self._BASE, "--autotune", "--hipdnn-cache-dir", "/c"]
+        config = SuiteConfig.from_namespace(_namespace(argv))
+        assert (config.fast, config.autotune, config.hipdnn_cache_dir) == (
+            True,
+            True,
+            "/c",
+        )
 
     @pytest.mark.parametrize(
         "argv, flag",
@@ -243,7 +250,6 @@ class TestFast:
             (["--trace"], "--trace"),
             (["--perf"], "--perf"),
             (["--roofline"], "--roofline"),
-            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
             (["-r", "hipdnn,rocke"], "--runtime other than hipdnn"),
         ],
     )

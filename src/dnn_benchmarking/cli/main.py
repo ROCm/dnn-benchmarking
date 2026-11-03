@@ -42,7 +42,8 @@ def _configure_cache_env(fast: bool) -> List[tempfile.TemporaryDirectory[str]]:
     With ``fast`` (``--fast``), the MIOpen user database is a new, empty
     temporary directory that replaces any inherited value. MIOpen reads the
     variable once per process, so every graph of the run shares it, and no
-    earlier command changes the selection. hipDNN's disk cache is off.
+    earlier command changes the selection. hipDNN's disk cache stays as
+    configured (``HIPDNN_CACHE_DIR``, ``--hipdnn-cache-dir``).
 
     Must run before any GPU runtime initialises. Keep the returned objects
     alive for the run, past the hipDNN handle; their finalizers remove the
@@ -53,7 +54,6 @@ def _configure_cache_env(fast: bool) -> List[tempfile.TemporaryDirectory[str]]:
         user_db = tempfile.TemporaryDirectory(prefix="dnn-bench-fast-db-")
         lifetimes.append(user_db)
         os.environ["MIOPEN_USER_DB_PATH"] = user_db.name
-        os.environ["HIPDNN_DISABLE_CACHE"] = "1"
     unset = [var for var in _CACHE_ENV_SUBDIRS if var not in os.environ]
     if not unset:
         return lifetimes

@@ -150,7 +150,7 @@ def run_suite_cli(
             reporter.info(
                 "--fast: one process, one handle; MIOpen user database "
                 f"{os.environ.get('MIOPEN_USER_DB_PATH')} (new, shared by every "
-                "graph); hipDNN disk cache off"
+                "graph)"
             )
         _warn_ignored_options(config, reporter)
         _apply_pytorch_environment(config, reporter)

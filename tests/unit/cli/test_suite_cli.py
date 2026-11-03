@@ -691,24 +691,25 @@ def _fast_main(tmp_path, n_graphs: int) -> int:
 
 def test_fast_run_shares_one_new_user_db(tmp_path, monkeypatch, runtime) -> None:
     """Every graph of a --fast run sees one new MIOpen user database, which
-    replaces the inherited one, starts empty and is removed after the run;
-    hipDNN's disk cache is off."""
+    replaces the inherited one, starts empty and is removed after the run.
+    hipDNN's disk cache stays as configured."""
     monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
+    monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
     seen = []
 
     def run(path):
         db = Path(os.environ["MIOPEN_USER_DB_PATH"])
-        seen.append((db, sorted(db.iterdir()), os.environ["HIPDNN_DISABLE_CACHE"]))
+        seen.append((db, sorted(db.iterdir()), "HIPDNN_DISABLE_CACHE" in os.environ))
         (db / f"{path.stem}.ufdb.txt").write_text("record")
         return _graph(path, [_passed()])
 
     runtime(run)
     assert _fast_main(tmp_path, 2) == 0
 
-    (db, first, cache), (db2, second, _) = seen
+    (db, first, cache_off), (db2, second, _) = seen
     assert db != Path("/shell/db")
-    assert (db2, first, cache) == (db, [], "1")
+    assert (db2, first, cache_off) == (db, [], False)
     assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
     assert not db.exists()
 

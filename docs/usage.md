@@ -436,9 +436,14 @@ What the tool does:
 4. It gives the run a new, empty MIOpen user database that every graph
    shares and that the tool deletes at exit. Find results thus carry over
    from graph to graph, but not from an earlier command.
-5. It turns hipDNN's disk cache off (`HIPDNN_DISABLE_CACHE=1`).
+5. It keeps hipDNN's disk cache as configured, the same as a normal run:
+   `HIPDNN_CACHE_DIR`, `--hipdnn-cache-dir`, or `~/.cache/hipdnn`. Rankings
+   that `--autotune` saved in an earlier command can thus serve this run (see
+   [Kernel selection](#kernel-selection---autotune---hipdnn-cache-dir)).
 6. After each graph it frees the plan, the workspace and the input and
-   output buffers.
+   output buffers. Each graph has its own shapes, so the next graph could
+   not reuse them; the state that makes later graphs faster (the handle,
+   the plugin, the MIOpen caches) stays.
 
 Requirements and limits:
 
@@ -446,9 +451,9 @@ Requirements and limits:
   library file. A directory, two engines or no engine stop the run with exit
   code 2.
 - The hipDNN runtime only. These options stop the run with exit code 2:
-  `--validate`, `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline`,
-  `--hipdnn-cache-dir` and a `--runtime` other than `hipdnn`. `--autotune`
-  works; the search of each problem then runs once per run.
+  `--validate`, `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline` and a
+  `--runtime` other than `hipdnn`. `--autotune` works; the search of each
+  problem then runs once per run.
 - The timing settings (`--warmup`, `--iters`, the stall gate) and the GPU
   clock samples stay as configured.
 - A crash in one graph ends the run. Only the last periodic result write
