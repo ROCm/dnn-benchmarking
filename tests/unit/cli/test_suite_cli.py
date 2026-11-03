@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import types
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Callable, List
 
@@ -94,7 +95,7 @@ def runtime(monkeypatch):
     calls = []
 
     def install(run: Callable[[Path], GraphResult]) -> None:
-        def start(config, reporter):
+        def start(config, reporter, resources):
             calls.append(config)
             return lambda path, graph_json, infos: run(path)
 
@@ -254,7 +255,7 @@ def run_graph(path, graph_json, infos):
 
 cli.SIGTERM_GRACE_S = 0.5
 cli.collect_environment_info = lambda: {}
-cli.start_runtime = lambda config, reporter: run_graph
+cli.start_runtime = lambda config, reporter, resources: run_graph
 args = create_parser(suppress_defaults=True).parse_args(["-g", "unused"])
 apply_config_file(args)
 code = cli.run_suite_cli(args, [Path(sys.argv[1])], Reporter(output=io.StringIO()))
@@ -565,6 +566,10 @@ def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
         PluginLoadingMode=types.SimpleNamespace(ABSOLUTE="abs"),
         set_engine_plugin_paths=lambda paths, mode: calls.append(paths),
         engine_id_to_name=lambda engine_id: names.get(engine_id, ""),
+        # Records whether the MIOpen user database still exists at the destroy.
+        destroy_handle=lambda handle: calls.append(
+            ("destroy", os.path.isdir(os.environ.get("MIOPEN_USER_DB_PATH", "")))
+        ),
     )
     monkeypatch.setitem(sys.modules, "hipdnn_frontend", module)
     monkeypatch.setattr(runtimes, "initialize_pip_rocm_runtime", lambda: None)
@@ -591,7 +596,9 @@ def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
         _args("-e", "1,1", "--plugin-path", f"{a},{b}")
     )
 
-    runtimes.start_runtime(config, Reporter(output=io.StringIO()))(None, {}, [])
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())(
+        None, {}, []
+    )
 
     assert calls == [[a], "Handle", [b], "Handle"]
     assert handles == [None]  # the runner creates one handle per pair
@@ -637,7 +644,7 @@ def test_fast_loads_only_the_named_plugin_file(tmp_path, monkeypatch) -> None:
         _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
     )
 
-    runtimes.start_runtime(config, Reporter(output=io.StringIO()))
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
 
     assert calls == [[str(plugin)], "Handle"]
     assert planners == [True]
@@ -655,18 +662,13 @@ def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> N
 
 
 def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, runtime
 ) -> None:
     """Every graph of a --fast run sees one new, empty MIOpen user database and
-    hipDNN's disk cache off. The handle is released while the database still
-    exists; then the database and the settings are gone."""
+    hipDNN's disk cache off; both are gone after the run."""
     monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
     monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
-    seen, released = [], []
-
-    class Handle:
-        def __del__(self):
-            released.append(seen[0][0].is_dir())
+    seen = []
 
     def run(path):
         db = Path(os.environ["MIOPEN_USER_DB_PATH"])
@@ -674,11 +676,7 @@ def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
         (db / f"{path.stem}.ufdb.txt").write_text("record")
         return _graph(path, [_passed()])
 
-    def start(config, reporter):
-        handle = Handle()
-        return lambda path, graph_json, infos: (handle, run(path))[1]
-
-    monkeypatch.setattr(suite_runner_cli, "start_runtime", start)
+    runtime(run)
     plugin = tmp_path / "libmiopen_plugin.so"
     plugin.write_bytes(b"")
     code, _ = _run(
@@ -690,10 +688,36 @@ def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
     (db, first, cache), (db2, second, _) = seen
     assert (db2, first, cache) == (db, [], "1")
     assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
-    assert released == [True]
     assert not db.exists()
     assert os.environ["MIOPEN_USER_DB_PATH"] == "/shell/db"
     assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+
+@pytest.mark.parametrize("probe_fails", [False, True], ids=["returns", "raises"])
+def test_fast_destroys_the_handle_while_its_user_db_exists(
+    tmp_path, monkeypatch, probe_fails
+) -> None:
+    """The one --fast handle (and its MIOpen handle) is destroyed before the
+    run's MIOpen user database is removed, also when an error escapes the run."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    monkeypatch.setattr(runtimes, "run_graph", lambda *a: _graph(a[0], [_passed()]))
+    if probe_fails:
+
+        def probe():
+            raise RuntimeError("amdsmi crashed")
+
+        monkeypatch.setattr(suite_runner_cli, "collect_environment_info", probe)
+    args = _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
+
+    if probe_fails:
+        with pytest.raises(RuntimeError, match="amdsmi crashed"):
+            _run(args, _graphs(tmp_path, 1))
+    else:
+        assert _run(args, _graphs(tmp_path, 1))[0] == 0
+
+    assert calls == [[str(plugin)], "Handle", ("destroy", True)]
 
 
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
@@ -721,7 +745,9 @@ def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path))
     )
-    runner = runtimes.start_runtime(config, Reporter(output=io.StringIO()))
+    runner = runtimes.start_runtime(
+        config, Reporter(output=io.StringIO()), ExitStack()
+    )
     assert runner("g.json", {}, []) == "ran"
     # The hipDNN planner, bound to the handle that startup created and checked.
     ((path, _, _, run_config, _, planners),) = seen
@@ -805,7 +831,9 @@ def test_available_reference_provider_passes_startup(tmp_path, monkeypatch) -> N
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("--validate", "pytorch", "--plugin-path", str(tmp_path))
     )
-    assert callable(runtimes.start_runtime(config, Reporter(output=io.StringIO())))
+    assert callable(
+        runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
+    )
     assert asked == ["pytorch"]
 
 

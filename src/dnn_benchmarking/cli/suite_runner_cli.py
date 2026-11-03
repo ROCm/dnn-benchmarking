@@ -9,7 +9,7 @@ import signal
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -143,7 +143,12 @@ def run_suite_cli(
     if missing:
         return 2
 
-    with fast_mode_environment(reporter) if config.fast else nullcontext():
+    # Resources close in reverse order: the runtime's handles are destroyed
+    # before the --fast environment (its MIOpen user database) goes, on every
+    # exit path.
+    with ExitStack() as resources:
+        if config.fast:
+            resources.enter_context(fast_mode_environment(reporter))
         _warn_ignored_options(config, reporter)
         _apply_pytorch_environment(config, reporter)
         if RuntimeName.HIPDNN in config.runtimes:
@@ -152,7 +157,7 @@ def run_suite_cli(
                 _warn_oracle(reporter)
 
         try:
-            run_graph = start_runtime(config, reporter)
+            run_graph = start_runtime(config, reporter, resources)
         except RuntimeStartupError as e:
             reporter.error(str(e))
             return e.exit_code
@@ -166,11 +171,7 @@ def run_suite_cli(
             )
         if argv is None:
             argv = list(sys.argv)
-        code = _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
-        # Drop the runner, and with it the hipDNN handle and its MIOpen handle,
-        # while the --fast MIOpen user database still exists.
-        del run_graph
-        return code
+        return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
 
 
 def _output_problem(path: Path) -> Optional[str]:

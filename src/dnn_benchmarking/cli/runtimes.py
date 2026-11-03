@@ -4,6 +4,7 @@
 """Runtime startup: check each selected runtime once, return a per-graph runner."""
 
 import importlib.util
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -36,11 +37,15 @@ class RuntimeStartupError(Exception):
         self.exit_code = exit_code
 
 
-def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
+def start_runtime(
+    config: SuiteConfig, reporter: Reporter, resources: ExitStack
+) -> GraphRunner:
     """Check every selected runtime (and the reference provider); return the runner.
 
     Each graph runs through the runtimes in ``config.runtimes`` order, and
-    every runtime adds its rows to the same graph result.
+    every runtime adds its rows to the same graph result. The shared hipDNN
+    handle is destroyed when ``resources`` closes, so the caller decides
+    which state (the ``--fast`` MIOpen user database) outlives it.
 
     Raises:
         RuntimeStartupError: a runtime is unavailable (exit 1) or an explicit
@@ -57,6 +62,8 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
     for runtime in config.runtimes:
         if runtime is RuntimeName.HIPDNN:
             handle = _create_hipdnn_handle(config, hipdnn, load_error)
+            if handle is not None:
+                resources.callback(hipdnn.destroy_handle, handle)
             planners.append(hipdnn_planner(handle, prime_once=config.fast))
         else:
             planners.append(_STARTERS[runtime](config, reporter))
