@@ -323,6 +323,27 @@ not from the timed loop. The child also launches input-fill kernels, and a
 graph can launch more than one kernel. Use `pmc.per_kernel[...].dispatches`
 and the kernel name to find the engine kernel.
 
+## Fast mode
+
+With `--fast`, every graph of the run uses the same hipDNN handle, the same
+loaded plugin and the same MIOpen user database (see
+[usage.md](usage.md#fast-mode---fast)). This changes what some numbers of a
+graph include:
+
+- `build_ms` is the timed plan build after a warm engine in both modes. A
+  normal run primes the engine before every graph. A `--fast` run primes it
+  before the first graph only; later graphs find it already warm.
+- `first_call_ms` (`setup`) can be smaller than in a normal run. The MIOpen
+  kernel cache of the handle and the find records of earlier graphs carry
+  over, so a later graph with the same convolution problem skips the compile
+  and the find.
+- `kernel_med` measures the same kernel as a normal run when the selection is
+  the same. With `--autotune`, a problem that an earlier graph searched
+  reuses that search result.
+
+The order of the graphs can thus change `first_call_ms`. Do not compare it
+between a `--fast` run and a run without it.
+
 ## Parity with other harnesses
 
 This table compares the tool with the rocKE runtime timer

@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -32,6 +33,7 @@ from ..reporting.suite_results import (
     engine_id_hex,
     graph_id_for,
 )
+from .fast_mode import fast_mode_environment
 from .runtimes import RuntimeStartupError, GraphRunner, start_runtime
 
 #: Minimum seconds between intermediate result writes.
@@ -141,28 +143,30 @@ def run_suite_cli(
     if missing:
         return 2
 
-    _warn_ignored_options(config, reporter)
-    _apply_pytorch_environment(config, reporter)
-    if RuntimeName.HIPDNN in config.runtimes:
-        _apply_tuning_environment(config, reporter)
-        if config.oracle:
-            _warn_oracle(reporter)
+    with fast_mode_environment(reporter) if config.fast else nullcontext():
+        _warn_ignored_options(config, reporter)
+        _apply_pytorch_environment(config, reporter)
+        if RuntimeName.HIPDNN in config.runtimes:
+            _apply_tuning_environment(config, reporter)
+            if config.oracle:
+                _warn_oracle(reporter)
 
-    try:
-        run_graph = start_runtime(config, reporter)
-    except RuntimeStartupError as e:
-        reporter.error(str(e))
-        return e.exit_code
+        try:
+            run_graph = start_runtime(config, reporter)
+        except RuntimeStartupError as e:
+            reporter.error(str(e))
+            return e.exit_code
 
-    if tarball_source:
-        reporter.info(f"Graphs from {tarball_source}")
-    if config.metrics.extra_runs_per_engine:
-        reporter.info(
-            f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) per engine"
-        )
-    if argv is None:
-        argv = list(sys.argv)
-    return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
+        if tarball_source:
+            reporter.info(f"Graphs from {tarball_source}")
+        if config.metrics.extra_runs_per_engine:
+            reporter.info(
+                f"Profiling: {config.metrics.extra_runs_per_engine} extra run(s) "
+                "per engine"
+            )
+        if argv is None:
+            argv = list(sys.argv)
+        return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
 
 
 def _output_problem(path: Path) -> Optional[str]:
@@ -432,7 +436,13 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     leaked = False
     if config.hipdnn_cache_dir:
         os.environ["HIPDNN_CACHE_DIR"] = config.hipdnn_cache_dir
-    cache = os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
+    cache_disabled = _truthy_env("HIPDNN_DISABLE_CACHE")
+    if cache_disabled:
+        cache = "disabled (HIPDNN_DISABLE_CACHE)"
+    else:
+        cache = (
+            os.environ.get("HIPDNN_CACHE_DIR") or "shared per-user (~/.cache/hipdnn)"
+        )
 
     if config.autotune:
         os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
@@ -445,7 +455,7 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
             "--autotune; kernels are benchmarked, not heuristic-selected"
         )
     autotune = config.autotune or leaked
-    if config.autotune and not config.hipdnn_cache_dir:
+    if config.autotune and not config.hipdnn_cache_dir and not cache_disabled:
         # The winner cache outlives the run and reads are not gated on
         # benchmarking, so a previous session's ranking can be reported.
         reporter.warning(

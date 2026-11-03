@@ -348,6 +348,56 @@ def reference(monkeypatch):
     monkeypatch.setattr(suite_runner, "_prepare_references", prepare)
 
 
+@pytest.mark.parametrize(
+    "prime_once, primes", [(False, 2), (True, 1)], ids=["default", "fast"]
+)
+def test_engine_primes_once_per_run_only_with_prime_once(fake, prime_once, primes):
+    """--fast primes an engine before its first graph only; the default primes
+    before every graph. Every graph still builds its own plan."""
+    planner = suite_runner.hipdnn_planner(_Handle(), prime_once=prime_once)
+    for _ in range(2):
+        graph = suite_runner.run_graph(
+            PATH,
+            GRAPH,
+            TENSORS,
+            SuiteConfig(engine_filter=[1]),
+            Reporter(io.StringIO()),
+            [planner],
+        )
+        assert [r.status for r in graph.results] == ["success"]
+    calls = [call for call, _, _ in fake.calls]
+    assert (calls.count("prime"), calls.count("prepare")) == (primes, 2)
+
+
+def test_a_failed_prime_is_retried_on_the_next_graph(fake, monkeypatch):
+    """Only a successful prime counts: a row that failed to prime leaves the
+    engine cold, so the next graph primes it again."""
+    planner = suite_runner.hipdnn_planner(_Handle(), prime_once=True)
+    real_prime = suite_runner.Executor.prime
+    failures = [RuntimeError("provider setup failed")]
+
+    def prime(self, handle, engine_id):
+        if failures:
+            raise failures.pop()
+        real_prime(self, handle, engine_id)
+
+    monkeypatch.setattr(suite_runner.Executor, "prime", prime)
+    statuses = []
+    for _ in range(3):
+        graph = suite_runner.run_graph(
+            PATH,
+            GRAPH,
+            TENSORS,
+            SuiteConfig(engine_filter=[1]),
+            Reporter(io.StringIO()),
+            [planner],
+        )
+        statuses += [r.status for r in graph.results]
+    calls = [call for call, _, _ in fake.calls]
+    assert statuses == ["error", "success", "success"]
+    assert calls.count("prime") == 1  # graph 2 primed; graph 3 found it warm
+
+
 def test_one_hipdnn_row_per_engine_named_from_engine_info(fake):
     graph, progress = _run()
 

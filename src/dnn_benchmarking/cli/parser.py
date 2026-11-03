@@ -358,6 +358,16 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_key="hipdnn_cache_dir",
         config_kind=ConfigKind.PATH,
     ),
+    _bool_option(
+        ("--fast",),
+        "fast",
+        "Runtime/Selection",
+        SuiteConfig,
+        "fast",
+        "run every graph through one engine in this process: one handle, only "
+        "the plugin under test loaded, warm caches (requires one -e and "
+        "--plugin-path naming the plugin library file)",
+    ),
     _choice_option(
         ("--pytorch-sdpa-backend",),
         "pytorch_sdpa_backend",

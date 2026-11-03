@@ -57,7 +57,7 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
     for runtime in config.runtimes:
         if runtime is RuntimeName.HIPDNN:
             handle = _create_hipdnn_handle(config, hipdnn, load_error)
-            planners.append(hipdnn_planner(handle))
+            planners.append(hipdnn_planner(handle, prime_once=config.fast))
         else:
             planners.append(_STARTERS[runtime](config, reporter))
     return lambda path, graph_json, infos: run_graph(
@@ -153,15 +153,11 @@ def _create_hipdnn_handle(
 ) -> Any:
     """Create the shared hipDNN handle; None when plugin paths are per engine.
 
-    Handle creation is the authoritative GPU/runtime check for hipDNN.
+    Handle creation is the authoritative GPU/runtime check for hipDNN. With
+    ``--fast`` the plugin path names one plugin library, so the handle loads
+    and initialises only that plugin.
     """
-    missing = [str(p) for p in config.plugin_paths or [] if not p.is_dir()]
-    if missing:
-        raise RuntimeStartupError(
-            f"hipDNN plugin path is not a directory: {', '.join(missing)} "
-            "(check --plugin-path)",
-            exit_code=2,
-        )
+    _check_plugin_paths(config)
     if load_error is not None:
         if isinstance(load_error, ImportError):
             raise RuntimeStartupError(
@@ -196,6 +192,27 @@ def _create_hipdnn_handle(
     if config.engine_filter is not None:
         _check_engines_loaded(hipdnn, handle, config.engine_filter)
     return handle
+
+
+def _check_plugin_paths(config: SuiteConfig) -> None:
+    """Plugin directories exist; with ``--fast``, the one path is a file."""
+    if config.fast:
+        plugin = config.plugin_path
+        if plugin is None or not plugin.is_file():
+            raise RuntimeStartupError(
+                f"--fast: --plugin-path must name one plugin library file "
+                f"(for example .../hipdnn_plugins/engines/libmiopen_plugin.so); "
+                f"got {plugin}",
+                exit_code=2,
+            )
+        return
+    missing = [str(p) for p in config.plugin_paths or [] if not p.is_dir()]
+    if missing:
+        raise RuntimeStartupError(
+            f"hipDNN plugin path is not a directory: {', '.join(missing)} "
+            "(check --plugin-path)",
+            exit_code=2,
+        )
 
 
 def _check_engines_loaded(

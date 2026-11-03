@@ -225,6 +225,45 @@ class TestSuiteConfigValidation:
             SuiteConfig.from_namespace(args)
 
 
+class TestFast:
+    """--fast runs one engine in this process; it rejects what needs more."""
+
+    _BASE = ["--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", "/p/libmiopen.so"]
+
+    def test_one_engine_and_one_plugin_file_with_autotune_is_accepted(self) -> None:
+        config = SuiteConfig.from_namespace(_namespace([*self._BASE, "--autotune"]))
+        assert (config.fast, config.autotune) == (True, True)
+
+    @pytest.mark.parametrize(
+        "argv, flag",
+        [
+            (["--validate", "pytorch"], "--validate"),
+            (["--oracle"], "--oracle"),
+            (["--pmc", "basic"], "--pmc"),
+            (["--trace"], "--trace"),
+            (["--perf"], "--perf"),
+            (["--roofline"], "--roofline"),
+            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
+            (["-r", "hipdnn,rocke"], "--runtime other than hipdnn"),
+        ],
+    )
+    def test_rejects_what_one_process_cannot_do(self, argv, flag) -> None:
+        with pytest.raises(ValueError, match=f"{flag} not supported with --fast"):
+            SuiteConfig.from_namespace(_namespace([*self._BASE, *argv]))
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--fast", "--plugin-path", "/p/libmiopen.so"],
+            ["--fast", "-e", "1,2", "--plugin-path", "/p/libmiopen.so"],
+        ],
+        ids=["no-engine", "two-engines"],
+    )
+    def test_requires_exactly_one_engine(self, argv) -> None:
+        with pytest.raises(ValueError, match="--fast requires exactly one --engine"):
+            SuiteConfig.from_namespace(_namespace(argv))
+
+
 class TestSuiteConfigPluginPaths:
     """Tests for SuiteConfig engine/plugin path selection."""
 
