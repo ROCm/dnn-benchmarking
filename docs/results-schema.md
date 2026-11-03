@@ -68,6 +68,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
 | `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
+| `miopen_user_db` | string or null | `--miopen-user-db`: the MIOpen user database that the run reused and kept. Not `null` marks a possibly warm run, whose `first_call_ms` is not comparable with a run on an empty database. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |

@@ -48,6 +48,7 @@ RUN_CONFIG_KEYS = (
     "oracle",
     "autotune",
     "hipdnn_cache_dir",
+    "miopen_user_db",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
     "metrics",

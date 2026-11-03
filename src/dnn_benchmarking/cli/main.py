@@ -32,25 +32,41 @@ def _create_cache_base(
     return Path(temporary_directory.name), temporary_directory
 
 
-def _configure_cache_env(fast: bool) -> List[tempfile.TemporaryDirectory[str]]:
+def _configure_cache_env(
+    fast: bool, miopen_user_db: Optional[Path] = None
+) -> List[tempfile.TemporaryDirectory[str]]:
     """Set the ROCm/tool cache variables; the one owner of ``MIOPEN_USER_DB_PATH``.
 
     MIOpen, comgr and torch default to ~/.cache or ~/.miopen. Unset variables
     point to DNN_BENCH_WORKSPACE (set by setup_env.py) or to a private
     temporary directory, allocated only when a variable is unset.
 
-    With ``fast`` (``--fast``), the MIOpen user database is a new, empty
-    temporary directory that replaces any inherited value. MIOpen reads the
-    variable once per process, so every graph of the run shares it, and no
-    earlier command changes the selection. hipDNN's disk cache stays as
-    configured (``HIPDNN_CACHE_DIR``, ``--hipdnn-cache-dir``).
+    The MIOpen user database, in order of precedence:
+
+    1. ``miopen_user_db`` (``--miopen-user-db``): created if missing and kept
+       after the run, so a later run with the same path reuses its find
+       results (a warm run).
+    2. With ``fast`` (``--fast``): a new, empty temporary directory, removed
+       after the run, so no earlier command changes the selection.
+    3. Otherwise the inherited value, or the workspace directory.
+
+    Both 1 and 2 replace an inherited value. MIOpen reads the variable once
+    per process, so every graph of the run shares the database. hipDNN's
+    disk cache stays as configured (``HIPDNN_CACHE_DIR``,
+    ``--hipdnn-cache-dir``).
 
     Must run before any GPU runtime initialises. Keep the returned objects
     alive for the run, past the hipDNN handle; their finalizers remove the
     temporary directories.
     """
     lifetimes: List[tempfile.TemporaryDirectory[str]] = []
-    if fast:
+    if miopen_user_db is not None:
+        try:
+            miopen_user_db.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise ValueError(f"--miopen-user-db {miopen_user_db}: {e}") from e
+        os.environ["MIOPEN_USER_DB_PATH"] = str(miopen_user_db.resolve())
+    elif fast:
         user_db = tempfile.TemporaryDirectory(prefix="dnn-bench-fast-db-")
         lifetimes.append(user_db)
         os.environ["MIOPEN_USER_DB_PATH"] = user_db.name
@@ -101,11 +117,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         apply_config_file(args)
     except ValueError as e:
         parser.error(str(e))
-    # After parsing (--fast can come from the config file), before any GPU
-    # runtime initialises.
-    _cache_lifetimes = _configure_cache_env(  # noqa: F841 - keeps the dirs alive
-        fast=bool(args.fast)
-    )
+    # After parsing (--fast and --miopen-user-db can come from the config
+    # file), before any GPU runtime initialises.
+    try:
+        _cache_lifetimes = _configure_cache_env(  # noqa: F841 - keeps dirs alive
+            fast=bool(args.fast), miopen_user_db=args.miopen_user_db
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
     # Runtime startup (in the suite runner) is the authoritative GPU check;
     # optional telemetry tools such as amd-smi are not gated here.

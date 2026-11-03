@@ -52,6 +52,7 @@ the same output format.
 | `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
 | `--hipdnn-cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
+| `--miopen-user-db PATH` | none | MIOpen user database (`MIOPEN_USER_DB_PATH`) for this run. The tool creates the directory if needed and keeps it after the run, so a later run with the same `PATH` reuses its find results. Such a warm run is much faster, but its `first_call_ms` and wall time are not comparable with a cold run. With `--fast`, it replaces the new, empty database. Recorded as `run.config.miopen_user_db`. |
 | `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
@@ -446,7 +447,13 @@ What the tool does:
    its own plan, and `build_ms` is that build.
 4. It gives the run a new, empty MIOpen user database that every graph
    shares and that the tool deletes at exit. Find results thus carry over
-   from graph to graph, but not from an earlier command.
+   from graph to graph, but not from an earlier command. With
+   `--miopen-user-db PATH`, the run uses that database instead and keeps it,
+   so the next command with the same path reuses the find results. MIOpen's
+   find dominates the first call of a convolution: on one gfx1151 host, 7
+   convolution graphs took 475 s with an empty database and 46 s with the
+   database of an earlier run. Results of such a warm run are not
+   comparable with a cold run.
 5. It keeps hipDNN's disk cache as configured, the same as a normal run:
    `HIPDNN_CACHE_DIR`, `--hipdnn-cache-dir`, or `~/.cache/hipdnn`. Rankings
    that `--autotune` saved in an earlier command can thus serve this run (see

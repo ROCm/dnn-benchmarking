@@ -147,10 +147,15 @@ def run_suite_cli(
     # exists.
     with ExitStack() as resources:
         if config.fast:
+            kind = (
+                "kept, from --miopen-user-db"
+                if config.miopen_user_db
+                else "new, removed after the run"
+            )
             reporter.info(
                 "--fast: one process, one handle; MIOpen user database "
-                f"{os.environ.get('MIOPEN_USER_DB_PATH')} (new, shared by every "
-                "graph)"
+                f"{os.environ.get('MIOPEN_USER_DB_PATH')} ({kind}; shared by "
+                "every graph)"
             )
         _warn_ignored_options(config, reporter)
         _apply_pytorch_environment(config, reporter)
@@ -232,6 +237,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "oracle": config.oracle,
         "autotune": config.autotune,
         "hipdnn_cache_dir": config.hipdnn_cache_dir,
+        "miopen_user_db": config.miopen_user_db,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
         "metrics": metrics.basic,
