@@ -166,7 +166,11 @@ def run_suite_cli(
             )
         if argv is None:
             argv = list(sys.argv)
-        return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
+        code = _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
+        # Drop the runner, and with it the hipDNN handle and its MIOpen handle,
+        # while the --fast MIOpen user database still exists.
+        del run_graph
+        return code
 
 
 def _output_problem(path: Path) -> Optional[str]:

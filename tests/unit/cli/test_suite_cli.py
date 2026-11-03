@@ -655,13 +655,18 @@ def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> N
 
 
 def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
-    tmp_path, monkeypatch, runtime
+    tmp_path, monkeypatch
 ) -> None:
     """Every graph of a --fast run sees one new, empty MIOpen user database and
-    hipDNN's disk cache off; both are gone after the run."""
+    hipDNN's disk cache off. The handle is released while the database still
+    exists; then the database and the settings are gone."""
     monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
     monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
-    seen = []
+    seen, released = [], []
+
+    class Handle:
+        def __del__(self):
+            released.append(seen[0][0].is_dir())
 
     def run(path):
         db = Path(os.environ["MIOPEN_USER_DB_PATH"])
@@ -669,7 +674,11 @@ def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
         (db / f"{path.stem}.ufdb.txt").write_text("record")
         return _graph(path, [_passed()])
 
-    runtime(run)
+    def start(config, reporter):
+        handle = Handle()
+        return lambda path, graph_json, infos: (handle, run(path))[1]
+
+    monkeypatch.setattr(suite_runner_cli, "start_runtime", start)
     plugin = tmp_path / "libmiopen_plugin.so"
     plugin.write_bytes(b"")
     code, _ = _run(
@@ -681,6 +690,7 @@ def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
     (db, first, cache), (db2, second, _) = seen
     assert (db2, first, cache) == (db, [], "1")
     assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
+    assert released == [True]
     assert not db.exists()
     assert os.environ["MIOPEN_USER_DB_PATH"] == "/shell/db"
     assert "HIPDNN_DISABLE_CACHE" not in os.environ
