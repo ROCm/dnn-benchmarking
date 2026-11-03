@@ -489,6 +489,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "oracle": False,
         "autotune": False,
         "hipdnn_cache_dir": None,
+        "miopen_user_db": None,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,
@@ -676,7 +677,7 @@ def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> N
     assert calls == []  # rejected before any handle
 
 
-def _fast_main(tmp_path, n_graphs: int) -> int:
+def _fast_main(tmp_path, n_graphs: int, *extra: str) -> int:
     """Run ``dnn-benchmark --fast`` on ``n_graphs`` copies of the sample."""
     plugin = tmp_path / "libmiopen_plugin.so"
     plugin.write_bytes(b"")
@@ -685,6 +686,7 @@ def _fast_main(tmp_path, n_graphs: int) -> int:
         [
             *("--graph", *map(str, graphs)),
             *("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
+            *extra,
         ]
     )
 
@@ -712,6 +714,32 @@ def test_fast_run_shares_one_new_user_db(tmp_path, monkeypatch, runtime) -> None
     assert (db2, first, cache_off) == (db, [], False)
     assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
     assert not db.exists()
+
+
+def test_fast_with_miopen_user_db_keeps_it_for_the_next_run(
+    tmp_path, monkeypatch, runtime
+) -> None:
+    """With --miopen-user-db, a --fast run uses that database and keeps it, so
+    a second run starts with the first run's records; run.config records it."""
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
+    user_db = tmp_path / "miopen-db"
+    seen = []
+
+    def run(path):
+        db = Path(os.environ["MIOPEN_USER_DB_PATH"])
+        seen.append(sorted(p.name for p in db.iterdir()))
+        (db / f"{path.stem}.ufdb.txt").write_text("record")
+        return _graph(path, [_passed()])
+
+    runtime(run)
+    out = tmp_path / "out.json"
+    args = ("--miopen-user-db", str(user_db), "-o", str(out))
+    assert _fast_main(tmp_path, 1, *args) == 0
+    assert _fast_main(tmp_path, 1, *args) == 0
+
+    assert seen == [[], ["g0.ufdb.txt"]]  # the second run starts warm
+    config = SuiteResult.load(out)["run"]["config"]
+    assert config["miopen_user_db"] == str(user_db)
 
 
 @pytest.mark.parametrize("probe_fails", [False, True], ids=["returns", "raises"])

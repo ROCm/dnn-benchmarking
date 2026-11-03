@@ -407,6 +407,11 @@ class SuiteConfig:
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
     hipdnn_cache_dir: Optional[str] = None
+    #: MIOpen user database for the run (``--miopen-user-db``), kept after it;
+    #: ``cli.main._configure_cache_env`` points ``MIOPEN_USER_DB_PATH`` at it.
+    #: ``None``: the inherited or workspace database, or with ``fast`` a new,
+    #: empty one.
+    miopen_user_db: Optional[str] = None
     #: Run every graph through one engine in this process: one hipDNN handle
     #: with only the plugin under test loaded, primed once, and one MIOpen
     #: user database for the whole run (``cli.main._configure_cache_env``).
@@ -479,6 +484,9 @@ class SuiteConfig:
             autotune=args.autotune,
             hipdnn_cache_dir=(
                 str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
+            ),
+            miopen_user_db=(
+                str(args.miopen_user_db) if args.miopen_user_db else None
             ),
             fast=args.fast,
         )

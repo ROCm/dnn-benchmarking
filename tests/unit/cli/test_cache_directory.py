@@ -7,6 +7,8 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 from dnn_benchmarking.cli.main import _configure_cache_env, _create_cache_base
 
 
@@ -59,3 +61,28 @@ def test_fast_gets_a_new_empty_user_db_over_an_inherited_one(
     assert list(user_db.iterdir()) == []
     lifetime.cleanup()
     assert not user_db.exists()
+
+
+def test_miopen_user_db_is_created_kept_and_wins_over_fast(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """--miopen-user-db replaces both the inherited value and the new --fast
+    database, and nothing the tool removes owns it."""
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/preset")
+    user_db = tmp_path / "db" / "nested"
+
+    lifetimes = _configure_cache_env(fast=True, miopen_user_db=user_db)
+
+    assert os.environ["MIOPEN_USER_DB_PATH"] == str(user_db.resolve())
+    assert user_db.is_dir()
+    for lifetime in lifetimes:
+        lifetime.cleanup()
+    assert user_db.is_dir()
+
+
+def test_unusable_miopen_user_db_names_the_option(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    with pytest.raises(ValueError, match=f"--miopen-user-db {blocker / 'db'}"):
+        _configure_cache_env(fast=False, miopen_user_db=blocker / "db")

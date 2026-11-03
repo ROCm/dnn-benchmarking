@@ -358,6 +358,19 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_key="hipdnn_cache_dir",
         config_kind=ConfigKind.PATH,
     ),
+    CliOption(
+        flags=("--miopen-user-db",),
+        dest="miopen_user_db",
+        group="Runtime/Selection",
+        parser_type=Path,
+        metavar="PATH",
+        help="MIOpen user database (MIOPEN_USER_DB_PATH) for this run, kept "
+        "afterwards: a later run with the same PATH reuses its find results "
+        "(warm; not comparable with cold runs). Replaces the new, empty "
+        "database of --fast",
+        config_key="miopen_user_db",
+        config_kind=ConfigKind.PATH,
+    ),
     _bool_option(
         ("--fast",),
         "fast",
