@@ -407,6 +407,11 @@ class SuiteConfig:
     #: job; reads are not gated on benchmarking while writes are, so without an
     #: explicit empty root an untuned phase can replay a previous tuned ranking.
     hipdnn_cache_dir: Optional[str] = None
+    #: Run every graph through one engine in this process: one hipDNN handle
+    #: with only the plugin under test loaded, primed once, and one MIOpen
+    #: user database for the whole run (``cli.fast_mode``). Needs one
+    #: ``--engine`` and a ``--plugin-path`` that names its plugin library.
+    fast: bool = False
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
@@ -474,6 +479,7 @@ class SuiteConfig:
             hipdnn_cache_dir=(
                 str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
             ),
+            fast=args.fast,
         )
 
     def __post_init__(self) -> None:
@@ -549,6 +555,34 @@ class SuiteConfig:
             raise ValueError(
                 f"{', '.join(dict.fromkeys(flags))} not supported with "
                 f"--runtime {names}"
+            )
+        if self.fast:
+            self._check_fast()
+
+    def _check_fast(self) -> None:
+        """Reject what ``--fast`` cannot do in one process with one engine.
+
+        Validation, the oracle and profiling need torch or other processes;
+        ``--hipdnn-cache-dir`` would set a cache that ``--fast`` turns off.
+        """
+        rejected = [
+            ("--validate", self.validation.enabled),
+            ("--oracle", self.oracle),
+            ("--pmc", self.metrics.pmc_set is not None),
+            ("--trace", self.metrics.trace),
+            ("--perf", self.metrics.perf),
+            ("--roofline", self.metrics.roofline),
+            ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
+            ("--runtime other than hipdnn", self.runtimes != (RuntimeName.HIPDNN,)),
+        ]
+        flags = [flag for flag, present in rejected if present]
+        if flags:
+            raise ValueError(f"{', '.join(flags)} not supported with --fast")
+        if self.engine_filter is None or len(self.engine_filter) != 1:
+            raise ValueError("--fast requires exactly one --engine")
+        if self.plugin_paths is None or len(self.plugin_paths) != 1:
+            raise ValueError(
+                "--fast requires --plugin-path to name one plugin library file"
             )
 
     @property

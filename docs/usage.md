@@ -49,9 +49,10 @@ the same output format.
 |---|---|---|
 | `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
-| `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
+| `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. With `--fast`, the plugin library file of the engine. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
 | `--hipdnn-cache-dir PATH` | none | Sets `HIPDNN_CACHE_DIR` for this run. |
+| `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
@@ -402,7 +403,52 @@ dnn-benchmark -g 'graphs/*.json' --autotune --hipdnn-cache-dir /tmp/cache-tuned
 
 The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
 value in the environment without `--autotune`, and when `--autotune` has no
-`--hipdnn-cache-dir`.
+`--hipdnn-cache-dir` while hipDNN's disk cache is on.
+
+## Fast mode (`--fast`)
+
+`--fast` runs every graph through one engine in the `dnn-benchmark` process
+and keeps the engine state between graphs. Use it to time a large set of
+graphs on one engine quickly.
+
+```bash
+dnn-benchmark -g 'graphs/*.json' --fast -e MIOPEN_ENGINE \
+  --plugin-path "$ROCM_PATH/lib/hipdnn_plugins/engines/libmiopen_plugin.so"
+```
+
+What the tool does:
+
+1. It loads only the plugin library that `--plugin-path` names, so hipDNN
+   initialises no other engine.
+2. It creates one hipDNN handle for the whole run and does not destroy it
+   between graphs. The plugin, its provider handle (for example the MIOpen
+   handle) and their in-memory caches stay loaded.
+3. It primes the engine before the first graph only. Every graph still builds
+   its own plan, and `build_ms` is that build.
+4. It gives the run a new, empty MIOpen user database that every graph
+   shares and that the tool deletes at exit. Find results thus carry over
+   from graph to graph, but not from an earlier command.
+5. It turns hipDNN's disk cache off (`HIPDNN_DISABLE_CACHE=1`).
+6. After each graph it frees the plan, the workspace and the input and
+   output buffers.
+
+Requirements and limits:
+
+- Exactly one `--engine`, and a `--plugin-path` that names one plugin
+  library file. A directory, two engines or no engine stop the run with exit
+  code 2.
+- The hipDNN runtime only. These options stop the run with exit code 2:
+  `--validate`, `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline`,
+  `--hipdnn-cache-dir` and a `--runtime` other than `hipdnn`. `--autotune`
+  works; the search of each problem then runs once per run.
+- The timing settings (`--warmup`, `--iters`, the stall gate) and the GPU
+  clock samples stay as configured.
+- A crash in one graph ends the run. The result file keeps the graphs that
+  finished (`run.complete = false`).
+- The result file does not record `--fast`. A graph's numbers can depend on
+  the graphs that ran before it in the same run (see
+  [methodology.md](methodology.md#fast-mode)). Do not compare a `--fast`
+  run with a run without it.
 
 ## Oracle
 

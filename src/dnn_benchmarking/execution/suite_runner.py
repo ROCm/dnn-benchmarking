@@ -25,6 +25,7 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -33,6 +34,7 @@ from ..config.benchmark_config import (
     PyTorchSdpaBackendName,
     ReferencePrecision,
     SuiteConfig,
+    TimingPolicy,
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
@@ -474,9 +476,33 @@ def _time_pytorch_row(
     return row, outputs
 
 
+class EnginePrimer:
+    """Primes an engine before its timed build.
+
+    Priming absorbs the engine's one-time build costs (provider setup, cold
+    plugin and kernel file reads), so the timed build starts warm. By default
+    every row primes. With ``once`` (``--fast``: one handle for the whole
+    run) only the first successful prime of each engine runs; later graphs
+    find the engine already warm.
+    """
+
+    def __init__(self, once: bool = False) -> None:
+        self._once = once
+        self._primed: Set[int] = set()
+
+    def prime(
+        self, handle: Any, graph_json_str: str, policy: TimingPolicy, engine_id: int
+    ) -> None:
+        if self._once and engine_id in self._primed:
+            return
+        Executor(graph_json_str, policy).prime(handle, engine_id)
+        self._primed.add(engine_id)
+
+
 def run_single_provider_engine(
     ctx: _GraphContext,
     handle: Any,
+    primer: EnginePrimer,
     engine_id: int,
     engine_name: str,
     engine_version: str,
@@ -505,7 +531,7 @@ def run_single_provider_engine(
         # Absorb the engine's one-time build costs (provider setup, cold
         # plugin and kernel file reads) before timing, so the OOTB and tuned
         # build times start from the same state.
-        Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
+        primer.prime(handle, ctx.graph_json_str, config.timing_policy, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
         row.ootb.cpu_build_time_ms = executor.build_time_ms
@@ -948,7 +974,7 @@ def _run_graph(
     return graph
 
 
-def hipdnn_planner(handle: Any) -> GraphPlanner:
+def hipdnn_planner(handle: Any, prime_once: bool = False) -> GraphPlanner:
     """Plan every selected or discovered hipDNN engine.
 
     Explicit ``--engine`` IDs run in the caller's order; otherwise the graph's
@@ -959,7 +985,10 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
     Args:
         handle: hipdnn.Handle, or None to create one per engine (per-engine
             plugin paths).
+        prime_once: Prime each engine only before its first build of the run
+            (``--fast``), not before every graph.
     """
+    primer = EnginePrimer(once=prime_once)
 
     def plan(
         graph_path: Path,
@@ -994,7 +1023,7 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
             "hipdnn",
             engine_ids=engine_ids,
             rows=lambda ctx: [
-                _run_engine_selection(ctx, handle, s.engine_id, s.plugin_path)
+                _run_engine_selection(ctx, handle, primer, s.engine_id, s.plugin_path)
                 for s in selections
             ],
             message=message,
@@ -1007,6 +1036,7 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
 def _run_engine_selection(
     ctx: _GraphContext,
     handle: Any,
+    primer: EnginePrimer,
     engine_id: int,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
@@ -1035,7 +1065,7 @@ def _run_engine_selection(
         ctx.reporter,
         name,
         lambda: run_single_provider_engine(
-            ctx, handle, engine_id, name, version, plugin_path
+            ctx, handle, primer, engine_id, name, version, plugin_path
         ),
     )
 

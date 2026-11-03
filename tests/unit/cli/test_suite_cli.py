@@ -583,7 +583,9 @@ def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
     a, b = _plugin_dirs(tmp_path)
     calls = _fake_hipdnn(monkeypatch, loaded={a: {1}, b: {1}})
     handles = []
-    monkeypatch.setattr(runtimes, "hipdnn_planner", handles.append)
+    monkeypatch.setattr(
+        runtimes, "hipdnn_planner", lambda handle, prime_once: handles.append(handle)
+    )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "1,1", "--plugin-path", f"{a},{b}")
@@ -618,6 +620,72 @@ def test_missing_plugin_path_is_usage_error(tmp_path, monkeypatch) -> None:
     assert calls == []  # rejected before any handle
 
 
+def test_fast_loads_only_the_named_plugin_file(tmp_path, monkeypatch) -> None:
+    """--fast creates one handle with just the plugin under test loaded,
+    and asks the planner to prime once per run."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    planners = []
+    monkeypatch.setattr(
+        runtimes,
+        "hipdnn_planner",
+        lambda handle, prime_once: planners.append(prime_once) or "plan",
+    )
+    monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
+    )
+
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()))
+
+    assert calls == [[str(plugin)], "Handle"]
+    assert planners == [True]
+
+
+def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> None:
+    calls = _fake_hipdnn(monkeypatch)
+    code, text = _run(
+        _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
+        _graphs(tmp_path, 1),
+    )
+    assert code == 2
+    assert "--plugin-path must name one plugin library file" in text
+    assert calls == []  # rejected before any handle
+
+
+def test_fast_runs_with_a_new_user_db_and_restores_the_environment(
+    tmp_path, monkeypatch, runtime
+) -> None:
+    """Every graph of a --fast run sees one new, empty MIOpen user database and
+    hipDNN's disk cache off; both are gone after the run."""
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
+    monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
+    seen = []
+
+    def run(path):
+        db = Path(os.environ["MIOPEN_USER_DB_PATH"])
+        seen.append((db, sorted(db.iterdir()), os.environ["HIPDNN_DISABLE_CACHE"]))
+        (db / f"{path.stem}.ufdb.txt").write_text("record")
+        return _graph(path, [_passed()])
+
+    runtime(run)
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    code, _ = _run(
+        _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
+        _graphs(tmp_path, 2),
+    )
+
+    assert code == 0
+    (db, first, cache), (db2, second, _) = seen
+    assert (db2, first, cache) == (db, [], "1")
+    assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
+    assert not db.exists()
+    assert os.environ["MIOPEN_USER_DB_PATH"] == "/shell/db"
+    assert "HIPDNN_DISABLE_CACHE" not in os.environ
+
+
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
     _fake_hipdnn(monkeypatch, loaded=())
     code, text = _run(
@@ -635,7 +703,9 @@ def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
     handles, seen = [], []
     monkeypatch.setattr(
-        runtimes, "hipdnn_planner", lambda handle: handles.append(handle) or "plan"
+        runtimes,
+        "hipdnn_planner",
+        lambda handle, prime_once: handles.append(handle) or "plan",
     )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: seen.append(args) or "ran")
     config = suite_runner_cli.SuiteConfig.from_namespace(
