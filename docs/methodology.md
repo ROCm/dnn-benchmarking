@@ -330,9 +330,13 @@ loaded plugin and the same MIOpen user database (see
 [usage.md](usage.md#fast-mode---fast)). This changes what some numbers of a
 graph include:
 
-- `build_ms` is the timed plan build after a warm engine in both modes. A
-  normal run primes the engine before every graph. A `--fast` run primes it
-  before the first graph only; later graphs find it already warm.
+- `build_ms` is not the same build in the two modes. The prime builds the
+  plan of the graph itself, untimed. A normal run primes before every graph,
+  so each `build_ms` is the second build of that graph. A `--fast` run primes
+  before the first graph only: its `build_ms` is a second build, and the
+  `build_ms` of every later graph is the first build of that problem on a
+  warm engine. It can include per-problem first-build costs, for example
+  reading that problem's kernel files.
 - `first_call_ms` (`setup`) can be smaller than in a normal run. The MIOpen
   kernel cache of the handle and the find records of earlier graphs carry
   over, so a later graph with the same convolution problem skips the compile
@@ -341,8 +345,9 @@ graph include:
   the same. With `--autotune`, a problem that an earlier graph searched
   reuses that search result.
 
-The order of the graphs can thus change `first_call_ms`. Do not compare it
-between a `--fast` run and a run without it.
+The order of the graphs can thus change `build_ms` and `first_call_ms`. Do
+not compare them between a `--fast` run and a run without it, or between the
+first graph of a `--fast` run and the later ones.
 
 ## Parity with other harnesses
 
