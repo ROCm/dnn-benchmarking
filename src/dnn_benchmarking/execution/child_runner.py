@@ -101,6 +101,14 @@ def pytorch_child_args(
     return args
 
 
+def rocke_child_args(
+    graph_path: Path, config: SuiteConfig, kernel_json: str, save_outputs: bool
+) -> List[str]:
+    """Arguments of ``cli/rocke_child.py``: the graph and the kernel to run
+    (``rocke_sdpa.kernel_to_json``)."""
+    return _common_args(graph_path, config, save_outputs) + ["--kernel", kernel_json]
+
+
 @contextmanager
 def child_run(
     spec: ChildSpec,

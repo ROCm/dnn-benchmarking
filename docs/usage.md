@@ -332,10 +332,8 @@ How the variant rows get the hipDNN kernel:
    reader (`librocm_kpack`, the reader that the plugin uses) and launches it
    through rocKE's runtime. It does not compile the variant. The row is an
    error when the code object does not have the recorded SHA-256, or when
-   rocKE's argument list is not the one that hipDNN binds. Each code object
-   loads once per run; later rows that use it reuse the module. When
-   several `--plugin-path` directories ship a variant, the first one gives
-   its row.
+   rocKE's argument list is not the one that hipDNN binds. When several
+   `--plugin-path` directories ship a variant, the first one gives its row.
 
 Read the rows as follows:
 
@@ -365,14 +363,16 @@ Requirements and limits:
   kernel runs reports `no engines applicable` with the reasons. In a runtime
   list it gets no rocKE rows.
 - `build_ms` is the time to get and load the kernel. For a variant row this
-  is the kpack read and the module load; a row that reuses a loaded module
-  reports the time of the first load. For the auto row it also includes the
-  compile and the first launch, because rocKE compiles the unified kernel
-  inside its launch call.
+  is the kpack read and the module load. For the auto row it also includes
+  the compile and the first launch, because rocKE compiles the unified
+  kernel inside its launch call.
 - `--plugin-path` selects the descriptor directory. With `--runtime rocke`
   alone, these options stop the run with exit code 2: `--engine`, `--oracle`,
   `--pmc`, `--trace`, `--perf`, `--roofline` and `--autotune`.
-- rocKE rows run in the `dnn-benchmark` process, not in a child process.
+- Each rocKE row runs in its own child process
+  (`python -m dnn_benchmarking.cli.rocke_child`), as the hipDNN and PyTorch
+  rows do. The child loads its own code object, so no row reuses a module
+  that an earlier row loaded.
 
 To compare rocKE with hipDNN, run both runtimes in one run:
 

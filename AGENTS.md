@@ -92,7 +92,8 @@ src/dnn_benchmarking/
 │   ├── internal_profiling.py # hidden --internal-profiling-run child
 │   ├── child_script.py       # body shared by the timed children: spec check, timed loop, saved outputs
 │   ├── hipdnn_child.py       # child: one hipDNN engine run (OOTB, --autotune, or --tuned)
-│   └── pytorch_child.py      # child: one PyTorch run (--runtime pytorch or the reference; OOTB, or --tuned)
+│   ├── pytorch_child.py      # child: one PyTorch run (--runtime pytorch or the reference; OOTB, or --tuned)
+│   └── rocke_child.py        # child: one rocKE kernel run (--runtime rocke)
 ├── common/                   # exceptions, dtypes, torch/ROCm runtime helpers, run_state (per-run temp dirs)
 ├── config/benchmark_config.py# SuiteConfig, TimingPolicy, MetricsConfig, ValidationConfig
 ├── execution/
@@ -139,11 +140,13 @@ Data flow (PyTorch): the same, with `pytorch_plan` -> `child_run` ->
 `timing.measure`). One `runtime = "pytorch"` row per graph. No engine
 discovery or plugins.
 
-Data flow (rocKE): the same, with `rocke_planner`, `RockeExecutor` and
-`PyTorchCudaBufferManager`, in the `dnn-benchmark` process (no child). The
-catalog reads the installed `hipkernel:Gfx950AttentionDense` descriptors once
-per suite (`rocke_session`); a variant row launches hipDNN's code object from
-the kpack archive.
+Data flow (rocKE): the same, with `rocke_planner` -> per kernel: `child_run`
+-> `cli/rocke_child.py` (`RockeExecutor` + `PyTorchCudaBufferManager` ->
+`timing.measure`). The parent selects each kernel and passes it as JSON
+(`rocke_sdpa.kernel_to_json`). The catalog reads the installed
+`hipkernel:Gfx950AttentionDense` descriptors once per suite
+(`rocke_session`); a variant row launches hipDNN's code object from the kpack
+archive.
 One `runtime = "rocke"` row per applicable kernel.
 
 With several runtimes, `run_graph` gets one planner per runtime, in
@@ -170,7 +173,9 @@ Rules that keep the design intact:
 - Run every hipDNN plan only in `cli/hipdnn_child.py` and every PyTorch GPU
   run only in `cli/pytorch_child.py`: the OOTB run of each row (the
   `--validate pytorch` reference saves its outputs), and with `--oracle` its
-  tuned run (`--tuned`). The parent sets no selection variable in its own
+  tuned run (`--tuned`). Run every rocKE kernel only in `cli/rocke_child.py`,
+  one OOTB run per row (rocKE has no tuned run and rejects `--oracle`). The
+  parent sets no selection variable in its own
   environment. Start every child with
   `execution/child_runner.child_run`: it gives the child a new, empty
   temporary directory and deletes it afterwards. For an OOTB spec it is also
@@ -183,7 +188,8 @@ Rules that keep the design intact:
   `execution/child_protocol.py` (`HIPDNN_OOTB` with
   `HIPDNN_FORCE_BENCHMARKING=0`, `HIPDNN_AUTOTUNE` and `HIPDNN_TUNED` with
   `HIPDNN_FORCE_BENCHMARKING=1`, `PYTORCH_OOTB` with the PyTorch selection
-  settings, `PYTORCH_TUNED` with them and the TunableOp variables). The
+  settings, `PYTORCH_TUNED` with them and the TunableOp variables,
+  `ROCKE_OOTB` with no selection variable). The
   spec gives the script, its environment and its flags; the script checks
   the environment of the spec that its flags select, for its own
   directory (`cli/child_script.run_timed_child`). The parent sets only

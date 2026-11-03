@@ -1,7 +1,8 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Body that the timed child scripts share (``hipdnn_child``, ``pytorch_child``).
+"""Body that the timed child scripts share (``hipdnn_child``, ``pytorch_child``,
+``rocke_child``).
 
 A script parses its options with ``execution.child_protocol.child_parser``
 and calls :func:`run_timed_child` with its specs and a ``prepare`` function

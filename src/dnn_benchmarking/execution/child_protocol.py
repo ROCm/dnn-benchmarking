@@ -7,7 +7,7 @@ Every GPU run is a child process. A hipDNN engine row runs its OOTB plan in
 ``cli/hipdnn_child.py`` and, with ``--oracle``, its tuned plan in the same
 script with ``--tuned``. A PyTorch row (``--runtime pytorch`` or the
 ``--validate pytorch`` reference) runs in ``cli/pytorch_child.py`` the same
-way.
+way. A rocKE row runs its kernel in ``cli/rocke_child.py`` (no tuned run).
 An OOTB child starts with a new, empty MIOpen user database (its private
 directory), so no Find result of another run reaches it. MIOpen reads the
 database path once per process, so only a new process can start empty.
@@ -25,7 +25,8 @@ module. It holds:
   :func:`read_failure`), which carries a failure across the process boundary
   as the exception that the parent raises again;
 - the kinds of child run (:class:`ChildSpec`: :data:`HIPDNN_OOTB`,
-  :data:`HIPDNN_TUNED`, :data:`PYTORCH_OOTB`, :data:`PYTORCH_TUNED`), each
+  :data:`HIPDNN_TUNED`, :data:`PYTORCH_OOTB`, :data:`PYTORCH_TUNED`,
+  :data:`ROCKE_OOTB`), each
   with the environment that the parent sets and the child checks
   (:class:`ChildEnv`). The parent sets no selection variable in its own
   environment.
@@ -243,6 +244,10 @@ PYTORCH_TUNED_ENV = ChildEnv(
     user_db=UserDb.TUNED,
 )
 
+#: rocKE child: no selection variable (rocKE launches one given kernel), and
+#: a private, empty MIOpen user database like every OOTB run.
+ROCKE_OOTB_ENV = ChildEnv(fixed={}, in_dir={}, user_db=UserDb.PRIVATE)
+
 
 @dataclass(frozen=True)
 class ChildSpec:
@@ -285,9 +290,17 @@ PYTORCH_OOTB = ChildSpec("PyTorch", "pytorch_child", PYTORCH_OOTB_ENV)
 PYTORCH_TUNED = ChildSpec(
     "tuned PyTorch", "pytorch_child", PYTORCH_TUNED_ENV, tuned=True
 )
+ROCKE_OOTB = ChildSpec("rocKE", "rocke_child", ROCKE_OOTB_ENV)
 
 #: Every kind of child run.
-ALL_SPECS = (HIPDNN_OOTB, HIPDNN_AUTOTUNE, HIPDNN_TUNED, PYTORCH_OOTB, PYTORCH_TUNED)
+ALL_SPECS = (
+    HIPDNN_OOTB,
+    HIPDNN_AUTOTUNE,
+    HIPDNN_TUNED,
+    PYTORCH_OOTB,
+    PYTORCH_TUNED,
+    ROCKE_OOTB,
+)
 
 #: Name prefixes of variables that hipDNN, MIOpen or PyTorch read to choose
 #: a kernel. A child inherits every variable of the parent except the ones

@@ -7,10 +7,9 @@ Each runtime turns a graph into a :class:`RuntimePlan` (its engines, or why
 none applies) before inputs exist. :func:`run_graph` then generates inputs and
 the ``--validate`` reference once, and appends each runtime's rows in run
 order. Every row is timed by ``timing.measure`` (through the executors).
-Each hipDNN engine row and each PyTorch row runs in a child process
+Every hipDNN, PyTorch and rocKE row runs in a child process
 (``execution.child_runner``): the OOTB run with a new, empty MIOpen user
-database, the tuned run with the command's shared tuned database. rocKE rows
-run in this process.
+database, the tuned run with the command's shared tuned database.
 """
 
 import copy
@@ -39,13 +38,12 @@ from ..config.benchmark_config import (
 from ..execution.buffer_manager import generate_input_data
 from ..execution.executor import Executor, set_plugin_path
 from ..execution.timing import (
-    Measurement,
     StallFallbackError,
     Timer,
     retry_unstalled,
 )
 from ..graph.tensor_info import TensorInfo
-from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
+from ..metrics import compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
@@ -61,6 +59,7 @@ from .child_protocol import (
     HIPDNN_AUTOTUNE,
     HIPDNN_OOTB,
     PYTORCH_OOTB,
+    ROCKE_OOTB,
     ChildResult,
     failure_text,
 )
@@ -69,15 +68,16 @@ from .child_runner import (
     child_run,
     hipdnn_child_args,
     pytorch_child_args,
+    rocke_child_args,
 )
-from .correctness import OutputSource, check_correctness, mismatch, unchecked
+from .correctness import check_correctness, mismatch, unchecked
 from .oracle import hipdnn_tuning_available, run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
     Catalog,
     RockeKernel,
-    SdpaProblem,
     auto_kernel,
     catalog_kernels,
+    kernel_to_json,
     sdpa_problem,
 )
 
@@ -192,25 +192,6 @@ def _record_timing(
         row.ootb.derived_tflops_per_s, row.ootb.derived_gbytes_per_s = (
             derive_throughputs(ctx.flops, ctx.io_bytes, kernel.median_ms)
         )
-
-
-def _measure_row(
-    row: ProviderEngineResult,
-    ctx: _GraphContext,
-    benchmark: Callable[[], Measurement],
-) -> None:
-    """Run an in-process timed loop (rocKE rows) and record it on ``row``."""
-    probe = GpuSmiProbe() if ctx.config.metrics.basic else None
-    m = benchmark()
-    clocks_after = probe.clocks() if probe is not None else None
-    _record_timing(
-        row,
-        ctx,
-        TimingInfo.from_measurement(m),
-        BenchmarkStats.from_timings(m.kernel_ms),
-        BenchmarkStats.from_timings(m.host_ms),
-        clocks_after,
-    )
 
 
 def _reference_provider(
@@ -446,9 +427,9 @@ def _record_ootb(
 
 
 def _ootb_correctness(
-    ctx: _GraphContext, outputs: OutputSource
+    ctx: _GraphContext, outputs: SavedOutputs
 ) -> Optional[CorrectnessResult]:
-    """Compare a row's OOTB outputs with the references.
+    """Compare the OOTB child's saved outputs with the references.
 
     When the reference was skipped on purpose (it does not fit in host
     memory), the row is unchecked. When ``--validate`` has no usable
@@ -935,16 +916,12 @@ class RockeSession:
         arch: GPU architecture name (``gfx950``).
         num_cus: Compute-unit count for rocKE's dispatcher.
         version: Installed ``rocke`` package version.
-        loaded: Code objects loaded so far, by ``(library, toc_key)``. A
-            variant loads once per suite, and every row that runs it reuses
-            the module.
     """
 
     catalog: Catalog
     arch: str
     num_cus: int
     version: str
-    loaded: Dict[Tuple[Path, str], Any] = field(default_factory=dict)
 
 
 def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
@@ -1013,7 +990,7 @@ def rocke_planner(session: RockeSession) -> GraphPlanner:
                 _report_row(
                     reporter,
                     kernel.name,
-                    lambda k=kernel: _run_rocke_row(ctx, k, problem, session),
+                    lambda k=kernel: _run_rocke_row(ctx, k, session),
                 )
                 for kernel in kernels
             ]
@@ -1027,12 +1004,9 @@ def rocke_planner(session: RockeSession) -> GraphPlanner:
 
 
 def _run_rocke_row(
-    ctx: _GraphContext,
-    kernel: RockeKernel,
-    problem: SdpaProblem,
-    session: RockeSession,
+    ctx: _GraphContext, kernel: RockeKernel, session: RockeSession
 ) -> ProviderEngineResult:
-    """Load, time and validate one rocKE kernel."""
+    """Load, time and validate one rocKE kernel in ``cli/rocke_child.py``."""
     config = ctx.config
     row = ProviderEngineResult(
         runtime="rocke",
@@ -1042,30 +1016,21 @@ def _run_rocke_row(
         status="success",
         engine_version=session.version,
     )
+    args = rocke_child_args(
+        ctx.graph_path,
+        config,
+        kernel_to_json(kernel),
+        save_outputs=ctx.reference_outputs is not None,
+    )
     try:
-        from .pytorch_buffer_manager import PyTorchCudaBufferManager
-        from .rocke_executor import RockeExecutor
-
-        executor = RockeExecutor(
-            kernel, problem, config.timing_policy, loaded=session.loaded
-        )
-        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
-            bm.allocate_all()
-            bm.load_input_data(ctx.input_data)
-            bm.zero_outputs()
-            executor.prepare(bm.get_tensors())
-            row.ootb.cpu_build_time_ms = executor.build_time_ms
-            _measure_row(row, ctx, executor.benchmark)
-            if ctx.reference_outputs is not None:
-                bm.zero_outputs()
-                executor.execute_once()
-            row.ootb.correctness = _ootb_correctness(ctx, bm)
+        # No time limit, as for every timed OOTB row.
+        with child_run(ROCKE_OOTB, args, None, config.tuned_db_dir) as (ootb, outputs):
+            _record_ootb(row, ctx, ootb)
+            row.ootb.correctness = _ootb_correctness(ctx, outputs)
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
-        return _failed_row(
-            ProviderEngineResult.error_row, row, f"{type(e).__name__}: {e}"
-        )
+        return _failed_row(ProviderEngineResult.error_row, row, failure_text(e))
     return row

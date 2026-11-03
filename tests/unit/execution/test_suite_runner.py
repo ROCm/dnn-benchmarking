@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from dnn_benchmarking.cli import child_script, hipdnn_child, pytorch_child
+from dnn_benchmarking.cli import child_script, hipdnn_child, pytorch_child, rocke_child
 from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
@@ -25,6 +25,7 @@ from dnn_benchmarking.execution.child_protocol import (
     HIPDNN_AUTOTUNE,
     HIPDNN_OOTB,
     PYTORCH_OOTB,
+    ROCKE_OOTB,
     output_file,
     write_result,
 )
@@ -190,11 +191,12 @@ def fake(monkeypatch):
 
     untuned = {
         (f"dnn_benchmarking.cli.{spec.module}", tuple(spec.flags())): spec
-        for spec in (HIPDNN_OOTB, HIPDNN_AUTOTUNE, PYTORCH_OOTB)
+        for spec in (HIPDNN_OOTB, HIPDNN_AUTOTUNE, PYTORCH_OOTB, ROCKE_OOTB)
     }
     scripts = {
         "dnn_benchmarking.cli.hipdnn_child": hipdnn_child,
         "dnn_benchmarking.cli.pytorch_child": pytorch_child,
+        "dnn_benchmarking.cli.rocke_child": rocke_child,
     }
 
     def run_capped(argv, timeout_s, env=None, capture_output=True):
@@ -218,6 +220,7 @@ def fake(monkeypatch):
     monkeypatch.setattr(child_script, "GpuSmiProbe", Probe)
     monkeypatch.setattr(hipdnn_child, "GraphLoader", Loader)
     monkeypatch.setattr(pytorch_child, "GraphLoader", Loader)
+    monkeypatch.setattr(rocke_child, "GraphLoader", Loader)
     monkeypatch.setattr(hipdnn_child, "initialize_pip_rocm_runtime", lambda: None)
     monkeypatch.setattr(child_runner, "run_capped", run_capped)
     monkeypatch.setitem(
@@ -1453,13 +1456,27 @@ def test_a_selection_error_keeps_the_other_runtime_rows(fake):
 @pytest.fixture
 def fake_rocke(fake_torch, monkeypatch):
     """rocKE kernel selection and executor; rows validate against the
-    reference of ``fake_torch``. A kernel in ``wrong`` writes no output."""
+    reference of ``fake_torch``. A kernel in ``wrong`` writes no output. The
+    kernels are real, so each one crosses to the rocKE child as JSON."""
     from dnn_benchmarking.execution import rocke_executor
+    from dnn_benchmarking.execution.rocke_sdpa import AutoKernel, CatalogKernel
+
+    def variant(name):
+        return CatalogKernel(
+            name=name,
+            spec={"block_m": 256, "causal": True},
+            library=Path("/plugins/kpack/gfx950.kpack"),
+            toc_key=f"toc-{name}",
+            symbol="sym",
+            sha256="00" * 32,
+            arg_names=("q_ptr", "o_ptr"),
+        )
 
     fake = fake_torch
-    fake.variants = [SimpleNamespace(name="rocke:a"), SimpleNamespace(name="rocke:b")]
-    fake.auto = SimpleNamespace(name="rocke:auto:k")
+    fake.variants = [variant("rocke:a"), variant("rocke:b")]
+    fake.auto = AutoKernel(name="rocke:auto:k", path="2d", block_size=16)
     fake.wrong = set()
+    fake.rocke_kernels = []  # kernel each rocKE child ran
 
     def auto_kernel(problem, arch, num_cus):
         if isinstance(fake.auto, Exception):
@@ -1467,7 +1484,8 @@ def fake_rocke(fake_torch, monkeypatch):
         return fake.auto
 
     class RockeExecutor:
-        def __init__(self, kernel, problem, policy, loaded=None):
+        def __init__(self, kernel, problem, policy):
+            fake.rocke_kernels.append(kernel)
             self.kernel, self.policy = kernel, policy
             self.device = "cuda:0"
             self.build_time_ms = 1.5
@@ -1482,6 +1500,7 @@ def fake_rocke(fake_torch, monkeypatch):
             fake.torch_outputs_written = self.kernel.name not in fake.wrong
 
     monkeypatch.setattr(suite_runner, "sdpa_problem", lambda graph, infos: "problem")
+    monkeypatch.setattr(rocke_child, "sdpa_problem", lambda graph, infos: "problem")
     monkeypatch.setattr(
         suite_runner, "catalog_kernels", lambda catalog, problem: list(fake.variants)
     )
@@ -1517,6 +1536,8 @@ def test_rocke_rows_are_the_variants_then_the_auto_kernel(fake_rocke):
     ]
     assert graph.results[1].engine_id == "rocke:a"
     assert graph.results[1].ootb.cpu_build_time_ms == 1.5
+    # Each row's child ran exactly the kernel that the parent planned.
+    assert fake_rocke.rocke_kernels == [*fake_rocke.variants, fake_rocke.auto]
 
 
 def test_rocke_without_a_variant_runs_the_auto_kernel_alone(fake_rocke):
