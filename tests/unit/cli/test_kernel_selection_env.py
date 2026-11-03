@@ -46,6 +46,15 @@ def test_autotune_with_cache_dir_is_isolated() -> None:
     assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
 
 
+def test_autotune_with_the_disk_cache_off_reports_no_stale_winner(monkeypatch) -> None:
+    """With HIPDNN_DISABLE_CACHE set, no earlier winner can be served: the
+    line says the cache is off and the stale-winner hazard is not raised."""
+    monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
+    lines = _lines(autotune=True)
+    assert [line for line in lines if line.startswith("WARNING")] == []
+    assert any("cache: disabled" in line for line in lines)
+
+
 @pytest.mark.parametrize(
     "value, warned", [("1", True), ("0", False)], ids=["truthy-leak", "off-value"]
 )

@@ -343,7 +343,8 @@ graph include:
   and the find.
 - `kernel_med` measures the same kernel as a normal run when the selection is
   the same. With `--autotune`, a problem that an earlier graph searched
-  reuses that search result.
+  reuses that search result. hipDNN's disk cache is on, as in a normal run,
+  so a ranking that an earlier command saved can also serve the run.
 
 The order of the graphs can thus change `build_ms` and `first_call_ms`. Do
 not compare them between a `--fast` run and a run without it, or between the
