@@ -110,7 +110,6 @@ id = 1
             (["--perf"], "--perf"),
             (["--roofline"], "--roofline"),
             (["--autotune"], "--autotune"),
-            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
         ],
     )
     def test_pytorch_runtime_rejects_hipdnn_only_options(
@@ -233,12 +232,12 @@ class TestFast:
     def test_one_engine_and_one_plugin_file_is_accepted_with_selection_options(
         self,
     ) -> None:
-        argv = [*self._BASE, "--autotune", "--hipdnn-cache-dir", "/c"]
+        argv = [*self._BASE, "--autotune", "--benchmark-work-dir", "/w"]
         config = SuiteConfig.from_namespace(_namespace(argv))
-        assert (config.fast, config.autotune, config.hipdnn_cache_dir) == (
+        assert (config.fast, config.autotune, config.benchmark_work_dir) == (
             True,
             True,
-            "/c",
+            str(Path("/w")),
         )
 
     @pytest.mark.parametrize(

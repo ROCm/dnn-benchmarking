@@ -30,6 +30,7 @@ from typing import (
 )
 
 from ..common.exceptions import UnsupportedGraphError
+from ..common.work_dir import work_dir
 from ..config.benchmark_config import (
     PyTorchSdpaBackendName,
     ReferencePrecision,
@@ -52,12 +53,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import (
-    build_tuned_plan,
-    run_pytorch_tuned,
-    run_tuned_plan,
-    tuned_in_process,
-)
+from .oracle import run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
     Catalog,
     RockeKernel,
@@ -86,7 +82,6 @@ class _GraphContext:
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
-    graph_id: str = ""  # hipDNN runs only
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -508,7 +503,8 @@ def run_single_provider_engine(
     engine_version: str,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
-    """Build, time, validate (and optionally tune/profile) one hipDNN engine."""
+    """Build, time and validate one hipDNN engine; then its tuned run and
+    profiling passes, each in a child process."""
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
     row = ProviderEngineResult(
@@ -521,34 +517,14 @@ def run_single_provider_engine(
     )
     memory_at_start = _gpu_memory_at_row_start()
     try:
-        if tuned_in_process(ctx.graph_id, engine_id):
-            # Typically the stall-fallback rerun of a graph whose first
-            # attempt already ran this engine's search, or a repeated graph.
-            raise RuntimeError(
-                "OOTB not measurable: this engine already ran a tuned search on "
-                "this graph in this process, and hipDNN would serve its winner"
-            )
         # Absorb the engine's one-time build costs (provider setup, cold
-        # plugin and kernel file reads) before timing, so the OOTB and tuned
-        # build times start from the same state.
+        # plugin and kernel file reads) before the timed build.
         primer.prime(handle, ctx.graph_json_str, config.timing_policy, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
         row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
-        tuned = (
-            build_tuned_plan(
-                row=row,
-                handle=handle,
-                engine_id=engine_id,
-                graph_json_str=ctx.graph_json_str,
-                graph_name=ctx.graph_name,
-                config=config,
-            )
-            if config.oracle
-            else None
-        )
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -562,23 +538,9 @@ def run_single_provider_engine(
             _validate_row(
                 row, ctx, bm, lambda: executor.execute_once(handle, variant_pack)
             )
-
-            if tuned is not None:
-                run_tuned_plan(
-                    tuned=tuned,
-                    row=row,
-                    graph_id=ctx.graph_id,
-                    engine_id=engine_id,
-                    graph_name=ctx.graph_name,
-                    config=config,
-                    bm=bm,
-                    variant_pack=variant_pack,
-                    tensor_infos=ctx.tensor_infos,
-                    reference_outputs=ctx.reference_outputs,
-                )
-        # Release both workspaces before the profiling child allocates its own
-        # VRAM; holding them roughly doubles peak VRAM on large graphs.
-        del executor, tuned
+        # Release the workspace before a child (tuned run, profiling) allocates
+        # its own VRAM.
+        del executor
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
@@ -590,8 +552,21 @@ def run_single_provider_engine(
             _failure_message(e, memory_at_start),
         )
 
-    # Profiling re-runs the workload after the timed pass, so profiler
-    # overhead cannot pollute the headline numbers.
+    # The tuned run and profiling run after the OOTB pass, each in its own
+    # process: the tuned run uses the kept tuned selection state while this
+    # process uses an empty OOTB one, and profiler overhead cannot pollute
+    # the headline numbers.
+    if config.oracle:
+        run_hipdnn_tuned(
+            row=row,
+            graph_path=ctx.graph_path,
+            graph_name=ctx.graph_name,
+            tensor_infos=ctx.tensor_infos,
+            reference_outputs=ctx.reference_outputs,
+            engine_id=engine_id,
+            plugin_path=plugin_path,
+            config=config,
+        )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
@@ -674,6 +649,7 @@ def _run_profiling(
                 warmup_iters=ctx.config.warmup_iters,
                 metrics_config=ctx.config.metrics,
                 plugin_path=plugin_path,
+                work_dir=work_dir(ctx.config.benchmark_work_dir),
             )
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
@@ -963,7 +939,7 @@ def _run_graph(
             errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
             graph.error = "; ".join(errors)
             return graph
-        ctx.graph_json_str, ctx.graph_id = json.dumps(graph_json), graph.graph_id
+        ctx.graph_json_str = json.dumps(graph_json)
         if config.validation.enabled:
             reference_row = _prepare_references(ctx)
             if reference_row is not None:

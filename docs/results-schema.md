@@ -67,8 +67,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
-| `miopen_user_db` | string or null | `--miopen-user-db`: the MIOpen user database that the run reused and kept. Not `null` marks a possibly warm run, whose `first_call_ms` is not comparable with a run on an empty database. |
+| `benchmark_work_dir` | string | The work directory: `--benchmark-work-dir`, else the default. `--fast`, `--autotune` and `--oracle` tuned runs use its kept tuned state, so they can be warm; see [usage.md](usage.md#work-directory---benchmark-work-dir). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |

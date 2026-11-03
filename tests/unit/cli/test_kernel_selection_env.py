@@ -33,25 +33,20 @@ def test_default_stays_on_the_heuristic_path() -> None:
     assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
 
-def test_autotune_without_cache_dir_is_a_hazard() -> None:
-    [warning] = _warnings(autotune=True)
-    assert "--hipdnn-cache-dir" in warning
+def test_autotune_says_earlier_tuned_results_are_reused() -> None:
+    lines = _lines(autotune=True)
+    assert [line for line in lines if line.startswith("WARNING")] == []
+    assert any("--benchmark-work-dir" in line for line in lines)
+    assert any("kernel selection: autotune;" in line for line in lines)
     assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
-def test_autotune_with_cache_dir_is_isolated() -> None:
-    lines = _lines(autotune=True, hipdnn_cache_dir="/tmp/phase-x")
-    assert [line for line in lines if line.startswith("WARNING")] == []
-    assert any("kernel selection: autotune;" in line for line in lines)
-    assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
-
-
-def test_autotune_with_the_disk_cache_off_reports_no_stale_winner(monkeypatch) -> None:
-    """With HIPDNN_DISABLE_CACHE set, no earlier winner can be served: the
-    line says the cache is off and the stale-winner hazard is not raised."""
+def test_autotune_with_the_disk_cache_off_reports_it(monkeypatch) -> None:
+    """With HIPDNN_DISABLE_CACHE set, no earlier ranking can be served: the
+    line says the cache is off and no reuse note is printed."""
     monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
     lines = _lines(autotune=True)
-    assert [line for line in lines if line.startswith("WARNING")] == []
+    assert not any("--benchmark-work-dir" in line for line in lines)
     assert any("cache: disabled" in line for line in lines)
 
 

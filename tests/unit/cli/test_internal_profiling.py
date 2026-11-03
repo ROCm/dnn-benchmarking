@@ -16,7 +16,7 @@ from dnn_benchmarking.metrics.profiling_orchestrator import build_inner_argv
 
 def _child_args(plugin_path=None):
     """Parse exactly what the orchestrator emits, as the child would."""
-    argv = build_inner_argv(Path("/g/x.json"), 42, 11, 3, 7, plugin_path)
+    argv = build_inner_argv(Path("/g/x.json"), 42, 11, 3, 7, plugin_path, Path("/w"))
     return create_parser().parse_args(argv[3:])  # drop python -m dnn_benchmarking
 
 

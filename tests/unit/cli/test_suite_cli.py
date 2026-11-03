@@ -488,8 +488,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "reference_precision": "float64",
         "oracle": False,
         "autotune": False,
-        "hipdnn_cache_dir": None,
-        "miopen_user_db": None,
+        "benchmark_work_dir": str(tmp_path / "workspace" / "work"),
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,
@@ -512,19 +511,19 @@ def test_run_config_records_non_default_selection_and_validation(
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "")
     monkeypatch.setenv("HIPDNN_CACHE_DIR", "")
     runtime(lambda path: _graph(path, [_passed()]))
-    out, cache = tmp_path / "out.json", str(tmp_path / "cache")
+    out, work = tmp_path / "out.json", tmp_path / "work"
     _run(
         _args(
             *("-o", str(out), "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
             *("--validate", "pytorch", "--rtol", "1e-3"),
-            *("--autotune", "--hipdnn-cache-dir", cache),
+            *("--autotune", "--benchmark-work-dir", str(work)),
         ),
         _graphs(tmp_path, 1),
     )
     config = SuiteResult.load(out)["run"]["config"]
     picked = {k: config[k] for k in ("engine_filter", "rtol")}
     assert picked == {"engine_filter": ["0x15B46865C717A122"], "rtol": 1e-3}
-    assert (config["autotune"], config["hipdnn_cache_dir"]) == (True, cache)
+    assert (config["autotune"], config["benchmark_work_dir"]) == (True, str(work))
 
 
 def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -> None:
@@ -677,72 +676,75 @@ def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> N
     assert calls == []  # rejected before any handle
 
 
-def _fast_main(tmp_path, n_graphs: int, *extra: str) -> int:
-    """Run ``dnn-benchmark --fast`` on ``n_graphs`` copies of the sample."""
+def _engine_main(tmp_path, n_graphs: int, *extra: str) -> int:
+    """Run ``dnn-benchmark -e MIOPEN_ENGINE`` on ``n_graphs`` copies of the
+    sample, with a plugin library file."""
     plugin = tmp_path / "libmiopen_plugin.so"
     plugin.write_bytes(b"")
     graphs = _graphs(tmp_path, n_graphs)
     return cli_main(
         [
             *("--graph", *map(str, graphs)),
-            *("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
+            *("-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
             *extra,
         ]
     )
 
 
-def test_fast_run_shares_one_new_user_db(tmp_path, monkeypatch, runtime) -> None:
-    """Every graph of a --fast run sees one new MIOpen user database, which
-    replaces the inherited one, starts empty and is removed after the run.
-    hipDNN's disk cache stays as configured."""
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
-    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
-    monkeypatch.delenv("HIPDNN_DISABLE_CACHE", raising=False)
+def _recording_state(runtime) -> list:
+    """Install a runtime that records the selection state each graph sees and
+    adds one find record per graph."""
     seen = []
 
     def run(path):
+        cache = Path(os.environ["HIPDNN_CACHE_DIR"])
         db = Path(os.environ["MIOPEN_USER_DB_PATH"])
-        seen.append((db, sorted(db.iterdir()), "HIPDNN_DISABLE_CACHE" in os.environ))
+        seen.append((cache, db, sorted(p.name for p in db.iterdir())))
         (db / f"{path.stem}.ufdb.txt").write_text("record")
         return _graph(path, [_passed()])
 
     runtime(run)
-    assert _fast_main(tmp_path, 2) == 0
-
-    (db, first, cache_off), (db2, second, _) = seen
-    assert db != Path("/shell/db")
-    assert (db2, first, cache_off) == (db, [], False)
-    assert [p.name for p in second] == ["g0.ufdb.txt"]  # shared by later graphs
-    assert not db.exists()
+    return seen
 
 
-def test_fast_with_miopen_user_db_keeps_it_for_the_next_run(
+def test_ootb_run_gets_a_new_empty_state_removed_after_it(
     tmp_path, monkeypatch, runtime
 ) -> None:
-    """With --miopen-user-db, a --fast run uses that database and keeps it, so
-    a second run starts with the first run's records; run.config records it."""
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
-    user_db = tmp_path / "miopen-db"
-    seen = []
+    """Graphs of one command share a new, empty state under ootb/temp that
+    replaces the inherited one and is removed when the command ends."""
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
+    seen = _recording_state(runtime)
+    work = tmp_path / "work"
 
-    def run(path):
-        db = Path(os.environ["MIOPEN_USER_DB_PATH"])
-        seen.append(sorted(p.name for p in db.iterdir()))
-        (db / f"{path.stem}.ufdb.txt").write_text("record")
-        return _graph(path, [_passed()])
+    assert _engine_main(tmp_path, 2, "--benchmark-work-dir", str(work)) == 0
+    assert _engine_main(tmp_path, 1, "--benchmark-work-dir", str(work)) == 0
 
-    runtime(run)
-    out = tmp_path / "out.json"
-    args = ("--miopen-user-db", str(user_db), "-o", str(out))
-    assert _fast_main(tmp_path, 1, *args) == 0
-    assert _fast_main(tmp_path, 1, *args) == 0
-
-    assert seen == [[], ["g0.ufdb.txt"]]  # the second run starts warm
-    config = SuiteResult.load(out)["run"]["config"]
-    assert config["miopen_user_db"] == str(user_db)
+    (cache, db, first), (_, db2, second), (_, db3, third) = seen
+    assert db.parent.parent == work / "ootb" / "temp"
+    assert cache.parent == db.parent
+    assert (db2, first, second) == (db, [], ["g0.ufdb.txt"])
+    assert (db3 != db, third) == (True, [])  # the next command starts empty
+    assert not db.exists() and not db3.exists()
 
 
-def test_unusable_miopen_user_db_is_a_usage_error_before_startup(
+def test_fast_uses_the_tuned_state_and_keeps_it(tmp_path, runtime) -> None:
+    """--fast runs on <work>/tuned, so the next command starts with the find
+    records of the first; run.config records the work dir."""
+    seen = _recording_state(runtime)
+    work, out = tmp_path / "work", tmp_path / "out.json"
+    args = ("--fast", "--benchmark-work-dir", str(work), "-o", str(out))
+
+    assert _engine_main(tmp_path, 1, *args) == 0
+    assert _engine_main(tmp_path, 1, *args) == 0
+
+    (cache, db, first), (_, db2, second) = seen
+    tuned = work / "tuned"
+    assert (cache, db) == (tuned / "hipdnn-cache", tuned / "miopen-user-db")
+    assert (db2, first, second) == (db, [], ["g0.ufdb.txt"])
+    assert SuiteResult.load(out)["run"]["config"]["benchmark_work_dir"] == str(work)
+
+
+def test_unusable_work_dir_is_a_usage_error_before_startup(
     tmp_path, runtime, capsys
 ) -> None:
     runtime(lambda path: _graph(path, [_passed()]))
@@ -750,19 +752,18 @@ def test_unusable_miopen_user_db_is_a_usage_error_before_startup(
     blocker.write_text("")
     graph = str(_graphs(tmp_path, 1)[0])
     with pytest.raises(SystemExit) as exit_info:
-        cli_main(["--graph", graph, "--miopen-user-db", str(blocker / "db")])
+        cli_main(["--graph", graph, "--benchmark-work-dir", str(blocker)])
     assert exit_info.value.code == 2
-    assert f"--miopen-user-db {blocker / 'db'}" in capsys.readouterr().err
+    assert f"benchmark work dir {blocker}" in capsys.readouterr().err
     assert runtime.calls == []  # no runtime started
 
 
 @pytest.mark.parametrize("probe_fails", [False, True], ids=["returns", "raises"])
-def test_fast_destroys_the_handle_while_its_user_db_exists(
+def test_handle_is_destroyed_while_the_ootb_state_exists(
     tmp_path, monkeypatch, probe_fails
 ) -> None:
-    """The one --fast handle (and its MIOpen handle) is destroyed before the
-    run's MIOpen user database is removed, also when an error escapes the run."""
-    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path / "workspace"))
+    """The hipDNN handle (and its MIOpen handle) is destroyed before the
+    command's OOTB state is removed, also when an error escapes the run."""
     calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
     monkeypatch.setattr(runtimes, "run_graph", lambda *a: _graph(a[0], [_passed()]))
     if probe_fails:
@@ -772,9 +773,9 @@ def test_fast_destroys_the_handle_while_its_user_db_exists(
 
         monkeypatch.setattr(suite_runner_cli, "collect_environment_info", probe)
         with pytest.raises(RuntimeError, match="amdsmi crashed"):
-            _fast_main(tmp_path, 1)
+            _engine_main(tmp_path, 1)
     else:
-        assert _fast_main(tmp_path, 1) == 0
+        assert _engine_main(tmp_path, 1) == 0
 
     assert calls[1:] == ["Handle", ("destroy", True)]
 
@@ -804,9 +805,7 @@ def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path))
     )
-    runner = runtimes.start_runtime(
-        config, Reporter(output=io.StringIO()), ExitStack()
-    )
+    runner = runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
     assert runner("g.json", {}, []) == "ran"
     # The hipDNN planner, bound to the handle that startup created and checked.
     ((path, _, _, run_config, _, planners),) = seen
@@ -914,49 +913,14 @@ def _warnings(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if "WARNING:" in line)
 
 
-@pytest.mark.parametrize(
-    "env, argv, expected",
-    [
-        ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-        ),
-        ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_CACHE=1",
-        ),
-        (
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "1"},
-            ["--warmup", "0"],  # priming always runs untimed: nothing to warn
-            None,
-        ),
-    ],
-    ids=[
-        "exact-cache-on",
-        "exact-cache-zero",
-        "provider-cache-on",
-        "provider-cache-zero",
-        "cold",
-    ],
-)
-def test_oracle_warns_on_non_cold_baseline(
-    tmp_path, runtime, monkeypatch, env, argv, expected
-) -> None:
+def test_oracle_needs_no_cache_warning(tmp_path, runtime, monkeypatch) -> None:
+    """OOTB plans run on an empty selection state, so hipDNN's caches no
+    longer make the baseline warm."""
     for name in ("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "HIPDNN_DISABLE_CACHE"):
         monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle", *argv), _graphs(tmp_path, 1))
-    warnings = _warnings(text)
-    if expected is None:
-        assert warnings == ""
-    else:
-        assert expected in warnings
+    _, text = _run(_args("--oracle"), _graphs(tmp_path, 1))
+    assert _warnings(text) == ""
 
 
 def test_final_write_survives_a_second_signal(
@@ -978,14 +942,6 @@ def test_final_write_survives_a_second_signal(
     assert code == 130
     assert SuiteResult.load(out)["run"]["complete"] is False
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
-
-
-@pytest.mark.parametrize("flag", ["--no-oracle", "--oracle"])
-def test_oracle_states_the_tuned_plan_knob(tmp_path, runtime, flag) -> None:
-    runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args(flag), _graphs(tmp_path, 1))
-    notice = "each engine gets a second plan built with global.benchmarking=1"
-    assert (notice in text) == (flag == "--oracle")
 
 
 @pytest.mark.parametrize(
