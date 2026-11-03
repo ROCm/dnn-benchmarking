@@ -623,7 +623,7 @@ def test_missing_plugin_path_is_usage_error(tmp_path, monkeypatch) -> None:
     missing = tmp_path / "nonexistent"
     code, text = _run(_args("--plugin-path", str(missing)), _graphs(tmp_path, 1))
     assert code == 2
-    assert f"does not exist: {missing}" in text
+    assert f"not a plugin directory or library file: {missing}" in text
     assert calls == []  # rejected before any handle
 
 
