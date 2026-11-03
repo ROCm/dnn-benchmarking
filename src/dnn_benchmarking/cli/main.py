@@ -32,24 +32,39 @@ def _create_cache_base(
     return Path(temporary_directory.name), temporary_directory
 
 
-def _configure_cache_env() -> tempfile.TemporaryDirectory[str] | None:
-    """Point unset ROCm/tool cache variables away from the (network) home dir.
+def _configure_cache_env(fast: bool) -> List[tempfile.TemporaryDirectory[str]]:
+    """Set the ROCm/tool cache variables; the one owner of ``MIOPEN_USER_DB_PATH``.
 
-    MIOpen, comgr and torch default to ~/.cache or ~/.miopen. Uses
-    DNN_BENCH_WORKSPACE (set by setup_env.py) or a private temporary directory,
-    allocated only when a variable is unset. Must run before any GPU runtime
-    initialises. Keep the returned object alive for the run; its finalizer
-    removes the temporary directory.
+    MIOpen, comgr and torch default to ~/.cache or ~/.miopen. Unset variables
+    point to DNN_BENCH_WORKSPACE (set by setup_env.py) or to a private
+    temporary directory, allocated only when a variable is unset.
+
+    With ``fast`` (``--fast``), the MIOpen user database is a new, empty
+    temporary directory that replaces any inherited value. MIOpen reads the
+    variable once per process, so every graph of the run shares it, and no
+    earlier command changes the selection. hipDNN's disk cache is off.
+
+    Must run before any GPU runtime initialises. Keep the returned objects
+    alive for the run, past the hipDNN handle; their finalizers remove the
+    temporary directories.
     """
+    lifetimes: List[tempfile.TemporaryDirectory[str]] = []
+    if fast:
+        user_db = tempfile.TemporaryDirectory(prefix="dnn-bench-fast-db-")
+        lifetimes.append(user_db)
+        os.environ["MIOPEN_USER_DB_PATH"] = user_db.name
+        os.environ["HIPDNN_DISABLE_CACHE"] = "1"
     unset = [var for var in _CACHE_ENV_SUBDIRS if var not in os.environ]
     if not unset:
-        return None
+        return lifetimes
     base, lifetime = _create_cache_base(os.environ.get("DNN_BENCH_WORKSPACE"))
+    if lifetime is not None:
+        lifetimes.append(lifetime)
     for var in unset:
         path = base / _CACHE_ENV_SUBDIRS[var]
         path.mkdir(parents=True, exist_ok=True)
         os.environ[var] = str(path)
-    return lifetime
+    return lifetimes
 
 
 def _resolve_graphs(args, reporter) -> tuple[list, Optional[List[str]], Optional[str]]:
@@ -80,13 +95,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         return compare_main(argv[1:])
 
-    _cache_lifetime = _configure_cache_env()  # noqa: F841 - keeps the dir alive
     parser = create_parser(suppress_defaults=True)
     args = parser.parse_args(argv)
     try:
         apply_config_file(args)
     except ValueError as e:
         parser.error(str(e))
+    # After parsing (--fast can come from the config file), before any GPU
+    # runtime initialises.
+    _cache_lifetimes = _configure_cache_env(  # noqa: F841 - keeps the dirs alive
+        fast=bool(args.fast)
+    )
 
     # Runtime startup (in the suite runner) is the authoritative GPU check;
     # optional telemetry tools such as amd-smi are not gated here.

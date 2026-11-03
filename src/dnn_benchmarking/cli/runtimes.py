@@ -78,6 +78,13 @@ def _start_pytorch(config: SuiteConfig, reporter: Reporter) -> GraphPlanner:
 
 
 def _start_rocke(config: SuiteConfig, reporter: Reporter) -> GraphPlanner:
+    files = [str(p) for p in config.plugin_paths or [] if p.is_file()]
+    if files:
+        raise RuntimeStartupError(
+            "--runtime rocke reads the kernel descriptors under plugin "
+            f"directories; --plugin-path names a file: {', '.join(files)}",
+            exit_code=2,
+        )
     _check_torch_gpu("rocke")
     if not torch_support.is_rocm_build():
         raise RuntimeStartupError(
@@ -202,22 +209,21 @@ def _create_hipdnn_handle(
 
 
 def _check_plugin_paths(config: SuiteConfig) -> None:
-    """Plugin directories exist; with ``--fast``, the one path is a file."""
-    if config.fast:
-        plugin = config.plugin_path
-        if plugin is None or not plugin.is_file():
-            raise RuntimeStartupError(
-                f"--fast: --plugin-path must name one plugin library file "
-                f"(for example .../hipdnn_plugins/engines/libmiopen_plugin.so); "
-                f"got {plugin}",
-                exit_code=2,
-            )
-        return
-    missing = [str(p) for p in config.plugin_paths or [] if not p.is_dir()]
+    """Every plugin path exists: a plugin directory, whose libraries all
+    load, or one plugin library file, which loads alone. With ``--fast`` the
+    one path must be a library file."""
+    missing = [str(p) for p in config.plugin_paths or [] if not p.exists()]
     if missing:
         raise RuntimeStartupError(
-            f"hipDNN plugin path is not a directory: {', '.join(missing)} "
+            f"hipDNN plugin path does not exist: {', '.join(missing)} "
             "(check --plugin-path)",
+            exit_code=2,
+        )
+    if config.fast and not config.plugin_path.is_file():
+        raise RuntimeStartupError(
+            f"--fast: --plugin-path must name one plugin library file "
+            f"(for example .../hipdnn_plugins/engines/libmiopen_plugin.so); "
+            f"got {config.plugin_path}",
             exit_code=2,
         )
 

@@ -33,7 +33,6 @@ from ..reporting.suite_results import (
     engine_id_hex,
     graph_id_for,
 )
-from .fast_mode import fast_mode_environment
 from .runtimes import RuntimeStartupError, GraphRunner, start_runtime
 
 #: Minimum seconds between intermediate result writes.
@@ -143,12 +142,16 @@ def run_suite_cli(
     if missing:
         return 2
 
-    # Resources close in reverse order: the runtime's handles are destroyed
-    # before the --fast environment (its MIOpen user database) goes, on every
-    # exit path.
+    # The runtime's handles are destroyed when ``resources`` closes, on every
+    # exit path, while the MIOpen user database that ``cli.main`` owns still
+    # exists.
     with ExitStack() as resources:
         if config.fast:
-            resources.enter_context(fast_mode_environment(reporter))
+            reporter.info(
+                "--fast: one process, one handle; MIOpen user database "
+                f"{os.environ.get('MIOPEN_USER_DB_PATH')} (new, shared by every "
+                "graph); hipDNN disk cache off"
+            )
         _warn_ignored_options(config, reporter)
         _apply_pytorch_environment(config, reporter)
         if RuntimeName.HIPDNN in config.runtimes:

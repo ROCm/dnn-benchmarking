@@ -37,7 +37,26 @@ def test_configure_cache_env_only_fills_unset_variables(
     for var in ("XDG_CACHE_HOME", "MIOPEN_USER_DB_PATH", "MIOPEN_CUSTOM_CACHE_DIR"):
         monkeypatch.setenv(var, "/preset")
 
-    assert _configure_cache_env() is None  # workspace given: no temp dir
+    assert _configure_cache_env(fast=False) == []  # workspace given: no temp dir
     assert os.environ["XDG_CACHE_HOME"] == "/preset"
+    assert os.environ["MIOPEN_USER_DB_PATH"] == "/preset"
     assert Path(os.environ["AMD_COMGR_CACHE_DIR"]).parent == tmp_path
     assert Path(os.environ["AMD_COMGR_CACHE_DIR"]).is_dir()
+
+
+def test_fast_gets_a_new_empty_user_db_over_an_inherited_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """--fast replaces even a preset MIOpen user database with a new, empty
+    directory that its lifetime object removes; hipDNN's disk cache is off."""
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/preset")
+
+    [lifetime] = _configure_cache_env(fast=True)
+
+    user_db = Path(os.environ["MIOPEN_USER_DB_PATH"])
+    assert user_db == Path(lifetime.name)
+    assert list(user_db.iterdir()) == []
+    assert os.environ["HIPDNN_DISABLE_CACHE"] == "1"
+    lifetime.cleanup()
+    assert not user_db.exists()

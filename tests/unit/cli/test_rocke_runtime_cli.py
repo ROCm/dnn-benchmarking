@@ -81,3 +81,13 @@ def test_hipdnn_only_option_is_usage_error(flag) -> None:
     code, text = _run("-r", "rocke", *flag)
     assert code == 2
     assert flag[0] in text
+
+
+def test_plugin_library_file_is_usage_error(tmp_path) -> None:
+    """rocKE reads descriptors under plugin directories, so a file is refused
+    before any GPU check."""
+    plugin = tmp_path / "libhip_kernel_provider.so"
+    plugin.write_bytes(b"")
+    code, text = _run("-r", "rocke", "--plugin-path", str(plugin))
+    assert code == 2
+    assert f"--plugin-path names a file: {plugin}" in text
