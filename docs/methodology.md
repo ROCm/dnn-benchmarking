@@ -350,6 +350,22 @@ The order of the graphs can thus change `build_ms` and `first_call_ms`. Do
 not compare them between a `--fast` run and a run without it, or between the
 first graph of a `--fast` run and the later ones.
 
+## Kept MIOpen user database (`--miopen-user-db`)
+
+MIOpen stores its find results in the user database. A convolution's first
+call runs the find when the database has no record for the problem, and the
+find can take minutes per problem: on one gfx1151 host, 7 convolution graphs
+took 475 s on an empty database and 46 s on the database of an earlier run.
+
+With `--miopen-user-db PATH`, a run reads and extends the database at `PATH`,
+so the find results of earlier commands remove that setup work. In such a
+warm run:
+
+- `first_call_ms` and the run's wall time are smaller; do not compare them
+  with a run on an empty database. `run.config.miopen_user_db` marks the run.
+- `kernel_med` measures the kernel that the stored find result selects. It
+  compares with a cold run when both select the same kernel.
+
 ## Parity with other harnesses
 
 This table compares the tool with the rocKE runtime timer
