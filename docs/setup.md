@@ -58,7 +58,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 |---|---|
 | `--torch-mode {rocm,cuda,cpu,existing,none}` | How to provide PyTorch. Default `rocm`. See [Torch modes](#torch-modes). |
 | `--workspace WORKSPACE` | Root for the venv, the Python bytecode cache and the runtime caches. See [Workspace](#workspace). |
-| `--no-editable` | Install dnn-benchmarking into the venv. The default links to the source tree. |
+| `--no-editable` | Install dnn-benchmarking and the rocKE packages into the venv. The default links to the source tree. |
 | `--torch-index-url URL` | pip index URL for PyTorch. |
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
@@ -253,8 +253,11 @@ you turn an engine option off, setup still installs the plugin `.so`. Graphs
 that only that engine supports then report `no engines applicable`.
 
 On Linux, setup also installs the rocKE Python packages (`rocke`, `kernels`,
-`builders`, `dispatch`) into the venv as editable installs from
-`rocm-libraries/dnn-providers/hip-kernel-provider/rocke`. `--runtime rocke`
+`builders`, `dispatch`) into the venv from
+`rocm-libraries/dnn-providers/hip-kernel-provider/rocke`. They are editable
+installs by default; with `--no-editable` setup copies them into the venv, so
+a venv copied without the checkout (as in a multi-stage image) still imports
+them. `--runtime rocke`
 needs them. In a source build they come from the same checkout as the
 plugins, so rocKE's specs and runtime match the kernels that the plugin
 ships. With `--reuse-artifacts`, the plugins come from an earlier build, so
