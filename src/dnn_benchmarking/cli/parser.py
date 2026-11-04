@@ -155,7 +155,7 @@ def _parse_engine_list(s: str) -> List[int]:
 
 
 def _parse_plugin_path_list(s: str) -> List[Path]:
-    """Parse --plugin-path as a comma-separated list of plugin directories."""
+    """Parse --plugin-path as a comma list of plugin directories or library files."""
     parts = [p for p in (p.strip() for p in s.split(",")) if p]
     if not parts:
         raise argparse.ArgumentTypeError("requires at least one path")
@@ -334,8 +334,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Runtime/Selection",
         parser_type=_parse_plugin_path_list,
         metavar="PATHS",
-        help="plugin dir, or comma list matching --engine order "
-        "(default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
+        help="plugin dir or plugin library file, or comma list matching --engine "
+        "order (default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
         config_key="plugin_path",
         config_kind=ConfigKind.PATH_OR_PATH_LIST,
     ),
@@ -346,17 +346,30 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         SuiteConfig,
         "autotune",
         "benchmark candidate kernels on first execute and cache the winner "
-        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --hipdnn-cache-dir",
+        "(HIPDNN_FORCE_BENCHMARKING=1), in the tuned state of the work dir",
     ),
     CliOption(
-        flags=("--hipdnn-cache-dir",),
-        dest="hipdnn_cache_dir",
+        flags=("--benchmark-work-dir",),
+        dest="benchmark_work_dir",
         group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
-        help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
-        config_key="hipdnn_cache_dir",
+        help="work dir: cache/ (compile caches), tuned/ (hipDNN cache and MIOpen "
+        "user DB of --fast, --autotune and --oracle tuned runs, kept) and "
+        "ootb/temp/ (empty state of every other run, removed after it) "
+        "(default: $DNN_BENCH_WORKSPACE/work, else ~/.cache/dnn-benchmark/work)",
+        config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
+    ),
+    _bool_option(
+        ("--fast",),
+        "fast",
+        "Runtime/Selection",
+        SuiteConfig,
+        "fast",
+        "run every graph through one engine in this process: one handle, only "
+        "the plugin under test loaded, warm caches (requires one -e and "
+        "--plugin-path naming the plugin library file)",
     ),
     _choice_option(
         ("--pytorch-sdpa-backend",),

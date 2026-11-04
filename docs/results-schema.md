@@ -67,7 +67,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
+| `benchmark_work_dir` | string | The work directory: `--benchmark-work-dir`, else the default. `--fast`, `--autotune` and `--oracle` tuned runs use its kept tuned state, so they can be warm; see [usage.md](usage.md#work-directory---benchmark-work-dir). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |

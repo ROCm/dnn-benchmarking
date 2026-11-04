@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import types
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Callable, List
 
@@ -94,7 +95,7 @@ def runtime(monkeypatch):
     calls = []
 
     def install(run: Callable[[Path], GraphResult]) -> None:
-        def start(config, reporter):
+        def start(config, reporter, resources):
             calls.append(config)
             return lambda path, graph_json, infos: run(path)
 
@@ -254,7 +255,7 @@ def run_graph(path, graph_json, infos):
 
 cli.SIGTERM_GRACE_S = 0.5
 cli.collect_environment_info = lambda: {}
-cli.start_runtime = lambda config, reporter: run_graph
+cli.start_runtime = lambda config, reporter, resources: run_graph
 args = create_parser(suppress_defaults=True).parse_args(["-g", "unused"])
 apply_config_file(args)
 code = cli.run_suite_cli(args, [Path(sys.argv[1])], Reporter(output=io.StringIO()))
@@ -487,7 +488,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "reference_precision": "float64",
         "oracle": False,
         "autotune": False,
-        "hipdnn_cache_dir": None,
+        "benchmark_work_dir": str(tmp_path / "workspace" / "work"),
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
         "metrics": True,
@@ -510,19 +511,19 @@ def test_run_config_records_non_default_selection_and_validation(
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "")
     monkeypatch.setenv("HIPDNN_CACHE_DIR", "")
     runtime(lambda path: _graph(path, [_passed()]))
-    out, cache = tmp_path / "out.json", str(tmp_path / "cache")
+    out, work = tmp_path / "out.json", tmp_path / "work"
     _run(
         _args(
             *("-o", str(out), "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
             *("--validate", "pytorch", "--rtol", "1e-3"),
-            *("--autotune", "--hipdnn-cache-dir", cache),
+            *("--autotune", "--benchmark-work-dir", str(work)),
         ),
         _graphs(tmp_path, 1),
     )
     config = SuiteResult.load(out)["run"]["config"]
     picked = {k: config[k] for k in ("engine_filter", "rtol")}
     assert picked == {"engine_filter": ["0x15B46865C717A122"], "rtol": 1e-3}
-    assert (config["autotune"], config["hipdnn_cache_dir"]) == (True, cache)
+    assert (config["autotune"], config["benchmark_work_dir"]) == (True, str(work))
 
 
 def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -> None:
@@ -565,6 +566,10 @@ def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
         PluginLoadingMode=types.SimpleNamespace(ABSOLUTE="abs"),
         set_engine_plugin_paths=lambda paths, mode: calls.append(paths),
         engine_id_to_name=lambda engine_id: names.get(engine_id, ""),
+        # Records whether the MIOpen user database still exists at the destroy.
+        destroy_handle=lambda handle: calls.append(
+            ("destroy", os.path.isdir(os.environ.get("MIOPEN_USER_DB_PATH", "")))
+        ),
     )
     monkeypatch.setitem(sys.modules, "hipdnn_frontend", module)
     monkeypatch.setattr(runtimes, "initialize_pip_rocm_runtime", lambda: None)
@@ -583,13 +588,17 @@ def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
     a, b = _plugin_dirs(tmp_path)
     calls = _fake_hipdnn(monkeypatch, loaded={a: {1}, b: {1}})
     handles = []
-    monkeypatch.setattr(runtimes, "hipdnn_planner", handles.append)
+    monkeypatch.setattr(
+        runtimes, "hipdnn_planner", lambda handle, prime_once: handles.append(handle)
+    )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "1,1", "--plugin-path", f"{a},{b}")
     )
 
-    runtimes.start_runtime(config, Reporter(output=io.StringIO()))(None, {}, [])
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())(
+        None, {}, []
+    )
 
     assert calls == [[a], "Handle", [b], "Handle"]
     assert handles == [None]  # the runner creates one handle per pair
@@ -614,8 +623,161 @@ def test_missing_plugin_path_is_usage_error(tmp_path, monkeypatch) -> None:
     missing = tmp_path / "nonexistent"
     code, text = _run(_args("--plugin-path", str(missing)), _graphs(tmp_path, 1))
     assert code == 2
-    assert f"not a directory: {missing}" in text
+    assert f"not a plugin directory or library file: {missing}" in text
     assert calls == []  # rejected before any handle
+
+
+def test_plugin_library_file_loads_only_that_plugin(tmp_path, monkeypatch) -> None:
+    """Without --fast too, a --plugin-path file is the only plugin loaded."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
+    )
+
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
+
+    assert calls == [[str(plugin)], "Handle"]
+
+
+def test_fast_loads_only_the_named_plugin_file(tmp_path, monkeypatch) -> None:
+    """--fast creates one handle with just the plugin under test loaded,
+    and asks the planner to prime once per run."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    planners = []
+    monkeypatch.setattr(
+        runtimes,
+        "hipdnn_planner",
+        lambda handle, prime_once: planners.append(prime_once) or "plan",
+    )
+    monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
+    config = suite_runner_cli.SuiteConfig.from_namespace(
+        _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin))
+    )
+
+    runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
+
+    assert calls == [[str(plugin)], "Handle"]
+    assert planners == [True]
+
+
+def test_fast_with_a_plugin_directory_is_usage_error(tmp_path, monkeypatch) -> None:
+    calls = _fake_hipdnn(monkeypatch)
+    code, text = _run(
+        _args("--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path)),
+        _graphs(tmp_path, 1),
+    )
+    assert code == 2
+    assert "--plugin-path must name one plugin library file" in text
+    assert calls == []  # rejected before any handle
+
+
+def _engine_main(tmp_path, n_graphs: int, *extra: str) -> int:
+    """Run ``dnn-benchmark -e MIOPEN_ENGINE`` on ``n_graphs`` copies of the
+    sample, with a plugin library file."""
+    plugin = tmp_path / "libmiopen_plugin.so"
+    plugin.write_bytes(b"")
+    graphs = _graphs(tmp_path, n_graphs)
+    return cli_main(
+        [
+            *("--graph", *map(str, graphs)),
+            *("-e", "MIOPEN_ENGINE", "--plugin-path", str(plugin)),
+            *extra,
+        ]
+    )
+
+
+def _recording_state(runtime) -> list:
+    """Install a runtime that records the selection state each graph sees and
+    adds one find record per graph."""
+    seen = []
+
+    def run(path):
+        cache = Path(os.environ["HIPDNN_CACHE_DIR"])
+        db = Path(os.environ["MIOPEN_USER_DB_PATH"])
+        seen.append((cache, db, sorted(p.name for p in db.iterdir())))
+        (db / f"{path.stem}.ufdb.txt").write_text("record")
+        return _graph(path, [_passed()])
+
+    runtime(run)
+    return seen
+
+
+def test_ootb_run_gets_a_new_empty_state_removed_after_it(
+    tmp_path, monkeypatch, runtime
+) -> None:
+    """Graphs of one command share a new, empty state under ootb/temp that
+    replaces the inherited one and is removed when the command ends."""
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shell/db")
+    seen = _recording_state(runtime)
+    work = tmp_path / "work"
+
+    assert _engine_main(tmp_path, 2, "--benchmark-work-dir", str(work)) == 0
+    assert _engine_main(tmp_path, 1, "--benchmark-work-dir", str(work)) == 0
+
+    (cache, db, first), (_, db2, second), (_, db3, third) = seen
+    assert db.parent.parent == work / "ootb" / "temp"
+    assert cache.parent == db.parent
+    assert (db2, first, second) == (db, [], ["g0.ufdb.txt"])
+    assert (db3 != db, third) == (True, [])  # the next command starts empty
+    assert not db.exists() and not db3.exists()
+
+
+def test_fast_uses_the_tuned_state_and_keeps_it(tmp_path, runtime) -> None:
+    """--fast runs on <work>/tuned, so the next command starts with the find
+    records of the first; run.config records the work dir."""
+    seen = _recording_state(runtime)
+    work, out = tmp_path / "work", tmp_path / "out.json"
+    args = ("--fast", "--benchmark-work-dir", str(work), "-o", str(out))
+
+    assert _engine_main(tmp_path, 1, *args) == 0
+    assert _engine_main(tmp_path, 1, *args) == 0
+
+    (cache, db, first), (_, db2, second) = seen
+    tuned = work / "tuned"
+    assert (cache, db) == (tuned / "hipdnn-cache", tuned / "miopen-user-db")
+    assert (db2, first, second) == (db, [], ["g0.ufdb.txt"])
+    assert SuiteResult.load(out)["run"]["config"]["benchmark_work_dir"] == str(work)
+
+
+def test_unusable_work_dir_is_a_usage_error_before_startup(
+    tmp_path, runtime, capsys
+) -> None:
+    runtime(lambda path: _graph(path, [_passed()]))
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    graph = str(_graphs(tmp_path, 1)[0])
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main(["--graph", graph, "--benchmark-work-dir", str(blocker)])
+    assert exit_info.value.code == 2
+    assert f"benchmark work dir {blocker}" in capsys.readouterr().err
+    assert runtime.calls == []  # no runtime started
+
+
+@pytest.mark.parametrize("probe_fails", [False, True], ids=["returns", "raises"])
+def test_handle_is_destroyed_while_the_ootb_state_exists(
+    tmp_path, monkeypatch, probe_fails
+) -> None:
+    """The hipDNN handle (and its MIOpen handle) is destroyed before the
+    command's OOTB state is removed, also when an error escapes the run."""
+    calls = _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
+    monkeypatch.setattr(runtimes, "run_graph", lambda *a: _graph(a[0], [_passed()]))
+    if probe_fails:
+
+        def probe():
+            raise RuntimeError("amdsmi crashed")
+
+        monkeypatch.setattr(suite_runner_cli, "collect_environment_info", probe)
+        with pytest.raises(RuntimeError, match="amdsmi crashed"):
+            _engine_main(tmp_path, 1)
+    else:
+        assert _engine_main(tmp_path, 1) == 0
+
+    assert calls[1:] == ["Handle", ("destroy", True)]
 
 
 def test_unknown_engine_is_usage_error(tmp_path, monkeypatch) -> None:
@@ -635,13 +797,15 @@ def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     _fake_hipdnn(monkeypatch, loaded=(0x15B46865C717A122,))
     handles, seen = [], []
     monkeypatch.setattr(
-        runtimes, "hipdnn_planner", lambda handle: handles.append(handle) or "plan"
+        runtimes,
+        "hipdnn_planner",
+        lambda handle, prime_once: handles.append(handle) or "plan",
     )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: seen.append(args) or "ran")
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("-e", "MIOPEN_ENGINE", "--plugin-path", str(tmp_path))
     )
-    runner = runtimes.start_runtime(config, Reporter(output=io.StringIO()))
+    runner = runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
     assert runner("g.json", {}, []) == "ran"
     # The hipDNN planner, bound to the handle that startup created and checked.
     ((path, _, _, run_config, _, planners),) = seen
@@ -725,7 +889,9 @@ def test_available_reference_provider_passes_startup(tmp_path, monkeypatch) -> N
     config = suite_runner_cli.SuiteConfig.from_namespace(
         _args("--validate", "pytorch", "--plugin-path", str(tmp_path))
     )
-    assert callable(runtimes.start_runtime(config, Reporter(output=io.StringIO())))
+    assert callable(
+        runtimes.start_runtime(config, Reporter(output=io.StringIO()), ExitStack())
+    )
     assert asked == ["pytorch"]
 
 
@@ -747,49 +913,14 @@ def _warnings(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if "WARNING:" in line)
 
 
-@pytest.mark.parametrize(
-    "env, argv, expected",
-    [
-        ({}, [], "HIPDNN_DISABLE_EXACT_ENGINE_CACHE"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_EXACT_ENGINE_CACHE",
-        ),
-        ({"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1"}, [], "HIPDNN_DISABLE_CACHE=1"),
-        (  # hipDNN reads "0" as off
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "0"},
-            [],
-            "HIPDNN_DISABLE_CACHE=1",
-        ),
-        (
-            {"HIPDNN_DISABLE_EXACT_ENGINE_CACHE": "1", "HIPDNN_DISABLE_CACHE": "1"},
-            ["--warmup", "0"],  # priming always runs untimed: nothing to warn
-            None,
-        ),
-    ],
-    ids=[
-        "exact-cache-on",
-        "exact-cache-zero",
-        "provider-cache-on",
-        "provider-cache-zero",
-        "cold",
-    ],
-)
-def test_oracle_warns_on_non_cold_baseline(
-    tmp_path, runtime, monkeypatch, env, argv, expected
-) -> None:
+def test_oracle_needs_no_cache_warning(tmp_path, runtime, monkeypatch) -> None:
+    """OOTB plans run on an empty selection state, so hipDNN's caches no
+    longer make the baseline warm."""
     for name in ("HIPDNN_DISABLE_EXACT_ENGINE_CACHE", "HIPDNN_DISABLE_CACHE"):
         monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
     runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args("--oracle", *argv), _graphs(tmp_path, 1))
-    warnings = _warnings(text)
-    if expected is None:
-        assert warnings == ""
-    else:
-        assert expected in warnings
+    _, text = _run(_args("--oracle"), _graphs(tmp_path, 1))
+    assert _warnings(text) == ""
 
 
 def test_final_write_survives_a_second_signal(
@@ -811,14 +942,6 @@ def test_final_write_survives_a_second_signal(
     assert code == 130
     assert SuiteResult.load(out)["run"]["complete"] is False
     assert all(signal.getsignal(s) is _sentinel_handler for s in _SIGNALS)
-
-
-@pytest.mark.parametrize("flag", ["--no-oracle", "--oracle"])
-def test_oracle_states_the_tuned_plan_knob(tmp_path, runtime, flag) -> None:
-    runtime(lambda path: _graph(path, [_passed()]))
-    _, text = _run(_args(flag), _graphs(tmp_path, 1))
-    notice = "each engine gets a second plan built with global.benchmarking=1"
-    assert (notice in text) == (flag == "--oracle")
 
 
 @pytest.mark.parametrize(

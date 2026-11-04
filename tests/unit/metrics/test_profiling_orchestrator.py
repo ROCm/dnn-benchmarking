@@ -28,6 +28,7 @@ class TestBuildInnerArgv:
             warmup_iters=5,
             iters=20,
             plugin_path=Path("/p"),
+            work_dir=Path("/w"),
         )
         # Allowlist, so no profiling/oracle flag can leak into the child.
         assert argv == [
@@ -45,12 +46,14 @@ class TestBuildInnerArgv:
             "20",
             "--seed",
             "7",
+            "--benchmark-work-dir",
+            str(Path("/w")),
             "--plugin-path",
             str(Path("/p")),
         ]
 
     def test_omits_plugin_path_when_unset(self):
-        argv = orch.build_inner_argv(Path("/g/x.json"), 1, 0, 1, 1, None)
+        argv = orch.build_inner_argv(Path("/g/x.json"), 1, 0, 1, 1, None, Path("/w"))
         assert "--plugin-path" not in argv
         assert argv[argv.index("--seed") + 1] == "0"
 
@@ -125,6 +128,7 @@ class TestResolveOutputDir:
                 warmup_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
             )
             first_root = cfg.profiling_output_dir
             assert first_root is not None
@@ -139,6 +143,7 @@ class TestResolveOutputDir:
                 warmup_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
             )
             assert cfg.profiling_output_dir == first_root
 
@@ -259,6 +264,7 @@ class TestDispatch:
             warmup_iters=1,
             metrics_config=cfg,
             plugin_path=None,
+            work_dir=Path("/w"),
             out_dir=tmp_path,
         )
         assert result == {}
@@ -287,6 +293,7 @@ class TestDispatch:
                 warmup_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
                 out_dir=tmp_path,
             )
         assert pmc.called and trace.called and perf.called and roof.called
@@ -303,6 +310,7 @@ class TestDispatch:
                 warmup_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
                 out_dir=tmp_path,
             )
         assert result["pmc"]["unexpected_error"] == "boom"
@@ -324,6 +332,7 @@ class TestDispatch:
                 warmup_iters=2,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
                 iters=7,
                 out_dir=tmp_path,
             )
@@ -371,6 +380,7 @@ class TestDispatch:
                 warmup_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
                 out_dir=tmp_path,
             )
         assert captured == {"pmc": 1234, "trace": 1234, "perf": 1234, "roofline": 1234}
@@ -399,6 +409,7 @@ class TestDispatch:
                 warmup_iters=1,
                 metrics_config=cfg,
                 plugin_path=None,
+                work_dir=Path("/w"),
                 out_dir=tmp_path,
             )
         # New layout: <root>/<graph-<hash>>/<engine_name>/<source>/.

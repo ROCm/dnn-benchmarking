@@ -116,12 +116,14 @@ def build_inner_argv(
     warmup_iters: int,
     iters: int,
     plugin_path: Optional[Path],
+    work_dir: Path,
 ) -> List[str]:
     """Argv for the ``--internal-profiling-run`` child (frozen contract).
 
     ``-m dnn_benchmarking --internal-profiling-run --graph G --engine E
-    --warmup W --iters I --seed S [--plugin-path P]``. No profiling flag
-    is ever forwarded, so the child cannot recurse.
+    --warmup W --iters I --seed S --benchmark-work-dir D [--plugin-path P]``.
+    No profiling flag is ever forwarded, so the child cannot recurse. The
+    work dir keeps the child's empty OOTB state under the parent's root.
     """
     argv = [
         sys.executable,
@@ -138,6 +140,8 @@ def build_inner_argv(
         str(iters),
         "--seed",
         str(seed),
+        "--benchmark-work-dir",
+        str(work_dir),
     ]
     if plugin_path is not None:
         argv += ["--plugin-path", str(plugin_path)]
@@ -210,6 +214,7 @@ def run_profiling_passes(
     warmup_iters: int,
     metrics_config: MetricsConfig,
     plugin_path: Optional[Path],
+    work_dir: Path,
     iters: int = PROFILING_ITERS,
     out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
@@ -227,6 +232,7 @@ def run_profiling_passes(
         warmup_iters: Child warmup iteration count.
         metrics_config: Decides which sources fire.
         plugin_path: Optional plugin path forwarded to the child.
+        work_dir: Absolute work dir of the run, forwarded to the child.
         iters: Child timed iteration count.
         out_dir: Override the resolved profiling-output root (test hook).
 
@@ -239,7 +245,7 @@ def run_profiling_passes(
     if out_dir is None:
         out_dir = resolve_output_dir(metrics_config)
     inner_argv = build_inner_argv(
-        graph_path, engine_id, seed, warmup_iters, iters, plugin_path
+        graph_path, engine_id, seed, warmup_iters, iters, plugin_path, work_dir
     )
     context = f"{graph_path.stem}/{engine_name}"
     sources = (

@@ -91,7 +91,7 @@ On Linux the venv activation script exports these variables:
 |---|---|
 | `ROCM_PATH` | The selected ROCm prefix. |
 | `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
-| `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts MIOpen, comgr and XDG caches under it when those variables are not set. |
+| `DNN_BENCH_WORKSPACE` | The workspace. The default `--benchmark-work-dir` is `<workspace>/work`: compile caches, and the kernel-selection state of the runs. |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
 
 dnn-benchmarking finds the engine plugins in
