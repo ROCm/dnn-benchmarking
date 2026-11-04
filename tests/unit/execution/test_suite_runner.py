@@ -1607,10 +1607,13 @@ def test_rocke_rows_without_a_reference(
     import psutil
 
     class Reference:
-        def estimate_host_bytes(self, graph_json):
+        def supports_float64(self, graph_json):
+            return False
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
             return host_bytes
 
-        def compute_reference(self, graph_json, input_data):
+        def compute_reference(self, graph_json, input_data, **kwargs):
             raise RuntimeError(reference_error)
 
     monkeypatch.setattr(
