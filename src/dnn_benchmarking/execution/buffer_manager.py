@@ -11,7 +11,7 @@ graph type, and are encoded to raw words only when written to device storage.
 
 import functools
 import warnings
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
+from .varlen_inputs import generate_varlen_inputs
 
 
 # fp8 formats as (exponent bits, mantissa bits); E8M0 is a special case.
@@ -141,6 +142,27 @@ def _storage_view(storage: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     return storage.reshape(tensor_info.dims)
 
 
+def _ragged_batch_views(
+    storage: np.ndarray, tensor_info: TensorInfo
+) -> Iterator[Tuple[int, np.ndarray]]:
+    """Yield (batch, view) for each non-empty batch of a ragged tensor.
+
+    The view has shape ``dims[1:]`` with the sequence dimension cut to the
+    batch's length. It starts at the batch's element offset and uses
+    ``strides[1:]``, so ``strides[0]`` is not used.
+    """
+    varlen = tensor_info.varlen
+    itemsize = storage.dtype.itemsize
+    byte_strides = tuple(s * itemsize for s in tensor_info.strides[1:])
+    for batch, (start, length) in enumerate(zip(varlen.starts, varlen.lengths)):
+        if length <= 0:
+            continue
+        shape = (tensor_info.dims[1], length, tensor_info.dims[3])
+        yield batch, np.lib.stride_tricks.as_strided(
+            storage[start:], shape=shape, strides=byte_strides
+        )
+
+
 def _is_packed(tensor_info: TensorInfo) -> bool:
     """True when the graph strides are the dense C-order strides of the dims."""
     if not tensor_info.strides:
@@ -165,13 +187,23 @@ def _encode_to_storage(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     """
     storage_dtype = _storage_dtype(tensor_info.dtype)
     data = np.asarray(data)
+    ragged = tensor_info.varlen is not None and tensor_info.varlen.starts is not None
     if (
-        data.dtype == storage_dtype
+        not ragged
+        and data.dtype == storage_dtype
         and data.shape == tuple(tensor_info.dims)
         and data.flags.c_contiguous
         and _is_packed(tensor_info)
     ):
         return data.reshape(-1)
+    if ragged:
+        storage = np.zeros(tensor_info.storage_elements, dtype=storage_dtype)
+        data = np.broadcast_to(data, tuple(tensor_info.dims))
+        for batch, view in _ragged_batch_views(storage, tensor_info):
+            source = data[batch, :, : view.shape[1], :]
+            for index in iter_blocks(view.shape):
+                view[index] = _encode(source[index], tensor_info.dtype)
+        return storage
     storage = np.zeros(tensor_info.storage_elements, dtype=storage_dtype)
     view = _storage_view(storage, tensor_info)
     data = np.broadcast_to(data, view.shape)
@@ -184,13 +216,21 @@ def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
     """Decode raw storage into a dense logical ndarray.
 
     ``raw`` is any buffer-protocol object (``bytes``, a NumPy array). The
-    words are decoded block by block into the result.
+    words are decoded block by block into the result. A ragged tensor
+    decodes each batch's valid positions from its start; the rest is 0.
     """
     storage = np.frombuffer(
         raw,
         dtype=_storage_dtype(tensor_info.dtype),
         count=tensor_info.storage_elements,
     )
+    if tensor_info.varlen is not None and tensor_info.varlen.starts is not None:
+        out = np.zeros(tensor_info.dims, dtype=tensor_info.dtype.numpy)
+        for batch, view in _ragged_batch_views(storage, tensor_info):
+            target = out[batch, :, : view.shape[1], :]
+            for index in iter_blocks(view.shape):
+                target[index] = _decode(view[index], tensor_info.dtype)
+        return out
     view = _storage_view(storage, tensor_info)
     if storage.dtype == tensor_info.dtype.numpy:
         return np.ascontiguousarray(view)
@@ -201,7 +241,7 @@ def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
 
 
 def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
-    """Map tensor UID -> paged role for every SDPA node in the graph.
+    """Map tensor UID -> ``"page_table"`` for every SDPA page table.
 
     Roles are read from the node's ``inputs`` map rather than guessed from a
     tensor name, because names are free-form and a graph is under no obligation
@@ -214,15 +254,10 @@ def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
         if not str(node.get("type", "")).startswith("Sdpa"):
             continue
         inputs = node.get("inputs") or {}
-        for key, role in (
-            ("page_table_k_tensor_uid", "page_table"),
-            ("page_table_v_tensor_uid", "page_table"),
-            ("seq_len_q_tensor_uid", "seq_len_q"),
-            ("seq_len_kv_tensor_uid", "seq_len_kv"),
-        ):
+        for key in ("page_table_k_tensor_uid", "page_table_v_tensor_uid"):
             uid = inputs.get(key)
             if uid is not None:
-                roles[int(uid)] = role
+                roles[int(uid)] = "page_table"
     return roles
 
 
@@ -342,32 +377,26 @@ def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:
 def _generate_paged_input(
     tensor_info: TensorInfo,
     role: str,
-    page_size: int,
     num_pages: int,
 ) -> np.ndarray:
-    """Structured data for a paged input.
+    """Structured data for a page table.
 
-    Random page ids or lengths are degenerate for these roles: a page table
-    must address distinct pages inside the cache, and a sequence length must be
-    positive and fit its page allocation. They are generated to satisfy those
-    invariants instead.
+    A page table must address distinct pages inside the cache, so random page
+    ids are degenerate.
     """
     dims = list(tensor_info.dims)
     dtype = tensor_info.dtype.numpy
 
-    if role == "page_table":
-        # Distinct pages per sequence, so a gather that ignores the table or
-        # collapses sequences produces a visibly different answer.
-        num_seqs = int(dims[0])
-        blocks_per_seq = int(dims[1]) if len(dims) > 1 else 1
-        needed = num_seqs * blocks_per_seq
-        pool = num_pages if num_pages > 0 else needed
-        ids = (np.arange(needed) % max(pool, 1)).astype(dtype)
-        return ids.reshape(dims)
-
-    # Sequence lengths fill the cache: every sequence uses its whole page
-    # allocation, which is the largest length the page table can legally address.
-    return np.full(dims, page_size if page_size > 0 else 1, dtype=dtype)
+    if role != "page_table":
+        raise ExecutionError(f"unknown paged input role '{role}'")
+    # Distinct pages per sequence, so a gather that ignores the table or
+    # collapses sequences produces a visibly different answer.
+    num_seqs = int(dims[0])
+    blocks_per_seq = int(dims[1]) if len(dims) > 1 else 1
+    needed = num_seqs * blocks_per_seq
+    pool = num_pages if num_pages > 0 else needed
+    ids = (np.arange(needed) % max(pool, 1)).astype(dtype)
+    return ids.reshape(dims)
 
 
 def generate_input_data(
@@ -385,18 +414,22 @@ def generate_input_data(
     convolution with an fp16 output are U[-1, 1) instead (see
     :func:`_signed_input_uids`). Both come from the same
     draw, so an unsigned tensor gets the same values with or without
-    ``graph_json``. Integer and boolean inputs are zeros, except paged-SDPA
-    roles.
+    ``graph_json``. Integer and boolean inputs are zeros, except the SDPA
+    sequence lengths, cumulative lengths and ragged offset tables, and the
+    paged-SDPA page tables.
 
-    ``graph_json`` selects the signed convolution operands and the **paged**
-    SDPA roles: page tables and sequence lengths have invariants random data
-    cannot satisfy (see :func:`_generate_paged_input`).
+    ``graph_json`` selects the signed convolution operands and the SDPA
+    tensors with invariants random data cannot satisfy. Lengths and offset
+    tables come from :func:`generate_varlen_inputs`, which uses its own random
+    stream, so the float values do not change. Page tables come from
+    :func:`_generate_paged_input`.
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
     signed_uids = _signed_input_uids(graph_json)
-    page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
+    varlen_values = generate_varlen_inputs(graph_json, tensor_infos, seed)
+    num_pages = _paged_metadata(graph_json)[1] if paged_roles else 0
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -410,9 +443,11 @@ def generate_input_data(
             continue
 
         role = paged_roles.get(tensor_info.uid)
-        if role is not None:
+        if tensor_info.uid in varlen_values:
+            input_data[tensor_info.uid] = varlen_values[tensor_info.uid]
+        elif role is not None:
             input_data[tensor_info.uid] = _generate_paged_input(
-                tensor_info, role, page_size, num_pages
+                tensor_info, role, num_pages
             )
         elif dtype.numpy.kind in "iub":
             # ponytail: zeros are safe for index/offset tensors (no OOB reads);
@@ -605,14 +640,15 @@ class BufferManager:
     def get_output_tensor(self, uid: int) -> Optional["torch.Tensor"]:
         """Return a typed logical view of an output buffer without a copy.
 
-        Returns None for DeviceBuffer storage, for an unknown UID, and for a
-        data type that the installed torch cannot represent.
+        Returns None for DeviceBuffer storage, for an unknown UID, for a
+        ragged tensor, and for a data type that the installed torch cannot
+        represent.
         """
         if self._device is None:
             return None
         buffer = self._buffers.get(uid)
         tensor_info = self._tensor_info_by_uid.get(uid)
-        if buffer is None or tensor_info is None:
+        if buffer is None or tensor_info is None or tensor_info.is_ragged:
             return None
         try:
             torch_dtype = tensor_info.dtype.torch_dtype()

@@ -415,10 +415,15 @@ class TestPagedInputGeneration:
         assert data.max() < self.NUM_PAGES, "page id addresses beyond the cache"
 
     def test_lengths_are_positive_and_fit_the_page_allocation(self) -> None:
+        graph = self._graph()
+        graph["tensors"].append(
+            {"uid": 5, "name": "PAGE_TABLE_K", "dims": [self.NUM_SEQS, 4]}
+        )
+        table = self._int_tensor(5, [self.NUM_SEQS, 4])
         lengths = self._int_tensor(8, [self.NUM_SEQS])
-        data = generate_input_data([lengths], seed=0, graph_json=self._graph())[8]
+        data = generate_input_data([table, lengths], seed=0, graph_json=graph)[8]
         assert data.min() > 0, "a zero length is an empty sequence"
-        assert data.max() <= self.BLOCKS_PER_SEQ * self.PAGE_SIZE
+        assert data.max() <= 4 * self.PAGE_SIZE, "length exceeds the page table"
 
     def test_dense_graph_inputs_are_untouched(self) -> None:
         """A graph with no page table generates exactly what it would without

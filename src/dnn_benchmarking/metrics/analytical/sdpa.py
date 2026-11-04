@@ -31,13 +31,20 @@ providers resolve it (``extractDiagonalBandParams`` / ``getMaskType``):
   ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT); an unset bound is
   unbounded.
 
+For a variable-length node (per-batch ``seq_len`` / ``cu_seq_len`` or ragged
+offsets, or a paged node) the count is a sum over batches,
+``num_q_heads * sum_b P(Sq_b, Skv_b)``, with the live lengths read from the
+input data. Without input data, or for a dense node, the tensor dims give
+``Sq`` and ``Skv``.
+
 A causal sliding window of ``W`` keys (``left = W - 1``, ``right = 0``,
 BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
 windowed count the rocKE attention benchmarks report.
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ...graph.varlen import sdpa_lengths
 from ._common import node_param, node_tensor
 
 
@@ -61,9 +68,14 @@ def _nonmasked_pairs(
 
 
 def _attention_terms(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors_by_uid: Dict[int, Dict[str, Any]],
+    read_ints: Optional[Callable[[int], List[int]]] = None,
 ) -> Optional[Tuple[int, int, int]]:
     """Return ``(batch * num_q_heads * P, head_dim_qk, head_dim_vo)``.
+
+    ``read_ints(uid)`` reads an integer input tensor (the live lengths of a
+    variable-length node).
 
     Returns None when q/k/v tensor data is incomplete, or when the mask is
     one hipDNN rejects (a bound below -1, or both deprecated causal flags).
@@ -100,21 +112,31 @@ def _attention_terms(
     else:
         bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
 
-    pairs = _nonmasked_pairs(
-        q_seqlen,
-        kv_seqlen,
+    band = (
         None if left == -1 else left,
         None if right == -1 else right,
         bottom_right,
     )
+    lengths = (
+        sdpa_lengths(node, tensors_by_uid, read_ints) if read_ints is not None else None
+    )
+    if lengths is not None:
+        num_q_heads = int(q_dims[-3])
+        pairs = sum(
+            _nonmasked_pairs(lq, lkv, *band) for lq, lkv in zip(lengths[0], lengths[1])
+        )
+        return num_q_heads * pairs, int(q_dims[-1]), int(v_dims[-1])
+    pairs = _nonmasked_pairs(q_seqlen, kv_seqlen, *band)
     return rows * pairs, int(q_dims[-1]), int(v_dims[-1])
 
 
 def sdpa_fwd_flops(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors_by_uid: Dict[int, Dict[str, Any]],
+    read_ints: Optional[Callable[[int], List[int]]] = None,
 ) -> Optional[int]:
     """FLOPs for SdpaAttributes: ``2 * B * Hq * P * (Dqk + Dvo)``."""
-    terms = _attention_terms(node, tensors_by_uid)
+    terms = _attention_terms(node, tensors_by_uid, read_ints)
     if terms is None:
         return None
     pairs, head_dim_qk, head_dim_vo = terms
@@ -122,10 +144,12 @@ def sdpa_fwd_flops(
 
 
 def sdpa_bwd_flops(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors_by_uid: Dict[int, Dict[str, Any]],
+    read_ints: Optional[Callable[[int], List[int]]] = None,
 ) -> Optional[int]:
     """FLOPs for SdpaBackwardAttributes: ``2 * B * Hq * P * (3*Dqk + 2*Dvo)``."""
-    terms = _attention_terms(node, tensors_by_uid)
+    terms = _attention_terms(node, tensors_by_uid, read_ints)
     if terms is None:
         return None
     pairs, head_dim_qk, head_dim_vo = terms

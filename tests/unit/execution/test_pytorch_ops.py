@@ -1352,18 +1352,32 @@ class TestPyTorchOpsNewHandlers:
                 node("paged", 2, 2, inputs={"page_table_k_tensor_uid": 5}),
                 node("bottom_right", 2, 2, causal_mask_bottom_right=True),
                 node("sink", 2, 2, inputs={"sink_token_tensor_uid": 6}),
+                node(
+                    "varlen",
+                    2,
+                    2,
+                    inputs={"seq_len_q_tensor_uid": 7, "seq_len_kv_tensor_uid": 8},
+                ),
             ],
         }
 
         warnings = pytorch_ops.get_reference_warnings(graph_json)
 
         flagged = {w.split(":")[0]: w for w in warnings}
-        assert set(flagged) == {"window", "hk_ne_hv", "paged", "bottom_right", "sink"}
+        assert set(flagged) == {
+            "window",
+            "hk_ne_hv",
+            "paged",
+            "bottom_right",
+            "sink",
+            "varlen",
+        }
         assert "sliding-window" in flagged["window"]
         assert "enable_gqa cannot express" in flagged["hk_ne_hv"]
         assert "paged SDPA" in flagged["paged"]
         assert "bottom-right" in flagged["bottom_right"]
         assert "attention-sink" in flagged["sink"]
+        assert "own SDPA call" in flagged["varlen"]
 
     def test_builtin_rmsnorm_reference_has_no_warning_when_available(self) -> None:
         graph_json = {
@@ -1702,6 +1716,8 @@ class TestPyTorchOpsNewHandlers:
             (None, {"causal_mask_bottom_right": True}, "bottom-right"),
             (None, {"left_bound": 0, "right_bound": 0}, "sliding-window"),
             ("sink_token_tensor_uid", {}, "sink_token_tensor_uid"),
+            ("cu_seq_len_q_tensor_uid", {}, "cu_seq_len_q_tensor_uid"),
+            ("page_table_k_tensor_uid", {}, "page_table_k_tensor_uid"),
         ],
     )
     def test_sdpa_backward_rejects_forward_only_features(
@@ -2509,6 +2525,49 @@ def _replay_sdpa(graph_json, tensors, selection=None, bounds=None):
     return primed, timed, calls
 
 
+def _force_gpu_gqa_dispatch(monkeypatch, native_fused: bool, expanded_fused: bool):
+    """Make a CPU replay take the GPU benchmark path's GQA dispatch probe.
+
+    ``native_fused`` is the probe's answer for an ``enable_gqa=True`` call and
+    ``expanded_fused`` for the same call on expanded K/V. Returns the list of
+    ``enable_gqa`` values the probe was asked about.
+    """
+    from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+    probes = []
+
+    def probe(q, k, v, *, enable_gqa, **_):
+        probes.append(enable_gqa)
+        return native_fused if enable_gqa else expanded_fused
+
+    monkeypatch.setattr(
+        sdpa, "_gqa_call_is_timed_on_gpu", lambda tensors, q, enable_gqa: enable_gqa
+    )
+    monkeypatch.setattr(sdpa, "default_sdpa_avoids_math", probe)
+    return probes
+
+
+def _run_replay(graph_json, tensors):
+    """Run a graph once on a ReplayTensors map with the real SDPA call.
+
+    Returns the map and each SDPA call as (K heads, enable_gqa, K requires grad).
+    """
+    from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+    real = sdpa.execute_selected_sdpa
+    calls = []
+
+    def spy(q, k, v, *, enable_gqa, **kwargs):
+        calls.append((int(k.shape[-3]), enable_gqa, k.requires_grad))
+        return real(q, k, v, enable_gqa=enable_gqa, **kwargs)
+
+    replay = pytorch_ops.ReplayTensors(tensors)
+    graph = pytorch_ops.compile_graph(graph_json)
+    with patch.object(sdpa, "execute_selected_sdpa", spy):
+        graph.execute(replay)
+    return replay, calls
+
+
 class TestPyTorchSdpaPaged:
     """Paged (KV-cache) SDPA support.
 
@@ -2801,6 +2860,49 @@ class TestPyTorchSdpaPaged:
         assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
         assert "aten.index.Tensor" in primed
 
+    @pytest.mark.parametrize("repeated", [False, True], ids=["distinct", "repeated"])
+    def test_gqa_segment_that_hits_math_runs_on_expanded_kv(
+        self, repeated, monkeypatch
+    ) -> None:
+        """When default dispatch sends native enable_gqa to math but the call on
+        expanded K/V stays fused, each segment expands K/V in setup and calls
+        with enable_gqa=False. The decision is reused for a repeated shape."""
+        if repeated:
+            self.Q_LENS, self.KV_LENS = [3, 3], [27, 27]
+        probes = _force_gpu_gqa_dispatch(
+            monkeypatch, native_fused=False, expanded_fused=True
+        )
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+
+        replay, calls = _run_replay(self._graph(), tensors)
+
+        assert calls == [(self.HQ, False, False)] * len(self.KV_LENS)
+        expected = self._dense_reference(q, dense_k, dense_v)
+        torch.testing.assert_close(replay[4], expected, rtol=1e-5, atol=1e-5)
+        assert len(probes) == (2 if repeated else 4)
+
+    def test_gqa_segment_that_hits_math_even_expanded_is_refused(
+        self, monkeypatch
+    ) -> None:
+        _force_gpu_gqa_dispatch(monkeypatch, native_fused=False, expanded_fused=False)
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+
+        with pytest.raises(UnsupportedGraphError, match="math backend"):
+            _run_replay(self._graph(), self._tensors(q, k_pages, v_pages, page_table))
+
+    def test_gqa_segment_that_stays_fused_keeps_native_enable_gqa(
+        self, monkeypatch
+    ) -> None:
+        _force_gpu_gqa_dispatch(monkeypatch, native_fused=True, expanded_fused=False)
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+
+        _, calls = _run_replay(
+            self._graph(), self._tensors(q, k_pages, v_pages, page_table)
+        )
+
+        assert calls == [(self.HKV, True, False)] * len(self.KV_LENS)
+
     def test_sink_timed_run_has_no_setup(self) -> None:
         """Sinks run a manual fp32 attention per sequence. The gather, casts,
         K/V expansion, masks and sink logits are built once; a timed run only
@@ -2841,6 +2943,8 @@ class TestPyTorchSdpaPaged:
                         "stats_tensor_uid": 6,
                         "page_table_k_tensor_uid": 7,
                         "page_table_v_tensor_uid": 8,
+                        "seq_len_q_tensor_uid": 12,
+                        "seq_len_kv_tensor_uid": 13,
                     },
                     "outputs": {
                         "dq_tensor_uid": 9,
@@ -2853,6 +2957,407 @@ class TestPyTorchSdpaPaged:
         }
         with pytest.raises(UnsupportedGraphError, match="page_table"):
             pytorch_ops.compile_graph(graph)
+
+
+# Varlen forward: the per-batch path also copies each batch into the output.
+_VARLEN_TIMED_OPS = _SDPA_TIMED_OPS | {"aten.copy_.default"}
+
+
+class TestPyTorchSdpaVarlen:
+    """Non-paged varlen forward and backward.
+
+    The tensors are logical (batch ``b`` at index ``b``) and the lengths bound
+    each batch.
+    """
+
+    B, HQ, HKV, SQ, SKV, D = 3, 4, 2, 5, 6, 8
+    Q_LENS = [5, 2, 3]
+    KV_LENS = [6, 4, 1]
+    SCALE = 0.5
+
+    def _graph(self, stats=False, sink=False, cu=(), **attributes):
+        inputs = {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3}
+        for side in ("q", "kv"):
+            prefix = "cu_seq_len" if side in cu else "seq_len"
+            inputs[f"{prefix}_{side}_tensor_uid"] = 7 if side == "q" else 8
+        if sink:
+            inputs["sink_token_tensor_uid"] = 9
+        outputs = {"o_tensor_uid": 4}
+        if stats:
+            outputs["stats_tensor_uid"] = 5
+        return {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": inputs,
+                    "outputs": outputs,
+                    "attributes": {"attn_scale_value": self.SCALE, **attributes},
+                }
+            ]
+        }
+
+    def _tensors(self, cu=(), seed=0):
+        torch.manual_seed(seed)
+
+        def lengths(side, values):
+            if side in cu:
+                return torch.tensor([0, *values], dtype=torch.int32).cumsum(0).int()
+            return torch.tensor(values, dtype=torch.int32)
+
+        return {
+            1: torch.randn(self.B, self.HQ, self.SQ, self.D),
+            2: torch.randn(self.B, self.HKV, self.SKV, self.D),
+            3: torch.randn(self.B, self.HKV, self.SKV, self.D),
+            7: lengths("q", self.Q_LENS),
+            8: lengths("kv", self.KV_LENS),
+        }
+
+    def _loop(self, tensors, mode=None, sink=None, mask=None):
+        """Rows with nothing live get O = 0 and LSE = -inf (the sink logit if any)."""
+        q, k, v = tensors[1], tensors[2], tensors[3]
+        rep = self.HQ // self.HKV
+        o = torch.zeros(self.B, self.HQ, self.SQ, self.D)
+        lse = torch.full((self.B, self.HQ, self.SQ, 1), float("-inf"))
+        for b, (lq, lkv) in enumerate(zip(self.Q_LENS, self.KV_LENS)):
+            if sink is not None:
+                lse[b : b + 1, :, :lq] = sink.reshape(1, -1, 1, 1)
+            dead = max(0, lq - lkv) if mode == "bottom_right" else 0
+            if lq <= dead:
+                continue
+            q_b = q[b : b + 1, :, dead:lq]
+            k_b = k[b : b + 1, :, :lkv].repeat_interleave(rep, dim=1)
+            v_b = v[b : b + 1, :, :lkv].repeat_interleave(rep, dim=1)
+            keep = None
+            if mode == "causal":
+                keep = torch.ones(lq, lkv, dtype=torch.bool).tril()[dead:]
+            elif mode == "bottom_right":
+                keep = torch.ones(lq, lkv, dtype=torch.bool).tril(lkv - lq)[dead:]
+            scores = (q_b @ k_b.transpose(-2, -1)) * self.SCALE
+            if mask is not None:
+                scores = scores + mask[b : b + 1, :, dead:lq, :lkv]
+            if keep is not None:
+                scores = scores.masked_fill(~keep, float("-inf"))
+            row_lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+            if sink is None:
+                attn = keep if mask is None else mask[b : b + 1, :, dead:lq, :lkv]
+                o_b = torch.nn.functional.scaled_dot_product_attention(
+                    q_b, k_b, v_b, attn_mask=attn, scale=self.SCALE
+                )
+            else:
+                row_lse = torch.logaddexp(row_lse, sink.reshape(1, -1, 1, 1))
+                o_b = torch.exp(scores - row_lse) @ v_b
+            o[b : b + 1, :, dead:lq] = o_b
+            lse[b : b + 1, :, dead:lq] = row_lse
+        return o, lse
+
+    @pytest.mark.parametrize(
+        "attributes,mode",
+        [
+            ({}, None),
+            ({"causal_mask": True}, "causal"),
+            ({"causal_mask_bottom_right": True}, "bottom_right"),
+        ],
+        ids=["full", "causal", "bottom-right"],
+    )
+    @pytest.mark.parametrize(
+        "cu", [(), ("q", "kv"), ("kv",)], ids=["seq", "cu", "mixed"]
+    )
+    def test_forward_matches_the_dense_loop(self, attributes, mode, cu) -> None:
+        tensors = self._tensors(cu)
+        expected_o, expected_lse = self._loop(tensors, mode)
+
+        pytorch_ops.execute_graph(self._graph(stats=True, cu=cu, **attributes), tensors)
+
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
+
+    def test_rows_without_live_keys_or_past_a_length_are_zero_with_minus_inf_stats(
+        self,
+    ) -> None:
+        tensors = self._tensors()
+        pytorch_ops.execute_graph(
+            self._graph(stats=True, causal_mask_bottom_right=True), tensors
+        )
+
+        for b, (lq, lkv) in enumerate(zip(self.Q_LENS, self.KV_LENS)):
+            dead = max(0, lq - lkv)
+            empty = list(range(dead)) + list(range(lq, self.SQ))
+            assert not tensors[4][b, :, empty].any()
+            assert torch.isneginf(tensors[5][b, :, empty]).all()
+            assert torch.isfinite(tensors[5][b, :, dead:lq]).all()
+
+    @pytest.mark.parametrize("sink", [False, True], ids=["no-sink", "sink"])
+    def test_window_rows_past_the_keys_are_dead_not_nan(self, sink) -> None:
+        """Top-left window w=2, lq >= lkv + w: batch 2 (lq=3, lkv=1) has row 2 with
+        no key in the band."""
+        tensors = self._tensors()
+        if sink:
+            tensors[9] = torch.randn(self.HQ)
+        width = 2
+        rep = self.HQ // self.HKV
+        expected_o = torch.zeros(self.B, self.HQ, self.SQ, self.D)
+        expected_lse = torch.full((self.B, self.HQ, self.SQ, 1), float("-inf"))
+        for b, (lq, lkv) in enumerate(zip(self.Q_LENS, self.KV_LENS)):
+            keep = torch.ones(lq, lkv, dtype=torch.bool).tril().triu(1 - width)
+            k_b = tensors[2][b : b + 1, :, :lkv].repeat_interleave(rep, dim=1)
+            v_b = tensors[3][b : b + 1, :, :lkv].repeat_interleave(rep, dim=1)
+            scores = tensors[1][b : b + 1, :, :lq] @ k_b.transpose(-2, -1)
+            scores = (scores * self.SCALE).masked_fill(~keep, float("-inf"))
+            lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+            if sink:
+                lse = torch.logaddexp(lse, tensors[9].reshape(1, -1, 1, 1))
+            live = keep.any(-1) | sink
+            expected_o[b : b + 1, :, :lq][:, :, live] = (torch.exp(scores - lse) @ v_b)[
+                :, :, live
+            ]
+            expected_lse[b : b + 1, :, :lq][:, :, live] = lse[:, :, live]
+        assert not keep.all() and not keep.any(-1).all()
+
+        pytorch_ops.execute_graph(
+            self._graph(stats=True, sink=sink, left_bound=width - 1, right_bound=0),
+            tensors,
+        )
+
+        assert not torch.isnan(tensors[4]).any()
+        assert not torch.isnan(tensors[5]).any()
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
+        assert not tensors[4][2, :, 2].any()
+
+    def test_gqa_probe_covers_a_masked_batch_after_a_native_one(self) -> None:
+        """Batches (lq=4, lkv=4) and (lq=6, lkv=4) bottom-right both run 4 live
+        rows over 4 keys, but the first is native causal and the second a masked
+        call. Each call form needs its own dispatch probe."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        torch.manual_seed(0)
+        tensors = {
+            1: torch.randn(2, self.HQ, 6, self.D),
+            2: torch.randn(2, self.HKV, 4, self.D),
+            3: torch.randn(2, self.HKV, 4, self.D),
+            7: torch.tensor([4, 6], dtype=torch.int32),
+            8: torch.tensor([4, 4], dtype=torch.int32),
+        }
+        with patch.object(
+            sdpa,
+            "_fused_kv_for_call",
+            wraps=sdpa._fused_kv_for_call,
+        ) as probe:
+            pytorch_ops.execute_graph(
+                self._graph(causal_mask_bottom_right=True), tensors
+            )
+
+        forms = {(call.args[4] is None, call.args[6]) for call in probe.call_args_list}
+        assert forms == {(True, True), (False, False)}
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(3, 1, 5, 6), (1, 1, 5, 6), (3, 1, 1, 6)],
+        ids=["per-batch", "broadcast-batch", "broadcast-rows"],
+    )
+    def test_explicit_attn_mask_is_sliced_per_batch(self, shape) -> None:
+        tensors = self._tensors()
+        mask = torch.randn(*shape)
+        tensors[10] = mask
+        mask = mask.expand(self.B, 1, self.SQ, self.SKV)
+        expected_o, expected_lse = self._loop(tensors, mask=mask)
+        graph = self._graph(stats=True)
+        graph["nodes"][0]["inputs"]["attn_mask_tensor_uid"] = 10
+
+        pytorch_ops.execute_graph(graph, tensors)
+
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("mode", [None, "bottom_right"])
+    def test_sinks_enter_the_denominator_and_fill_empty_rows(self, mode) -> None:
+        tensors = self._tensors()
+        tensors[9] = torch.randn(self.HQ)
+        expected_o, expected_lse = self._loop(tensors, mode, sink=tensors[9])
+        attributes = {"causal_mask_bottom_right": True} if mode else {}
+
+        pytorch_ops.execute_graph(
+            self._graph(stats=True, sink=True, **attributes), tensors
+        )
+
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("cu", [(), ("q", "kv")], ids=["seq", "cu"])
+    def test_timed_run_only_calls_sdpa_and_copies(self, cu) -> None:
+        primed, timed, calls = _replay_sdpa(
+            self._graph(cu=cu, causal_mask_bottom_right=True), self._tensors(cu)
+        )
+
+        assert len(calls) == 2 * self.B
+        assert set(timed) <= _VARLEN_TIMED_OPS, f"setup in timed run: {timed}"
+        assert timed["aten.copy_.default"] == self.B
+        assert set(primed) - _VARLEN_TIMED_OPS
+
+    @pytest.mark.parametrize("stats", [False, True], ids=["no-stats", "stats"])
+    def test_gqa_batch_that_hits_math_runs_on_expanded_kv(
+        self, stats, monkeypatch
+    ) -> None:
+        """When default dispatch sends native enable_gqa to math but the call on
+        expanded K/V stays fused, each batch expands K/V in setup and calls with
+        enable_gqa=False. With stats the expanded K/V still record autograd, so
+        the fused kernel emits the log-sum-exp."""
+        _force_gpu_gqa_dispatch(monkeypatch, native_fused=False, expanded_fused=True)
+        tensors = self._tensors()
+        expected_o, expected_lse = self._loop(tensors)
+
+        replay, calls = _run_replay(self._graph(stats=stats), tensors)
+
+        assert calls == [(self.HQ, False, stats)] * self.B
+        torch.testing.assert_close(replay[4], expected_o, rtol=1e-5, atol=1e-5)
+        if stats:
+            torch.testing.assert_close(replay[5], expected_lse, rtol=1e-5, atol=1e-5)
+
+    def test_gqa_batch_that_hits_math_even_expanded_is_refused(
+        self, monkeypatch
+    ) -> None:
+        _force_gpu_gqa_dispatch(monkeypatch, native_fused=False, expanded_fused=False)
+
+        with pytest.raises(UnsupportedGraphError, match="math backend"):
+            _run_replay(self._graph(), self._tensors())
+
+    def test_gqa_batch_that_stays_fused_keeps_native_enable_gqa(
+        self, monkeypatch
+    ) -> None:
+        _force_gpu_gqa_dispatch(monkeypatch, native_fused=True, expanded_fused=False)
+
+        _, calls = _run_replay(self._graph(), self._tensors())
+
+        assert calls == [(self.HKV, True, False)] * self.B
+
+    def test_expanded_kv_is_built_in_setup_not_timed(self, monkeypatch) -> None:
+        _force_gpu_gqa_dispatch(monkeypatch, native_fused=False, expanded_fused=True)
+
+        _, timed, calls = _replay_sdpa(self._graph(), self._tensors())
+
+        assert calls == [(self.HQ, self.HQ, False)] * (2 * self.B)
+        assert set(timed) <= _VARLEN_TIMED_OPS, f"setup in timed run: {timed}"
+
+    def test_lengths_are_read_from_the_host_once(self, monkeypatch) -> None:
+        """A seq_len .tolist() on every replay syncs the stream inside the
+        staged timer's gated region and deadlocks."""
+        replay = pytorch_ops.ReplayTensors(self._tensors())
+        length_ptrs = sorted(replay[uid].data_ptr() for uid in (7, 8))
+        reads = []
+        tolist = torch.Tensor.tolist
+
+        def counting_tolist(t):
+            if t.data_ptr() in length_ptrs:
+                reads.append(t.data_ptr())
+            return tolist(t)
+
+        monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+        graph = pytorch_ops.compile_graph(self._graph())
+        graph.execute(replay)
+        graph.execute(replay)
+
+        assert sorted(reads) == length_ptrs
+
+    @staticmethod
+    def _backward_graph(**attributes):
+        return {
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                        "seq_len_q_tensor_uid": 7,
+                        "seq_len_kv_tensor_uid": 8,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 10,
+                        "dk_tensor_uid": 11,
+                        "dv_tensor_uid": 12,
+                    },
+                    "attributes": {"attn_scale_value": 0.5, **attributes},
+                }
+            ]
+        }
+
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_backward_matches_per_batch_autograd_and_is_zero_past_lengths(
+        self, causal
+    ) -> None:
+        tensors = self._tensors()
+        o, lse = self._loop(tensors, "causal" if causal else None)
+        do = torch.randn(self.B, self.HQ, self.SQ, self.D)
+        tensors.update({4: o, 5: do, 6: lse})
+        rep = self.HQ // self.HKV
+
+        dq_ref = torch.zeros_like(tensors[1])
+        dk_ref = torch.zeros_like(tensors[2])
+        dv_ref = torch.zeros_like(tensors[3])
+        for b, (lq, lkv) in enumerate(zip(self.Q_LENS, self.KV_LENS)):
+            q_g = tensors[1][b : b + 1, :, :lq].clone().requires_grad_()
+            k_g = tensors[2][b : b + 1, :, :lkv].clone().requires_grad_()
+            v_g = tensors[3][b : b + 1, :, :lkv].clone().requires_grad_()
+            keep = torch.ones(lq, lkv, dtype=torch.bool).tril() if causal else None
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q_g,
+                k_g.repeat_interleave(rep, dim=1),
+                v_g.repeat_interleave(rep, dim=1),
+                attn_mask=keep,
+                scale=self.SCALE,
+            )
+            out.backward(do[b : b + 1, :, :lq])
+            dq_ref[b : b + 1, :, :lq] = q_g.grad
+            dk_ref[b : b + 1, :, :lkv] = k_g.grad
+            dv_ref[b : b + 1, :, :lkv] = v_g.grad
+
+        pytorch_ops.execute_graph(self._backward_graph(causal_mask=causal), tensors)
+
+        torch.testing.assert_close(tensors[10], dq_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(tensors[11], dk_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(tensors[12], dv_ref, rtol=1e-4, atol=1e-4)
+        for b, (lq, lkv) in enumerate(zip(self.Q_LENS, self.KV_LENS)):
+            assert not tensors[10][b, :, lq:].any()
+            assert not tensors[11][b, :, lkv:].any()
+            assert not tensors[12][b, :, lkv:].any()
+
+    def test_backward_slices_an_explicit_attn_mask_per_batch(self) -> None:
+        tensors = self._tensors()
+        mask = torch.randn(self.B, 1, self.SQ, self.SKV)
+        o, lse = self._loop(tensors, mask=mask)
+        do = torch.randn(self.B, self.HQ, self.SQ, self.D)
+        tensors.update({4: o, 5: do, 6: lse, 13: mask})
+        rep = self.HQ // self.HKV
+
+        dq_ref = torch.zeros_like(tensors[1])
+        dk_ref = torch.zeros_like(tensors[2])
+        dv_ref = torch.zeros_like(tensors[3])
+        for b, (lq, lkv) in enumerate(zip(self.Q_LENS, self.KV_LENS)):
+            q_g = tensors[1][b : b + 1, :, :lq].clone().requires_grad_()
+            k_g = tensors[2][b : b + 1, :, :lkv].clone().requires_grad_()
+            v_g = tensors[3][b : b + 1, :, :lkv].clone().requires_grad_()
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q_g,
+                k_g.repeat_interleave(rep, dim=1),
+                v_g.repeat_interleave(rep, dim=1),
+                attn_mask=mask[b : b + 1, :, :lq, :lkv],
+                scale=self.SCALE,
+            )
+            out.backward(do[b : b + 1, :, :lq])
+            dq_ref[b : b + 1, :, :lq] = q_g.grad
+            dk_ref[b : b + 1, :, :lkv] = k_g.grad
+            dv_ref[b : b + 1, :, :lkv] = v_g.grad
+
+        graph = self._backward_graph()
+        graph["nodes"][0]["inputs"]["attn_mask_tensor_uid"] = 13
+        pytorch_ops.execute_graph(graph, tensors)
+
+        torch.testing.assert_close(tensors[10], dq_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(tensors[11], dk_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(tensors[12], dv_ref, rtol=1e-4, atol=1e-4)
 
 
 class TestSdpaTimedRegion:

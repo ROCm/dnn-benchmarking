@@ -17,7 +17,7 @@ from ._common import (
 from .handlers.norm import _rmsnorm_graph_can_use_builtin
 from .handlers.reduction import _reduction_mode_name
 from .handlers.resample import _resample_has_asymmetric_padding, _resample_mode_name
-from .handlers.sdpa import _sdpa_derive_mask
+from .handlers.sdpa import _has_ragged_operand, _sdpa_derive_mask
 
 
 def _sdpa_forward_workarounds(
@@ -39,6 +39,23 @@ def _sdpa_forward_workarounds(
             "PyTorch has no paged SDPA, so K/V are gathered into dense "
             "per-sequence tensors once and each sequence runs as its own SDPA "
             "call, re-packed with torch.cat"
+        )
+    if uid("page_table_k_tensor_uid") is None and (
+        any(
+            uid(key) is not None
+            for key in (
+                "seq_len_q_tensor_uid",
+                "seq_len_kv_tensor_uid",
+                "cu_seq_len_q_tensor_uid",
+                "cu_seq_len_kv_tensor_uid",
+            )
+        )
+        or _has_ragged_operand(node, graph_json)
+    ):
+        reasons.append(
+            "PyTorch SDPA has no variable-length input, so the valid rows and "
+            "keys of each batch run as their own SDPA call, written into the "
+            "output with a device copy"
         )
     try:
         _, window, bottom_right = _sdpa_derive_mask(node)

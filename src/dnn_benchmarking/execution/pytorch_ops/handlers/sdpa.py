@@ -9,6 +9,7 @@ import torch
 
 from ....common.exceptions import UnsupportedGraphError
 from ....config.benchmark_config import PyTorchSdpaBackendName
+from ....graph.varlen import live_rows, padding_rule, sdpa_lengths, sdpa_operands
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
 from .._sdpa_backend import (
@@ -37,6 +38,7 @@ class _PagedSegment(NamedTuple):
     v: torch.Tensor
     mask: Optional[torch.Tensor]
     is_causal: bool
+    enable_gqa: bool
 
 
 class _PagedSdpa(NamedTuple):
@@ -44,7 +46,6 @@ class _PagedSdpa(NamedTuple):
 
     segments: List[_PagedSegment]
     scale: float
-    enable_gqa: bool
     q_float: Optional[torch.Tensor]
     sink: Optional[torch.Tensor]
 
@@ -71,6 +72,38 @@ class _SinkSdpa(NamedTuple):
     v_float: torch.Tensor
     mask: Optional[torch.Tensor]
     sink: torch.Tensor
+
+
+class _VarlenBatch(NamedTuple):
+    """One batch of a varlen forward, prepared untimed.
+
+    The kernel path holds the SDPA operands. The sink path holds the fp32 Q,
+    K^T and V of the manual attention instead. ``o_rows`` and ``stats_rows``
+    are views of the preallocated outputs for the batch's live rows.
+    """
+
+    index: int
+    rows: int
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    k_raw: Optional[torch.Tensor]
+    mask: Optional[torch.Tensor]
+    is_causal: bool
+    o_rows: torch.Tensor
+    stats_rows: Optional[torch.Tensor]
+    enable_gqa: bool
+
+
+class _VarlenSdpa(NamedTuple):
+    """Setup of a non-paged varlen forward, built once."""
+
+    batches: List[_VarlenBatch]
+    scale: float
+    rep_k: int
+    sink: Optional[torch.Tensor]
+    o: torch.Tensor
+    stats: Optional[torch.Tensor]
 
 
 def _sdpa_bool(node: Dict[str, Any], key: str, default: bool = False) -> bool:
@@ -144,22 +177,25 @@ def _plan_sdpa_common(
     if not allow_sink:
         unsupported.append("sink_token_tensor_uid")
     if not allow_paged:
-        # The paged/varlen inputs are served by the forward handler only: it
-        # gathers the page table into dense per-sequence K/V before calling
-        # PyTorch, which has no paged API. Backward has no such path, so for it
-        # these remain hard rejections rather than a silently dense gradient.
+        # Page tables and the cumulative lengths are served by the forward
+        # handler only: it gathers the page table into dense per-sequence K/V
+        # before calling PyTorch, which has no paged API. Backward has no such
+        # path, so for it these remain hard rejections rather than a silently
+        # dense gradient.
         unsupported += [
-            "seq_len_q_tensor_uid",
-            "seq_len_kv_tensor_uid",
+            "cu_seq_len_q_tensor_uid",
+            "cu_seq_len_kv_tensor_uid",
             "page_table_k_tensor_uid",
             "page_table_v_tensor_uid",
         ]
     _sdpa_unsupported_if_present(node, unsupported)
 
-    if _sdpa_bool(node, "alibi_mask") or _sdpa_bool(node, "padding_mask"):
-        raise ValueError(
-            "SDPA alibi/padding masks are not supported by the PyTorch reference"
-        )
+    if _sdpa_bool(node, "alibi_mask"):
+        raise ValueError("SDPA alibi masks are not supported by the PyTorch reference")
+    try:
+        padding_rule(node, sdpa_operands(node))
+    except (ValueError, UnsupportedGraphError) as e:
+        raise ValueError(f"SDPA padding_mask rule: {e}") from e
 
     dropout_probability = _node_param(node, "dropout_probability", 0.0)
     dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
@@ -355,6 +391,28 @@ def _sdpa_kv_operands(
     )
 
 
+def _gqa_call_is_timed_on_gpu(
+    tensors: Dict[int, torch.Tensor], q: torch.Tensor, enable_gqa: bool
+) -> bool:
+    """Whether a GQA call is on the GPU benchmark path under default dispatch.
+
+    Only that path (``ReplayTensors``) is checked: the one-shot reference path
+    computes outputs, not timings, and math is a correct answer there.
+    """
+    return (
+        enable_gqa
+        and isinstance(tensors, ReplayTensors)
+        and q.is_cuda
+        and strict_sdpa_selection() is None
+    )
+
+
+_MATH_BACKEND_MESSAGE = (
+    "PyTorch default SDPA dispatch would use the math backend for this "
+    "GQA graph, which expands K/V inside the timed call"
+)
+
+
 def _require_fused_default_sdpa(
     tensors: Dict[int, torch.Tensor],
     q: torch.Tensor,
@@ -369,16 +427,9 @@ def _require_fused_default_sdpa(
     """Refuse to time a GQA call that default dispatch sends to math.
 
     The math backend expands K/V to the query head count inside the call, the
-    copy this handler keeps out of the timed region. Only the GPU benchmark
-    path (``ReplayTensors``) is checked: the one-shot reference path computes
-    outputs, not timings, and math is a correct answer there.
+    copy this handler keeps out of the timed region.
     """
-    if not (
-        enable_gqa
-        and isinstance(tensors, ReplayTensors)
-        and q.is_cuda
-        and strict_sdpa_selection() is None
-    ):
+    if not _gqa_call_is_timed_on_gpu(tensors, q, enable_gqa):
         return
     if not default_sdpa_avoids_math(
         q,
@@ -390,10 +441,66 @@ def _require_fused_default_sdpa(
         scale=scale,
         enable_gqa=enable_gqa,
     ):
-        raise UnsupportedGraphError(
-            "PyTorch default SDPA dispatch would use the math backend for this "
-            "GQA graph, which expands K/V inside the timed call"
-        )
+        raise UnsupportedGraphError(_MATH_BACKEND_MESSAGE)
+
+
+def _expand_kv(
+    k: torch.Tensor, v: torch.Tensor, rep_k: int, rep_v: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """K and V at the query head count. Autograd recording is kept as it was."""
+    return tuple(  # type: ignore[return-value]
+        t.detach().repeat_interleave(rep, dim=-3).requires_grad_(t.requires_grad)
+        for t, rep in ((k, rep_k), (v, rep_v))
+    )
+
+
+def _fused_kv_for_call(
+    tensors: Dict[int, torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float,
+    is_causal: bool,
+    scale: Optional[float],
+    enable_gqa: bool,
+    rep_k: int,
+    rep_v: int,
+) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+    """K, V and ``enable_gqa`` for one call that default dispatch keeps fused.
+
+    Operands come back unchanged when the call is off the GPU benchmark path or
+    its default dispatch avoids math. Otherwise some shapes reject
+    ``enable_gqa`` in the fused kernels (top-left causal with Lq != Lkv): the
+    call then takes K/V expanded here, in setup, with ``enable_gqa=False``.
+    A call that math would still serve after that is refused.
+    """
+    if not _gqa_call_is_timed_on_gpu(tensors, q, enable_gqa):
+        return k, v, enable_gqa
+    if default_sdpa_avoids_math(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=True,
+    ):
+        return k, v, True
+    k_exp, v_exp = _expand_kv(k, v, rep_k, rep_v)
+    if not default_sdpa_avoids_math(
+        q,
+        k_exp,
+        v_exp,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=False,
+    ):
+        raise UnsupportedGraphError(_MATH_BACKEND_MESSAGE)
+    return k_exp, v_exp, False
 
 
 def _plan_paged_sdpa(
@@ -415,7 +522,7 @@ def _plan_paged_sdpa(
     window: Optional[int],
     bottom_right: bool,
     sink: Optional[torch.Tensor],
-) -> Tuple[List[_PagedSegment], bool]:
+) -> List[_PagedSegment]:
     """Gather a paged KV cache into dense per-sequence K/V and masks.
 
     Layouts, taken from the committed paged bundles rather than assumed:
@@ -467,8 +574,8 @@ def _plan_paged_sdpa(
         q_lengths = [total_q // num_seqs] * num_seqs
 
     segments: List[_PagedSegment] = []
-    enable_gqa = False
-    probed = set()
+    # Per call shape: whether K/V are expanded because native GQA would hit math.
+    expanded: Dict[Tuple[int, int], bool] = {}
     q_start = 0
     for seq, (q_len, kv_len) in enumerate(zip(q_lengths, kv_lengths)):
         if kv_len <= 0:
@@ -519,6 +626,7 @@ def _plan_paged_sdpa(
                     _fp32_at_query_heads(v_seq, rep_v),
                     seq_mask,
                     seq_causal,
+                    False,
                 )
             )
             q_start += q_len
@@ -527,10 +635,10 @@ def _plan_paged_sdpa(
         k_seq, v_seq, enable_gqa = _sdpa_kv_operands(
             k_seq.contiguous(), v_seq.contiguous(), rep_k, rep_v
         )
-        # Dispatch depends on shapes, not values: probe each shape once.
-        if (seq_q_len, kv_len) not in probed:
-            probed.add((seq_q_len, kv_len))
-            _require_fused_default_sdpa(
+        # Dispatch depends on shapes, not values: decide each shape once.
+        key = (seq_q_len, kv_len)
+        if key not in expanded:
+            k_call, v_call, gqa_call = _fused_kv_for_call(
                 tensors,
                 q_seq,
                 k_seq,
@@ -540,12 +648,22 @@ def _plan_paged_sdpa(
                 seq_causal,
                 scale,
                 enable_gqa,
+                rep_k,
+                rep_v,
             )
+            expanded[key] = enable_gqa and not gqa_call
+        elif expanded[key]:
+            k_call, v_call = _expand_kv(k_seq, v_seq, rep_k, rep_v)
+            gqa_call = False
+        else:
+            k_call, v_call, gqa_call = k_seq, v_seq, enable_gqa
         segments.append(
-            _PagedSegment(q_start, q_len, k_seq, v_seq, seq_mask, seq_causal)
+            _PagedSegment(
+                q_start, q_len, k_call, v_call, seq_mask, seq_causal, gqa_call
+            )
         )
         q_start += q_len
-    return segments, enable_gqa
+    return segments
 
 
 def _fp32_at_query_heads(t: torch.Tensor, rep: int) -> torch.Tensor:
@@ -716,6 +834,218 @@ def _sink_attention(
     return torch.cat(outputs, dim=-2), torch.cat(stats, dim=-2)
 
 
+def _batch_attn_mask(
+    mask: Optional[torch.Tensor], batch: int, start: int, end: int, kv_len: int
+) -> Optional[torch.Tensor]:
+    """Batch ``batch``, query rows ``start:end`` and keys ``:kv_len`` of an
+    explicit attention mask. Size-1 broadcast dims stay whole."""
+    if mask is None:
+        return None
+    if mask.ndim == 4 and mask.shape[0] > 1:
+        mask = mask[batch : batch + 1]
+    if mask.ndim >= 2:
+        if mask.shape[-2] > 1:
+            mask = mask[..., start:end, :]
+        if mask.shape[-1] > 1:
+            mask = mask[..., :kv_len]
+    return mask
+
+
+_SDPA_LENGTH_KEYS = (
+    "seq_len_q_tensor_uid",
+    "seq_len_kv_tensor_uid",
+    "cu_seq_len_q_tensor_uid",
+    "cu_seq_len_kv_tensor_uid",
+)
+_SDPA_OPERAND_KEYS = (
+    "q_tensor_uid",
+    "k_tensor_uid",
+    "v_tensor_uid",
+    "o_tensor_uid",
+    "stats_tensor_uid",
+    "do_tensor_uid",
+    "dq_tensor_uid",
+    "dk_tensor_uid",
+    "dv_tensor_uid",
+)
+
+
+def _has_ragged_operand(node: Dict[str, Any], graph_json: Dict[str, Any]) -> bool:
+    ragged = {
+        int(t["uid"])
+        for t in graph_json.get("tensors", [])
+        if t.get("ragged_offset_tensor_uid") is not None
+    }
+    return any(_optional_uid(node, key) in ragged for key in _SDPA_OPERAND_KEYS)
+
+
+def _is_varlen_sdpa(node: Dict[str, Any], graph_json: Dict[str, Any]) -> bool:
+    """Whether a non-paged SDPA node carries lengths or a ragged operand."""
+    return any(
+        _optional_uid(node, key) is not None for key in _SDPA_LENGTH_KEYS
+    ) or _has_ragged_operand(node, graph_json)
+
+
+def _sdpa_varlen_lengths(
+    node: Dict[str, Any],
+    graph_json: Dict[str, Any],
+    tensors: Dict[int, torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> Tuple[List[int], List[int]]:
+    """Per-batch ``(q_lengths, kv_lengths)`` of a varlen node, read from the host.
+
+    The tensors the handlers see are logical: batch ``b`` is at index ``b``.
+    Offsets are only a length source.
+    """
+    by_uid = {int(t["uid"]): t for t in graph_json.get("tensors", [])}
+    lengths = sdpa_lengths(node, by_uid, lambda uid: _host_ints(tensors, uid, node))
+    if lengths is None:
+        raise ValueError("SDPA varlen graph has no sequence length source")
+    q_lens, kv_lens = lengths
+    batches = int(q.shape[0])
+    if len(q_lens) != batches or len(kv_lens) != batches:
+        raise ValueError(
+            f"SDPA lengths cover {len(q_lens)} q and {len(kv_lens)} kv batches "
+            f"for {batches} batches"
+        )
+    for b, (lq, lkv) in enumerate(zip(q_lens, kv_lens)):
+        if not 0 <= lq <= int(q.shape[-2]) or not 0 <= lkv <= int(k.shape[-2]):
+            raise ValueError(
+                f"SDPA batch {b} lengths (q={lq}, kv={lkv}) exceed the tensor "
+                f"sequence dims (q={int(q.shape[-2])}, kv={int(k.shape[-2])})"
+            )
+    return list(q_lens), list(kv_lens)
+
+
+def _plan_varlen_sdpa(
+    node: Dict[str, Any],
+    graph_json: Dict[str, Any],
+    tensors: Dict[int, torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    plan: _SdpaPlan,
+    attn_mask: Optional[torch.Tensor],
+    scale: float,
+    rep_k: int,
+    rep_v: int,
+    sink: Optional[torch.Tensor],
+    dropout_p: float,
+    want_stats: bool,
+) -> _VarlenSdpa:
+    """Slice a non-paged varlen forward into per-batch SDPA calls.
+
+    Each batch runs on its live rows ``start:stop`` and keys ``:lkv`` only,
+    with bounds built for those live lengths (bottom-right alignment follows
+    them). Rows at or past ``lq`` keep O = 0 and stats = -inf, also with
+    sinks. Dead rows below ``lq`` keep O = 0 and stats = -inf, or the sink
+    logit with sinks.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("Varlen SDPA expects rank-4 q/k/v tensors [B, H, S, D]")
+    q_lens, kv_lens = _sdpa_varlen_lengths(node, graph_json, tensors, q, k)
+
+    q_op, k_op, v_op, enable_gqa = q, k, v, False
+    if sink is None:
+        k_op, v_op, enable_gqa = _sdpa_kv_operands(k, v, rep_k, rep_v)
+        if want_stats:
+            # Recording autograd makes the fused kernel emit the log-sum-exp.
+            q_op, k_op, v_op = (t.detach().requires_grad_() for t in (q, k_op, v_op))
+
+    o = torch.zeros((*q.shape[:-1], int(v.shape[-1])), dtype=q.dtype, device=q.device)
+    stats = None
+    if want_stats:
+        stats = torch.full(
+            (*q.shape[:-1], 1), float("-inf"), dtype=torch.float32, device=q.device
+        )
+        if sink is not None:
+            for b, lq in enumerate(q_lens):
+                stats[b : b + 1, :, :lq] = sink
+
+    batches: List[_VarlenBatch] = []
+    # Per call form: whether K/V are expanded because native GQA would hit math.
+    expanded: Dict[Tuple[int, int, bool, bool], bool] = {}
+    for b, (lq, lkv) in enumerate(zip(q_lens, kv_lens)):
+        if lkv == 0:
+            continue
+        start, stop = live_rows(lq, lkv, plan.is_causal, plan.window, plan.bottom_right)
+        rows = stop - start
+        if rows <= 0:
+            continue
+        band, causal = _attention_bounds(
+            lq, lkv, plan.window, plan.bottom_right, plan.is_causal, q
+        )
+        if band is not None:
+            mask = band[start:stop] if (start or stop < lq) else band
+        else:
+            mask = _batch_attn_mask(attn_mask, b, start, stop, lkv)
+        q_rows = slice(start, stop)
+        o_rows = o[b : b + 1, :, q_rows]
+        stats_rows = None if stats is None else stats[b : b + 1, :, q_rows]
+        if sink is not None:
+            k_t, mask = _score_operands(
+                k[b : b + 1, :, :lkv], mask, causal, rows, rep_k
+            )
+            batches.append(
+                _VarlenBatch(
+                    b,
+                    rows,
+                    q[b : b + 1, :, q_rows].to(dtype=torch.float32),
+                    k_t,
+                    _fp32_at_query_heads(v[b : b + 1, :, :lkv], rep_v),
+                    None,
+                    mask,
+                    causal,
+                    o_rows,
+                    stats_rows,
+                    False,
+                )
+            )
+            continue
+        q_b = q_op[b : b + 1, :, q_rows]
+        k_b = k_op[b : b + 1, :, :lkv]
+        v_b = v_op[b : b + 1, :, :lkv]
+        # Dispatch depends on shapes and the call form, not values.
+        key = (rows, lkv, mask is None, causal)
+        if key not in expanded:
+            k_b, v_b, gqa_b = _fused_kv_for_call(
+                tensors,
+                q_b,
+                k_b,
+                v_b,
+                mask,
+                dropout_p,
+                causal,
+                scale,
+                enable_gqa,
+                rep_k,
+                rep_v,
+            )
+            expanded[key] = enable_gqa and not gqa_b
+        elif expanded[key]:
+            k_b, v_b = _expand_kv(k_b, v_b, rep_k, rep_v)
+            gqa_b = False
+        else:
+            gqa_b = enable_gqa
+        batches.append(
+            _VarlenBatch(
+                b,
+                rows,
+                q_b,
+                k_b,
+                v_b,
+                k[b : b + 1, :, :lkv],
+                mask,
+                causal,
+                o_rows,
+                stats_rows,
+                gqa_b,
+            )
+        )
+    return _VarlenSdpa(batches, scale, rep_k, sink, o, stats)
+
+
 def _is_computed(graph_json: Dict[str, Any], uid: int) -> bool:
     """Whether some node of the graph writes tensor ``uid``."""
     for node in graph_json.get("nodes", []):
@@ -747,6 +1077,9 @@ def compile_sdpa(
     handlers with CPU tensors, so there is no reference-side shortcut. On the
     benchmark path (``ReplayTensors``) the gather, K/V head expansion and masks
     are built once during priming, so the timed region holds only the op work.
+
+    A non-paged varlen or ragged graph runs one SDPA call per batch on the
+    batch's live rows and keys (``_plan_varlen_sdpa``).
 
     The ``stats`` output (log-sum-exp) comes from the fused kernel, as in a
     training forward: Q/K/V go in with ``requires_grad`` and the kernel's saved
@@ -787,6 +1120,9 @@ def compile_sdpa(
             raise ValueError("Paged SDPA needs seq_len_kv to bound each sequence")
         if stats_uid is not None:
             raise ValueError("Paged SDPA stats output is not supported")
+    if is_paged and _has_ragged_operand(node, graph_json):
+        raise ValueError("Paged SDPA with ragged operands is not supported")
+    is_varlen = not is_paged and _is_varlen_sdpa(node, graph_json)
 
     # Setup is cached on the assumption that its inputs repeat unchanged every
     # replay. A tensor written by an earlier node breaks that assumption,
@@ -804,6 +1140,8 @@ def compile_sdpa(
             page_table_v_uid,
             seq_len_q_uid,
             seq_len_kv_uid,
+            _optional_uid(node, "cu_seq_len_q_tensor_uid"),
+            _optional_uid(node, "cu_seq_len_kv_tensor_uid"),
         )
         if uid is not None and _is_computed(graph_json, uid)
     ]
@@ -898,7 +1236,7 @@ def compile_sdpa(
         v: torch.Tensor,
     ) -> _PagedSdpa:
         attn_mask, scale, rep_k, rep_v, sink = resolve(tensors, q, k, v)
-        segments, enable_gqa = _plan_paged_sdpa(
+        segments = _plan_paged_sdpa(
             node,
             tensors,
             q,
@@ -919,7 +1257,91 @@ def compile_sdpa(
             sink,
         )
         q_float = None if sink is None else q.to(dtype=torch.float32)
-        return _PagedSdpa(segments, scale, enable_gqa, q_float, sink)
+        return _PagedSdpa(segments, scale, q_float, sink)
+
+    def prepare_varlen(
+        tensors: Dict[int, torch.Tensor],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> _VarlenSdpa:
+        attn_mask, scale, rep_k, rep_v, sink = resolve(tensors, q, k, v)
+        return _plan_varlen_sdpa(
+            node,
+            graph_json,
+            tensors,
+            q,
+            k,
+            v,
+            plan,
+            attn_mask,
+            scale,
+            rep_k,
+            rep_v,
+            sink,
+            dropout_p,
+            stats_uid is not None,
+        )
+
+    def varlen_stats_operands(
+        tensors: Dict[int, torch.Tensor], s: _VarlenSdpa, batch: _VarlenBatch
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        # As ``stats_operands``: reached when the kernel saved no log-sum-exp.
+        if (
+            isinstance(tensors, ReplayTensors)
+            and strict_sdpa_selection() is not PyTorchSdpaBackendName.MATH
+        ):
+            tensors.note(_STATS_FALLBACK_WARNING)
+        return (
+            batch.q.detach().to(dtype=torch.float32),
+            *_score_operands(
+                batch.k_raw.detach(), batch.mask, batch.is_causal, batch.rows, s.rep_k
+            ),
+        )
+
+    def run_varlen(
+        tensors: Dict[int, torch.Tensor],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        s = setup(tensors, "varlen", lambda: prepare_varlen(tensors, q, k, v))
+        for batch in s.batches:
+            if s.sink is not None:
+                o, stats = _sink_attention(
+                    batch.q, batch.k, batch.v, batch.mask, s.sink, s.scale
+                )
+            else:
+                with torch.enable_grad():
+                    o = execute_selected_sdpa(
+                        batch.q,
+                        batch.k,
+                        batch.v,
+                        attn_mask=batch.mask,
+                        dropout_p=dropout_p,
+                        is_causal=batch.is_causal,
+                        scale=s.scale,
+                        enable_gqa=batch.enable_gqa,
+                    )
+                stats = None
+                if stats_uid is not None:
+                    stats = fused_logsumexp(o, batch.rows)
+                    if stats is None:
+                        stats = _sdpa_stats(
+                            *setup(
+                                tensors,
+                                ("varlen_stats", batch.index),
+                                lambda: varlen_stats_operands(tensors, s, batch),
+                            ),
+                            s.scale,
+                        )
+            with torch.no_grad():
+                batch.o_rows.copy_(o)
+                if stats_uid is not None:
+                    batch.stats_rows.copy_(stats)
+        _store_tensor(tensors, o_uid, s.o)
+        if stats_uid is not None:
+            _store_tensor(tensors, stats_uid, s.stats)
 
     def stats_operands(
         tensors: Dict[int, torch.Tensor],
@@ -947,6 +1369,10 @@ def compile_sdpa(
         q = _tensor(tensors, q_uid, node)
         k = _tensor(tensors, k_uid, node)
         v = _tensor(tensors, v_uid, node)
+        if is_varlen:
+            run_varlen(tensors, q, k, v)
+            return
+
         if is_paged:
             paged = setup(tensors, "paged", lambda: prepare_paged(tensors, q, k, v))
             if paged.sink is not None:
@@ -972,7 +1398,7 @@ def compile_sdpa(
                         dropout_p=dropout_p,
                         is_causal=s.is_causal,
                         scale=paged.scale,
-                        enable_gqa=paged.enable_gqa,
+                        enable_gqa=s.enable_gqa,
                     )
                     for s in paged.segments
                 ]
@@ -1019,6 +1445,67 @@ def compile_sdpa(
     return run
 
 
+def _sdpa_gradients(
+    q_f: torch.Tensor,
+    k_f: torch.Tensor,
+    v_f: torch.Tensor,
+    o_f: torch.Tensor,
+    do_f: torch.Tensor,
+    stats_f: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+    rep_k: int,
+    rep_v: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp32 ``(dQ, dK, dV)`` of one dense backward, dK and dV at the K and V heads.
+
+    Consumes the saved ``stats`` directly (see ``compile_sdpa_backward``).
+    """
+    head_dim = int(q_f.shape[-1])
+    k_heads = int(k_f.shape[1])
+    v_heads = int(v_f.shape[1])
+    if rep_k > 1:
+        k_f = k_f.repeat_interleave(rep_k, dim=1)
+    if rep_v > 1:
+        v_f = v_f.repeat_interleave(rep_v, dim=1)
+
+    # One query block at a time: a block's probs and d_scores are at most
+    # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
+    # dQ rows are independent; dK and dV sum over every query row.
+    dq = torch.empty_like(q_f)
+    dk_full = torch.zeros_like(k_f)
+    dv_full = torch.zeros_like(v_f)
+    for start, end in _query_blocks(q_f, int(k_f.shape[-2])):
+        q_block = q_f[..., start:end, :]
+        do_block = do_f[..., start:end, :]
+        scores = _block_scores(
+            q_block, k_f, _rows(attn_mask, start, end), is_causal, start, scale
+        )
+        probs = scores.sub_(_rows(stats_f, start, end)).exp_()
+        row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
+        # d_scores = probs * (do @ v^T - row_dot) * scale
+        d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
+        d_scores.sub_(row_dot).mul_(probs).mul_(scale)
+        dq[..., start:end, :] = torch.matmul(d_scores, k_f)
+        dk_full += torch.matmul(d_scores.transpose(-2, -1), q_block)
+        dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
+        del scores, probs, d_scores
+
+    batch, seq_kv = dk_full.shape[0], dk_full.shape[2]
+    if rep_k > 1:
+        dk_f = dk_full.view(batch, k_heads, rep_k, seq_kv, head_dim).sum(dim=2)
+    else:
+        dk_f = dk_full
+    if rep_v > 1:
+        dv_f = dv_full.view(batch, v_heads, rep_v, seq_kv, int(v_f.shape[-1])).sum(
+            dim=2
+        )
+    else:
+        dv_f = dv_full
+    return dq, dk_f, dv_f
+
+
 @register_handler("SdpaBackwardAttributes")
 def compile_sdpa_backward(
     node: Dict[str, Any],
@@ -1050,6 +1537,7 @@ def compile_sdpa_backward(
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
     plan = _plan_sdpa_common(node)
+    is_varlen = _is_varlen_sdpa(node, graph_json)
     is_causal = plan.is_causal
     if plan.window is not None or plan.bottom_right:
         raise ValueError(
@@ -1084,54 +1572,50 @@ def compile_sdpa_backward(
         o_f = o.to(dtype=torch.float32)
         do_f = do.to(dtype=torch.float32)
         stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
-
-        head_dim = int(q.shape[-1])
         scale_value = float(scale)
-        k_heads = int(k.shape[1])
-        v_heads = int(v.shape[1])
-        if rep_k > 1:
-            k_f = k_f.repeat_interleave(rep_k, dim=1)
-        if rep_v > 1:
-            v_f = v_f.repeat_interleave(rep_v, dim=1)
 
-        # One query block at a time: a block's probs and d_scores are at most
-        # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
-        # dQ rows are independent; dK and dV sum over every query row.
-        dq = torch.empty_like(q_f)
-        dk_full = torch.zeros_like(k_f)
-        dv_full = torch.zeros_like(v_f)
-        for start, end in _query_blocks(q, int(k_f.shape[-2])):
-            q_block = q_f[..., start:end, :]
-            do_block = do_f[..., start:end, :]
-            scores = _block_scores(
-                q_block,
+        if not is_varlen:
+            dq, dk_f, dv_f = _sdpa_gradients(
+                q_f,
                 k_f,
-                _rows(attn_mask, start, end),
+                v_f,
+                o_f,
+                do_f,
+                stats_f,
+                attn_mask,
                 is_causal,
-                start,
                 scale_value,
-            )
-            probs = scores.sub_(_rows(stats_f, start, end)).exp_()
-            row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
-            # d_scores = probs * (do @ v^T - row_dot) * scale
-            d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
-            d_scores.sub_(row_dot).mul_(probs).mul_(scale_value)
-            dq[..., start:end, :] = torch.matmul(d_scores, k_f)
-            dk_full += torch.matmul(d_scores.transpose(-2, -1), q_block)
-            dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
-            del scores, probs, d_scores
-
-        batch, seq_kv = dk_full.shape[0], dk_full.shape[2]
-        if rep_k > 1:
-            dk_f = dk_full.view(batch, k_heads, rep_k, seq_kv, head_dim).sum(dim=2)
-        else:
-            dk_f = dk_full
-        if rep_v > 1:
-            dv_f = dv_full.view(batch, v_heads, rep_v, seq_kv, int(v.shape[-1])).sum(
-                dim=2
+                rep_k,
+                rep_v,
             )
         else:
-            dv_f = dv_full
+            # Per batch on the valid slices. Gradients past a length stay 0.
+            # Backward refuses bottom-right and window bounds, so no live row
+            # is dead.
+            q_lens, kv_lens = _sdpa_varlen_lengths(node, graph_json, tensors, q, k)
+            dq = torch.zeros_like(q_f)
+            dk_f = torch.zeros_like(k_f)
+            dv_f = torch.zeros_like(v_f)
+            for b, (lq, lkv) in enumerate(zip(q_lens, kv_lens)):
+                if lq == 0 or lkv == 0:
+                    continue
+                one = slice(b, b + 1)
+                dq_b, dk_b, dv_b = _sdpa_gradients(
+                    q_f[one, :, :lq],
+                    k_f[one, :, :lkv],
+                    v_f[one, :, :lkv],
+                    o_f[one, :, :lq],
+                    do_f[one, :, :lq],
+                    stats_f[one, :, :lq],
+                    _batch_attn_mask(attn_mask, b, 0, lq, lkv),
+                    is_causal,
+                    scale_value,
+                    rep_k,
+                    rep_v,
+                )
+                dq[one, :, :lq] = dq_b
+                dk_f[one, :, :lkv] = dk_b
+                dv_f[one, :, :lkv] = dv_b
 
         _store_tensor(tensors, dq_uid, dq.to(dtype=q.dtype))
         _store_tensor(tensors, dk_uid, dk_f.to(dtype=k.dtype))

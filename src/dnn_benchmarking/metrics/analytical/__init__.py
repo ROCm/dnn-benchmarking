@@ -26,6 +26,7 @@ Per-op formulas (FMA = 2 FLOPs throughout):
   ``2 * B * H_q * unmasked_pairs * (3 * D_qk + 2 * D_vo)`` (2.5x fwd for
   equal head dims, FlashAttention's convention) — see :mod:`.sdpa`.
   Exact causal / sliding-window pair counts using hipDNN's mask semantics.
+  A variable-length or paged node sums the pair count over the batches.
 * GEMM: ``2 * batch * M * N * K`` — see :mod:`.matmul`. Standard
   textbook formula (e.g. NVIDIA's perf model docs). MoE grouped matmul
   fwd: ``2 * routed_rows * K * N``; bwd (weight gradient only):
@@ -61,7 +62,9 @@ rather than a partial count, and a one-shot warning names the unknown type
 via :mod:`.._diagnostic.warn_once`.
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
 
 from ...graph.tensor_info import TensorInfo
 from .._diagnostic import warn_once
@@ -127,11 +130,20 @@ _FLOP_HANDLERS = {
 }
 
 
-def compute_flops(graph_json: Dict[str, Any]) -> Optional[int]:
+# Handlers that take the live lengths of a variable-length node.
+_LENGTH_AWARE = frozenset({sdpa_fwd_flops, sdpa_bwd_flops})
+
+
+def compute_flops(
+    graph_json: Dict[str, Any], input_data: Optional[Dict[int, Any]] = None
+) -> Optional[int]:
     """Sum analytical FLOPs across a graph's nodes.
 
     Args:
         graph_json: Parsed hipDNN graph dictionary.
+        input_data: Generated input arrays by UID. A variable-length SDPA node
+            reads its live lengths from them. Without it, every node counts
+            from the tensor dims.
 
     Returns:
         Total FLOPs, or ``None`` ("unknown") when the graph has no nodes
@@ -143,6 +155,12 @@ def compute_flops(graph_json: Dict[str, Any]) -> Optional[int]:
         return None
 
     tensors_by_uid = tensor_lookup(graph_json)
+    read_ints: Optional[Callable[[int], List[int]]] = None
+    if input_data is not None:
+
+        def read_ints(uid: int) -> List[int]:
+            return [int(v) for v in np.asarray(input_data[uid]).reshape(-1)]
+
     total = 0
     for node in nodes:
         node_type = node.get("type", "")
@@ -153,7 +171,10 @@ def compute_flops(graph_json: Dict[str, Any]) -> Optional[int]:
                 f"unrecognised node type {node_type!r}; FLOPs unknown",
             )
             return None
-        flops = handler(node, tensors_by_uid)
+        if handler in _LENGTH_AWARE:
+            flops = handler(node, tensors_by_uid, read_ints)
+        else:
+            flops = handler(node, tensors_by_uid)
         if flops is None:
             return None
         total += flops
@@ -165,14 +186,19 @@ def compute_io_bytes(tensor_infos: Iterable[TensorInfo]) -> int:
 
     Virtual tensors are intermediate buffers that hipDNN may allocate
     inside a fused kernel and never materialise to global memory, so
-    they are excluded. Uses :attr:`TensorInfo.size_bytes` which already
-    accounts for non-contiguous strides.
+    they are excluded. Uses :attr:`TensorInfo.size_bytes`, which already
+    accounts for non-contiguous strides. A tensor with a variable-length
+    layout counts only its valid elements (:attr:`TensorInfo.valid_elements`),
+    because the padding is never read or written.
     """
     total = 0
     for ti in tensor_infos:
         if ti.is_virtual:
             continue
-        total += ti.size_bytes
+        if ti.varlen is not None:
+            total += ti.valid_elements * ti.element_size
+        else:
+            total += ti.size_bytes
     return total
 
 

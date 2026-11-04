@@ -50,6 +50,9 @@ def stack(monkeypatch):
     buffer_manager.return_value.__enter__.return_value = bm
     monkeypatch.setattr(internal_profiling, "BufferManager", buffer_manager)
     monkeypatch.setattr(internal_profiling, "generate_input_data", mocks["inputs"])
+    monkeypatch.setattr(
+        internal_profiling, "resolve_varlen_layouts", lambda infos, graph, data: infos
+    )
     return mocks
 
 
