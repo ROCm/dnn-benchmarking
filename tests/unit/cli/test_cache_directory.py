@@ -4,6 +4,7 @@
 """Tests for the work-directory layout that ``cli.main`` sets up."""
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -82,7 +83,7 @@ def test_compile_caches_fill_unset_and_replace_only_for_an_explicit_work_dir(
 def test_unusable_work_dir_names_it(tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("")
-    with pytest.raises(ValueError, match=f"benchmark work dir {blocker}"):
+    with pytest.raises(ValueError, match=re.escape(f"benchmark work dir {blocker}")):
         _configure_cache_env(blocker, tuned=False, replace_compile_caches=False)
 
 
