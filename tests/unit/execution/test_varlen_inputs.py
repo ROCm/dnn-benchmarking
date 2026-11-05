@@ -396,6 +396,37 @@ class TestOffsetTables:
             assert layout.lengths == tuple(int(n) for n in data[7])
             assert all(n <= 2 * int(r) for n, r in zip(layout.lengths, np.diff(table)))
 
+    @pytest.mark.parametrize("align", [1, 2])
+    @pytest.mark.parametrize("batch, capacity", [(2, 20), (4, 31), (4, 40)])
+    def test_a_tight_head_major_capacity_keeps_a_gapped_start(
+        self, align, batch, capacity
+    ) -> None:
+        # Each case has room for one aligned gap before a batch other than the
+        # last, so some batch must start past the packed end of the ones before.
+        # Measured on the resolved layout, as an engine reads it.
+        heads, seq, head_dim = 2, 16, 8
+        strides = [heads * capacity * head_dim, capacity * head_dim, head_dim, 1]
+        for seed in SEEDS:
+            graph, infos = _ragged_graph(
+                batch=batch,
+                seq=seq,
+                heads=heads,
+                strides=strides,
+                multiplier=align * head_dim,
+            )
+            data = generate_input_data(infos, seed, graph)
+            q = next(
+                ti
+                for ti in resolve_varlen_layouts(
+                    [TensorInfo.from_json(t) for t in graph["tensors"]], graph, data
+                )
+                if ti.uid == 1
+            )
+            starts = np.asarray(q.varlen.starts) // head_dim
+            packed = np.concatenate(([0], np.cumsum(q.varlen.lengths)))[:-1]
+            assert q.varlen.end // head_dim <= capacity
+            assert np.any(starts[1:] > packed[1:]), f"seed {seed}: no gapped start"
+
     def test_single_token_head_major_tensor_is_accepted(self) -> None:
         # strides[1] == strides[2]: the head axis is outer, one token fits.
         graph, infos = _ragged_graph(

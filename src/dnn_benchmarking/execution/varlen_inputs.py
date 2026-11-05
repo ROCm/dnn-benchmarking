@@ -295,14 +295,43 @@ def _token_alignment(tables: Dict[int, List[Dict[str, Any]]], max_len: int) -> i
     return align
 
 
+def _interior_gap(
+    lengths: np.ndarray,
+    gaps: np.ndarray,
+    align: int,
+    limit: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """``gaps`` with one aligned block before a batch other than the last,
+    unless such a batch already starts after unused tokens or none has room."""
+    if len(lengths) < 2:
+        return gaps
+    ranges = _ranges(lengths, gaps, align)
+    if np.any(ranges[:-1] > lengths[:-1]):
+        return gaps
+    candidates = np.flatnonzero(ranges[:-1] + align <= limit)
+    if not candidates.size:
+        return gaps
+    gaps = gaps.copy()
+    gaps[int(rng.choice(candidates))] += align
+    return gaps
+
+
 def _fit(
     lengths: np.ndarray,
     gaps: np.ndarray,
     capacity: int,
     limiter: Dict[str, Any],
     align: int,
+    limit: int,
+    keep_gap: bool,
+    rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Shrink gaps, then lengths, until the batches fit ``capacity`` tokens."""
+    """Shrink gaps, then lengths, until the batches fit ``capacity`` tokens.
+
+    With ``keep_gap``, one aligned gap before a batch other than the last
+    survives when it fits, so some batch still starts after unused tokens.
+    """
     blocks_capacity = capacity // align
     if len(lengths) > blocks_capacity:
         raise UnsupportedGraphError(
@@ -312,13 +341,24 @@ def _fit(
     if int(_ranges(lengths, gaps, align).sum()) <= capacity:
         return lengths, gaps
     gaps = np.zeros_like(gaps)
-    if int(_ranges(lengths, gaps, align).sum()) <= capacity:
+    if keep_gap:
+        kept = _interior_gap(lengths, gaps, align, limit, rng)
+        if int(_ranges(lengths, kept, align).sum()) <= capacity:
+            return lengths, kept
+    elif int(_ranges(lengths, gaps, align).sum()) <= capacity:
         return lengths, gaps
+    # Scale the lengths to one block less than the capacity when a gap must
+    # stay, and give that block to the gap.
+    reserve = 1 if keep_gap and blocks_capacity > len(lengths) else 0
+    target = blocks_capacity - reserve
     blocks = -(-lengths // align)
-    blocks = np.maximum(1, blocks * blocks_capacity // int(blocks.sum()))
-    while int(blocks.sum()) > blocks_capacity:
+    blocks = np.maximum(1, blocks * target // int(blocks.sum()))
+    while int(blocks.sum()) > target:
         blocks[int(np.argmax(blocks))] -= 1
-    return np.minimum(lengths, blocks * align), gaps
+    lengths = np.minimum(lengths, blocks * align)
+    if reserve:
+        gaps = _interior_gap(lengths, gaps, align, limit, rng)
+    return lengths, gaps
 
 
 def _fill(info: TensorInfo, values: Sequence[int], what: str) -> np.ndarray:
@@ -434,11 +474,14 @@ def _generate_group(
         else:
             # The lengths are the ranges, so they must be aligned themselves.
             lengths = np.maximum(align, lengths // align * align)
+        keep_gap = batch > 1 and bool(seq_uids or cu_uids)
         for tensors in tables.values():
             for tensor in tensors:
                 capacity = _token_capacity(tensor)
                 if capacity is not None:
-                    lengths, gaps = _fit(lengths, gaps, capacity, tensor, align)
+                    lengths, gaps = _fit(
+                        lengths, gaps, capacity, tensor, align, limit, keep_gap, rng
+                    )
 
     for uid in seq_uids:
         if uid in graph.infos:

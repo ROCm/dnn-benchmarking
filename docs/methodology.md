@@ -320,13 +320,16 @@ They are not uniform floats:
   and its gap, in the unit of the table. Only a graph that has a length
   source gets gaps. A gap is padding tokens after the live tokens of a
   batch, and the length excludes them. With two or more batches, at least
-  one batch starts after a gap, unless the token capacity leaves no room for
-  one. Each entry is stored in the unit of the table. That is the token
-  start times the sequence stride divided by `ragged_offset_multiplier`.
+  one batch starts after a gap. There is no gap only when no batch before the
+  last has room for one: every length is at the aligned sequence length, or
+  the token capacity holds just one aligned block for each batch. Each entry
+  is stored in the unit of the table. That is the token start times the
+  sequence stride divided by `ragged_offset_multiplier`.
 - A head-major ragged tensor (for example `[H, T, D]`) stores the token
   range in the head stride. The capacity of that range limits the lengths
-  and the gaps. The tool reduces them to fit. A graph that cannot fit one
-  token for each batch is not served.
+  and the gaps. The tool reduces them to fit, and keeps one gap before a
+  batch other than the last when the capacity has room for it. A graph that
+  cannot fit one token for each batch is not served.
 - `cu_seq_len` tensors hold the running totals of the lengths: `0`, `l0`,
   `l0 + l1`, and so on, `B + 1` entries, in the dtype of the tensor. A side
   uses `seq_len` or `cu_seq_len`, not both. The two sides can use different
