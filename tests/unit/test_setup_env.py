@@ -1276,6 +1276,5 @@ def test_rocke_install_honours_no_editable(
 
     setup.install_rocke_packages()
 
-    assert [
-        tuple(a.removeprefix(f"{rocke}/") for a in call) for call in calls
-    ] == expected
+    package_dirs = {name: str(rocke / name) for name in ("platform", "library")}
+    assert calls == [tuple(package_dirs.get(a, a) for a in call) for call in expected]
