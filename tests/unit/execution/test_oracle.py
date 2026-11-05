@@ -285,23 +285,16 @@ def test_no_references_means_no_tuned_validation(tuned):
     assert row.oracle.correctness is None
 
 
-def test_tuned_validation_hands_the_graph_json_to_the_correctness_check(
-    tuned, monkeypatch
-):
-    """Varlen graphs need the graph JSON to mask padding; the tuned check must
-    see the same JSON as the OOTB check."""
-    seen = []
+def test_tuned_validation_matches_infinities_in_sdpa_stats(tuned):
+    """Varlen graphs hold -inf in dead stats rows; the tuned check must see the
+    graph JSON, as the OOTB check does, to compare those rows as equal."""
+    dead = np.full(2, -np.inf, np.float32)
+    refs = {1: ReferenceOutput(data=dead.copy(), tensor_uid=1)}
+    graph = {"nodes": [{"type": "SdpaAttributes", "outputs": {"stats_tensor_uid": 1}}]}
 
-    def spy(bm, infos, references, provider, config, graph_json=None):
-        seen.append(graph_json)
-        return CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
+    row = _run(refs=refs, bm=_BM({1: dead.copy()}), graph_json=graph)
 
-    monkeypatch.setattr(oracle_mod, "check_correctness", spy)
-    graph = {"nodes": [{"type": "SdpaFwdAttributes"}]}
-
-    _run(refs=_refs(), graph_json=graph)
-
-    assert seen == [graph]
+    assert row.oracle.correctness.tolerance_match
 
 
 def test_failing_tuned_plan_keeps_the_row_verdict(tuned):

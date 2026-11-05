@@ -11,6 +11,7 @@ from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.varlen_inputs import generate_varlen_inputs
 from dnn_benchmarking.graph.tensor_info import TensorInfo
+from dnn_benchmarking.graph.varlen import resolve_varlen_layouts
 
 SEEDS = range(12)
 
@@ -195,6 +196,21 @@ class TestLengths:
             assert out[7].max() <= 8, "shared lengths exceed the smaller operand"
             assert out[8].max() <= 16 and out[9].max() <= 8
 
+    def test_lengths_under_any_node_section_are_found_like_the_resolver_does(
+        self,
+    ) -> None:
+        graph, infos = _dense_varlen(batch=4, seq=16)
+        node = graph["nodes"][0]
+        for key in ("seq_len_q_tensor_uid", "seq_len_kv_tensor_uid"):
+            node["attributes"][key] = node["inputs"].pop(key)
+        infos = [TensorInfo.from_json(t) for t in graph["tensors"]]
+        for seed in SEEDS:
+            data = generate_input_data(infos, seed, graph)
+            assert data[7].min() >= 1 and data[8].min() >= 1
+            resolved = resolve_varlen_layouts(infos, graph, data)
+            q = next(ti for ti in resolved if ti.uid == 1)
+            assert q.varlen.lengths == tuple(int(n) for n in data[7])
+
 
 class TestInputDataIntegration:
     def test_float_values_do_not_depend_on_the_graph(self) -> None:
@@ -367,6 +383,63 @@ class TestOffsetTables:
         graph, infos = _ragged_graph(
             batch=2, seq=1, heads=4, strides=[32, 8, 8, 1], multiplier=8
         )
+        with pytest.raises(UnsupportedGraphError, match="'Q'"):
+            generate_varlen_inputs(graph, infos, 0)
+
+    @pytest.mark.parametrize("batch", [2, 4])
+    def test_a_length_source_always_leaves_a_gap_before_some_batch(self, batch) -> None:
+        for seed in range(40):
+            graph, infos = _ragged_graph(batch=batch, seq=16)
+            out = generate_varlen_inputs(graph, infos, seed)
+            ranges = np.diff(out[9].reshape(-1))
+            assert np.any(ranges > out[7]), f"seed {seed}: no gap"
+
+    @pytest.mark.parametrize("with_seq_len", [True, False])
+    def test_a_multiplier_above_the_token_stride_succeeds_for_every_seed(
+        self, with_seq_len
+    ) -> None:
+        # Token stride 16, multiplier 32: an offset is a whole number only for
+        # an even token start.
+        for seed in range(30):
+            graph, infos = _ragged_graph(
+                batch=4, seq=16, multiplier=32, with_seq_len=with_seq_len
+            )
+            data = generate_input_data(infos, seed, graph)
+            table = data[9].reshape(-1)
+            assert table.dtype == np.int32
+            resolved = {
+                ti.uid: ti
+                for ti in resolve_varlen_layouts(
+                    [TensorInfo.from_json(t) for t in graph["tensors"]], graph, data
+                )
+            }
+            layout = resolved[1].varlen
+            assert layout.starts == tuple(int(off) * 32 for off in table[:-1])
+            assert layout.end == int(table[-1]) * 32
+            ranges = np.diff(table) * 2
+            assert np.all(ranges <= 16)
+            if with_seq_len:
+                assert layout.lengths == tuple(int(n) for n in data[7])
+            else:
+                assert layout.lengths == tuple(int(n) for n in ranges)
+                assert all(n >= 2 and n % 2 == 0 for n in layout.lengths)
+
+    def test_an_alignment_longer_than_a_sequence_is_refused_for_every_seed(
+        self,
+    ) -> None:
+        for seed in SEEDS:
+            graph, infos = _ragged_graph(batch=4, seq=16, multiplier=16 * 32)
+            with pytest.raises(UnsupportedGraphError, match="'Q'"):
+                generate_varlen_inputs(graph, infos, seed)
+
+    def test_an_offset_table_that_overflows_its_dtype_is_refused(self) -> None:
+        strides = [2**33, 8, 2**31, 1]
+        graph, infos = _ragged_graph(batch=4, seq=16, strides=strides, multiplier=1)
+        with pytest.raises(UnsupportedGraphError, match="OFFSETS"):
+            generate_varlen_inputs(graph, infos, 0)
+
+    def test_a_zero_sequence_stride_is_refused_naming_the_tensor(self) -> None:
+        graph, infos = _ragged_graph(batch=4, seq=16, strides=[0, 8, 0, 1])
         with pytest.raises(UnsupportedGraphError, match="'Q'"):
             generate_varlen_inputs(graph, infos, 0)
 

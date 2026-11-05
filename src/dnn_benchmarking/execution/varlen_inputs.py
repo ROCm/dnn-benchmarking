@@ -13,6 +13,7 @@ The values come from their own random stream, so the floating-point inputs of
 a graph are the same with and without these tensors.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,18 +21,10 @@ import numpy as np
 
 from ..common.exceptions import UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
+from ..graph.varlen import SdpaOperands, sdpa_operands
 
 # Mixed into the seed so this stream is separate from the float draws.
 _STREAM = 0x3139
-
-_QUERY_KEYS = (
-    "q_tensor_uid",
-    "o_tensor_uid",
-    "stats_tensor_uid",
-    "do_tensor_uid",
-    "dq_tensor_uid",
-)
-_KEY_KEYS = ("k_tensor_uid", "v_tensor_uid", "dk_tensor_uid", "dv_tensor_uid")
 
 
 @dataclass
@@ -113,19 +106,9 @@ class _Graph:
         return None
 
 
-def _node_side(
-    node: Dict[str, Any], keys: Tuple[str, ...], graph: _Graph
-) -> List[Dict[str, Any]]:
-    operands: List[Dict[str, Any]] = []
-    seen = set()
-    for section in ("inputs", "outputs"):
-        values = node.get(section) or {}
-        for key in keys:
-            uid = _uid(values.get(key))
-            if uid is not None and uid in graph.json and uid not in seen:
-                seen.add(uid)
-                operands.append(graph.json[uid])
-    return operands
+def _tensors(uids: Tuple[int, ...], graph: _Graph) -> List[Dict[str, Any]]:
+    """JSON of the listed tensors that the graph defines, without repeats."""
+    return [graph.json[uid] for uid in dict.fromkeys(uids) if uid in graph.json]
 
 
 def _collect_sides(graph_json: Dict[str, Any], graph: _Graph) -> List[_Side]:
@@ -133,22 +116,21 @@ def _collect_sides(graph_json: Dict[str, Any], graph: _Graph) -> List[_Side]:
     for node in graph_json.get("nodes", []) or []:
         if not str(node.get("type", "")).startswith("Sdpa"):
             continue
-        inputs = node.get("inputs") or {}
-        attributes = node.get("attributes") or {}
-        seq_q = _uid(inputs.get("seq_len_q_tensor_uid"))
-        seq_kv = _uid(inputs.get("seq_len_kv_tensor_uid"))
-        cu_q = _uid(inputs.get("cu_seq_len_q_tensor_uid"))
-        cu_kv = _uid(inputs.get("cu_seq_len_kv_tensor_uid"))
-        table_uid = _uid(inputs.get("page_table_k_tensor_uid"))
-
+        operands = sdpa_operands(node)
         query = _Side(
-            seq_uid=seq_q, cu_uid=cu_q, operands=_node_side(node, _QUERY_KEYS, graph)
+            seq_uid=operands.seq_len_q_tensor_uid,
+            cu_uid=operands.cu_seq_len_q_tensor_uid,
+            operands=_tensors(operands.q_side, graph),
         )
         key = _Side(
-            seq_uid=seq_kv, cu_uid=cu_kv, operands=_node_side(node, _KEY_KEYS, graph)
+            seq_uid=operands.seq_len_kv_tensor_uid,
+            cu_uid=operands.cu_seq_len_kv_tensor_uid,
+            operands=_tensors(operands.kv_side, graph),
         )
-        if table_uid is not None:
-            _bound_paged(node, graph, query, key, table_uid, attributes)
+        if operands.page_table_k_tensor_uid is not None:
+            _bound_paged(
+                node, operands, graph, query, key, operands.page_table_k_tensor_uid
+            )
         else:
             for side in (query, key):
                 _bound_dense(side)
@@ -169,17 +151,17 @@ def _bound_dense(side: _Side) -> None:
 
 def _bound_paged(
     node: Dict[str, Any],
+    operands: SdpaOperands,
     graph: _Graph,
     query: _Side,
     key: _Side,
     table_uid: int,
-    attributes: Dict[str, Any],
 ) -> None:
     """Bound a paged node: key lengths by the page allocation, query lengths
     by the query tensor (a packed query is split over the sequences)."""
-    inputs = node.get("inputs") or {}
+    attributes = node.get("attributes") or {}
     table_dims = graph.dims(table_uid)
-    key_tensor = graph.json.get(_uid(inputs.get("k_tensor_uid")) or -1)
+    key_tensor = graph.json.get(operands.k)
     page_size = 1
     if key_tensor and len(key_tensor.get("dims", [])) == 4:
         page_size = max(int(key_tensor["dims"][2]), 1)
@@ -197,7 +179,7 @@ def _bound_paged(
     query.batch = batch
 
     q_tensors = query.operands
-    q_main = graph.json.get(_uid(inputs.get("q_tensor_uid")) or -1)
+    q_main = graph.json.get(operands.q)
     if q_main is None or len(q_main.get("dims", [])) != 4:
         # No query tensor to bound the lengths: take the page size.
         query.operands = []
@@ -282,28 +264,60 @@ def _token_capacity(tensor: Dict[str, Any]) -> Optional[int]:
     return min(capacities) if capacities else None
 
 
+def _ranges(lengths: np.ndarray, gaps: np.ndarray, align: int) -> np.ndarray:
+    """Token range of each batch: its length and gap, rounded up to ``align``."""
+    return -(-(lengths + gaps) // align) * align
+
+
+def _token_alignment(tables: Dict[int, List[Dict[str, Any]]], max_len: int) -> int:
+    """Token multiple that every start must be, for every tensor to read its
+    offset as a whole number: ``start * strides[2]`` must divide by the
+    multiplier."""
+    align = 1
+    for uid, tensors in tables.items():
+        for tensor in tensors:
+            multiplier = _multiplier(tensor)
+            if multiplier <= 0:
+                raise UnsupportedGraphError(
+                    f"{_describe(tensor)} has ragged_offset_multiplier "
+                    f"{multiplier}, which must be positive"
+                )
+            stride = int(tensor["strides"][2])
+            align = math.lcm(align, multiplier // math.gcd(multiplier, stride))
+            if align > max_len:
+                raise UnsupportedGraphError(
+                    f"{_describe(tensor)}: ragged_offset_multiplier {multiplier} "
+                    f"with token stride {stride} needs every start of offset "
+                    f"table (uid {uid}) to be a multiple of {align} tokens, but "
+                    f"a sequence holds {max_len}"
+                )
+    return align
+
+
 def _fit(
     lengths: np.ndarray,
     gaps: np.ndarray,
     capacity: int,
     limiter: Dict[str, Any],
+    align: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Shrink gaps, then lengths, until the batches fit ``capacity`` tokens."""
-    if len(lengths) > capacity:
+    blocks_capacity = capacity // align
+    if len(lengths) > blocks_capacity:
         raise UnsupportedGraphError(
             f"{_describe(limiter)} holds {capacity} tokens, fewer than the "
-            f"{len(lengths)} batches that each need at least one"
+            f"{len(lengths)} batches that each need {align}"
         )
-    if int(lengths.sum() + gaps.sum()) <= capacity:
+    if int(_ranges(lengths, gaps, align).sum()) <= capacity:
         return lengths, gaps
     gaps = np.zeros_like(gaps)
-    total = int(lengths.sum())
-    if total <= capacity:
+    if int(_ranges(lengths, gaps, align).sum()) <= capacity:
         return lengths, gaps
-    lengths = np.maximum(1, lengths * capacity // total)
-    while int(lengths.sum()) > capacity:
-        lengths[int(np.argmax(lengths))] -= 1
-    return lengths, gaps
+    blocks = -(-lengths // align)
+    blocks = np.maximum(1, blocks * blocks_capacity // int(blocks.sum()))
+    while int(blocks.sum()) > blocks_capacity:
+        blocks[int(np.argmax(blocks))] -= 1
+    return np.minimum(lengths, blocks * align), gaps
 
 
 def _fill(info: TensorInfo, values: Sequence[int], what: str) -> np.ndarray:
@@ -312,7 +326,16 @@ def _fill(info: TensorInfo, values: Sequence[int], what: str) -> np.ndarray:
             f"tensor '{info.name}' (uid {info.uid}) has {info.num_elements} "
             f"elements, but {what} needs {len(values)}"
         )
-    return np.asarray(values, dtype=info.dtype.numpy).reshape(info.dims)
+    dtype = np.dtype(info.dtype.numpy)
+    if dtype.kind in "iu" and len(values):
+        limits = np.iinfo(dtype)
+        if min(values) < limits.min or max(values) > limits.max:
+            raise UnsupportedGraphError(
+                f"tensor '{info.name}' (uid {info.uid}) is {dtype.name}, which "
+                f"holds {limits.min}..{limits.max}, but {what} needs "
+                f"{min(values)}..{max(values)}"
+            )
+    return np.asarray(values, dtype=dtype).reshape(info.dims)
 
 
 def _ordered(values: List[Optional[int]]) -> List[int]:
@@ -359,12 +382,19 @@ def _generate_group(
     for side in group:
         for tensor in side.operands:
             uid = _offset_uid(tensor)
-            if uid is not None and len(tensor.get("dims", [])) != 4:
+            if uid is None:
+                continue
+            if len(tensor.get("dims", [])) != 4:
                 raise UnsupportedGraphError(
                     f"{_describe(tensor)} is ragged and must have 4 dims, "
                     f"has {len(tensor.get('dims', []))}"
                 )
-            if uid is not None and tensor not in tables.setdefault(uid, []):
+            if len(tensor.get("strides", [])) != 4 or int(tensor["strides"][2]) <= 0:
+                raise UnsupportedGraphError(
+                    f"{_describe(tensor)} is ragged and needs 4 strides with a "
+                    f"positive sequence stride, has {tensor.get('strides')}"
+                )
+            if tensor not in tables.setdefault(uid, []):
                 tables[uid].append(tensor)
 
     targets = [u for u in seq_uids + cu_uids + list(tables) if u in graph.infos]
@@ -372,23 +402,34 @@ def _generate_group(
         return
 
     batch = _batch_count(group, graph)
+    bounds = [s.max_len for s in group if s.max_len is not None]
+    max_len = min(bounds) if bounds else 1
+    align = _token_alignment(tables, max_len)
     lengths = _draw_lengths(group, batch, rng)
 
     gaps = np.zeros(batch, dtype=np.int64)
     if tables:
-        has_source = bool(seq_uids or cu_uids)
-        bounds = [s.max_len for s in group if s.max_len is not None]
-        max_len = min(bounds) if bounds else 1
-        if has_source:
-            room = np.maximum(max_len - lengths, 0)
+        # Every start is a multiple of `align`, so a range never passes `limit`.
+        limit = max_len // align * align
+        lengths = np.minimum(lengths, limit)
+        if seq_uids or cu_uids:
+            room = limit - lengths
             wanted = rng.random(batch) < 0.5
             drawn = rng.integers(1, np.maximum(room, 1) + 1)
             gaps = np.where(wanted & (room > 0), drawn, 0).astype(np.int64)
+            # As a padded batch is forced, so is a gap before a batch that has
+            # room for one.
+            if np.any(room > 0) and not np.any(_ranges(lengths, gaps, align) > lengths):
+                chosen = int(rng.choice(np.flatnonzero(room > 0)))
+                gaps[chosen] = drawn[chosen]
+        else:
+            # The lengths are the ranges, so they must be aligned themselves.
+            lengths = np.maximum(align, lengths // align * align)
         for tensors in tables.values():
             for tensor in tensors:
                 capacity = _token_capacity(tensor)
                 if capacity is not None:
-                    lengths, gaps = _fit(lengths, gaps, capacity, tensor)
+                    lengths, gaps = _fit(lengths, gaps, capacity, tensor, align)
 
     for uid in seq_uids:
         if uid in graph.infos:
@@ -399,7 +440,7 @@ def _generate_group(
             if uid in graph.infos:
                 out[uid] = _fill(graph.infos[uid], totals, "cu_seq_len")
 
-    starts = np.concatenate(([0], np.cumsum(lengths + gaps)))
+    starts = np.concatenate(([0], np.cumsum(_ranges(lengths, gaps, align))))
     for uid, tensors in tables.items():
         if uid in graph.infos:
             out[uid] = _offset_table(graph.infos[uid], tensors, starts)
@@ -422,18 +463,11 @@ def _offset_table(
     info: TensorInfo, tensors: List[Dict[str, Any]], starts: np.ndarray
 ) -> np.ndarray:
     """Offsets ``t_b * strides[2] / multiplier`` that every user of the table
-    must read the same way."""
+    must read the same way. The starts are multiples of the token alignment,
+    so the division is exact."""
     values: Optional[np.ndarray] = None
     for tensor in tensors:
-        scaled = starts * int(tensor["strides"][2])
-        multiplier = _multiplier(tensor)
-        if multiplier <= 0 or np.any(scaled % multiplier):
-            raise UnsupportedGraphError(
-                f"{_describe(tensor)}: ragged_offset_multiplier {multiplier} does "
-                f"not divide the token starts (token stride {tensor['strides'][2]}) "
-                f"stored in offset table '{info.name}' (uid {info.uid})"
-            )
-        scaled = scaled // multiplier
+        scaled = starts * int(tensor["strides"][2]) // _multiplier(tensor)
         if values is not None and not np.array_equal(values, scaled):
             raise UnsupportedGraphError(
                 f"{_describe(tensor)} reads offset table '{info.name}' "

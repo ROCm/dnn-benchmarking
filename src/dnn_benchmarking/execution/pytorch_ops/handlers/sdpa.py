@@ -973,12 +973,18 @@ def _plan_varlen_sdpa(
         rows = stop - start
         if rows <= 0:
             continue
-        band, causal = _attention_bounds(
-            lq, lkv, plan.window, plan.bottom_right, plan.is_causal, q
-        )
-        if band is not None:
-            mask = band[start:stop] if (start or stop < lq) else band
+        if start and plan.window is None and plan.bottom_right:
+            # The trimmed block is top-left causal: keep the call native.
+            band, causal = _attention_bounds(rows, lkv, None, True, plan.is_causal, q)
+            mask = band
         else:
+            band, causal = _attention_bounds(
+                lq, lkv, plan.window, plan.bottom_right, plan.is_causal, q
+            )
+            mask = None
+            if band is not None:
+                mask = band[start:stop] if (start or stop < lq) else band
+        if mask is None:
             mask = _batch_attn_mask(attn_mask, b, start, stop, lkv)
         q_rows = slice(start, stop)
         o_rows = o[b : b + 1, :, q_rows]

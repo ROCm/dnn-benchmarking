@@ -337,6 +337,11 @@ def _check_source_inputs(
 def _ragged_offsets(info: TensorInfo, batches: int, read_ints: _ReadInts) -> List[int]:
     if len(info.dims) != 4 or len(info.strides) != 4:
         raise _refuse(f"Ragged {_label(info)} must be rank 4, got dims {info.dims}")
+    if info.strides[2] <= 0:
+        raise _refuse(
+            f"Ragged {_label(info)} needs a positive sequence stride, got "
+            f"strides {info.strides}"
+        )
     offsets = read_ints(info.ragged_offset_tensor_uid)
     if len(offsets) != batches + 1:
         raise _refuse(

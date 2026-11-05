@@ -3124,31 +3124,73 @@ class TestPyTorchSdpaVarlen:
         torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
         assert not tensors[4][2, :, 2].any()
 
-    def test_gqa_probe_covers_a_masked_batch_after_a_native_one(self) -> None:
-        """Batches (lq=4, lkv=4) and (lq=6, lkv=4) bottom-right both run 4 live
-        rows over 4 keys, but the first is native causal and the second a masked
-        call. Each call form needs its own dispatch probe."""
+    def test_bottom_right_rows_past_the_keys_run_as_native_causal(self) -> None:
+        """Batch 2 (lq=3, lkv=1) has two dead rows. Its live block is top-left
+        causal, so the call must stay native (no ``attn_mask``) to remain
+        eligible for the fused kernels."""
         from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
 
-        torch.manual_seed(0)
-        tensors = {
-            1: torch.randn(2, self.HQ, 6, self.D),
-            2: torch.randn(2, self.HKV, 4, self.D),
-            3: torch.randn(2, self.HKV, 4, self.D),
-            7: torch.tensor([4, 6], dtype=torch.int32),
-            8: torch.tensor([4, 4], dtype=torch.int32),
-        }
-        with patch.object(
-            sdpa,
-            "_fused_kv_for_call",
-            wraps=sdpa._fused_kv_for_call,
-        ) as probe:
+        real = sdpa.execute_selected_sdpa
+        calls = []
+
+        def spy(q, k, v, *, attn_mask=None, is_causal=False, **kwargs):
+            calls.append(
+                (int(q.shape[-2]), int(k.shape[-2]), attn_mask is None, is_causal)
+            )
+            return real(q, k, v, attn_mask=attn_mask, is_causal=is_causal, **kwargs)
+
+        tensors = self._tensors()
+        expected_o, _ = self._loop(tensors, "bottom_right")
+        with patch.object(sdpa, "execute_selected_sdpa", spy):
             pytorch_ops.execute_graph(
                 self._graph(causal_mask_bottom_right=True), tensors
             )
 
-        forms = {(call.args[4] is None, call.args[6]) for call in probe.call_args_list}
-        assert forms == {(True, True), (False, False)}
+        assert (1, 1, True, True) in calls
+        assert not [c for c in calls if c[:2] == (1, 1) and not c[2]]
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "masked_first", [False, True], ids=["native-first", "masked-first"]
+    )
+    @pytest.mark.parametrize("masked_hits_math", [False, True], ids=["fused", "math"])
+    def test_gqa_math_refusal_covers_a_masked_batch_in_any_position(
+        self, monkeypatch, masked_first, masked_hits_math
+    ) -> None:
+        """Bottom-right batches (lq=4, lkv=4) and (lq=3, lkv=5): the first is a
+        native causal call, the second a masked one. When only a masked call
+        would run on math, native or expanded, the graph is refused whichever
+        batch comes first."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+
+        q_lens, kv_lens = [[4, 3], [4, 5]]
+        if masked_first:
+            q_lens, kv_lens = q_lens[::-1], kv_lens[::-1]
+        torch.manual_seed(0)
+        tensors = {
+            1: torch.randn(2, self.HQ, 4, self.D),
+            2: torch.randn(2, self.HKV, 5, self.D),
+            3: torch.randn(2, self.HKV, 5, self.D),
+            7: torch.tensor(q_lens, dtype=torch.int32),
+            8: torch.tensor(kv_lens, dtype=torch.int32),
+        }
+        monkeypatch.setattr(
+            sdpa, "_gqa_call_is_timed_on_gpu", lambda tensors, q, enable_gqa: enable_gqa
+        )
+        monkeypatch.setattr(
+            sdpa,
+            "default_sdpa_avoids_math",
+            lambda q, k, v, *, attn_mask, **_: not (
+                masked_hits_math and attn_mask is not None
+            ),
+        )
+        graph = self._graph(causal_mask_bottom_right=True)
+
+        if masked_hits_math:
+            with pytest.raises(UnsupportedGraphError, match="math"):
+                pytorch_ops.execute_graph(graph, tensors)
+        else:
+            pytorch_ops.execute_graph(graph, tensors)
 
     @pytest.mark.parametrize(
         "shape",

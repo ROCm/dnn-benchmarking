@@ -105,7 +105,8 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   reads the first `lq` query positions of the batch. It reads the first
   `lkv` key positions of the batch. Every mask, including the bottom-right
   causal alignment, uses these live lengths.
-- A row with no visible key (a dead row) keeps `O = 0` and `stats = -inf`.
+- A row with no visible key (a dead row) keeps `O = 0`. Its `stats` is
+  `-inf`, or the sink logit when the graph has sink tokens.
   Dead rows are the leading rows of a bottom-right mask when `lq > lkv`.
   They are also the trailing rows of a top-left window when `lq >= lkv + w`,
   where `w` is the window size. A row past `lq` keeps `stats = -inf`, also

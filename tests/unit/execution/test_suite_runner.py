@@ -665,22 +665,36 @@ def test_varlen_graph_reports_the_per_batch_flops_not_the_dense_count(fake):
     assert row.analytical_flops == expected
 
 
-def test_varlen_graph_hands_the_graph_json_to_the_correctness_check(
-    fake, reference, monkeypatch
-):
+def test_varlen_sdpa_stats_with_matching_infinities_pass_validation(fake, monkeypatch):
+    """Dead rows hold -inf in the engine and the reference; the graph JSON
+    must reach the check so the stats output compares with matching infinities."""
     fake.discovered = [1]
-    seen = []
+    shape = (3, 1, 8)
+    stats = np.full((*shape, 1), -np.inf, np.float32)
+    out = np.zeros((*shape, 4), np.float32)
+    outputs = {4: out, 5: stats}
 
-    def spy(bm, infos, references, provider, config, graph_json=None):
-        seen.append(graph_json)
-        return suite_runner.unchecked(config, "spy")
+    def prepare(ctx):
+        ctx.reference_outputs = {
+            uid: suite_runner.ReferenceOutput(data=data.copy(), tensor_uid=uid)
+            for uid, data in outputs.items()
+        }
 
-    monkeypatch.setattr(suite_runner, "check_correctness", spy)
-    graph_json = _varlen_graph()
+    monkeypatch.setattr(suite_runner, "_prepare_references", prepare)
+    monkeypatch.setattr(
+        suite_runner.BufferManager,
+        "get_output_data",
+        lambda self, uid: outputs[uid].copy(),
+    )
 
-    _run_varlen(graph_json, validation=ValidationConfig(provider="pytorch"))
+    graph, _ = _run_varlen(
+        _varlen_graph(), validation=ValidationConfig(provider="pytorch")
+    )
 
-    assert seen == [graph_json]
+    (infos,) = fake.buffer_infos
+    assert sum(next(i for i in infos if i.name == "stats").varlen.lengths) > 0
+    (row,) = graph.results
+    assert row.verdict == "passed"
 
 
 def test_graph_the_varlen_resolver_refuses_has_no_engines_and_names_the_tensor(fake):
@@ -688,7 +702,7 @@ def test_graph_the_varlen_resolver_refuses_has_no_engines_and_names_the_tensor(f
 
     assert graph.status == "no_engines"
     assert graph.results == [] and graph.error is None
-    assert "seq_len" in graph.message and "q" in graph.message
+    assert "seq_len" in graph.message and "'q'" in graph.message
 
 
 @pytest.mark.parametrize(

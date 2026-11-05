@@ -108,7 +108,7 @@ ragged tensors) compare valid positions only:
 In the `stats` output of every SDPA forward node, an infinity in both tensors
 with the same sign is equal. This holds for dense graphs too, for example a
 bottom-right mask with `Sq > Skv`. A row with no visible key has
-`stats = -inf`.
+`stats = -inf`, or the sink logit when the graph has sink tokens.
 
 #### Reference precision
 

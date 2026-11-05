@@ -246,6 +246,43 @@ def _drop_data(scenario, uid):
     return graph, data
 
 
+def _own_table_for_o():
+    """O reads its own table, whose ranges (3, 3) differ from Q's lengths."""
+    graph, data = _scenario(off=[0, 2, 5], ragged=("q", "k", "v"))
+    graph["tensors"][3].update(ragged_offset_tensor_uid=13, ragged_offset_multiplier=6)
+    graph["tensors"].append(_tensor(13, "table13", [3, 1, 1, 1], dtype="int32"))
+    data[13] = np.array([0, 3, 6], dtype=np.int32).reshape(-1, 1, 1, 1)
+    return graph, data
+
+
+def _wide_k():
+    graph, data = _scenario(seq=[2, 3])
+    graph["tensors"][1]["dims"] = [3, 2, 4, 3]
+    return graph, data
+
+
+def _second_node():
+    """A second node reads the same Q/K/V/O with other lengths."""
+    graph, data = _scenario(seq=[2, 3])
+    graph["tensors"].append(_tensor(14, "table14", [2, 1, 1, 1], dtype="int32"))
+    data[14] = np.array([1, 1], dtype=np.int32).reshape(-1, 1, 1, 1)
+    graph["nodes"].append(
+        {
+            "type": "SdpaAttributes",
+            "inputs": {
+                "q_tensor_uid": 1,
+                "k_tensor_uid": 2,
+                "v_tensor_uid": 3,
+                "seq_len_q_tensor_uid": 14,
+                "seq_len_kv_tensor_uid": 14,
+            },
+            "outputs": {"o_tensor_uid": 4},
+            "attributes": {},
+        }
+    )
+    return graph, data
+
+
 REFUSALS = {
     "rank": _rank3,
     "table size": lambda: _scenario(off=[0, 2]),
@@ -283,6 +320,10 @@ REFUSALS = {
         extra_nodes=[{"type": "Other", "outputs": {"y_tensor_uid": 11}}],
     ),
     "missing table data": lambda: _drop_data(_scenario(seq=[2, 3]), 11),
+    "zero sequence stride": lambda: _scenario(off=[0, 2, 5], strides=[24, 3, 0, 1]),
+    "operand table disagrees with the side lengths": _own_table_for_o,
+    "operand batch count": _wide_k,
+    "layouts differ between nodes": _second_node,
 }
 
 
@@ -290,7 +331,7 @@ REFUSALS = {
 def test_unsupported_layout_is_refused_naming_the_tensor(case: str) -> None:
     graph, data = REFUSALS[case]()
 
-    with pytest.raises(UnsupportedGraphError, match=r"'[qkv]'|table11"):
+    with pytest.raises(UnsupportedGraphError, match=r"'[qkvo]'|table11"):
         _resolve(graph, data)
 
 

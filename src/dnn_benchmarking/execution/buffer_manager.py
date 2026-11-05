@@ -240,16 +240,16 @@ def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
     return out
 
 
-def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
-    """Map tensor UID -> ``"page_table"`` for every SDPA page table.
+def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
+    """UIDs of every SDPA page table.
 
-    Roles are read from the node's ``inputs`` map rather than guessed from a
-    tensor name, because names are free-form and a graph is under no obligation
-    to call its page table PAGE_TABLE_K.
+    Page tables are read from the node's ``inputs`` map rather than guessed
+    from a tensor name, because names are free-form and a graph is under no
+    obligation to call its page table PAGE_TABLE_K.
     """
-    roles: Dict[int, str] = {}
+    uids: Set[int] = set()
     if not graph_json:
-        return roles
+        return uids
     for node in graph_json.get("nodes", []) or []:
         if not str(node.get("type", "")).startswith("Sdpa"):
             continue
@@ -257,21 +257,19 @@ def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
         for key in ("page_table_k_tensor_uid", "page_table_v_tensor_uid"):
             uid = inputs.get(key)
             if uid is not None:
-                roles[int(uid)] = "page_table"
-    return roles
+                uids.add(int(uid))
+    return uids
 
 
-def _paged_metadata(
-    graph_json: Optional[Dict[str, Any]],
-) -> Tuple[int, int]:
-    """(page_size, num_pages) taken from the paged K container's own dims.
+def _paged_metadata(graph_json: Optional[Dict[str, Any]]) -> int:
+    """Number of pages, taken from the paged K container's own dims.
 
-    hipDNN has no page-size scalar: the paged K/V container is
-    ``[num_blocks, num_kv_heads, page_size, head_size]``, so both facts are read
-    off that tensor instead of being assumed.
+    hipDNN has no page-count scalar: the paged K/V container is
+    ``[num_blocks, num_kv_heads, page_size, head_size]``, so the count is read
+    off that tensor instead of being assumed. Returns 0 when there is none.
     """
     if not graph_json:
-        return 0, 0
+        return 0
     tensors = {int(t["uid"]): t for t in graph_json.get("tensors", []) or []}
     for node in graph_json.get("nodes", []) or []:
         inputs = node.get("inputs") or {}
@@ -283,8 +281,8 @@ def _paged_metadata(
             else None
         )
         if k and len(k.get("dims", [])) == 4:
-            return int(k["dims"][2]), int(k["dims"][0])
-    return 0, 0
+            return int(k["dims"][0])
+    return 0
 
 
 # Convolution operands that can take signed data: the data, filter and
@@ -376,7 +374,6 @@ def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:
 
 def _generate_paged_input(
     tensor_info: TensorInfo,
-    role: str,
     num_pages: int,
 ) -> np.ndarray:
     """Structured data for a page table.
@@ -387,8 +384,6 @@ def _generate_paged_input(
     dims = list(tensor_info.dims)
     dtype = tensor_info.dtype.numpy
 
-    if role != "page_table":
-        raise ExecutionError(f"unknown paged input role '{role}'")
     # Distinct pages per sequence, so a gather that ignores the table or
     # collapses sequences produces a visibly different answer.
     num_seqs = int(dims[0])
@@ -426,10 +421,10 @@ def generate_input_data(
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
-    paged_roles = _paged_input_roles(graph_json)
+    page_tables = _paged_input_roles(graph_json)
     signed_uids = _signed_input_uids(graph_json)
     varlen_values = generate_varlen_inputs(graph_json, tensor_infos, seed)
-    num_pages = _paged_metadata(graph_json)[1] if paged_roles else 0
+    num_pages = _paged_metadata(graph_json) if page_tables else 0
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -442,13 +437,10 @@ def generate_input_data(
             )
             continue
 
-        role = paged_roles.get(tensor_info.uid)
         if tensor_info.uid in varlen_values:
             input_data[tensor_info.uid] = varlen_values[tensor_info.uid]
-        elif role is not None:
-            input_data[tensor_info.uid] = _generate_paged_input(
-                tensor_info, role, num_pages
-            )
+        elif tensor_info.uid in page_tables:
+            input_data[tensor_info.uid] = _generate_paged_input(tensor_info, num_pages)
         elif dtype.numpy.kind in "iub":
             # ponytail: zeros are safe for index/offset tensors (no OOB reads);
             # per-role structured generation (e.g. MoE offsets) is the upgrade path.

@@ -166,14 +166,18 @@ def _prepare(graph_json):
     return {info.uid: info for info in infos}, input_data
 
 
-def _gather(storage, info, batch):
+def _gather(storage, info, batch, input_data):
     """``[heads, length, last]`` valid positions of one batch, by
     ``start + h * s1 + t * s2 + d * s3``; the start is ``off[b] * multiplier``
-    for a ragged tensor and ``b * strides[0]`` for a padded one."""
+    for a ragged tensor, from the generated table and the graph's multiplier,
+    and ``b * strides[0]`` for a padded one."""
     layout = info.varlen
-    start = (
-        layout.starts[batch] if layout.starts is not None else batch * info.strides[0]
-    )
+    if info.ragged_offset_tensor_uid is None:
+        start = batch * info.strides[0]
+    else:
+        table = input_data[info.ragged_offset_tensor_uid].reshape(-1)
+        start = int(table[batch]) * info.ragged_offset_multiplier
+
     s1, s2, s3 = info.strides[1:]
     heads, last = info.dims[1], info.dims[3]
     index = (
@@ -185,10 +189,26 @@ def _gather(storage, info, batch):
     return storage[index]
 
 
-def _gather_all(infos, uid, array):
+def _gather_all(infos, input_data, uid, array):
     info = infos[uid]
     storage = _encode_to_storage(array, info)
-    return [_gather(storage, info, b) for b in range(B)]
+    return [_gather(storage, info, b, input_data) for b in range(B)]
+
+
+def _has_gap(info):
+    """Whether some ragged batch starts after unused tokens of the one before."""
+    token = info.strides[2]
+    return any(
+        nxt - start > length * token
+        for start, nxt, length in zip(
+            info.varlen.starts, info.varlen.starts[1:], info.varlen.lengths
+        )
+    )
+
+
+def _has_padding(info):
+    """Whether some batch of a padded tensor is shorter than the capacity."""
+    return any(length < info.dims[2] for length in info.varlen.lengths)
 
 
 def _keep(mode, lq, lkv, dead):
@@ -252,6 +272,10 @@ MODES = {
     "bottom_right": {"causal_mask_bottom_right": True},
 }
 
+# Cases that exist to cover batches placed after unused tokens, or padded batches.
+GAPPED_CASES = {"gapped_seq_len"}
+PADDED_CASES = {"cu_seq_len_padded", "aiter_bshd", "aotriton_bhsd"}
+
 
 def _shape(mode, shared):
     """``(q_len, kv_len)`` capacities. Bottom-right gets more query rows than
@@ -268,12 +292,12 @@ def test_reference_matches_the_dense_loop_on_valid_positions(case, mode):
     graph_json = _graph(kind, source, _shape(mode, shared), MODES[mode], shared=shared)
     infos, input_data = _prepare(graph_json)
 
-    q = _gather_all(infos, Q, input_data[Q])
-    k = _gather_all(infos, K, input_data[K])
-    v = _gather_all(infos, V, input_data[V])
+    q = _gather_all(infos, input_data, Q, input_data[Q])
+    k = _gather_all(infos, input_data, K, input_data[K])
+    v = _gather_all(infos, input_data, V, input_data[V])
     reference = PyTorchReferenceProvider().compute_reference(graph_json, input_data)
-    got_o = _gather_all(infos, O, reference[O].data)
-    got_lse = _gather_all(infos, FWD_STATS, reference[FWD_STATS].data)
+    got_o = _gather_all(infos, input_data, O, reference[O].data)
+    got_lse = _gather_all(infos, input_data, FWD_STATS, reference[FWD_STATS].data)
 
     if source == "seq_len":
         assert list(infos[Q].varlen.lengths) == list(input_data[SEQ_LEN_Q])
@@ -288,6 +312,12 @@ def test_reference_matches_the_dense_loop_on_valid_positions(case, mode):
         dead_seen |= mode == "bottom_right" and lq > lkv
     if mode == "bottom_right" and not shared:
         assert dead_seen, "no batch has dead rows; the case checks nothing"
+    if case in GAPPED_CASES:
+        gap_seen = _has_gap(infos[Q]) or _has_gap(infos[K])
+        assert gap_seen, "no batch starts after a gap; the case checks nothing"
+    if case in PADDED_CASES:
+        padded_seen = _has_padding(infos[Q]) or _has_padding(infos[K])
+        assert padded_seen, "no batch is padded; the case checks nothing"
 
 
 @pytest.mark.parametrize("mode", ["full", "causal"])
@@ -314,10 +344,10 @@ def test_backward_reference_matches_per_batch_autograd(case, mode):
     hq = infos[Q].dims[1]
     rep = hq // infos[K].dims[1]
 
-    q = _gather_all(infos, Q, input_data[Q])
-    k = _gather_all(infos, K, input_data[K])
-    v = _gather_all(infos, V, input_data[V])
-    do = _gather_all(infos, DO, input_data[DO])
+    q = _gather_all(infos, input_data, Q, input_data[Q])
+    k = _gather_all(infos, input_data, K, input_data[K])
+    v = _gather_all(infos, input_data, V, input_data[V])
+    do = _gather_all(infos, input_data, DO, input_data[DO])
 
     # The handler consumes external O and LSE, so they must come from a
     # consistent forward: the per-batch dense loop.
@@ -351,7 +381,7 @@ def test_backward_reference_matches_per_batch_autograd(case, mode):
 
     for uid, lengths_of in ((DQ, Q), (DK, K), (DV, V)):
         logical = reference[uid].data
-        got = _gather_all(infos, uid, logical)
+        got = _gather_all(infos, input_data, uid, logical)
         for b in range(B):
             np.testing.assert_allclose(got[b], want[uid][b], rtol=1e-4, atol=1e-4)
             length = infos[lengths_of].varlen.lengths[b]

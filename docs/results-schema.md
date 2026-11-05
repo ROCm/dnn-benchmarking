@@ -230,7 +230,7 @@ file does not store them.
 | Key | Type | Meaning |
 |---|---|---|
 | `flops` | int or null | Analytical FLOPs for one launch of the graph. For an SDPA node with variable lengths, it sums the counts over batches. Each count comes from the valid lengths of that batch. A paged graph uses the real KV lengths. `null` when any node has no FLOP formula, or lacks the tensor data its formula needs. A partial count is never reported. `tflops` is then `null` too. |
-| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. A tensor with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors) counts only its valid elements. |
+| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. A non-paged tensor with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors) counts only its valid elements. Paged K and V containers count their full size. |
 | `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. See [clocks](#clocks). |
 
 `--no-metrics` sets these values and the plan `workspace_bytes`, `tflops` and
@@ -259,7 +259,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
 | `max_rel_diff` | float or null | Largest `\|actual - expected\| / \|expected\|` over all outputs, taken only over elements with `\|expected\| > atol`. `0.0` when no element qualifies, so a mismatch against a near-zero reference can show `0.0` with `n_mismatch > 0`. Use `match` and `n_mismatch` for pass or fail. |
 | `n_mismatch` | int or null | Elements outside tolerance, summed over outputs. |
-| `n_total` | int or null | Elements compared, summed over outputs. For an output with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors), only the positions inside the length of each batch count. |
+| `n_total` | int or null | Elements compared, summed over outputs. For a non-paged output with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors), only the positions inside the length of each batch count. |
 | `worst_output_uid` | int or null | Tensor UID of the output with the largest difference. |
 | `reference_precision` | string or null | Arithmetic of the reference that the outputs were compared with: `float64` (a float64 computation from the same inputs, not rounded to the output dtype) or `native` (the graph data types). `native` for graphs outside the float64 scope, for `--reference-precision native`, and when the float64 reference failed. `null` when no comparison ran. See [Reference precision](usage.md#reference-precision). |
 | `message` | string or null | Why `match` is `false` or `null`. |

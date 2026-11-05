@@ -48,10 +48,14 @@ def stack(monkeypatch):
     bm.create_variant_pack.side_effect = lambda: calls.append("variant_pack")
     buffer_manager = MagicMock()
     buffer_manager.return_value.__enter__.return_value = bm
+    mocks["buffer_manager"] = buffer_manager
     monkeypatch.setattr(internal_profiling, "BufferManager", buffer_manager)
     monkeypatch.setattr(internal_profiling, "generate_input_data", mocks["inputs"])
+    mocks["resolved"] = ["resolved-infos"]
     monkeypatch.setattr(
-        internal_profiling, "resolve_varlen_layouts", lambda infos, graph, data: infos
+        internal_profiling,
+        "resolve_varlen_layouts",
+        lambda infos, graph, data: mocks["resolved"],
     )
     return mocks
 
@@ -77,6 +81,9 @@ def test_orchestrator_argv_drives_one_engine_warm_fixed_count(stack):
     # so paged-SDPA page tables are valid.
     _, seed, inputs_graph_json = stack["inputs"].call_args.args
     assert seed == 11 and inputs_graph_json == graph_json
+    # Buffers follow the resolved (variable-length) layouts, not the raw infos.
+    buffer_manager = stack["buffer_manager"]
+    buffer_manager.assert_called_once_with(stack["resolved"])
 
 
 def test_plugin_path_replaces_default_plugin_loading(stack):
