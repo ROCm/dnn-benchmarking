@@ -20,6 +20,7 @@ from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
+from ..graph.varlen import sdpa_operands
 from .varlen_inputs import generate_varlen_inputs
 
 
@@ -243,9 +244,10 @@ def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
 def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     """UIDs of every SDPA page table.
 
-    Page tables are read from the node's ``inputs`` map rather than guessed
-    from a tensor name, because names are free-form and a graph is under no
-    obligation to call its page table PAGE_TABLE_K.
+    Page tables are read from the node's operand keys, through the lookup the
+    variable-length generator and resolver use, rather than guessed from a
+    tensor name: names are free-form, and a graph is under no obligation to
+    call its page table PAGE_TABLE_K.
     """
     uids: Set[int] = set()
     if not graph_json:
@@ -253,11 +255,10 @@ def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     for node in graph_json.get("nodes", []) or []:
         if not str(node.get("type", "")).startswith("Sdpa"):
             continue
-        inputs = node.get("inputs") or {}
-        for key in ("page_table_k_tensor_uid", "page_table_v_tensor_uid"):
-            uid = inputs.get(key)
+        operands = sdpa_operands(node)
+        for uid in (operands.page_table_k_tensor_uid, operands.page_table_v_tensor_uid):
             if uid is not None:
-                uids.add(int(uid))
+                uids.add(uid)
     return uids
 
 
@@ -272,14 +273,12 @@ def _paged_metadata(graph_json: Optional[Dict[str, Any]]) -> int:
         return 0
     tensors = {int(t["uid"]): t for t in graph_json.get("tensors", []) or []}
     for node in graph_json.get("nodes", []) or []:
-        inputs = node.get("inputs") or {}
-        if inputs.get("page_table_k_tensor_uid") is None:
+        if not str(node.get("type", "")).startswith("Sdpa"):
             continue
-        k = (
-            tensors.get(int(inputs["k_tensor_uid"]))
-            if inputs.get("k_tensor_uid")
-            else None
-        )
+        operands = sdpa_operands(node)
+        if not operands.is_paged:
+            continue
+        k = tensors.get(operands.k) if operands.k is not None else None
         if k and len(k.get("dims", [])) == 4:
             return int(k["dims"][0])
     return 0

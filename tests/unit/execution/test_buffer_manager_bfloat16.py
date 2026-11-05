@@ -425,6 +425,40 @@ class TestPagedInputGeneration:
         assert data.min() > 0, "a zero length is an empty sequence"
         assert data.max() <= 4 * self.PAGE_SIZE, "length exceeds the page table"
 
+    def test_page_tables_under_attributes_are_found_like_the_resolver_does(
+        self,
+    ) -> None:
+        """The table and length lookups share the resolver's operand lookup,
+        so a page table key in another node section still gets page ids."""
+        graph = self._graph()
+        node = graph["nodes"][0]
+        for key in ("page_table_k_tensor_uid", "page_table_v_tensor_uid"):
+            node["attributes"][key] = node["inputs"].pop(key)
+        graph["tensors"].append(
+            {"uid": 5, "name": "PAGE_TABLE_K", "dims": [self.NUM_SEQS, 4]}
+        )
+        table = self._int_tensor(5, [self.NUM_SEQS, 4])
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([table, lengths], seed=0, graph_json=graph)
+        assert data[5].max() > 0, "every sequence would read page 0"
+        assert data[5].max() < self.NUM_PAGES
+        assert data[8].max() <= 4 * self.PAGE_SIZE, "length exceeds the page table"
+
+    def test_a_v_page_table_alone_marks_the_node_paged(self) -> None:
+        """Paged detection matches the resolver: either page table makes the
+        node paged, so lengths fit that table's allocation."""
+        graph = self._graph()
+        node = graph["nodes"][0]
+        node["inputs"]["page_table_k_tensor_uid"] = None
+        graph["tensors"].append(
+            {"uid": 6, "name": "PAGE_TABLE_V", "dims": [self.NUM_SEQS, 4]}
+        )
+        table = self._int_tensor(6, [self.NUM_SEQS, 4])
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([table, lengths], seed=0, graph_json=graph)
+        assert data[6].max() > 0, "every sequence would read page 0"
+        assert 0 < data[8].min() and data[8].max() <= 4 * self.PAGE_SIZE
+
     def test_dense_graph_inputs_are_untouched(self) -> None:
         """A graph with no page table generates exactly what it would without
         the graph."""

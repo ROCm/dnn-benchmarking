@@ -319,9 +319,10 @@ They are not uniform floats:
   the start of batch `b + 1`. That is the start of batch `b` plus its length
   and its gap, in the unit of the table. Only a graph that has a length
   source gets gaps. A gap is padding tokens after the live tokens of a
-  batch, and the length excludes them. Each entry is stored in the unit of
-  the table. That is the token start times the sequence stride divided by
-  `ragged_offset_multiplier`.
+  batch, and the length excludes them. With two or more batches, at least
+  one batch starts after a gap, unless the token capacity leaves no room for
+  one. Each entry is stored in the unit of the table. That is the token
+  start times the sequence stride divided by `ragged_offset_multiplier`.
 - A head-major ragged tensor (for example `[H, T, D]`) stores the token
   range in the head stride. The capacity of that range limits the lengths
   and the gaps. The tool reduces them to fit. A graph that cannot fit one

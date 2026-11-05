@@ -127,10 +127,11 @@ def _collect_sides(graph_json: Dict[str, Any], graph: _Graph) -> List[_Side]:
             cu_uid=operands.cu_seq_len_kv_tensor_uid,
             operands=_tensors(operands.kv_side, graph),
         )
-        if operands.page_table_k_tensor_uid is not None:
-            _bound_paged(
-                node, operands, graph, query, key, operands.page_table_k_tensor_uid
-            )
+        if operands.is_paged:
+            table_uid = operands.page_table_k_tensor_uid
+            if table_uid is None:
+                table_uid = operands.page_table_v_tensor_uid
+            _bound_paged(node, operands, graph, query, key, table_uid)
         else:
             for side in (query, key):
                 _bound_dense(side)
@@ -417,11 +418,19 @@ def _generate_group(
             wanted = rng.random(batch) < 0.5
             drawn = rng.integers(1, np.maximum(room, 1) + 1)
             gaps = np.where(wanted & (room > 0), drawn, 0).astype(np.int64)
-            # As a padded batch is forced, so is a gap before a batch that has
-            # room for one.
-            if np.any(room > 0) and not np.any(_ranges(lengths, gaps, align) > lengths):
-                chosen = int(rng.choice(np.flatnonzero(room > 0)))
-                gaps[chosen] = drawn[chosen]
+            # As a padded batch is forced, so is a gap before a later batch. A
+            # gap after the last batch moves only the table's end entry, so no
+            # batch would start after unused tokens.
+            ranges = _ranges(lengths, gaps, align)
+            if batch > 1 and not np.any(ranges[:-1] > lengths[:-1]):
+                if not np.any(room[:-1] > 0) and room[-1] > 0:
+                    # Every earlier batch is full: move the padded last one first.
+                    for values in (lengths, room, drawn, gaps):
+                        values[[0, -1]] = values[[-1, 0]]
+                candidates = np.flatnonzero(room[:-1] > 0)
+                if candidates.size:
+                    chosen = int(rng.choice(candidates))
+                    gaps[chosen] = drawn[chosen]
         else:
             # The lengths are the ranges, so they must be aligned themselves.
             lengths = np.maximum(align, lengths // align * align)

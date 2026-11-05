@@ -91,10 +91,11 @@ graph get the verdict `unchecked` with the reason in `correctness.message`.
 These rows do not fail validation (no exit code 3).
 
 Variable-length and ragged SDPA graphs (graphs with `seq_len`, `cu_seq_len` or
-ragged tensors) compare valid positions only:
+ragged tensors) follow these rules:
 
-- A position at or past the length of its batch is not compared. Engines
-  can write any value there.
+- A non-paged graph compares valid positions only. A position at or past the
+  length of its batch is not compared, so engines can write any value there.
+  A paged graph compares every output element.
 - `correctness.n_total` counts the compared elements, not the tensor size.
 - If the tool cannot serve the layout of a graph, it refuses the graph. The
   graph reports the status `no_engines` and the message names the tensor.

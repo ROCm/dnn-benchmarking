@@ -370,6 +370,32 @@ class TestOffsetTables:
         with pytest.raises(UnsupportedGraphError, match="Q"):
             generate_varlen_inputs(graph, infos, 0)
 
+    def test_an_aligned_table_fits_a_tight_head_major_capacity(self) -> None:
+        # Head-major, 31 tokens of capacity; multiplier 2 * strides[2], so
+        # every token start is even and the batches fit 15 two-token blocks.
+        batch, heads, seq, head_dim, capacity = 4, 2, 16, 8, 31
+        strides = [heads * capacity * head_dim, capacity * head_dim, head_dim, 1]
+        for seed in SEEDS:
+            graph, infos = _ragged_graph(
+                batch=batch,
+                seq=seq,
+                heads=heads,
+                strides=strides,
+                multiplier=2 * head_dim,
+            )
+            data = generate_input_data(infos, seed, graph)
+            table = data[9].reshape(-1)
+            assert int(table[-1]) * 2 <= capacity, f"seed {seed}: past the capacity"
+            resolved = {
+                ti.uid: ti
+                for ti in resolve_varlen_layouts(
+                    [TensorInfo.from_json(t) for t in graph["tensors"]], graph, data
+                )
+            }
+            layout = resolved[1].varlen
+            assert layout.lengths == tuple(int(n) for n in data[7])
+            assert all(n <= 2 * int(r) for n, r in zip(layout.lengths, np.diff(table)))
+
     def test_single_token_head_major_tensor_is_accepted(self) -> None:
         # strides[1] == strides[2]: the head axis is outer, one token fits.
         graph, infos = _ragged_graph(
@@ -386,13 +412,15 @@ class TestOffsetTables:
         with pytest.raises(UnsupportedGraphError, match="'Q'"):
             generate_varlen_inputs(graph, infos, 0)
 
-    @pytest.mark.parametrize("batch", [2, 4])
+    @pytest.mark.parametrize("batch", [2, 3, 4, 8])
     def test_a_length_source_always_leaves_a_gap_before_some_batch(self, batch) -> None:
+        # A gap after the last batch moves only the end entry, so it does not
+        # count: some batch must start after unused tokens.
         for seed in range(40):
             graph, infos = _ragged_graph(batch=batch, seq=16)
             out = generate_varlen_inputs(graph, infos, seed)
             ranges = np.diff(out[9].reshape(-1))
-            assert np.any(ranges > out[7]), f"seed {seed}: no gap"
+            assert np.any(ranges[:-1] > out[7][:-1]), f"seed {seed}: no gapped start"
 
     @pytest.mark.parametrize("with_seq_len", [True, False])
     def test_a_multiplier_above_the_token_stride_succeeds_for_every_seed(
