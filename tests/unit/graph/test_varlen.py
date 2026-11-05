@@ -321,8 +321,7 @@ REFUSALS = {
     ),
     "missing table data": lambda: _drop_data(_scenario(seq=[2, 3]), 11),
     # With seq_len the lengths do not come from the table, so only the
-    # resolver's own stride check stands between the zero stride and a
-    # division by zero.
+    # resolver's stride check prevents a division by zero.
     "zero sequence stride": lambda: _scenario(
         off=[0, 2, 5], seq=[2, 3], strides=[24, 3, 0, 1]
     ),

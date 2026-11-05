@@ -403,7 +403,7 @@ class TestOffsetTables:
     ) -> None:
         # Each case has room for one aligned gap before a batch other than the
         # last, so some batch must start past the packed end of the ones before.
-        # Measured on the resolved layout, as an engine reads it.
+        # Measured on the resolved starts, as an engine reads them.
         heads, seq, head_dim = 2, 16, 8
         strides = [heads * capacity * head_dim, capacity * head_dim, head_dim, 1]
         for seed in SEEDS:

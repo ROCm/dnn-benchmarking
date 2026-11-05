@@ -272,7 +272,6 @@ MODES = {
     "bottom_right": {"causal_mask_bottom_right": True},
 }
 
-# Cases that exist to cover batches placed after unused tokens, or padded batches.
 GAPPED_CASES = {"gapped_seq_len"}
 PADDED_CASES = {"cu_seq_len_padded", "aiter_bshd", "aotriton_bhsd"}
 

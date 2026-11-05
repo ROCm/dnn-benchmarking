@@ -548,10 +548,12 @@ def generate_varlen_inputs(
     sequences. Offset tables start at 0, store the token start of every batch
     scaled by the tensor's token stride and multiplier, and have a trailing
     entry for the end. Batches start after gaps of padding tokens only when
-    the group has a ``seq_len`` or ``cu_seq_len`` that excludes the padding.
+    the group has a ``seq_len`` or ``cu_seq_len`` that excludes the padding;
+    then, with several batches, some batch other than the first does when a
+    batch before the last has room for a gap.
 
     Raises :class:`UnsupportedGraphError` when tensors that share an offset
-    table read it differently, an offset is not a whole number, or the
+    table read it differently, the offset alignment exceeds a sequence, or the
     tokens do not fit the tensor.
     """
     if not graph_json:

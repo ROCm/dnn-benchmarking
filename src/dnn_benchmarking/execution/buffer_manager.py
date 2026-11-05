@@ -244,9 +244,8 @@ def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
 def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     """UIDs of every SDPA page table.
 
-    Page tables are read from the node's operand keys, through the lookup the
-    variable-length generator and resolver use, rather than guessed from a
-    tensor name: names are free-form, and a graph is under no obligation to
+    Page tables are read from the node's operand keys rather than guessed from
+    a tensor name: names are free-form, and a graph is under no obligation to
     call its page table PAGE_TABLE_K.
     """
     uids: Set[int] = set()
