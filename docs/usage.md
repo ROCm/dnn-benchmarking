@@ -341,12 +341,16 @@ How the variant rows get the hipDNN kernel:
    batch).
 3. The tool reads the code object from the kpack archive with ROCm's kpack
    reader (`librocm_kpack`, the reader that the plugin uses) and launches it
-   through rocKE's runtime. It does not compile the variant. The row is an
-   error when the code object does not have the recorded SHA-256, or when
-   rocKE's argument list is not the one that hipDNN binds. Each code object
-   loads once per run; later rows that use it reuse the module. When
-   several `--plugin-path` directories ship a variant, the first one gives
-   its row.
+   through rocKE's runtime. It does not compile the variant. It passes each
+   argument in the variant's recorded argument list with the value that
+   hipDNN passes: the Q, K, V and O pointers, the scale, the batch, the
+   sequence lengths and, for kernels that read them at runtime, the query
+   and KV head counts. The row is an error when the code object does not
+   have the recorded SHA-256, when rocKE's argument list is not the recorded
+   one, or when the recorded list has an argument that hipDNN does not bind.
+   Each code object loads once per run; later rows that use it reuse the
+   module. When several `--plugin-path` directories ship a variant, the
+   first one gives its row.
 
 Read the rows as follows:
 
