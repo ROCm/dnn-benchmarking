@@ -1751,6 +1751,40 @@ class TestPyTorchOpsNewHandlers:
         with pytest.raises(UnsupportedGraphError, match=match):
             pytorch_ops.compile_graph(graph_json)
 
+    @pytest.mark.parametrize(
+        "optional_input",
+        ["sink_token_tensor_uid", "seed_tensor_uid", "page_table_k_tensor_uid"],
+    )
+    def test_sdpa_backward_refuses_optional_tensors_under_parameters(
+        self, optional_input
+    ) -> None:
+        # The backward node keeps its attributes under "parameters". A tensor
+        # key there is refused like one under "inputs", whichever check owns it.
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 10,
+                        "dk_tensor_uid": 11,
+                        "dv_tensor_uid": 12,
+                    },
+                    "parameters": {optional_input: 7},
+                }
+            ]
+        }
+
+        with pytest.raises(UnsupportedGraphError, match=optional_input):
+            pytorch_ops.compile_graph(graph_json)
+
     def test_sdpa_backward_independent_kv_heads(self) -> None:
         # Hq == Hk but Hv < Hq: regression for the single-flag GQA bug that
         # skipped V expansion/reduction whenever Hq == Hk.
