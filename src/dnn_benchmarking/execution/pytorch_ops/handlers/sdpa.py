@@ -15,6 +15,7 @@ from .._sdpa_backend import (
     default_sdpa_avoids_math,
     execute_selected_sdpa,
     fused_logsumexp,
+    mark_native_sdpa_call,
     strict_sdpa_selection,
 )
 
@@ -1019,6 +1020,141 @@ def compile_sdpa(
     return run
 
 
+_MATH_BACKWARD_NOTE = (
+    "PyTorch SDPA: default dispatch chose the math backend, so the backward "
+    "runs as a manual fp32 flash-attention formula instead of a fused kernel"
+)
+
+
+class _FusedBackward(NamedTuple):
+    """A fused SDPA backward kernel call, built once from a forward probe.
+
+    ``call(do, o)`` returns ``(dq, dk, dv)`` at the query head count. The
+    other arguments (Q, K/V at the query head count, the kernel's
+    log-sum-exp layout filled with the graph's stats, and the forward's
+    saved scalars) are bound in ``call``.
+    """
+
+    call: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, ...]]
+    rep_k: int
+    rep_v: int
+
+
+def _saved(grad_fn: Any, *names: str) -> Any:
+    """The first saved forward value of ``grad_fn`` among ``names``."""
+    for name in names:
+        if hasattr(grad_fn, name):
+            return getattr(grad_fn, name)
+    raise AttributeError(f"{grad_fn.name()} saved none of {names}")
+
+
+def _prepare_fused_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    stats: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+    rep_k: int,
+    rep_v: int,
+) -> Optional[_FusedBackward]:
+    """Bind the fused backward kernel the selected forward dispatches to.
+
+    A training step's forward chooses the kernel, and its backward replays the
+    same kernel with the saved output and log-sum-exp. This runs that forward
+    once (untimed) with the graph's Q, K and V, reads which fused kernel ran
+    and its saved scalars from the autograd node, and binds the matching ATen
+    backward. The timed call then passes the graph's own O and stats, as the
+    hipDNN kernel reads them. K and V are expanded to the query head count
+    here; the timed call sums dK and dV back over each head group.
+
+    Returns ``None`` when default dispatch chose no fused kernel (math).
+    """
+    k_op = k.repeat_interleave(rep_k, dim=-3) if rep_k > 1 else k
+    v_op = v.repeat_interleave(rep_v, dim=-3) if rep_v > 1 else v
+    probe = [t.detach().requires_grad_() for t in (q, k_op, v_op)]
+    with torch.enable_grad():
+        out = execute_selected_sdpa(
+            *probe,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale,
+        )
+    grad_fn = out.grad_fn
+    name = grad_fn.name() if grad_fn is not None else ""
+    if "FlashAttentionBackward" in name:
+        aten = torch.ops.aten._scaled_dot_product_flash_attention_backward
+        lse_saved = _saved(grad_fn, "_saved_logsumexp")
+        args = (
+            _saved(grad_fn, "_saved_cum_seq_q"),
+            _saved(grad_fn, "_saved_cum_seq_k"),
+            _saved(grad_fn, "_saved_max_q"),
+            _saved(grad_fn, "_saved_max_k"),
+            0.0,
+            _saved(grad_fn, "_saved_is_causal"),
+            _saved(grad_fn, "_saved_rng_state", "_saved_philox_seed"),
+            _saved(grad_fn, "_saved_unused", "_saved_philox_offset"),
+        )
+
+        def kernel(do, o, lse):
+            return aten(do, q, k_op, v_op, o, lse, *args, scale=scale)
+
+    elif "EfficientAttentionBackward" in name:
+        aten = torch.ops.aten._scaled_dot_product_efficient_attention_backward
+        lse_saved = _saved(grad_fn, "_saved_log_sumexp", "_saved_logsumexp")
+        bias = _saved(grad_fn, "_saved_attn_bias")
+        seed = _saved(grad_fn, "_saved_philox_seed")
+        offset = _saved(grad_fn, "_saved_philox_offset")
+        causal = _saved(grad_fn, "_saved_is_causal")
+
+        def kernel(do, o, lse):
+            return aten(
+                do,
+                q,
+                k_op,
+                v_op,
+                bias,
+                o,
+                lse,
+                seed,
+                offset,
+                0.0,
+                [True, True, True, False],
+                causal,
+                scale=scale,
+            )[:3]
+
+    elif strict_sdpa_selection() is None:
+        return None
+    else:
+        raise UnsupportedGraphError(
+            f"PyTorch SDPA backward: the selected forward ran {name or 'no fused kernel'}, "
+            "which has no backward kernel that reads saved stats"
+        )
+
+    # The kernel's log-sum-exp layout ([B, H, Sq], padded on some backends),
+    # filled once with the graph's stats: they are a constant input.
+    lse = torch.zeros_like(lse_saved)
+    lse[..., : int(stats.shape[-2])] = stats[..., 0]
+    del out, grad_fn, probe
+
+    def call(do: torch.Tensor, o: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        mark_native_sdpa_call()
+        return kernel(do, o, lse)
+
+    return _FusedBackward(call, rep_k, rep_v)
+
+
+def _sum_head_groups(grad: torch.Tensor, rep: int) -> torch.Tensor:
+    """Sum a gradient at the query head count over each group of ``rep`` heads."""
+    if rep == 1:
+        return grad
+    batch, heads, length, dim = grad.shape
+    return grad.reshape(batch, heads // rep, rep, length, dim).sum(dim=2)
+
+
 @register_handler("SdpaBackwardAttributes")
 def compile_sdpa_backward(
     node: Dict[str, Any],
@@ -1026,13 +1162,16 @@ def compile_sdpa_backward(
 ) -> CompiledOp:
     """Plan scaled dot-product attention backward.
 
-    Mirrors hipDNN's CPU reference (CpuFpReferenceSdpa::backward): the saved
-    softmax statistics ``stats`` (forward log-sum-exp) are consumed directly to
-    recompute probabilities as ``P = exp(scores - stats)`` without
-    renormalization.  PyTorch's built-in SDPA autograd cannot consume an
-    external ``stats`` tensor and always renormalizes its own softmax, so it
-    would diverge from hipDNN whenever ``stats`` is not the exact, consistent
-    forward LSE.  This handler therefore implements the gradient manually.
+    Both paths read the graph's O and ``stats`` (forward log-sum-exp), as the
+    hipDNN kernel does, and recompute ``P = exp(scores - stats)`` without
+    renormalization.
+
+    * On a GPU, the fused Flash or memory-efficient backward kernel runs, the
+      one a training step's forward dispatches to (``_prepare_fused_backward``).
+      On ROCm this is AOTriton or CK. Its setup is built once, untimed.
+    * On the host (the CPU reference), and on a GPU when default dispatch
+      picks math, a manual fp32 formula runs. It mirrors hipDNN's CPU
+      reference (CpuFpReferenceSdpa::backward).
     """
     _sdpa_unsupported_if_present(node, ["dropout_scale_inv_tensor_uid"])
     if _optional_uid(node, "dbias_tensor_uid") is not None:
@@ -1050,20 +1189,13 @@ def compile_sdpa_backward(
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
     plan = _plan_sdpa_common(node)
-    is_causal = plan.is_causal
-    if plan.window is not None or plan.bottom_right:
-        raise ValueError(
-            "SDPA bottom-right/sliding-window bounds are not supported by the "
-            "PyTorch reference backward"
-        )
+    computed_inputs = [
+        uid
+        for uid in (q_uid, k_uid, v_uid, stats_uid, plan.mask_uid, plan.scale_uid)
+        if uid is not None and _is_computed(graph_json, uid)
+    ]
 
-    def run(tensors: Dict[int, torch.Tensor]) -> None:
-        q = _tensor(tensors, q_uid, node)
-        k = _tensor(tensors, k_uid, node)
-        v = _tensor(tensors, v_uid, node)
-        o = _tensor(tensors, o_uid, node)
-        do = _tensor(tensors, do_uid, node)
-        stats = _tensor(tensors, stats_uid, node)
+    def resolve(tensors, q, k, v):
         attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
             node,
             tensors,
@@ -1074,25 +1206,66 @@ def compile_sdpa_backward(
             plan.scale_uid,
             plan.attn_scale_value,
         )
+        band, causal = _attention_bounds(
+            int(q.shape[-2]),
+            int(k.shape[-2]),
+            plan.window,
+            plan.bottom_right,
+            plan.is_causal,
+            q,
+        )
+        return (attn_mask if band is None else band), causal, float(scale), rep_k, rep_v
 
+    def fused(tensors, q, k, v, stats) -> Optional[_FusedBackward]:
+        if computed_inputs and isinstance(tensors, ReplayTensors):
+            raise UnsupportedGraphError(
+                f"SDPA backward inputs {computed_inputs} are computed inside the "
+                "graph, so the PyTorch baseline cannot build their setup outside "
+                "the timed region"
+            )
+        attn_mask, causal, scale, rep_k, rep_v = resolve(tensors, q, k, v)
+        return _prepare_fused_backward(
+            q, k, v, stats, attn_mask, causal, scale, rep_k, rep_v
+        )
+
+    def run(tensors: Dict[int, torch.Tensor]) -> None:
+        q = _tensor(tensors, q_uid, node)
+        k = _tensor(tensors, k_uid, node)
+        v = _tensor(tensors, v_uid, node)
+        o = _tensor(tensors, o_uid, node)
+        do = _tensor(tensors, do_uid, node)
+        stats = _require_fp32_stat(
+            _tensor(tensors, stats_uid, node), "SDPA stats (log-sum-exp)"
+        )
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
 
+        if q.is_cuda:
+            if strict_sdpa_selection() is PyTorchSdpaBackendName.MATH:
+                raise UnsupportedGraphError(
+                    "PyTorch's math SDPA backward recomputes the forward and "
+                    "cannot read the graph's saved stats"
+                )
+            kernel = _replay_constant(
+                tensors, ("sdpa_bwd", dq_uid), lambda: fused(tensors, q, k, v, stats)
+            )
+            if kernel is not None:
+                dq, dk, dv = kernel.call(do, o)
+                _store_tensor(tensors, dq_uid, dq)
+                _store_tensor(tensors, dk_uid, _sum_head_groups(dk, kernel.rep_k))
+                _store_tensor(tensors, dv_uid, _sum_head_groups(dv, kernel.rep_v))
+                return
+            if isinstance(tensors, ReplayTensors):
+                tensors.note(_MATH_BACKWARD_NOTE)
+
+        attn_mask, is_causal, scale_value, rep_k, rep_v = _replay_constant(
+            tensors, ("sdpa_bwd_bounds", dq_uid), lambda: resolve(tensors, q, k, v)
+        )
         q_f = q.to(dtype=torch.float32)
-        k_f = k.to(dtype=torch.float32)
-        v_f = v.to(dtype=torch.float32)
+        k_f = _fp32_at_query_heads(k, rep_k)
+        v_f = _fp32_at_query_heads(v, rep_v)
         o_f = o.to(dtype=torch.float32)
         do_f = do.to(dtype=torch.float32)
-        stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
-
-        head_dim = int(q.shape[-1])
-        scale_value = float(scale)
-        k_heads = int(k.shape[1])
-        v_heads = int(v.shape[1])
-        if rep_k > 1:
-            k_f = k_f.repeat_interleave(rep_k, dim=1)
-        if rep_v > 1:
-            v_f = v_f.repeat_interleave(rep_v, dim=1)
 
         # One query block at a time: a block's probs and d_scores are at most
         # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
@@ -1111,7 +1284,7 @@ def compile_sdpa_backward(
                 start,
                 scale_value,
             )
-            probs = scores.sub_(_rows(stats_f, start, end)).exp_()
+            probs = scores.sub_(_rows(stats, start, end)).exp_()
             row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
             # d_scores = probs * (do @ v^T - row_dot) * scale
             d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
@@ -1121,20 +1294,8 @@ def compile_sdpa_backward(
             dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
             del scores, probs, d_scores
 
-        batch, seq_kv = dk_full.shape[0], dk_full.shape[2]
-        if rep_k > 1:
-            dk_f = dk_full.view(batch, k_heads, rep_k, seq_kv, head_dim).sum(dim=2)
-        else:
-            dk_f = dk_full
-        if rep_v > 1:
-            dv_f = dv_full.view(batch, v_heads, rep_v, seq_kv, int(v.shape[-1])).sum(
-                dim=2
-            )
-        else:
-            dv_f = dv_full
-
         _store_tensor(tensors, dq_uid, dq.to(dtype=q.dtype))
-        _store_tensor(tensors, dk_uid, dk_f.to(dtype=k.dtype))
-        _store_tensor(tensors, dv_uid, dv_f.to(dtype=v.dtype))
+        _store_tensor(tensors, dk_uid, _sum_head_groups(dk_full, rep_k).to(k.dtype))
+        _store_tensor(tensors, dv_uid, _sum_head_groups(dv_full, rep_v).to(v.dtype))
 
     return run

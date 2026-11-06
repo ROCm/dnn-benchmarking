@@ -8,6 +8,7 @@ import pytest
 
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.execution.correctness import check_correctness, tolerance_for
+from dnn_benchmarking.graph.loader import GraphLoader
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.validation import ReferenceOutput
 
@@ -123,6 +124,47 @@ def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
     c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
 
     assert c.n_mismatch == 1
+
+
+def _graph_outputs(node_type):
+    """Output TensorInfo of a one-node fp16 graph, through the loader."""
+    graph = {
+        "tensors": [
+            {
+                "uid": 1,
+                "name": "y",
+                "dims": [4],
+                "strides": [1],
+                "data_type": "half",
+                "virtual": False,
+            }
+        ],
+        "nodes": [{"type": node_type, "inputs": {}, "outputs": {"y_tensor_uid": 1}}],
+    }
+    return GraphLoader().extract_tensor_info(graph)
+
+
+@pytest.mark.parametrize(
+    "node_type, actual, passes",
+    [
+        # fp16 ULP at 1024 is 1: SDPA backward gradients may land 2 ULP apart.
+        ("SdpaBackwardAttributes", [1026, 1024, 1022, 1024], True),
+        ("SdpaBackwardAttributes", [1040, 1024, 1024, 1024], False),
+        ("PointwiseAttributes", [1026, 1024, 1022, 1024], False),
+    ],
+)
+def test_fp16_sdpa_backward_tolerates_two_ulp(node_type, actual, passes):
+    ref = {1: _ref([1024, 1024, 1024, 1024])}
+    bm = _HostBM({1: np.array(actual, np.float32)})
+
+    c = check_correctness(bm, _graph_outputs(node_type), ref, "pytorch", _config())
+
+    assert c.tolerance_match is passes
+
+
+def test_explicit_tolerance_wins_over_the_sdpa_backward_default():
+    (out,) = _graph_outputs("SdpaBackwardAttributes")
+    assert tolerance_for(_config(1e-3, 1e-3), out) == (1e-3, 1e-3)
 
 
 def test_aggregates_over_outputs_and_names_the_failing_output():
