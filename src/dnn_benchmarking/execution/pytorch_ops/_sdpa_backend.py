@@ -28,7 +28,7 @@ class PyTorchSdpaBackendState:
     ) -> None:
         self.selection = PyTorchSdpaBackendName(selection)
         self.rocm_fa_library = rocm_fa_library
-        self._native_forward_sdpa_executed = False
+        self._native_sdpa_executed = False
 
 
 _ACTIVE_SDPA_BACKEND: ContextVar[Optional[PyTorchSdpaBackendState]] = ContextVar(
@@ -46,24 +46,22 @@ _SDPA_SELECTION_LOCK = RLock()
 def use_pytorch_sdpa_backend(
     state: PyTorchSdpaBackendState,
 ) -> Iterator[None]:
-    """Activate and require a native forward SDPA call for strict selections."""
-    previous_execution = state._native_forward_sdpa_executed
-    state._native_forward_sdpa_executed = False
+    """Activate and require a native SDPA call for strict selections."""
+    previous_execution = state._native_sdpa_executed
+    state._native_sdpa_executed = False
     token = _ACTIVE_SDPA_BACKEND.set(state)
     try:
         yield
         if (
             state.selection is not PyTorchSdpaBackendName.DEFAULT
-            and not state._native_forward_sdpa_executed
+            and not state._native_sdpa_executed
         ):
             raise _unavailable_error(
                 state.selection,
-                "The graph did not execute a native forward SDPA call.",
+                "The graph did not execute a native SDPA call.",
             )
     finally:
-        state._native_forward_sdpa_executed = (
-            previous_execution or state._native_forward_sdpa_executed
-        )
+        state._native_sdpa_executed = previous_execution or state._native_sdpa_executed
         _ACTIVE_SDPA_BACKEND.reset(token)
 
 
@@ -176,6 +174,17 @@ def strict_sdpa_selection() -> Optional[PyTorchSdpaBackendName]:
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
         return None
     return state.selection
+
+
+def mark_native_sdpa_call() -> None:
+    """Record a native SDPA kernel call made outside ``execute_selected_sdpa``.
+
+    A backward replays the fused kernel its forward probe selected, so each
+    timed backward call counts as a native call of the selected category.
+    """
+    state = _ACTIVE_SDPA_BACKEND.get()
+    if state is not None:
+        state._native_sdpa_executed = True
 
 
 def _sdpa_kwargs(
@@ -296,5 +305,5 @@ def execute_selected_sdpa(
             if _is_backend_unavailable_error(error):
                 raise _unavailable_error(state.selection, str(error)) from error
             raise
-        state._native_forward_sdpa_executed = True
+        state._native_sdpa_executed = True
         return result

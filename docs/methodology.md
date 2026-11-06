@@ -145,6 +145,36 @@ includes a workaround, and the row gets a reference warning:
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.
 
+### PyTorch SDPA backward
+
+A timed SDPA backward iteration calls the fused backward kernel that a
+PyTorch training step uses: `aten::_scaled_dot_product_flash_attention_backward`
+or `aten::_scaled_dot_product_efficient_attention_backward`. On ROCm these run
+AOTriton or CK. The call reads the graph's O and `stats` inputs, as the hipDNN
+kernel does. PyTorch autograd cannot do this, because it keeps its own saved
+output and log-sum-exp.
+
+The setup runs once, before the timed loop:
+
+1. Expand K and V to the query head count.
+2. Run the forward once with the current `--pytorch-sdpa-backend` selection,
+   with `requires_grad` inputs and the graph's mask, bounds and scale.
+3. Read from the autograd node which fused kernel ran, and its saved scalars.
+4. Copy `stats` into the log-sum-exp layout of that kernel.
+
+A timed iteration does one backward kernel call. For GQA and MQA graphs it
+also sums dK and dV over each head group, which is real backward work.
+
+- With the default selection, the backward kernel is the one the forward
+  dispatches to. If default dispatch chooses math, the row runs a manual fp32
+  backward formula and gets a warning.
+- `--pytorch-sdpa-backend flash` and `efficient` select that kernel. Flash
+  takes no mask tensor, so it fails sliding-window, bottom-right and
+  `attn_mask` graphs. `math`, `cudnn` and `overrideable` have no backward
+  kernel that reads saved stats, so the row is an error.
+- The CPU reference (`--validate pytorch` on the host) uses the manual fp32
+  formula of hipDNN's CPU reference.
+
 ### PyTorch convolution backward
 
 A timed dgrad (`ConvolutionBwdAttributes`) or wgrad
@@ -430,6 +460,37 @@ back to back, in two repeats (92 median pairs):
 A time series that crosses this change can show a step on bimodal rows.
 Measure again after a timing change.
 
+## SDPA backward inputs
+
+An SDPA backward node reads Q, K, V, the forward output O, the incoming
+gradient dO and the forward log-sum-exp `stats`. The tool draws Q, K, V and
+dO from U[0, 1) like other inputs. It then computes O and `stats` as the
+exact float32 forward of Q, K and V with the graph's scale, mask, bounds and
+GQA layout. The forward runs in PyTorch, on the GPU when one is visible;
+without PyTorch a NumPy fallback gives the same values. O is rounded to its
+graph type. Both runtimes and the reference read these values.
+
+Independent random O and `stats` do not describe a forward pass. On gfx942
+(ALMIOPEN-2976), random values gave gradients of 1e4 to 1e5 and fp16
+overflow, and the ASM SDPA engine failed validation on every graph. An upper
+bound for `stats` without a forward kept the gradients finite but between
+4e-6 and 0.13, so the tolerances could not detect an error. With the forward
+values, the gradients were 1 to 7 and the engine passed on every bf16 graph.
+The kernel times were the same within 1% for all three input forms.
+
+fp16 SDPA backward outputs use `rtol` 4e-3 (about 4 ULP) instead of the fp16
+default of 1e-3. dQ, dK and dV sum over every key or query row. On gfx942 the
+ASM SDPA engine and the AOTriton reference differ by 2 ULP on 1 in 10,000 to
+1 in 50,000 elements (`max_rel_diff` 2^-9), so 1e-3 fails two correct
+kernels. Known wrong gradients miss by 1e3 or more. The source is
+`OP_TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
+
+The forward is dense and has no dropout: sequence-length and dropout inputs
+do not change O and `stats`. The forward adds host time to input generation
+before the timed loop. It is proportional to the attention FLOPs of the
+graph. Forward-consistent SDPA backward inputs start at tool version 0.4.0.
+Do not compare SDPA backward results with results from earlier versions.
+
 ## Not yet
 
 The tool does not do these things yet:
@@ -465,6 +526,13 @@ The tool does not do these things yet:
   tool version 0.3.0 (`tool.version` in the result file). Do not compare
   fp16 convolution correctness results with results from earlier versions.
   Signed data for other operations needs a role for each tensor first.
+- Validation of large fp16 SDPA backward gradients. On the six fp16
+  `aotriton_test_perf` graphs (B4, H48, D128, S 1024 to 4096), dK reaches
+  about 440. The ASM SDPA engine and the AOTriton reference differ by up to
+  1.0 on 18 to 194 elements of up to 3e8, where cancellation leaves small
+  values. AOTriton itself differs from an fp32 reference by up to 0.13, so
+  these rows fail validation although the error is small for the scale of
+  dK. An fp32 reference with a norm-based tolerance would decide them.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with

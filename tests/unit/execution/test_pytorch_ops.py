@@ -1316,13 +1316,14 @@ class TestPyTorchOpsNewHandlers:
 
         warnings = pytorch_ops.get_reference_warnings(graph_json)
 
-        assert len(warnings) == 4
+        assert len(warnings) == 3
         assert all("not solely built-in PyTorch operator time" in w for w in warnings)
         assert not any("LayernormAttributes" in w for w in warnings)
         assert any("RMSNormBackwardAttributes" in w for w in warnings)
         assert any("MUL_NO_ZEROS" in w for w in warnings)
         assert any("AVGPOOL_EXCLUDE_PADDING" in w for w in warnings)
-        assert any("SdpaBackwardAttributes" in w for w in warnings)
+        # The backward runs a fused SDPA kernel on a GPU, so it adds no warning.
+        assert not any("SdpaBackwardAttributes" in w for w in warnings)
 
     def test_sdpa_forward_warns_for_unexpressible_features(self) -> None:
         """Paged KV, sliding windows, bottom-right causal, sinks and Hk != Hv
@@ -1413,6 +1414,7 @@ class TestPyTorchOpsNewHandlers:
         causal: bool,
         repeat_k: int,
         repeat_v: int,
+        keep: "torch.Tensor | None" = None,
     ):
         q_g = q.clone().requires_grad_()
         k_g = k.clone().requires_grad_()
@@ -1421,10 +1423,11 @@ class TestPyTorchOpsNewHandlers:
         v_e = v_g.repeat_interleave(repeat_v, dim=1) if repeat_v > 1 else v_g
         scores = (q_g @ k_e.transpose(-2, -1)) * scale
         if causal:
-            mask = torch.ones(
+            keep = torch.ones(
                 scores.shape[-2], scores.shape[-1], dtype=torch.bool
             ).tril()
-            scores = scores.masked_fill(~mask, float("-inf"))
+        if keep is not None:
+            scores = scores.masked_fill(~keep, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         out = probs @ v_e
         lse = torch.logsumexp(scores, dim=-1, keepdim=True)
@@ -1696,44 +1699,77 @@ class TestPyTorchOpsNewHandlers:
                 graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
             )
 
-    @pytest.mark.parametrize(
-        "optional_input,attributes,match",
-        [
-            (None, {"causal_mask_bottom_right": True}, "bottom-right"),
-            (None, {"left_bound": 0, "right_bound": 0}, "sliding-window"),
-            ("sink_token_tensor_uid", {}, "sink_token_tensor_uid"),
-        ],
-    )
-    def test_sdpa_backward_rejects_forward_only_features(
-        self, optional_input, attributes, match
-    ) -> None:
-        inputs = {
-            "q_tensor_uid": 1,
-            "k_tensor_uid": 2,
-            "v_tensor_uid": 3,
-            "o_tensor_uid": 4,
-            "do_tensor_uid": 5,
-            "stats_tensor_uid": 6,
-        }
-        if optional_input is not None:
-            inputs[optional_input] = 7
+    def test_sdpa_backward_rejects_sink(self) -> None:
         graph_json = {
             "nodes": [
                 {
                     "type": "SdpaBackwardAttributes",
-                    "inputs": inputs,
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                        "sink_token_tensor_uid": 7,
+                    },
                     "outputs": {
                         "dq_tensor_uid": 10,
                         "dk_tensor_uid": 11,
                         "dv_tensor_uid": 12,
                     },
-                    "attributes": attributes,
                 }
             ]
         }
 
-        with pytest.raises(UnsupportedGraphError, match=match):
+        with pytest.raises(UnsupportedGraphError, match="sink_token_tensor_uid"):
             pytorch_ops.compile_graph(graph_json)
+
+    @pytest.mark.parametrize(
+        "attrs, q_len, kv_len, keep",
+        [
+            # Bottom-right causal with fewer queries than keys: row i sees
+            # keys up to i + (kv_len - q_len).
+            ({"causal_mask_bottom_right": True}, 4, 7, lambda i, j: j <= i + 3),
+            # Top-left sliding window of 3 keys (left_bound 2).
+            ({"left_bound": 2, "right_bound": 0}, 6, 6, lambda i, j: i - 2 <= j <= i),
+            # Bottom-right sliding window of 2 keys.
+            (
+                {
+                    "left_bound": 1,
+                    "right_bound": 0,
+                    "diagonal_alignment": "BOTTOM_RIGHT",
+                },
+                3,
+                6,
+                lambda i, j: i + 2 <= j <= i + 3,
+            ),
+        ],
+        ids=["bottom-right", "window", "bottom-right-window"],
+    )
+    def test_sdpa_backward_bounds_match_autograd(
+        self, attrs, q_len: int, kv_len: int, keep
+    ) -> None:
+        torch.manual_seed(7)
+        scale = 1.0 / (8**0.5)
+        q = torch.randn(1, 2, q_len, 8)
+        k = torch.randn(1, 2, kv_len, 8)
+        v = torch.randn(1, 2, kv_len, 8)
+        do = torch.randn(1, 2, q_len, 8)
+        visible = torch.tensor(
+            [[keep(i, j) for j in range(kv_len)] for i in range(q_len)]
+        )
+        o, lse, dq_ref, dk_ref, dv_ref = self._sdpa_autograd_reference(
+            q, k, v, do, scale, False, 1, 1, keep=visible
+        )
+
+        dq, dk, dv = self._run_sdpa_backward(
+            q, k, v, o, do, lse, {"attn_scale_value": scale, **attrs}
+        )
+
+        torch.testing.assert_close(dq, dq_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dk, dk_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dv, dv_ref, rtol=1e-4, atol=1e-4)
 
     def test_sdpa_backward_independent_kv_heads(self) -> None:
         # Hq == Hk but Hv < Hq: regression for the single-flag GQA bug that
@@ -1807,10 +1843,7 @@ class TestPyTorchOpsNewHandlers:
         o, lse, _, _, _ = self._sdpa_autograd_reference(q, q, q, do, scale, False, 1, 1)
         state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
 
-        with pytest.raises(
-            pytorch_ops.PyTorchSdpaBackendUnavailableError,
-            match="The graph did not execute a native forward SDPA call.",
-        ):
+        with pytest.raises(pytorch_ops.PyTorchSdpaBackendUnavailableError):
             with pytorch_ops.use_pytorch_sdpa_backend(state):
                 self._run_sdpa_backward(
                     q, q, q, o, do, lse, {"attn_scale_value": scale}
@@ -2177,14 +2210,7 @@ class TestPyTorchSdpaBackendSelection:
         from dnn_benchmarking.config import PyTorchSdpaBackendName
 
         state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.MATH)
-        with pytest.raises(
-            pytorch_ops.PyTorchSdpaBackendUnavailableError,
-            match=(
-                "Requested PyTorch SDPA backend 'math' is unavailable; "
-                "no fallback is used. The graph did not execute a native forward "
-                "SDPA call."
-            ),
-        ):
+        with pytest.raises(pytorch_ops.PyTorchSdpaBackendUnavailableError):
             with pytorch_ops.use_pytorch_sdpa_backend(state):
                 pass
 

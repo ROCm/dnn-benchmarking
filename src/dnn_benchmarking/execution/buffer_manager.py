@@ -20,6 +20,7 @@ from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
+from .sdpa_backward_inputs import set_sdpa_backward_inputs
 
 
 # fp8 formats as (exponent bits, mantissa bits); E8M0 is a special case.
@@ -390,7 +391,9 @@ def generate_input_data(
 
     ``graph_json`` selects the signed convolution operands and the **paged**
     SDPA roles: page tables and sequence lengths have invariants random data
-    cannot satisfy (see :func:`_generate_paged_input`).
+    cannot satisfy (see :func:`_generate_paged_input`). It also makes the O
+    and stats inputs of an SDPA backward node the exact forward outputs of
+    its Q, K and V (see :mod:`.sdpa_backward_inputs`).
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
@@ -430,7 +433,18 @@ def generate_input_data(
                 data[index] = _decode(_encode(block, dtype), dtype)
             input_data[tensor_info.uid] = data
 
+    set_sdpa_backward_inputs(graph_json, tensor_infos, input_data, _rounded)
     return input_data
+
+
+def _rounded(values: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
+    """float32 ``values`` rounded to the logical values of the tensor's type."""
+    data = np.empty(tensor_info.dims, dtype=tensor_info.dtype.numpy)
+    for index in iter_blocks(data.shape):
+        data[index] = _decode(
+            _encode(values[index], tensor_info.dtype), tensor_info.dtype
+        )
+    return data
 
 
 class BufferManager:

@@ -446,3 +446,76 @@ def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> 
         np.testing.assert_allclose(
             ref.host_data(), host[uid].host_data(), rtol=1e-12, atol=0
         )
+
+
+@pytest.mark.parametrize(
+    "q_heads, kv_heads, parameters",
+    [
+        (4, 4, {"causal_mask": True}),
+        (4, 2, {}),
+        (4, 4, {"left_bound": 15, "right_bound": 0}),
+    ],
+    ids=["causal", "gqa", "window"],
+)
+@pytest.mark.parametrize("backend", ["default", "flash", "efficient"])
+def test_sdpa_backward_fused_kernel_matches_host_formula(
+    torch_gpu, q_heads: int, kv_heads: int, parameters: dict, backend: str
+) -> None:
+    """The GPU row runs a fused backward kernel on the graph's O and stats.
+    Its gradients match the host formula on the same inputs."""
+    from dnn_benchmarking.execution import pytorch_ops
+
+    torch = torch_gpu
+    torch.manual_seed(0)
+    batch, length, dim, scale = 2, 96, 64, 0.125
+    q = torch.randn(batch, q_heads, length, dim)
+    k = torch.randn(batch, kv_heads, length, dim)
+    v = torch.randn(batch, kv_heads, length, dim)
+    do = torch.randn(batch, q_heads, length, dim)
+    keep = torch.ones(length, length, dtype=torch.bool).tril()
+    if "left_bound" in parameters:
+        keep &= ~torch.ones(length, length, dtype=torch.bool).tril(-16)
+    if not parameters:
+        keep = torch.ones(length, length, dtype=torch.bool)
+    rep = q_heads // kv_heads
+    scores = q @ k.repeat_interleave(rep, 1).transpose(-2, -1) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    stats = torch.logsumexp(scores, -1, keepdim=True)
+    o = torch.softmax(scores, -1) @ v.repeat_interleave(rep, 1)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                },
+                "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+                "parameters": {"attn_scale_value": scale, **parameters},
+            }
+        ]
+    }
+    half = [t.to(torch.bfloat16) for t in (q, k, v, o, do)]
+    host = {**dict(zip(range(1, 6), [t.float() for t in half])), 6: stats}
+    device = {**dict(zip(range(1, 6), [t.cuda() for t in half])), 6: stats.cuda()}
+
+    pytorch_ops.execute_graph(graph_json, host)
+    state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName(backend))
+    if backend == "flash" and "left_bound" in parameters:
+        # Flash takes no mask, so a strict Flash selection cannot run a window.
+        with pytest.raises(pytorch_ops.PyTorchSdpaBackendUnavailableError):
+            with pytorch_ops.use_pytorch_sdpa_backend(state):
+                pytorch_ops.execute_graph(graph_json, device)
+        return
+    with pytorch_ops.use_pytorch_sdpa_backend(state):
+        pytorch_ops.execute_graph(graph_json, device)
+
+    for uid in (7, 8, 9):
+        assert device[uid].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            device[uid].float().cpu(), host[uid], rtol=3e-2, atol=3e-2
+        )

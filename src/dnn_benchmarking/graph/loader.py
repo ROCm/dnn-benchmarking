@@ -11,15 +11,21 @@ from ..common.exceptions import GraphLoadError
 from .tensor_info import TensorInfo
 
 
-def output_uids(graph_json: Dict[str, Any]) -> Set[int]:
-    """UIDs every node writes, from int- or list-valued ``outputs`` entries."""
-    uids: Set[int] = set()
+def output_producers(graph_json: Dict[str, Any]) -> Dict[int, str]:
+    """Node ``type`` of the node that writes each UID, from int- or
+    list-valued ``outputs`` entries."""
+    producers: Dict[int, str] = {}
     for node in graph_json.get("nodes") or []:
         for value in (node.get("outputs") or {}).values():
             for uid in value if isinstance(value, list) else [value]:
                 if isinstance(uid, int) and not isinstance(uid, bool):
-                    uids.add(uid)
-    return uids
+                    producers[uid] = str(node.get("type", ""))
+    return producers
+
+
+def output_uids(graph_json: Dict[str, Any]) -> Set[int]:
+    """UIDs every node writes."""
+    return set(output_producers(graph_json))
 
 
 def tensor_data_type(
@@ -91,7 +97,7 @@ class GraphLoader:
             GraphLoadError: If a tensor entry is malformed.
             UnsupportedGraphError: If a tensor has an unsupported data type.
         """
-        outputs = output_uids(graph_json)
+        producers = output_producers(graph_json)
         result = []
         for tensor_json in graph_json.get("tensors", []):
             # Virtual tensors get no buffer, and hipDNN may leave their
@@ -104,6 +110,7 @@ class GraphLoader:
                 if data_type != tensor_json.get("data_type"):
                     tensor_json = {**tensor_json, "data_type": data_type}
             tensor_info = TensorInfo.from_json(tensor_json)
-            tensor_info.is_output = tensor_info.uid in outputs
+            tensor_info.is_output = tensor_info.uid in producers
+            tensor_info.producer = producers.get(tensor_info.uid)
             result.append(tensor_info)
         return result
