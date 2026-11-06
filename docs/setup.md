@@ -40,9 +40,11 @@ stages are:
    package is absent.
 9. `rocKE Python packages`: Linux only. Install rocKE's Python packages for
    `--runtime rocke` (see [Extra CMake defines](#extra-cmake-defines)).
-10. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
+10. `AITER`: Linux with ROCm torch only. Install AITER for `--runtime aiter`
+    and compile its attention kernels (see [AITER](#aiter)).
+11. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
     and link the wheel rocprofiler libraries.
-11. `Verify installation`.
+12. `Verify installation`.
 
 Then setup prints the `Profiling sources:` block. See
 [troubleshooting.md](troubleshooting.md#what-each-profiling-source-needs).
@@ -261,6 +263,28 @@ ships. With `--reuse-artifacts`, the plugins come from an earlier build, so
 the checkout can differ from the one they were built from. The rocKE rows
 then fail with an argument-list, grid or SHA-256 error rather than give wrong
 numbers.
+
+## AITER
+
+On Linux with ROCm torch, the `AITER` stage installs AITER for
+`--runtime aiter`:
+
+1. It fetches the `aiter` submodule at the commit that this repository pins,
+   and AITER's `3rdparty/composable_kernel` submodule, each at depth 1. An
+   existing checkout (for example from `git submodule update --init
+   --recursive aiter`) is kept; a commit other than the pin gives a warning.
+2. It installs AITER's `requirements.txt` and then AITER as an editable
+   package, with `AITER_USE_SYSTEM_TRITON=1` so torch's Triton stays.
+3. With a GPU visible, it runs every AITER backend that `--runtime aiter` runs
+   on that GPU once, for fp16 and bf16 with and without a causal mask. This
+   compiles AITER's host modules (JIT) into `aiter/aiter/jit`, so the first
+   benchmark does not compile. The CK modules take minutes each. Without a
+   GPU, each backend compiles on its first use. A backend that does not
+   compile gives a warning; its rows then report the same error.
+
+AITER compiles with the pip ROCm SDK of torch (see
+[AITER runtime](usage.md#aiter-runtime)). Other torch modes and Windows skip
+the stage.
 
 ## Rebuild from zero
 

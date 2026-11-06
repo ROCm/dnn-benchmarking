@@ -52,3 +52,17 @@ def is_cuda_build() -> bool:
         )
     except Exception:
         return False
+
+
+def device_arch(device) -> str:
+    """GPU architecture name of a torch device, without feature flags (``gfx950``)."""
+    import torch
+
+    return str(torch.cuda.get_device_properties(device).gcnArchName).split(":")[0]
+
+
+def device_num_cus(device) -> int:
+    """Compute-unit count of a torch device; kernel dispatchers size grids by it."""
+    import torch
+
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)

@@ -213,6 +213,8 @@ class TestSuiteConfigValidation:
         [
             ("rocke", ["--oracle"], "--oracle"),
             ("pytorch,rocke", ["--autotune"], "--autotune"),
+            # AITER rows read no hipDNN plugins.
+            ("aiter", ["--plugin-path", "/plugins"], "--plugin-path"),
             # The reference row would time the pytorch runtime's graph again.
             ("hipdnn,pytorch", ["--validate", "pytorch"], "--validate pytorch"),
         ],
@@ -223,6 +225,11 @@ class TestSuiteConfigValidation:
         args = _namespace(["-r", runtime, *argv])
         with pytest.raises(ValueError, match=f"{flag} not supported with --runtime"):
             SuiteConfig.from_namespace(args)
+
+    def test_aiter_alone_reads_no_plugin_path(self) -> None:
+        """Only hipDNN and rocKE fall back to the ROCm plugin directory."""
+        config = SuiteConfig.from_namespace(_namespace(["-r", "aiter"]))
+        assert (config.runtimes, config.plugin_paths) == ((RuntimeName.AITER,), None)
 
 
 class TestSuiteConfigPluginPaths:

@@ -35,6 +35,7 @@ class RuntimeName(str, Enum):
     HIPDNN = "hipdnn"
     PYTORCH = "pytorch"
     ROCKE = "rocke"
+    AITER = "aiter"
 
 
 #: Options that only some runtimes honour. An option is accepted when at least
@@ -58,6 +59,7 @@ RUNTIME_OPTIONS: Dict[RuntimeName, frozenset] = {
     RuntimeName.PYTORCH: frozenset({"--oracle"}),
     # --plugin-path locates the shipped rocKE descriptors.
     RuntimeName.ROCKE: frozenset({"--plugin-path", "--validate pytorch"}),
+    RuntimeName.AITER: frozenset({"--validate pytorch"}),
 }
 
 
@@ -375,9 +377,10 @@ class SuiteConfig:
             (``hipdnn`` runs discovered engine plugins, ``pytorch`` runs the
             graph through the PyTorch executor as a single engine row,
             ``rocke`` launches rocKE kernels directly (SDPA forward today),
-            one row per kernel). Several runtimes add their rows to the same
-            graph. After ``__post_init__`` it holds the first runtime and
-            ``runtimes`` holds all of them.
+            one row per kernel; ``aiter`` launches AITER SDPA forward
+            kernels directly, one row per backend). Several runtimes add
+            their rows to the same graph. After ``__post_init__`` it holds
+            the first runtime and ``runtimes`` holds all of them.
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
@@ -432,8 +435,8 @@ class SuiteConfig:
         hip-kernel-provider descriptors there.
         """
         plugin_paths = args.plugin_path
-        if plugin_paths is None and parse_runtimes(args.runtime) != (
-            RuntimeName.PYTORCH,
+        if plugin_paths is None and {RuntimeName.HIPDNN, RuntimeName.ROCKE} & set(
+            parse_runtimes(args.runtime)
         ):
             from ..common.rocm_runtime import default_hipdnn_plugin_paths
 
