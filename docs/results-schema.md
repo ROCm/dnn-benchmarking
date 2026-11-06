@@ -51,10 +51,10 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch` or `rocke`. |
+| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch`, `rocke` or `aiter`. |
 | `runtimes` | array of string or null | Every selected runtime in run order, for example `["hipdnn", "rocke"]` for `--runtime hipdnn,rocke`. `null` in files written before this key. |
 | `engine_filter` | array of string or null | `--engine` selections as hex engine IDs (same format as `engine.id`). `null` means all discovered engines. |
-| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
+| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`, `--runtime aiter` and `--runtime pytorch,aiter`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
@@ -148,7 +148,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch` or `rocke`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. |
+| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch`, `rocke` or `aiter`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. An `aiter` row has `engine.id` and `engine.name` `aiter:<backend>` (`aiter:auto`, `aiter:ck`, ...), and `engine.version` the `amd-aiter` package version. |
 | `role` | string | `engine` for a benchmarked engine. `reference` for the timed reference row that `--validate pytorch` adds. |
 | `engine` | object | See [engine](#engine). |
 | `status` | string | `success`, `error` or `skipped`. |
@@ -167,7 +167,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE rows: the row name, which is stable across runs. `null` for PyTorch rows. |
+| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE and AITER rows: the row name, which is stable across runs. `null` for PyTorch rows. |
 | `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
 | `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
 

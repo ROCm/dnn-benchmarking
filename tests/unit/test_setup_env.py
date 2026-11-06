@@ -1008,6 +1008,7 @@ def test_hipdnn_reuse_keeps_prepared_venv_and_does_not_fetch_sources(
     # are exercised separately on the actual ROCm image.
     monkeypatch.setattr(setup, "install_package", lambda: None)
     monkeypatch.setattr(setup, "install_runtime_extras", lambda: None)
+    monkeypatch.setattr(setup, "install_aiter", lambda: None)
     monkeypatch.setattr(setup, "verify", lambda: None)
     monkeypatch.setattr(setup, "report_profiling_sources", lambda: None)
     monkeypatch.setattr(

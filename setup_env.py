@@ -59,6 +59,12 @@ PROVIDER_DESCRIPTOR_ROOT = (
     / "kernel_ingestor_engine"
     / "descriptors"
 )
+
+AITER_DIR = SCRIPT_DIR / "aiter"
+# AITER submodules that its JIT compiles against: the CK headers and the CK
+# code generator of its CK forward kernels.
+AITER_SUBMODULES = ("3rdparty/composable_kernel",)
+
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
@@ -386,6 +392,23 @@ else:
 print("\n" + mode)
 """
 
+# Compile the AITER backends that --runtime aiter runs on this GPU (see
+# aiter_executor.prebuild). Exit 1 when any of them fails.
+_AITER_PREBUILD = r"""
+import sys
+
+from dnn_benchmarking.execution.aiter_executor import prebuild
+
+ran = failed = 0
+for label, error in prebuild():
+    ran += 1
+    failed += error is not None
+    print(f"  {label}: {error}" if error else f"  {label}", flush=True)
+if not ran:
+    print("  No supported GPU is visible; AITER compiles each backend on first use.")
+sys.exit(1 if failed else 0)
+"""
+
 
 # --- CLI -------------------------------------------------------------------
 
@@ -643,24 +666,12 @@ class Setup:
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
         gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        ref = self.rocm_libraries_ref
-        if not ref:
-            try:
-                ref = git_output(
-                    ["-C", str(SCRIPT_DIR), "rev-parse", "HEAD:rocm-libraries"]
-                )
-            except subprocess.CalledProcessError:
-                ref = git_output(
-                    ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
-                )
-                warn(
-                    "could not resolve the pinned rocm-libraries commit (no git "
-                    "metadata, e.g. a Docker build or source tarball); falling "
-                    f"back to the MOVING branch '{ref}'.",
-                    "The hipDNN/provider build is not reproducible. Pass "
-                    "--rocm-libraries-ref <sha> (`git rev-parse "
-                    "HEAD:rocm-libraries` in a checkout of this repository).",
-                )
+        ref = self.rocm_libraries_ref or self._pinned_submodule_commit(
+            "rocm-libraries",
+            "The hipDNN/provider build is not reproducible. Pass "
+            "--rocm-libraries-ref <sha> (`git rev-parse "
+            "HEAD:rocm-libraries` in a checkout of this repository).",
+        )
         # Only a full commit id can be compared with HEAD; a branch moves.
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
@@ -755,6 +766,113 @@ class Setup:
             )
         except subprocess.CalledProcessError:
             return False
+
+    @staticmethod
+    def _pinned_submodule_commit(name: str, fallback_note: str) -> str:
+        """The commit this repository pins for submodule ``name``.
+
+        Without git metadata (a Docker build or a source tarball) there is no
+        pin to read, so warn and return the submodule's moving branch.
+        """
+        try:
+            return git_output(["-C", str(SCRIPT_DIR), "rev-parse", f"HEAD:{name}"])
+        except subprocess.CalledProcessError:
+            branch = git_output(
+                [
+                    "config",
+                    "-f",
+                    str(SCRIPT_DIR / ".gitmodules"),
+                    f"submodule.{name}.branch",
+                ]
+            )
+            warn(
+                f"could not resolve the pinned {name} commit (no git metadata, "
+                "e.g. a Docker build or source tarball); falling back to the "
+                f"MOVING branch '{branch}'.",
+                fallback_note,
+            )
+            return branch
+
+    # -- AITER ----------------------------------------------------------------
+
+    def ensure_aiter_checkout(self) -> None:
+        """Fetch AITER at its pinned submodule commit if absent.
+
+        `git submodule update --init --recursive aiter` also works. This path
+        fetches only the pinned commit and the AITER submodules that its JIT
+        compiles against (AITER_SUBMODULES), each at depth 1. An existing
+        checkout is reused as-is.
+        """
+        ref = self._pinned_submodule_commit(
+            "aiter", "The AITER rows are not reproducible."
+        )
+        pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
+        if (AITER_DIR / ".git").exists():
+            head = git_output(["-C", str(AITER_DIR), "rev-parse", "HEAD"])
+            if pinned and head != ref:
+                warn(
+                    f"aiter is at {head[:12]}, not the pinned {ref[:12]}. Check "
+                    "out that commit in aiter/ (e.g. `git submodule update "
+                    "--recursive aiter`) or delete the directory to fetch it."
+                )
+            self._init_aiter_submodules(AITER_DIR)
+            return
+
+        # An uninitialised submodule leaves an empty directory; anything else
+        # here is not ours to delete without asking.
+        if AITER_DIR.exists() and any(AITER_DIR.iterdir()):
+            self._confirm(
+                f"replace {AITER_DIR}, which is not a git checkout and is not empty"
+            )
+        url = git_output(
+            ["config", "-f", str(SCRIPT_DIR / ".gitmodules"), "submodule.aiter.url"]
+        )
+        print(f"Fetching aiter ({ref}) at depth 1...")
+        # Same staging as rocm-libraries: an interrupted fetch must not leave
+        # a .git directory that the next run would reuse.
+        staging = AITER_DIR.with_name(AITER_DIR.name + ".partial")
+        if staging.exists():
+            rmtree(staging)
+        git = ["-C", str(staging)]
+        try:
+            run_git(["init", "--quiet", str(staging)])
+            run_git([*git, "remote", "add", "origin", url])
+            run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
+            run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
+            self._init_aiter_submodules(staging)
+        except BaseException:
+            if staging.exists():
+                rmtree(staging)
+            raise
+        if AITER_DIR.exists():
+            rmtree(AITER_DIR)
+        os.replace(staging, AITER_DIR)
+
+    @staticmethod
+    def _init_aiter_submodules(checkout: Path) -> None:
+        """Fetch each AITER submodule that is not checked out, at depth 1.
+
+        A checked-out submodule is left alone, so local changes survive.
+        """
+        missing = [
+            path
+            for path in AITER_SUBMODULES
+            if not (checkout / path).is_dir() or not any((checkout / path).iterdir())
+        ]
+        if missing:
+            run_git(
+                [
+                    "-C",
+                    str(checkout),
+                    "submodule",
+                    "update",
+                    "--quiet",
+                    "--init",
+                    "--depth",
+                    "1",
+                    *missing,
+                ]
+            )
 
     # -- venv lifecycle -----------------------------------------------------
 
@@ -1567,6 +1685,39 @@ class Setup:
         self.pip("install", *compat, "-e", str(rocke / "platform"))
         self.pip("install", *compat, "--no-deps", "-e", str(rocke / "library"))
 
+    def install_aiter(self) -> None:
+        """Install the pinned AITER for ``--runtime aiter`` and compile its kernels.
+
+        AITER compiles its host modules (JIT) against the installed torch, so
+        it is installed from source (the ``aiter`` submodule) and only with
+        ROCm torch. ``AITER_USE_SYSTEM_TRITON=1`` keeps torch's Triton. With a
+        GPU visible, the stage then runs every AITER backend once on small
+        problems (``aiter_executor.prebuild``, which also selects the ROCm
+        SDK toolchain of torch); the compiled modules stay in
+        ``aiter/aiter/jit``.
+        """
+        if self.installed_torch_mode != "rocm":
+            print(
+                f"Skipping AITER: --runtime aiter needs ROCm torch, not "
+                f"'{self.installed_torch_mode}'."
+            )
+            return
+        self.ensure_aiter_checkout()
+        env = dict(self.env, AITER_USE_SYSTEM_TRITON="1")
+        # AITER's runtime imports (pyyaml, ...) are in requirements.txt only.
+        self.pip("install", "-r", str(AITER_DIR / "requirements.txt"), env=env)
+        # compat mode puts aiter/ on sys.path through a .pth file. The default
+        # finder loses to the aiter/ checkout itself, which imports as an empty
+        # namespace package from the repository root (python -c, python -m).
+        compat = ("--config-settings", "editable_mode=compat")
+        self.pip("install", *compat, "-e", str(AITER_DIR), env=env)
+        prebuild = run([self.py, "-c", _AITER_PREBUILD], env=env, check=False)
+        if prebuild.returncode != 0:
+            warn(
+                "Some AITER backends did not compile or run (see above).",
+                "Their --runtime aiter rows report the same error.",
+            )
+
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
             self.install_prefix,
@@ -1804,6 +1955,8 @@ class Setup:
             if not IS_WINDOWS:
                 # The Windows ROCm build of rocKE is untested (see rocke_args).
                 stages.append(("rocKE Python packages", self.install_rocke_packages))
+                # AITER's source install needs FlyDSL, which ships Linux wheels only.
+                stages.append(("AITER", self.install_aiter))
             stages.append(
                 ("amdsmi and rocprofiler libraries", self.install_runtime_extras)
             )

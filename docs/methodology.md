@@ -9,10 +9,10 @@ measures it. The code is `src/dnn_benchmarking/execution/timing.py`
 - The headline number is `kernel_med`: the median device time of one launch
   of the graph, in the table and in `ootb.kernel.median_ms`.
 - One loop implementation (`timing.measure`) times hipDNN engines, the
-  PyTorch runtime and the rocKE runtime. The runtimes get the same warmup,
-  stop rule, cache mode and statistics. rocKE rows launch with
-  `rocke.runtime.no_fence`, because a fenced rocKE launch synchronizes the
-  host after each call.
+  PyTorch runtime, the rocKE runtime and the AITER runtime. The runtimes get
+  the same warmup, stop rule, cache mode and statistics. rocKE rows launch
+  with `rocke.runtime.no_fence`, because a fenced rocKE launch synchronizes
+  the host after each call. AITER rows launch on the torch default stream.
 - Each plan records how it was measured in `timing`: mode, timer,
   cache mode, warmup count, first-call cost, cap and fallback reason.
 - TFLOP/s and GB/s use the median. The tool reports the spread (IQR, CV) and

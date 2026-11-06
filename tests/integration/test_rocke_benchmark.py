@@ -21,7 +21,7 @@ def rocke_gfx950(torch_gpu, plugin_paths):
     """Plugin paths on a gfx950 host with the rocKE packages, or skip."""
     pytest.importorskip("kernels.gfx950.attention_dense")
     pytest.importorskip("dispatch.attention")
-    from dnn_benchmarking.execution.rocke_executor import device_arch
+    from dnn_benchmarking.common.torch_support import device_arch
 
     arch = device_arch(torch_gpu.device("cuda"))
     if arch != "gfx950":

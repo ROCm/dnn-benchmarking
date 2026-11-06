@@ -1,7 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""rocKE runtime startup: missing prerequisites fail fast, hipDNN untouched."""
+"""rocKE and AITER runtime startup: missing prerequisites fail fast, hipDNN untouched."""
 
 import builtins
 import importlib.util
@@ -19,12 +19,12 @@ from dnn_benchmarking.reporting.reporter import Reporter
 
 @pytest.fixture(autouse=True)
 def _no_hipdnn(monkeypatch):
-    """Fail any hipDNN import: the rocKE runtime must never create a handle."""
+    """Fail any hipDNN import: these runtimes must never create a handle."""
     real_import = builtins.__import__
 
     def guarded(name, *args, **kwargs):
         if name.startswith("hipdnn_frontend"):
-            raise AssertionError("hipdnn_frontend imported by the rocke runtime")
+            raise AssertionError("hipdnn_frontend imported by a direct runtime")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded)
@@ -72,6 +72,19 @@ def test_missing_rocke_packages_exit_1(monkeypatch) -> None:
     code, text = _run("-r", "rocke")
     assert code == 1
     assert "dispatch" in text and "Traceback" not in text
+
+
+def test_missing_aiter_package_exits_1(monkeypatch) -> None:
+    _fake_torch(monkeypatch, gpu=True, hip="7.0")
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a: None if name == "aiter" else real_find_spec(name, *a),
+    )
+    code, text = _run("-r", "aiter")
+    assert code == 1
+    assert "aiter package is not importable" in text and "Traceback" not in text
 
 
 @pytest.mark.parametrize(

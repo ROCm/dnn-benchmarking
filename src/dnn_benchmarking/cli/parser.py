@@ -312,7 +312,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         metavar="RUNTIMES",
         help="comma list of " + ", ".join(_values(RuntimeName)) + ": "
         "hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
-        "rocke launches rocKE kernels directly (SDPA forward today). "
+        "rocke launches rocKE kernels directly (SDPA forward today); "
+        "aiter launches AITER SDPA forward kernels directly, one row per backend. "
         "Several runtimes add their rows to each graph, for example hipdnn,rocke",
         config_key="runtime",
         config_kind=ConfigKind.SCALAR,
@@ -564,6 +565,7 @@ examples:
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
   dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
   dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke --timing-block 50
+  dnn-benchmark -g graphs/sample_sdpa.json --runtime hipdnn,aiter --validate pytorch
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
 engines:
