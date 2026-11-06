@@ -145,7 +145,7 @@ def _build(row, handle=None, config=None):
     )
 
 
-def _run(row=None, refs=None, bm=None, config=None):
+def _run(row=None, refs=None, bm=None, config=None, matching_infinities=False):
     row = row or _row()
     config = config or _config()
     out = TensorInfo(
@@ -156,6 +156,7 @@ def _run(row=None, refs=None, bm=None, config=None):
         data_type="float",
         is_virtual=False,
         is_output=True,
+        matching_infinities=matching_infinities,
     )
     oracle_mod.run_tuned_plan(
         tuned=_build(row, config=config),
@@ -282,6 +283,17 @@ def test_no_references_means_no_tuned_validation(tuned):
 
     assert ("execute_once", tuned.prepared.handle) not in CALLS
     assert row.oracle.correctness is None
+
+
+def test_tuned_validation_matches_infinities_in_sdpa_stats(tuned):
+    """Varlen graphs hold -inf in dead stats rows; the tuned check compares
+    them as equal, as the OOTB check does."""
+    dead = np.full(2, -np.inf, np.float32)
+    refs = {1: ReferenceOutput(data=dead.copy(), tensor_uid=1)}
+
+    row = _run(refs=refs, bm=_BM({1: dead.copy()}), matching_infinities=True)
+
+    assert row.oracle.correctness.tolerance_match
 
 
 def test_failing_tuned_plan_keeps_the_row_verdict(tuned):

@@ -91,6 +91,7 @@ class Fake:
         # (call, handle, HIPDNN_DISABLE_CACHE) per plan build/run, in order;
         # calls on the tuned plan are prefixed "tuned.".
         self.calls = []
+        self.buffer_infos = []  # TensorInfo lists the buffer managers received
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
 
 
@@ -150,7 +151,7 @@ def fake(monkeypatch):
 
     class BufferManager:
         def __init__(self, tensor_infos, device=None):
-            pass
+            f.buffer_infos.append(tensor_infos)
 
         def __enter__(self):
             return self
@@ -417,7 +418,9 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
 
 
 def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch):
-    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
+    monkeypatch.setattr(
+        suite_runner, "compute_flops", lambda g, data=None: 2_000_000_000
+    )
     fake.discovered = [1]
     # Median 1 ms, mean 1.4 ms: throughput must come from the median.
     # Every timing field off its default, so a row cannot claim a cache mode,
@@ -515,7 +518,9 @@ def test_tuned_plan_failing_validation_publishes_no_speedup(
 
 
 def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
-    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
+    monkeypatch.setattr(
+        suite_runner, "compute_flops", lambda g, data=None: 2_000_000_000
+    )
     fake.discovered = [1]
     fake.clocks = [{"sclk_mhz": 1700}]
 
@@ -567,6 +572,138 @@ def test_unsupported_graph_still_gets_the_pytorch_reference_row(fake_torch):
         ("pytorch", "reference", None, "reference")
     ]
     assert graph.results[0].ootb.gpu_kernel_stats is not None
+
+
+def _varlen_graph(sources=("q", "kv")):
+    batches, heads, seq, head_dim = 3, 1, 8, 4
+
+    def tensor(uid, name, dims, dtype="float"):
+        return {
+            "uid": uid,
+            "name": name,
+            "dims": dims,
+            "strides": [int(np.prod(dims[i + 1 :])) for i in range(len(dims))],
+            "data_type": dtype,
+            "virtual": False,
+        }
+
+    dims = [batches, heads, seq, head_dim]
+    inputs = {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3}
+    inputs.update(
+        {
+            f"seq_len_{s}_tensor_uid": uid
+            for s, uid in (("q", 7), ("kv", 8))
+            if s in sources
+        }
+    )
+    return {
+        "name": "varlen",
+        "tensors": [
+            tensor(1, "q", dims),
+            tensor(2, "k", dims),
+            tensor(3, "v", dims),
+            tensor(4, "o", dims),
+            tensor(5, "stats", [batches, heads, seq, 1]),
+            tensor(7, "seq_len_q", [batches], "int32"),
+            tensor(8, "seq_len_kv", [batches], "int32"),
+        ],
+        "nodes": [
+            {
+                "name": "sdpa",
+                "type": "SdpaAttributes",
+                "inputs": inputs,
+                "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 5},
+                "attributes": {"attn_scale_value": 0.5},
+            }
+        ],
+    }
+
+
+def _run_varlen(graph_json, **config):
+    from dnn_benchmarking.graph.loader import GraphLoader
+
+    out = io.StringIO()
+    graph = suite_runner.run_graph(
+        PATH,
+        graph_json,
+        GraphLoader().extract_tensor_info(graph_json),
+        SuiteConfig(**config),
+        Reporter(out),
+        [suite_runner.hipdnn_planner(_Handle())],
+    )
+    return graph, out.getvalue()
+
+
+def test_varlen_graph_gives_the_buffer_manager_resolved_layouts(fake):
+    fake.discovered = [1]
+
+    _run_varlen(_varlen_graph())
+
+    (infos,) = fake.buffer_infos
+    operands = {i.name: i for i in infos}
+    for name in ("q", "k", "v", "o", "stats"):
+        assert operands[name].varlen is not None, name
+        assert len(operands[name].varlen.lengths) == 3
+
+
+def test_varlen_graph_reports_the_per_batch_flops_not_the_dense_count(fake):
+    from dnn_benchmarking.execution.buffer_manager import generate_input_data
+    from dnn_benchmarking.graph.loader import GraphLoader
+    from dnn_benchmarking.metrics import compute_flops
+
+    fake.discovered = [1]
+    graph_json = _varlen_graph()
+    config = SuiteConfig()
+    infos = GraphLoader().extract_tensor_info(graph_json)
+    data = generate_input_data(infos, config.seed, graph_json)
+    expected = compute_flops(graph_json, data)
+    dense = compute_flops(graph_json)
+    assert expected != dense
+
+    (row,) = _run_varlen(graph_json)[0].results
+
+    assert row.analytical_flops == expected
+
+
+def test_varlen_sdpa_stats_with_matching_infinities_pass_validation(fake, monkeypatch):
+    """Dead rows hold -inf in the engine and the reference; the resolved tensor
+    infos must reach the check so the stats output compares with matching
+    infinities."""
+    fake.discovered = [1]
+    shape = (3, 1, 8)
+    stats = np.full((*shape, 1), -np.inf, np.float32)
+    out = np.zeros((*shape, 4), np.float32)
+    outputs = {4: out, 5: stats}
+
+    def prepare(ctx):
+        ctx.reference_outputs = {
+            uid: suite_runner.ReferenceOutput(data=data.copy(), tensor_uid=uid)
+            for uid, data in outputs.items()
+        }
+
+    monkeypatch.setattr(suite_runner, "_prepare_references", prepare)
+    monkeypatch.setattr(
+        suite_runner.BufferManager,
+        "get_output_data",
+        lambda self, uid: outputs[uid].copy(),
+    )
+
+    graph, _ = _run_varlen(
+        _varlen_graph(), validation=ValidationConfig(provider="pytorch")
+    )
+
+    (infos,) = fake.buffer_infos
+    assert sum(next(i for i in infos if i.name == "stats").varlen.lengths) > 0
+    (row,) = graph.results
+    assert row.verdict == "passed"
+
+
+def test_graph_the_varlen_resolver_refuses_has_no_engines_and_names_the_tensor(fake):
+    graph, _ = _run_varlen(_varlen_graph(sources=("q",)))
+
+    assert graph.status == "no_engines"
+    assert graph.results == [] and graph.error is None
+    assert "seq_len" in graph.message and "'q'" in graph.message
 
 
 @pytest.mark.parametrize(
@@ -1574,10 +1711,13 @@ def test_rocke_rows_without_a_reference(
     import psutil
 
     class Reference:
-        def estimate_host_bytes(self, graph_json):
+        def supports_float64(self, graph_json):
+            return False
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
             return host_bytes
 
-        def compute_reference(self, graph_json, input_data):
+        def compute_reference(self, graph_json, input_data, **kwargs):
             raise RuntimeError(reference_error)
 
     monkeypatch.setattr(

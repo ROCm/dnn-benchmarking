@@ -8,7 +8,8 @@ import pytest
 
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.execution.correctness import check_correctness, tolerance_for
-from dnn_benchmarking.graph.tensor_info import TensorInfo
+from dnn_benchmarking.graph.tensor_info import TensorInfo, VarlenLayout
+from dnn_benchmarking.graph.varlen import resolve_varlen_layouts
 from dnn_benchmarking.validation import ReferenceOutput
 
 
@@ -275,3 +276,108 @@ def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
     }
 
     assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
+
+
+def _varlen_out(uid, lengths, data_type="float"):
+    return TensorInfo(
+        uid=uid,
+        name=f"t{uid}",
+        dims=[2, 1, 3, 2],
+        strides=[6, 6, 2, 1],
+        data_type=data_type,
+        is_virtual=False,
+        is_output=True,
+        varlen=VarlenLayout(lengths=lengths),
+    )
+
+
+def test_varlen_output_ignores_padding_and_counts_valid_elements():
+    expected = np.ones((2, 1, 3, 2), np.float32)
+    actual = expected.copy()
+    actual[0, :, 2:, :] = np.nan  # past batch 0's length of 2
+    actual[1, :, 3:, :] = 99.0  # empty slice: batch 1 is full
+    ref = {1: _ref(expected)}
+
+    c = check_correctness(
+        _HostBM({1: actual}), [_varlen_out(1, (2, 3))], ref, "pytorch", _config()
+    )
+
+    assert c.tolerance_match is True
+    assert c.n_total == (2 + 3) * 2
+
+
+def test_varlen_output_fails_on_a_wrong_valid_value():
+    expected = np.ones((2, 1, 3, 2), np.float32)
+    actual = expected.copy()
+    actual[0, 0, 1, 0] = 2.0
+    ref = {1: _ref(expected)}
+
+    c = check_correctness(
+        _HostBM({1: actual}), [_varlen_out(1, (2, 3))], ref, "pytorch", _config()
+    )
+
+    assert c.tolerance_match is False
+    assert c.n_mismatch == 1
+
+
+def test_varlen_device_output_ignores_padding():
+    torch = pytest.importorskip("torch")
+    expected = torch.ones(2, 1, 3, 2)
+    actual = expected.clone()
+    actual[0, :, 2:, :] = float("nan")
+
+    class DeviceBM:
+        def get_output_tensor(self, uid):
+            return actual
+
+    ref = {
+        1: ReferenceOutput(
+            data=expected.numpy(), tensor_uid=1, device_data=expected.clone()
+        )
+    }
+
+    c = check_correctness(
+        DeviceBM(), [_varlen_out(1, (2, 3))], ref, "pytorch", _config()
+    )
+
+    assert c.tolerance_match is True
+
+
+_SDPA_GRAPH = {
+    "nodes": [
+        {
+            "type": "SdpaAttributes",
+            "inputs": {"q_tensor_uid": 10},
+            "outputs": {"o_tensor_uid": 2, "stats_tensor_uid": 1},
+        }
+    ]
+}
+
+
+def _sdpa_output(uid):
+    """Output ``uid`` of ``_SDPA_GRAPH`` with the fields the graph decides."""
+    (info,) = resolve_varlen_layouts([_out(uid)], _SDPA_GRAPH, {})
+    return info
+
+
+def test_sdpa_stats_output_matches_negative_infinity():
+    """A row with no live key has a log-sum-exp of -inf on both sides."""
+    values = np.array([0.5, -np.inf, 1.0, 2.0], np.float32)
+    ref = {1: _ref(values)}
+    bm = _HostBM({1: values.copy()})
+
+    resolved = check_correctness(bm, [_sdpa_output(1)], ref, "pytorch", _config())
+    unresolved = check_correctness(bm, [_out(1)], ref, "pytorch", _config())
+
+    assert resolved.tolerance_match is True
+    assert unresolved.tolerance_match is False
+
+
+def test_infinity_in_a_non_stats_output_still_fails():
+    values = np.array([0.5, -np.inf, 1.0, 2.0], np.float32)
+    ref = {2: _ref(values)}
+    bm = _HostBM({2: values.copy()})
+
+    c = check_correctness(bm, [_sdpa_output(2)], ref, "pytorch", _config())
+
+    assert c.tolerance_match is False

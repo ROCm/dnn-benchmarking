@@ -62,6 +62,17 @@ def test_size_one_dimension_strides_do_not_matter() -> None:
             ),
             id="window",
         ),
+        pytest.param(
+            lambda g: g["nodes"][0]["inputs"].update(cu_seq_len_q_tensor_uid=5),
+            id="cu_seq_len_q",
+        ),
+        pytest.param(
+            lambda g: g["nodes"][0]["inputs"].update(cu_seq_len_kv_tensor_uid=5),
+            id="cu_seq_len_kv",
+        ),
+        pytest.param(
+            lambda g: g["tensors"][0].update(ragged_offset_tensor_uid=5), id="ragged"
+        ),
     ],
 )
 def test_unsupported_graphs_are_rejected(mutate) -> None:

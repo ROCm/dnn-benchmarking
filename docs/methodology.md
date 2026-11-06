@@ -97,9 +97,24 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   `--pytorch-sdpa-backend math`, `efficient`, `cudnn` or `overrideable`. Those
   strict backends can reject `enable_gqa`, and a row that does not use it
   still runs.
-- Sliding-window and bottom-right masks, where a graph needs one, and the
-  dense per-sequence K and V of paged graphs are built once. A timed paged
-  iteration does one SDPA call per sequence and one `torch.cat`.
+- Sliding-window and bottom-right masks, where a graph needs one, are built
+  once. The dense per-sequence K and V of paged graphs are also built once. A
+  timed paged iteration does one SDPA call per sequence and one `torch.cat`.
+- A variable-length forward graph (`seq_len`, `cu_seq_len` or ragged
+  tensors, without a page table) does one SDPA call per batch. The call
+  reads the first `lq` query positions of the batch. It reads the first
+  `lkv` key positions of the batch. Every mask, including the bottom-right
+  causal alignment, uses these live lengths.
+- A row with no visible key (a dead row) keeps `O = 0`. Its `stats` is
+  `-inf`, or the sink logit when the graph has sink tokens.
+  Dead rows are the leading rows of a bottom-right mask when `lq > lkv`.
+  They are also the trailing rows of a top-left window when `lq >= lkv + w`,
+  where `w` is the window size. A row past `lq` keeps `stats = -inf`, also
+  with sink tokens.
+- The tool reads the lengths once, before the timed loop. The timed region
+  does the slices, the SDPA calls and the copy into the output. A
+  variable-length backward graph runs per batch too. `dQ`, `dK` and `dV` are
+  0 past each length and on dead rows.
 - The `stats` output (log-sum-exp) comes from the fused kernel, as in a
   PyTorch training step. Q, K and V go into the call with `requires_grad`, and
   the tool reads the log-sum-exp that the kernel saves for the backward pass.
@@ -131,6 +146,14 @@ causal with one query (decode) or with equal query and KV lengths. On MI210
 (gfx90a), fp32 GQA graphs are skipped too. Other architectures can differ,
 because the result depends on the torch build.
 
+Paged and variable-length graphs run one SDPA call per sequence. When such a
+GQA call would use the math backend, the tool tries the call with K and V
+expanded to the query head count. It builds the expansion once, before the
+timed loop. When a fused kernel accepts the expanded call, the row is timed
+with that call. The row is skipped only when the expanded call also needs
+the math backend. On MI308X (gfx942), memory-efficient attention accepts the
+expanded top-left causal call with unequal query and KV lengths.
+
 The setup is built once on the assumption that the inputs do not change
 between iterations. When a graph node computes an SDPA input, the tool skips
 the PyTorch row instead of timing the setup.
@@ -139,6 +162,8 @@ Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
 - Paged KV: one SDPA call per sequence and a `torch.cat`.
+- Variable-length lengths (`seq_len`, `cu_seq_len` or ragged tensors): one
+  SDPA call per batch.
 - Sliding window or bottom-right causal with a query length above 1 that
   differs from the KV length: the kernel reads an additive mask tensor.
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
@@ -275,6 +300,54 @@ The median is the headline because one slow iteration moves the mean but not
 the median. In the MI210 runs below, one 37.6 us sample in a 29 us matmul run
 moved the mean and the standard deviation, but not the median.
 
+## Input data for variable-length SDPA
+
+An SDPA node is variable-length when it has a length source on a side:
+`seq_len_q_tensor_uid`, `seq_len_kv_tensor_uid`, `cu_seq_len_q_tensor_uid` or
+`cu_seq_len_kv_tensor_uid`. A tensor is ragged when it sets
+`ragged_offset_tensor_uid` (with the optional `ragged_offset_multiplier`,
+default 1). The tool draws the values of these integer tensors from the seed.
+They are not uniform floats:
+
+- Lengths are in `1..S_max`, where `S_max` is the sequence dim of the
+  operands. A group of lengths varies between batches. With two or more
+  batches, one batch is padded (shorter than `S_max`) and one batch is full.
+- For a paged graph, the KV lengths stay within the page allocation:
+  `page_table` width times page size, capped by `max_seq_len_kv` when the
+  graph sets it.
+- An offset table has `B + 1` entries and starts with 0. Entry `b + 1` is
+  the start of batch `b + 1`. That is the start of batch `b` plus its length
+  and its gap, in the unit of the table. Only a graph that has a length
+  source gets gaps. A gap is padding tokens after the live tokens of a
+  batch, and the length excludes them. With two or more batches, some batch
+  starts after a gap. The exception is a graph where no batch before the last
+  has room for one. Then every length is at the aligned sequence length, or
+  the token capacity holds just one aligned block for each batch. Each entry
+  is stored in the unit of the table. That is the token start times the
+  sequence stride divided by `ragged_offset_multiplier`.
+- A head-major ragged tensor (for example `[H, T, D]`) stores the token
+  range in the head stride. The capacity of that range limits the lengths
+  and the gaps. The tool reduces them to fit, and keeps one gap before a
+  batch other than the last when the capacity has room for it. A graph that
+  cannot fit one aligned block of tokens for each batch is not served.
+- `cu_seq_len` tensors hold the running totals of the lengths: `0`, `l0`,
+  `l0 + l1`, and so on, `B + 1` entries, in the dtype of the tensor. A side
+  uses `seq_len` or `cu_seq_len`, not both. The two sides can use different
+  sources. The key names follow rocm-libraries PR #14560 (forward
+  `SdpaAttributes` only; ALMIOPEN-2935).
+- Tensors that share one length or offset tensor get one set of values. For
+  example, self-attention can use one offset table for Q and K.
+- The lengths and the offsets come from a separate random stream that the
+  seed also sets. The float inputs of a graph do not change when the graph
+  has these tensors.
+
+Every tensor of the graph stays logical (shaped by its dims) in the
+reference. The graph layout (offsets, strides) applies only when the tool
+writes inputs to device storage and reads outputs from it. A ragged tensor
+stores each batch at its offset and holds zero elsewhere. Padding of a
+non-ragged tensor (for example the BSHD view of aiter graphs) holds
+generated values that an engine must ignore.
+
 ## TFLOP/s and GB/s
 
 `tflops = flops / median` and `gbps = io_bytes / median`:
@@ -284,8 +357,14 @@ moved the mean and the standard deviation, but not the median.
   are in its sibling modules (`conv.py`, `matmul.py`, `elementwise.py`,
   `normalization.py`, `reduction.py`, `sdpa.py`). When any node of the graph
   has no formula, `flops` and `tflops` are `null`, not a partial count.
+- For an SDPA node with variable lengths, `flops` sums the count of each
+  batch from its valid lengths. The lengths come from the generated input
+  data, not from the tensor dims. A paged graph counts the real KV lengths
+  of its batches, not the page size.
 - `io_bytes` is the sum of the sizes of all non-virtual tensors. It is a
-  lower bound of the real memory traffic.
+  lower bound of the real memory traffic. A tensor with valid lengths counts
+  only its valid elements: `sum(lengths) * elements per position * element
+  size`. Paged K and V containers count their full size.
 - In `warm` mode, a small problem can stay in L2. GB/s can then be more than
   the HBM bandwidth. Use `--cache-mode cold` to measure from memory.
 
@@ -445,6 +524,10 @@ The tool does not do these things yet:
   attention-sink logits. It follows hipDNN precedence: the deprecated causal
   booleans override the modern bounds and diagonal alignment. Other masks make
   the reference decline the graph as unsupported.
+- Per-document masking inside one sequence (`varlen_docmask`).
+  Variable-length SDPA with `seq_len`, `cu_seq_len` and ragged tensors is
+  supported; see
+  [Input data for variable-length SDPA](#input-data-for-variable-length-sdpa).
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
