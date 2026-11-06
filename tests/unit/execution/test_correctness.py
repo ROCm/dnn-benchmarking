@@ -9,6 +9,7 @@ import pytest
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.execution.correctness import check_correctness, tolerance_for
 from dnn_benchmarking.graph.tensor_info import TensorInfo, VarlenLayout
+from dnn_benchmarking.graph.varlen import resolve_varlen_layouts
 from dnn_benchmarking.validation import ReferenceOutput
 
 
@@ -353,19 +354,23 @@ _SDPA_GRAPH = {
 }
 
 
+def _sdpa_output(uid):
+    """Output ``uid`` of ``_SDPA_GRAPH`` with the fields the graph decides."""
+    (info,) = resolve_varlen_layouts([_out(uid)], _SDPA_GRAPH, {})
+    return info
+
+
 def test_sdpa_stats_output_matches_negative_infinity():
     """A row with no live key has a log-sum-exp of -inf on both sides."""
     values = np.array([0.5, -np.inf, 1.0, 2.0], np.float32)
     ref = {1: _ref(values)}
     bm = _HostBM({1: values.copy()})
 
-    with_graph = check_correctness(
-        bm, [_out(1)], ref, "pytorch", _config(), _SDPA_GRAPH
-    )
-    without_graph = check_correctness(bm, [_out(1)], ref, "pytorch", _config())
+    resolved = check_correctness(bm, [_sdpa_output(1)], ref, "pytorch", _config())
+    unresolved = check_correctness(bm, [_out(1)], ref, "pytorch", _config())
 
-    assert with_graph.tolerance_match is True
-    assert without_graph.tolerance_match is False
+    assert resolved.tolerance_match is True
+    assert unresolved.tolerance_match is False
 
 
 def test_infinity_in_a_non_stats_output_still_fails():
@@ -373,6 +378,6 @@ def test_infinity_in_a_non_stats_output_still_fails():
     ref = {2: _ref(values)}
     bm = _HostBM({2: values.copy()})
 
-    c = check_correctness(bm, [_out(2)], ref, "pytorch", _config(), _SDPA_GRAPH)
+    c = check_correctness(bm, [_sdpa_output(2)], ref, "pytorch", _config())
 
     assert c.tolerance_match is False

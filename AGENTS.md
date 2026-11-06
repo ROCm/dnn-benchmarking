@@ -100,12 +100,13 @@ src/dnn_benchmarking/
 │   ├── rocke_executor.py     # rocKE runtime: load and launch one rocKE kernel
 │   ├── kpack.py              # rocKE runtime: read hipDNN's code objects (librocm_kpack)
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
+│   ├── varlen_inputs.py      # seq_len, cu_seq_len and ragged offset-table inputs
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
 │   ├── oracle.py             # --oracle pass
 │   └── correctness.py        # output comparison for a row
-├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
+├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs), varlen (SDPA lengths, ragged layouts)
 ├── metrics/
 │   ├── analytical/           # FLOP and I/O byte formulas
 │   ├── gpu_smi.py            # amdsmi clocks, VRAM, static GPU info
@@ -126,7 +127,9 @@ Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
 each graph: `GraphLoader` -> `suite_runner.run_graph` with
 `hipdnn_planner` -> `Executor` + `BufferManager` -> `timing.measure` ->
 correctness, oracle, profiling -> `GraphResult` -> `Reporter` and
-`SuiteResult.write`.
+`SuiteResult.write`. `run_graph` generates the inputs once per graph. Then
+`resolve_varlen_layouts` sets the per-tensor varlen layouts and comparison
+fields that buffer managers, comparison and I/O metrics read.
 
 Data flow (PyTorch): the same, with `pytorch_plan`, `PyTorchCudaExecutor`
 and `PyTorchCudaBufferManager`. One `runtime = "pytorch"` row per graph. No

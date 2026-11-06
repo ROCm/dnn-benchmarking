@@ -2843,6 +2843,31 @@ class TestPyTorchSdpaPaged:
         with pytest.raises(UnsupportedGraphError, match="page table holds"):
             pytorch_ops.execute_graph(self._graph(), tensors)
 
+    def test_packed_queries_without_seq_len_q_split_evenly(self) -> None:
+        """Without seq_len_q, each sequence takes total_q / num_seqs queries of
+        the packed Q, with total_q from the graph's Q dims."""
+        self.Q_LENS = [4, 4]
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        graph = self._graph()
+        del graph["nodes"][0]["inputs"]["seq_len_q_tensor_uid"]
+        graph["tensors"] = [
+            {"uid": 1, "dims": list(q.shape), "data_type": "float"},
+        ]
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+
+        pytorch_ops.execute_graph(graph, tensors)
+
+        expected = self._dense_reference(q, dense_k, dense_v)
+        torch.testing.assert_close(tensors[4], expected, rtol=1e-5, atol=1e-5)
+
+    def test_seq_len_q_count_must_match_seq_len_kv(self) -> None:
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        tensors[7] = torch.tensor([3, 3, 2], dtype=torch.int32)
+
+        with pytest.raises(UnsupportedGraphError, match="disagree"):
+            pytorch_ops.execute_graph(self._graph(), tensors)
+
     @pytest.mark.parametrize(
         "attributes",
         [{}, {"left_bound": 3, "right_bound": 0}, {"causal_mask_bottom_right": True}],
@@ -3067,6 +3092,24 @@ class TestPyTorchSdpaVarlen:
         expected_o, expected_lse = self._loop(tensors, mode)
 
         pytorch_ops.execute_graph(self._graph(stats=True, cu=cu, **attributes), tensors)
+
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
+
+    def test_lengths_under_parameters_bound_each_batch(self) -> None:
+        """The layout resolver finds seq_len in any node section. The handler
+        must find it there too and compute each batch on its lengths, not the
+        dense problem."""
+        tensors = self._tensors()
+        expected_o, expected_lse = self._loop(tensors)
+        graph = self._graph(stats=True)
+        node = graph["nodes"][0]
+        node["parameters"] = {
+            key: node["inputs"].pop(key)
+            for key in ("seq_len_q_tensor_uid", "seq_len_kv_tensor_uid")
+        }
+
+        pytorch_ops.execute_graph(graph, tensors)
 
         torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)

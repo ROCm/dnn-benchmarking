@@ -42,9 +42,9 @@ BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
 windowed count the rocKE attention benchmarks report.
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from ...graph.varlen import sdpa_lengths
+from ...graph.varlen import ReadInts, sdpa_lengths
 from ._common import node_param, node_tensor
 
 
@@ -70,7 +70,7 @@ def _nonmasked_pairs(
 def _attention_terms(
     node: Dict[str, Any],
     tensors_by_uid: Dict[int, Dict[str, Any]],
-    read_ints: Optional[Callable[[int], List[int]]] = None,
+    read_ints: Optional[ReadInts] = None,
 ) -> Optional[Tuple[int, int, int]]:
     """Return ``(batch * num_q_heads * P, head_dim_qk, head_dim_vo)``.
 
@@ -133,7 +133,7 @@ def _attention_terms(
 def sdpa_fwd_flops(
     node: Dict[str, Any],
     tensors_by_uid: Dict[int, Dict[str, Any]],
-    read_ints: Optional[Callable[[int], List[int]]] = None,
+    read_ints: Optional[ReadInts] = None,
 ) -> Optional[int]:
     """FLOPs for SdpaAttributes: ``2 * B * Hq * P * (Dqk + Dvo)``."""
     terms = _attention_terms(node, tensors_by_uid, read_ints)
@@ -146,7 +146,7 @@ def sdpa_fwd_flops(
 def sdpa_bwd_flops(
     node: Dict[str, Any],
     tensors_by_uid: Dict[int, Dict[str, Any]],
-    read_ints: Optional[Callable[[int], List[int]]] = None,
+    read_ints: Optional[ReadInts] = None,
 ) -> Optional[int]:
     """FLOPs for SdpaBackwardAttributes: ``2 * B * Hq * P * (3*Dqk + 2*Dvo)``."""
     terms = _attention_terms(node, tensors_by_uid, read_ints)

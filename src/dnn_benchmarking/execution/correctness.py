@@ -3,7 +3,7 @@
 
 """Compare one engine's outputs against the cached reference outputs."""
 
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -85,35 +85,20 @@ def unchecked(config: SuiteConfig, message: str) -> CorrectnessResult:
     )
 
 
-def _stats_uids(graph_json: Optional[Dict[str, Any]]) -> FrozenSet[int]:
-    """UIDs of the ``stats`` outputs of the graph's SDPA forward nodes.
-
-    Rows with no live key hold a log-sum-exp of -inf in both the engine and
-    the reference, so those outputs compare with matching infinities.
-    """
-    uids = set()
-    for node in (graph_json or {}).get("nodes") or []:
-        if node.get("type") != "SdpaAttributes":
-            continue
-        uid = (node.get("outputs") or {}).get("stats_tensor_uid")
-        if uid is not None:
-            uids.add(int(uid))
-    return frozenset(uids)
-
-
 def _compare_output(
     buffer_manager: Any,
     tensor_info: TensorInfo,
     ref: ReferenceOutput,
     rtol: float,
     atol: float,
-    matching_infinities: bool = False,
 ) -> Optional[ComparisonResult]:
     """Compare on the GPU when both sides are device tensors, else on the host.
 
-    A variable-length output compares only the valid positions of each batch.
+    A variable-length output compares only the valid positions of each batch,
+    and a ``matching_infinities`` output accepts infinities equal in both.
     """
     lengths = tensor_info.varlen.lengths if tensor_info.varlen is not None else None
+    matching_infinities = tensor_info.matching_infinities
     if ref.device_data is not None:
         actual = buffer_manager.get_output_tensor(tensor_info.uid)
         if actual is not None:
@@ -149,18 +134,13 @@ def check_correctness(
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
     config: SuiteConfig,
-    graph_json: Optional[Dict[str, Any]] = None,
 ) -> CorrectnessResult:
     """Compare every graph output against the precomputed reference outputs.
-
-    ``graph_json`` names the SDPA ``stats`` outputs, which compare with
-    matching infinities; without it none does.
 
     Diffs and counts aggregate over outputs; ``worst_output_uid`` and the
     message come from the output with the largest absolute difference (a
     failing output wins over a passing one).
     """
-    stats = _stats_uids(graph_json)
     try:
         compared: List[Tuple[int, float, float, ComparisonResult]] = []
         for ti in tensor_infos:
@@ -174,9 +154,7 @@ def check_correctness(
                     f"produce output tensor UID {ti.uid}",
                 )
             rtol, atol = tolerance_for(config, ti)
-            result = _compare_output(
-                buffer_manager, ti, ref, rtol, atol, ti.uid in stats
-            )
+            result = _compare_output(buffer_manager, ti, ref, rtol, atol)
             if result is not None:
                 compared.append((ti.uid, rtol, atol, result))
     except (ValueError, RuntimeError, ExecutionError) as e:

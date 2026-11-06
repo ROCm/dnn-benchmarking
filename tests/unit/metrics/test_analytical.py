@@ -667,6 +667,21 @@ class TestComputeFlops:
         flops = compute_flops(graph, data)
         assert flops == _HEADS_AND_DIMS * (3 * 10 + 5 * 5)
 
+    def test_sdpa_paged_without_seq_len_q_splits_the_queries_evenly(self):
+        # 8 packed queries over 2 sequences: 4 each, against kv lengths 10, 5.
+        graph = _sdpa_graph(b=1, hq=4, hkv=2, sq=8, skv=4, d=16)
+        graph["tensors"] += [
+            {"uid": 5, "dims": [2, 3], "data_type": "int32", "virtual": False},
+            {"uid": 7, "dims": [2], "data_type": "int32", "virtual": False},
+        ]
+        graph["nodes"][0]["inputs"].update(
+            page_table_k_tensor_uid=5,
+            page_table_v_tensor_uid=5,
+            seq_len_kv_tensor_uid=7,
+        )
+        flops = compute_flops(graph, {7: np.array([10, 5], np.int32)})
+        assert flops == _HEADS_AND_DIMS * (4 * 10 + 4 * 5)
+
 
 def _graph(node_type, tensors, inputs, outputs, **params):
     return {

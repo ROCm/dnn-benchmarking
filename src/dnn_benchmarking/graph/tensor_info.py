@@ -4,10 +4,32 @@
 """Tensor information dataclass."""
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..common.dtypes import DType, get_dtype
 from ..common.exceptions import GraphLoadError, UnsupportedGraphError
+
+
+def tensor_label(uid: int, name: Optional[str] = None) -> str:
+    """How messages name a tensor: ``tensor '<name>' (uid <uid>)``.
+
+    A tensor without a name is ``tensor_<uid>``, as in ``TensorInfo.from_json``.
+    """
+    return f"tensor '{f'tensor_{uid}' if name is None else name}' (uid {uid})"
+
+
+def ragged_fields(tensor_json: Dict[str, Any]) -> Tuple[Optional[int], int]:
+    """``(ragged_offset_tensor_uid, ragged_offset_multiplier)`` of a tensor's JSON.
+
+    The UID is None for a dense or padded tensor. A missing multiplier is 1;
+    callers refuse one below 1.
+    """
+    offset_uid = tensor_json.get("ragged_offset_tensor_uid")
+    multiplier = tensor_json.get("ragged_offset_multiplier")
+    return (
+        None if offset_uid is None else int(offset_uid),
+        1 if multiplier is None else int(multiplier),
+    )
 
 
 @dataclass(frozen=True)
@@ -44,6 +66,9 @@ class TensorInfo:
         ragged_offset_multiplier: Elements per offset-table unit.
         varlen: Valid lengths (and batch starts when ragged), set by
             ``resolve_varlen_layouts``; None until resolved.
+        matching_infinities: Whether the comparison accepts infinities that
+            match in both tensors, set by ``resolve_varlen_layouts`` on the
+            ``stats`` output of each SDPA forward node.
         dtype: Registry entry for ``data_type``; construction raises
             UnsupportedGraphError for an unknown type.
     """
@@ -59,10 +84,16 @@ class TensorInfo:
     ragged_offset_tensor_uid: Optional[int] = None
     ragged_offset_multiplier: int = 1
     varlen: Optional[VarlenLayout] = field(default=None, compare=False)
+    matching_infinities: bool = field(default=False, compare=False)
     dtype: DType = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.dtype = get_dtype(self.data_type)
+
+    @property
+    def label(self) -> str:
+        """How messages name this tensor (``tensor_label``)."""
+        return tensor_label(self.uid, self.name)
 
     @property
     def element_size(self) -> int:
@@ -109,7 +140,7 @@ class TensorInfo:
     def _ragged_storage_elements(self) -> int:
         if self.varlen is None or self.varlen.starts is None:
             raise UnsupportedGraphError(
-                f"Ragged tensor '{self.name}' (uid {self.uid}) has no resolved "
+                f"Ragged {self.label} has no resolved "
                 "layout, so its storage size is unknown"
             )
         if self.num_elements == 0:
@@ -146,9 +177,7 @@ class TensorInfo:
             UnsupportedGraphError: If the data type is not supported.
         """
         try:
-            offset_uid = tensor_json.get("ragged_offset_tensor_uid")
-            multiplier = tensor_json.get("ragged_offset_multiplier")
-            multiplier = 1 if multiplier is None else int(multiplier)
+            offset_uid, multiplier = ragged_fields(tensor_json)
             if multiplier < 1:
                 raise GraphLoadError(
                     f"Tensor {tensor_json.get('uid')} has ragged_offset_multiplier "
@@ -162,9 +191,7 @@ class TensorInfo:
                 data_type=tensor_json["data_type"],
                 is_virtual=bool(tensor_json.get("virtual", False)),
                 value=tensor_json.get("value"),
-                ragged_offset_tensor_uid=(
-                    None if offset_uid is None else int(offset_uid)
-                ),
+                ragged_offset_tensor_uid=offset_uid,
                 ragged_offset_multiplier=multiplier,
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:

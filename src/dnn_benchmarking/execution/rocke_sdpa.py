@@ -176,8 +176,8 @@ def sdpa_problem(
             present.append(flag)
     if _node_param(node, "generate_stats", False):
         present.append("generate_stats")
-    # The planner sees unresolved TensorInfo, so read the JSON-derived field.
-    if any(info.ragged_offset_tensor_uid is not None for info in tensor_infos):
+    # The planner sees unresolved TensorInfo; ``is_ragged`` needs no layout.
+    if any(info.is_ragged for info in tensor_infos):
         present.append("ragged_offset_tensor_uid")
     if float(_node_param(node, "dropout_probability", 0.0) or 0.0) != 0.0:
         present.append("dropout_probability")

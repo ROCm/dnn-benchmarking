@@ -241,7 +241,7 @@ def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
     return out
 
 
-def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
+def _page_table_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     """UIDs of every SDPA page table.
 
     Page tables are read from the node's operand keys rather than guessed from
@@ -419,7 +419,7 @@ def generate_input_data(
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
-    page_tables = _paged_input_roles(graph_json)
+    page_tables = _page_table_uids(graph_json)
     signed_uids = _signed_input_uids(graph_json)
     varlen_values = generate_varlen_inputs(graph_json, tensor_infos, seed)
     num_pages = _paged_metadata(graph_json) if page_tables else 0

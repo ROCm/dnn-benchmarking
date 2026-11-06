@@ -553,7 +553,6 @@ def run_single_provider_engine(
                     variant_pack=variant_pack,
                     tensor_infos=ctx.tensor_infos,
                     reference_outputs=ctx.reference_outputs,
-                    graph_json=ctx.graph_json,
                 )
         # Release both workspaces before the profiling child allocates its own
         # VRAM; holding them roughly doubles peak VRAM on large graphs.
@@ -600,7 +599,6 @@ def _validate_row(
             ctx.reference_outputs,
             config.validation.provider.value,
             config,
-            ctx.graph_json,
         )
     elif ctx.validation_skip_reason is not None:
         row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)

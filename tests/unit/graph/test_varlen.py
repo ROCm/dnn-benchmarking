@@ -11,7 +11,10 @@ import pytest
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.graph import TensorInfo
 from dnn_benchmarking.graph.varlen import (
+    check_ragged_shape,
     live_rows,
+    offset_spans,
+    ragged_token_capacity,
     resolve_varlen_layouts,
     sdpa_lengths,
     sdpa_operands,
@@ -403,3 +406,63 @@ def test_live_rows_is_the_half_open_range_of_rows_with_a_key(
     lq, lkv, causal, window, bottom_right, expected
 ) -> None:
     assert live_rows(lq, lkv, causal, window, bottom_right) == expected
+
+
+LABEL = "tensor 'q' (uid 1)"
+
+
+class TestRaggedHelpers:
+    """The shape, span and capacity rules the generator and resolver share."""
+
+    def test_a_rank_4_shape_with_a_positive_sequence_stride_passes(self) -> None:
+        assert check_ragged_shape(DIMS, TOKEN_MAJOR, LABEL) is None
+
+    @pytest.mark.parametrize(
+        "dims, strides",
+        [([2, 4, 3], [12, 3, 1]), (DIMS, [24, 3, 0, 1])],
+        ids=["rank_3", "zero_sequence_stride"],
+    )
+    def test_a_bad_shape_is_refused_naming_the_tensor(self, dims, strides) -> None:
+        with pytest.raises(UnsupportedGraphError, match="'q'"):
+            check_ragged_shape(dims, strides, LABEL)
+
+    def test_the_error_argument_selects_the_raised_type(self) -> None:
+        with pytest.raises(ValueError, match="'q'"):
+            check_ragged_shape([2, 4, 3], [12, 3, 1], LABEL, ValueError)
+
+    @pytest.mark.parametrize(
+        "offsets, multiplier, seq_stride, expected",
+        [
+            # Element units: 4 * 6 / 3 and 6 * 6 / 3 tokens.
+            ([0, 4, 10], 6, 3, [8, 12]),
+            # Token units: the multiplier is the token stride.
+            ([0, 2, 5], 3, 3, [2, 3]),
+        ],
+    )
+    def test_offset_spans_count_tokens_per_batch(
+        self, offsets, multiplier, seq_stride, expected
+    ) -> None:
+        assert offset_spans(offsets, multiplier, seq_stride, LABEL) == expected
+
+    @pytest.mark.parametrize("multiplier", [0, -1])
+    def test_offset_spans_refuse_a_multiplier_below_one(self, multiplier) -> None:
+        with pytest.raises(UnsupportedGraphError, match="'q'"):
+            offset_spans([0, 3, 6], multiplier, 3, LABEL)
+
+    def test_offset_spans_refuse_a_partial_sequence_stride(self) -> None:
+        with pytest.raises(UnsupportedGraphError, match="'q'"):
+            offset_spans([0, 1], 1, 3, LABEL)
+
+    @pytest.mark.parametrize(
+        "strides, expected",
+        [
+            (TOKEN_MAJOR, None),
+            # Head-major over 6 tokens: [0, T*D, D, 1].
+            ([0, 18, 3, 1], 6),
+            # Axes 1 and 3 both outer: 30 // 3 = 10 and 12 // 3 = 4 tokens.
+            ([0, 30, 3, 12], 4),
+        ],
+        ids=["token_major", "head_major", "two_outer_axes"],
+    )
+    def test_ragged_token_capacity(self, strides, expected) -> None:
+        assert ragged_token_capacity(DIMS, strides) == expected

@@ -666,8 +666,9 @@ def test_varlen_graph_reports_the_per_batch_flops_not_the_dense_count(fake):
 
 
 def test_varlen_sdpa_stats_with_matching_infinities_pass_validation(fake, monkeypatch):
-    """Dead rows hold -inf in the engine and the reference; the graph JSON
-    must reach the check so the stats output compares with matching infinities."""
+    """Dead rows hold -inf in the engine and the reference; the resolved tensor
+    infos must reach the check so the stats output compares with matching
+    infinities."""
     fake.discovered = [1]
     shape = (3, 1, 8)
     stats = np.full((*shape, 1), -np.inf, np.float32)

@@ -20,8 +20,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..common.exceptions import UnsupportedGraphError
-from ..graph.tensor_info import TensorInfo
-from ..graph.varlen import SdpaOperands, sdpa_operands
+from ..graph.loader import tensors_by_uid
+from ..graph.tensor_info import TensorInfo, ragged_fields, tensor_label
+from ..graph.varlen import (
+    SdpaOperands,
+    check_ragged_shape,
+    ragged_token_capacity,
+    sdpa_operands,
+)
 
 # Mixed into the seed so this stream is separate from the float draws.
 _STREAM = 0x3139
@@ -50,34 +56,22 @@ class _Side:
         if self.cu_uid is not None:
             tokens.append(("cu", self.cu_uid))
         for operand in self.operands:
-            offset_uid = _offset_uid(operand)
+            offset_uid = ragged_fields(operand)[0]
             if offset_uid is not None:
                 tokens.append(("off", offset_uid))
         return tokens
 
 
-def _uid(value: Any) -> Optional[int]:
-    return None if value is None else int(value)
+def _label(tensor: Dict[str, Any]) -> str:
+    return tensor_label(tensor["uid"], tensor.get("name"))
 
 
-def _offset_uid(tensor: Dict[str, Any]) -> Optional[int]:
-    return _uid(tensor.get("ragged_offset_tensor_uid"))
-
-
-def _multiplier(tensor: Dict[str, Any]) -> int:
-    value = tensor.get("ragged_offset_multiplier")
-    return 1 if value is None else int(value)
-
-
-def _describe(tensor: Dict[str, Any]) -> str:
-    return f"tensor '{tensor.get('name', '')}' (uid {tensor.get('uid')})"
-
-
-def _numel(dims: Sequence[int]) -> int:
-    result = 1
-    for dim in dims:
-        result *= int(dim)
-    return result
+def _shape(tensor: Dict[str, Any]) -> Tuple[List[int], List[int]]:
+    """Integer dims and strides of a tensor's JSON."""
+    return (
+        [int(d) for d in tensor.get("dims") or []],
+        [int(s) for s in tensor.get("strides") or []],
+    )
 
 
 class _Graph:
@@ -86,9 +80,7 @@ class _Graph:
     def __init__(
         self, graph_json: Dict[str, Any], tensor_infos: List[TensorInfo]
     ) -> None:
-        self.json = {
-            int(t["uid"]): t for t in graph_json.get("tensors", []) or [] if "uid" in t
-        }
+        self.json = tensors_by_uid(graph_json)
         # Only real, non-output inputs are generated here.
         self.infos = {
             t.uid: t
@@ -191,12 +183,12 @@ def _bound_paged(
     if dims[0] == 1 and (batch is None or batch > 1):
         query.mode = "partition"
         query.total_q = dims[2]
-        query.q_label = _describe(q_main)
+        query.q_label = _label(q_main)
         query.max_len = dims[2]
     else:
         query.max_len = dims[2]
         query.batch = query.batch or dims[0]
-    query.operands = [t for t in q_tensors if _offset_uid(t) is not None]
+    query.operands = [t for t in q_tensors if ragged_fields(t)[0] is not None]
 
 
 def _groups(sides: List[_Side]) -> List[List[_Side]]:
@@ -250,21 +242,6 @@ def _draw_partition(
     return np.diff(np.concatenate(([0], cuts, [total])))
 
 
-def _token_capacity(tensor: Dict[str, Any]) -> Optional[int]:
-    """Tokens a ragged tensor can hold in total. A head-major tensor stores
-    its token axis inside the head stride; a token-major tensor has no bound.
-    Axis 1 is head-major when its stride is at least the sequence stride."""
-    dims, strides = tensor["dims"], tensor["strides"]
-    seq_stride = int(strides[2])
-    capacities = [
-        int(strides[i]) // seq_stride
-        for i in (1, 3)
-        if int(dims[i]) > 1
-        and (int(strides[i]) >= seq_stride if i == 1 else int(strides[i]) > seq_stride)
-    ]
-    return min(capacities) if capacities else None
-
-
 def _ranges(lengths: np.ndarray, gaps: np.ndarray, align: int) -> np.ndarray:
     """Token range of each batch: its length and gap, rounded up to ``align``."""
     return -(-(lengths + gaps) // align) * align
@@ -277,17 +254,17 @@ def _token_alignment(tables: Dict[int, List[Dict[str, Any]]], max_len: int) -> i
     align = 1
     for uid, tensors in tables.items():
         for tensor in tensors:
-            multiplier = _multiplier(tensor)
+            multiplier = ragged_fields(tensor)[1]
             if multiplier <= 0:
                 raise UnsupportedGraphError(
-                    f"{_describe(tensor)} has ragged_offset_multiplier "
+                    f"{_label(tensor)} has ragged_offset_multiplier "
                     f"{multiplier}, which must be positive"
                 )
             stride = int(tensor["strides"][2])
             align = math.lcm(align, multiplier // math.gcd(multiplier, stride))
             if align > max_len:
                 raise UnsupportedGraphError(
-                    f"{_describe(tensor)}: ragged_offset_multiplier {multiplier} "
+                    f"{_label(tensor)}: ragged_offset_multiplier {multiplier} "
                     f"with token stride {stride} needs every start of offset "
                     f"table (uid {uid}) to be a multiple of {align} tokens, but "
                     f"a sequence holds {max_len}"
@@ -335,7 +312,7 @@ def _fit(
     blocks_capacity = capacity // align
     if len(lengths) > blocks_capacity:
         raise UnsupportedGraphError(
-            f"{_describe(limiter)} holds {capacity} tokens, fewer than the "
+            f"{_label(limiter)} holds {capacity} tokens, fewer than the "
             f"{len(lengths)} batches that each need {align}"
         )
     if int(_ranges(lengths, gaps, align).sum()) <= capacity:
@@ -364,16 +341,16 @@ def _fit(
 def _fill(info: TensorInfo, values: Sequence[int], what: str) -> np.ndarray:
     if info.num_elements != len(values):
         raise UnsupportedGraphError(
-            f"tensor '{info.name}' (uid {info.uid}) has {info.num_elements} "
-            f"elements, but {what} needs {len(values)}"
+            f"{info.label} has {info.num_elements} elements, but {what} needs "
+            f"{len(values)}"
         )
     dtype = np.dtype(info.dtype.numpy)
     if dtype.kind in "iu" and len(values):
         limits = np.iinfo(dtype)
         if min(values) < limits.min or max(values) > limits.max:
             raise UnsupportedGraphError(
-                f"tensor '{info.name}' (uid {info.uid}) is {dtype.name}, which "
-                f"holds {limits.min}..{limits.max}, but {what} needs "
+                f"{info.label} is {dtype.name}, which holds "
+                f"{limits.min}..{limits.max}, but {what} needs "
                 f"{min(values)}..{max(values)}"
             )
     return np.asarray(values, dtype=dtype).reshape(info.dims)
@@ -393,21 +370,17 @@ def _batch_count(group: List[_Side], graph: _Graph) -> int:
             if not dims:
                 continue
             if token_kind == "seq":
-                return _numel(dims)
-            return _numel(dims) - 1
-    names = ", ".join(
-        (
-            _describe(graph.json[uid])
-            if uid in graph.json
-            else (
-                f"tensor '{graph.infos[uid].name}' (uid {uid})"
-                if uid in graph.infos
-                else f"tensor (uid {uid})"
-            )
-        )
-        for side in group
-        for _, uid in side.tokens()
-    )
+                return math.prod(dims)
+            return math.prod(dims) - 1
+
+    def label(uid: int) -> str:
+        if uid in graph.json:
+            return _label(graph.json[uid])
+        if uid in graph.infos:
+            return graph.infos[uid].label
+        return f"tensor (uid {uid})"
+
+    names = ", ".join(label(uid) for side in group for _, uid in side.tokens())
     raise UnsupportedGraphError(
         f"a variable-length SDPA group has no batch count; its tensors are "
         f"{names or 'none'}"
@@ -422,19 +395,10 @@ def _generate_group(
     tables: Dict[int, List[Dict[str, Any]]] = {}
     for side in group:
         for tensor in side.operands:
-            uid = _offset_uid(tensor)
+            uid = ragged_fields(tensor)[0]
             if uid is None:
                 continue
-            if len(tensor.get("dims", [])) != 4:
-                raise UnsupportedGraphError(
-                    f"{_describe(tensor)} is ragged and must have 4 dims, "
-                    f"has {len(tensor.get('dims', []))}"
-                )
-            if len(tensor.get("strides", [])) != 4 or int(tensor["strides"][2]) <= 0:
-                raise UnsupportedGraphError(
-                    f"{_describe(tensor)} is ragged and needs 4 strides with a "
-                    f"positive sequence stride, has {tensor.get('strides')}"
-                )
+            check_ragged_shape(*_shape(tensor), _label(tensor))
             if tensor not in tables.setdefault(uid, []):
                 tables[uid].append(tensor)
 
@@ -477,7 +441,7 @@ def _generate_group(
         keep_gap = batch > 1 and bool(seq_uids or cu_uids)
         for tensors in tables.values():
             for tensor in tensors:
-                capacity = _token_capacity(tensor)
+                capacity = ragged_token_capacity(*_shape(tensor))
                 if capacity is not None:
                     lengths, gaps = _fit(
                         lengths, gaps, capacity, tensor, align, limit, keep_gap, rng
@@ -519,10 +483,10 @@ def _offset_table(
     so the division is exact."""
     values: Optional[np.ndarray] = None
     for tensor in tensors:
-        scaled = starts * int(tensor["strides"][2]) // _multiplier(tensor)
+        scaled = starts * int(tensor["strides"][2]) // ragged_fields(tensor)[1]
         if values is not None and not np.array_equal(values, scaled):
             raise UnsupportedGraphError(
-                f"{_describe(tensor)} reads offset table '{info.name}' "
+                f"{_label(tensor)} reads offset table '{info.name}' "
                 f"(uid {info.uid}) as different values than another tensor "
                 "that shares it"
             )

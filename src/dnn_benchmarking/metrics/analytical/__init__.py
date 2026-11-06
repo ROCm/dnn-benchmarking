@@ -62,11 +62,11 @@ rather than a partial count, and a one-shot warning names the unknown type
 via :mod:`.._diagnostic.warn_once`.
 """
 
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-import numpy as np
+from functools import partial
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ...graph.tensor_info import TensorInfo
+from ...graph.varlen import read_input_ints
 from .._diagnostic import warn_once
 from ._common import tensor_lookup
 from .conv import conv_dgrad_flops, conv_fwd_flops, conv_wgrad_flops
@@ -130,8 +130,9 @@ _FLOP_HANDLERS = {
 }
 
 
-# Handlers that take the live lengths of a variable-length node.
-_LENGTH_AWARE = frozenset({sdpa_fwd_flops, sdpa_bwd_flops})
+# Handlers that also take ``read_ints``, the reader of the live lengths of a
+# variable-length node; compute_flops binds it when it has input data.
+_LENGTH_READERS = ("SdpaAttributes", "SdpaBackwardAttributes")
 
 
 def compute_flops(
@@ -155,26 +156,25 @@ def compute_flops(
         return None
 
     tensors_by_uid = tensor_lookup(graph_json)
-    read_ints: Optional[Callable[[int], List[int]]] = None
+    handlers = _FLOP_HANDLERS
     if input_data is not None:
-
-        def read_ints(uid: int) -> List[int]:
-            return [int(v) for v in np.asarray(input_data[uid]).reshape(-1)]
+        read_ints = partial(read_input_ints, input_data)
+        handlers = {
+            **handlers,
+            **{t: partial(handlers[t], read_ints=read_ints) for t in _LENGTH_READERS},
+        }
 
     total = 0
     for node in nodes:
         node_type = node.get("type", "")
-        handler = _FLOP_HANDLERS.get(node_type)
+        handler = handlers.get(node_type)
         if handler is None:
             warn_once(
                 "analytical",
                 f"unrecognised node type {node_type!r}; FLOPs unknown",
             )
             return None
-        if handler in _LENGTH_AWARE:
-            flops = handler(node, tensors_by_uid, read_ints)
-        else:
-            flops = handler(node, tensors_by_uid)
+        flops = handler(node, tensors_by_uid)
         if flops is None:
             return None
         total += flops
