@@ -121,6 +121,7 @@ class _SdpaPlan(NamedTuple):
     window: Optional[int]
     bottom_right: bool
     sink_uid: Optional[int]
+    alibi: bool
 
 
 def _plan_sdpa_common(
@@ -156,10 +157,8 @@ def _plan_sdpa_common(
         ]
     _sdpa_unsupported_if_present(node, unsupported)
 
-    if _sdpa_bool(node, "alibi_mask") or _sdpa_bool(node, "padding_mask"):
-        raise ValueError(
-            "SDPA alibi/padding masks are not supported by the PyTorch reference"
-        )
+    if _sdpa_bool(node, "padding_mask"):
+        raise ValueError("SDPA padding masks are not supported by the PyTorch reference")
 
     dropout_probability = _node_param(node, "dropout_probability", 0.0)
     dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
@@ -170,10 +169,21 @@ def _plan_sdpa_common(
 
     mask_uid = _optional_uid(node, "attn_mask_tensor_uid")
     is_causal, window, bottom_right = _sdpa_derive_mask(node)
-    if mask_uid is not None and (is_causal or window is not None or bottom_right):
-        raise ValueError(
-            "PyTorch SDPA reference does not support both attn_mask and causal_mask"
-        )
+    alibi = _sdpa_bool(node, "alibi_mask")
+    if alibi:
+        # The cuDNN ALiBi form is defined for top-left causal masking only.
+        if bottom_right:
+            raise ValueError(
+                "SDPA ALiBi does not support bottom-right causal alignment; "
+                "cuDNN's ALiBi form requires top-left causal masking"
+            )
+        if window is not None:
+            raise ValueError(
+                "SDPA ALiBi does not support a sliding window; "
+                "cuDNN's ALiBi form requires top-left causal masking"
+            )
+        if not is_causal:
+            raise ValueError("SDPA ALiBi requires top-left causal masking")
 
     scale_uid = _optional_uid(node, "scale_tensor_uid")
     attn_scale_value = _node_param(node, "attn_scale_value", None)
@@ -187,6 +197,7 @@ def _plan_sdpa_common(
         window=window,
         bottom_right=bottom_right,
         sink_uid=sink_uid,
+        alibi=alibi,
     )
 
 
@@ -280,31 +291,76 @@ def _diagonal_band_mask(
     return mask.masked_fill(~keep, float("-inf"))
 
 
+def _alibi_slopes(
+    num_heads: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """cuDNN's per-query-head ALiBi slopes (``get_alibi_slope``).
+
+    The geometric schedule covers the closest power of two below or at
+    ``num_heads``. Extra heads use the next power of two's odd-indexed
+    slopes, as cuDNN and common open-source ALiBi implementations do.
+    """
+    base = 1 << (num_heads.bit_length() - 1)
+    head = torch.arange(base, device=device, dtype=torch.float64)
+    exponents = -8.0 * (head + 1.0) / base
+    extra = num_heads - base
+    if extra > 0:
+        odd = torch.arange(extra, device=device, dtype=torch.float64)
+        exponents = torch.cat([exponents, -4.0 * (2.0 * odd + 1.0) / base])
+    return torch.pow(2.0, exponents).to(dtype=dtype)
+
+
+def _alibi_bias(
+    q_len: int,
+    kv_len: int,
+    num_heads: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """cuDNN's ALiBi bias ``(j - i) * slope(h)``, shaped ``[H, Sq, Skv]``.
+
+    ``i`` is the query position, ``j`` the key position, ``h`` the query
+    head. Broadcasts against scores shaped ``[..., H, Sq, Skv]``.
+    """
+    slopes = _alibi_slopes(num_heads, device, torch.float64)
+    q_idx = torch.arange(q_len, device=device, dtype=torch.float64).unsqueeze(-1)
+    k_idx = torch.arange(kv_len, device=device, dtype=torch.float64).unsqueeze(0)
+    return ((k_idx - q_idx) * slopes.reshape(-1, 1, 1)).to(dtype=dtype)
+
+
 def _attention_bounds(
     q_len: int,
     kv_len: int,
     window: Optional[int],
     bottom_right: bool,
+    extra_bias: Optional[torch.Tensor],
     is_causal: bool,
     like: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], bool]:
     """The ``(attn_mask, is_causal)`` pair that expresses a call's bounds.
+
+    ``extra_bias`` is the additive bias already summed by the caller (the
+    explicit ``attn_mask`` and the ALiBi bias). The bias goes onto the scores
+    first and the band second (SEM-006), so the band is added to the bias.
 
     torch's SDPA spells only top-left causal natively (``is_causal``). A window
     or a bottom-right alignment needs an additive band mask, unless the bounds
     equal something native: bottom-right causal with ``q_len == kv_len`` is
     top-left causal, and with ``q_len == 1`` (decode) every key is visible.
     Passing those natively keeps the fused kernels eligible, since Flash
-    rejects any ``attn_mask``.
+    rejects any ``attn_mask``. A bias always needs the band as a mask tensor.
     """
-    if window is None and not bottom_right:
-        return None, is_causal
-    if window is None:
-        if q_len == kv_len:
-            return None, True
-        if q_len == 1:
-            return None, False
-    mask = _diagonal_band_mask(
+    if extra_bias is None:
+        if window is None and not bottom_right:
+            return None, is_causal
+        if window is None:
+            if q_len == kv_len:
+                return None, True
+            if q_len == 1:
+                return None, False
+    elif window is None and not bottom_right and not is_causal:
+        return extra_bias, False
+    band = _diagonal_band_mask(
         q_len,
         kv_len,
         window,
@@ -312,7 +368,7 @@ def _attention_bounds(
         device=like.device,
         dtype=like.dtype,
     )
-    return mask, False
+    return (band if extra_bias is None else band + extra_bias), False
 
 
 def _sink_logits(sink: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
@@ -504,7 +560,7 @@ def _plan_paged_sdpa(
             v_seq = v_seq.unsqueeze(0)
         seq_q_len = int(q_seq.shape[-2])
         seq_mask, seq_causal = _attention_bounds(
-            seq_q_len, kv_len, window, bottom_right, is_causal, q
+            seq_q_len, kv_len, window, bottom_right, None, is_causal, q
         )
         if sink is not None:
             # Sinks run the manual fp32 attention: its operands replace K/V.
@@ -625,12 +681,12 @@ def _score_operands(
 
     For the score matmul of the manual paths (stats under math, sinks). These
     depend only on the inputs, so the benchmark path builds them once. A
-    causal mask becomes an additive ``-inf`` mask; ``attn_mask`` and
-    ``is_causal`` never come together (``_plan_sdpa_common``).
+    causal mask becomes an additive ``-inf`` band that is added to any
+    ``attn_mask`` bias.
     """
     mask = None if attn_mask is None else attn_mask.to(dtype=torch.float32)
     if is_causal:
-        mask = _diagonal_band_mask(
+        band = _diagonal_band_mask(
             q_len,
             int(k.shape[-2]),
             None,
@@ -638,6 +694,7 @@ def _score_operands(
             device=k.device,
             dtype=torch.float32,
         )
+        mask = band if mask is None else band + mask
     return _fp32_at_query_heads(k, rep_k).transpose(-2, -1), mask
 
 
@@ -780,6 +837,8 @@ def compile_sdpa(
     seq_len_q_uid = _optional_uid(node, "seq_len_q_tensor_uid")
     seq_len_kv_uid = _optional_uid(node, "seq_len_kv_tensor_uid")
     is_paged = page_table_k_uid is not None or page_table_v_uid is not None
+    if is_paged and plan.alibi:
+        raise UnsupportedGraphError("SDPA ALiBi is not supported with paged attention")
     if is_paged:
         if page_table_k_uid is None or page_table_v_uid is None:
             raise ValueError("Paged SDPA needs both K and V page tables")
@@ -836,15 +895,25 @@ def compile_sdpa(
         return attn_mask, scale, rep_k, rep_v, sink
 
     def bounds(q, k, attn_mask):
-        band, causal = _attention_bounds(
+        bias = attn_mask
+        if plan.alibi:
+            alibi = _alibi_bias(
+                int(q.shape[-2]),
+                int(k.shape[-2]),
+                int(q.shape[-3]),
+                q.device,
+                q.dtype,
+            )
+            bias = alibi if bias is None else bias + alibi
+        return _attention_bounds(
             int(q.shape[-2]),
             int(k.shape[-2]),
             plan.window,
             plan.bottom_right,
+            bias,
             is_causal,
             q,
         )
-        return (attn_mask if band is None else band), causal
 
     def prepare_sink(
         tensors: Dict[int, torch.Tensor],
@@ -1074,6 +1143,15 @@ def compile_sdpa_backward(
             plan.scale_uid,
             plan.attn_scale_value,
         )
+        if plan.alibi:
+            alibi = _alibi_bias(
+                int(q.shape[-2]),
+                int(k.shape[-2]),
+                int(q.shape[1]),
+                q.device,
+                torch.float32,
+            )
+            attn_mask = alibi if attn_mask is None else attn_mask + alibi
 
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")

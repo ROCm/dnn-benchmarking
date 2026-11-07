@@ -1352,18 +1352,36 @@ class TestPyTorchOpsNewHandlers:
                 node("paged", 2, 2, inputs={"page_table_k_tensor_uid": 5}),
                 node("bottom_right", 2, 2, causal_mask_bottom_right=True),
                 node("sink", 2, 2, inputs={"sink_token_tensor_uid": 6}),
+                node("alibi", 2, 2, causal_mask=True, alibi_mask=True),
+                node(
+                    "bias_causal",
+                    2,
+                    2,
+                    causal_mask=True,
+                    inputs={"attn_mask_tensor_uid": 7},
+                ),
             ],
         }
 
         warnings = pytorch_ops.get_reference_warnings(graph_json)
 
         flagged = {w.split(":")[0]: w for w in warnings}
-        assert set(flagged) == {"window", "hk_ne_hv", "paged", "bottom_right", "sink"}
+        assert set(flagged) == {
+            "window",
+            "hk_ne_hv",
+            "paged",
+            "bottom_right",
+            "sink",
+            "alibi",
+            "bias_causal",
+        }
         assert "sliding-window" in flagged["window"]
         assert "enable_gqa cannot express" in flagged["hk_ne_hv"]
         assert "paged SDPA" in flagged["paged"]
         assert "bottom-right" in flagged["bottom_right"]
         assert "attention-sink" in flagged["sink"]
+        assert "ALiBi" in flagged["alibi"]
+        assert "attn_mask combined with a causal mask" in flagged["bias_causal"]
 
     def test_builtin_rmsnorm_reference_has_no_warning_when_available(self) -> None:
         graph_json = {
