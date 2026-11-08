@@ -13,9 +13,11 @@ from dnn_benchmarking.graph.tensor_info import TensorInfo
 
 @pytest.fixture(autouse=True, params=["torch", "numpy"])
 def implementation(request, monkeypatch) -> None:
-    """Run every test with the PyTorch forward and with the NumPy fallback."""
+    """Run every test with the PyTorch forward (on the host, as unit tests use
+    no GPU) and with the NumPy fallback."""
     if request.param == "torch":
-        pytest.importorskip("torch")
+        torch = pytest.importorskip("torch")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     else:
         monkeypatch.setattr(sdpa_backward_inputs, "_torch", lambda: None)
 

@@ -2001,6 +2001,38 @@ class TestPyTorchSdpaBackendSelection:
         assert caught.value is failure
         assert preference == ["ck"]
 
+    def test_replayed_native_call_runs_under_rocm_preference(self) -> None:
+        """A fused backward replayed outside execute_selected_sdpa runs under
+        the selected ROCm Flash library and satisfies the strict selection."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops import _sdpa_backend
+
+        preference = ["aotriton"]
+
+        def fake_preference(value=None):
+            if value is None:
+                return preference[0]
+            preference[0] = value
+            return value
+
+        state = pytorch_ops.PyTorchSdpaBackendState(
+            PyTorchSdpaBackendName.FLASH,
+            "ck",
+        )
+        seen = []
+        with (
+            patch.object(
+                _sdpa_backend.torch_support, "is_rocm_build", return_value=True
+            ),
+            self._patch_rocm_preference(side_effect=fake_preference),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+        ):
+            with _sdpa_backend.native_sdpa_call():
+                seen.append(preference[0])
+
+        assert seen == ["ck"]
+        assert preference == ["aotriton"]
+
     def test_default_opens_no_selection_context(self) -> None:
         from torch.nn import attention
 

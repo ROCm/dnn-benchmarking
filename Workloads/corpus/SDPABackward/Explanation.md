@@ -72,9 +72,11 @@ lexical order and combines the `source` and `model` values of duplicates.
 
 ## Known limits
 
-- The variable-length graphs come from `microbench/aiter`. dnn-benchmarking
-  generates zero sequence lengths for them, as for their forward graphs, and
-  generates O and `stats` for the dense shape.
+- The variable-length graphs come from `microbench/aiter` (2,244) and
+  `microbench/aotriton` (5). dnn-benchmarking sets every sequence length to 1
+  for them, as for their forward graphs, so these rows measure a one-token
+  problem. It still generates O and `stats` for the dense shape. Variable
+  sequence length support is tracked in ALMIOPEN-3139.
 - The PyTorch reference does not support variable sequence lengths, so these
   graphs have no PyTorch row and no validation.
 - Decode shapes have no training use. They are kept because the collection

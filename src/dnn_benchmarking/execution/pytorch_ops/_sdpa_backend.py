@@ -176,15 +176,26 @@ def strict_sdpa_selection() -> Optional[PyTorchSdpaBackendName]:
     return state.selection
 
 
-def mark_native_sdpa_call() -> None:
-    """Record a native SDPA kernel call made outside ``execute_selected_sdpa``.
+@contextmanager
+def native_sdpa_call() -> Iterator[None]:
+    """Scope a native SDPA kernel call made outside ``execute_selected_sdpa``.
 
-    A backward replays the fused kernel its forward probe selected, so each
-    timed backward call counts as a native call of the selected category.
+    A backward replays the fused kernel its forward probe selected. PyTorch
+    reads the ROCm Flash preference on each call, so the call runs under the
+    selected preference. Each call counts as a native call of the selected
+    category.
     """
     state = _ACTIVE_SDPA_BACKEND.get()
-    if state is not None:
-        state._native_sdpa_executed = True
+    if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
+        with _SDPA_SELECTION_LOCK:
+            yield
+        return
+    with (
+        _SDPA_SELECTION_LOCK,
+        _prefer_rocm_fa_library(state.selection, state.rocm_fa_library),
+    ):
+        yield
+    state._native_sdpa_executed = True
 
 
 def _sdpa_kwargs(

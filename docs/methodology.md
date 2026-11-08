@@ -166,12 +166,15 @@ A timed iteration does one backward kernel call. For GQA and MQA graphs it
 also sums dK and dV over each head group, which is real backward work.
 
 - With the default selection, the backward kernel is the one the forward
-  dispatches to. If default dispatch chooses math, the row runs a manual fp32
-  backward formula and gets a warning.
+  dispatches to. If default dispatch chooses neither Flash nor
+  memory-efficient attention (math, or cuDNN on CUDA), the row runs a manual
+  fp32 backward formula and gets a warning.
 - `--pytorch-sdpa-backend flash` and `efficient` select that kernel. Flash
-  takes no mask tensor, so it fails sliding-window, bottom-right and
-  `attn_mask` graphs. `math`, `cudnn` and `overrideable` have no backward
-  kernel that reads saved stats, so the row is an error.
+  takes no mask tensor, so it fails sliding-window and `attn_mask` graphs, and
+  bottom-right causal graphs with `Sq > 1` and `Sq != Skv`. It also rejects
+  top-left causal graphs with `Sq != Skv`. `--pytorch-rocm-fa-library` applies
+  to the timed backward call too. The tool binds no backward for `math`,
+  `cudnn` and `overrideable`, so the row is an error.
 - The CPU reference (`--validate pytorch` on the host) uses the manual fp32
   formula of hipDNN's CPU reference.
 
@@ -350,8 +353,12 @@ device once. It does not use the timed loop, for two reasons:
 Before each child starts, the parent frees the engine buffers. The child thus
 has the same free VRAM as the timed run. Counter values come from this child,
 not from the timed loop. The child also launches input-fill kernels, and a
-graph can launch more than one kernel. Use `pmc.per_kernel[...].dispatches`
-and the kernel name to find the engine kernel.
+graph can launch more than one kernel. For an SDPA backward graph, the input
+fill includes the PyTorch attention forward that computes O and `stats` (see
+[SDPA backward inputs](#sdpa-backward-inputs)). Its matmul, `exp` and
+`logsumexp` kernels run on the GPU before the graph executes, and the
+profiler records them. Use `pmc.per_kernel[...].dispatches` and the kernel
+name to find the engine kernel.
 
 ## Parity with other harnesses
 

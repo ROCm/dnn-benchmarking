@@ -25,34 +25,15 @@ import numpy as np
 
 from ..graph.tensor_info import TensorInfo
 from ..metrics.analytical._common import node_param
+from ..metrics.analytical.sdpa import Band, sdpa_band
 
 #: Float32 elements of one score block (256 MiB).
 _SCORE_BLOCK_ELEMENTS = 1 << 26
-
-Band = Tuple[Optional[int], Optional[int], bool]
 
 
 def _uid(node: Dict[str, Any], key: str) -> Optional[int]:
     value = (node.get("inputs") or {}).get(key)
     return None if value is None else int(value)
-
-
-def _band(node: Dict[str, Any]) -> Band:
-    """``(left, right, bottom_right)``, resolved in hipDNN's order.
-
-    Row ``i`` keeps key ``j`` when ``i + off - left <= j <= i + off + right``,
-    with ``off = Skv - Sq`` for bottom-right alignment and ``0`` otherwise. A
-    ``None`` bound is unbounded. The deprecated causal flags win over the
-    bounds and the alignment.
-    """
-    if node_param(node, "causal_mask") is True:
-        return None, 0, False
-    if node_param(node, "causal_mask_bottom_right") is True:
-        return None, 0, True
-    left = int(node_param(node, "left_bound", -1))
-    right = int(node_param(node, "right_bound", -1))
-    bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
-    return (None if left < 0 else left), (None if right < 0 else right), bottom_right
 
 
 def _scale(node: Dict[str, Any], input_data: Dict[int, np.ndarray]) -> float:
@@ -228,6 +209,9 @@ def set_sdpa_backward_inputs(
         }
         if any(uids[name] not in input_data for name in ("q", "k", "v", "o", "stats")):
             continue
+        band = sdpa_band(node)
+        if band is None:
+            continue  # hipDNN rejects the mask, so no engine reads O or stats
         mask_uid = uids["attn_mask"]
         out, stats = attention_forward(
             input_data[uids["q"]],
@@ -235,7 +219,7 @@ def set_sdpa_backward_inputs(
             input_data[uids["v"]],
             _scale(node, input_data),
             None if mask_uid is None else input_data.get(mask_uid),
-            _band(node),
+            band,
         )
         for name, values in (("o", out), ("stats", stats)):
             info = infos[uids[name]]

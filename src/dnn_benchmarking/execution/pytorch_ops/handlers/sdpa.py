@@ -15,7 +15,7 @@ from .._sdpa_backend import (
     default_sdpa_avoids_math,
     execute_selected_sdpa,
     fused_logsumexp,
-    mark_native_sdpa_call,
+    native_sdpa_call,
     strict_sdpa_selection,
 )
 
@@ -1021,8 +1021,9 @@ def compile_sdpa(
 
 
 _MATH_BACKWARD_NOTE = (
-    "PyTorch SDPA: default dispatch chose the math backend, so the backward "
-    "runs as a manual fp32 flash-attention formula instead of a fused kernel"
+    "PyTorch SDPA: default dispatch chose neither the Flash nor the "
+    "memory-efficient kernel, so the backward runs as a manual fp32 "
+    "flash-attention formula instead of a fused kernel"
 )
 
 
@@ -1069,7 +1070,8 @@ def _prepare_fused_backward(
     hipDNN kernel reads them. K and V are expanded to the query head count
     here; the timed call sums dK and dV back over each head group.
 
-    Returns ``None`` when default dispatch chose no fused kernel (math).
+    Returns ``None`` when default dispatch chose neither Flash nor
+    memory-efficient attention.
     """
     k_op = k.repeat_interleave(rep_k, dim=-3) if rep_k > 1 else k
     v_op = v.repeat_interleave(rep_v, dim=-3) if rep_v > 1 else v
@@ -1131,7 +1133,7 @@ def _prepare_fused_backward(
     else:
         raise UnsupportedGraphError(
             f"PyTorch SDPA backward: the selected forward ran {name or 'no fused kernel'}, "
-            "which has no backward kernel that reads saved stats"
+            "whose backward this tool does not bind"
         )
 
     # The kernel's log-sum-exp layout ([B, H, Sq], padded on some backends),
@@ -1141,8 +1143,8 @@ def _prepare_fused_backward(
     del out, grad_fn, probe
 
     def call(do: torch.Tensor, o: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        mark_native_sdpa_call()
-        return kernel(do, o, lse)
+        with native_sdpa_call():
+            return kernel(do, o, lse)
 
     return _FusedBackward(call, rep_k, rep_v)
 

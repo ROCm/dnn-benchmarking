@@ -449,34 +449,36 @@ def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> 
 
 
 @pytest.mark.parametrize(
-    "q_heads, kv_heads, parameters",
+    "q_heads, kv_heads, q_len, parameters",
     [
-        (4, 4, {"causal_mask": True}),
-        (4, 2, {}),
-        (4, 4, {"left_bound": 15, "right_bound": 0}),
+        (4, 4, 96, {"causal_mask": True}),
+        (4, 4, 64, {"causal_mask": True}),
+        (4, 2, 96, {}),
+        (4, 4, 96, {"left_bound": 15, "right_bound": 0}),
     ],
-    ids=["causal", "gqa", "window"],
+    ids=["causal", "causal-sq-lt-skv", "gqa", "window"],
 )
 @pytest.mark.parametrize("backend", ["default", "flash", "efficient"])
 def test_sdpa_backward_fused_kernel_matches_host_formula(
-    torch_gpu, q_heads: int, kv_heads: int, parameters: dict, backend: str
+    torch_gpu, q_heads: int, kv_heads: int, q_len: int, parameters: dict, backend: str
 ) -> None:
     """The GPU row runs a fused backward kernel on the graph's O and stats.
-    Its gradients match the host formula on the same inputs."""
+    Its gradients match the host formula on the same inputs. Causal is
+    top-left, also with fewer queries than keys."""
     from dnn_benchmarking.execution import pytorch_ops
 
     torch = torch_gpu
     torch.manual_seed(0)
-    batch, length, dim, scale = 2, 96, 64, 0.125
-    q = torch.randn(batch, q_heads, length, dim)
-    k = torch.randn(batch, kv_heads, length, dim)
-    v = torch.randn(batch, kv_heads, length, dim)
-    do = torch.randn(batch, q_heads, length, dim)
-    keep = torch.ones(length, length, dtype=torch.bool).tril()
+    batch, kv_len, dim, scale = 2, 96, 64, 0.125
+    q = torch.randn(batch, q_heads, q_len, dim)
+    k = torch.randn(batch, kv_heads, kv_len, dim)
+    v = torch.randn(batch, kv_heads, kv_len, dim)
+    do = torch.randn(batch, q_heads, q_len, dim)
+    keep = torch.ones(q_len, kv_len, dtype=torch.bool)
+    if parameters:
+        keep = keep.tril()
     if "left_bound" in parameters:
-        keep &= ~torch.ones(length, length, dtype=torch.bool).tril(-16)
-    if not parameters:
-        keep = torch.ones(length, length, dtype=torch.bool)
+        keep &= ~torch.ones(q_len, kv_len, dtype=torch.bool).tril(-16)
     rep = q_heads // kv_heads
     scores = q @ k.repeat_interleave(rep, 1).transpose(-2, -1) * scale
     scores = scores.masked_fill(~keep, float("-inf"))
@@ -505,8 +507,9 @@ def test_sdpa_backward_fused_kernel_matches_host_formula(
 
     pytorch_ops.execute_graph(graph_json, host)
     state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName(backend))
-    if backend == "flash" and "left_bound" in parameters:
-        # Flash takes no mask, so a strict Flash selection cannot run a window.
+    if backend == "flash" and ("left_bound" in parameters or q_len != kv_len):
+        # Flash takes no mask, so a strict Flash selection cannot run a
+        # window, and it rejects is_causal when Sq != Skv.
         with pytest.raises(pytorch_ops.PyTorchSdpaBackendUnavailableError):
             with pytorch_ops.use_pytorch_sdpa_backend(state):
                 pytorch_ops.execute_graph(graph_json, device)
@@ -519,3 +522,58 @@ def test_sdpa_backward_fused_kernel_matches_host_formula(
         torch.testing.assert_close(
             device[uid].float().cpu(), host[uid], rtol=3e-2, atol=3e-2
         )
+
+
+@pytest.mark.parametrize(
+    "backend, kernel",
+    [
+        ("flash", "aten::_scaled_dot_product_flash_attention_backward"),
+        ("efficient", "aten::_scaled_dot_product_efficient_attention_backward"),
+    ],
+)
+def test_strict_sdpa_backward_row_times_only_the_backward_kernel(
+    torch_gpu, backend: str, kernel: str
+) -> None:
+    """A strict SDPA backward row is timed, and its forward probe runs once.
+
+    The timed iterations replay the backward kernel; a forward in them would
+    add to the PyTorch time and give a false hipDNN speedup.
+    """
+    torch = torch_gpu
+    torch.manual_seed(0)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                },
+                "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+                "parameters": {"attn_scale_value": 0.125, "causal_mask": True},
+            }
+        ]
+    }
+    shape = (2, 4, 128, 64)
+    tensors = {
+        uid: torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+    }
+    tensors[6] = torch.randn(shape[:-1] + (1,), device="cuda")
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName(backend)
+    )
+    executor.prepare()
+
+    profiler = torch.profiler
+    with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+        m = executor.benchmark(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert m.kernel_ms[0] > 0
+    assert ops["aten::scaled_dot_product_attention"] == 1, ops
+    assert ops[kernel] > POLICY.iters, ops

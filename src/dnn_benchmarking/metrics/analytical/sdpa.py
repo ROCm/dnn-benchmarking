@@ -40,6 +40,35 @@ from typing import Any, Dict, Optional, Tuple
 
 from ._common import node_param, node_tensor
 
+#: ``(left, right, bottom_right)``; a ``None`` bound is unbounded.
+Band = Tuple[Optional[int], Optional[int], bool]
+
+
+def sdpa_band(node: Dict[str, Any]) -> Optional[Band]:
+    """The node's diagonal band, resolved in the order of hipDNN's
+    ``extractDiagonalBandParams``.
+
+    Returns None for a mask hipDNN rejects: a bound below -1, or both
+    deprecated causal flags.
+    """
+    left = int(node_param(node, "left_bound", -1))
+    right = int(node_param(node, "right_bound", -1))
+    if left < -1 or right < -1:
+        return None
+    causal_top_left = node_param(node, "causal_mask") is True
+    causal_bottom_right = node_param(node, "causal_mask_bottom_right") is True
+    if causal_top_left and causal_bottom_right:
+        return None
+    if causal_top_left or causal_bottom_right:
+        left, right, bottom_right = -1, 0, causal_bottom_right
+    else:
+        bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
+    return (
+        (None if left == -1 else left),
+        (None if right == -1 else right),
+        bottom_right,
+    )
+
 
 def _nonmasked_pairs(
     q_seqlen: int,
@@ -66,7 +95,7 @@ def _attention_terms(
     """Return ``(batch * num_q_heads * P, head_dim_qk, head_dim_vo)``.
 
     Returns None when q/k/v tensor data is incomplete, or when the mask is
-    one hipDNN rejects (a bound below -1, or both deprecated causal flags).
+    one hipDNN rejects (see :func:`sdpa_band`).
     """
     q = node_tensor(node, "q_tensor_uid", tensors_by_uid)
     k = node_tensor(node, "k_tensor_uid", tensors_by_uid)
@@ -85,28 +114,10 @@ def _attention_terms(
     for d in q_dims[:-2]:
         rows *= int(d)
 
-    # Validate and resolve the mask in the order of hipDNN's
-    # extractDiagonalBandParams.
-    left = int(node_param(node, "left_bound", -1))
-    right = int(node_param(node, "right_bound", -1))
-    if left < -1 or right < -1:
+    band = sdpa_band(node)
+    if band is None:
         return None
-    causal_top_left = node_param(node, "causal_mask") is True
-    causal_bottom_right = node_param(node, "causal_mask_bottom_right") is True
-    if causal_top_left and causal_bottom_right:
-        return None
-    if causal_top_left or causal_bottom_right:
-        left, right, bottom_right = -1, 0, causal_bottom_right
-    else:
-        bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
-
-    pairs = _nonmasked_pairs(
-        q_seqlen,
-        kv_seqlen,
-        None if left == -1 else left,
-        None if right == -1 else right,
-        bottom_right,
-    )
+    pairs = _nonmasked_pairs(q_seqlen, kv_seqlen, *band)
     return rows * pairs, int(q_dims[-1]), int(v_dims[-1])
 
 

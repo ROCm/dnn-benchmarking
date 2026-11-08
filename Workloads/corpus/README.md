@@ -44,7 +44,7 @@ workload class across many representative models.
 |---|---|---|
 | `Convolution/` | 9,471 unique convolution geometries from 31 models | [Convolution corpus guide](Convolution/Explanation.md) |
 | `SDPA/` | 164 unique SDPA forward graphs from the rocKE Solera performance set | [SDPA corpus guide](SDPA/Explanation.md) |
-| `SDPABackward/` | 4,774 unique SDPA backward graphs, converted from every SDPA forward graph in `Workloads/` | [SDPA backward corpus guide](SDPABackward/Explanation.md) |
+| `SDPABackward/` | 4,774 unique SDPA backward graphs, converted from every dense SDPA forward graph in `Workloads/` | [SDPA backward corpus guide](SDPABackward/Explanation.md) |
 
 The convolution collection includes forward, backward-data, and
 backward-weight graphs. It covers 2-D, 3-D, audio, image, and video workloads.
