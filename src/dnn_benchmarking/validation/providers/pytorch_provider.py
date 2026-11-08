@@ -4,7 +4,7 @@
 """PyTorch reference provider for hipDNN graph validation.
 
 Computes reference outputs by parsing graph JSON and executing
-equivalent PyTorch operations on CPU.
+equivalent PyTorch operations on the host or on a GPU.
 """
 
 from math import prod
@@ -15,7 +15,7 @@ import numpy as np
 from ...common import torch_support
 from ...common.dtypes import get_dtype
 from ...common.exceptions import UnsupportedGraphError
-from ...config.benchmark_config import ReferenceProviderName
+from ...config.benchmark_config import ReferencePrecision, ReferenceProviderName
 from ...graph.loader import output_uids, tensor_data_type
 
 from ..reference_provider import (
@@ -111,22 +111,27 @@ def _sdpa_scratch_bytes(
     return block + expanded + band + sink_mask
 
 
-def estimate_reference_host_bytes(graph_json: Dict[str, Any]) -> int:
+def estimate_reference_host_bytes(
+    graph_json: Dict[str, Any],
+    precision: ReferencePrecision = ReferencePrecision.NATIVE,
+) -> int:
     """Estimate the host memory of the CPU reference, inputs excluded.
 
-    Each tensor counts once in its graph dtype and once as a float32 working
-    copy (most handlers compute in float32); each graph output adds its
-    float32 host copy; each SDPA node adds its scratch. The estimate ignores
-    that virtual tensors are freed after their last reader, so it is high.
+    Each tensor counts once in its graph dtype and once as a working copy:
+    float32 (most handlers compute in float32), or float64 for a float64
+    reference. Each graph output adds its host copy in the working dtype.
+    Each SDPA node adds its scratch. The estimate ignores that virtual
+    tensors are freed after their last reader, so it is high.
     """
+    work = 8 if precision is ReferencePrecision.FLOAT64 else 4
     tensors = _tensor_metadata(graph_json)
     outputs = output_uids(graph_json)
     total = 0
     for uid, tensor_json in tensors.items():
         numel = prod(_dims(tensor_json))
-        total += numel * (_element_size(tensor_json, graph_json) + 4)
+        total += numel * (_element_size(tensor_json, graph_json) + work)
         if uid in outputs and not tensor_json.get("virtual", False):
-            total += numel * 4
+            total += numel * work
     for node in graph_json.get("nodes", []):
         if str(node.get("type", "")).startswith("Sdpa"):
             total += _sdpa_scratch_bytes(node, tensors)
@@ -141,7 +146,7 @@ class PyTorchReferenceProvider(ReferenceProvider):
     to produce reference outputs for validation.
 
     Uses the shared operation handlers from pytorch_ops module, executing
-    on CPU tensors for reference computation.
+    on host tensors, or on a GPU when the caller names a device.
 
     Supported operations:
     - ConvolutionFwdAttributes: 2D convolution forward pass
@@ -192,20 +197,39 @@ class PyTorchReferenceProvider(ReferenceProvider):
         """
         return _get_pytorch_ops().get_unsupported_operations(graph_json)
 
-    def estimate_host_bytes(self, graph_json: Dict[str, Any]) -> Optional[int]:
+    def supports_float64(self, graph_json: Dict[str, Any]) -> bool:
+        """See :func:`pytorch_ops.float64_reference_supported`."""
+        return _get_pytorch_ops().float64_reference_supported(graph_json)
+
+    def estimate_host_bytes(
+        self,
+        graph_json: Dict[str, Any],
+        precision: ReferencePrecision = ReferencePrecision.NATIVE,
+    ) -> Optional[int]:
         """See :func:`estimate_reference_host_bytes`."""
-        return estimate_reference_host_bytes(graph_json)
+        return estimate_reference_host_bytes(graph_json, precision)
 
     def compute_reference(
         self,
         graph_json: Dict[str, Any],
         input_data: Dict[int, np.ndarray],
+        *,
+        precision: ReferencePrecision = ReferencePrecision.NATIVE,
+        device: Optional[str] = None,
     ) -> Dict[int, ReferenceOutput]:
-        """Compute reference outputs using PyTorch on CPU.
+        """Compute reference outputs using PyTorch.
+
+        ``FLOAT64`` rounds every input to its graph dtype, as the engine sees
+        it, and then widens it to float64 without loss. The graph then runs in
+        float64 and the outputs stay float64: a cast to fp16, bf16 or fp8
+        goes through float32 in torch and would round twice.
 
         Args:
             graph_json: The graph as a parsed JSON dictionary.
             input_data: Mapping of tensor UID to input numpy arrays.
+            precision: ``FLOAT64`` requires :meth:`supports_float64`.
+            device: Torch device to compute on; None is the host. GPU
+                outputs stay on the device (``ReferenceOutput.device_data``).
 
         Returns:
             Mapping of output tensor UID to ReferenceOutput.
@@ -229,9 +253,15 @@ class PyTorchReferenceProvider(ReferenceProvider):
                 f"Graph contains unsupported operations: {unsupported}. "
                 f"Supported: {list(self.supported_operations())}"
             )
+        float64 = ReferencePrecision(precision) is ReferencePrecision.FLOAT64
+        if float64 and not self.supports_float64(graph_json):
+            raise UnsupportedGraphError(
+                "The float64 reference supports only convolution graphs "
+                "(convolution and pointwise nodes)"
+            )
 
-        # Convert input data to torch tensors on CPU. When graph metadata names
-        # a dtype, force PyTorch to execute with that dtype; validating a BF16
+        # Convert input data to torch tensors. When graph metadata names a
+        # dtype, force PyTorch to execute with that dtype; validating a BF16
         # hipDNN graph against FP32 PyTorch math is a different computation.
         # from_numpy shares the caller's memory: no handler writes its inputs
         # in place (each stores a new tensor), so no defensive copy is made.
@@ -239,21 +269,39 @@ class PyTorchReferenceProvider(ReferenceProvider):
         tensors: Dict[int, torch.Tensor] = {}
         for uid, data in input_data.items():
             tensor = torch.from_numpy(data)
+            if device is not None:
+                tensor = tensor.to(device)
             data_type = tensor_data_type(tensor_json_by_uid.get(uid, {}), graph_json)
             if data_type is not None:
                 tensor = tensor.to(get_dtype(data_type).torch_dtype())
+            if float64 and tensor.is_floating_point():
+                tensor = tensor.to(torch.float64)
             tensors[uid] = tensor
 
-        # Execute graph using shared handlers (works on CPU tensors)
         _get_pytorch_ops().execute_graph(graph_json, tensors)
 
-        # NumPy has no bfloat16 or fp8, so those outputs are returned as the
-        # float32 values BufferManager also uses for comparison. Virtual
-        # (intermediate) tensors are not graph outputs and get no host copy.
+        # NumPy has no bfloat16 or fp8, so those host outputs are returned as
+        # the float32 values BufferManager also uses for comparison. Virtual
+        # (intermediate) tensors are not graph outputs and get no copy.
         from ...execution.pytorch_buffer_manager import host_numpy
 
+        label = ReferencePrecision.FLOAT64 if float64 else ReferencePrecision.NATIVE
+
+        def output(uid: int) -> ReferenceOutput:
+            tensor = tensors[uid]
+            if tensor.is_cuda:
+                return ReferenceOutput(
+                    data=None,
+                    tensor_uid=uid,
+                    device_data=tensor,
+                    precision=label.value,
+                )
+            return ReferenceOutput(
+                data=host_numpy(tensor), tensor_uid=uid, precision=label.value
+            )
+
         return {
-            uid: ReferenceOutput(data=host_numpy(tensors[uid]), tensor_uid=uid)
+            uid: output(uid)
             for uid in output_uids(graph_json)
             if uid in tensors
             and not tensor_json_by_uid.get(uid, {}).get("virtual", False)

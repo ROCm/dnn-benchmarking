@@ -18,6 +18,7 @@ from dnn_benchmarking.common.exceptions import ExecutionError, UnsupportedGraphE
 from dnn_benchmarking.config.benchmark_config import (
     MetricsConfig,
     PyTorchSdpaBackendName,
+    ReferencePrecision,
     SuiteConfig,
     TimingPolicy,
     ValidationConfig,
@@ -32,6 +33,7 @@ from dnn_benchmarking.reporting.suite_results import graph_id_for, oracle_speedu
 GRAPH = {"name": "g", "nodes": [], "tensors": []}
 PATH = Path("g.json")
 REF = np.arange(4, dtype=np.float32)
+NATIVE, FLOAT64 = ReferencePrecision.NATIVE, ReferencePrecision.FLOAT64
 
 
 def _tensor(uid, is_output):
@@ -279,14 +281,33 @@ def fake_torch(fake, monkeypatch):
             return REF.copy() if fake.torch_outputs_written else np.zeros_like(REF)
 
     class CpuReference:
-        estimated_bytes = 0
+        """``estimated_bytes`` by precision: an int sets both."""
 
-        def estimate_host_bytes(self, graph_json):
+        estimated_bytes = 0
+        float64 = False  # supports_float64
+        float64_error = None  # raised by a float64 compute
+        float64_output = REF.astype(np.float64)
+
+        def supports_float64(self, graph_json):
+            return self.float64
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
+            if isinstance(self.estimated_bytes, dict):
+                return self.estimated_bytes[precision]
             return self.estimated_bytes
 
-        def compute_reference(self, graph_json, input_data):
-            fake.events.append("cpu_reference")
-            return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+        def compute_reference(self, graph_json, input_data, *, precision, device):
+            if precision is NATIVE:
+                fake.events.append("cpu_reference")
+                return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+            fake.events.append(("float64_reference", device))
+            if self.float64_error is not None:
+                raise self.float64_error
+            return {
+                2: suite_runner.ReferenceOutput(
+                    data=self.float64_output.copy(), tensor_uid=2, precision="float64"
+                )
+            }
 
     fake.cpu_reference = CpuReference()
 
@@ -321,13 +342,13 @@ class _Handle:
 
 def _run(handle="default", **config):
     out = io.StringIO()
-    graph = suite_runner.run_graph_all_providers(
+    graph = suite_runner.run_graph(
         PATH,
         GRAPH,
         TENSORS,
         SuiteConfig(**config),
-        _Handle() if handle == "default" else handle,
         Reporter(out),
+        [suite_runner.hipdnn_planner(_Handle() if handle == "default" else handle)],
     )
     return graph, out.getvalue()
 
@@ -657,10 +678,13 @@ def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
     fake_torch, monkeypatch
 ):
     class FailingReference:
-        def estimate_host_bytes(self, graph_json):
+        def supports_float64(self, graph_json):
+            return False
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
             return 0
 
-        def compute_reference(self, graph_json, input_data):
+        def compute_reference(self, graph_json, input_data, **kwargs):
             raise RuntimeError("cpu reference exploded")
 
     monkeypatch.setattr(
@@ -741,6 +765,191 @@ def test_cpu_reference_runs_when_host_memory_cannot_be_judged(
     _, *engines = graph.results
     assert "cpu_reference" in fake_torch.events
     assert [e.verdict for e in engines] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize(
+    "supported, precision, verdict, used",
+    [
+        (True, "float64", "passed", "float64"),
+        (True, "native", "failed", "native"),
+        (False, "float64", "failed", "native"),
+    ],
+)
+def test_engines_compare_against_the_float64_reference_of_a_supported_graph(
+    fake_torch, supported, precision, verdict, used
+):
+    """The engine output equals the float64 reference and is 1.0 off the
+    native one, so the verdict shows which reference the engine met."""
+    fake_torch.discovered = [1]
+    fake_torch.cpu_reference.float64 = supported
+    fake_torch.cpu_reference.float64_output = (REF + 1.0).astype(np.float64)
+    fake_torch.engine_output = REF + 1.0
+
+    graph, _ = _run(
+        validation=ValidationConfig(provider="pytorch", precision=precision)
+    )
+
+    reference, engine = graph.results
+    assert engine.verdict == verdict
+    assert engine.ootb.correctness.reference_precision == used
+    float64_calls = [e for e in fake_torch.events if e[0] == "float64_reference"]
+    # After the timed GPU row, the float64 reference runs on the GPU.
+    assert float64_calls == (
+        [("float64_reference", "cuda")] if used == "float64" else []
+    )
+    assert not reference.warnings
+
+
+def test_failed_float64_reference_keeps_the_native_reference_with_a_note(fake_torch):
+    fake_torch.discovered = [1]
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.float64_error = RuntimeError("HIP out of memory")
+
+    graph, _ = _validate()
+
+    reference, engine = graph.results
+    assert (engine.verdict, engine.ootb.correctness.reference_precision) == (
+        "passed",
+        "native",
+    )
+    (note,) = reference.warnings
+    assert "HIP out of memory" in note
+
+
+@pytest.mark.parametrize("float64_fits", [True, False])
+def test_cpu_reference_is_float64_when_it_fits_in_host_memory(
+    fake_torch, monkeypatch, float64_fits
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.estimated_bytes = {
+        NATIVE: 1 << 30,
+        FLOAT64: (7 if float64_fits else 9) << 30,  # 80% of 10 GiB is the limit
+    }
+
+    graph, _ = _validate()
+
+    reference, *engines = graph.results
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+    used = {e.ootb.correctness.reference_precision for e in engines}
+    if float64_fits:
+        assert fake_torch.events.count(("float64_reference", None)) == 1
+        assert "cpu_reference" not in fake_torch.events
+        assert used == {"float64"}
+    else:
+        assert ("float64_reference", None) not in fake_torch.events
+        assert "cpu_reference" in fake_torch.events
+        assert used == {"native"}
+        assert any("host memory" in note for note in reference.warnings)
+
+
+def test_native_gpu_reference_is_freed_before_the_float64_cache_release(
+    fake_torch, monkeypatch
+):
+    """The cache release after the float64 pass must see the native outputs
+    already freed; otherwise their memory stays cached during the engine rows."""
+    import weakref
+
+    fake_torch.discovered = [1]
+    fake_torch.cpu_reference.float64 = True
+    native = []
+    run_row = suite_runner._run_pytorch_row
+
+    def tracked_row(ctx, role):
+        row, outputs = run_row(ctx, role)
+        native.extend(weakref.ref(o) for o in (outputs or {}).values())
+        return row, outputs
+
+    alive_at_release = []
+    monkeypatch.setattr(suite_runner, "_run_pytorch_row", tracked_row)
+    monkeypatch.setattr(
+        suite_runner,
+        "_release_torch_cache",
+        lambda: alive_at_release.append(sum(r() is not None for r in native)),
+    )
+
+    graph, _ = _validate()
+
+    assert native
+    assert graph.results[1].ootb.correctness.reference_precision == "float64"
+    # The last release (after the float64 pass) runs with no native output left.
+    assert alive_at_release[-1] == 0
+
+
+def test_failed_cpu_float64_reference_falls_back_to_the_native_cpu_reference(
+    fake_torch, monkeypatch
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.float64 = True
+    fake_torch.cpu_reference.float64_error = MemoryError("host allocation failed")
+    fake_torch.cpu_reference.estimated_bytes = 1 << 30
+
+    graph, _ = _validate()
+
+    reference, *engines = graph.results
+    assert ("float64_reference", None) in fake_torch.events
+    assert "cpu_reference" in fake_torch.events
+    assert [e.verdict for e in engines] == ["passed", "passed"]
+    assert {e.ootb.correctness.reference_precision for e in engines} == {"native"}
+    assert any("host allocation failed" in note for note in reference.warnings)
+
+
+@pytest.mark.parametrize("profiled", [False, True])
+def test_profiled_runs_keep_the_float64_reference_on_the_host(
+    fake_torch, monkeypatch, profiled
+):
+    """Profiled runs keep host-only references, as the timed row does."""
+    import torch
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
+    fake_torch.discovered = [1]
+    reference = fake_torch.cpu_reference
+    reference.float64 = True
+
+    def device_float64(graph_json, input_data, *, precision, device):
+        if precision is NATIVE:
+            return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
+        return {
+            2: suite_runner.ReferenceOutput(
+                data=None,
+                tensor_uid=2,
+                device_data=torch.from_numpy(REF.astype(np.float64)),
+                precision="float64",
+            )
+        }
+
+    monkeypatch.setattr(reference, "compute_reference", device_float64)
+    seen = []
+    check = suite_runner.check_correctness
+
+    def recording_check(bm, infos, refs, *args):
+        seen.extend(refs.values())
+        return check(bm, infos, refs, *args)
+
+    monkeypatch.setattr(suite_runner, "check_correctness", recording_check)
+    metrics = MetricsConfig(perf=True) if profiled else MetricsConfig()
+
+    graph, _ = _validate(metrics=metrics)
+
+    assert graph.results[1].verdict == "passed"
+    (ref,) = {id(r): r for r in seen}.values()
+    assert ref.precision == "float64"
+    if profiled:
+        assert ref.device_data is None
+        assert ref.data.dtype == np.float64
+    else:
+        assert ref.device_data is not None and ref.data is None
 
 
 def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
@@ -1126,12 +1335,13 @@ def test_reference_provider_is_usable_or_says_why_not(monkeypatch, provider, rea
 
 class TestPytorchRuntime:
     def _run(self, graph_json=GRAPH, **config):
-        return suite_runner.run_graph_pytorch(
+        return suite_runner.run_graph(
             PATH,
             graph_json,
             TENSORS,
             SuiteConfig(runtime="pytorch", **config),
             Reporter(io.StringIO()),
+            [suite_runner.pytorch_plan],
         )
 
     def test_single_timed_pytorch_row(self, fake_torch):
@@ -1213,3 +1423,211 @@ class TestPytorchRuntime:
 
         assert row.status == status
         assert "NotARealOp" in (row.error_message or row.skip_reason)
+
+
+def _run_with(other, **config):
+    """hipDNN plus a second runtime whose planner returns ``other``."""
+    graph = suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(**config),
+        Reporter(io.StringIO()),
+        [suite_runner.hipdnn_planner(_Handle()), lambda *args: other],
+    )
+    return graph
+
+
+def test_a_runtime_that_does_not_apply_leaves_the_graph_unchanged(fake):
+    fake.discovered = [1]
+    alone, _ = _run()
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", message="not an SDPA graph"))
+
+    assert (graph.status, graph.message, graph.error) == ("ok", None, None)
+    assert [(r.runtime, r.engine_id) for r in graph.results] == [
+        (r.runtime, r.engine_id) for r in alone.results
+    ]
+
+
+def test_runtimes_share_one_reference_and_append_in_order(fake_torch):
+    fake_torch.discovered = [1]
+    seen = []
+
+    def rows(ctx):
+        seen.append(ctx.reference_outputs is not None)
+        return [suite_runner.ProviderEngineResult("rocke", "rocke:k", "success")]
+
+    graph = _run_with(
+        suite_runner.RuntimePlan("rocke", [0], rows=rows, needs_inputs=True),
+        validation=ValidationConfig(provider="pytorch"),
+    )
+
+    assert [(r.runtime, r.role) for r in graph.results] == [
+        ("pytorch", "reference"),
+        ("hipdnn", "engine"),
+        ("rocke", "engine"),
+    ]
+    assert seen == [True]  # the second runtime checks against the same reference
+
+
+def test_no_runtime_applies_joins_the_labelled_reasons(fake):
+    fake.discover_error = UnsupportedGraphError("no hipDNN engine")
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", message="not an SDPA graph"))
+
+    assert graph.status == "no_engines"
+    assert graph.message == "hipdnn: no hipDNN engine; rocke: not an SDPA graph"
+
+
+def test_a_selection_error_keeps_the_other_runtime_rows(fake):
+    fake.discovered = [1]
+
+    graph = _run_with(suite_runner.RuntimePlan("rocke", error="catalog broke"))
+
+    assert (graph.status, graph.error) == ("error", "rocke: catalog broke")
+    assert [r.runtime for r in graph.results] == ["hipdnn"]
+
+
+@pytest.fixture
+def fake_rocke(fake_torch, monkeypatch):
+    """rocKE kernel selection and executor; rows validate against the
+    reference of ``fake_torch``. A kernel in ``wrong`` writes no output."""
+    from dnn_benchmarking.execution import rocke_executor
+
+    fake = fake_torch
+    fake.variants = [SimpleNamespace(name="rocke:a"), SimpleNamespace(name="rocke:b")]
+    fake.auto = SimpleNamespace(name="rocke:auto:k")
+    fake.wrong = set()
+
+    def auto_kernel(problem, arch, num_cus):
+        if isinstance(fake.auto, Exception):
+            raise fake.auto
+        return fake.auto
+
+    class RockeExecutor:
+        def __init__(self, kernel, problem, policy, loaded=None):
+            self.kernel, self.policy = kernel, policy
+            self.device = "cuda:0"
+            self.build_time_ms = 1.5
+
+        def prepare(self, tensors):
+            pass
+
+        def benchmark(self):
+            return _stall_aware(fake, self.kernel.name, self.policy)
+
+        def execute_once(self):
+            fake.torch_outputs_written = self.kernel.name not in fake.wrong
+
+    monkeypatch.setattr(suite_runner, "sdpa_problem", lambda graph, infos: "problem")
+    monkeypatch.setattr(
+        suite_runner, "catalog_kernels", lambda catalog, problem: list(fake.variants)
+    )
+    monkeypatch.setattr(suite_runner, "auto_kernel", auto_kernel)
+    monkeypatch.setattr(rocke_executor, "RockeExecutor", RockeExecutor)
+    return fake
+
+
+def _run_rocke(**config):
+    session = suite_runner.RockeSession(
+        catalog=(), arch="gfx950", num_cus=256, version="1.0"
+    )
+    return suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(validation=ValidationConfig(provider="pytorch"), **config),
+        Reporter(io.StringIO()),
+        [suite_runner.rocke_planner(session)],
+    )
+
+
+def test_rocke_rows_are_the_variants_then_the_auto_kernel(fake_rocke):
+    fake_rocke.wrong = {"rocke:b"}
+
+    graph = _run_rocke()
+
+    assert [(r.runtime, r.engine_name, r.role, r.verdict) for r in graph.results] == [
+        ("pytorch", "pytorch", "reference", "reference"),
+        ("rocke", "rocke:a", "engine", "passed"),
+        ("rocke", "rocke:b", "engine", "failed"),
+        ("rocke", "rocke:auto:k", "engine", "passed"),
+    ]
+    assert graph.results[1].engine_id == "rocke:a"
+    assert graph.results[1].ootb.cpu_build_time_ms == 1.5
+
+
+def test_rocke_without_a_variant_runs_the_auto_kernel_alone(fake_rocke):
+    fake_rocke.variants = []
+
+    graph = _run_rocke()
+
+    assert [r.engine_name for r in graph.results if r.role == "engine"] == [
+        "rocke:auto:k"
+    ]
+
+
+def test_rocke_without_any_kernel_names_both_reasons(fake_rocke):
+    fake_rocke.variants = []
+    fake_rocke.auto = UnsupportedGraphError("rocKE auto dispatch: causal-only")
+
+    graph = _run_rocke()
+
+    assert (graph.status, graph.results) == ("no_engines", [])
+    assert graph.message == (
+        "no hipDNN-shipped rocKE variant matches; rocKE auto dispatch: causal-only"
+    )
+
+
+def test_rocke_selection_failure_is_a_graph_error(fake_rocke, monkeypatch):
+    def broken(catalog, problem):
+        raise TypeError("unexpected keyword argument 'knob'")
+
+    monkeypatch.setattr(suite_runner, "catalog_kernels", broken)
+
+    graph = _run_rocke()
+
+    assert graph.status == "error"
+    assert graph.error == (
+        "rocKE kernel selection failed: TypeError: unexpected keyword argument 'knob'"
+    )
+
+
+@pytest.mark.parametrize(
+    "host_bytes, reference_error, verdict",
+    [
+        pytest.param(9 << 30, None, "unchecked", id="reference-too-large"),
+        pytest.param(0, "cpu reference exploded", "failed", id="reference-failed"),
+    ],
+)
+def test_rocke_rows_without_a_reference(
+    fake_rocke, monkeypatch, host_bytes, reference_error, verdict
+):
+    """A reference skipped for host memory leaves the rows unchecked, as for
+    hipDNN rows; any other missing reference fails them."""
+    import psutil
+
+    class Reference:
+        def supports_float64(self, graph_json):
+            return False
+
+        def estimate_host_bytes(self, graph_json, precision=NATIVE):
+            return host_bytes
+
+        def compute_reference(self, graph_json, input_data, **kwargs):
+            raise RuntimeError(reference_error)
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    monkeypatch.setattr(
+        suite_runner, "_reference_provider", lambda c, g: (Reference(), None)
+    )
+    fake_rocke.torch_error = ExecutionError("PyTorch GPU not available")
+
+    graph = _run_rocke()
+
+    engines = [r for r in graph.results if r.role == "engine"]
+    assert [e.verdict for e in engines] == [verdict] * 3
+    assert all(e.status == "success" for e in engines)

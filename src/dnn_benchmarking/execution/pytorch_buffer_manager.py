@@ -157,6 +157,17 @@ class PyTorchCudaBufferManager:
 
         return host_numpy(tensor)
 
+    def get_output_tensor(self, uid: int) -> Optional[torch.Tensor]:
+        """Return the CUDA output tensor for a device-side comparison.
+
+        Args:
+            uid: Tensor UID.
+
+        Returns:
+            The typed, strided CUDA tensor, or None if tensor not found.
+        """
+        return self._tensors.get(uid)
+
     def get_output_tensors(self) -> List[TensorInfo]:
         """Get list of output tensor infos.
 

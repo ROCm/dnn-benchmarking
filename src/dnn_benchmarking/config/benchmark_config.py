@@ -7,7 +7,7 @@ import argparse
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class ReferenceProviderName(str, Enum):
@@ -17,11 +17,69 @@ class ReferenceProviderName(str, Enum):
     PYTORCH = "pytorch"
 
 
+class ReferencePrecision(str, Enum):
+    """Arithmetic of the reference outputs.
+
+    ``float64`` computes convolution graphs in float64 from the same inputs.
+    ``native`` computes every graph in its own data types, with the same
+    library kernels as the engines under test.
+    """
+
+    FLOAT64 = "float64"
+    NATIVE = "native"
+
+
 class RuntimeName(str, Enum):
-    """Runtimes that execute the graph."""
+    """Runtimes that execute the graph, in the order a run executes them."""
 
     HIPDNN = "hipdnn"
     PYTORCH = "pytorch"
+    ROCKE = "rocke"
+
+
+#: Options that only some runtimes honour. An option is accepted when at least
+#: one selected runtime honours it, and it applies to that runtime's rows only.
+#: A new runtime adds one entry here.
+RUNTIME_OPTIONS: Dict[RuntimeName, frozenset] = {
+    RuntimeName.HIPDNN: frozenset(
+        {
+            "--engine",
+            "--pmc",
+            "--trace",
+            "--perf",
+            "--roofline",
+            "--autotune",
+            "--hipdnn-cache-dir",
+            "--oracle",
+            "--plugin-path",
+            "--validate pytorch",
+        }
+    ),
+    RuntimeName.PYTORCH: frozenset({"--oracle"}),
+    # --plugin-path locates the shipped rocKE descriptors.
+    RuntimeName.ROCKE: frozenset({"--plugin-path", "--validate pytorch"}),
+}
+
+
+def parse_runtimes(value: Any) -> Tuple[RuntimeName, ...]:
+    """Parse ``--runtime`` (one name or a comma list) into run order.
+
+    The order is :class:`RuntimeName` order, not the typed order: hipDNN
+    loads its HIP runtime before torch does, and its rows exist before a
+    later runtime can fault the process.
+    """
+    text = value.value if isinstance(value, RuntimeName) else str(value)
+    names = [part.strip() for part in text.split(",")]
+    try:
+        selected = {RuntimeName(name) for name in names}
+    except ValueError as e:
+        choices = ", ".join(r.value for r in RuntimeName)
+        raise ValueError(
+            f"must be one of: {choices}, or a comma list of them; got {text!r}"
+        ) from e
+    if len(selected) != len(names):
+        raise ValueError(f"lists a runtime twice: {text!r}")
+    return tuple(name for name in RuntimeName if name in selected)
 
 
 class PyTorchSdpaBackendName(str, Enum):
@@ -129,11 +187,14 @@ class ValidationConfig:
             is set, it is used for both; if neither is set, validation uses
             dtype-aware defaults.
         atol: Optional absolute tolerance override.
+        precision: Arithmetic of the reference for graphs that support
+            float64 (see ``pytorch_ops.float64_reference_supported``).
     """
 
     provider: ReferenceProviderName = ReferenceProviderName.NONE
     rtol: Optional[float] = None
     atol: Optional[float] = None
+    precision: ReferencePrecision = ReferencePrecision.FLOAT64
 
     def __post_init__(self) -> None:
         """Validate and normalize configuration values."""
@@ -141,6 +202,12 @@ class ValidationConfig:
             self.provider = ReferenceProviderName(self.provider)
         except ValueError as e:
             raise ValueError(_one_of("--validate", ReferenceProviderName)) from e
+        try:
+            self.precision = ReferencePrecision(self.precision)
+        except ValueError as e:
+            raise ValueError(
+                _one_of("--reference-precision", ReferencePrecision)
+            ) from e
         if self.rtol is not None and self.rtol < 0:
             raise ValueError("--rtol must be >= 0")
         if self.atol is not None and self.atol < 0:
@@ -304,9 +371,13 @@ class SuiteConfig:
             an isolated subprocess. Cannot be combined with ``autotune``.
         metrics: Metric collection configuration. Defaults to the always-on
             probes and no extra runs.
-        runtime: Runtime that executes the graph (``hipdnn`` runs discovered
-            engine plugins, ``pytorch`` runs the graph through the PyTorch executor as a single
-            engine row per graph).
+        runtime: Runtime, or comma list of runtimes, that executes each graph
+            (``hipdnn`` runs discovered engine plugins, ``pytorch`` runs the
+            graph through the PyTorch executor as a single engine row,
+            ``rocke`` launches rocKE kernels directly (SDPA forward today),
+            one row per kernel). Several runtimes add their rows to the same
+            graph. After ``__post_init__`` it holds the first runtime and
+            ``runtimes`` holds all of them.
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
@@ -322,6 +393,8 @@ class SuiteConfig:
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     plugin_paths: Optional[List[Path]] = None
+    #: One runtime name or a comma list (``hipdnn,rocke``). ``__post_init__``
+    #: sets ``runtimes`` from it and keeps the first of them here.
     runtime: RuntimeName = RuntimeName.HIPDNN
     pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
     pytorch_rocm_fa_library: Optional[str] = None
@@ -349,17 +422,22 @@ class SuiteConfig:
     compact_json: bool = False
     #: Timing loop policy built from the fields above in ``__post_init__``.
     timing_policy: TimingPolicy = field(init=False, repr=False)
+    #: Every selected runtime, in run order (see :func:`parse_runtimes`).
+    runtimes: Tuple[RuntimeName, ...] = field(init=False)
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "SuiteConfig":
         """Build a suite config from merged CLI/config-file arguments.
 
         ``args`` must hold every public option (``apply_config_file`` merges
-        the defaults). hipDNN runs without ``--plugin-path`` fall back to the
-        ROCm install's plugin directory.
+        the defaults). hipDNN and rocKE runs without ``--plugin-path`` fall
+        back to the ROCm install's plugin directory; rocKE reads the
+        hip-kernel-provider descriptors there.
         """
         plugin_paths = args.plugin_path
-        if plugin_paths is None and args.runtime != RuntimeName.PYTORCH:
+        if plugin_paths is None and parse_runtimes(args.runtime) != (
+            RuntimeName.PYTORCH,
+        ):
             from ..common.rocm_runtime import default_hipdnn_plugin_paths
 
             plugin_paths = default_hipdnn_plugin_paths()
@@ -386,7 +464,10 @@ class SuiteConfig:
                 profiling_timeout_s=args.profiling_timeout,
             ),
             validation=ValidationConfig(
-                provider=args.validate, rtol=args.rtol, atol=args.atol
+                provider=args.validate,
+                rtol=args.rtol,
+                atol=args.atol,
+                precision=args.reference_precision,
             ),
             plugin_paths=plugin_paths,
             runtime=args.runtime,
@@ -426,9 +507,10 @@ class SuiteConfig:
                         "--plugin-path entry count must be 1 or match --engine count"
                     )
         try:
-            self.runtime = RuntimeName(self.runtime)
+            self.runtimes = parse_runtimes(self.runtime)
         except ValueError as e:
-            raise ValueError(_one_of("--runtime", RuntimeName)) from e
+            raise ValueError(f"--runtime {e}") from e
+        self.runtime = self.runtimes[0]
         if self.oracle and self.autotune:
             # --autotune sets HIPDNN_FORCE_BENCHMARKING=1, which providers apply
             # over the knob, so the OOTB plan would be tuned too.
@@ -443,27 +525,35 @@ class SuiteConfig:
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
         )
-        if self.runtime is RuntimeName.PYTORCH:
-            rejected = [
-                ("--engine", self.engine_filter is not None),
-                ("--plugin-path", self.plugin_paths is not None),
-                (
-                    "--validate pytorch",
-                    self.validation.provider is ReferenceProviderName.PYTORCH,
-                ),
-                ("--pmc", self.metrics.pmc_set is not None),
-                ("--trace", self.metrics.trace),
-                ("--perf", self.metrics.perf),
-                ("--roofline", self.metrics.roofline),
-                ("--autotune", self.autotune),
-                ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
-            ]
-            flags = [flag for flag, present in rejected if present]
-            if flags:
-                raise ValueError(
-                    f"{', '.join(flags)} not supported with --runtime pytorch "
-                    "(hipDNN-only options)"
-                )
+        runtime_options = [
+            ("--engine", self.engine_filter is not None),
+            ("--pmc", self.metrics.pmc_set is not None),
+            ("--trace", self.metrics.trace),
+            ("--perf", self.metrics.perf),
+            ("--roofline", self.metrics.roofline),
+            ("--autotune", self.autotune),
+            ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
+            ("--oracle", self.oracle),
+            ("--plugin-path", self.plugin_paths is not None),
+            (
+                "--validate pytorch",
+                self.validation.provider is ReferenceProviderName.PYTORCH,
+            ),
+        ]
+        honoured = frozenset().union(*(RUNTIME_OPTIONS[r] for r in self.runtimes))
+        flags = [f for f, present in runtime_options if present and f not in honoured]
+        if (
+            RuntimeName.PYTORCH in self.runtimes
+            and self.validation.provider is ReferenceProviderName.PYTORCH
+        ):
+            # The reference row would time the same PyTorch graph again.
+            flags.append("--validate pytorch")
+        if flags:
+            names = ",".join(r.value for r in self.runtimes)
+            raise ValueError(
+                f"{', '.join(dict.fromkeys(flags))} not supported with "
+                f"--runtime {names}"
+            )
 
     @property
     def plugin_path(self) -> Optional[Path]:
