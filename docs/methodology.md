@@ -8,9 +8,11 @@ measures it. The code is `src/dnn_benchmarking/execution/timing.py`
 
 - The headline number is `kernel_med`: the median device time of one launch
   of the graph, in the table and in `ootb.kernel.median_ms`.
-- One loop implementation (`timing.measure`) times hipDNN engines and the
-  PyTorch runtime. The two runtimes get the same warmup, stop rule, cache
-  mode and statistics.
+- One loop implementation (`timing.measure`) times hipDNN engines, the
+  PyTorch runtime and the rocKE runtime. The runtimes get the same warmup,
+  stop rule, cache mode and statistics. rocKE rows launch with
+  `rocke.runtime.no_fence`, because a fenced rocKE launch synchronizes the
+  host after each call.
 - Each plan records how it was measured in `timing`: mode, timer,
   cache mode, warmup count, first-call cost, cap and fallback reason.
 - TFLOP/s and GB/s use the median. The tool reports the spread (IQR, CV) and
@@ -341,6 +343,10 @@ This table compares the tool with the rocKE runtime timer
 with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 `triton.testing.do_bench`).
 
+`--runtime rocke` does not use `time_launches`. It times rocKE launches with
+`timing.measure`, so rocKE rows and hipDNN rows use the same protocol. With
+`--timing-block N`, the protocol is the block protocol in the table.
+
 | Feature | dnn-benchmarking | rocKE | PyTorch / Triton |
 |---|---|---|---|
 | Warmup | Fixed count (default 10) through the timed path, first call timed separately; per sample in block mode | Fixed count (default 5) per sample | do_bench: 25 ms time budget. Timer: block-size estimate. |
@@ -426,10 +432,12 @@ a change.
 
 The tool does not do these things yet:
 
-- Independent fp32 reference. `--validate pytorch` computes the reference in
-  the dtype of the graph. For fp16 and bf16 graphs the reference then has the
-  same precision as the result under test, and the tolerances must be loose.
-  An fp32 reference needs new tolerances for all workloads.
+- Float64 reference for all operations. `--validate pytorch` computes the
+  reference of convolution graphs (convolution and pointwise nodes) in
+  float64. See [Reference precision](usage.md#reference-precision). Other
+  graphs (matmul, normalization, SDPA) still use the graph data types, so
+  for fp16 and bf16 the reference has the same precision as the result under
+  test, and the tolerances must be loose.
 - SDPA reference for every mask. The PyTorch reference supports top-left and
   bottom-right causal bands, bounded left windows with `right_bound = 0`, and
   attention-sink logits. It follows hipDNN precedence: the deprecated causal
