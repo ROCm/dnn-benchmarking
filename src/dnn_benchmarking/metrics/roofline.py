@@ -29,22 +29,17 @@ against the workload directory we record in
 ``extra_metrics["roofline"]["workload_path"]``.
 """
 
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
-from ._artifact_paths import DEFAULT_PROFILING_TIMEOUT_S, find_first
+from ._artifact_paths import find_first
 from ._diagnostic import warn_once
-from ._subprocess import run_capped
+from ._subprocess import run_tool
 from ._tool_resolver import resolve_rocm_tool
 
 
-def _build_argv(
-    workload_dir: Path,
-    inner_argv: List[str],
-    rocprof_compute_binary: str,
-) -> List[str]:
-    """Build the ``profile --roof-only`` command line.
+def _build_argv(workload_dir: Path, inner_argv: List[str]) -> List[str]:
+    """Build the ``profile --roof-only`` arguments (without the binary).
 
     ``-p`` must stay a directory we own outright. rocprof-compute 3.3.0
     clears the whole ``-p`` root, not just ``-p/-n``: measured with a
@@ -54,7 +49,6 @@ def _build_argv(
     ``-p`` at a shared parent would take the pmc db and traces with it.
     """
     return [
-        rocprof_compute_binary,
         "profile",
         "--roof-only",
         "-n",
@@ -69,7 +63,8 @@ def _build_argv(
 def run(
     inner_argv: List[str],
     out_dir: Path,
-    timeout_s: int = DEFAULT_PROFILING_TIMEOUT_S,
+    timeout_s: int,
+    context: str,
 ) -> Dict[str, Any]:
     """Run rocprof-compute --roof-only and record the artefact paths.
 
@@ -78,49 +73,17 @@ def run(
     PDF and no SQLite. The PDF/HTML is rendered later by a separate
     ``rocprof-compute analyze --path <workload_dir> [--roofline-data-type
     DTYPE]`` run, which the user is expected to run themselves against
-    the ``workload_path`` we record.
+    the ``workload_path`` we record. Replay fires the workload ~3 times.
     """
-    binary = resolve_rocm_tool("rocprof-compute")
-    if binary is None:
-        warn_once(
-            "roofline",
-            "rocprof-compute binary not found; skipping roofline",
-        )
-        return {"roofline": {"skipped": "rocprof-compute binary not found"}}
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    workload_dir = out_dir / "workload"
-    argv = _build_argv(workload_dir, inner_argv, binary)
-
-    subprocess_timeout = timeout_s or None
-    try:
-        proc = run_capped(argv, subprocess_timeout)
-    except subprocess.TimeoutExpired:
-        warn_once(
-            "roofline",
-            f"rocprof-compute timed out after {subprocess_timeout}s — roofline "
-            "replay fires the workload ~3 times; raise --profiling-timeout "
-            "for slow workloads",
-        )
-        return {
-            "roofline": {
-                "skipped": f"rocprof-compute timed out after {subprocess_timeout}s"
-            }
-        }
-    except (OSError, subprocess.SubprocessError) as e:
-        warn_once("roofline", f"rocprof-compute invocation failed: {e}")
-        return {"roofline": {"skipped": f"rocprof-compute invocation failed: {e}"}}
-
-    result: Dict[str, Any] = {}
-    if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-40:])
-        warn_once(
-            "roofline",
-            f"rocprof-compute exited {proc.returncode}; "
-            "see extra_metrics['roofline']['error_tail']",
-        )
-        result["returncode"] = proc.returncode
-        result["error_tail"] = tail
+    _, result = run_tool(
+        "roofline",
+        resolve_rocm_tool("rocprof-compute"),
+        _build_argv(out_dir / "workload", inner_argv),
+        out_dir,
+        timeout_s,
+        context,
+    )
+    if result:
         return {"roofline": result}
 
     # roofline.csv carries the empirical HBM/compute ceilings — the

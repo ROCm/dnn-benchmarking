@@ -9,7 +9,9 @@ enabling validation of GPU execution against known-correct implementations.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, Optional, Type
+
+from ..config.benchmark_config import ReferencePrecision
 
 if TYPE_CHECKING:
     import numpy as np
@@ -19,15 +21,34 @@ if TYPE_CHECKING:
 class ReferenceOutput:
     """Output from a reference provider for a single tensor.
 
+    At least one of ``data`` and ``device_data`` is set.
+
     Attributes:
-        data: The computed output data as numpy array.
+        data: The computed output data as numpy array, or None when only
+            ``device_data`` holds the values (see :meth:`host_data`).
         tensor_uid: UID of the tensor in the graph.
-        metadata: Optional provider-specific metadata.
+        device_data: Same logical values as ``data`` as a torch GPU tensor,
+            or None when only host data exists.
+        precision: Arithmetic of the values: ``float64`` (float64 values of
+            a float64 computation) or ``native`` (the graph data types).
     """
 
-    data: "np.ndarray"
+    data: Optional["np.ndarray"]
     tensor_uid: int
-    metadata: Optional[Dict[str, Any]] = None
+    device_data: Optional[Any] = None
+    precision: str = ReferencePrecision.NATIVE.value
+
+    def host_data(self) -> "np.ndarray":
+        """Return the values as a dense host array in the validation representation.
+
+        A device-only reference is copied to the host on each call and the
+        copy is not kept, so the host holds it only during one comparison.
+        """
+        if self.data is not None:
+            return self.data
+        from ..execution.pytorch_buffer_manager import host_numpy
+
+        return host_numpy(self.device_data)
 
 
 class ReferenceProvider(ABC):
@@ -57,12 +78,18 @@ class ReferenceProvider(ABC):
         self,
         graph_json: Dict[str, Any],
         input_data: Dict[int, "np.ndarray"],
+        *,
+        precision: ReferencePrecision = ReferencePrecision.NATIVE,
+        device: Optional[str] = None,
     ) -> Dict[int, ReferenceOutput]:
         """Compute reference outputs for given graph and inputs.
 
         Args:
             graph_json: The graph as a parsed JSON dictionary.
             input_data: Mapping of tensor UID to input numpy arrays.
+            precision: ``FLOAT64`` requires :meth:`supports_float64`.
+            device: Device to compute on; None is the host. Outputs computed
+                on a GPU stay there (``ReferenceOutput.device_data``).
 
         Returns:
             Mapping of output tensor UID to ReferenceOutput.
@@ -84,6 +111,23 @@ class ReferenceProvider(ABC):
             True if all operations are supported.
         """
         return True  # Default: assume supported, let compute_reference fail if not
+
+    def supports_float64(self, graph_json: Dict[str, Any]) -> bool:
+        """True when ``compute_reference`` can compute this graph in float64."""
+        return False
+
+    def estimate_host_bytes(
+        self,
+        graph_json: Dict[str, Any],
+        precision: ReferencePrecision = ReferencePrecision.NATIVE,
+    ) -> Optional[int]:
+        """Estimate the host memory ``compute_reference`` needs beyond its inputs.
+
+        Returns:
+            Bytes, or None when the provider has no estimate (the caller then
+            runs the reference without a memory check).
+        """
+        return None
 
 
 class ReferenceProviderRegistry:
@@ -136,28 +180,3 @@ class ReferenceProviderRegistry:
                 f"Unknown reference provider: '{name}'. Available: {available}"
             )
         return cls._providers[name](**kwargs)
-
-    @classmethod
-    def list_registered(cls) -> List[str]:
-        """List names of all registered providers."""
-        return list(cls._providers.keys())
-
-    @classmethod
-    def list_available(cls) -> List[str]:
-        """List names of providers that are currently usable.
-
-        Checks is_available() on each registered provider.
-
-        Returns:
-            List of provider names where is_available() returns True.
-        """
-        available = []
-        for name, provider_cls in cls._providers.items():
-            try:
-                instance = provider_cls()
-                if instance.is_available():
-                    available.append(name)
-            except Exception:
-                # Provider failed to instantiate, not available
-                pass
-        return available

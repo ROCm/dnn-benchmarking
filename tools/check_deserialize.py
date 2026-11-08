@@ -10,7 +10,7 @@ Levels:
 Usage:
   python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
 """
-import argparse, glob, json, os, sys
+import argparse, glob, os, sys
 from pathlib import Path
 
 
@@ -50,7 +50,7 @@ def main():
             import hipdnn_frontend as hipdnn
         except ImportError:
             print(
-                "hipdnn_frontend not importable; build hipDNN (setup.sh) first.",
+                "hipdnn_frontend not importable; build hipDNN (setup_env.py) first.",
                 file=sys.stderr,
             )
             return 3

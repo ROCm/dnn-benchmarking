@@ -44,3 +44,30 @@ def output_elements(
     if not tensor:
         return None
     return tensor_dim_product(tensor)
+
+
+def node_param(node: Dict[str, Any], key: str, default: Any = None) -> Any:
+    """Read a node attribute wherever the graph producer put it.
+
+    hipDNN's JSON writers disagree: SDPA forward nests attributes under
+    ``attributes``, SDPA backward and convolution under ``parameters``, and
+    other nodes place them at the top level. An explicit null counts as
+    absent, as in the PyTorch executor's ``_node_param``.
+    """
+    for section in ("parameters", "attributes"):
+        values = node.get(section)
+        if isinstance(values, dict) and values.get(key) is not None:
+            return values[key]
+    value = node.get(key)
+    return default if value is None else value
+
+
+def node_tensor(
+    node: Dict[str, Any], key: str, tensors_by_uid: Dict[int, Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Resolve the tensor bound to ``key`` in the node's inputs or outputs."""
+    for section in ("inputs", "outputs"):
+        uid = (node.get(section) or {}).get(key)
+        if uid is not None:
+            return tensors_by_uid.get(int(uid))
+    return None

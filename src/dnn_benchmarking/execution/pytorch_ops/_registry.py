@@ -3,7 +3,7 @@
 
 """Operation-handler registry and graph execution."""
 
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -90,14 +90,50 @@ def get_unsupported_operations(graph_json: Dict[str, Any]) -> List[str]:
     return unsupported
 
 
+_CONVOLUTION_OPS = frozenset(
+    {
+        "ConvolutionFwdAttributes",
+        "ConvolutionBwdAttributes",
+        "ConvolutionWrwAttributes",
+    }
+)
+# Ops whose handlers compute in the dtype of their inputs and store their
+# outputs in that dtype, so float64 inputs give float64 arithmetic.
+_FLOAT64_OPS = _CONVOLUTION_OPS | {"PointwiseAttributes"}
+
+
+def float64_reference_supported(graph_json: Dict[str, Any]) -> bool:
+    """True for a graph with a convolution whose nodes all run in float64.
+
+    Fused convolution graphs (convolution plus pointwise nodes) qualify.
+    Other ops keep the graph data types: some handlers (batch norm, SDPA)
+    pin float32 statistics or scratch.
+    """
+    types = {node.get("type") for node in graph_json.get("nodes", [])}
+    return bool(types & _CONVOLUTION_OPS) and types <= _FLOAT64_OPS
+
+
 class CompiledGraph:
     """A graph compiled once into replayable per-op closures."""
 
-    def __init__(self, ops: List[Tuple[str, CompiledOp]]) -> None:
+    def __init__(
+        self,
+        ops: List[Tuple[str, CompiledOp]],
+        releases: Optional[Sequence[Tuple[int, ...]]] = None,
+    ) -> None:
+        """Args:
+        ops: ``(op_type, closure)`` in execution order.
+        releases: For each op, the UIDs to drop from the tensor map after
+            it runs (virtual tensors no later op reads). None drops nothing.
+        """
         self._ops = ops
+        self._releases = releases or [()] * len(ops)
 
     def execute(self, tensors: Dict[int, torch.Tensor]) -> None:
         """Replay every compiled op against the provided tensor map.
+
+        Virtual tensors leave ``tensors`` after their last reader, so peak
+        memory is the live intermediates, not every intermediate of the graph.
 
         Args:
             tensors: Mapping of tensor UID to torch.Tensor.
@@ -105,7 +141,7 @@ class CompiledGraph:
         Raises:
             UnsupportedGraphError: If an op fails at runtime.
         """
-        for op_type, run in self._ops:
+        for (op_type, run), release in zip(self._ops, self._releases):
             try:
                 run(tensors)
             except UnsupportedGraphError:
@@ -118,6 +154,42 @@ class CompiledGraph:
                     f"PyTorch reference could not execute {op_type!r} with the provided "
                     f"dtypes/parameters: {e}"
                 ) from e
+            for uid in release:
+                tensors.pop(uid, None)
+
+
+def _referenced_uids(value: Any, key: str = "") -> Iterator[int]:
+    """Every tensor UID a node references, in any section, under a ``*uid*`` key."""
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            yield from _referenced_uids(child, str(child_key))
+    elif isinstance(value, list):
+        for child in value:
+            yield from _referenced_uids(child, key)
+    elif "uid" in key and not isinstance(value, bool):
+        try:
+            yield int(value)
+        except (TypeError, ValueError):
+            pass
+
+
+def _virtual_releases(graph_json: Dict[str, Any]) -> List[Tuple[int, ...]]:
+    """For each node, the virtual tensor UIDs whose last reference it is."""
+    virtual = {
+        int(tensor["uid"])
+        for tensor in graph_json.get("tensors", [])
+        if isinstance(tensor, dict) and tensor.get("virtual") and "uid" in tensor
+    }
+    nodes = graph_json.get("nodes", [])
+    last_use: Dict[int, int] = {}
+    for index, node in enumerate(nodes):
+        for uid in _referenced_uids(node):
+            if uid in virtual:
+                last_use[uid] = index
+    releases: List[List[int]] = [[] for _ in nodes]
+    for uid, index in last_use.items():
+        releases[index].append(uid)
+    return [tuple(uids) for uids in releases]
 
 
 def compile_graph(graph_json: Dict[str, Any]) -> CompiledGraph:
@@ -152,7 +224,7 @@ def compile_graph(graph_json: Dict[str, Any]) -> CompiledGraph:
                 f"dtypes/parameters: {e}"
             ) from e
         ops.append((op_type, op))
-    return CompiledGraph(ops)
+    return CompiledGraph(ops, _virtual_releases(graph_json))
 
 
 def execute_graph(

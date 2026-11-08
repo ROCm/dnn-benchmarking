@@ -4,7 +4,18 @@
 """Shared tensor and graph-node helpers for PyTorch reference handlers."""
 
 from math import prod
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 
@@ -33,27 +44,59 @@ __all__ = [
     "_store_planned",
     "_strip_leading_singletons",
     "_sum_to_shape",
+    "_host_ints",
+    "_replay_constant",
     "ReplayTensors",
 ]
 
+_T = TypeVar("_T")
+
 
 class ReplayTensors(dict):
-    """Tensor map that memoizes host-resolved scalar reads.
+    """Tensor map that memoizes host-resolved reads of constant inputs.
 
-    Reading a scalar input (e.g. batchnorm/layernorm epsilon, SDPA scale) calls
-    ``Tensor.item()``, a device->host copy that synchronizes the stream. During
-    a stalled-queue benchmark the work stream is gated, so any such sync inside
-    the timed region would deadlock. Because the benchmark replays the same
-    inputs every iteration, those scalars are constant: resolve each once and
-    cache it here so timed iterations are pure asynchronous enqueue.
+    Reading a scalar input (e.g. batchnorm/layernorm epsilon, SDPA scale) or an
+    integer index tensor (paged SDPA sequence lengths) copies device->host and
+    synchronizes the stream. During a stalled-queue benchmark the work stream
+    is gated, so any such sync inside the timed region would deadlock. Because
+    the benchmark replays the same inputs every iteration, those values are
+    constant: resolve each once and cache it here so timed iterations are pure
+    asynchronous enqueue.
 
     Plain ``dict`` inputs (the one-shot reference path) carry no cache, so
-    ``_scalar_value`` resolves normally with no behavior change.
+    ``_scalar_value`` / ``_host_ints`` resolve normally with no behavior change.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._scalar_cache: Dict[int, float] = {}
+        self._int_cache: Dict[int, List[int]] = {}
+        self._derived_cache: Dict[Hashable, Any] = {}
+        self.notes: List[str] = []
+
+    def host_ints(self, uid: int) -> List[int]:
+        """Return tensor ``uid`` flattened to host ints, resolved once."""
+        cached = self._int_cache.get(uid)
+        if cached is None:
+            cached = [int(x) for x in self[uid].flatten().tolist()]
+            self._int_cache[uid] = cached
+        return cached
+
+    def derived(self, key: Hashable, build: Callable[[], _T]) -> _T:
+        """Return ``build()`` for ``key``, built once on the first call.
+
+        Holds handler setup derived only from constant inputs (layout
+        emulation, masks), so timed iterations do not repeat it.
+        """
+        if key not in self._derived_cache:
+            self._derived_cache[key] = build()
+        return self._derived_cache[key]
+
+    def note(self, text: str) -> None:
+        """Record a row warning found while priming (a handler's runtime
+        finding that static graph metadata cannot show). Repeats are dropped."""
+        if text not in self.notes:
+            self.notes.append(text)
 
 
 def _as_tuple(
@@ -244,6 +287,25 @@ def _scalar_value(
     if cache is not None:
         cache[uid] = value
     return value
+
+
+def _host_ints(
+    tensors: Dict[int, torch.Tensor], uid: int, node: Dict[str, Any]
+) -> List[int]:
+    """Host copy of an integer tensor; memoized when ``tensors`` replays."""
+    tensor = _tensor(tensors, uid, node)  # validates presence with node context
+    if isinstance(tensors, ReplayTensors):
+        return tensors.host_ints(uid)
+    return [int(x) for x in tensor.flatten().tolist()]
+
+
+def _replay_constant(
+    tensors: Dict[int, torch.Tensor], key: Hashable, build: Callable[[], _T]
+) -> _T:
+    """``build()`` once per replay map; every call on a plain dict."""
+    if isinstance(tensors, ReplayTensors):
+        return tensors.derived(key, build)
+    return build()
 
 
 def _numel(shape: Sequence[int]) -> int:

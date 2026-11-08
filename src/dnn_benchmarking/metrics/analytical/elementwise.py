@@ -3,15 +3,15 @@
 
 """FLOP handlers for element-wise ops driven by output element count.
 
-Pointwise (relu, add, mul, …) and Rng both do O(num_output_elements)
-work and are dominated by memory traffic. We don't distinguish unary
-vs binary pointwise because the FLOP component is small relative to
-fused-graph totals.
+Pointwise (relu, add, mul, …), Rng, and block-scale quantize/dequantize
+all do O(num_output_elements) work and are dominated by memory traffic.
+We don't distinguish unary vs binary pointwise because the FLOP
+component is small relative to fused-graph totals.
 """
 
 from typing import Any, Dict, Optional
 
-from ._common import tensor_dim_product
+from ._common import output_elements, tensor_dim_product
 
 
 def pointwise_flops(
@@ -46,3 +46,23 @@ def rng_flops(
     if not tensor:
         return None
     return tensor_dim_product(tensor)
+
+
+def block_scale_quantize_flops(
+    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+) -> Optional[int]:
+    """BlockScaleQuantize: 2 ops per element.
+
+    One for the per-block abs-max reduction and one to apply the scale.
+    The per-block scale computation is one op per ``block_size`` elements
+    and is ignored.
+    """
+    elems = output_elements(node, tensors_by_uid)
+    return 2 * elems if elems is not None else None
+
+
+def block_scale_dequantize_flops(
+    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+) -> Optional[int]:
+    """BlockScaleDequantize: 1 op per element (multiply by the block scale)."""
+    return output_elements(node, tensors_by_uid)

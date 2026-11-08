@@ -11,26 +11,12 @@ from .executor import Executor
 #   from dnn_benchmarking.execution.pytorch_buffer_manager import PyTorchCudaBufferManager
 #   from dnn_benchmarking.execution.pytorch_executor import PyTorchCudaExecutor
 
-from .timing import (
-    GpuTimer,
-    GpuTimerInterface,
-    HipGpuTimer,
-    Timer,
-    TorchGpuTimer,
-    create_gpu_timer,
-    get_available_backends,
-    is_gpu_timing_available,
-)
+from .timing import Measurement, Timer, measure
 
 __all__ = [
     "BufferManager",
     "Executor",
-    "GpuTimer",
-    "GpuTimerInterface",
-    "HipGpuTimer",
+    "Measurement",
     "Timer",
-    "TorchGpuTimer",
-    "create_gpu_timer",
-    "get_available_backends",
-    "is_gpu_timing_available",
+    "measure",
 ]

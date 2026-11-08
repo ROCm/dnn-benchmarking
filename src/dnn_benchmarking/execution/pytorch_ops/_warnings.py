@@ -12,10 +12,58 @@ from ._common import (
     _is_float32_compute,
     _node_param,
     _node_uid,
+    _tensor_shape,
 )
 from .handlers.norm import _rmsnorm_graph_can_use_builtin
 from .handlers.reduction import _reduction_mode_name
 from .handlers.resample import _resample_has_asymmetric_padding, _resample_mode_name
+from .handlers.sdpa import _sdpa_derive_mask
+
+
+def _sdpa_forward_workarounds(
+    node: Dict[str, Any], graph_json: Dict[str, Any]
+) -> List[str]:
+    """SDPA forward features PyTorch's SDPA cannot express natively."""
+
+    def uid(key: str) -> Any:
+        return _node_uid(node, key, ("inputs",), required=False)
+
+    reasons: List[str] = []
+    if uid("sink_token_tensor_uid") is not None:
+        reasons.append(
+            "PyTorch SDPA has no attention-sink input, so attention runs as "
+            "separate fp32 matmul, softmax and matmul ops instead of an SDPA kernel"
+        )
+    if uid("page_table_k_tensor_uid") is not None:
+        reasons.append(
+            "PyTorch has no paged SDPA, so K/V are gathered into dense "
+            "per-sequence tensors once and each sequence runs as its own SDPA "
+            "call, re-packed with torch.cat"
+        )
+    try:
+        _, window, bottom_right = _sdpa_derive_mask(node)
+    except ValueError:
+        window, bottom_right = None, False
+    if window is not None:
+        reasons.append(
+            "PyTorch SDPA has no sliding-window option, so the window is passed "
+            "as an additive mask tensor that the kernel reads"
+        )
+    elif bottom_right:
+        reasons.append(
+            "the bottom-right causal mask is passed as an additive mask tensor "
+            "that the kernel reads (is_causal is top-left only)"
+        )
+    k_shape = _tensor_shape(graph_json, uid("k_tensor_uid"))
+    v_shape = _tensor_shape(graph_json, uid("v_tensor_uid"))
+    if k_shape and v_shape and len(k_shape) >= 3 and len(v_shape) >= 3:
+        if k_shape[-3] != v_shape[-3]:
+            reasons.append(
+                "K and V head counts differ, which enable_gqa cannot express, so "
+                "K/V are expanded to the query head count once and the kernel "
+                "reads the expanded tensors"
+            )
+    return reasons
 
 
 def get_reference_warnings(graph_json: Dict[str, Any]) -> List[str]:
@@ -79,6 +127,15 @@ def get_reference_warnings(graph_json: Dict[str, Any]) -> List[str]:
                 "consume external stats, so PyTorch reference timing is not solely "
                 "built-in PyTorch operator time."
             )
+
+        elif op_type == "SdpaAttributes":
+            reasons = _sdpa_forward_workarounds(node, graph_json)
+            if reasons:
+                warnings.append(
+                    f"{name}: SdpaAttributes includes manual reference work "
+                    f"({'; '.join(reasons)}); PyTorch reference timing is not "
+                    "solely built-in PyTorch operator time."
+                )
 
         elif op_type == "ReductionAttributes":
             if (

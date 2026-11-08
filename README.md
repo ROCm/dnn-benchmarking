@@ -1,162 +1,177 @@
 # dnn-benchmarking
 
-Benchmarks and validates serialized hipDNN graphs. The tool runs each graph
-through the installed hipDNN engine plugins, or through PyTorch with
-`--backend pytorch`, and reports kernel and end-to-end timing.
+Benchmarking and validation tool for hipDNN graphs.
 
-> **Caution**: This tool is in early development and subject to change.
-> Do not use it in build workflows or CI pipelines.
+> **Caution**: This tool is in early development and can change. Do not use
+> it in build workflows or CI gating.
 
-## Installation
+dnn-benchmarking loads serialized hipDNN graphs (JSON). It runs each graph
+through the installed hipDNN engine plugins, through PyTorch with
+`--runtime pytorch`, or through rocKE SDPA kernels with `--runtime rocke`.
+A comma list such as `--runtime hipdnn,rocke` puts the rows of each runtime
+in the same run. For each engine it measures the device time of one launch
+and, if you ask, compares the output with a PyTorch reference.
 
-The tool needs Python 3.12 or newer.
+- One timed loop for all runtimes. The headline number is the median device
+  time per launch (`kernel_med`), measured with a stall-gated event span.
+- Each result records how it was measured: timing mode, cache mode, warmup,
+  sample count, seed and first-call cost.
+- Results go to stdout as tables, progress goes to stderr, and `-o` writes a
+  versioned JSON or CSV file.
+- `dnn-benchmark compare` compares two result files, for example two builds
+  or a ROCm host and a CUDA host.
 
-### Released wheels (AMD GPUs)
+## Requirements
 
-This path needs no compiler, CMake, or system ROCm. Wheels exist for `gfx90a`,
-`gfx942`, `gfx950`, `gfx1100`, and `gfx1151`.
+- Python 3.12 or newer.
+- hipDNN backend: an AMD GPU with ROCm, the hipDNN Python bindings
+  (`hipdnn_frontend`) and the engine plugins. The released wheels ship them,
+  or `setup_env.py` builds them.
+- PyTorch runtime: a ROCm or CUDA build of PyTorch. hipDNN is not necessary.
+- rocKE runtime: a ROCm build of PyTorch and the rocKE Python packages
+  (`setup_env.py` installs them on Linux). See
+  [docs/usage.md](docs/usage.md#rocke-runtime).
+- `--validate pytorch`: any PyTorch build. A CPU build is sufficient.
+- Optional: amdsmi for GPU clocks and throttle status; `rocprofv3`, `perf`
+  and `rocprof-compute` for the profiling flags.
+
+With ROCm torch and a separate `--rocm-prefix`, two hipDNN backends can be
+visible in one process. Read the
+[mixed-prefix guidance](docs/setup.md#mixed-rocm-torch-and-hipdnn-prefixes)
+before using `--validate pytorch` with that setup.
+
+## Quick start
+
+1. Set up the environment (ROCm host). On a supported GPU (`gfx90a`,
+   `gfx942`, `gfx950`, `gfx1100`, `gfx1151`), install the released wheels.
+   This needs no compiler, CMake or system ROCm. Take `<tag>` from the
+   [releases page](https://github.com/ROCm/dnn-benchmarking/releases) and
+   replace `gfx942` with the architecture that `rocm_agent_enumerator`
+   reports:
+
+   ```bash
+   python3.12 -m venv .venv && source .venv/bin/activate
+   pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/<tag>/requirements-gfx942.txt
+   ```
+
+   To change hipDNN or the providers, or when no wheel exists for your GPU,
+   build from source. See [docs/setup.md](docs/setup.md) for released wheels,
+   CUDA hosts, CPU-only PyTorch and Docker.
+
+   ```bash
+   python3 setup_env.py --workspace .workspace
+   source .workspace/.venv/bin/activate
+   ```
+
+2. Benchmark one graph with all engines that support it:
+
+   ```bash
+   dnn-benchmark -g graphs/sample_conv_fwd.json
+   ```
+
+   ```text
+   sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [e50543fd1d83]
+     engine                       verdict    kernel_med  iqr%    submit  tflops  gbps  vs_best
+     MIOPEN_ENGINE                unchecked   25.44 µs    1.9  11.55 µs    0.74  21.0    1.00x
+     MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.60 µs    1.3  11.47 µs    0.74  20.8    0.99x
+   ```
+
+3. Run the same graph through PyTorch:
+
+   ```bash
+   dnn-benchmark -g graphs/sample_conv_fwd.json --runtime pytorch
+   ```
+
+4. Benchmark a set of graphs, validate the outputs and write the results:
+
+   ```bash
+   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
+   dnn-benchmark -g 'graphs/*.json' -o results.csv
+   ```
+
+5. Compare two result files. `speedup = A / B`; more than 1 means B is
+   faster:
+
+   ```bash
+   dnn-benchmark compare base.json results.json
+   ```
+
+More examples:
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/<tag>/requirements-gfx942.txt
+# Select engines by name, hex ID or decimal ID, in order
+dnn-benchmark -g graphs/sample_conv_fwd.json -e MIOPEN_ENGINE -v
+
+# Cold cache, at least 200 iterations and 100 ms of kernel time
+dnn-benchmark -g graphs/sample_conv_fwd.json -i 200 --min-time-ms 100 --cache-mode cold
+
+# rocKE block timing: each of 100 samples times 50 back-to-back launches
+dnn-benchmark -g 'graphs/*.json' --iters 100 --timing-block 50
+
+# Run every graph in a tarball (fetch it first, see Workload files)
+dnn-benchmark -g Workloads/headline/conv.tar.gz -o conv.json
+
+# Repeatable recipe; CLI flags override the file
+dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 ```
 
-Take `<tag>` from the [releases page](https://github.com/ROCm/dnn-benchmarking/releases).
-Replace `gfx942` with the architecture that `rocm_agent_enumerator` reports.
-The requirements file pins torch and the ROCm SDK to one nightly. It also
-installs hipDNN and the engine plugins, built from the `rocm-libraries` commit
-that this repository pins. If `ROCM_PATH` is set, it overrides the bundled
-plugins.
+## Exit codes
 
-### Source build
+| Code | Meaning |
+|---|---|
+| 0 | Success. |
+| 1 | Engine row error, graph error, failed final result write, no graph files, or runtime not available. |
+| 2 | Usage or config error. |
+| 3 | An engine row failed validation. |
+| 130 / 143 | Interrupted by SIGINT / SIGTERM. A partial result file has `run.complete = false`. |
 
-Use the source build to change hipDNN or the providers, or when no wheel exists
-for your GPU:
+## Documentation
 
-```bash
-python3 setup_env.py --workspace .workspace
-source .workspace/.venv/bin/activate
-```
+| Document | Content |
+|---|---|
+| [docs/setup.md](docs/setup.md) | Released wheels and how to publish them; `setup_env.py`: torch modes, CMake defines, rocm-libraries source, CUDA hosts, Docker. |
+| [docs/usage.md](docs/usage.md) | All CLI options, engine selection, config files, console output, exit codes, `compare`, profiling. |
+| [docs/methodology.md](docs/methodology.md) | What `kernel_med` measures, warmup, cache modes, stop rule, statistics, parity with rocKE and PyTorch, known limits. |
+| [docs/results-schema.md](docs/results-schema.md) | Result file schema version 2 (JSON and CSV). |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | ROCm library paths, profiler requirements, profiling artefacts. |
+| [AGENTS.md](AGENTS.md) | Architecture and development rules. |
 
-`setup_env.py` installs ROCm PyTorch for the detected GPU. It then builds hipDNN,
-the MIOpen, hipBLASLt, and hip-kernel providers, and the Python bindings from
-the `rocm-libraries` submodule. See [docs/source-build.md](docs/source-build.md)
-for CPU-only, CUDA, and existing-torch modes, extra CMake defines, and the
-workspace location.
+`dnn-benchmark --help` is the authoritative option list.
 
-## Usage
+## Workload files
 
-`--graph` accepts a JSON file, a glob, or a tarball (`.tar`, `.tar.gz`, `.tgz`,
-`.tar.bz2`, `.tar.xz`). All three use the same suite path.
+The `Workloads/` directory holds benchmark workload tarballs tracked with
+[DVC](https://dvc.org/). The public DVC remote in `.dvc/config` allows
+anonymous reads.
 
-```bash
-dnn-benchmark --graph ./graphs/sample_conv_fwd.json --warmup 10 --iters 100
-dnn-benchmark --graph 'graphs/*.json' -o results.json      # full JSON results
-dnn-benchmark --graph ./Workloads/headline/conv.tar.gz -v  # per-engine detail
-dnn-benchmark --graph ./graphs/sample_conv_fwd.json --engine 1,2 --seed 42
-```
-
-The console shows one summary line for each graph and a suite summary. `-v`
-shows a block for each engine. `--output` always writes the full `SuiteResult`
-JSON.
-
-The tool finds engine plugins from the installed `hipdnn_runtime` wheel or from
-`$ROCM_PATH/lib/hipdnn_plugins/engines`. `--plugin-path` takes one directory or
-a comma-separated list in `--engine` order.
-
-Other modes, described in [docs/usage.md](docs/usage.md):
-
-- `--backend pytorch`: run the graphs through PyTorch, on ROCm or CUDA, with
-  the same JSON schema for cross-machine comparison.
-- `--autotune` and `--cache-dir`: measure the full kernel set instead of the
-  heuristic pick, with an isolated winner cache.
-- `--oracle-mode plan|exhaustive`: compare the out-of-the-box plan with the
-  tuned plan.
-
-`--config <file.toml>` loads a repeatable recipe; CLI flags override its values.
-See `sample_configs/`. Run `dnn-benchmark --help` for all options.
-
-## Workload Files
-
-`Workloads/` holds benchmark tarballs tracked with [DVC](https://dvc.org/). The
-committed remote in `.dvc/config` allows anonymous reads.
-
-- `Workloads/headline/`: the curated regression set (`conv`, `bnorm`, `attn`,
-  `hipblaslt`, `moe`, `norm`). `norm.tar.gz` has 0% applicability until a ROCm
-  engine implements RMSNorm or LayerNorm.
-- `Workloads/microbench/`: broader shape sweeps, outside the headline signal.
-- `Workloads/models/`: workload collections for each model.
+- `Workloads/headline/`: the small, curated set for regression monitoring
+  (`conv`, `bnorm`, `attn`, `hipblaslt`, `moe`, `norm`). No ROCm engine
+  implements RMSNorm or LayerNorm yet, so `norm.tar.gz` has no applicable
+  engines today.
+- `Workloads/microbench/`: larger shape sweeps and per-source collections.
+- `Workloads/models/`: workloads for each model.
+- `Workloads/corpus/`: reference collections across models with minimal graph
+  overlap inside each collection. The current collection covers convolution.
 
 ```bash
 python -m pip install "dvc[s3]"
-dvc pull                                        # every workload
-dvc pull Workloads/headline/conv.tar.gz.dvc     # one workload
+dvc pull                                      # every workload
+dvc pull Workloads/headline/conv.tar.gz.dvc   # one headline workload
+dvc pull Workloads/corpus/Convolution/files.tar.gz.dvc  # corpus
 ```
 
 Keep credentials in `.dvc/config.local`, which git ignores.
 
-To check that new graphs deserialize without running a kernel:
+## Tests
 
 ```bash
-# Pure-Python loader only, no hipDNN build needed
-python tools/check_deserialize.py --level json --src src 'Workloads/**/*.json'
-# Deserialize and finalize the backend operation graph, needs hipDNN
-python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+pytest -m "not gpu"        # unit tests, any host
+pytest                     # GPU host (ROCm or CUDA): unit + GPU tests
 ```
 
-For MIOpen shape conversion, see
+See [AGENTS.md](AGENTS.md#tests) for the test tiers and markers.
+
+## Related tools
+
+For the MIOpen shape conversion tool, see
 [`dnn-convert-shapes`](https://github.com/ROCm/rocm-libraries/tree/develop/projects/hipdnn/tools/dnn-convert-shapes).
-
-## Running Tests
-
-```bash
-pytest -m "not gpu"   # no GPU or hipDNN needed
-pytest                # everything; GPU tests skip on the wrong platform
-pytest -m "not cuda"  # ROCm host: drop CUDA-only tests
-pytest -m "not rocm"  # CUDA host: drop ROCm-only tests
-pytest -m gpu --dnn-plugin-paths /path/to/hipdnn_plugins/engines
-```
-
-GPU tests find plugins in provider build trees, the active venv's ROCm SDK, and
-`/opt/rocm`. Markers: `gpu` runs on any GPU, `rocm` only on AMD, `cuda` only on
-NVIDIA.
-
-Strict profiling tests need real profiler artifacts and skip by default:
-
-```bash
-LD_LIBRARY_PATH=$HIPDNN_PREFIX/lib:$LD_LIBRARY_PATH pytest --profiling-strict -m profiling_strict
-```
-
-See [docs/troubleshooting.md](docs/troubleshooting.md) for profiling setup and
-library-path problems.
-
-## Releasing Wheels
-
-`tools/build_release_wheels.py` builds the per-architecture `hipdnn_runtime`
-wheel, the `hipdnn_frontend` bindings, this package, and a requirements file for
-each architecture. It uses the pinned `rocm-libraries` commit. The ROCm SDK
-wheels bundle an older hipDNN that lacks entry points the bindings need, so the
-runtime wheel ships its own. The tool loads that copy first.
-
-The `release-wheels` workflow builds and publishes a release. Start it manually
-from the Actions tab. The build loads every architecture's payload against the
-pinned ROCm SDK; CI has no GPU, so it runs no benchmark. To publish by hand from
-a pushed commit:
-
-```bash
-TAG=v0.1.0
-python3 tools/build_release_wheels.py \
-    --base-url https://github.com/ROCm/dnn-benchmarking/releases/download/$TAG
-gh release create $TAG dist/*.whl dist/requirements-*.txt \
-    --target "$(git rev-parse HEAD)"
-```
-
-Without `--target`, `gh` tags the newest commit on the default branch, which
-can differ from the commit that built the wheels.
-
-Do not publish to `rocm.nightlies.amd.com`. That index belongs to TheRock.
-
-## Limitations
-
-- Validation-provider rows are timing baselines. They are not counted as hipDNN
-  engine pass or fail results. Use `--validate` to check output correctness.

@@ -1,362 +1,228 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Suite runner for per-graph engine iteration with granular timing.
+"""Per-graph row iteration: every selected runtime adds its rows to the graph.
 
-Uses explicit ``--engine`` IDs in caller order when provided; otherwise
-discovers ranked engine IDs for the graph via ``Graph.get_ranked_engine_ids``.
-For each engine, captures separated CPU build time, GPU kernel time,
-and E2E wall-clock time. Performs correctness validation by comparing GPU
-output against a reference provider via ArrayComparator.
+Each runtime turns a graph into a :class:`RuntimePlan` (its engines, or why
+none applies) before inputs exist. :func:`run_graph` then generates inputs and
+the ``--validate`` reference once, and appends each runtime's rows in run
+order. Every row is timed by ``timing.measure`` (through the executors).
 """
 
-from contextlib import contextmanager
-from dataclasses import dataclass
+import copy
+import gc
 import json
-import os
+import re
 import sys
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
-from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
-    BenchmarkConfig,
     PyTorchSdpaBackendName,
-    ReferenceProviderName,
+    ReferencePrecision,
     SuiteConfig,
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
-from ..execution.timing import Timer
-from ..metrics import (
-    CpuTimeProbe,
-    GpuSmiProbe,
-    compute_flops,
-    compute_io_bytes,
-    derive_throughputs,
-)
+from ..execution.timing import Measurement, StallFallbackError, Timer
+from ..graph.tensor_info import TensorInfo
+from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
-from ..reporting.statistics import BenchmarkStats
+from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
 from ..reporting.suite_results import (
-    CorrectnessResult,
     GraphResult,
-    OracleResult,
     ProviderEngineResult,
-    build_oracle_delta,
+    engine_id_hex,
+    graph_id_for,
 )
-from ..validation.reference_provider import (
-    ReferenceOutput,
-    ReferenceProvider,
-    ReferenceProviderRegistry,
+from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
+from .correctness import check_correctness, mismatch, unchecked
+from .oracle import (
+    build_tuned_plan,
+    run_pytorch_tuned,
+    run_tuned_plan,
+    tuned_in_process,
 )
-from ..validation.validator import Validator
-
-
-# bf16 has a 7-bit mantissa: 1 ULP ~= 2^-7 = 0.78% relative. Backward
-# convolutions (wgrad/dgrad) accumulate over large reductions, and the MIOpen
-# kernels hipDNN and PyTorch select round 2-3 ULP apart even when they pick the
-# same solver. A 1% (~1.3 ULP) rtol flags that legitimate bf16 drift as a
-# failure; 3% (~3.8 ULP) keeps validation meaningful while tolerating it.
-_BFLOAT16_RTOL = 3e-2
-_BFLOAT16_ATOL = 1e-3
-_HALF_RTOL = 1e-3
-_HALF_ATOL = 1e-3
-_DEFAULT_RTOL = 1e-5
-_DEFAULT_ATOL = 1e-6
+from .rocke_sdpa import (
+    Catalog,
+    RockeKernel,
+    SdpaProblem,
+    auto_kernel,
+    catalog_kernels,
+    sdpa_problem,
+)
 
 
 @dataclass
-class _TimedPytorchRow:
-    """Timed PyTorch row plus reference outputs (reference role only)."""
+class _GraphContext:
+    """Per-graph state shared by every row of one graph."""
 
-    result: ProviderEngineResult
-    outputs: Optional[Dict[int, ReferenceOutput]]
-
-
-def _output_node_types(graph_json: Dict[str, Any]) -> Dict[int, str]:
-    output_to_node: Dict[int, str] = {}
-    for node in graph_json.get("nodes", []):
-        node_type = str(node.get("type", ""))
-        for uid in (node.get("outputs") or {}).values():
-            if uid is not None:
-                output_to_node[int(uid)] = node_type
-    return output_to_node
-
-
-def _default_tolerance_for_output(
-    tensor_info: Any,
-    output_node_type: Optional[str],
-) -> tuple[float, float]:
-    dtype = str(getattr(tensor_info, "data_type", "float")).lower()
-    if dtype == "bfloat16":
-        return _BFLOAT16_RTOL, _BFLOAT16_ATOL
-    if dtype == "half":
-        return _HALF_RTOL, _HALF_ATOL
-    return _DEFAULT_RTOL, _DEFAULT_ATOL
+    graph_path: Path
+    graph_json: Dict[str, Any]
+    graph_name: str
+    tensor_infos: List[TensorInfo]
+    config: SuiteConfig
+    reporter: Reporter
+    input_data: Dict[int, Any]
+    flops: Optional[int] = None
+    io_bytes: Optional[int] = None
+    reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
+    reference_error: Optional[str] = None
+    # Set when validation was skipped on purpose (rows stay unchecked).
+    validation_skip_reason: Optional[str] = None
+    graph_json_str: str = ""  # hipDNN runs only
+    graph_id: str = ""  # hipDNN runs only
 
 
-def _fallback_tolerance_for_config(config: SuiteConfig) -> tuple[float, float]:
-    """Return explicit tolerances, or the default float tolerance for reporting."""
-    return config.validation.tolerance_override or (_DEFAULT_RTOL, _DEFAULT_ATOL)
-
-
-def _tolerance_for_output(
-    config: SuiteConfig,
-    tensor_info: Any,
-    output_node_type: Optional[str],
-) -> tuple[float, float]:
-    override = config.validation.tolerance_override
-    if override is not None:
-        return override
-    return _default_tolerance_for_output(tensor_info, output_node_type)
-
-
-def _resolve_engine_name(engine_id: int) -> str:
-    """Resolve an engine ID to its registered name.
-
-    Looks up the name via ``hipdnn_frontend.engine_id_to_name``. If the ID
-    isn't registered (returns empty string), falls back to a hex display
-    string so callers always have something printable.
-
-    Unexpected exceptions (plugin import error, registry corruption)
-    emit a one-shot warning to stderr so a silent fallback doesn't hide
-    a real plugin-init bug — the hex fallback only changes the artifact
-    path and reporting label, but the underlying error usually indicates
-    a broader registry problem worth surfacing.
-
-    Args:
-        engine_id: int engine ID.
-
-    Returns:
-        Registered engine name or ``f"engine_0x..."`` fallback.
-    """
-    try:
-        import hipdnn_frontend as hipdnn
-
-        name = hipdnn.engine_id_to_name(engine_id)
-        if name:
-            return name
-    except Exception as e:
-        from ..metrics._diagnostic import warn_once
-
-        warn_once(
-            "suite_runner",
-            f"engine_id_to_name failed for {engine_id:#x}: {e}; "
-            "falling back to hex display string",
+def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
+    """Set the process-wide hipDNN plugin search path for the next handle."""
+    if plugin_path is not None:
+        hipdnn.set_engine_plugin_paths(
+            [str(plugin_path)], hipdnn.PluginLoadingMode.ABSOLUTE
         )
-    return f"engine_{engine_id:#x}"
 
 
-def _resolve_engine_version(handle: Any, engine_id: int) -> str:
-    """Return the loaded provider plugin version for an engine ID."""
+def _engine_identity(handle: Any, engine_id: int) -> Tuple[str, str]:
+    """(display name, plugin version) of a loaded engine.
+
+    The name comes from the handle's engine info, else the handle's name
+    lookup (it asks the loaded plugins, so it also names plugin-supplied
+    ``hipkernel:*`` engines), else the built-in hipDNN registry, else the
+    hex ID, so a row always has a printable label.
+    """
+    name: Optional[str] = None
+    version = "unavailable"
     try:
         info = handle.get_engine_info(engine_id)
-        if info.version:
-            return str(info.version)
+        name = str(info.engine_name or "") or None
+        version = str(info.version or "") or version
     except Exception as e:
-        warn_once(
-            "suite_runner",
-            f"engine version lookup failed for {engine_id:#x}: {e}",
-        )
-    return "unavailable"
+        warn_once("suite_runner", f"engine info lookup failed for {engine_id:#x}: {e}")
+    if name is None:
+        try:
+            name = handle.engine_id_to_name(engine_id) or None
+        except IndexError:
+            pass  # the handle does not carry this ID
+        except Exception as e:
+            warn_once(
+                "suite_runner", f"handle name lookup failed for {engine_id:#x}: {e}"
+            )
+    if name is None:
+        try:
+            import hipdnn_frontend as hipdnn
+
+            name = hipdnn.engine_id_to_name(engine_id) or None
+        except Exception:
+            pass
+    return name or engine_id_hex(engine_id) or "", version
 
 
-def set_plugin_path(
-    hipdnn: Any, plugin_path: Optional[Path], loading_mode: Optional[Any] = None
-) -> None:
-    """Set the process-wide hipDNN plugin search path for the next handle."""
-    if plugin_path is None:
-        return
-    paths = [str(plugin_path)]
-    if loading_mode is None:
-        loading_mode = hipdnn.PluginLoadingMode.ABSOLUTE
-    hipdnn.set_engine_plugin_paths(paths, loading_mode)
+def _hipdnn_buffer_device(
+    reference_outputs: Optional[Dict[int, ReferenceOutput]],
+) -> Optional[str]:
+    """Torch device for hipDNN I/O buffers, or None for hipdnn.DeviceBuffer.
+
+    Torch storage is used only when a device reference exists, so the
+    outputs can be compared on the GPU. Timing-only runs, and runs whose
+    reference is host-only, keep the DeviceBuffer baseline. ``"cuda"`` is
+    torch's current device, which torch reads with ``hipGetDevice``. The
+    hipDNN handle uses the same in-process HIP device, so the pointers
+    belong to the handle's device.
+    """
+    if reference_outputs and any(
+        ref.device_data is not None for ref in reference_outputs.values()
+    ):
+        return "cuda"
+    return None
 
 
-def _engine_setup_error_result(
-    provider: str,
-    engine_id: int,
-    plugin_path: Optional[Path],
-    config: SuiteConfig,
-    error_message: str,
+def _report_row(
+    reporter: Reporter,
+    label: str,
+    run: Callable[[], ProviderEngineResult],
 ) -> ProviderEngineResult:
-    """Build a per-engine error row for plugin-path/handle setup failures."""
-    rtol, atol = _fallback_tolerance_for_config(config)
-    return ProviderEngineResult(
-        provider=provider,
-        engine_id=engine_id,
-        status="error",
-        plugin_path=str(plugin_path) if plugin_path is not None else None,
-        error_message=error_message,
-        correctness=CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=error_message
-        ),
-    )
+    """Run one row between progress events, stamping its start and wall time."""
+    reporter.engine_start(label)
+    started_at = datetime.now(timezone.utc).isoformat()
+    with Timer() as t:
+        row = run()
+    row.started_at = started_at
+    row.elapsed_time_ms = t.elapsed_ms
+    reporter.engine_done(row)
+    return row
 
 
-def _get_reference_provider(
+def _throttled(after: Optional[Dict[str, Any]]) -> bool:
+    # Only the SMU's throttle status counts: sclk alone moves with DPM demand
+    # (1700 -> 1430 MHz over a 3-iteration loop on an idle MI210), so a lower
+    # after-sample is not evidence of throttling.
+    return bool(after and after.get("throttle_status"))
+
+
+def _measure_row(
+    row: ProviderEngineResult,
+    ctx: _GraphContext,
+    benchmark: Callable[[], Measurement],
+) -> None:
+    """Run the timed loop and record stats, provenance, clocks and warnings."""
+    basic = ctx.config.metrics.basic
+    probe = GpuSmiProbe() if basic else None
+    m = benchmark()
+    if probe is not None:
+        row.clocks_after = probe.clocks()
+
+    kernel = BenchmarkStats.from_timings(m.kernel_ms)
+    row.ootb.gpu_kernel_stats = kernel
+    row.ootb.host_stats = BenchmarkStats.from_timings(m.host_ms)
+    row.ootb.timing = TimingInfo.from_measurement(m)
+    warnings = list(row.warnings or []) + noise_warnings(kernel)
+    if m.capped:
+        warnings.append("capped at max_iters")
+    if m.fallback_reason:
+        # events mode: why staged timing was not used; block mode: a host
+        # sync inside the timed span.
+        text = f"{m.mode} timing: {m.fallback_reason}"
+        warn_once("timing", text)
+        warnings.append(text)
+    if _throttled(row.clocks_after):
+        warnings.append("throttled")
+    row.warnings = warnings
+
+    if probe is not None:
+        row.analytical_flops = ctx.flops
+        row.analytical_io_bytes = ctx.io_bytes
+        row.ootb.derived_tflops_per_s, row.ootb.derived_gbytes_per_s = (
+            derive_throughputs(ctx.flops, ctx.io_bytes, kernel.median_ms)
+        )
+
+
+def _reference_provider(
     config: SuiteConfig, graph_json: Dict[str, Any]
-) -> Optional[ReferenceProvider]:
-    """Attempt to get and validate a reference provider for this graph.
-
-    Args:
-        config: Suite configuration with validation settings.
-        graph_json: Parsed graph JSON dictionary.
-
-    Returns:
-        ReferenceProvider instance if available and supports the graph,
-        None if validation was not requested (``config.validation`` is
-        disabled) or if the provider is unavailable/unsupported.
-    """
-    if not config.validation.enabled:
-        return None
-
+) -> Tuple[Optional[ReferenceProvider], Optional[str]]:
+    """The requested reference provider for this graph, or why there is none."""
+    name = config.validation.provider.value
     try:
-        provider = ReferenceProviderRegistry.get_provider(
-            config.validation.provider.value
-        )
+        provider = ReferenceProviderRegistry.get_provider(name)
     except ValueError:
-        print(
-            f"Reference provider '{config.validation.provider.value}' not registered",
-            file=sys.stderr,
-        )
-        return None
-
+        return None, f"Reference provider '{name}' not registered"
     if not provider.is_available():
-        print(
-            f"Reference provider '{config.validation.provider.value}' not available",
-            file=sys.stderr,
-        )
-        return None
-
+        return None, f"Reference provider '{name}' not available"
     if not provider.supports_graph(graph_json):
-        print(
-            f"Reference provider '{config.validation.provider.value}' "
-            "does not support this graph",
-            file=sys.stderr,
-        )
-        return None
-
-    return provider
-
-
-def _check_correctness(
-    buffer_manager: BufferManager,
-    tensor_infos: list,
-    graph_json: Dict[str, Any],
-    ref_outputs: Dict[int, ReferenceOutput],
-    reference_provider_name: str,
-    config: SuiteConfig,
-) -> CorrectnessResult:
-    """Compare GPU outputs against precomputed reference outputs.
-
-    Reference providers are executed once per graph by the suite runner. This
-    helper only compares a single hipDNN engine's outputs against that cached
-    reference output map.
-    """
-    try:
-        output_node_types = _output_node_types(graph_json)
-        all_passed = True
-        worst_abs_diff = 0.0
-        worst_rel_diff = 0.0
-        used_rtol = 0.0
-        used_atol = 0.0
-
-        output_count = 0
-        for ti in tensor_infos:
-            if not ti.is_output:
-                continue
-
-            actual = buffer_manager.get_output_data(ti.uid)
-            if actual is None:
-                continue
-
-            if ti.uid not in ref_outputs:
-                rtol, atol = _tolerance_for_output(
-                    config, ti, output_node_types.get(ti.uid)
-                )
-                return CorrectnessResult(
-                    execution_success=True,
-                    tolerance_match=False,
-                    rtol=rtol,
-                    atol=atol,
-                    error_message=(
-                        f"Reference provider '{reference_provider_name}' did not "
-                        f"produce output tensor UID {ti.uid}"
-                    ),
-                )
-
-            rtol, atol = _tolerance_for_output(
-                config, ti, output_node_types.get(ti.uid)
-            )
-            validator = Validator(rtol=rtol, atol=atol)
-            expected = ref_outputs[ti.uid].data
-            result = validator.validate(actual, ti, reference_data=expected)
-            output_count += 1
-            used_rtol = max(used_rtol, rtol)
-            used_atol = max(used_atol, atol)
-
-            if not result.passed:
-                all_passed = False
-
-            if result.max_abs_diff > worst_abs_diff:
-                worst_abs_diff = result.max_abs_diff
-            if result.max_rel_diff > worst_rel_diff:
-                worst_rel_diff = result.max_rel_diff
-
-        if output_count == 0:
-            rtol, atol = _fallback_tolerance_for_config(config)
-            return CorrectnessResult(
-                execution_success=True,
-                tolerance_match=False,
-                rtol=rtol,
-                atol=atol,
-                error_message="No output tensors to compare",
-            )
-
-        return CorrectnessResult(
-            execution_success=True,
-            tolerance_match=all_passed,
-            rtol=used_rtol,
-            atol=used_atol,
-            max_abs_diff=worst_abs_diff,
-            max_rel_diff=worst_rel_diff,
-        )
-
-    except (ValueError, RuntimeError, ExecutionError) as e:
-        rtol, atol = _fallback_tolerance_for_config(config)
-        return CorrectnessResult(
-            execution_success=True,
-            tolerance_match=False,
-            rtol=rtol,
-            atol=atol,
-            error_message=str(e),
-        )
-
-
-def _reference_unavailable_correctness(
-    config: SuiteConfig, error_message: str
-) -> CorrectnessResult:
-    rtol, atol = _fallback_tolerance_for_config(config)
-    return CorrectnessResult(
-        execution_success=True,
-        tolerance_match=False,
-        rtol=rtol,
-        atol=atol,
-        error_message=error_message,
-    )
-
-
-def _reference_row_correctness(config: SuiteConfig) -> CorrectnessResult:
-    rtol, atol = _fallback_tolerance_for_config(config)
-    return CorrectnessResult(
-        execution_success=True,
-        tolerance_match=None,
-        rtol=rtol,
-        atol=atol,
-        error_message="Reference provider timing row; no comparison performed",
-    )
+        return None, f"Reference provider '{name}' does not support this graph"
+    return provider, None
 
 
 def _compute_reference_outputs_once(
@@ -364,1032 +230,994 @@ def _compute_reference_outputs_once(
     graph_json: Dict[str, Any],
     input_data: Dict[int, Any],
     config: SuiteConfig,
-) -> tuple[Optional[Dict[int, ReferenceOutput]], Optional[str]]:
+    precision: ReferencePrecision = ReferencePrecision.NATIVE,
+    device: Optional[str] = None,
+) -> Tuple[Optional[Dict[int, ReferenceOutput]], Optional[str]]:
     try:
-        from ..validation.providers.pytorch_provider import PyTorchReferenceProvider
+        from .pytorch_ops import PyTorchSdpaBackendState, use_pytorch_sdpa_backend
 
-        if isinstance(ref_provider, PyTorchReferenceProvider):
-            from .pytorch_ops import (
-                PyTorchSdpaBackendState,
-                use_pytorch_sdpa_backend,
+        state = PyTorchSdpaBackendState(
+            config.pytorch_sdpa_backend, config.pytorch_rocm_fa_library
+        )
+        with use_pytorch_sdpa_backend(state):
+            outputs = ref_provider.compute_reference(
+                graph_json, input_data, precision=precision, device=device
             )
-
-            state = PyTorchSdpaBackendState(
-                config.pytorch_sdpa_backend,
-                config.pytorch_rocm_fa_library,
-            )
-            with use_pytorch_sdpa_backend(state):
-                outputs = ref_provider.compute_reference(graph_json, input_data)
             return outputs, None
-        return ref_provider.compute_reference(graph_json, input_data), None
-    except (ImportError, ValueError, RuntimeError, ExecutionError) as e:
+    except Exception as e:
         return None, str(e)
 
 
 def _pytorch_reference_outputs_from_buffer(
     buffer_manager: Any,
+    keep_device: bool = True,
 ) -> Dict[int, ReferenceOutput]:
+    """Collect reference outputs from a PyTorch buffer manager.
+
+    With ``keep_device``, a GPU output stays on the device only: each engine
+    compares on the GPU, and the rare host fallback copies it to the host for
+    one comparison (``ReferenceOutput.host_data``). Otherwise ``data`` is a
+    host copy.
+    """
     outputs: Dict[int, ReferenceOutput] = {}
+    tensors = buffer_manager.get_tensors()
     for tensor_info in buffer_manager.get_output_tensors():
-        data = buffer_manager.get_output_data(tensor_info.uid)
-        if data is not None:
-            outputs[tensor_info.uid] = ReferenceOutput(
-                data=data,
-                tensor_uid=tensor_info.uid,
+        uid = tensor_info.uid
+        tensor = tensors.get(uid)
+        if tensor is None:
+            continue
+        if keep_device and tensor.is_cuda:
+            outputs[uid] = ReferenceOutput(
+                data=None, tensor_uid=uid, device_data=_owned(tensor.detach())
+            )
+        else:
+            outputs[uid] = ReferenceOutput(
+                data=buffer_manager.get_output_data(uid), tensor_uid=uid
             )
     return outputs
 
 
-def _compute_graph_analytical_metrics(
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    graph_name: str,
-) -> tuple[Optional[int], bool, Optional[int]]:
-    """Compute per-graph analytical FLOPs/IO once.
+def _owned(tensor: Any) -> Any:
+    """``tensor`` itself, or a compact copy when it is a view of a larger storage.
 
-    These are a function of the graph shape only and don't change across
-    engines, so they're computed once per graph and propagated onto every
-    row. Failures route through warn_once and yield None.
-
-    Returns:
-        (analytical_flops, analytical_flops_partial, analytical_io_bytes)
+    The buffer manager only drops its references on exit, so a kept tensor
+    stays valid without a copy. A view would keep its whole base allocation
+    alive, which can be larger than a copy of the view.
     """
-    analytical_flops: Optional[int] = None
-    analytical_flops_partial = False
-    analytical_io_bytes: Optional[int] = None
-    if config.metrics.basic_enabled:
-        try:
-            analytical_flops, analytical_flops_partial = compute_flops(graph_json)
-        except Exception as e:
-            warn_once("analytical", f"compute_flops failed for {graph_name}: {e}")
-        try:
-            analytical_io_bytes = compute_io_bytes(tensor_infos)
-        except Exception as e:
-            warn_once("analytical", f"compute_io_bytes failed for {graph_name}: {e}")
-    return analytical_flops, analytical_flops_partial, analytical_io_bytes
+    if tensor.untyped_storage().nbytes() > tensor.numel() * tensor.element_size():
+        return tensor.clone()
+    return tensor
 
 
-def _run_timed_pytorch_row(
+def _graph_context(
     graph_path: Path,
     graph_json: Dict[str, Any],
-    graph_name: str,
-    tensor_infos: list,
+    tensor_infos: List[TensorInfo],
     config: SuiteConfig,
-    input_data: Dict[int, Any],
-    analytical_flops: Optional[int],
-    analytical_flops_partial: bool,
-    analytical_io_bytes: Optional[int],
-    role: Literal["engine", "reference"] = "reference",
-) -> _TimedPytorchRow:
-    """Run PyTorch once as a timed suite row.
-
-    With ``role="reference"`` this is the timed validation-provider row: it
-    additionally extracts reference outputs for engine comparison. Failed
-    default-dispatch references are skipped; failed strict selections are
-    errors because their requested native SDPA path was not fulfilled. With
-    ``role="engine"`` (the ``--backend pytorch`` path), failures are errors.
-    """
-    from . import pytorch_ops
-
-    try:
-        from importlib.metadata import version
-
-        engine_version = version("torch")
-    except Exception:
-        engine_version = "unavailable"
-    result = ProviderEngineResult(
-        provider=ReferenceProviderName.PYTORCH.value,
-        engine_id=0,
-        status="skipped",
-        engine_version=engine_version,
-    )
-    outputs: Optional[Dict[int, ReferenceOutput]] = None
-    strict_selection = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
-
-    with Timer() as elapsed_timer:
-        try:
-            from ..execution.pytorch_buffer_manager import PyTorchCudaBufferManager
-            from ..execution.pytorch_executor import PyTorchCudaExecutor
-
-            bench_config = BenchmarkConfig(
-                graph_path=graph_path,
-                warmup_iters=config.warmup_iters,
-                benchmark_iters=config.benchmark_iters,
-                engine_id=0,
-                pytorch_sdpa_backend=config.pytorch_sdpa_backend,
-                pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
-            )
-            executor = PyTorchCudaExecutor(graph_json, bench_config)
-            executor.prepare()
-            result.cpu_build_time_ms = executor.init_time_ms
-
-            with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-                buffer_manager.allocate_all()
-                buffer_manager.load_input_data(input_data)
-                buffer_manager.zero_outputs()
-
-                tensors = buffer_manager.get_tensors()
-                executor.warmup(tensors)
-
-                cpu_time_probe = (
-                    CpuTimeProbe() if config.metrics.basic_enabled else None
-                )
-                if cpu_time_probe is not None:
-                    cpu_time_probe.__enter__()
-                try:
-                    bench_result = executor.benchmark(tensors, graph_name=graph_name)
-                finally:
-                    if cpu_time_probe is not None:
-                        cpu_time_probe.__exit__(None, None, None)
-
-                result.host_stats = BenchmarkStats.from_timings(
-                    bench_result.host_timings
-                )
-                if bench_result.has_kernel_timings:
-                    result.gpu_kernel_stats = BenchmarkStats.from_timings(
-                        bench_result.kernel_timings
-                    )
-                assert bench_result.metadata is not None
-
-                if config.metrics.basic_enabled:
-                    _collect_basic_metrics_post_loop(
-                        result=result,
-                        cpu_time_probe=cpu_time_probe,
-                        benchmark_iters=config.benchmark_iters,
-                        analytical_flops=analytical_flops,
-                        analytical_flops_partial=analytical_flops_partial,
-                        analytical_io_bytes=analytical_io_bytes,
-                    )
-
-                if role == "reference":
-                    buffer_manager.zero_outputs()
-                    executor.execute_once(tensors)
-                    outputs = _pytorch_reference_outputs_from_buffer(buffer_manager)
-
-            if role == "reference":
-                result.correctness = _reference_row_correctness(config)
-                warnings = pytorch_ops.get_reference_warnings(graph_json)
-                if warnings:
-                    result.warnings = warnings
-            else:
-                rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult(
-                    execution_success=True,
-                    tolerance_match=None,
-                    rtol=rtol,
-                    atol=atol,
-                    error_message="No reference provider requested",
-                )
-            result.status = "success"
-
-        except UnsupportedGraphError as e:
-            msg = str(e)
-            if strict_selection:
-                result.status = "error"
-                result.error_message = msg
-            else:
-                result.status = "skipped"
-                result.skip_reason = msg
-            if role == "engine":
-                rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult.failed(
-                    rtol=rtol, atol=atol, error_message=msg
-                )
-        except Exception as e:
-            msg = str(e)
-            if role == "engine" or strict_selection:
-                result.status = "error"
-                result.error_message = msg
-                if role == "engine":
-                    rtol, atol = _fallback_tolerance_for_config(config)
-                    result.correctness = CorrectnessResult.failed(
-                        rtol=rtol, atol=atol, error_message=msg
-                    )
-            else:
-                result.skip_reason = msg
-    result.elapsed_time_ms = elapsed_timer.elapsed_ms
-    return _TimedPytorchRow(result=result, outputs=outputs)
-
-
-def run_graph_all_providers(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    handle: Any,
-    reporter: Optional[Reporter] = None,
-) -> GraphResult:
-    """Run a single graph against every engine the backend ranks for it.
-
-    Discovers engine IDs via ``Graph.get_ranked_engine_ids``, applies any
-    user engine filter, and runs the benchmark for each remaining ID.
-    Captures separated CPU build time, GPU kernel time, and E2E wall-clock
-    time per engine. Performs correctness checking against a reference
-    provider when ``--validate`` was requested.
-
-    Args:
-        graph_path: Path to the graph JSON file.
-        graph_json: Parsed graph JSON dictionary.
-        tensor_infos: List of TensorInfo objects for the graph.
-        config: Suite configuration.
-        handle: hipdnn.Handle instance.
-
-    Returns:
-        GraphResult with one ProviderEngineResult per engine.
-    """
+    reporter: Reporter,
+) -> _GraphContext:
+    """Generate inputs and per-graph analytical FLOPs/IO (shape-only, once)."""
     graph_name = graph_json.get("name", graph_path.stem)
-    graph_json_str = json.dumps(graph_json)
-
-    validation_requested = config.validation.enabled
-
-    if config.engine_filter is not None:
-        # Explicit --engine is a selection, not a post-discovery filter. Keep the
-        # caller's order so per-engine plugin paths are deterministic.
-        engine_ids = list(config.engine_filter)
-    else:
-        # Discover engines via real backend heuristics. A discovery failure is a
-        # graph-level error (record it and stop iterating engines), but "no
-        # engine configurations available" / "not supported" messages are
-        # really an unsupported-graph signal.
-        discovery_config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=config.warmup_iters,
-            benchmark_iters=config.benchmark_iters,
-        )
-        try:
-            if handle is None:
-                import hipdnn_frontend as hipdnn
-
-                handle = hipdnn.Handle()
-            discovery_executor = Executor(
-                graph_json_str=graph_json_str,
-                config=discovery_config,
-            )
-            engine_ids = discovery_executor.discover_engines(handle)
-        except UnsupportedGraphError as e:
-            rtol, atol = _fallback_tolerance_for_config(config)
-            return GraphResult(
-                graph_name=graph_name,
-                graph_path=str(graph_path),
-                results=[
-                    ProviderEngineResult(
-                        provider="unknown",
-                        engine_id=0,
-                        status="skipped",
-                        skip_reason=str(e),
-                        correctness=CorrectnessResult.failed(
-                            rtol=rtol, atol=atol, error_message=str(e)
-                        ),
-                    )
-                ],
-            )
-        except (ExecutionError, RuntimeError) as e:
-            msg = str(e)
-            rtol, atol = _fallback_tolerance_for_config(config)
-            return GraphResult(
-                graph_name=graph_name,
-                graph_path=str(graph_path),
-                results=[
-                    ProviderEngineResult(
-                        provider="unknown",
-                        engine_id=0,
-                        status="error",
-                        error_message=f"Engine discovery failed: {msg}",
-                        correctness=CorrectnessResult.failed(
-                            rtol=rtol, atol=atol, error_message=msg
-                        ),
-                    )
-                ],
-            )
-
-    if not engine_ids:
-        return GraphResult(
-            graph_name=graph_name,
-            graph_path=str(graph_path),
-            results=[
-                ProviderEngineResult(
-                    provider="unknown",
-                    engine_id=0,
-                    status="error",
-                    error_message=(
-                        "No engines discovered for graph"
-                        if config.engine_filter is None
-                        else "No engines selected for graph"
-                    ),
-                )
-            ],
-        )
-    engine_selections = config.engine_selections_for(engine_ids)
-    ref_provider = _get_reference_provider(config, graph_json)
-    try:
-        graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
-    except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
-        msg = f"Input data generation failed: {e}"
-        rtol, atol = _fallback_tolerance_for_config(config)
-        return GraphResult(
-            graph_name=graph_name,
-            graph_path=str(graph_path),
-            results=[
-                ProviderEngineResult(
-                    provider="unknown",
-                    engine_id=0,
-                    status="error",
-                    error_message=msg,
-                    correctness=CorrectnessResult.failed(
-                        rtol=rtol, atol=atol, error_message=msg
-                    ),
-                )
-            ],
-            engine_ids=engine_ids,
-        )
-    reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
-    reference_error: Optional[str] = None
-    timed_reference: Optional[_TimedPytorchRow] = None
-
-    (
-        analytical_flops,
-        analytical_flops_partial,
-        analytical_io_bytes,
-    ) = _compute_graph_analytical_metrics(graph_json, tensor_infos, config, graph_name)
-
-    pe_results: List[ProviderEngineResult] = []
-    if (
-        ref_provider is not None
-        and config.validation.provider is ReferenceProviderName.PYTORCH
-    ):
-        if reporter is not None:
-            reporter.print_engine_start("pytorch reference")
-        timed_reference = _run_timed_pytorch_row(
-            graph_path=graph_path,
-            graph_json=graph_json,
-            graph_name=graph_name,
-            tensor_infos=tensor_infos,
-            config=config,
-            input_data=graph_input_data,
-            analytical_flops=analytical_flops,
-            analytical_flops_partial=analytical_flops_partial,
-            analytical_io_bytes=analytical_io_bytes,
-        )
-        reference_outputs = timed_reference.outputs
-        if reporter is not None:
-            reporter.print_engine_result(timed_reference.result)
-        pe_results.append(timed_reference.result)
-
-    # A strict PyTorch selection must run through the timed native path. It
-    # never falls back to CPU reference execution after that path fails.
-    if ref_provider is not None and reference_outputs is None:
-        if (
-            config.validation.provider is ReferenceProviderName.PYTORCH
-            and config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
-        ):
-            assert timed_reference is not None
-            reference_error = (
-                timed_reference.result.error_message
-                or timed_reference.result.skip_reason
-                or (
-                    f"Requested PyTorch SDPA backend "
-                    f"'{config.pytorch_sdpa_backend.value}' is unavailable; "
-                    "no fallback is used. The timed PyTorch reference did not "
-                    "produce outputs."
-                )
-            )
-        else:
-            reference_outputs, reference_error = _compute_reference_outputs_once(
-                ref_provider,
-                graph_json,
-                graph_input_data,
-                config,
-            )
-
-    for selection in engine_selections:
-        engine_id = selection.engine_id
-        engine_plugin_path = selection.plugin_path
-        engine_name = _resolve_engine_name(engine_id)
-        engine_handle = handle
-        with Timer() as t:
-            if engine_handle is None:
-                try:
-                    import hipdnn_frontend as hipdnn
-
-                    set_plugin_path(
-                        hipdnn,
-                        engine_plugin_path,
-                        hipdnn.PluginLoadingMode.ABSOLUTE,
-                    )
-                    engine_handle = hipdnn.Handle()
-                except (ImportError, RuntimeError, ValueError, OSError) as e:
-                    pe_result = _engine_setup_error_result(
-                        provider=engine_name,
-                        engine_id=engine_id,
-                        plugin_path=engine_plugin_path,
-                        config=config,
-                        error_message=str(e),
-                    )
-                    pe_result.elapsed_time_ms = t.elapsed_ms
-                    if reporter is not None:
-                        reporter.print_engine_start(engine_name)
-                        reporter.print_engine_result(pe_result)
-                    pe_results.append(pe_result)
-                    continue
-
-            if reporter is not None:
-                reporter.print_engine_start(engine_name)
-
-            pe_result = run_single_provider_engine(
-                graph_path=graph_path,
-                graph_json_str=graph_json_str,
-                graph_name=graph_name,
-                tensor_infos=tensor_infos,
-                config=config,
-                handle=engine_handle,
-                provider=engine_name,
-                engine_id=engine_id,
-                plugin_path=engine_plugin_path,
-                reference_outputs=reference_outputs,
-                reference_error=reference_error,
-                input_data=graph_input_data,
-                validation_requested=validation_requested,
-                graph_json=graph_json,
-                analytical_flops=analytical_flops,
-                analytical_flops_partial=analytical_flops_partial,
-                analytical_io_bytes=analytical_io_bytes,
-            )
-        pe_result.elapsed_time_ms = t.elapsed_ms
-        if engine_plugin_path is not None:
-            pe_result.plugin_path = str(engine_plugin_path)
-        if reporter is not None:
-            reporter.print_engine_result(pe_result)
-        pe_results.append(pe_result)
-
-    return GraphResult(
-        graph_name=graph_name,
-        graph_path=str(graph_path),
-        results=pe_results,
-        engine_ids=engine_ids,
-    )
-
-
-def run_graph_pytorch_backend(
-    graph_path: Path,
-    graph_json: Dict[str, Any],
-    tensor_infos: list,
-    config: SuiteConfig,
-    reporter: Optional[Reporter] = None,
-) -> GraphResult:
-    """Run a single graph through the PyTorch executor as the sole engine row.
-
-    The ``--backend pytorch`` counterpart of :func:`run_graph_all_providers`:
-    no hipDNN engine discovery, plugins, or reference validation — one
-    ``provider="pytorch"`` engine row per graph, so suite console output and
-    JSON artifacts share one schema across execution backends and hosts
-    (ROCm and CUDA).
-    """
-    graph_name = graph_json.get("name", graph_path.stem)
-    provider = ReferenceProviderName.PYTORCH.value
-    rtol, atol = _fallback_tolerance_for_config(config)
-
-    # Unsupported operations are an unsupported-graph signal (mirrors the
-    # hipDNN UnsupportedGraphError path), not an execution error. Checked
-    # before input generation: the check is a static graph inspection, so
-    # unsupported graphs are skipped without allocating inputs (and without
-    # misreporting an input-generation failure as an error). A torch import
-    # failure here is deliberately ignored: the timed row below will surface
-    # it as a proper engine error.
-    unsupported: List[str] = []
-    try:
-        from ..execution import pytorch_ops
-
-        unsupported = sorted(pytorch_ops.get_unsupported_operations(graph_json))
-    except Exception:
-        pass
-    if unsupported:
-        msg = f"Graph contains unsupported operations: {unsupported}"
-        strict_selection = (
-            config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
-        )
-        row = ProviderEngineResult(
-            provider=provider,
-            engine_id=0,
-            status="error" if strict_selection else "skipped",
-            error_message=msg if strict_selection else None,
-            skip_reason=None if strict_selection else msg,
-            correctness=CorrectnessResult.failed(
-                rtol=rtol, atol=atol, error_message=msg
-            ),
-        )
-        if reporter is not None:
-            reporter.print_engine_start(provider)
-            reporter.print_engine_result(row)
-        return GraphResult(
-            graph_name=graph_name,
-            graph_path=str(graph_path),
-            results=[row],
-            engine_ids=[0],
-        )
-
-    try:
-        graph_input_data = generate_input_data(tensor_infos, config.seed, graph_json)
-    except (ValueError, RuntimeError, OSError, TypeError, OverflowError) as e:
-        msg = f"Input data generation failed: {e}"
-        return GraphResult(
-            graph_name=graph_name,
-            graph_path=str(graph_path),
-            results=[
-                ProviderEngineResult(
-                    provider=provider,
-                    engine_id=0,
-                    status="error",
-                    error_message=msg,
-                    correctness=CorrectnessResult.failed(
-                        rtol=rtol, atol=atol, error_message=msg
-                    ),
-                )
-            ],
-            engine_ids=[0],
-        )
-
-    (
-        analytical_flops,
-        analytical_flops_partial,
-        analytical_io_bytes,
-    ) = _compute_graph_analytical_metrics(graph_json, tensor_infos, config, graph_name)
-
-    if reporter is not None:
-        reporter.print_engine_start(provider)
-    row = _run_timed_pytorch_row(
+    ctx = _GraphContext(
         graph_path=graph_path,
         graph_json=graph_json,
         graph_name=graph_name,
         tensor_infos=tensor_infos,
         config=config,
-        input_data=graph_input_data,
-        analytical_flops=analytical_flops,
-        analytical_flops_partial=analytical_flops_partial,
-        analytical_io_bytes=analytical_io_bytes,
-        role="engine",
-    ).result
-    if reporter is not None:
-        reporter.print_engine_result(row)
-
-    return GraphResult(
-        graph_name=graph_name,
-        graph_path=str(graph_path),
-        results=[row],
-        engine_ids=[0],
+        reporter=reporter,
+        input_data=generate_input_data(tensor_infos, config.seed, graph_json),
     )
+    if config.metrics.basic:
+        try:
+            ctx.flops = compute_flops(graph_json)
+        except Exception as e:
+            warn_once("analytical", f"compute_flops failed for {graph_name}: {e}")
+        try:
+            ctx.io_bytes = compute_io_bytes(tensor_infos)
+        except Exception as e:
+            warn_once("analytical", f"compute_io_bytes failed for {graph_name}: {e}")
+    return ctx
 
 
-def _collect_basic_metrics_post_loop(
-    result: ProviderEngineResult,
-    cpu_time_probe: Optional[CpuTimeProbe],
-    benchmark_iters: int,
-    analytical_flops: Optional[int],
-    analytical_flops_partial: bool,
-    analytical_io_bytes: Optional[int],
-) -> None:
-    """Populate the basic always-on metric fields on ``result``.
+def _package_version(distribution: str) -> str:
+    try:
+        from importlib.metadata import version
 
-    Called once after the timed loop when ``metrics.tier == "basic"``.
-    Pulled out of :func:`run_single_provider_engine` to keep that
-    function focused on the timed loop itself; the basic-tier book
-    keeping is otherwise just a long sequence of conditionals on
-    intermediate results.
+        return version(distribution)
+    except Exception:
+        return "unavailable"
+
+
+def _run_pytorch_row(
+    ctx: _GraphContext, role: Literal["engine", "reference"]
+) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
+    """Time the graph through PyTorch as one row (``_time_pytorch_row``).
+
+    Then return PyTorch's cached VRAM to the device. The buffer manager
+    empties the cache on exit, but the row's locals (and, after a failure,
+    the exception's frames) still hold the executor and its intermediates at
+    that point. They reach the cache only once the row returns. Without this
+    release, hipDNN's own allocations (``hipMalloc``) for the same graph can
+    fail although the device has room.
     """
-    if cpu_time_probe is not None and cpu_time_probe.delta is not None:
-        # Per-iter microseconds is the interpretable unit: the loop
-        # total is dominated by Python dispatch cost, and per-iter
-        # lets users compare directly against the kernel mean (also
-        # reported per-iter).
-        iters = max(benchmark_iters, 1)
-        result.cpu_user_time_per_iter_us = (
-            cpu_time_probe.delta.user_time_ms * 1000.0 / iters
-        )
-        result.cpu_kernel_time_per_iter_us = (
-            cpu_time_probe.delta.kernel_time_ms * 1000.0 / iters
-        )
-
-    # Analytical totals were computed once at the graph level; propagate
-    # them onto every engine's result so JSON consumers don't have to
-    # look up across structures.
-    result.analytical_flops = analytical_flops
-    result.analytical_flops_partial = analytical_flops_partial
-    result.analytical_io_bytes = analytical_io_bytes
-
-    # Derived throughputs use the *arithmetic mean* of post-warmup kernel
-    # timings — no trimming, no outlier rejection. A single noisy iter
-    # (context switch, thermal throttle) skews the headline number; for
-    # tighter signal use gpu_kernel_stats.min_ms or p95_ms.
-    kernel_mean = (
-        result.gpu_kernel_stats.mean_ms if result.gpu_kernel_stats is not None else None
-    )
-    tflops, gbytes = derive_throughputs(
-        analytical_flops, analytical_io_bytes, kernel_mean
-    )
-    result.derived_tflops_per_s = tflops
-    result.derived_gbytes_per_s = gbytes
-
-    # VRAM is sampled here (still inside the BufferManager context, so
-    # workspace + I/O buffers are still allocated). This is the only
-    # amdsmi field we expose per-engine — see ProviderEngineResult
-    # docstring.
     try:
-        snap = GpuSmiProbe().snapshot()
-        result.vram_used_mb = snap.get("vram_used_mb")
-    except Exception as e:
-        warn_once("gpu_smi", f"vram snapshot failed: {e}")
-
-
-# Benchmarking is latched when oracle plans are built. Disable hipDNN disk
-# caches so the selected provider variant cannot affect later runs.
-# ponytail: process-global guard; concurrent execution needs process isolation.
-_EXHAUSTIVE_ENV = {
-    "HIPDNN_FORCE_BENCHMARKING": "1",
-    "HIPDNN_DISABLE_CACHE": "1",
-}
-
-
-@contextmanager
-def _exhaustive_env(enabled: bool):
-    """Set provider benchmarking controls and restore the prior environment."""
-    if not enabled:
-        yield
-        return
-    previous = {name: os.environ.get(name) for name in _EXHAUSTIVE_ENV}
-    os.environ.update(_EXHAUSTIVE_ENV)
-    try:
-        yield
+        return _time_pytorch_row(ctx, role)
     finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        _release_torch_cache()
 
 
-def _run_oracle_pass(
-    *,
-    result: ProviderEngineResult,
-    graph_path: Path,
-    graph_json_str: str,
-    graph_name: str,
-    config: SuiteConfig,
-    handle: Any,
-    engine_id: int,
-    bm: Any,
-    ootb_executor: Any,
-    tensor_infos: list,
-    graph_json: Dict[str, Any],
-    reference_outputs: Optional[Dict[int, Any]],
-) -> None:
-    """Tune one engine and attach its result without failing the OOTB row."""
+def _release_torch_cache() -> None:
+    """Free the tensors no longer referenced, then return PyTorch's cached VRAM.
+
+    ``gc.collect()`` frees tensors held only by reference cycles, which
+    ``empty_cache()`` alone cannot release.
+    """
+    torch = sys.modules.get("torch")
     try:
-        with _exhaustive_env(config.oracle_exhaustive):
-            # Isolate MIOpen's mutable per-handle solver map from the baseline.
-            oracle_handle = type(handle)()
-            get_stream = getattr(handle, "get_stream", None)
-            set_stream = getattr(oracle_handle, "set_stream", None)
-            if callable(get_stream) and callable(set_stream):
-                set_stream(get_stream())
-            bench_config = BenchmarkConfig(
-                graph_path=graph_path,
-                warmup_iters=config.warmup_iters,
-                benchmark_iters=config.benchmark_iters,
-                engine_id=engine_id,
-            )
-            executor = Executor(
-                graph_json_str=graph_json_str,
-                config=bench_config,
-            )
-            executor.prepare(oracle_handle, engine_id=engine_id, for_autotune=True)
+        if torch is None or not torch.cuda.is_initialized():
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
-            # Restore outputs; inputs remain valid across executions.
-            bm.zero_outputs()
-            variant_pack = bm.create_variant_pack()
 
-            candidates = executor.autotune(oracle_handle, variant_pack, engine_id)
-            eligible_candidates = [
-                candidate
-                for candidate in candidates
-                if not getattr(candidate, "excluded_by_caller", False)
-            ]
-            successful_candidates = [
-                candidate for candidate in eligible_candidates if candidate.succeeded
-            ]
-            winner = successful_candidates[0]
+_OUT_OF_MEMORY = re.compile(r"out ?of ?memory", re.IGNORECASE)
 
-            # Re-time OOTB after the sweep so both operands share device warmth.
-            bm.zero_outputs()
-            ootb_executor.warmup(handle, variant_pack)
-            baseline_result = ootb_executor.benchmark(
-                handle, variant_pack, graph_name=graph_name
-            )
 
-            bm.zero_outputs()
-            executor.warmup(oracle_handle, variant_pack)
-            bench_result = executor.benchmark(
-                oracle_handle, variant_pack, graph_name=graph_name
-            )
+def _gpu_memory_at_row_start() -> Optional[str]:
+    """Device memory as a row starts, reported if the row runs out of memory.
 
-            oracle = OracleResult(
-                plan_name=executor.plan_name(oracle_handle) or "",
-                compiled_plan_index=int(winner.compiled_plan_index),
-                rank=int(winner.rank),
-                sweep_min_time_ms=float(winner.min_time_ms),
-                compiled_plans_benchmarked=len(successful_candidates),
-                compiled_plans_total=len(eligible_candidates),
-                compiled_plans_failed=(
-                    len(eligible_candidates) - len(successful_candidates)
-                ),
-                knob_settings=[
-                    {"knob_id": str(k.knob_id), "value": k.value}
-                    for k in winner.knob_settings
-                ],
-                cpu_build_time_ms=executor.init_time_ms,
-                host_stats=BenchmarkStats.from_timings(bench_result.host_timings),
-                gpu_kernel_stats=(
-                    BenchmarkStats.from_timings(bench_result.kernel_timings)
-                    if bench_result.has_kernel_timings
-                    else None
-                ),
-                warm_baseline_host_stats=BenchmarkStats.from_timings(
-                    baseline_result.host_timings
-                ),
-                warm_baseline_gpu_kernel_stats=(
-                    BenchmarkStats.from_timings(baseline_result.kernel_timings)
-                    if baseline_result.has_kernel_timings
-                    else None
-                ),
-                exhaustive_requested=config.oracle_exhaustive,
-                exhaustive_supported=bool(
-                    getattr(winner, "supports_exhaustive", False)
-                ),
-            )
+    Read only when torch has already initialized the GPU: initializing it
+    here would itself take VRAM in a run that has no PyTorch rows. The
+    device-free figure counts every process on the GPU; the PyTorch cache
+    figure counts only this process.
+    """
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_initialized():
+            return None
+        free, total = torch.cuda.mem_get_info()
+        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    except Exception:
+        return None
+    gib = float(1 << 30)
+    return (
+        f"at row start the GPU had {free / gib:.1f} of {total / gib:.1f} GiB free "
+        f"(all processes) and this process's PyTorch cache held "
+        f"{cached / gib:.1f} GiB unused"
+    )
 
-            # Validate after timing; keep OOTB and tuned verdicts separate.
-            if reference_outputs is not None:
-                bm.zero_outputs()
-                executor.execute_once(oracle_handle, variant_pack)
-                oracle.correctness = _check_correctness(
-                    bm,
-                    tensor_infos,
-                    graph_json,
-                    reference_outputs,
-                    config.validation.provider.value,
-                    config,
-                )
 
-            result.oracle = oracle
-            # A speedup requires two valid operands.
-            invalid = [
-                side
-                for side, verdict in (
-                    ("baseline", result.correctness),
-                    ("tuned plan", oracle.correctness),
-                )
-                if verdict is not None and verdict.explicitly_failed
-            ]
-            if invalid:
-                # Preserve timing and verdict evidence, but refuse the ratio.
-                result.oracle_delta = None
-                warn_once(
-                    "oracle_correctness",
-                    f"oracle comparison for {graph_name} engine {engine_id} "
-                    f"suppressed: {' and '.join(invalid)} failed validation",
-                )
-            else:
-                result.oracle_delta = build_oracle_delta(oracle)
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-        result.oracle_error = error
-        warn_once(
-            "oracle",
-            f"oracle tuning failed for {graph_name} engine {engine_id}: {error}",
+def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
+    """``Type: message``, plus the row-start memory for out-of-memory errors."""
+    message = f"{type(error).__name__}: {error}"
+    if memory_at_start is not None and _OUT_OF_MEMORY.search(message):
+        message = f"{message} [{memory_at_start}]"
+    return message
+
+
+def _time_pytorch_row(
+    ctx: _GraphContext, role: Literal["engine", "reference"]
+) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
+    """Time the graph through PyTorch as one row.
+
+    ``role="reference"`` additionally extracts reference outputs for the
+    engine comparison. Unsupported graphs are skipped unless the SDPA
+    selection is strict. Any other failure of a default-dispatch reference
+    is skipped (the CPU reference may still serve); any other failure of a
+    strict SDPA selection or of the ``--runtime pytorch`` engine row is an
+    error.
+    """
+    config = ctx.config
+    strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
+    row = ProviderEngineResult(
+        runtime="pytorch",
+        engine_id=None,
+        engine_name="pytorch",
+        status="success",
+        role=role,
+        engine_version=_package_version("torch"),
+    )
+    outputs: Optional[Dict[int, ReferenceOutput]] = None
+    memory_at_start = _gpu_memory_at_row_start()
+    try:
+        from . import pytorch_ops
+        from .pytorch_buffer_manager import PyTorchCudaBufferManager
+        from .pytorch_executor import PyTorchCudaExecutor
+
+        executor = PyTorchCudaExecutor(
+            ctx.graph_json,
+            config.timing_policy,
+            pytorch_sdpa_backend=config.pytorch_sdpa_backend,
+            pytorch_rocm_fa_library=config.pytorch_rocm_fa_library,
         )
+        executor.prepare()
+        # The executor's device, not the buffer manager's cuda:0 default.
+        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
+            bm.allocate_all()
+            bm.load_input_data(ctx.input_data)
+            bm.zero_outputs()
+            tensors = bm.get_tensors()
+            _measure_row(row, ctx, lambda: executor.benchmark(tensors))
+            row.warnings = (row.warnings or []) + executor.notes
+            if role == "reference":
+                bm.zero_outputs()
+                executor.execute_once(tensors)
+                # A profiling child allocates its own VRAM, so profiled runs
+                # keep host-only references (and DeviceBuffer I/O).
+                outputs = _pytorch_reference_outputs_from_buffer(
+                    bm, keep_device=not config.metrics.opt_in_pass_requested
+                )
+        if role == "reference":
+            row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
+                ctx.graph_json
+            )
+        # After the OOTB buffers are released, so the child's allocations do
+        # not stack on top of them.
+        if config.oracle:
+            run_pytorch_tuned(
+                row=row,
+                graph_path=ctx.graph_path,
+                graph_json=ctx.graph_json,
+                graph_name=ctx.graph_name,
+                config=config,
+            )
+    except StallFallbackError:
+        raise  # run_graph remeasures the whole graph unstalled.
+    except UnsupportedGraphError as e:
+        return _failed_row(_error_or_skip(strict), row, str(e)), None
+    except Exception as e:
+        fatal = role == "engine" or strict
+        message = _failure_message(e, memory_at_start)
+        return _failed_row(_error_or_skip(fatal), row, message), None
+    return row, outputs
 
 
 def run_single_provider_engine(
-    graph_path: Path,
-    graph_json_str: str,
-    graph_name: str,
-    tensor_infos: list,
-    config: SuiteConfig,
+    ctx: _GraphContext,
     handle: Any,
-    provider: str,
     engine_id: int,
+    engine_name: str,
+    engine_version: str,
     plugin_path: Optional[Path],
-    reference_outputs: Optional[Dict[int, ReferenceOutput]],
-    reference_error: Optional[str],
-    input_data: Dict[int, Any],
-    validation_requested: bool,
-    graph_json: Dict[str, Any],
-    analytical_flops: Optional[int] = None,
-    analytical_flops_partial: bool = False,
-    analytical_io_bytes: Optional[int] = None,
 ) -> ProviderEngineResult:
-    """Execute a single engine for a graph (single attempt)."""
-    # Initialise the result conservatively as an error and mutate fields as
-    # the run progresses; on success, status flips to "success" at the end.
-    result = ProviderEngineResult(
-        provider=provider,
+    """Build, time, validate (and optionally tune/profile) one hipDNN engine."""
+    config = ctx.config
+    plugin = str(plugin_path) if plugin_path is not None else None
+    row = ProviderEngineResult(
+        runtime="hipdnn",
         engine_id=engine_id,
-        status="error",
-        engine_version=_resolve_engine_version(handle, engine_id),
+        engine_name=engine_name,
+        status="success",
+        engine_version=engine_version,
+        plugin_path=plugin,
+    )
+    memory_at_start = _gpu_memory_at_row_start()
+    try:
+        if tuned_in_process(ctx.graph_id, engine_id):
+            # Typically the stall-fallback rerun of a graph whose first
+            # attempt already ran this engine's search, or a repeated graph.
+            raise RuntimeError(
+                "OOTB not measurable: this engine already ran a tuned search on "
+                "this graph in this process, and hipDNN would serve its winner"
+            )
+        # Absorb the engine's one-time build costs (provider setup, cold
+        # plugin and kernel file reads) before timing, so the OOTB and tuned
+        # build times start from the same state.
+        Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
+        executor = Executor(ctx.graph_json_str, config.timing_policy)
+        executor.prepare(handle, engine_id=engine_id)
+        row.ootb.cpu_build_time_ms = executor.build_time_ms
+        if config.metrics.basic:
+            row.ootb.workspace_bytes = executor.workspace_size
+        tuned = (
+            build_tuned_plan(
+                row=row,
+                handle=handle,
+                engine_id=engine_id,
+                graph_json_str=ctx.graph_json_str,
+                graph_name=ctx.graph_name,
+                config=config,
+            )
+            if config.oracle
+            else None
+        )
+
+        with BufferManager(
+            ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
+        ) as bm:
+            bm.allocate_all()
+            bm.load_input_data(ctx.input_data)
+            bm.zero_outputs()
+            variant_pack = bm.create_variant_pack()
+            _measure_row(row, ctx, lambda: executor.benchmark(handle, variant_pack))
+
+            _validate_row(
+                row, ctx, bm, lambda: executor.execute_once(handle, variant_pack)
+            )
+
+            if tuned is not None:
+                run_tuned_plan(
+                    tuned=tuned,
+                    row=row,
+                    graph_id=ctx.graph_id,
+                    engine_id=engine_id,
+                    graph_name=ctx.graph_name,
+                    config=config,
+                    bm=bm,
+                    variant_pack=variant_pack,
+                    tensor_infos=ctx.tensor_infos,
+                    reference_outputs=ctx.reference_outputs,
+                )
+        # Release both workspaces before the profiling child allocates its own
+        # VRAM; holding them roughly doubles peak VRAM on large graphs.
+        del executor, tuned
+    except StallFallbackError:
+        raise  # run_graph remeasures the whole graph unstalled.
+    except UnsupportedGraphError as e:
+        return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
+    except Exception as e:
+        return _failed_row(
+            ProviderEngineResult.error_row,
+            row,
+            _failure_message(e, memory_at_start),
+        )
+
+    # Profiling re-runs the workload after the timed pass, so profiler
+    # overhead cannot pollute the headline numbers.
+    if config.metrics.opt_in_pass_requested:
+        _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
+    return row
+
+
+def _validate_row(
+    row: ProviderEngineResult,
+    ctx: _GraphContext,
+    bm: Any,
+    execute_once: Callable[[], None],
+) -> None:
+    """Set ``row.ootb.correctness`` for one engine row.
+
+    With reference outputs, run the engine once more on zeroed outputs and
+    compare. When the reference was skipped on purpose (it does not fit in
+    host memory), the row is unchecked. When ``--validate`` has no usable
+    reference for another reason, the row fails, so ``--validate`` stays a
+    hard gate.
+    """
+    config = ctx.config
+    if ctx.reference_outputs is not None:
+        bm.zero_outputs()
+        execute_once()
+        row.ootb.correctness = check_correctness(
+            bm,
+            ctx.tensor_infos,
+            ctx.reference_outputs,
+            config.validation.provider.value,
+            config,
+        )
+    elif ctx.validation_skip_reason is not None:
+        row.ootb.correctness = unchecked(config, ctx.validation_skip_reason)
+    elif config.validation.enabled:
+        row.ootb.correctness = mismatch(
+            config, ctx.reference_error or "Reference outputs unavailable"
+        )
+
+
+def _error_or_skip(fatal: bool) -> Callable[..., ProviderEngineResult]:
+    return ProviderEngineResult.error_row if fatal else ProviderEngineResult.skipped_row
+
+
+def _failed_row(
+    make: Callable[..., ProviderEngineResult],
+    row: ProviderEngineResult,
+    message: str,
+) -> ProviderEngineResult:
+    """Replace a partially filled row with a reason-only error/skipped row."""
+    failed = make(
+        row.runtime,
+        row.engine_id,
+        message,
+        engine_name=row.engine_name,
+        role=row.role,
+        plugin_path=row.plugin_path,
+    )
+    failed.engine_version = row.engine_version
+    return failed
+
+
+def _run_profiling(
+    row: ProviderEngineResult,
+    ctx: _GraphContext,
+    engine_id: int,
+    engine_name: str,
+    plugin_path: Optional[Path],
+) -> None:
+    """Run the opt-in profiler passes; a failure annotates the timed row."""
+    from ..metrics.profiling_orchestrator import run_profiling_passes
+
+    extra = None
+    ctx.reporter.profiling_start(engine_name)
+    with Timer() as t:
+        try:
+            extra = run_profiling_passes(
+                graph_path=ctx.graph_path,
+                engine_id=engine_id,
+                engine_name=engine_name,
+                seed=ctx.config.seed,
+                warmup_iters=ctx.config.warmup_iters,
+                metrics_config=ctx.config.metrics,
+                plugin_path=plugin_path,
+            )
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            warn_once("profiling", f"profiling pass failed: {msg}")
+            row.warnings = (row.warnings or []) + [f"profiling failed: {msg}"]
+    ctx.reporter.profiling_done(engine_name, t.elapsed_ms / 1000.0)
+    row.extra_metrics = extra or None
+
+
+def _prepare_references(
+    ctx: _GraphContext,
+) -> Optional[ProviderEngineResult]:
+    """Compute reference outputs once per graph; return the timed PyTorch row.
+
+    Sets ``ctx.reference_outputs`` or ``ctx.reference_error``. A strict
+    PyTorch SDPA selection never falls back to the CPU reference after the
+    timed native path fails. The CPU reference is skipped when its estimated
+    host memory does not fit (``ctx.validation_skip_reason``): the engine rows
+    are then unchecked, not failed.
+
+    With ``--reference-precision float64`` (the default), a graph the provider
+    can compute in float64 gets a float64 reference: on the GPU after the
+    timed row, else on the host. If the float64 reference fails or does not
+    fit, the native reference serves and the reference row gets a note.
+    """
+    config = ctx.config
+    provider, ctx.reference_error = _reference_provider(config, ctx.graph_json)
+    if provider is None:
+        warn_once("validation", f"{ctx.graph_name}: {ctx.reference_error}")
+        return None
+
+    outputs: Optional[Dict[int, ReferenceOutput]] = None
+
+    def run() -> ProviderEngineResult:
+        nonlocal outputs
+        row, outputs = _run_pytorch_row(ctx, "reference")
+        return row
+
+    row = _report_row(ctx.reporter, "pytorch reference", run)
+    float64 = (
+        config.validation.precision is ReferencePrecision.FLOAT64
+        and provider.supports_float64(ctx.graph_json)
+    )
+    if outputs is not None:
+        # Drop the local name: ctx.reference_outputs then holds the only
+        # reference to the native outputs, so the float64 pass can free them.
+        ctx.reference_outputs, outputs = outputs, None
+        if float64:
+            # The timed row ran, so PyTorch has a GPU. The native outputs stay
+            # the reference if the float64 one fails.
+            _use_float64_reference(ctx, provider, row, device="cuda")
+    elif config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT:
+        ctx.reference_error = (
+            row.error_message
+            or row.skip_reason
+            or (
+                f"Requested PyTorch SDPA backend '{config.pytorch_sdpa_backend.value}' "
+                "is unavailable; no fallback is used."
+            )
+        )
+    else:
+        if float64:
+            shortfall = _host_memory_shortfall(
+                provider, ctx.graph_json, ReferencePrecision.FLOAT64
+            )
+            if shortfall is not None:
+                _note_native_reference(ctx, row, shortfall)
+            elif _use_float64_reference(ctx, provider, row, device=None):
+                return row
+        shortfall = _host_memory_shortfall(provider, ctx.graph_json)
+        if shortfall is not None:
+            ctx.validation_skip_reason = f"validation skipped: {shortfall}"
+            ctx.reference_error = ctx.validation_skip_reason
+            warn_once("validation", f"{ctx.graph_name}: {ctx.validation_skip_reason}")
+        else:
+            ctx.reference_outputs, ctx.reference_error = (
+                _compute_reference_outputs_once(
+                    provider, ctx.graph_json, ctx.input_data, config
+                )
+            )
+    return row
+
+
+def _use_float64_reference(
+    ctx: _GraphContext,
+    provider: ReferenceProvider,
+    row: ProviderEngineResult,
+    device: Optional[str],
+) -> bool:
+    """Make a float64 reference ``ctx.reference_outputs``; False if it failed.
+
+    A failure (for example a GPU out-of-memory error) keeps the current
+    reference and adds a note to ``row``. Profiled runs keep host-only
+    references, as the timed row does.
+    """
+    outputs, error = _compute_reference_outputs_once(
+        provider,
+        ctx.graph_json,
+        ctx.input_data,
+        ctx.config,
+        ReferencePrecision.FLOAT64,
+        device,
+    )
+    if outputs is None:
+        _release_torch_cache()
+        _note_native_reference(ctx, row, error or "no outputs")
+        return False
+    keep_device = not ctx.config.metrics.opt_in_pass_requested
+    for ref in outputs.values():
+        if ref.device_data is None:
+            continue
+        if keep_device:
+            ref.device_data = _owned(ref.device_data)
+        else:
+            ref.data, ref.device_data = ref.host_data(), None
+    ctx.reference_outputs = outputs
+    # Return the float64 temporaries and the replaced native outputs to the
+    # device before the engine rows allocate.
+    _release_torch_cache()
+    return True
+
+
+def _note_native_reference(
+    ctx: _GraphContext, row: ProviderEngineResult, reason: str
+) -> None:
+    """Record on the reference row why the float64 reference is not used."""
+    note = f"float64 reference not used ({reason}); using the graph data types"
+    row.warnings = (row.warnings or []) + [note]
+    warn_once("validation", f"{ctx.graph_name}: {note}")
+
+
+#: Share of the available host memory the CPU reference may use; the rest is
+#: left for the engine rows of the same graph and for the estimate's error.
+_REFERENCE_HOST_FRACTION = 0.8
+
+
+def _host_memory_shortfall(
+    provider: ReferenceProvider,
+    graph_json: Dict[str, Any],
+    precision: ReferencePrecision = ReferencePrecision.NATIVE,
+) -> Optional[str]:
+    """Why the CPU reference would not fit in host memory, or None.
+
+    Without an estimate or a reading of the available memory, the reference
+    runs as before.
+    """
+    needed = provider.estimate_host_bytes(graph_json, precision)
+    if needed is None:
+        return None
+    try:
+        import psutil
+
+        available = psutil.virtual_memory().available
+    except Exception as e:
+        warn_once("validation", f"host memory reading failed: {e}")
+        return None
+    if needed <= available * _REFERENCE_HOST_FRACTION:
+        return None
+    gib = float(1 << 30)
+    kind = "float64 " if precision is ReferencePrecision.FLOAT64 else ""
+    return (
+        f"the {kind}CPU reference needs about {needed / gib:.1f} GiB "
+        f"of host memory and {available / gib:.1f} GiB is available"
     )
 
-    metrics_basic = config.metrics.basic_enabled
 
+def _with_stall_fallback(
+    run: Callable[[SuiteConfig], GraphResult],
+    config: SuiteConfig,
+    reporter: Reporter,
+) -> GraphResult:
+    """Run one graph; if stall-gated timing fails, rerun every row unstalled.
+
+    Rows of one graph are compared with each other, so they must share a
+    timing mode: a declined arm or a watchdog release discards the partial
+    graph instead of mixing staged and events rows. Each rerun row records
+    the reason in ``timing.fallback_reason`` and ``warnings``.
+    """
     try:
-        bench_config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=config.warmup_iters,
-            benchmark_iters=config.benchmark_iters,
-            engine_id=engine_id,
-        )
+        return run(config)
+    except StallFallbackError as e:
+        reason = str(e)
+    # Rerun outside the except block: the caught exception's traceback holds
+    # every frame of the first attempt, with its inputs, references, device
+    # buffers and workspaces, until the block exits.
+    reporter.warning(f"{reason}; remeasuring every row of this graph without stalling")
+    unstalled = copy.copy(config)
+    unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
+    return run(unstalled)
 
-        executor = Executor(
-            graph_json_str=graph_json_str,
-            config=bench_config,
-        )
-        executor.prepare(handle, engine_id=engine_id)
-        result.cpu_build_time_ms = executor.init_time_ms
-        if metrics_basic:
-            result.workspace_bytes = executor.workspace_size
 
-        with BufferManager(tensor_infos) as bm:
-            bm.allocate_all()
-            bm.load_input_data(input_data)
-            bm.zero_outputs()
+@dataclass
+class RuntimePlan:
+    """What one runtime runs for one graph, decided before inputs exist.
 
-            variant_pack = bm.create_variant_pack()
-            executor.warmup(handle, variant_pack)
+    Attributes:
+        runtime: Runtime name; it prefixes ``message`` and ``error`` when a
+            run selects several runtimes.
+        engine_ids: Engines that apply (0 for each non-hipDNN row); empty
+            means none.
+        rows: Builds the rows. It gets the shared graph context, or None when
+            no plan of the graph needs inputs.
+        message: Why no engine applies.
+        error: Why selection failed; the runtime then adds no rows.
+        needs_inputs: The rows, or the reference row this runtime promises
+            for a graph without engines, need generated inputs.
+    """
 
-            # Wrap the timed loop with always-on host probes when basic
-            # tier is enabled. The probes are designed to be no-cost on
-            # the GPU side: CPU-time sampling is two read-only kernel
-            # calls before/after the loop, and the amdsmi snapshot fires
-            # once after the benchmark returns. Failures inside probes
-            # are swallowed and surface as None fields on the result.
-            cpu_time_probe = CpuTimeProbe() if metrics_basic else None
-            if cpu_time_probe is not None:
-                cpu_time_probe.__enter__()
+    runtime: str
+    engine_ids: List[int] = field(default_factory=list)
+    rows: Callable[[Optional[_GraphContext]], List[ProviderEngineResult]] = (
+        lambda ctx: []
+    )
+    message: Optional[str] = None
+    error: Optional[str] = None
+    needs_inputs: bool = False
+
+
+#: ``plan(graph_path, graph_json, tensor_infos, config, reporter)``. A new
+#: runtime adds one planner; :func:`run_graph` composes any of them.
+GraphPlanner = Callable[
+    [Path, Dict[str, Any], list, SuiteConfig, Reporter], RuntimePlan
+]
+
+
+def run_graph(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+    planners: Sequence[GraphPlanner],
+) -> GraphResult:
+    """Run one graph through every planner's runtime, in order.
+
+    Inputs and the ``--validate`` reference row are computed once and shared
+    by every runtime. A runtime that does not apply adds no rows; its reason
+    becomes ``GraphResult.message`` only when no runtime applies. A selection
+    failure sets ``GraphResult.error`` and the other runtimes still run. A
+    stall-gate failure reruns the whole graph without stalling
+    (``_with_stall_fallback``), so all rows share one timing mode.
+    """
+    return _with_stall_fallback(
+        lambda cfg: _run_graph(
+            graph_path, graph_json, tensor_infos, cfg, reporter, planners
+        ),
+        config,
+        reporter,
+    )
+
+
+def _run_graph(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+    planners: Sequence[GraphPlanner],
+) -> GraphResult:
+    """One attempt of :func:`run_graph` with ``config``'s policy."""
+    graph = GraphResult(
+        graph_name=graph_json.get("name", graph_path.stem),
+        graph_path=str(graph_path),
+        results=[],
+        graph_id=graph_id_for(graph_json),
+    )
+    plans = [
+        plan(graph_path, graph_json, tensor_infos, config, reporter)
+        for plan in planners
+    ]
+
+    def labelled(plan: RuntimePlan, text: str) -> str:
+        return f"{plan.runtime}: {text}" if len(plans) > 1 else text
+
+    errors = [labelled(p, p.error) for p in plans if p.error is not None]
+    graph.error = "; ".join(errors) or None
+    graph.engine_ids = [e for p in plans for e in p.engine_ids]
+    if not graph.engine_ids:
+        messages = [labelled(p, p.message) for p in plans if p.message]
+        graph.message = "; ".join(messages) or None
+
+    ctx: Optional[_GraphContext] = None
+    if any(p.needs_inputs for p in plans):
+        try:
+            ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
+        except Exception as e:
+            errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
+            graph.error = "; ".join(errors)
+            return graph
+        ctx.graph_json_str, ctx.graph_id = json.dumps(graph_json), graph.graph_id
+        if config.validation.enabled:
+            reference_row = _prepare_references(ctx)
+            if reference_row is not None:
+                graph.results.append(reference_row)
+
+    for plan in plans:
+        graph.results.extend(plan.rows(ctx))
+    return graph
+
+
+def hipdnn_planner(handle: Any) -> GraphPlanner:
+    """Plan every selected or discovered hipDNN engine.
+
+    Explicit ``--engine`` IDs run in the caller's order; otherwise the graph's
+    ranked engines are discovered. A graph without engines still needs inputs:
+    with ``--validate pytorch`` the timed PyTorch reference row is emitted
+    when PyTorch can run the graph.
+
+    Args:
+        handle: hipdnn.Handle, or None to create one per engine (per-engine
+            plugin paths).
+    """
+
+    def plan(
+        graph_path: Path,
+        graph_json: Dict[str, Any],
+        tensor_infos: list,
+        config: SuiteConfig,
+        reporter: Reporter,
+    ) -> RuntimePlan:
+        message = None
+        if config.engine_filter is not None:
+            # Explicit --engine is a selection, not a post-discovery filter.
+            # Keep the caller's order so per-engine plugin paths are
+            # deterministic.
+            engine_ids = list(config.engine_filter)
+        else:
             try:
-                bench_result = executor.benchmark(
-                    handle, variant_pack, graph_name=graph_name
-                )
-            finally:
-                if cpu_time_probe is not None:
-                    cpu_time_probe.__exit__(None, None, None)
-
-            result.host_stats = BenchmarkStats.from_timings(bench_result.host_timings)
-            if bench_result.has_kernel_timings:
-                result.gpu_kernel_stats = BenchmarkStats.from_timings(
-                    bench_result.kernel_timings
-                )
-
-            if metrics_basic:
-                _collect_basic_metrics_post_loop(
-                    result=result,
-                    cpu_time_probe=cpu_time_probe,
-                    benchmark_iters=config.benchmark_iters,
-                    analytical_flops=analytical_flops,
-                    analytical_flops_partial=analytical_flops_partial,
-                    analytical_io_bytes=analytical_io_bytes,
-                )
-
-            if reference_outputs is not None:
-                bm.zero_outputs()
-                executor.execute_once(handle, variant_pack)
-                result.correctness = _check_correctness(
-                    bm,
-                    tensor_infos,
-                    graph_json,
-                    reference_outputs,
-                    config.validation.provider.value,
-                    config,
-                )
-            elif validation_requested:
-                error_message = reference_error or (
-                    f"Reference provider '{config.validation.provider.value}' "
-                    f"does not support this graph"
-                )
-                # User asked for validation but no reference output was usable.
-                # Treat as a correctness failure so --validate stays a hard gate.
-                result.correctness = _reference_unavailable_correctness(
-                    config, error_message
-                )
-            else:
-                rtol, atol = _fallback_tolerance_for_config(config)
-                result.correctness = CorrectnessResult(
-                    execution_success=True,
-                    tolerance_match=None,
-                    rtol=rtol,
-                    atol=atol,
-                    error_message="No reference provider requested",
-                )
-
-            # Reaching here means the OOTB timed pass succeeded (any
-            # failure raised out of this try block already), so the row
-            # is eligible for an oracle comparison.
-            if config.oracle_enabled:
-                _run_oracle_pass(
-                    result=result,
-                    graph_path=graph_path,
-                    graph_json_str=graph_json_str,
-                    graph_name=graph_name,
-                    config=config,
-                    handle=handle,
-                    engine_id=engine_id,
-                    bm=bm,
-                    ootb_executor=executor,
-                    tensor_infos=tensor_infos,
-                    graph_json=graph_json,
-                    reference_outputs=reference_outputs,
-                )
-
-        # BufferManager context has exited — I/O buffers are freed.
-        # Drop the executor reference too so its workspace allocation
-        # is released before the profiling subprocess fires. Without
-        # this, the inner profiling process allocates its own VRAM on
-        # top of the parent's still-pinned workspace, which roughly
-        # doubles peak VRAM and can OOM on large graphs that fit fine
-        # on the headline run.
-        del executor
-
-        # Opt-in profiling pass — runs *after* the timed pass and
-        # always-on probes (so profiler overhead can't pollute the
-        # headline numbers) and *after* the bm/executor teardown above
-        # (so the subprocess gets the full VRAM headroom the parent
-        # had). The orchestrator handles tool-missing / paranoid /
-        # parse failures internally and never raises; we still wrap
-        # defensively because anything bubbling out would mark a
-        # successful timed run as failed.
-        if config.metrics.opt_in_pass_requested:
-            try:
-                from ..metrics.profiling_orchestrator import (
-                    run_profiling_passes,
-                )
-
-                extra = run_profiling_passes(
-                    graph_path=graph_path,
-                    engine_id=engine_id,
-                    # `provider` is the human-readable engine name set
-                    # by run_graph_all_providers (see
-                    # ``_resolve_engine_name``) — use it for the
-                    # per-engine output subdirectory so the artifact
-                    # path doesn't carry the 19-digit engine ID hash.
-                    engine_name=provider,
-                    seed=config.seed,
-                    warmup_iters=config.warmup_iters,
-                    benchmark_iters=config.benchmark_iters,
-                    metrics_config=config.metrics,
-                    plugin_path=plugin_path,
-                )
-                if extra:
-                    result.extra_metrics = extra
+                # SuiteConfig requires --engine with several plugin paths, so
+                # the shared handle exists whenever discovery runs. The
+                # discovery graph is a temporary: it is not kept alive for the
+                # engine rows.
+                engine_ids = Executor(
+                    json.dumps(graph_json), config.timing_policy
+                ).discover_engines(handle)
+            except UnsupportedGraphError as e:
+                engine_ids, message = [], str(e)
             except Exception as e:
-                warn_once(
-                    "profiling_orchestrator",
-                    f"profiling pass failed: {type(e).__name__}: {e}",
+                return RuntimePlan(
+                    "hipdnn", error=f"Engine discovery failed: {type(e).__name__}: {e}"
                 )
+        selections = config.engine_selections_for(engine_ids)
+        return RuntimePlan(
+            "hipdnn",
+            engine_ids=engine_ids,
+            rows=lambda ctx: [
+                _run_engine_selection(ctx, handle, s.engine_id, s.plugin_path)
+                for s in selections
+            ],
+            message=message,
+            needs_inputs=True,
+        )
 
-        result.status = "success"
-        return result
+    return plan
 
+
+def _run_engine_selection(
+    ctx: _GraphContext,
+    handle: Any,
+    engine_id: int,
+    plugin_path: Optional[Path],
+) -> ProviderEngineResult:
+    """One engine row, creating a plugin-scoped handle when none is shared."""
+    if handle is None:
+        try:
+            import hipdnn_frontend as hipdnn
+
+            set_plugin_path(hipdnn, plugin_path)
+            handle = hipdnn.Handle()
+        except Exception as e:
+            label = engine_id_hex(engine_id) or ""
+            return _report_row(
+                ctx.reporter,
+                label,
+                lambda: ProviderEngineResult.error_row(
+                    "hipdnn",
+                    engine_id,
+                    f"{type(e).__name__}: {e}",
+                    engine_name=label,
+                    plugin_path=str(plugin_path) if plugin_path else None,
+                ),
+            )
+    name, version = _engine_identity(handle, engine_id)
+    return _report_row(
+        ctx.reporter,
+        name,
+        lambda: run_single_provider_engine(
+            ctx, handle, engine_id, name, version, plugin_path
+        ),
+    )
+
+
+def pytorch_plan(
+    graph_path: Path,
+    graph_json: Dict[str, Any],
+    tensor_infos: list,
+    config: SuiteConfig,
+    reporter: Reporter,
+) -> RuntimePlan:
+    """Plan the graph through the PyTorch executor as one engine row.
+
+    An unsupported operation gives an error or skipped row without inputs
+    (a static inspection).
+    """
+    from . import pytorch_ops
+
+    unsupported = sorted(pytorch_ops.get_unsupported_operations(graph_json))
+    if unsupported:
+        msg = f"Graph contains unsupported operations: {unsupported}"
+        make = _error_or_skip(
+            config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
+        )
+        return RuntimePlan(
+            "pytorch",
+            engine_ids=[0],
+            rows=lambda ctx: [
+                _report_row(
+                    reporter,
+                    "pytorch",
+                    lambda: make("pytorch", None, msg, engine_name="pytorch"),
+                )
+            ],
+        )
+    return RuntimePlan(
+        "pytorch",
+        engine_ids=[0],
+        rows=lambda ctx: [
+            _report_row(reporter, "pytorch", lambda: _run_pytorch_row(ctx, "engine")[0])
+        ],
+        needs_inputs=True,
+    )
+
+
+@dataclass(frozen=True)
+class RockeSession:
+    """Per-suite rocKE state: the shipped-kernel catalog and the device.
+
+    Attributes:
+        catalog: hipDNN-shipped rocKE variants for ``arch``.
+        arch: GPU architecture name (``gfx950``).
+        num_cus: Compute-unit count for rocKE's dispatcher.
+        version: Installed ``rocke`` package version.
+        loaded: Code objects loaded so far, by ``(library, toc_key)``. A
+            variant loads once per suite, and every row that runs it reuses
+            the module.
+    """
+
+    catalog: Catalog
+    arch: str
+    num_cus: int
+    version: str
+    loaded: Dict[Tuple[Path, str], Any] = field(default_factory=dict)
+
+
+def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
+    """Read the device and the shipped rocKE catalog once per suite.
+
+    Raises:
+        OSError, ValueError, KeyError: A descriptor file is unreadable or
+            malformed.
+    """
+    import torch
+
+    from .rocke_executor import device_arch, device_num_cus
+    from .rocke_sdpa import load_catalog
+
+    device = torch.device("cuda")
+    arch = device_arch(device)
+    catalog = load_catalog(config.plugin_paths or [], arch)
+    if not catalog:
+        reporter.warning(
+            f"no hipDNN-shipped rocKE kernels for {arch} under the plugin path; "
+            "only the rocKE auto kernel runs"
+        )
+    return RockeSession(
+        catalog=catalog,
+        arch=arch,
+        num_cus=device_num_cus(device),
+        version=_package_version("rocke"),
+    )
+
+
+def rocke_planner(session: RockeSession) -> GraphPlanner:
+    """Plan every rocKE kernel that runs an SDPA graph.
+
+    One row for each hipDNN-shipped variant that runs the graph, then one row
+    for rocKE's auto kernel. A graph that no rocKE kernel runs gets no rows
+    and no inputs; alone, its status is ``no_engines``.
+    """
+
+    def plan(
+        graph_path: Path,
+        graph_json: Dict[str, Any],
+        tensor_infos: list,
+        config: SuiteConfig,
+        reporter: Reporter,
+    ) -> RuntimePlan:
+        try:
+            problem = sdpa_problem(graph_json, tensor_infos)
+            kernels: List[RockeKernel] = list(catalog_kernels(session.catalog, problem))
+            reasons = [] if kernels else ["no hipDNN-shipped rocKE variant matches"]
+            try:
+                kernels.append(auto_kernel(problem, session.arch, session.num_cus))
+            except UnsupportedGraphError as e:
+                reasons.append(str(e))
+        except UnsupportedGraphError as e:
+            return RuntimePlan("rocke", message=str(e))
+        except Exception as e:
+            return RuntimePlan(
+                "rocke",
+                error=f"rocKE kernel selection failed: {type(e).__name__}: {e}",
+            )
+        if not kernels:
+            return RuntimePlan("rocke", message="; ".join(reasons))
+
+        def rows(ctx: Optional[_GraphContext]) -> List[ProviderEngineResult]:
+            return [
+                _report_row(
+                    reporter,
+                    kernel.name,
+                    lambda k=kernel: _run_rocke_row(ctx, k, problem, session),
+                )
+                for kernel in kernels
+            ]
+
+        # No hipDNN engine IDs: one 0 sentinel per row, as for PyTorch.
+        return RuntimePlan(
+            "rocke", engine_ids=[0] * len(kernels), rows=rows, needs_inputs=True
+        )
+
+    return plan
+
+
+def _run_rocke_row(
+    ctx: _GraphContext,
+    kernel: RockeKernel,
+    problem: SdpaProblem,
+    session: RockeSession,
+) -> ProviderEngineResult:
+    """Load, time and validate one rocKE kernel."""
+    config = ctx.config
+    row = ProviderEngineResult(
+        runtime="rocke",
+        # The row name is stable across runs, so it is the engine ID.
+        engine_id=kernel.name,
+        engine_name=kernel.name,
+        status="success",
+        engine_version=session.version,
+    )
+    try:
+        from .pytorch_buffer_manager import PyTorchCudaBufferManager
+        from .rocke_executor import RockeExecutor
+
+        executor = RockeExecutor(
+            kernel, problem, config.timing_policy, loaded=session.loaded
+        )
+        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
+            bm.allocate_all()
+            bm.load_input_data(ctx.input_data)
+            bm.zero_outputs()
+            executor.prepare(bm.get_tensors())
+            row.ootb.cpu_build_time_ms = executor.build_time_ms
+            _measure_row(row, ctx, executor.benchmark)
+            _validate_row(row, ctx, bm, executor.execute_once)
+    except StallFallbackError:
+        raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
-        result.cpu_build_time_ms = None
-        result.gpu_kernel_stats = None
-        result.host_stats = None
-        result.status = "skipped"
-        result.skip_reason = str(e)
-        rtol, atol = _fallback_tolerance_for_config(config)
-        result.correctness = CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=str(e)
+        return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
+    except Exception as e:
+        return _failed_row(
+            ProviderEngineResult.error_row, row, f"{type(e).__name__}: {e}"
         )
-        return result
-
-    except ExecutionError as e:
-        error_msg = str(e)
-        result.cpu_build_time_ms = None
-        result.gpu_kernel_stats = None
-        result.host_stats = None
-        result.status = "error"
-        result.error_message = error_msg
-        rtol, atol = _fallback_tolerance_for_config(config)
-        result.correctness = CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=error_msg
-        )
-        return result
-
-    except (ValueError, RuntimeError, OSError) as e:
-        error_msg = str(e)
-        result.cpu_build_time_ms = None
-        result.gpu_kernel_stats = None
-        result.host_stats = None
-        result.status = "error"
-        result.error_message = error_msg
-        rtol, atol = _fallback_tolerance_for_config(config)
-        result.correctness = CorrectnessResult.failed(
-            rtol=rtol, atol=atol, error_message=error_msg
-        )
-        return result
+    return row

@@ -3,252 +3,139 @@
 
 """Benchmark statistics calculation."""
 
-import json
-import socket
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
 
-def _get_hostname() -> str:
-    """Get machine hostname for result identification."""
-    return socket.gethostname()
-
-
-def _get_timestamp() -> str:
-    """Get current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat()
-
-
 @dataclass
 class BenchmarkStats:
-    """Statistics from benchmark execution.
+    """Summary statistics of one timing sample set (milliseconds).
+
+    No field has a default: a partially built instance must fail loudly
+    rather than report a silent ``0.0``.
 
     Attributes:
-        mean_ms: Mean execution time in milliseconds.
-        median_ms: Median execution time in milliseconds.
-        std_ms: Standard deviation of execution time in milliseconds.
-        min_ms: Minimum execution time in milliseconds.
-        max_ms: Maximum execution time in milliseconds.
-        p95_ms: 95th percentile execution time in milliseconds.
-        p99_ms: 99th percentile execution time in milliseconds.
-        total_ms: Total execution time across all iterations in milliseconds.
+        n: Number of samples.
+        mean_ms: Arithmetic mean.
+        std_ms: Sample standard deviation (ddof=1; 0 for n == 1).
+        min_ms: Minimum.
+        p25_ms: 25th percentile.
+        median_ms: Upper median ``sorted(timings)[n // 2]`` (rocKE / Solera
+            definition; always an observed sample); the headline number.
+        p75_ms: 75th percentile.
+        p95_ms: 95th percentile (console only; meaningful for n >= 20).
+        max_ms: Maximum.
     """
 
+    n: int
     mean_ms: float
     std_ms: float
     min_ms: float
-    max_ms: float
+    p25_ms: float
+    median_ms: float
+    p75_ms: float
     p95_ms: float
-    p99_ms: float
-    total_ms: float = 0.0
-    median_ms: float = 0.0
+    max_ms: float
 
     @classmethod
-    def from_timings(cls, timings: List[float]) -> "BenchmarkStats":
-        """Calculate statistics from a list of timing values.
-
-        Args:
-            timings: List of execution times in milliseconds.
-
-        Returns:
-            BenchmarkStats with calculated statistics.
+    def from_timings(cls, timings: Sequence[float]) -> "BenchmarkStats":
+        """Summarize a non-empty list of timings in milliseconds.
 
         Raises:
-            ValueError: If timings list is empty.
+            ValueError: If ``timings`` is empty.
         """
-        if not timings:
+        if len(timings) == 0:
             raise ValueError("timings list cannot be empty")
-
-        arr = np.array(timings)
-
+        arr = np.asarray(timings, dtype=np.float64)
+        mean = float(arr.mean())
+        std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+        p25, p75, p95 = (float(v) for v in np.percentile(arr, [25, 75, 95]))
+        median = float(np.sort(arr)[arr.size // 2])
         return cls(
-            mean_ms=float(np.mean(arr)),
-            median_ms=float(np.median(arr)),
-            std_ms=float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
-            min_ms=float(np.min(arr)),
-            max_ms=float(np.max(arr)),
-            p95_ms=float(np.percentile(arr, 95)),
-            p99_ms=float(np.percentile(arr, 99)),
-            total_ms=float(np.sum(arr)),
+            n=int(arr.size),
+            mean_ms=mean,
+            std_ms=std,
+            min_ms=float(arr.min()),
+            p25_ms=p25,
+            median_ms=median,
+            p75_ms=p75,
+            p95_ms=p95,
+            max_ms=float(arr.max()),
         )
 
-    def to_dict(self) -> Dict[str, float]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "mean_ms": self.mean_ms,
-            "median_ms": self.median_ms,
-            "std_ms": self.std_ms,
-            "min_ms": self.min_ms,
-            "max_ms": self.max_ms,
-            "p95_ms": self.p95_ms,
-            "p99_ms": self.p99_ms,
-            "total_ms": self.total_ms,
-        }
-
-
-@dataclass
-class BenchmarkMetadata:
-    """Metadata for benchmark results export.
-
-    Attributes:
-        timestamp: UTC timestamp when benchmark was run.
-        graph_name: Name/identifier of the graph being benchmarked.
-        graph_path: Path to the graph JSON file.
-        warmup_iters: Number of warmup iterations.
-        benchmark_iters: Number of benchmark iterations.
-        engine_id: Engine ID used for execution.
-        timing_backend: GPU timer backend used ("hip" or "").
-        execution_backend: Execution backend used ("hipdnn", "pytorch", or "").
-        pytorch_sdpa_backend_requested: Requested PyTorch SDPA backend; None
-            when PyTorch SDPA selection does not apply.
-        pytorch_rocm_fa_library_requested: Requested ROCm Flash Attention
-            implementation preference; None when not requested.
-        hostname: Machine hostname where benchmark was run.
-    """
-
-    timestamp: str = field(default_factory=_get_timestamp)
-    graph_name: str = ""
-    graph_path: str = ""
-    warmup_iters: int = 0
-    benchmark_iters: int = 0
-    engine_id: int = 0
-    timing_backend: str = ""
-    execution_backend: str = ""
-    pytorch_sdpa_backend_requested: Optional[str] = None
-    pytorch_rocm_fa_library_requested: Optional[str] = None
-    hostname: str = field(default_factory=_get_hostname)
-
-
-@dataclass
-class BenchmarkResult:
-    """Raw benchmark timing results.
-
-    Holds host (submission) timings and optional kernel (GPU event) timings,
-    with metadata for cross-device comparison. End-to-end time, when needed,
-    is host + kernel.
-
-    Attributes:
-        host_timings: List of host-side submission times in milliseconds.
-        kernel_timings: Optional list of GPU kernel times in milliseconds.
-        metadata: Optional metadata for result identification and comparison.
-    """
-
-    host_timings: List[float]
-    kernel_timings: Optional[List[float]] = None
-    metadata: Optional[BenchmarkMetadata] = None
-
     @property
-    def has_kernel_timings(self) -> bool:
-        """Check if kernel timings are available."""
-        return self.kernel_timings is not None and len(self.kernel_timings) > 0
+    def iqr_ms(self) -> float:
+        """Interquartile range (not serialized)."""
+        return self.p75_ms - self.p25_ms
 
-    @property
-    def timing_backend(self) -> str:
-        """Return backend used for kernel timing."""
-        if self.metadata:
-            return self.metadata.timing_backend
-        return ""
+    #: The serialized subset: the median is the headline number, and the
+    #: quartiles give ``compare`` its noise band. The sample count is the
+    #: plan's ``timing.samples``; the others are for the console and
+    #: in-process warnings only.
+    SERIALIZED = ("p25_ms", "median_ms", "p75_ms")
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization.
+        """Convert to a JSON-ready dict of :attr:`SERIALIZED` keys."""
+        return {k: getattr(self, k) for k in self.SERIALIZED}
 
-        Returns:
-            Dictionary representation of the result.
-        """
-        result: Dict[str, Any] = {
-            "host_timings": self.host_timings,
-            "kernel_timings": self.kernel_timings,
-        }
-        if self.metadata:
-            result["metadata"] = asdict(self.metadata)
-        return result
 
-    def to_json(self, indent: int = 2) -> str:
-        """Serialize to JSON string.
+# Heuristic thresholds. NOISY_IQR: quiet MI210 runs show IQR 1-2 % of the
+# median (docs/usage.md example), so 5 % marks a disturbed run, not normal
+# spread. OUTLIER_RATIO: launch jitter and clock ramp on a quiet GPU stay well
+# under 2x (the slowest sample in the docs/methodology.md matmul run is 1.3x).
+NOISY_IQR = 0.05
+OUTLIER_RATIO = 2.0
 
-        Args:
-            indent: JSON indentation level.
 
-        Returns:
-            JSON string representation.
-        """
-        return json.dumps(self.to_dict(), indent=indent)
+def noise_warnings(stats: BenchmarkStats) -> List[str]:
+    """Flag dispersion a reader should know about; samples are never trimmed.
 
-    def save_json(self, path: str) -> None:
-        """Save results to JSON file.
-
-        Args:
-            path: Path to the output JSON file.
-        """
-        Path(path).write_text(self.to_json())
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "BenchmarkResult":
-        """Create from dictionary.
-
-        Args:
-            data: Dictionary with result data.
-
-        Returns:
-            BenchmarkResult instance.
-        """
-        metadata = None
-        if "metadata" in data and data["metadata"]:
-            metadata_dict = dict(data["metadata"])
-            legacy_gpu_backend = metadata_dict.pop("gpu_backend", None)
-            if "timing_backend" not in metadata_dict and legacy_gpu_backend is not None:
-                metadata_dict["timing_backend"] = legacy_gpu_backend
-            metadata = BenchmarkMetadata(**metadata_dict)
-        return cls(
-            host_timings=data["host_timings"],
-            kernel_timings=data.get("kernel_timings"),
-            metadata=metadata,
-        )
-
-    @classmethod
-    def load_json(cls, path: str) -> "BenchmarkResult":
-        """Load results from JSON file.
-
-        Args:
-            path: Path to the JSON file.
-
-        Returns:
-            BenchmarkResult loaded from file.
-        """
-        data = json.loads(Path(path).read_text())
-        return cls.from_dict(data)
+    Noise uses the robust spread IQR/median, so a few slow samples (reported
+    by the outlier flag) do not mark an otherwise tight distribution noisy.
+    """
+    warnings: List[str] = []
+    if stats.n >= 10 and stats.median_ms > 0:
+        spread = stats.iqr_ms / stats.median_ms
+        if spread > NOISY_IQR:
+            warnings.append(f"noisy: IQR {spread:.1%} of median")
+    if stats.median_ms > 0 and stats.max_ms > OUTLIER_RATIO * stats.median_ms:
+        warnings.append(f"outlier: max {stats.max_ms / stats.median_ms:.1f}x median")
+    return warnings
 
 
 @dataclass
-class CombinedBenchmarkStats:
-    """Combined statistics for host and kernel timing.
+class TimingInfo:
+    """How a plan's timings were measured (serialized as the plan's ``timing``).
 
-    Attributes:
-        host_stats: Statistics from host-side submission timing.
-        kernel_stats: Optional statistics from GPU kernel timing.
+    Attributes mirror ``execution.timing.Measurement`` minus the samples and
+    the run-wide ``cache_mode`` and ``timing_block`` (see ``run.config``).
+    ``samples`` is the number of timed samples, shared by the kernel and host
+    stats; it exceeds ``--iters`` when ``--min-time-ms`` extends the loop.
     """
 
-    host_stats: BenchmarkStats
-    kernel_stats: Optional[BenchmarkStats] = None
+    mode: str
+    timer: str
+    warmup_iters: int
+    samples: int
+    first_call_ms: float
+    capped: bool = False
+    fallback_reason: Optional[str] = None
 
     @classmethod
-    def from_result(cls, result: BenchmarkResult) -> "CombinedBenchmarkStats":
-        """Create combined stats from a BenchmarkResult.
-
-        Args:
-            result: BenchmarkResult with host and optional kernel timings.
-
-        Returns:
-            CombinedBenchmarkStats with calculated statistics.
-        """
-        host = BenchmarkStats.from_timings(result.host_timings)
-        kernel = (
-            BenchmarkStats.from_timings(result.kernel_timings)
-            if result.has_kernel_timings
-            else None
+    def from_measurement(cls, m: Any) -> "TimingInfo":
+        """Copy the provenance fields of an ``execution.timing.Measurement``."""
+        return cls(
+            mode=m.mode,
+            timer=m.timer,
+            warmup_iters=m.warmup_iters,
+            samples=len(m.kernel_ms),
+            first_call_ms=m.first_call_ms,
+            capped=m.capped,
+            fallback_reason=m.fallback_reason,
         )
-        return cls(host_stats=host, kernel_stats=kernel)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a JSON-ready dict."""
+        return asdict(self)

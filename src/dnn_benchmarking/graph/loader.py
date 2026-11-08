@@ -9,7 +9,28 @@ from typing import Any, Dict, List, Optional, Set
 
 from ..common.exceptions import GraphLoadError
 from .tensor_info import TensorInfo
-from .validator import GraphValidator
+
+
+def output_uids(graph_json: Dict[str, Any]) -> Set[int]:
+    """UIDs every node writes, from int- or list-valued ``outputs`` entries."""
+    uids: Set[int] = set()
+    for node in graph_json.get("nodes") or []:
+        for value in (node.get("outputs") or {}).values():
+            for uid in value if isinstance(value, list) else [value]:
+                if isinstance(uid, int) and not isinstance(uid, bool):
+                    uids.add(uid)
+    return uids
+
+
+def tensor_data_type(
+    tensor_json: Dict[str, Any], graph_json: Dict[str, Any]
+) -> Optional[str]:
+    """``data_type`` after hipDNN's fill: "unset" takes the graph's io_data_type
+    (TensorAttributes::fill_from_context); it stays "unset" only if both are."""
+    data_type = tensor_json.get("data_type")
+    if data_type == "unset":
+        return graph_json.get("io_data_type") or data_type
+    return data_type
 
 
 class GraphLoader:
@@ -18,10 +39,6 @@ class GraphLoader:
     Handles JSON loading, validation, and tensor info extraction.
     """
 
-    def __init__(self) -> None:
-        """Initialize loader."""
-        self._validator = GraphValidator()
-
     def load_json(self, path: Path) -> Dict[str, Any]:
         """Load and parse a graph JSON file.
 
@@ -29,32 +46,37 @@ class GraphLoader:
             path: Path to the JSON file.
 
         Returns:
-            Parsed JSON as a dictionary.
+            Parsed JSON object.
 
         Raises:
-            GraphLoadError: If file cannot be read or parsed.
+            GraphLoadError: If the file cannot be read or parsed, or is not a
+                JSON object.
         """
         if not path.exists():
             raise GraphLoadError(f"Graph file not found: {path}")
 
         try:
             with open(path, "r") as f:
-                return json.load(f)
+                graph_json = json.load(f)
         except json.JSONDecodeError as e:
             raise GraphLoadError(f"Invalid JSON in graph file: {e}") from e
         except OSError as e:
             raise GraphLoadError(f"Cannot read graph file: {e}") from e
+        if not isinstance(graph_json, dict):
+            raise GraphLoadError(
+                f"Graph file must contain a JSON object, got "
+                f"{type(graph_json).__name__}: {path}"
+            )
+        return graph_json
 
     def validate(self, graph_json: Dict[str, Any]) -> None:
-        """Validate that graph contains only supported operations.
-
-        Args:
-            graph_json: Parsed graph JSON dictionary.
+        """Check basic graph structure; operation-level checks are hipDNN's.
 
         Raises:
-            GraphLoadError: If graph contains unsupported operations.
+            GraphLoadError: If the graph has no operation nodes.
         """
-        self._validator.validate(graph_json)
+        if not graph_json.get("nodes"):
+            raise GraphLoadError("Graph contains no operation nodes")
 
     def extract_tensor_info(self, graph_json: Dict[str, Any]) -> List[TensorInfo]:
         """Extract tensor information from graph JSON.
@@ -64,58 +86,24 @@ class GraphLoader:
 
         Returns:
             List of TensorInfo objects for all non-virtual tensors.
-        """
-        tensors = graph_json.get("tensors", [])
-        output_uids = self._get_output_tensor_uids(graph_json)
 
+        Raises:
+            GraphLoadError: If a tensor entry is malformed.
+            UnsupportedGraphError: If a tensor has an unsupported data type.
+        """
+        outputs = output_uids(graph_json)
         result = []
-        for tensor_json in tensors:
-            is_output = tensor_json.get("uid") in output_uids
-            tensor_info = TensorInfo.from_json(tensor_json, is_output=is_output)
-
-            # Skip virtual tensors - they don't need buffers
-            if not tensor_info.is_virtual:
-                result.append(tensor_info)
-
+        for tensor_json in graph_json.get("tensors", []):
+            # Virtual tensors get no buffer, and hipDNN may leave their
+            # data_type "unset" (filled from intermediate_data_type), so skip
+            # them before resolving the dtype.
+            if isinstance(tensor_json, dict):
+                if tensor_json.get("virtual"):
+                    continue
+                data_type = tensor_data_type(tensor_json, graph_json)
+                if data_type != tensor_json.get("data_type"):
+                    tensor_json = {**tensor_json, "data_type": data_type}
+            tensor_info = TensorInfo.from_json(tensor_json)
+            tensor_info.is_output = tensor_info.uid in outputs
+            result.append(tensor_info)
         return result
-
-    def _get_output_tensor_uids(self, graph_json: Dict[str, Any]) -> Set[int]:
-        """Get UIDs of output tensors from graph nodes.
-
-        Args:
-            graph_json: Parsed graph JSON dictionary.
-
-        Returns:
-            Set of output tensor UIDs.
-        """
-        output_uids = set()
-
-        for node in graph_json.get("nodes", []):
-            outputs = node.get("outputs", {})
-            for key, value in outputs.items():
-                if isinstance(value, int):
-                    output_uids.add(value)
-
-        return output_uids
-
-    def get_graph_name(self, graph_json: Dict[str, Any]) -> str:
-        """Get the name of the graph.
-
-        Args:
-            graph_json: Parsed graph JSON dictionary.
-
-        Returns:
-            Graph name, or "unnamed_graph" if not specified.
-        """
-        return graph_json.get("name", "unnamed_graph")
-
-    def get_engine_id(self, graph_json: Dict[str, Any]) -> Optional[int]:
-        """Get the preferred engine ID from the graph.
-
-        Args:
-            graph_json: Parsed graph JSON dictionary.
-
-        Returns:
-            Preferred engine ID, or None if not specified.
-        """
-        return graph_json.get("preferred_engine_id")

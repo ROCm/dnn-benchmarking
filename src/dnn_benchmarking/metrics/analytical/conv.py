@@ -9,9 +9,14 @@ resolve the right UID-keyed tensor as ``x`` (activation-shaped input),
 ``w`` (weight), ``y`` (activation-shaped output) and dispatch to a
 single arithmetic implementation.
 
-MIOpen formula (matches ``conv_driver.hpp:1750-1751``)::
+Formula (matches MIOpen ``conv_driver.hpp`` and the rocKE conv benchmarks)::
 
-    2 * N * C_in * R * S * K * H_out * W_out / group
+    2 * N * (C_in / group) * R * S * K * H_out * W_out
+
+``C_in / group`` is read from the weight tensor (``[K, C/g, R, S]``): hipDNN
+graphs carry no explicit group count, so grouped / depthwise convolutions
+are inferred from the weight shape, as the PyTorch executor also does.
+Any rank with at least one spatial dim (conv1d / 2d / 3d) is supported.
 """
 
 from typing import Any, Dict, Optional
@@ -21,7 +26,6 @@ def _conv_flops_impl(
     x: Optional[Dict[str, Any]],
     w: Optional[Dict[str, Any]],
     y: Optional[Dict[str, Any]],
-    params: Dict[str, Any],
 ) -> Optional[int]:
     """Compute conv FLOPs given resolved input / weight / output tensors."""
     if not x or not w or not y:
@@ -29,16 +33,16 @@ def _conv_flops_impl(
     x_dims = x.get("dims") or []
     w_dims = w.get("dims") or []
     y_dims = y.get("dims") or []
-    if len(x_dims) < 4 or len(w_dims) < 4 or len(y_dims) < 4:
+    if len(x_dims) < 3 or len(w_dims) < 3 or len(y_dims) < 3:
         return None
     spatial_w = w_dims[2:]
     spatial_y = y_dims[2:]
     if not spatial_w or not spatial_y:
         return None
 
-    # NCHW / NCDHW: dim 0 = N, dim 1 = C; for weight K = dim 0, C/g = dim 1.
+    # NC[D]HW: dim 0 = N; for weight K = dim 0, C/g = dim 1.
     n = int(x_dims[0])
-    c_in = int(x_dims[1])
+    c_per_group = int(w_dims[1])
     k = int(w_dims[0])
 
     weight_spatial = 1
@@ -48,9 +52,7 @@ def _conv_flops_impl(
     for d in spatial_y:
         output_spatial *= int(d)
 
-    group_count = int(params.get("group_count", 1)) or 1
-
-    return 2 * n * c_in * weight_spatial * k * output_spatial // group_count
+    return 2 * n * c_per_group * weight_spatial * k * output_spatial
 
 
 # TODO: lift the string-keyed UID lookups in the per-direction handlers
@@ -78,7 +80,6 @@ def conv_fwd_flops(
         x=tensors_by_uid.get(int(x_uid)),
         w=tensors_by_uid.get(int(w_uid)),
         y=tensors_by_uid.get(int(y_uid)),
-        params=node.get("parameters", {}) or {},
     )
 
 
@@ -102,7 +103,6 @@ def conv_dgrad_flops(
         x=tensors_by_uid.get(int(dx_uid)),
         w=tensors_by_uid.get(int(w_uid)),
         y=tensors_by_uid.get(int(dy_uid)),
-        params=node.get("parameters", {}) or {},
     )
 
 
@@ -126,5 +126,4 @@ def conv_wgrad_flops(
         x=tensors_by_uid.get(int(x_uid)),
         w=tensors_by_uid.get(int(dw_uid)),
         y=tensors_by_uid.get(int(dy_uid)),
-        params=node.get("parameters", {}) or {},
     )

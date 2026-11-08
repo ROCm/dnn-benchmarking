@@ -1,380 +1,448 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Integration tests for the PyTorch executor benchmark mode.
+"""PyTorch executor and buffer manager on a live GPU (ROCm or CUDA).
 
-These exercise the PyTorch execution backend and run on any live GPU
-(ROCm or CUDA): the timing backend selected by the executor differs per
-platform (HIP events on ROCm, torch.cuda events on CUDA), so assertions
-use ``expected_timing_backend()`` rather than hardcoding one.
+The timer differs per platform (HIP events on ROCm, torch.cuda
+events on CUDA), so assertions use ``expected_timer()``.
 """
 
-import json
-from pathlib import Path
+from collections import Counter
 
+import numpy as np
 import pytest
 
-from dnn_benchmarking.config.benchmark_config import BenchmarkConfig
+from dnn_benchmarking.config import PyTorchSdpaBackendName, TimingPolicy
+from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.pytorch_buffer_manager import PyTorchCudaBufferManager
-from dnn_benchmarking.execution.pytorch_executor import (
-    PyTorchCudaExecutor,
-    PyTorchExecutionError,
+from dnn_benchmarking.execution.pytorch_executor import PyTorchCudaExecutor
+from tests.conftest import expected_timer
+from tests.integration.conftest import load_graph
+
+pytestmark = pytest.mark.gpu
+
+POLICY = TimingPolicy(warmup_iters=1, iters=2)
+
+
+def _benchmark(graph_name: str, policy: TimingPolicy = POLICY, **executor_kwargs):
+    """Prepare, load seeded inputs, and time one sample graph."""
+    _, graph_json, tensor_infos = load_graph(graph_name)
+    executor_kwargs.setdefault("pytorch_sdpa_backend", PyTorchSdpaBackendName.DEFAULT)
+    executor = PyTorchCudaExecutor(graph_json, policy, **executor_kwargs)
+    executor.prepare()
+
+    with PyTorchCudaBufferManager(tensor_infos) as bm:
+        bm.allocate_all()
+        bm.load_input_data(generate_input_data(tensor_infos, 42, graph_json))
+        bm.zero_outputs()
+        return executor.benchmark(bm.get_tensors())
+
+
+def test_load_input_data_copies_inputs_to_device(torch_gpu) -> None:
+    """Loaded device tensors hold exactly the generated host inputs."""
+    _, graph_json, tensor_infos = load_graph("sample_conv_fwd.json")
+    inputs = generate_input_data(tensor_infos, seed=123)
+
+    with PyTorchCudaBufferManager(tensor_infos) as bm:
+        bm.allocate_all()
+        bm.load_input_data(inputs)
+        tensors = bm.get_tensors()
+        assert all(t.is_cuda for t in tensors.values())
+        for uid, expected in inputs.items():
+            np.testing.assert_array_equal(tensors[uid].cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize(
+    "graph_name",
+    [
+        "sample_conv_fwd.json",
+        "sample_conv_dgrad.json",
+        "sample_conv_wgrad.json",
+        "sample_matmul.json",
+        "sample_matmul_batched.json",
+        "sample_matmul_broadcast.json",
+        "sample_relu.json",
+        "sample_add.json",
+        "sample_batchnorm.json",
+        "sample_batchnorm_training.json",
+        "sample_batchnorm_inference.json",
+        "sample_batchnorm_inference_variance.json",
+        "sample_batchnorm_backward.json",
+        "sample_sdpa.json",
+        "sample_mha_sdpa.json",
+        "sample_sdpa_backward.json",
+        "sample_sdpa_paged.json",
+        "sample_layernorm.json",
+        "sample_rmsnorm.json",
+        "sample_rmsnorm_backward.json",
+        "sample_reduction.json",
+        "sample_resample_fwd.json",
+    ],
 )
-from dnn_benchmarking.graph.loader import GraphLoader
-from tests.conftest import expected_timing_backend, skip_if_no_gpu_torch
-
-pytestmark = [pytest.mark.gpu]
-
-
-@pytest.fixture
-def sample_conv_graph():
-    """Load sample conv graph for testing."""
-    graph_path = Path(__file__).parent.parent.parent / "graphs" / "sample_conv_fwd.json"
-    if not graph_path.exists():
-        pytest.skip(f"Sample graph not found: {graph_path}")
-    loader = GraphLoader()
-    return loader.load_json(graph_path), graph_path
-
-
-@pytest.fixture
-def sample_matmul_graph():
-    """Load sample matmul graph for testing."""
-    graph_path = Path(__file__).parent.parent.parent / "graphs" / "sample_matmul.json"
-    if not graph_path.exists():
-        pytest.skip(f"Sample graph not found: {graph_path}")
-    loader = GraphLoader()
-    return loader.load_json(graph_path), graph_path
+# Cold runs the cache flush beside the PyTorch executor's stream: the HIP
+# flush buffer on ROCm, the torch one on CUDA.
+@pytest.mark.parametrize("cache_mode", ["warm", "cold"])
+def test_benchmark_times_every_iteration(
+    torch_gpu, graph_name: str, cache_mode: str
+) -> None:
+    """Every supported sample graph yields one positive timing per iteration."""
+    policy = TimingPolicy(warmup_iters=1, iters=2, cache_mode=cache_mode)
+    m = _benchmark(graph_name, policy)
+    assert len(m.kernel_ms) == len(m.host_ms) == policy.iters
+    assert all(t > 0 for t in m.kernel_ms + m.host_ms)
+    # The host-sync probe may add one priming enqueue; it is counted honestly.
+    assert m.warmup_iters >= policy.warmup_iters
+    assert m.timer == expected_timer()
+    assert m.cache_mode == cache_mode
+    assert m.mode == "staged" or m.fallback_reason, m
 
 
-@pytest.fixture
-def sample_relu_graph():
-    """Load sample relu graph for testing."""
-    graph_path = Path(__file__).parent.parent.parent / "graphs" / "sample_relu.json"
-    if not graph_path.exists():
-        pytest.skip(f"Sample graph not found: {graph_path}")
-    loader = GraphLoader()
-    return loader.load_json(graph_path), graph_path
+_NO_COPY = {"aten::copy_", "aten::convolution"}
 
 
-class TestPyTorchCudaBufferManager:
-    """Tests for PyTorch GPU buffer management."""
-
-    def test_allocate_and_fill(self, sample_conv_graph):
-        """Test tensor allocation and random fill."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_conv_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-
-            tensors = buffer_manager.get_tensors()
-            assert len(tensors) > 0
-
-            for uid, tensor in tensors.items():
-                assert tensor.is_cuda
-
-    def test_reproducible_with_seed(self, sample_conv_graph):
-        """Test that same seed produces same random data."""
-        skip_if_no_gpu_torch()
-
-        graph_json, _ = sample_conv_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        # First run
-        with PyTorchCudaBufferManager(tensor_infos) as bm1:
-            bm1.allocate_all()
-            bm1.fill_inputs_random(seed=42)
-            data1 = {uid: bm1.get_input_data(uid) for uid in bm1.get_tensors().keys()}
-
-        # Second run with same seed
-        with PyTorchCudaBufferManager(tensor_infos) as bm2:
-            bm2.allocate_all()
-            bm2.fill_inputs_random(seed=42)
-            data2 = {uid: bm2.get_input_data(uid) for uid in bm2.get_tensors().keys()}
-
-        # Compare
-        import numpy as np
-
-        for uid in data1:
-            if data1[uid] is not None and data2[uid] is not None:
-                assert np.allclose(data1[uid], data2[uid])
-
-    def test_load_input_data_uses_shared_input_map(self, sample_conv_graph):
-        """Pre-generated inputs can be loaded without regenerating per run."""
-        skip_if_no_gpu_torch()
-
-        graph_json, _ = sample_conv_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-        input_data = generate_input_data(tensor_infos, seed=123)
-
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.load_input_data(input_data)
-
-            for uid, expected in input_data.items():
-                actual = buffer_manager.get_input_data(uid)
-                if actual is not None:
-                    assert actual.shape == expected.shape
-
-
-class TestPyTorchCudaExecutor:
-    """Tests for the PyTorch GPU executor."""
-
-    def test_prepare_validates_operations(self, sample_conv_graph):
-        """Test that prepare validates graph operations."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_conv_graph
-        config = BenchmarkConfig(
-            graph_path=graph_path, warmup_iters=1, benchmark_iters=1
-        )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-        executor.prepare()  # Should not raise
-
-        assert executor.init_time_ms > 0
-
-    def test_full_benchmark_conv(self, sample_conv_graph):
-        """Test full benchmark workflow with convolution graph."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_conv_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=2,
-            benchmark_iters=5,
-        )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-        executor.prepare()
-
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-
-            tensors = buffer_manager.get_tensors()
-
-            # Run warmup
-            executor.warmup(tensors)
-
-            # Run benchmark
-            result = executor.benchmark(tensors, graph_name="test_conv")
-
-            # Verify result
-            assert len(result.host_timings) == 5
-            assert result.kernel_timings is not None
-            assert len(result.kernel_timings) == 5
-            assert result.metadata is not None
-            assert result.metadata.execution_backend == "pytorch"
-            assert result.metadata.timing_backend == expected_timing_backend()
-            assert result.metadata.graph_name == "test_conv"
-
-    def test_full_benchmark_matmul(self, sample_matmul_graph):
-        """Test full benchmark workflow with matmul graph."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_matmul_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=2,
-            benchmark_iters=5,
-        )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-        executor.prepare()
-
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-
-            tensors = buffer_manager.get_tensors()
-            executor.warmup(tensors)
-            result = executor.benchmark(tensors, graph_name="test_matmul")
-
-            assert len(result.host_timings) == 5
-            assert result.kernel_timings is not None
-
-    def test_full_benchmark_relu(self, sample_relu_graph):
-        """Test full benchmark workflow with relu graph."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_relu_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=2,
-            benchmark_iters=5,
-        )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-        executor.prepare()
-
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-
-            tensors = buffer_manager.get_tensors()
-            executor.warmup(tensors)
-            result = executor.benchmark(tensors, graph_name="test_relu")
-
-            assert len(result.host_timings) == 5
-
-    @pytest.mark.parametrize(
-        "graph_name",
-        [
-            "sample_conv_dgrad.json",
+@pytest.mark.parametrize(
+    "graph_name, asymmetric, channels_last, forbidden",
+    [
+        pytest.param("sample_conv_dgrad.json", False, False, _NO_COPY, id="dgrad"),
+        pytest.param("sample_conv_dgrad.json", True, False, _NO_COPY, id="dgrad-asym"),
+        pytest.param("sample_conv_dgrad.json", False, True, _NO_COPY, id="dgrad-nhwc"),
+        pytest.param(
+            "sample_conv_dgrad.json", True, True, _NO_COPY, id="dgrad-asym-nhwc"
+        ),
+        # Asymmetric wgrad must pad x, and that pad copies x.
+        pytest.param(
             "sample_conv_wgrad.json",
-            "sample_matmul_batched.json",
-            "sample_matmul_broadcast.json",
-            "sample_batchnorm_training.json",
-            "sample_batchnorm_inference.json",
-            "sample_batchnorm_inference_variance.json",
-            "sample_batchnorm_backward.json",
-            "sample_sdpa.json",
-            "sample_mha_sdpa.json",
-            "sample_sdpa_backward.json",
-            "sample_layernorm.json",
-            "sample_rmsnorm.json",
-            "sample_rmsnorm_backward.json",
-            "sample_reduction.json",
-            "sample_resample_fwd.json",
-        ],
+            True,
+            False,
+            {"aten::convolution"},
+            id="wgrad-asym",
+        ),
+    ],
+)
+def test_conv_backward_iteration_runs_only_the_backward_conv(
+    torch_gpu,
+    monkeypatch,
+    graph_name: str,
+    asymmetric: bool,
+    channels_last: bool,
+    forbidden: set,
+) -> None:
+    """A timed dgrad or wgrad iteration runs one backward conv and no extra work.
+
+    A copy or a forward conv in the iteration adds to the PyTorch time and
+    gives a false hipDNN speedup.
+    """
+    _, graph_json, _ = load_graph(graph_name)
+    if asymmetric:
+        # Same output size as the symmetric [1, 1] padding of the sample.
+        params = graph_json["nodes"][0]["parameters"]
+        params["pre_padding"], params["post_padding"] = [0, 0], [2, 2]
+    if channels_last:
+        # NHWC on every tensor, as in the graphs of the reported defect. The
+        # MIOpen path keeps NHWC only with this flag, which the CLI sets.
+        monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+        for tensor in graph_json["tensors"]:
+            _, c, h, w = tensor["dims"]
+            tensor["strides"] = [h * w * c, 1, w * c, c]
+    tensor_infos = GraphLoader().extract_tensor_info(graph_json)
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
     )
-    def test_full_benchmark_new_reference_graphs(self, graph_name):
-        """Test PyTorch benchmark workflow for newly covered reference graphs."""
-        skip_if_no_gpu_torch()
+    executor.prepare()
 
-        graph_path = Path(__file__).parent.parent.parent / "graphs" / graph_name
-        loader = GraphLoader()
-        graph_json = loader.load_json(graph_path)
-        tensor_infos = loader.extract_tensor_info(graph_json)
-        config = BenchmarkConfig(
-            graph_path=graph_path, warmup_iters=1, benchmark_iters=1
+    profiler = torch_gpu.profiler
+    with PyTorchCudaBufferManager(tensor_infos) as bm:
+        bm.allocate_all()
+        bm.load_input_data(generate_input_data(tensor_infos, 42, graph_json))
+        tensors = bm.get_tensors()
+        # The first call does one-time work (algorithm find, lazy init).
+        executor.execute_once(tensors)
+        with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+            executor.execute_once(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert ops["aten::convolution_backward"] == 1, ops
+    assert not forbidden & ops.keys(), ops
+
+
+def test_flash_aotriton_preference_benchmarks_sdpa(torch_gpu) -> None:
+    """Strict flash selection with an AOTriton preference runs natively."""
+    from dnn_benchmarking.common import torch_support
+
+    if not torch_support.is_rocm_build():
+        pytest.skip("AOTriton SDPA selection is ROCm-only")
+
+    m = _benchmark(
+        "sample_sdpa.json",
+        pytorch_sdpa_backend=PyTorchSdpaBackendName.FLASH,
+        pytorch_rocm_fa_library="aotriton",
+    )
+    assert m.kernel_ms[0] > 0 and m.host_ms[0] > 0
+
+
+def test_gqa_math_fallback_is_skipped_not_timed(torch_gpu) -> None:
+    """A GQA call no fused kernel accepts would run math, which copies K/V to
+    the query head count inside the timed call. The benchmark refuses it; the
+    one-shot reference still computes it.
+
+    A sliding window forces this on every arch: Flash takes no mask, and
+    Efficient needs equal Q/K/V head counts. If a torch release lifts either
+    limit, this test fails and the methodology note needs an update.
+    """
+    from dnn_benchmarking.common.exceptions import UnsupportedGraphError
+
+    torch = torch_gpu
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                "outputs": {"o_tensor_uid": 4},
+                "attributes": {
+                    "attn_scale_value": 0.125,
+                    "left_bound": 15,
+                    "right_bound": 0,
+                },
+            }
+        ]
+    }
+    tensors = {
+        uid: torch.randn(1, heads, 128, 64, device="cuda", dtype=torch.bfloat16)
+        for uid, heads in ((1, 8), (2, 2), (3, 2))
+    }
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+
+    with pytest.raises(UnsupportedGraphError, match="math backend"):
+        executor.benchmark(tensors)
+    executor.execute_once(tensors)
+    assert tensors[4].shape == (1, 8, 128, 64)
+
+
+@pytest.mark.parametrize("q_heads", [8, 2])
+def test_sdpa_stats_come_from_fused_kernel(torch_gpu, q_heads: int) -> None:
+    """The stats output is the log-sum-exp the fused kernel saved for backward.
+
+    Guards its layout on this torch build: query length 100 is not a multiple
+    of any kernel block, so a padded or transposed log-sum-exp shows up here.
+    """
+    torch = torch_gpu
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 5},
+                "attributes": {"attn_scale_value": 0.125, "causal_mask": True},
+            }
+        ]
+    }
+    torch.manual_seed(0)
+    tensors = {
+        uid: torch.randn(2, heads, 100, 64, device="cuda", dtype=torch.bfloat16)
+        for uid, heads in ((1, q_heads), (2, 2), (3, 2))
+    }
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+    executor.benchmark(tensors)
+    executor.execute_once(tensors)
+
+    k = tensors[2].float().repeat_interleave(q_heads // 2, dim=-3)
+    scores = (tensors[1].float() @ k.transpose(-2, -1)) * 0.125
+    keep = torch.ones(100, 100, dtype=torch.bool, device="cuda").tril()
+    expected = torch.logsumexp(
+        scores.masked_fill(~keep, float("-inf")), dim=-1, keepdim=True
+    )
+    # Inputs are bf16 (about 3 significant digits) and the reference is fp32,
+    # so the kernel's log-sum-exp matches it to about 1e-3, not to fp32 rounding.
+    torch.testing.assert_close(tensors[5].float(), expected, rtol=1e-3, atol=1e-3)
+    assert executor.notes == [], "stats fell back to a separate score matmul"
+
+
+def _gqa_graph(**attributes) -> dict:
+    return {
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                "outputs": {"o_tensor_uid": 4},
+                "attributes": {"attn_scale_value": 0.125, **attributes},
+            }
+        ]
+    }
+
+
+def _gqa_tensors(torch, q_len: int, kv_len: int, kv_heads: int = 2):
+    return {
+        1: torch.randn(2, 8, q_len, 64, device="cuda", dtype=torch.bfloat16),
+        2: torch.randn(2, kv_heads, kv_len, 64, device="cuda", dtype=torch.bfloat16),
+        3: torch.randn(2, kv_heads, kv_len, 64, device="cuda", dtype=torch.bfloat16),
+    }
+
+
+def test_bottom_right_gqa_decode_is_timed_by_default(torch_gpu) -> None:
+    """One query over a long cache with bottom-right causal bounds needs no
+    mask, so default dispatch keeps a fused kernel and the row is timed."""
+    executor = PyTorchCudaExecutor(
+        _gqa_graph(causal_mask_bottom_right=True),
+        POLICY,
+        pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT,
+    )
+    executor.prepare()
+
+    m = executor.benchmark(_gqa_tensors(torch_gpu, 1, 256))
+    assert m.kernel_ms[0] > 0
+
+
+def test_strict_efficient_runs_gqa_graph(torch_gpu) -> None:
+    """Efficient rejects enable_gqa, so a strict efficient row gets K/V
+    expanded up front, as before enable_gqa was used."""
+    from dnn_benchmarking.execution.pytorch_ops import (
+        PyTorchSdpaBackendUnavailableError,
+    )
+
+    def run(kv_heads: int) -> None:
+        executor = PyTorchCudaExecutor(
+            _gqa_graph(),
+            POLICY,
+            pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT,
         )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
         executor.prepare()
+        executor.benchmark(_gqa_tensors(torch_gpu, 64, 64, kv_heads))
 
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-            tensors = buffer_manager.get_tensors()
+    try:
+        run(8)
+    except PyTorchSdpaBackendUnavailableError:
+        pytest.skip("strict efficient attention is unavailable on this build")
+    run(2)
 
-            executor.warmup(tensors)
-            result = executor.benchmark(tensors, graph_name=graph_name)
 
-        assert len(result.host_timings) == 1
+def test_pytorch_row_returns_vram_after_oom(torch_gpu) -> None:
+    """A PyTorch row that runs out of memory must not keep VRAM reserved.
 
-    def test_flash_rocm_preference_reports_requested_metadata(self):
-        """Flash selection forwards and records an AOTriton preference."""
-        from dnn_benchmarking.common import torch_support
+    hipDNN rows of the same graph allocate with hipMalloc, outside PyTorch's
+    caching allocator, so memory PyTorch keeps cached is lost to them. The
+    graph chains two 1 GiB intermediates under a cap that fits only one, so
+    the row fails while the first is still referenced.
+    """
+    import io
+    from pathlib import Path
 
-        skip_if_no_gpu_torch()
-        if not torch_support.is_rocm_build():
-            pytest.skip("AOTriton SDPA selection is ROCm-only")
+    from dnn_benchmarking.config import SuiteConfig
+    from dnn_benchmarking.execution import suite_runner
+    from dnn_benchmarking.graph import GraphLoader
+    from dnn_benchmarking.reporting.reporter import Reporter
 
-        graph_path = Path(__file__).parent.parent.parent / "graphs" / "sample_sdpa.json"
-        loader = GraphLoader()
-        graph_json = loader.load_json(graph_path)
-        tensor_infos = loader.extract_tensor_info(graph_json)
-        config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=1,
-            benchmark_iters=1,
-            pytorch_sdpa_backend="flash",
-            pytorch_rocm_fa_library="aotriton",
+    torch = torch_gpu
+    m, k = 16384, 256  # an M x M fp32 tensor is 1 GiB
+
+    def tensor(uid, dims, virtual=False):
+        return {
+            "uid": uid,
+            "name": f"t{uid}",
+            "dims": dims,
+            "strides": [dims[1], 1],
+            "data_type": "float",
+            "virtual": virtual,
+        }
+
+    def relu(name, x, y):
+        return {
+            "name": name,
+            "type": "PointwiseAttributes",
+            "compute_data_type": "float",
+            "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": x},
+            "outputs": {"out_0_tensor_uid": y},
+        }
+
+    graph_json = {
+        "name": "oom_chain",
+        "compute_data_type": "float",
+        "io_data_type": "float",
+        "intermediate_data_type": "float",
+        "tensors": [
+            tensor(1, [m, k]),
+            tensor(2, [k, m]),
+            tensor(3, [m, m], virtual=True),
+            tensor(4, [m, m], virtual=True),
+            tensor(5, [m, m]),
+        ],
+        "nodes": [
+            {
+                "name": "mm",
+                "type": "MatmulAttributes",
+                "compute_data_type": "float",
+                "inputs": {"a_tensor_uid": 1, "b_tensor_uid": 2},
+                "outputs": {"c_tensor_uid": 3},
+            },
+            relu("relu1", 3, 4),
+            relu("relu2", 4, 5),
+        ],
+    }
+    infos = GraphLoader().extract_tensor_info(graph_json)
+    ctx = suite_runner._graph_context(
+        Path("oom_chain.json"),
+        graph_json,
+        infos,
+        SuiteConfig(runtime="pytorch"),
+        Reporter(io.StringIO()),
+    )
+
+    torch.cuda.empty_cache()
+    reserved_before = torch.cuda.memory_reserved()
+    total = torch.cuda.get_device_properties(0).total_memory
+    # Inputs and output (~1.1 GiB), one intermediate, and some slack.
+    cap = reserved_before + 2.6 * (1 << 30)
+    torch.cuda.set_per_process_memory_fraction(cap / total)
+    try:
+        row, _ = suite_runner._run_pytorch_row(ctx, "engine")
+    finally:
+        torch.cuda.set_per_process_memory_fraction(1.0)
+
+    assert "out of memory" in (row.error_message or ""), row
+    assert torch.cuda.memory_reserved() <= reserved_before
+    assert "at row start the GPU had" in row.error_message
+
+
+@pytest.mark.parametrize(
+    "graph_name",
+    ["sample_conv_fwd.json", "sample_conv_dgrad.json", "sample_conv_wgrad.json"],
+)
+def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> None:
+    """With the default config, a convolution graph is validated against a
+    float64 reference computed on the GPU, and that reference equals a
+    float64 computation on the host."""
+    import io
+    from pathlib import Path
+
+    from dnn_benchmarking.config import SuiteConfig, ValidationConfig
+    from dnn_benchmarking.execution import suite_runner
+    from dnn_benchmarking.reporting.reporter import Reporter
+    from dnn_benchmarking.validation import ReferenceProviderRegistry
+    from dnn_benchmarking.validation.reference_provider import ReferencePrecision
+
+    path, graph_json, tensor_infos = load_graph(graph_name)
+    config = SuiteConfig(validation=ValidationConfig(provider="pytorch"))
+    ctx = suite_runner._graph_context(
+        Path(path), graph_json, tensor_infos, config, Reporter(io.StringIO())
+    )
+    row = suite_runner._prepare_references(ctx)
+
+    assert row is not None and row.status == "success", row
+    assert not any("float64 reference not used" in w for w in row.warnings or [])
+    assert ctx.reference_outputs
+    host = ReferenceProviderRegistry.get_provider("pytorch").compute_reference(
+        graph_json, ctx.input_data, precision=ReferencePrecision.FLOAT64
+    )
+    for uid, ref in ctx.reference_outputs.items():
+        assert ref.precision == ReferencePrecision.FLOAT64.value
+        assert ref.device_data is not None and ref.device_data.is_cuda
+        assert ref.device_data.dtype == torch_gpu.float64
+        np.testing.assert_allclose(
+            ref.host_data(), host[uid].host_data(), rtol=1e-12, atol=0
         )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-        executor.prepare()
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-            tensors = buffer_manager.get_tensors()
-            executor.warmup(tensors)
-            result = executor.benchmark(
-                tensors,
-                graph_name="flash_aotriton_sdpa_backend",
-            )
-
-        assert result.host_timings and result.host_timings[0] > 0
-        assert result.kernel_timings and result.kernel_timings[0] > 0
-        assert result.metadata is not None
-        assert result.metadata.pytorch_sdpa_backend_requested == "flash"
-        assert result.metadata.pytorch_rocm_fa_library_requested == "aotriton"
-
-    def test_json_export(self, sample_conv_graph, tmp_path):
-        """Test that benchmark results can be exported to JSON."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_conv_graph
-        loader = GraphLoader()
-        tensor_infos = loader.extract_tensor_info(graph_json)
-
-        config = BenchmarkConfig(
-            graph_path=graph_path,
-            warmup_iters=1,
-            benchmark_iters=3,
-        )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-        executor.prepare()
-
-        with PyTorchCudaBufferManager(tensor_infos) as buffer_manager:
-            buffer_manager.allocate_all()
-            buffer_manager.fill_inputs_random(seed=42)
-            buffer_manager.zero_outputs()
-
-            tensors = buffer_manager.get_tensors()
-            executor.warmup(tensors)
-            result = executor.benchmark(tensors, graph_name="test_export")
-
-            # Export to JSON
-            output_path = tmp_path / "results.json"
-            result.save_json(str(output_path))
-
-            # Verify JSON content
-            with open(output_path) as f:
-                data = json.load(f)
-
-            assert "host_timings" in data
-            assert "kernel_timings" in data
-            assert "metadata" in data
-            assert data["metadata"]["execution_backend"] == "pytorch"
-            assert data["metadata"]["timing_backend"] == expected_timing_backend()
-
-    def test_not_prepared_raises(self, sample_conv_graph):
-        """Test that running without prepare raises error."""
-        skip_if_no_gpu_torch()
-
-        graph_json, graph_path = sample_conv_graph
-        config = BenchmarkConfig(
-            graph_path=graph_path, warmup_iters=1, benchmark_iters=1
-        )
-
-        executor = PyTorchCudaExecutor(graph_json, config)
-
-        # Should raise without prepare
-        with pytest.raises(PyTorchExecutionError, match="not prepared"):
-            executor.warmup({})

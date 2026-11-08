@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
+from dnn_benchmarking.config.benchmark_config import ReferencePrecision
 from dnn_benchmarking.validation import ReferenceProviderRegistry
 
 # Skip all tests if torch is not available
@@ -175,14 +176,21 @@ class TestPyTorchProviderMatmul:
         # A @ I = A
         assert np.allclose(outputs[3].data, a)
 
-    def test_matmul_bfloat16_uses_graph_dtype_and_returns_float32(self) -> None:
+    @pytest.mark.parametrize(
+        "tensor_dtype, io_data_type",
+        [("bfloat16", None), ("unset", "bfloat16")],  # hipDNN fill_from_context
+    )
+    def test_matmul_bfloat16_uses_graph_dtype_and_returns_float32(
+        self, tensor_dtype, io_data_type
+    ) -> None:
         torch = pytest.importorskip("torch")
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph_json = {
+            "io_data_type": io_data_type,
             "tensors": [
-                {"uid": 1, "name": "a", "dims": [2, 3], "data_type": "bfloat16"},
-                {"uid": 2, "name": "b", "dims": [3, 2], "data_type": "bfloat16"},
-                {"uid": 3, "name": "c", "dims": [2, 2], "data_type": "bfloat16"},
+                {"uid": 1, "name": "a", "dims": [2, 3], "data_type": tensor_dtype},
+                {"uid": 2, "name": "b", "dims": [3, 2], "data_type": tensor_dtype},
+                {"uid": 3, "name": "c", "dims": [2, 2], "data_type": tensor_dtype},
             ],
             "nodes": [
                 {
@@ -967,10 +975,10 @@ class TestPyTorchProviderNewOps:
         k_t = torch.from_numpy(k)
         v_t = torch.from_numpy(v)
         expected = torch.nn.functional.scaled_dot_product_attention(
-            q_t, k_t, v_t, dropout_p=0.0
+            q_t, k_t, v_t, dropout_p=0.0, scale=1.0
         )
         expected_stats = torch.logsumexp(
-            torch.matmul(q_t, k_t.transpose(-2, -1)) / torch.sqrt(torch.tensor(2.0)),
+            torch.matmul(q_t, k_t.transpose(-2, -1)),
             dim=-1,
             keepdim=True,
         )
@@ -1007,11 +1015,9 @@ class TestPyTorchProviderNewOps:
         k_t = torch.from_numpy(k)
         v_t = torch.from_numpy(v)
         expected = torch.nn.functional.scaled_dot_product_attention(
-            q_t, k_t, v_t, dropout_p=0.0, is_causal=True
+            q_t, k_t, v_t, dropout_p=0.0, is_causal=True, scale=1.0
         )
-        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) / torch.sqrt(
-            torch.tensor(2.0)
-        )
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1))
         causal = torch.ones(3, 3, dtype=torch.bool).tril()
         expected_stats = torch.logsumexp(
             scores.masked_fill(~causal, float("-inf")), dim=-1, keepdim=True
@@ -1019,6 +1025,40 @@ class TestPyTorchProviderNewOps:
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
         np.testing.assert_allclose(outputs[6].data, expected_stats.numpy(), rtol=1e-6)
+
+    def test_sdpa_sliding_window_masks_output_and_stats(self) -> None:
+        """A width-1 band (left/right bound 0) lets each query see only its own
+        key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array([[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]], dtype=np.float32)
+        v = np.array([[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]], dtype=np.float32)
+        dims = [1, 1, 3, 2]
+        graph_json = {
+            "tensors": [
+                *(
+                    {"uid": uid, "dims": dims, "data_type": "float"}
+                    for uid in (1, 2, 3, 4)
+                ),
+                {"uid": 6, "dims": [1, 1, 3, 1], "data_type": "float"},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "dropout_probability": 0.0,
+                        "left_bound": 0,
+                        "right_bound": 0,
+                    },
+                }
+            ],
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: q.copy(), 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, v, rtol=1e-6)
+        np.testing.assert_allclose(outputs[6].data[..., 0], (q * q).sum(-1), rtol=1e-6)
 
     def test_sdpa_additive_attention_mask_matches_torch(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
@@ -1056,6 +1096,7 @@ class TestPyTorchProviderNewOps:
             torch.from_numpy(v),
             attn_mask=torch.from_numpy(mask),
             dropout_p=0.0,
+            scale=1.0,
         )
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
@@ -1088,6 +1129,7 @@ class TestPyTorchProviderNewOps:
             torch.from_numpy(k).repeat_interleave(2, dim=-3),
             torch.from_numpy(v).repeat_interleave(2, dim=-3),
             dropout_p=0.0,
+            scale=1.0,
         )
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
@@ -1184,6 +1226,109 @@ class TestPyTorchProviderNewOps:
 
         np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
 
+    def test_sdpa_bottom_right_causal_aligns_to_sequence_end(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 4, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [2.0], [3.0], [4.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "left_bound": -1,
+                        "right_bound": 0,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
+        np.testing.assert_allclose(outputs[6].data, [[[[np.log(3.0)], [np.log(4.0)]]]])
+
+    def test_sdpa_deprecated_causal_mask_overrides_bottom_right_alignment(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.zeros((1, 1, 2, 1), dtype=np.float32)
+        k = np.zeros((1, 1, 4, 1), dtype=np.float32)
+        v = np.array([[[[1.0], [2.0], [3.0], [4.0]]]], dtype=np.float32)
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {
+                        "causal_mask": True,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
+
+        np.testing.assert_allclose(outputs[4].data, [[[[1.0], [1.5]]]])
+
+    def test_sdpa_attention_sink_gqa_and_bottom_right_match_explicit_softmax(
+        self,
+    ) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array(
+            [[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]]],
+            dtype=np.float32,
+        )
+        k = np.array(
+            [[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, -1.0]]]],
+            dtype=np.float32,
+        )
+        v = np.array(
+            [[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]],
+            dtype=np.float32,
+        )
+        sink = np.log(np.array([2.0, 4.0], dtype=np.float32))
+        graph_json = {
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "sink_token_tensor_uid": 5,
+                    },
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "attn_scale_value": 0.5,
+                        "left_bound": -1,
+                        "right_bound": 0,
+                        "diagonal_alignment": "BOTTOM_RIGHT",
+                    },
+                }
+            ]
+        }
+
+        outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v, 5: sink})
+
+        q_t = torch.from_numpy(q)
+        k_t = torch.from_numpy(k).repeat_interleave(2, dim=1)
+        v_t = torch.from_numpy(v).repeat_interleave(2, dim=1)
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * 0.5
+        bottom_right = torch.ones(2, 4, dtype=torch.bool).tril(diagonal=2)
+        scores = scores.masked_fill(~bottom_right, float("-inf"))
+        log_denom = torch.logaddexp(
+            torch.logsumexp(scores, dim=-1, keepdim=True),
+            torch.from_numpy(sink).reshape(1, 2, 1, 1),
+        )
+        expected = torch.exp(scores - log_denom) @ v_t
+
+        np.testing.assert_allclose(outputs[4].data, expected.numpy(), rtol=1e-6)
+        np.testing.assert_allclose(outputs[6].data, log_denom.numpy(), rtol=1e-6)
+
     def test_sdpa_bfloat16_uses_graph_dtype(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[0.10, 0.20], [0.30, 0.40]]]], dtype=np.float32)
@@ -1212,6 +1357,7 @@ class TestPyTorchProviderNewOps:
             torch.from_numpy(k).to(torch.bfloat16),
             torch.from_numpy(v).to(torch.bfloat16),
             dropout_p=0.0,
+            scale=1.0,
         ).to(torch.float32)
 
         assert outputs[4].data.dtype == np.float32
@@ -1256,7 +1402,6 @@ class TestPyTorchProviderNewOps:
             "dropout_mask_tensor_uid",
             "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
-            "sink_token_tensor_uid",
             "descale_q_tensor_uid",
             "descale_k_tensor_uid",
             "descale_v_tensor_uid",
@@ -1362,10 +1507,13 @@ class TestPyTorchProviderNewOps:
         [
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
-            ({"causal_mask_bottom_right": True}, "bottom-right causal"),
-            ({"diagonal_alignment": "BOTTOM_RIGHT"}, "TOP_LEFT"),
             ({"right_bound": 1}, "forward-looking band"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
+            (
+                {"causal_mask": True, "causal_mask_bottom_right": True},
+                "mutually exclusive",
+            ),
+            ({"diagonal_alignment": "CENTER"}, "diagonal_alignment"),
         ],
     )
     def test_sdpa_forward_rejects_unsupported_attributes(
@@ -1387,7 +1535,14 @@ class TestPyTorchProviderNewOps:
         with pytest.raises(UnsupportedGraphError, match=match):
             provider.compute_reference(graph_json, {1: q, 2: q, 3: q})
 
-    def test_sdpa_forward_rejects_attn_mask_with_causal_mask(self) -> None:
+    @pytest.mark.parametrize(
+        "mask_attributes",
+        [{"causal_mask": True}, {"causal_mask_bottom_right": True}],
+        ids=["top-left", "bottom-right"],
+    )
+    def test_sdpa_forward_rejects_attn_mask_with_derived_mask(
+        self, mask_attributes: dict
+    ) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
         graph_json = {
@@ -1401,7 +1556,7 @@ class TestPyTorchProviderNewOps:
                         "attn_mask_tensor_uid": 5,
                     },
                     "outputs": {"o_tensor_uid": 4},
-                    "attributes": {"causal_mask": True, "dropout_probability": 0.0},
+                    "attributes": {"dropout_probability": 0.0, **mask_attributes},
                 }
             ],
         }
@@ -1412,4 +1567,260 @@ class TestPyTorchProviderNewOps:
             provider.compute_reference(
                 graph_json,
                 {1: q, 2: q, 3: q, 5: np.zeros((1, 1, 2, 2), dtype=np.float32)},
+            )
+
+
+class TestHostMemoryEstimate:
+    """The validation gate trusts this estimate, so it must count every
+    full-size temporary of the CPU reference and no more: a forward SDPA
+    without sinks runs on the fused kernel and holds no score matrix."""
+
+    @staticmethod
+    def _sdpa(q_dims, k_dims, attributes, page_table_dims=None, sink=False):
+        def tensor(uid, dims, data_type="float"):
+            return {"uid": uid, "dims": dims, "data_type": data_type}
+
+        tensors = [
+            tensor(1, q_dims),
+            tensor(2, k_dims),
+            tensor(3, k_dims),
+            tensor(4, q_dims),
+        ]
+        inputs = {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3}
+        if sink:
+            tensors.append(tensor(8, [q_dims[1]]))
+            inputs["sink_token_tensor_uid"] = 8
+        if page_table_dims is not None:
+            tensors += [
+                tensor(5, page_table_dims, "int32"),
+                tensor(6, page_table_dims, "int32"),
+                tensor(7, [page_table_dims[0], 1, 1, 1], "int32"),
+            ]
+            inputs.update(
+                page_table_k_tensor_uid=5,
+                page_table_v_tensor_uid=6,
+                seq_len_kv_tensor_uid=7,
+            )
+        return {
+            "tensors": tensors,
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": inputs,
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": attributes,
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"causal_mask_bottom_right": True},
+            {"left_bound": 255, "right_bound": 0},
+        ],
+    )
+    def test_band_masks_count_the_full_mask(self, attributes) -> None:
+        """Bottom-right and windowed masks are built at [q_len, kv_len] in
+        float32 (twice) before SDPA runs; causal and unmasked graphs are not.
+        Bottom-right with q_len == kv_len is native causal and builds none."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        q, k = [1, 2, 1024, 16], [1, 2, 512, 16]
+        unmasked = estimate(self._sdpa(q, k, {}))
+        assert estimate(self._sdpa(q, k, {"causal_mask": True})) == unmasked
+        masked = estimate(self._sdpa(q, k, attributes))
+        assert masked - unmasked >= 1024 * 512 * 4 * 2
+        square = [1, 2, 1024, 16]
+        native = {"causal_mask_bottom_right": True}
+        assert estimate(self._sdpa(q, square, native)) == estimate(
+            self._sdpa(q, square, {})
+        )
+
+    def test_sink_forward_counts_score_blocks_and_the_float32_mask(self) -> None:
+        """A forward with sinks forms scores by hand and builds a float32 mask
+        for its bounds; the same forward without sinks holds neither."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        dims = [1, 2, 1024, 16]
+        causal = {"causal_mask": True}
+        plain = estimate(self._sdpa(dims, dims, causal))
+        with_sink = estimate(self._sdpa(dims, dims, causal, sink=True))
+        # Three score-sized buffers (2 rows * 1024 * 1024 * 4 B each) plus the
+        # 1024 * 1024 float32 mask; the sink tensor itself is negligible.
+        assert with_sink - plain >= 3 * 2 * 1024 * 1024 * 4 + 1024 * 1024 * 4
+
+    def test_paged_counts_the_kv_length_the_page_table_addresses(self) -> None:
+        """K and V of a paged graph hold pages, not sequences: the gathered KV
+        length is pages per sequence times the page size."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        q, pages = [4, 2, 64, 16], [64, 2, 16, 16]  # 64 pages of 16 rows
+        one_page = estimate(self._sdpa(q, pages, {}, page_table_dims=[4, 1], sink=True))
+        all_pages = estimate(
+            self._sdpa(q, pages, {}, page_table_dims=[4, 16], sink=True)
+        )
+        # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
+        # against 16 pages * 16 rows instead of 1 page.
+        assert all_pages - one_page >= 4 * 2 * 64 * (16 - 1) * 16 * 4
+
+
+class TestFloat64Reference:
+    """The float64 reference of convolution graphs."""
+
+    PARAMS = {
+        "conv_mode": "CROSS_CORRELATION",
+        "pre_padding": [1, 1],
+        "post_padding": [1, 1],
+        "stride": [1, 1],
+        "dilation": [1, 1],
+    }
+    X, W, DY = (2, 3, 6, 6), (4, 3, 3, 3), (2, 4, 6, 6)
+
+    @classmethod
+    def _graph(cls, node_type: str, nodes=()) -> dict:
+        x, w, dy, out = {"uid": 1}, {"uid": 2}, {"uid": 3}, {"uid": 4}
+        node = {"type": node_type, "parameters": cls.PARAMS}
+        if node_type == "ConvolutionFwdAttributes":
+            node["inputs"] = {"x_tensor_uid": 1, "w_tensor_uid": 2}
+            node["outputs"] = {"y_tensor_uid": 4}
+            x["dims"], w["dims"], out["dims"] = cls.X, cls.W, cls.DY
+            tensors = [x, w, out]
+        elif node_type == "ConvolutionBwdAttributes":
+            node["inputs"] = {"dy_tensor_uid": 3, "w_tensor_uid": 2}
+            node["outputs"] = {"dx_tensor_uid": 4}
+            dy["dims"], w["dims"], out["dims"] = cls.DY, cls.W, cls.X
+            tensors = [dy, w, out]
+        else:
+            node["inputs"] = {"x_tensor_uid": 1, "dy_tensor_uid": 3}
+            node["outputs"] = {"dw_tensor_uid": 4}
+            x["dims"], dy["dims"], out["dims"] = cls.X, cls.DY, cls.W
+            tensors = [x, dy, out]
+        for tensor in tensors:
+            tensor["data_type"] = "half"
+        return {"tensors": tensors, "nodes": [node, *nodes]}
+
+    @staticmethod
+    def _inputs() -> dict:
+        rng = np.random.default_rng(0)
+        shapes = {1: TestFloat64Reference.X, 2: TestFloat64Reference.W}
+        shapes[3] = TestFloat64Reference.DY
+        return {
+            uid: rng.uniform(-1, 1, shape).astype(np.float32)
+            for uid, shape in shapes.items()
+        }
+
+    @pytest.mark.parametrize(
+        "node_type",
+        [
+            "ConvolutionFwdAttributes",
+            "ConvolutionBwdAttributes",
+            "ConvolutionWrwAttributes",
+        ],
+    )
+    def test_float64_reference_is_exact_math_on_the_graph_dtype_inputs(
+        self, node_type: str
+    ) -> None:
+        """Inputs round to fp16 as the engine sees them; the result stays
+        float64 and is not rounded to fp16."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        inputs = self._inputs()
+        # The fp16 values the engine sees, exactly, in float64.
+        x, w, dy = (torch.from_numpy(inputs[uid]).half().double() for uid in (1, 2, 3))
+        kw = {"padding": 1}
+        expected = {
+            "ConvolutionFwdAttributes": lambda: torch.nn.functional.conv2d(x, w, **kw),
+            "ConvolutionBwdAttributes": lambda: torch.nn.grad.conv2d_input(
+                self.X, w, dy, **kw
+            ),
+            "ConvolutionWrwAttributes": lambda: torch.nn.grad.conv2d_weight(
+                x, self.W, dy, **kw
+            ),
+        }[node_type]().numpy()
+
+        (out,) = provider.compute_reference(
+            self._graph(node_type), inputs, precision=ReferencePrecision.FLOAT64
+        ).values()
+
+        assert out.precision == "float64"
+        assert out.data.dtype == np.float64
+        np.testing.assert_allclose(out.data, expected, rtol=1e-12, atol=1e-12)
+        assert np.any(out.data != out.data.astype(np.float16))
+
+    def test_native_reference_keeps_the_graph_dtype(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+
+        (out,) = provider.compute_reference(
+            self._graph("ConvolutionFwdAttributes"), self._inputs()
+        ).values()
+
+        assert (out.precision, out.data.dtype) == ("native", np.float16)
+
+    def test_fused_pointwise_runs_in_float64(self) -> None:
+        relu = {
+            "type": "PointwiseAttributes",
+            "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": 4},
+            "outputs": {"out_0_tensor_uid": 5},
+        }
+        graph = self._graph("ConvolutionFwdAttributes", [relu])
+        graph["tensors"][-1]["virtual"] = True
+        graph["tensors"].append({"uid": 5, "dims": self.DY, "data_type": "half"})
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        inputs = self._inputs()
+        x, w = (torch.from_numpy(inputs[uid]).half().double() for uid in (1, 2))
+
+        outputs = provider.compute_reference(
+            graph, inputs, precision=ReferencePrecision.FLOAT64
+        )
+
+        assert list(outputs) == [5]
+        np.testing.assert_allclose(
+            outputs[5].data,
+            torch.relu(torch.nn.functional.conv2d(x, w, padding=1)).numpy(),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize(
+        "types, supported",
+        [
+            (["ConvolutionWrwAttributes"], True),
+            (["ConvolutionFwdAttributes", "PointwiseAttributes"], True),
+            (["PointwiseAttributes"], False),
+            (["ConvolutionFwdAttributes", "BatchnormAttributes"], False),
+            (["MatmulAttributes"], False),
+        ],
+    )
+    def test_float64_covers_convolution_and_pointwise_graphs_only(
+        self, types: list, supported: bool
+    ) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = {"nodes": [{"type": t} for t in types]}
+
+        assert provider.supports_float64(graph) is supported
+
+    def test_float64_request_for_an_unsupported_graph_raises(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = {
+            "tensors": [{"uid": 1, "dims": [2]}, {"uid": 2, "dims": [2]}],
+            "nodes": [
+                {
+                    "type": "PointwiseAttributes",
+                    "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": 1},
+                    "outputs": {"out_0_tensor_uid": 2},
+                }
+            ],
+        }
+
+        with pytest.raises(UnsupportedGraphError, match="float64"):
+            provider.compute_reference(
+                graph,
+                {1: np.ones(2, dtype=np.float32)},
+                precision=ReferencePrecision.FLOAT64,
             )

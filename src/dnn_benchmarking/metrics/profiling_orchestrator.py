@@ -3,24 +3,21 @@
 
 """Re-exec orchestrator for opt-in profiling sources.
 
-When the user passes ``--pmc``, ``--emit-trace``, ``--perf``, or
+When the user passes ``--pmc``, ``--trace``, ``--perf``, or
 ``--roofline``, the timed pass runs first to keep its numbers clean.
 After it succeeds, this orchestrator runs the workload again — once per
 requested source — under the corresponding external profiler (rocprofv3,
 perf, rocprof-compute). The results are merged into a single dict that
 populates ``ProviderEngineResult.extra_metrics``.
 
-Architecture: the orchestrator builds a hidden re-exec argv that
-re-invokes ``python -m dnn_benchmarking`` with the
-``--internal-profiling-run`` sub-mode and a single
-(graph, engine) pair. All profiling flags are stripped from the inner
-argv to prevent infinite recursion. The sub-mode short-circuits engine
-discovery and Reporter output; it just runs warmup + benchmark for the
-given engine and exits.
+The child is ``python -m dnn_benchmarking --internal-profiling-run``
+for a single (graph, engine) pair (see :func:`build_inner_argv`); it
+carries no profiling flag, so it cannot recurse. It primes, then runs
+``iters`` timed iterations with a warm cache.
 
 Failures of individual sources never raise — each module returns a dict
 slice with a ``skipped`` / ``error_tail`` / ``warnings`` key, and a
-single ``warn_once`` line goes to stderr.
+warning naming the graph and engine goes to stderr.
 """
 
 import hashlib
@@ -32,10 +29,16 @@ from typing import Any, Dict, List, Optional
 
 from ..config.benchmark_config import MetricsConfig
 from ._diagnostic import warn_once
+from ._tool_resolver import resolve_rocm_tool
 from . import perf as _perf_mod
 from . import rocprof_pmc as _pmc_mod
 from . import rocprof_trace as _trace_mod
 from . import roofline as _roofline_mod
+
+# Timed iterations in the profiled child unless the caller asks for more.
+# Enough dispatches to see the engine kernel repeat under PMC, few enough
+# that trace/roofline replay stays cheap.
+PROFILING_ITERS = 5
 
 
 def resolve_output_dir(metrics_config: MetricsConfig) -> Path:
@@ -109,41 +112,68 @@ def _graph_segment(graph_path: Path) -> str:
 def build_inner_argv(
     graph_path: Path,
     engine_id: int,
-    seed: Optional[int],
+    seed: int,
     warmup_iters: int,
-    benchmark_iters: int,
+    iters: int,
     plugin_path: Optional[Path],
 ) -> List[str]:
-    """Construct the argv for the ``--internal-profiling-run`` sub-mode.
+    """Argv for the ``--internal-profiling-run`` child (frozen contract).
 
-    Always omits any opt-in profiling flag so the child process can't
-    recurse back into the orchestrator.
+    ``-m dnn_benchmarking --internal-profiling-run --graph G --engine E
+    --warmup W --iters I --seed S [--plugin-path P]``. No profiling flag
+    is ever forwarded, so the child cannot recurse.
     """
     argv = [
         sys.executable,
         "-m",
         "dnn_benchmarking",
         "--internal-profiling-run",
-        "--internal-profiling-graph",
-        str(graph_path),
-        "--internal-profiling-engine",
-        str(engine_id),
         "--graph",
         str(graph_path),
+        "--engine",
+        str(engine_id),
         "--warmup",
         str(warmup_iters),
         "--iters",
-        str(benchmark_iters),
-        "--engine",
-        str(engine_id),
-        "--metrics-tier",
-        "off",
+        str(iters),
+        "--seed",
+        str(seed),
     ]
-    if seed is not None:
-        argv += ["--seed", str(seed)]
     if plugin_path is not None:
         argv += ["--plugin-path", str(plugin_path)]
     return argv
+
+
+def check_requested_tools(metrics_config: MetricsConfig) -> List[str]:
+    """One message per requested profiling pass whose tool cannot be found.
+
+    Called once at startup; the CLI exits 2 when the list is non-empty so
+    a missing profiler fails fast instead of skipping every engine.
+    """
+    missing: List[str] = []
+    rocprof_flags = [
+        flag
+        for flag, on in (
+            ("--pmc", metrics_config.pmc_set is not None),
+            ("--trace", metrics_config.trace),
+        )
+        if on
+    ]
+    if rocprof_flags and resolve_rocm_tool("rocprofv3") is None:
+        missing.append(
+            f"{'/'.join(rocprof_flags)} requires rocprofv3, which was not found "
+            "(rocm-sdk wheel shim, $ROCM_PATH/bin or PATH)"
+        )
+    if metrics_config.perf and _perf_mod._resolve_perf() is None:
+        missing.append(
+            "--perf requires a runnable `perf` binary (linux-tools); none found"
+        )
+    if metrics_config.roofline and resolve_rocm_tool("rocprof-compute") is None:
+        missing.append(
+            "--roofline requires rocprof-compute, which was not found "
+            "(rocm-sdk wheel shim, $ROCM_PATH/bin or PATH)"
+        )
+    return missing
 
 
 def _subdir(out_dir: Path, graph_path: Path, engine_name: str, source: str) -> Path:
@@ -176,11 +206,11 @@ def run_profiling_passes(
     graph_path: Path,
     engine_id: int,
     engine_name: str,
-    seed: Optional[int],
+    seed: int,
     warmup_iters: int,
-    benchmark_iters: int,
     metrics_config: MetricsConfig,
     plugin_path: Optional[Path],
+    iters: int = PROFILING_ITERS,
     out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run every requested profiling source. Returns a merged dict.
@@ -189,19 +219,15 @@ def run_profiling_passes(
     them via ``extra_metrics["pmc"]``, ``extra_metrics["trace"]`` etc.
 
     Args:
-        graph_path: Graph file passed to the inner process.
-        engine_id: Single engine ID for the inner process.
-        engine_name: Human-readable engine name (e.g.
-            ``"MIOPEN_ENGINE"``) used as the per-engine output
-            subdirectory; resolved by the caller via
-            ``suite_runner._resolve_engine_name``.
-        seed: Reproducibility seed for fill_inputs_random; passed
-            through to the inner process so PMC counts are over the
-            same input distribution as the timed pass.
-        warmup_iters: Inner warmup iteration count.
-        benchmark_iters: Inner benchmark iteration count.
+        graph_path: Graph file passed to the child.
+        engine_id: Single engine ID for the child.
+        engine_name: Human-readable engine name (e.g. ``"MIOPEN_ENGINE"``),
+            used for the per-engine output subdirectory and warnings.
+        seed: Input seed, forwarded so counters see the timed pass's inputs.
+        warmup_iters: Child warmup iteration count.
         metrics_config: Decides which sources fire.
-        plugin_path: Optional plugin path forwarded to the inner CLI.
+        plugin_path: Optional plugin path forwarded to the child.
+        iters: Child timed iteration count.
         out_dir: Override the resolved profiling-output root (test hook).
 
     Never raises. Source-specific failures end up in their slice's
@@ -213,81 +239,44 @@ def run_profiling_passes(
     if out_dir is None:
         out_dir = resolve_output_dir(metrics_config)
     inner_argv = build_inner_argv(
-        graph_path=graph_path,
-        engine_id=engine_id,
-        seed=seed,
-        warmup_iters=warmup_iters,
-        # Single iter — warmups should be enough to stabilise; re-evaluate
-        # if any source shows noisy counters in practice.
-        benchmark_iters=1,
-        plugin_path=plugin_path,
+        graph_path, engine_id, seed, warmup_iters, iters, plugin_path
+    )
+    context = f"{graph_path.stem}/{engine_name}"
+    sources = (
+        # (requested, slice key, module, subdir, extra kwargs)
+        (
+            metrics_config.pmc_set is not None,
+            "pmc",
+            _pmc_mod,
+            f"pmc_{metrics_config.pmc_set}",
+            {"pmc_set": metrics_config.pmc_set},
+        ),
+        (
+            metrics_config.trace,
+            "trace",
+            _trace_mod,
+            "trace_pftrace",
+            {},
+        ),
+        (metrics_config.perf, "perf", _perf_mod, "perf", {}),
+        (metrics_config.roofline, "roofline", _roofline_mod, "roofline", {}),
     )
 
     aggregated: Dict[str, Any] = {}
-
-    timeout_s = metrics_config.profiling_timeout_s
-
-    if metrics_config.pmc_set is not None:
+    for requested, key, module, subdir, extra in sources:
+        if not requested:
+            continue
         try:
             aggregated.update(
-                _pmc_mod.run(
+                module.run(
                     inner_argv=inner_argv,
-                    out_dir=_subdir(
-                        out_dir,
-                        graph_path,
-                        engine_name,
-                        f"pmc_{metrics_config.pmc_set}",
-                    ),
-                    pmc_set=metrics_config.pmc_set,
-                    timeout_s=timeout_s,
+                    out_dir=_subdir(out_dir, graph_path, engine_name, subdir),
+                    timeout_s=metrics_config.profiling_timeout_s,
+                    context=context,
+                    **extra,
                 )
             )
         except Exception as e:
-            warn_once("rocprof_pmc", f"unexpected error in PMC pass: {e}")
-            aggregated.setdefault("pmc", {})["unexpected_error"] = str(e)
-
-    if metrics_config.emit_trace is not None:
-        try:
-            aggregated.update(
-                _trace_mod.run(
-                    inner_argv=inner_argv,
-                    out_dir=_subdir(
-                        out_dir,
-                        graph_path,
-                        engine_name,
-                        f"trace_{metrics_config.emit_trace}",
-                    ),
-                    timeout_s=timeout_s,
-                )
-            )
-        except Exception as e:
-            warn_once("rocprof_trace", f"unexpected error in trace pass: {e}")
-            aggregated.setdefault("trace", {})["unexpected_error"] = str(e)
-
-    if metrics_config.perf:
-        try:
-            aggregated.update(
-                _perf_mod.run(
-                    inner_argv=inner_argv,
-                    out_dir=_subdir(out_dir, graph_path, engine_name, "perf"),
-                    timeout_s=timeout_s,
-                )
-            )
-        except Exception as e:
-            warn_once("perf", f"unexpected error in perf pass: {e}")
-            aggregated.setdefault("perf", {})["unexpected_error"] = str(e)
-
-    if metrics_config.roofline:
-        try:
-            aggregated.update(
-                _roofline_mod.run(
-                    inner_argv=inner_argv,
-                    out_dir=_subdir(out_dir, graph_path, engine_name, "roofline"),
-                    timeout_s=timeout_s,
-                )
-            )
-        except Exception as e:
-            warn_once("roofline", f"unexpected error in roofline pass: {e}")
-            aggregated.setdefault("roofline", {})["unexpected_error"] = str(e)
-
+            warn_once(key, f"{context}: unexpected error in {key} pass: {e}")
+            aggregated.setdefault(key, {})["unexpected_error"] = str(e)
     return aggregated

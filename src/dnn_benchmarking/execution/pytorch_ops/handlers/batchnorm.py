@@ -10,7 +10,19 @@ import torch.nn.functional as F
 
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
+from ....common import torch_support
 from ....common.exceptions import UnsupportedGraphError
+
+# hipDNN's batchnorm backward carries no epsilon attribute. It only matters
+# when the graph omits saved mean/inv_variance and the statistics are
+# recomputed here; this is the default hipDNN's CPU reference uses
+# (CpuFpReferenceBatchnorm::backward).
+_BACKWARD_EPSILON = 1e-5
+
+
+def _use_miopen(x: torch.Tensor, rocm_build: bool) -> bool:
+    """MIOpen batchnorm primitives exist only in ROCm torch, on GPU tensors."""
+    return rocm_build and x.is_cuda
 
 
 def _bn_reduce_dims(x: torch.Tensor) -> Tuple[int, ...]:
@@ -135,6 +147,7 @@ def compile_batchnorm_training(
     graph_json: Dict[str, Any],
 ) -> CompiledOp:
     """Plan batchnorm forward training."""
+    rocm_build = torch_support.is_rocm_build()
     _reject_peer_stats(node, "Batchnorm forward training")
     x_uid = _required_input_uid(node, "x_tensor_uid")
     scale_uid = _required_input_uid(node, "scale_tensor_uid")
@@ -170,13 +183,13 @@ def compile_batchnorm_training(
         epsilon = _scalar_value(tensors, epsilon_uid, node)
 
         # Fused batchnorm forward-training returning (y, save_mean, save_invstd).
-        # On GPU route through the same MIOpen primitive as the engine under test:
-        # F.conv2d auto-dispatches conv to MIOpen, but native_batch_norm does NOT,
-        # so call miopen_batch_norm explicitly (it requires fp32 scale/bias). On CPU
-        # (unit tests / no HIP) fall back to native_batch_norm with graph-dtype
-        # params. Both keep x's dtype and return float32 saved stats.
+        # On ROCm GPU route through the same MIOpen primitive as the engine under
+        # test: F.conv2d auto-dispatches conv to MIOpen, but native_batch_norm
+        # does NOT, so call miopen_batch_norm explicitly (it requires fp32
+        # scale/bias). Elsewhere (CUDA torch, CPU) use native_batch_norm with
+        # graph-dtype params. Both keep x's dtype and return float32 saved stats.
         try:
-            if x.is_cuda:
+            if _use_miopen(x, rocm_build):
                 y, mean, inv_variance = torch.ops.aten.miopen_batch_norm(
                     x,
                     scale.to(torch.float32),
@@ -240,6 +253,7 @@ def compile_batchnorm_backward(
     graph_json: Dict[str, Any],
 ) -> CompiledOp:
     """Plan batchnorm backward."""
+    rocm_build = torch_support.is_rocm_build()
     _reject_peer_stats(node, "Batchnorm backward")
     dy_uid = _required_input_uid(node, "dy_tensor_uid")
     x_uid = _required_input_uid(node, "x_tensor_uid")
@@ -262,7 +276,7 @@ def compile_batchnorm_backward(
         scale = _channel_values(_tensor(tensors, scale_uid, node), x)
         if not saved_stats:
             mean, variance = _bn_mean_var(x)
-            inv_variance = torch.rsqrt(variance + 1e-5)
+            inv_variance = torch.rsqrt(variance + _BACKWARD_EPSILON)
         else:
             mean = _require_fp32_stat(
                 _channel_values(_tensor(tensors, int(mean_uid), node), x), "mean"
@@ -271,14 +285,21 @@ def compile_batchnorm_backward(
                 _channel_values(_tensor(tensors, int(inv_uid), node), x), "inv_variance"
             )
 
-        # Fused batchnorm backward returning (dx, dscale, dbias). On GPU route
-        # through the same MIOpen primitive as the engine (miopen_batch_norm_backward
-        # needs fp32 weight; arg order is input, grad_output, weight, running_mean,
-        # running_var, save_mean, save_invstd, epsilon). On CPU fall back to
-        # native_batch_norm_backward.
-        if x.is_cuda:
+        # Fused batchnorm backward returning (dx, dscale, dbias). On ROCm GPU
+        # route through the same MIOpen primitive as the engine
+        # (miopen_batch_norm_backward needs fp32 weight; arg order is input,
+        # grad_output, weight, running_mean, running_var, save_mean,
+        # save_invstd, epsilon). Elsewhere use native_batch_norm_backward.
+        if _use_miopen(x, rocm_build):
             dx, dscale, dbias = torch.ops.aten.miopen_batch_norm_backward(
-                x, dy, scale.to(torch.float32), None, None, mean, inv_variance, 1e-5
+                x,
+                dy,
+                scale.to(torch.float32),
+                None,
+                None,
+                mean,
+                inv_variance,
+                _BACKWARD_EPSILON,
             )
         else:
             dx, dscale, dbias = torch.ops.aten.native_batch_norm_backward(
@@ -290,7 +311,7 @@ def compile_batchnorm_backward(
                 mean,
                 inv_variance,
                 True,
-                1e-5,
+                _BACKWARD_EPSILON,
                 [True, True, True],
             )
 

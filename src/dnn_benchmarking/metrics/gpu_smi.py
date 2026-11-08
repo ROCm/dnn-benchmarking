@@ -1,49 +1,29 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""GPU telemetry probe using the AMD SMI Python library.
+"""GPU telemetry via the AMD SMI Python library.
 
-The amdsmi library ships with system ROCm installs and ROCm SDK wheels under
-``share/amd_smi/``. ``setup_env.py`` installs the bindings when it finds a usable
-source tree, but they are not a hard dependency — ``GpuSmiProbe.snapshot()``
-returns a stable-shape dict whose values are ``None`` whenever the library,
-init, or a per-metric query fails.
+amdsmi ships with system ROCm installs and ROCm SDK wheels under
+``share/amd_smi/`` but is not a hard dependency. Availability is
+resolved once per process and silently: every query returns ``None``
+when amdsmi is missing. The one user-facing notice is emitted by
+:func:`machine_info.collect_environment_info` at suite start, which also
+records ``amdsmi_available`` in the environment block.
 
-Two collaborators:
-
-* :class:`AmdsmiSession` owns the amdsmi import, the one-time
-  ``amdsmi_init()`` call, and processor-handle resolution. A
-  module-level singleton (:func:`default_session`) is used by default
-  so the global init only fires once per process.
-* :class:`GpuSmiProbe` issues telemetry queries through a session.
-  Tests can pass a fake session to bypass the global state entirely.
-
-The split keeps the per-call telemetry methods on the probe focused on
-"call this amdsmi function and stash the result", and concentrates the
-fragile import / init / handle-lookup logic in one testable place.
+``GpuSmiProbe`` targets the GPU the workload runs on: device indices are
+HIP (torch) logical indices, mapped to the amdsmi handle by PCI bus
+address when torch is already imported (this module never imports it, so a
+hipDNN run stays torch-free). Otherwise, or when the address matches no
+amdsmi device, the HIP index is used as the amdsmi index; under
+``HIP_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` remapping that can be
+another physical GPU.
 """
 
-from typing import Any, Dict, Optional
+import functools
+import sys
+from typing import Any, Callable, Dict, Optional, Tuple
 
-from ._diagnostic import warn_once
-
-_SNAPSHOT_KEYS = (
-    "vram_used_mb",
-    "vram_total_mb",
-    "power_w",
-    "sclk_mhz",
-    "mclk_mhz",
-    "temp_edge_c",
-    "temp_hotspot_c",
-    "gpu_utilization_pct",
-    "memory_utilization_pct",
-    "throttle_status",
-)
-
-
-def _empty_snapshot() -> Dict[str, Optional[Any]]:
-    return {k: None for k in _SNAPSHOT_KEYS}
-
+from ..common import torch_support
 
 _UNAVAILABLE_VALUES = {"", "N/A", "NA", "NONE", "NULL", "UNSUPPORTED"}
 
@@ -54,303 +34,190 @@ def _is_unavailable(value: Any) -> bool:
     return isinstance(value, str) and value.strip().upper() in _UNAVAILABLE_VALUES
 
 
-def _first_available(*values: Any) -> Any:
-    for value in values:
-        if not _is_unavailable(value):
-            return value
-    return None
+def _query(fn: Callable[[], Any], convert: Callable[[Any], Any] = float) -> Any:
+    """``convert(fn())``, or None when the query fails or reports N/A.
 
-
-def _optional_float(value: Any) -> Optional[float]:
-    if _is_unavailable(value):
+    Platforms expose different SMI subsets (NOT_SUPPORTED errors, "N/A"
+    payloads); a missing reading is expected, not a diagnostic.
+    """
+    try:
+        value = fn()
+        return None if _is_unavailable(value) else convert(value)
+    except Exception:
         return None
-    return float(value)
 
 
-def _optional_int(value: Any) -> Optional[int]:
-    if _is_unavailable(value):
+@functools.lru_cache(maxsize=None)
+def _amdsmi() -> Optional[Any]:
+    """Imported and initialised ``amdsmi`` module, or None. Resolved once."""
+    try:
+        import amdsmi
+
+        amdsmi.amdsmi_init()
+    except Exception:
         return None
-    return int(value)
-
-
-def _is_not_supported_error(e: Exception) -> bool:
-    text = str(e)
-    return "AMDSMI_STATUS_NOT_SUPPORTED" in text or "Feature not supported" in text
-
-
-def _warn_optional_query_failure(
-    amdsmi: Any,
-    reason: str,
-    e: Exception,
-) -> None:
-    # Some platforms expose a subset of SMI counters and report unsupported
-    # values either as "N/A" payloads or AMDSMI_STATUS_NOT_SUPPORTED. These are
-    # expected missing telemetry, not actionable benchmark diagnostics.
-    if isinstance(e, amdsmi.AmdSmiException) and _is_not_supported_error(e):
-        return
-    warn_once("amdsmi", f"{reason} failed: {e}")
+    return amdsmi
 
 
 def is_amdsmi_available() -> bool:
-    """Return True if amdsmi can be imported."""
-    try:
-        import amdsmi  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    """True when amdsmi imports and initialises."""
+    return _amdsmi() is not None
 
 
-class AmdsmiSession:
-    """Process-wide amdsmi lifecycle: import, init, processor handles.
+def _hip_device_bdf(device_index: Optional[int]) -> Optional[str]:
+    """``dddd:bb:dd`` PCI address of a HIP device (None = current), via torch.
 
-    Designed as a thin singleton-style collaborator for
-    :class:`GpuSmiProbe`. The default instance is reached via
-    :func:`default_session`; tests construct their own to exercise
-    init / handle-resolution failures without monkeypatching globals.
-
-    All public methods degrade gracefully — ``module()`` returns
-    ``None`` when amdsmi can't be imported, and ``handle()`` returns
-    ``None`` for any failure in init or processor-handle lookup. A
-    one-shot diagnostic warning surfaces each failure mode.
+    None unless torch is already imported: importing it takes seconds and
+    starts a second HIP runtime context in a hipDNN run.
     """
+    # ponytail: unmapped HIP index under *_VISIBLE_DEVICES without torch; ask
+    # the HIP runtime (hipDeviceGetPCIBusId) if hipdnn_frontend ever binds it.
+    if "torch" not in sys.modules or not torch_support.gpu_available():
+        return None
+    try:
+        import torch
 
-    def __init__(self) -> None:
-        self._initialised = False
-        # Cache resolved handles by device index so repeated probes
-        # reuse the same object rather than re-querying amdsmi.
-        self._handles: Dict[int, Any] = {}
-
-    def module(self) -> Optional[Any]:
-        """Return the imported ``amdsmi`` module, or ``None``."""
-        try:
-            import amdsmi
-        except ImportError:
-            warn_once("amdsmi", "module not installed; GPU snapshot disabled")
-            return None
-        return amdsmi
-
-    def handle(self, device_index: int) -> Optional[Any]:
-        """Return the amdsmi processor handle for ``device_index``.
-
-        Lazily runs ``amdsmi_init`` on first use. Returns ``None`` if
-        amdsmi is missing, init fails, the handle list is unavailable,
-        or the device index is out of range.
-        """
-        if device_index in self._handles:
-            return self._handles[device_index]
-
-        amdsmi = self.module()
-        if amdsmi is None:
-            return None
-
-        if not self._initialised:
-            try:
-                amdsmi.amdsmi_init()
-                self._initialised = True
-            except amdsmi.AmdSmiException as e:
-                warn_once("amdsmi", f"init failed: {e}")
-                return None
-
-        try:
-            handles = amdsmi.amdsmi_get_processor_handles()
-        except amdsmi.AmdSmiException as e:
-            warn_once("amdsmi", f"get_processor_handles failed: {e}")
-            return None
-
-        if not handles or device_index >= len(handles):
-            warn_once(
-                "amdsmi",
-                f"device index {device_index} out of range "
-                f"({len(handles)} handles)",
-            )
-            return None
-
-        self._handles[device_index] = handles[device_index]
-        return self._handles[device_index]
+        index = torch.cuda.current_device() if device_index is None else device_index
+        p = torch.cuda.get_device_properties(index)
+        return f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}"
+    except Exception:
+        return None
 
 
-_default_session: Optional[AmdsmiSession] = None
-
-
-def default_session() -> AmdsmiSession:
-    """Return the process-wide default :class:`AmdsmiSession` instance."""
-    global _default_session
-    if _default_session is None:
-        _default_session = AmdsmiSession()
-    return _default_session
-
-
-def _reset_default_session_for_tests() -> None:
-    """Test-only: drop the module singleton so init / handle state is fresh."""
-    global _default_session
-    _default_session = None
+@functools.lru_cache(maxsize=None)
+def _handle_for(device_index: Optional[int]) -> Optional[Any]:
+    """amdsmi processor handle for a HIP device index (None = current)."""
+    amdsmi = _amdsmi()
+    if amdsmi is None:
+        return None
+    try:
+        handles = amdsmi.amdsmi_get_processor_handles()
+    except Exception:
+        return None
+    if not handles:
+        return None
+    bdf = _hip_device_bdf(device_index)
+    if bdf is not None:
+        for handle in handles:
+            # amdsmi reports "dddd:bb:dd.f"; torch exposes no function number.
+            smi_bdf = _query(lambda: amdsmi.amdsmi_get_gpu_device_bdf(handle), str)
+            if smi_bdf is not None and smi_bdf.lower().split(".")[0] == bdf:
+                return handle
+    index = device_index or 0
+    return handles[index] if index < len(handles) else None
 
 
 class GpuSmiProbe:
-    """Stateful amdsmi probe targeting a single GPU.
+    """amdsmi queries for one GPU (HIP device index; None = current device)."""
 
-    The amdsmi lifecycle (import, ``amdsmi_init``, processor handles)
-    lives in :class:`AmdsmiSession`. Pass a custom session to inject a
-    fake for tests; otherwise the module singleton is used and the
-    global ``amdsmi_init`` fires at most once per process.
-    """
+    def __init__(self, device_index: Optional[int] = None) -> None:
+        self._amdsmi = _amdsmi()
+        self._handle = _handle_for(device_index) if self._amdsmi is not None else None
 
-    def __init__(
-        self,
-        device_index: int = 0,
-        session: Optional[AmdsmiSession] = None,
-    ) -> None:
-        self._device_index = device_index
-        self._session = session if session is not None else default_session()
+    def clocks(self) -> Optional[Dict[str, Any]]:
+        """Current clocks, power, hotspot temperature and throttle status.
 
-    def _amdsmi_handle(self) -> Optional[Any]:
-        """Resolve (and cache) the amdsmi handle for this probe's device."""
-        return self._session.handle(self._device_index)
-
-    def snapshot(self) -> Dict[str, Optional[Any]]:
-        """Return a single-shot snapshot of GPU telemetry.
-
-        Every key in :data:`_SNAPSHOT_KEYS` is present in the returned
-        dict; values are ``None`` when the underlying query fails or
-        amdsmi is unavailable. Failures emit a deduplicated warning via
-        :func:`warn_once`.
+        Keys: ``sclk_mhz``, ``mclk_mhz``, ``power_w``, ``temp_hotspot_c``,
+        ``throttle_status``; a value is None when the platform does not
+        report it. Returns None when amdsmi or the device is unavailable.
         """
-        snap = _empty_snapshot()
-        handle = self._amdsmi_handle()
-        if handle is None:
-            return snap
-        amdsmi = self._session.module()
-        if amdsmi is None:
-            return snap
+        if self._handle is None:
+            return None
+        smi, h = self._amdsmi, self._handle
 
-        # VRAM usage
-        try:
-            vram = amdsmi.amdsmi_get_gpu_vram_usage(handle)
-            # amdsmi reports MB already
-            snap["vram_used_mb"] = _optional_float(vram.get("vram_used"))
-            snap["vram_total_mb"] = _optional_float(vram.get("vram_total"))
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "vram_usage", e)
+        def power() -> Any:
+            info = smi.amdsmi_get_power_info(h)
+            avg = info.get("average_socket_power")
+            return info.get("current_socket_power") if _is_unavailable(avg) else avg
 
-        # Power
-        try:
-            power = amdsmi.amdsmi_get_power_info(handle)
-            socket_w = _first_available(
-                power.get("average_socket_power"),
-                power.get("current_socket_power"),
-            )
-            snap["power_w"] = _optional_float(socket_w)
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "power_info", e)
+        return {
+            "sclk_mhz": _query(
+                lambda: smi.amdsmi_get_clock_info(h, smi.AmdSmiClkType.GFX)["clk"]
+            ),
+            "mclk_mhz": _query(
+                lambda: smi.amdsmi_get_clock_info(h, smi.AmdSmiClkType.MEM)["clk"]
+            ),
+            "power_w": _query(power),
+            "temp_hotspot_c": _query(
+                lambda: smi.amdsmi_get_temp_metric(
+                    h,
+                    smi.AmdSmiTemperatureType.HOTSPOT,
+                    smi.AmdSmiTemperatureMetric.CURRENT,
+                )
+            ),
+            "throttle_status": _query(
+                lambda: smi.amdsmi_get_gpu_metrics_info(h)["throttle_status"], int
+            ),
+        }
 
-        # Clocks (GFX = sclk, MEM = mclk)
-        try:
-            sclk = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)
-            snap["sclk_mhz"] = _optional_float(sclk.get("clk"))
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "clock_info GFX", e)
+    def identity(self) -> Tuple[Optional[str], Optional[str]]:
+        """``(target_graphics_version, market_name)``; None where unreported.
 
-        try:
-            mclk = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.MEM)
-            snap["mclk_mhz"] = _optional_float(mclk.get("clk"))
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "clock_info MEM", e)
-
-        # Temperatures
-        try:
-            edge = amdsmi.amdsmi_get_temp_metric(
-                handle,
-                amdsmi.AmdSmiTemperatureType.EDGE,
-                amdsmi.AmdSmiTemperatureMetric.CURRENT,
-            )
-            snap["temp_edge_c"] = _optional_float(edge)
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "temp EDGE", e)
-
-        try:
-            hot = amdsmi.amdsmi_get_temp_metric(
-                handle,
-                amdsmi.AmdSmiTemperatureType.HOTSPOT,
-                amdsmi.AmdSmiTemperatureMetric.CURRENT,
-            )
-            snap["temp_hotspot_c"] = _optional_float(hot)
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "temp HOTSPOT", e)
-
-        # Utilisation + throttle status from gpu_metrics
-        try:
-            metrics = amdsmi.amdsmi_get_gpu_metrics_info(handle)
-            gpu_util = metrics.get("average_gfx_activity")
-            mem_util = metrics.get("average_umc_activity")
-            throttle = metrics.get("throttle_status")
-            snap["gpu_utilization_pct"] = _optional_float(gpu_util)
-            snap["memory_utilization_pct"] = _optional_float(mem_util)
-            snap["throttle_status"] = _optional_int(throttle)
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            _warn_optional_query_failure(amdsmi, "gpu_metrics_info", e)
-
-        return snap
-
-    def static_info(self) -> Dict[str, Optional[Any]]:
-        """Return one-time static info: CUs, HBM size, PCIe link, driver.
-
-        Used by :func:`machine_info.collect_machine_info`. Stable-shape
-        dict; missing values are ``None``.
+        Older amdsmi builds have no ``target_graphics_version``.
         """
-        info: Dict[str, Optional[Any]] = {
+        if self._handle is None:
+            return None, None
+        asic = _query(lambda: self._amdsmi.amdsmi_get_gpu_asic_info(self._handle), dict)
+        if not asic:
+            return None, None
+        return (
+            _query(lambda: asic["target_graphics_version"], str),
+            _query(lambda: asic["market_name"], str),
+        )
+
+    def static_info(self) -> Dict[str, Any]:
+        """One-time static GPU facts for the environment block.
+
+        Keys: ``gpu_compute_units``, ``gpu_hbm_gb``, ``gpu_pcie_link``,
+        ``amdgpu_driver_version``, ``gpu_power_cap_w``,
+        ``gpu_max_sclk_mhz``, ``gpu_compute_partition``; None when unknown.
+        """
+        info: Dict[str, Any] = {
             "gpu_compute_units": None,
             "gpu_hbm_gb": None,
             "gpu_pcie_link": None,
             "amdgpu_driver_version": None,
+            "gpu_power_cap_w": None,
+            "gpu_max_sclk_mhz": None,
+            "gpu_compute_partition": None,
         }
-        handle = self._amdsmi_handle()
-        if handle is None:
+        if self._handle is None:
             return info
-        amdsmi = self._session.module()
-        if amdsmi is None:
-            return info
+        smi, h = self._amdsmi, self._handle
 
-        try:
-            asic = amdsmi.amdsmi_get_gpu_asic_info(handle)
-            cus = asic.get("num_of_compute_units") or asic.get("num_compute_units")
-            if cus is not None:
-                info["gpu_compute_units"] = int(cus)
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"asic_info failed: {e}")
+        def pcie_link() -> Any:
+            # pcie_speed is the per-lane rate in MT/s (16000 = PCIe gen4).
+            metric = smi.amdsmi_get_pcie_info(h)["pcie_metric"]
+            speed, width = metric.get("pcie_speed"), metric.get("pcie_width")
+            if _is_unavailable(speed) or _is_unavailable(width):
+                return None
+            return f"{float(speed) / 1000:g} GT/s x{width}"
 
-        try:
-            vram = amdsmi.amdsmi_get_gpu_vram_info(handle)
-            size_mb = vram.get("vram_size") or vram.get("vram_size_mb")
-            if size_mb is not None:
-                info["gpu_hbm_gb"] = round(float(size_mb) / 1024.0, 2)
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"vram_info failed: {e}")
+        def compute_units() -> Any:
+            asic = smi.amdsmi_get_gpu_asic_info(h)
+            return asic.get("num_of_compute_units") or asic.get("num_compute_units")
 
-        try:
-            pcie = amdsmi.amdsmi_get_pcie_info(handle)
-            metric = pcie.get("pcie_metric") or {}
-            gen = metric.get("pcie_speed") or pcie.get("pcie_speed")
-            width = metric.get("pcie_width") or pcie.get("pcie_lanes")
-            if gen is not None and width is not None:
-                info["gpu_pcie_link"] = f"gen{gen} x{width}"
-        except (amdsmi.AmdSmiException, KeyError, TypeError, ValueError) as e:
-            warn_once("amdsmi", f"pcie_info failed: {e}")
+        def hbm_mb() -> Any:
+            vram = smi.amdsmi_get_gpu_vram_info(h)
+            return vram.get("vram_size") or vram.get("vram_size_mb")
 
-        try:
-            driver = amdsmi.amdsmi_get_gpu_driver_info(handle)
-            ver = driver.get("driver_version") or driver.get("driver_name")
-            if ver:
-                info["amdgpu_driver_version"] = str(ver)
-        except (
-            AttributeError,
-            amdsmi.AmdSmiException,
-            KeyError,
-            TypeError,
-            ValueError,
-        ) as e:
-            # AttributeError caught because amdsmi_get_gpu_driver_info may
-            # not exist in older amdsmi versions.
-            warn_once("amdsmi", f"driver_info failed: {e}")
+        def driver() -> Any:
+            d = smi.amdsmi_get_gpu_driver_info(h)
+            return d.get("driver_version") or d.get("driver_name")
 
+        info["gpu_compute_units"] = _query(compute_units, int)
+        info["gpu_hbm_gb"] = _query(hbm_mb, lambda mb: round(float(mb) / 1024.0, 2))
+        info["gpu_pcie_link"] = _query(pcie_link, str)
+        info["amdgpu_driver_version"] = _query(driver, str)
+        # amdsmi reports the power cap in microwatts.
+        info["gpu_power_cap_w"] = _query(
+            lambda: smi.amdsmi_get_power_cap_info(h)["power_cap"],
+            lambda uw: float(uw) / 1e6,
+        )
+        info["gpu_max_sclk_mhz"] = _query(
+            lambda: smi.amdsmi_get_clock_info(h, smi.AmdSmiClkType.GFX)["max_clk"]
+        )
+        info["gpu_compute_partition"] = _query(
+            lambda: smi.amdsmi_get_gpu_compute_partition(h), str
+        )
         return info

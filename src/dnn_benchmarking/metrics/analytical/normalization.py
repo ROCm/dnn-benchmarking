@@ -6,9 +6,11 @@
 All of these are output-element-count driven and use a small fixed
 ops/elem multiplier:
 
-* BN inference: 4 (subtract mean, mul inv_var, mul scale, add bias)
-* BN training fwd / bwd: 8 (above + mean & variance reductions)
+* BN inference (also the variance-input ``VarianceExt`` form): 4
+  (subtract mean, mul inv_var, mul scale, add bias)
+* BN training fwd: 8 (above + mean & variance reductions)
 * LayerNorm / RMSNorm fwd: 8 (mean + variance + normalisation)
+* BN / LayerNorm / RMSNorm bwd: 8 per ``dx`` element
 * Softmax fwd: 4 (max, exp, sum, divide)
 
 RMSNorm omits the mean step (~6 ops/elem in theory) but the
@@ -41,12 +43,12 @@ def batchnorm_training_flops(
     return 8 * elems if elems is not None else None
 
 
-def batchnorm_backward_flops(
+def norm_backward_flops(
     node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
 ) -> Optional[int]:
-    """BatchNorm bwd: 8 ops/elem on the activation-shaped gradient.
+    """BatchNorm / LayerNorm / RMSNorm bwd: 8 ops/elem on ``dx``.
 
-    BN backward emits ``dx_tensor_uid`` (the gradient w.r.t. the input
+    Each backward emits ``dx_tensor_uid`` (the gradient w.r.t. the input
     activation), plus ``dscale`` / ``dbias`` (parameter-sized — small
     enough to ignore). The dominant cost is over ``dx`` elements.
     """

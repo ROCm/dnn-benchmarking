@@ -132,29 +132,31 @@ def resolve_graph_files_multi(
 ) -> Tuple[List[tempfile.TemporaryDirectory], List[str], Optional[str]]:
     """Resolve multiple --graph arguments to a deduplicated list of JSON paths.
 
-    Calls :func:`resolve_graph_files` for each argument and merges the results.
+    Files keep the command-line order of ``graph_args``; only the files one
+    argument expands to (glob, directory, tarball) are sorted. A file named
+    twice (by any spelling of its path) runs once, at its first position.
 
     Args:
         graph_args: List of raw --graph argument strings.
 
     Returns:
         Tuple of (list of TemporaryDirectory objects to keep alive,
-        sorted deduplicated list of resolved JSON file paths,
+        ordered deduplicated list of resolved JSON file paths,
         tarball_source string for reporting or None).
 
     Raises:
         GraphLoadError: If any tarball cannot be opened or extracted.
     """
     all_tmpdirs: List[tempfile.TemporaryDirectory] = []
-    seen: dict[str, None] = {}
+    seen: dict[Path, str] = {}
     tarball_source: Optional[str] = None
 
     for arg in graph_args:
         tmpdirs, files, tb_source = resolve_graph_files(arg)
         all_tmpdirs.extend(tmpdirs)
         for f in files:
-            seen.setdefault(f)
+            seen.setdefault(Path(f).resolve(), f)
         if tb_source is not None:
             tarball_source = tb_source
 
-    return all_tmpdirs, sorted(seen), tarball_source
+    return all_tmpdirs, list(seen.values()), tarball_source
