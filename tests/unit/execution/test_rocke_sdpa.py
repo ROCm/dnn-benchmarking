@@ -71,6 +71,13 @@ def test_unsupported_graphs_are_rejected(mutate) -> None:
         _problem(graph)
 
 
+def test_v_head_size_other_than_qk_is_rejected() -> None:
+    """rocKE kernels take one head size; the shared reader accepts 192/128."""
+    graph = sdpa_graph(d=192, d_v=128, causal_mask=False)
+    with pytest.raises(UnsupportedGraphError, match="one head size"):
+        _problem(graph)
+
+
 def _set_seqlen_q(graph, seqlen_q):
     for index in (0, 3):  # query and output
         tensor = graph["tensors"][index]

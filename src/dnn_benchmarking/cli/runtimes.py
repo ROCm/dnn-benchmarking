@@ -111,8 +111,9 @@ def _start_aiter(config: SuiteConfig, reporter: Reporter) -> GraphPlanner:
     if spec is None or spec.origin is None:
         raise RuntimeStartupError(
             "--runtime aiter: the aiter package is not importable; run "
-            "setup_env.py on Linux with ROCm torch, or pip install -e the "
-            "aiter submodule of this repository"
+            "setup_env.py on Linux with ROCm torch, or `pip install "
+            "--config-settings editable_mode=compat -e aiter` from the "
+            "repository root"
         )
     try:
         session = aiter_session()

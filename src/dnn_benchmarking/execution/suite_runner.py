@@ -41,7 +41,12 @@ from ..graph.tensor_info import TensorInfo
 from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
-from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
+from ..reporting.statistics import (
+    BenchmarkStats,
+    TimingInfo,
+    host_bound_warnings,
+    noise_warnings,
+)
 from ..reporting.suite_results import (
     GraphResult,
     ProviderEngineResult,
@@ -187,10 +192,15 @@ def _measure_row(
         row.clocks_after = probe.clocks()
 
     kernel = BenchmarkStats.from_timings(m.kernel_ms)
+    host = BenchmarkStats.from_timings(m.host_ms)
     row.ootb.gpu_kernel_stats = kernel
-    row.ootb.host_stats = BenchmarkStats.from_timings(m.host_ms)
+    row.ootb.host_stats = host
     row.ootb.timing = TimingInfo.from_measurement(m)
-    warnings = list(row.warnings or []) + noise_warnings(kernel)
+    warnings = (
+        list(row.warnings or [])
+        + noise_warnings(kernel)
+        + host_bound_warnings(kernel, host, m.mode)
+    )
     if m.capped:
         warnings.append("capped at max_iters")
     if m.fallback_reason:

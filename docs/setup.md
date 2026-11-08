@@ -41,7 +41,8 @@ stages are:
 9. `rocKE Python packages`: Linux only. Install rocKE's Python packages for
    `--runtime rocke` (see [Extra CMake defines](#extra-cmake-defines)).
 10. `AITER`: Linux with ROCm torch only. Install AITER for `--runtime aiter`
-    and compile its attention kernels (see [AITER](#aiter)).
+    and compile its attention kernels (see [AITER](#aiter)). Skipped with
+    `--no-aiter`.
 11. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
     and link the wheel rocprofiler libraries.
 12. `Verify installation`.
@@ -65,6 +66,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
+| `--no-aiter` | Skip the `AITER` stage. Only `--runtime aiter` needs it. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
 | `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
@@ -95,6 +97,7 @@ On Linux the venv activation script exports these variables:
 | `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
 | `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts MIOpen, comgr and XDG caches under it when those variables are not set. |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
+| `AITER_JIT_DIR` | `<venv>/aiter-jit`, where the `AITER` stage compiles AITER's modules. A plain `import aiter` in the venv loads them. |
 
 dnn-benchmarking finds the engine plugins in
 `$ROCM_PATH/lib/hipdnn_plugins/engines/`. Give this directory to
@@ -270,21 +273,28 @@ On Linux with ROCm torch, the `AITER` stage installs AITER for
 `--runtime aiter`:
 
 1. It fetches the `aiter` submodule at the commit that this repository pins,
-   and AITER's `3rdparty/composable_kernel` submodule, each at depth 1. An
-   existing checkout (for example from `git submodule update --init
+   with the release tags at that commit, and AITER's
+   `3rdparty/composable_kernel` submodule, each at depth 1. The tags give
+   the AITER package its release version, which the result files record.
+   An existing checkout (for example from `git submodule update --init
    --recursive aiter`) is kept; a commit other than the pin gives a warning.
+   With `--reuse-artifacts`, it fetches nothing: without a checkout, it
+   skips the stage.
 2. It installs AITER's `requirements.txt` and then AITER as an editable
    package, with `AITER_USE_SYSTEM_TRITON=1` so torch's Triton stays.
-3. With a GPU visible, it runs every AITER backend that `--runtime aiter` runs
-   on that GPU once, for fp16 and bf16 with and without a causal mask. This
-   compiles AITER's host modules (JIT) into `aiter/aiter/jit`, so the first
-   benchmark does not compile. The CK modules take minutes each. Without a
-   GPU, each backend compiles on its first use. A backend that does not
-   compile gives a warning; its rows then report the same error.
+3. On a GPU that AITER supports (gfx90a, gfx942, gfx950), it runs every
+   AITER backend that `--runtime aiter` runs on that GPU once, for fp16 and
+   bf16 with and without a causal mask. This compiles AITER's host modules
+   (JIT) into the `aiter-jit` directory of the venv, so the first benchmark
+   does not compile and `--clean` removes them. The CK modules take minutes
+   each. Without a GPU, each backend compiles on its first use. A backend
+   that does not compile gives a warning; its rows then report the same
+   error.
 
 AITER compiles with the pip ROCm SDK of torch (see
 [AITER runtime](usage.md#aiter-runtime)). Other torch modes and Windows skip
-the stage.
+the stage. It adds about 6 minutes to the CI setup and 15 to 18 minutes on
+a 32-core node. Use `--no-aiter` when you do not run `--runtime aiter`.
 
 ## Rebuild from zero
 

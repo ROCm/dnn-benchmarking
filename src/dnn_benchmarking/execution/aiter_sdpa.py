@@ -21,8 +21,10 @@ Row                       AITER entry point
 AITER decides between its compiled backends inside ``_flash_attn_forward``
 with nested ``can_impl_*`` checks that callers cannot reach. :func:`backend_rows`
 repeats those checks for the graphs this runtime accepts (dense, no bias, no
-dropout, no window, no sink, no FP8). They follow the AITER commit pinned by
-the ``aiter`` submodule; a submodule bump must check them again.
+dropout, no window, no sink, no FP8). They follow the AITER commit
+:data:`VERIFIED_AITER_COMMIT`. A unit test fails when the ``aiter`` submodule
+pins another commit: check these copies and the entry-point arguments of
+``aiter_executor._launch_for`` against it, then update the constant.
 
 This module needs neither torch nor AITER at import time.
 """
@@ -37,6 +39,10 @@ from .sdpa_graph import DenseSdpa, dense_sdpa
 #: Arches where AITER's CK forward kernels, and so ``aiter:auto``, run.
 #: AITER's other backends are subsets of these.
 AITER_ARCHES = ("gfx90a", "gfx942", "gfx950")
+
+#: The AITER commit (v0.1.28.post1) whose backend checks :func:`backend_rows`
+#: repeats. It must equal the commit of the ``aiter`` submodule.
+VERIFIED_AITER_COMMIT = "ad0554a97858d8089e92c2d8b5db7017a6efc0f2"
 
 #: KV byte extent at which the 32-bit buffer offsets of some kernels wrap
 #: (AITER ``_fmha_kv_byte_extent_ge_u32``).

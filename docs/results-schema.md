@@ -275,6 +275,7 @@ loop. Paths are relative to the row:
 | `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.timing.samples` is 10 or more. |
 | `outlier: max Nx median` | The slowest sample is more than 2 x `ootb.kernel.median_ms`. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
+| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | `ootb.timing.mode` is `block` or `events`, and `ootb.host.median_ms` is 0.9 x `ootb.kernel.median_ms` or more. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |

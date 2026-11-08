@@ -4,11 +4,15 @@
 """AITER runtime: SDPA problem extraction and the backend rows of each problem."""
 
 import importlib.util
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.execution.aiter_sdpa import (
+    VERIFIED_AITER_COMMIT,
     AiterDevice,
     _native_splits,
     aiter_problem,
@@ -143,9 +147,9 @@ def test_split_kv_count_matches_aiter() -> None:
     spec = importlib.util.find_spec("aiter")
     if spec is None or spec.origin is None:  # an empty aiter/ is a namespace
         pytest.skip("aiter is not installed")
-    from dnn_benchmarking.execution.aiter_executor import use_torch_rocm_toolchain
+    from dnn_benchmarking.execution.aiter_executor import prepare_aiter_environment
 
-    use_torch_rocm_toolchain()  # import aiter compiles its core module
+    prepare_aiter_environment()  # import aiter compiles its core module
     mha = pytest.importorskip("aiter.ops.mha")
     for b in (1, 2):
         for hq in (8, 64):
@@ -157,3 +161,22 @@ def test_split_kv_count_matches_aiter() -> None:
                     assert _native_splits(p, 304) == mha._native_splitkv_heuristic(
                         b, hq, sq, skv, 304
                     ), (b, hq, sq, skv)
+
+
+def test_backend_checks_were_verified_against_the_pinned_aiter() -> None:
+    """A submodule bump fails here until someone checks the copied AITER code."""
+    repo = Path(__file__).resolve().parents[3]
+    if shutil.which("git") is None or not (repo / ".git").exists():
+        pytest.skip("no git checkout of this repository")
+    entry = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--stage", "aiter"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert entry[:1] == ["160000"], "aiter is not a submodule"
+    assert entry[1] == VERIFIED_AITER_COMMIT, (
+        f"the aiter submodule pins {entry[1]}; check the backend checks in "
+        "execution/aiter_sdpa.py and the arguments in aiter_executor._launch_for "
+        "against it, then update VERIFIED_AITER_COMMIT"
+    )

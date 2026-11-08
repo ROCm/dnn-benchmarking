@@ -397,15 +397,16 @@ print("\n" + mode)
 _AITER_PREBUILD = r"""
 import sys
 
-from dnn_benchmarking.execution.aiter_executor import prebuild
+from dnn_benchmarking.execution import aiter_executor
 
-ran = failed = 0
-for label, error in prebuild():
-    ran += 1
+reason = aiter_executor.prebuild_skip_reason()
+if reason:
+    print(f"  Nothing to compile: {reason}.")
+    sys.exit(0)
+failed = 0
+for label, error in aiter_executor.prebuild():
     failed += error is not None
     print(f"  {label}: {error}" if error else f"  {label}", flush=True)
-if not ran:
-    print("  No supported GPU is visible; AITER compiles each backend on first use.")
 sys.exit(1 if failed else 0)
 """
 
@@ -527,6 +528,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-aiter",
+        dest="aiter",
+        action="store_false",
+        help=(
+            "Skip the AITER stage (fetch, install and kernel compile for "
+            "--runtime aiter). Other runtimes do not need it."
+        ),
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help=(
@@ -592,6 +602,7 @@ class Setup:
     def __init__(self, args: argparse.Namespace) -> None:
         self.torch_mode = args.torch_mode
         self.reuse_artifacts = args.reuse_artifacts
+        self.with_aiter = args.aiter
         self.auto_yes = args.yes
         self.clean = args.clean
         self.rocm_prefix = args.rocm_prefix
@@ -839,6 +850,7 @@ class Setup:
             run_git([*git, "remote", "add", "origin", url])
             run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
             run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
+            self._fetch_tags_at(staging, ref)
             self._init_aiter_submodules(staging)
         except BaseException:
             if staging.exists():
@@ -847,6 +859,27 @@ class Setup:
         if AITER_DIR.exists():
             rmtree(AITER_DIR)
         os.replace(staging, AITER_DIR)
+
+    @staticmethod
+    def _fetch_tags_at(checkout: Path, commit: str) -> None:
+        """Fetch the tags of ``origin`` that point at ``commit``.
+
+        AITER's package version comes from ``git describe`` (setuptools_scm).
+        A depth-1 fetch has no tags, so a release commit would install as
+        ``0.1.1.dev1+g<sha>`` and the result files would record that version.
+        """
+        listing = git_output(["-C", str(checkout), "ls-remote", "--tags", "origin"])
+        tags = set()
+        for line in listing.splitlines():
+            sha, _, name = line.partition("\t")
+            if sha == commit:
+                tags.add(name.removeprefix("refs/tags/").removesuffix("^{}"))
+        for tag in sorted(tags):
+            ref = f"refs/tags/{tag}"
+            run_git(
+                ["-C", str(checkout), "fetch", "--quiet", "--depth", "1", "origin"]
+                + [f"{ref}:{ref}"]
+            )
 
     @staticmethod
     def _init_aiter_submodules(checkout: Path) -> None:
@@ -903,6 +936,10 @@ class Setup:
         lines = [
             f"export PYTHONPYCACHEPREFIX={shlex.quote(str(self.workspace / 'pycache'))}",
             f"export DNN_BENCH_WORKSPACE={shlex.quote(str(self.workspace))}",
+            # Where the AITER stage compiled AITER's modules (see
+            # aiter_executor.prepare_aiter_environment): a plain `import
+            # aiter` in the venv then loads them instead of compiling again.
+            f"export AITER_JIT_DIR={shlex.quote(str(self.venv_dir / 'aiter-jit'))}",
         ]
         if rocm_prefix:
             lines.append(f"export ROCM_PATH={shlex.quote(rocm_prefix)}")
@@ -1690,16 +1727,23 @@ class Setup:
 
         AITER compiles its host modules (JIT) against the installed torch, so
         it is installed from source (the ``aiter`` submodule) and only with
-        ROCm torch. ``AITER_USE_SYSTEM_TRITON=1`` keeps torch's Triton. With a
-        GPU visible, the stage then runs every AITER backend once on small
-        problems (``aiter_executor.prebuild``, which also selects the ROCm
-        SDK toolchain of torch); the compiled modules stay in
-        ``aiter/aiter/jit``.
+        ROCm torch. ``AITER_USE_SYSTEM_TRITON=1`` keeps torch's Triton. On a
+        GPU that AITER supports, the stage then runs every AITER backend once
+        on small problems (``aiter_executor.prebuild``); the compiled modules
+        stay in ``<venv>/aiter-jit``. --reuse-artifacts fetches no AITER
+        sources: it installs an existing ``aiter/`` checkout or skips.
         """
         if self.installed_torch_mode != "rocm":
             print(
                 f"Skipping AITER: --runtime aiter needs ROCm torch, not "
                 f"'{self.installed_torch_mode}'."
+            )
+            return
+        if self.reuse_artifacts and not (AITER_DIR / ".git").exists():
+            print(
+                "Skipping AITER: --reuse-artifacts fetches no sources and aiter/ "
+                "is not checked out (`git submodule update --init --recursive "
+                "aiter`)."
             )
             return
         self.ensure_aiter_checkout()
@@ -1955,7 +1999,8 @@ class Setup:
             if not IS_WINDOWS:
                 # The Windows ROCm build of rocKE is untested (see rocke_args).
                 stages.append(("rocKE Python packages", self.install_rocke_packages))
-                # AITER's source install needs FlyDSL, which ships Linux wheels only.
+            # AITER's source install needs FlyDSL, which ships Linux wheels only.
+            if not IS_WINDOWS and self.with_aiter:
                 stages.append(("AITER", self.install_aiter))
             stages.append(
                 ("amdsmi and rocprofiler libraries", self.install_runtime_extras)

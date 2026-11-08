@@ -36,8 +36,14 @@ Launch = Callable[[], Any]
 _ALLOCATES_OUTPUT = frozenset({"auto", "triton", "gluon"})
 
 
-def use_torch_rocm_toolchain() -> None:
-    """Make AITER's JIT compile and link with the pip ROCm SDK of torch.
+def prepare_aiter_environment() -> None:
+    """Set the JIT directory and toolchain of AITER; call before ``import aiter``.
+
+    AITER compiles its host modules (JIT) against the installed torch and
+    rebuilds a module only when it is missing or built for another GPU. So,
+    in a venv and unless ``AITER_JIT_DIR`` is set, this keeps the modules in
+    ``<venv>/aiter-jit``: ``setup_env.py --clean`` removes them with the venv,
+    and two venvs do not load each other's modules.
 
     AITER reads its ROCm root from ``ROCM_HOME``, then ``ROCM_PATH``, and its
     compiler from the first ``hipcc`` on ``PATH``. The setup_env.py
@@ -46,9 +52,10 @@ def use_torch_rocm_toolchain() -> None:
     the SDK's devel package is installed and expanded, this sets
     ``ROCM_HOME`` to it (unless ``ROCM_HOME`` is set) and puts the
     interpreter's ``bin``, which holds the SDK's ``hipcc``, first on
-    ``PATH``. Call it before the first ``import aiter``, which compiles
-    AITER's core module.
+    ``PATH``. The first ``import aiter`` compiles AITER's core module.
     """
+    if sys.prefix != sys.base_prefix:
+        os.environ.setdefault("AITER_JIT_DIR", str(Path(sys.prefix) / "aiter-jit"))
     spec = importlib.util.find_spec("_rocm_sdk_devel")
     if spec is None or not spec.submodule_search_locations:
         return
@@ -87,21 +94,50 @@ def _launch_for(
             q, k, v, dropout_p=0.0, softmax_scale=scale, causal=causal
         )
     if name == "ck":
-        # dropout_p, scale, causal, window left/right, sink size,
-        # return_softmax_lse, return_dropout_randval.
-        args = (0.0, scale, causal, -1, -1, 0, False, False)
-        return lambda: mha.mha_fwd(q, k, v, *args, out=o)
+        return lambda: mha.mha_fwd(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=scale,
+            is_causal=causal,
+            window_size_left=-1,
+            window_size_right=-1,
+            sink_size=0,
+            return_softmax_lse=False,
+            return_dropout_randval=False,
+            out=o,
+        )
     if name == "asm_v3":
-        # dropout_p, scale, causal, window left/right, return_softmax_lse,
-        # return_dropout_randval, how_v3_bf16_cvt (flash_attn_func's default).
-        args = (0.0, scale, causal, -1, -1, False, False, 1)
-        return lambda: mha.fmha_v3_fwd(q, k, v, *args, out=o)
+        return lambda: mha.fmha_v3_fwd(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=scale,
+            is_causal=causal,
+            window_size_left=-1,
+            window_size_right=-1,
+            return_softmax_lse=False,
+            return_dropout_randval=False,
+            how_v3_bf16_cvt=1,  # flash_attn_func's default
+            out=o,
+        )
     if name == "opus":
-        return lambda: mha.fmha_fwd_bf16_opus_fwd(q, k, v, scale, causal, out=o)
+        return lambda: mha.fmha_fwd_bf16_opus_fwd(
+            q, k, v, softmax_scale=scale, causal=causal, out=o
+        )
     if name == "native_splitkv":
         splits = backend.num_splits
         return lambda: mha.mha_fwd_native_splitkv(
-            q, k, v, o, scale, causal, False, splits
+            q,
+            k,
+            v,
+            out=o,
+            softmax_scale=scale,
+            causal=causal,
+            return_lse=False,
+            num_splits=splits,
         )
     if name in ("triton", "gluon"):
         from aiter.ops.triton.attention.mha import flash_attn_func
@@ -224,10 +260,10 @@ class AiterExecutor:
 def aiter_device(device: torch.device) -> AiterDevice:
     """The facts of ``device`` that AITER's backend checks read.
 
-    It imports AITER, so it sets up the toolchain first
-    (:func:`use_torch_rocm_toolchain`).
+    It imports AITER, so it prepares the environment first
+    (:func:`prepare_aiter_environment`).
     """
-    use_torch_rocm_toolchain()
+    prepare_aiter_environment()
     from aiter.ops.triton.attention.mha import is_gluon_available
 
     return AiterDevice(
@@ -242,24 +278,33 @@ def aiter_device(device: torch.device) -> AiterDevice:
 _PREBUILD_HEAD_SIZES = ((128, 128), (192, 128), (64, 64))
 
 
+def prebuild_skip_reason() -> Optional[str]:
+    """Why :func:`prebuild` compiles nothing on this host, or None.
+
+    It does not import AITER, whose import compiles AITER's core module.
+    """
+    if not torch_support.gpu_available():
+        return "no GPU is visible; AITER compiles each backend on first use"
+    arch = torch_support.device_arch(torch.device("cuda"))
+    if arch not in AITER_ARCHES:
+        return f"{arch} is not one of {', '.join(AITER_ARCHES)}; it has no AITER rows"
+    return None
+
+
 def prebuild() -> Iterator[Tuple[str, Optional[str]]]:
     """Compile every AITER backend that runs on this GPU, for fp16 and bf16.
 
     It runs each backend once on small problems with and without a causal
     mask, which compiles the host modules that ``--runtime aiter`` loads
     later. setup_env.py calls it after it installs AITER and prints each
-    result.
+    result. Call :func:`prebuild_skip_reason` first.
 
     Yields:
         ``(what ran, error)`` for each backend run; ``error`` is None when
-        the run passed. Nothing when no supported GPU is visible.
+        the run passed.
     """
-    if not torch_support.gpu_available():
-        return
     device = torch.device("cuda")
     info = aiter_device(device)
-    if info.arch not in AITER_ARCHES:
-        return
     # A long KV makes the native split-KV heuristic split (gfx942 bf16 d64).
     b, h, sq, skv = 1, 8, 128, 4096
     for data_type, dtype in (("half", torch.float16), ("bfloat16", torch.bfloat16)):

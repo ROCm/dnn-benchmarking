@@ -20,11 +20,11 @@ pytestmark = pytest.mark.gpu
 def aiter_session(torch_gpu):
     """The AITER session on a GPU that --runtime aiter supports, or skip."""
     from dnn_benchmarking.common.torch_support import device_arch
-    from dnn_benchmarking.execution.aiter_executor import use_torch_rocm_toolchain
+    from dnn_benchmarking.execution.aiter_executor import prepare_aiter_environment
     from dnn_benchmarking.execution.aiter_sdpa import AITER_ARCHES
     from dnn_benchmarking.execution.suite_runner import aiter_session
 
-    use_torch_rocm_toolchain()  # import aiter compiles its core module
+    prepare_aiter_environment()  # import aiter compiles its core module
     pytest.importorskip("aiter.ops.mha")
 
     arch = device_arch(torch_gpu.device("cuda"))

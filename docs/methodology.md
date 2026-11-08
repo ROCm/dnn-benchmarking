@@ -267,6 +267,7 @@ The tool does not remove outliers. It adds warnings to the row:
 |---|---|
 | `noisy: IQR x% of median` | `iqr_ms / median_ms` more than 5 % and 10 or more samples. The table marks `kernel_med` with `*`. |
 | `outlier: max Nx median` | Maximum more than 2 x median. The table marks `kernel_med` with `*` and shows the warning in `note`. |
+| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | Block or events timing only. The median host submit time is 90 % or more of the median span. The span then measures the launch cost, not the device. Use the default staged timing for such kernels. |
 
 The noise flag uses IQR/median, not CV. A few slow samples raise the CV a
 lot but do not change the IQR. The `outlier` flag reports those samples.

@@ -4,6 +4,7 @@
 """rocKE and AITER runtime startup: missing prerequisites fail fast, hipDNN untouched."""
 
 import builtins
+import importlib.machinery
 import importlib.util
 import io
 import sys
@@ -74,13 +75,25 @@ def test_missing_rocke_packages_exit_1(monkeypatch) -> None:
     assert "dispatch" in text and "Traceback" not in text
 
 
-def test_missing_aiter_package_exits_1(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(None, id="absent"),
+        # From the repository root, the uninstalled aiter/ submodule
+        # directory imports as a namespace package, which has no origin.
+        pytest.param(
+            importlib.machinery.ModuleSpec("aiter", None, is_package=True),
+            id="namespace",
+        ),
+    ],
+)
+def test_missing_aiter_package_exits_1(monkeypatch, spec) -> None:
     _fake_torch(monkeypatch, gpu=True, hip="7.0")
     real_find_spec = importlib.util.find_spec
     monkeypatch.setattr(
         importlib.util,
         "find_spec",
-        lambda name, *a: None if name == "aiter" else real_find_spec(name, *a),
+        lambda name, *a: spec if name == "aiter" else real_find_spec(name, *a),
     )
     code, text = _run("-r", "aiter")
     assert code == 1

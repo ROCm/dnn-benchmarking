@@ -658,6 +658,196 @@ def test_a_full_checkout_is_not_made_sparse(
     assert not setup._rocm_libraries_is_sparse()
 
 
+# --- AITER -------------------------------------------------------------------
+
+_AITER_TAG = "v0.1.28.post1"
+
+
+def _pin_aiter(repo: Path, commit: str) -> None:
+    _git("update-index", "--add", "--cacheinfo", f"160000,{commit},aiter", cwd=repo)
+    _git("commit", "-q", "--allow-empty", "-m", f"pin {commit[:8]}", cwd=repo)
+
+
+@pytest.fixture
+def aiter(setup_env, tmp_path, monkeypatch):
+    """A local AITER origin whose tagged release commit has a CK submodule
+    and is no longer the branch tip; this repository pins that commit.
+
+    Returns ``(checkout path, pinned commit, branch tip)``.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    # git 2.38.1 and later refuse file:// submodule URLs by default.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "always")
+
+    ck = tmp_path / "ck-src"
+    (ck / "include").mkdir(parents=True)
+    (ck / "include" / "ck.hpp").write_text("// ck\n")
+    _git("init", "-q", "-b", "develop", cwd=ck)
+    _git("add", ".", cwd=ck)
+    _git("commit", "-q", "-m", "ck", cwd=ck)
+    ck_origin = tmp_path / "ck.git"
+    _git("clone", "-q", "--bare", str(ck), str(ck_origin))
+
+    src = tmp_path / "aiter-src"
+    src.mkdir()
+    (src / "setup.py").write_text("# aiter\n")
+    _git("init", "-q", "-b", "main", cwd=src)
+    _git(
+        "submodule",
+        "add",
+        "-q",
+        ck_origin.as_uri(),
+        "3rdparty/composable_kernel",
+        cwd=src,
+    )
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", "release", cwd=src)
+    _git("tag", "-a", _AITER_TAG, "-m", "release", cwd=src)
+    pinned = _head(src)
+    (src / "next.txt").write_text("next")
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", "next", cwd=src)
+    origin = tmp_path / "aiter.git"
+    _git("clone", "-q", "--bare", str(src), str(origin))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitmodules").write_text(
+        '[submodule "aiter"]\n'
+        "\tpath = aiter\n"
+        f"\turl = {origin.as_uri()}\n"
+        "\tbranch = main\n"
+    )
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("add", ".gitmodules", cwd=repo)
+    _pin_aiter(repo, pinned)
+    monkeypatch.setattr(setup_env, "SCRIPT_DIR", repo)
+    monkeypatch.setattr(setup_env, "AITER_DIR", repo / "aiter")
+    return repo / "aiter", pinned, _head(src)
+
+
+def test_aiter_fetch_pins_the_release_with_its_tag_and_ck(
+    setup_env, tmp_path, capsys, aiter
+) -> None:
+    checkout, pinned, _ = aiter
+    _setup(setup_env, tmp_path).ensure_aiter_checkout()
+
+    assert _head(checkout) == pinned
+    assert (checkout / "3rdparty/composable_kernel/include/ck.hpp").is_file()
+    # setuptools_scm versions AITER from the tag; without it the result
+    # files record 0.1.1.dev1 for a release.
+    describe = subprocess.run(
+        ["git", "-C", str(checkout), "describe", "--tags", "--exact-match"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert describe.stdout.strip() == _AITER_TAG
+    assert not checkout.with_name("aiter.partial").exists()
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_aiter_failed_fetch_leaves_no_checkout_to_reuse(
+    setup_env, tmp_path, aiter
+) -> None:
+    checkout, pinned, _ = aiter
+    _pin_aiter(setup_env.SCRIPT_DIR, "1" * 40)  # not in the origin
+    setup = _setup(setup_env, tmp_path)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        setup.ensure_aiter_checkout()
+    assert not checkout.exists()
+    assert not checkout.with_name("aiter.partial").exists()
+
+    _pin_aiter(setup_env.SCRIPT_DIR, pinned)
+    setup.ensure_aiter_checkout()
+    assert _head(checkout) == pinned
+
+
+def test_aiter_non_git_directory_is_kept_without_confirmation(
+    setup_env, tmp_path, monkeypatch, aiter
+) -> None:
+    checkout, _, _ = aiter
+    checkout.mkdir()
+    (checkout / "notes.txt").write_text("mine")
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
+
+    with pytest.raises(SystemExit):
+        _setup(setup_env, tmp_path).ensure_aiter_checkout()
+    assert (checkout / "notes.txt").read_text() == "mine"
+
+
+def test_aiter_checkout_off_the_pin_is_kept_and_reported(
+    setup_env, tmp_path, capsys, aiter
+) -> None:
+    """A user checkout survives; only its missing CK submodule is fetched."""
+    checkout, pinned, tip = aiter
+    _git("clone", "-q", str(tmp_path / "aiter.git"), str(checkout))
+
+    _setup(setup_env, tmp_path).ensure_aiter_checkout()
+
+    assert _head(checkout) == tip
+    assert f"not the pinned {pinned[:12]}" in capsys.readouterr().err
+    assert (checkout / "3rdparty/composable_kernel/include/ck.hpp").is_file()
+
+
+@pytest.mark.parametrize(
+    "torch_mode, argv",
+    [
+        pytest.param("cpu", (), id="cpu-torch"),
+        pytest.param("rocm", ("--reuse-artifacts",), id="reuse-without-checkout"),
+    ],
+)
+def test_install_aiter_skips_without_fetching(
+    setup_env, tmp_path, monkeypatch, torch_mode, argv
+) -> None:
+    monkeypatch.setattr(setup_env, "AITER_DIR", tmp_path / "aiter")
+    monkeypatch.setattr(
+        setup_env, "run_git", lambda *a, **k: pytest.fail("fetched AITER")
+    )
+    setup = _setup(setup_env, tmp_path, *argv)
+    setup.installed_torch_mode = torch_mode
+    monkeypatch.setattr(setup, "pip", lambda *a, **k: pytest.fail("installed AITER"))
+
+    setup.install_aiter()
+
+    assert not (tmp_path / "aiter").exists()
+
+
+def test_install_aiter_installs_in_compat_mode_and_reports_prebuild_failure(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(setup_env, "AITER_DIR", tmp_path / "aiter")
+    setup = _setup(setup_env, tmp_path)
+    setup.installed_torch_mode = "rocm"
+    monkeypatch.setattr(setup, "ensure_aiter_checkout", lambda: None)
+    installs = []
+    monkeypatch.setattr(setup, "pip", lambda *a, env=None: installs.append((a, env)))
+    monkeypatch.setattr(
+        setup_env,
+        "run",
+        lambda cmd, **k: subprocess.CompletedProcess(cmd, returncode=1),
+    )
+
+    setup.install_aiter()
+
+    # The default editable finder loses to the aiter/ checkout, which imports
+    # as an empty namespace package from the repository root.
+    args, env = installs[-1]
+    assert args == (
+        "install",
+        "--config-settings",
+        "editable_mode=compat",
+        "-e",
+        str(tmp_path / "aiter"),
+    )
+    assert env["AITER_USE_SYSTEM_TRITON"] == "1"
+    assert "Some AITER backends did not compile" in capsys.readouterr().err
+
+
 # --- venv reuse ----------------------------------------------------------------
 
 
@@ -989,6 +1179,8 @@ def test_hipdnn_reuse_keeps_prepared_venv_and_does_not_fetch_sources(
     source_marker = checkout / "keep-me"
     source_marker.write_text("original checkout")
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", checkout)
+    # No aiter/ checkout: the AITER stage must skip, not fetch.
+    monkeypatch.setattr(setup_env, "AITER_DIR", tmp_path / "no-aiter")
     monkeypatch.setattr(
         setup_env,
         "run_git",
@@ -1008,7 +1200,6 @@ def test_hipdnn_reuse_keeps_prepared_venv_and_does_not_fetch_sources(
     # are exercised separately on the actual ROCm image.
     monkeypatch.setattr(setup, "install_package", lambda: None)
     monkeypatch.setattr(setup, "install_runtime_extras", lambda: None)
-    monkeypatch.setattr(setup, "install_aiter", lambda: None)
     monkeypatch.setattr(setup, "verify", lambda: None)
     monkeypatch.setattr(setup, "report_profiling_sources", lambda: None)
     monkeypatch.setattr(

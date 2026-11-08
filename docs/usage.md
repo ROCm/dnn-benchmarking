@@ -412,8 +412,11 @@ row also runs the 128/128 OPUS kernel, which `aiter:auto` uses only with
 Read the rows as follows:
 
 - `aiter:auto` is what an AITER user gets from the public API.
-- The fastest backend row minus `aiter:auto` is the loss from AITER's own
-  backend selection.
+- In the default staged timing, the fastest backend row minus `aiter:auto`
+  is the loss from AITER's own backend selection. In block or events
+  timing, a short kernel's row measures the host launch cost of its entry
+  point instead, and the row gets a `host-bound` warning. Compare such rows
+  in staged timing.
 - `aiter:auto`, `aiter:triton` and `aiter:gluon` allocate their output inside
   the timed call, as their entry points do. The Triton entry point also
   zero-fills it, so these rows include that fill kernel. The other rows
@@ -431,7 +434,9 @@ Requirements and limits:
   has no HIP runtime to link. So, with the pip ROCm SDK installed, the tool
   sets `ROCM_HOME` to the SDK's devel package (unless `ROCM_HOME` is set)
   and puts the venv's `bin` directory, which holds the SDK's `hipcc`, first
-  on `PATH`. The compiled modules stay in `aiter/aiter/jit`.
+  on `PATH`. The compiled modules stay in the `aiter-jit` directory of the
+  venv (`AITER_JIT_DIR`, unless it is set). So `--clean` removes them, and
+  each venv compiles against its own torch.
   `build_ms` is the first launch of the row: the compile on a cold JIT
   cache (minutes for a CK module), the module load otherwise. Triton
   compiles each kernel once per process.
