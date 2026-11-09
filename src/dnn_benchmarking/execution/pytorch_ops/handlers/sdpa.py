@@ -158,7 +158,9 @@ def _plan_sdpa_common(
     _sdpa_unsupported_if_present(node, unsupported)
 
     if _sdpa_bool(node, "padding_mask"):
-        raise ValueError("SDPA padding masks are not supported by the PyTorch reference")
+        raise ValueError(
+            "SDPA padding masks are not supported by the PyTorch reference"
+        )
 
     dropout_probability = _node_param(node, "dropout_probability", 0.0)
     dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
