@@ -27,9 +27,10 @@ providers resolve it (``extractDiagonalBandParams`` / ``getMaskType``):
 * deprecated ``causal_mask`` -> top-left causal (bounds/alignment ignored);
 * deprecated ``causal_mask_bottom_right`` -> bottom-right causal;
 * otherwise ``left_bound`` / ``right_bound`` / ``diagonal_alignment``, where
-  row ``i`` keeps ``kv`` in ``[i + off - left, i + off + right]`` with
-  ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT); an unset bound is
-  unbounded.
+  row ``i`` keeps ``kv`` in ``[i + off - left + 1, i + off + right]`` with
+  ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT): ``left`` keys up to
+  and including the diagonal and ``right`` keys past it (hipDNN and cuDNN);
+  an unset bound is unbounded, and ``left_bound = 0`` is rejected.
 
 For a variable-length node (per-batch ``seq_len`` / ``cu_seq_len`` or ragged
 offsets, or a paged node) the count is a sum over batches,
@@ -37,7 +38,7 @@ offsets, or a paged node) the count is a sum over batches,
 input data. Without input data, or for a dense node, the tensor dims give
 ``Sq`` and ``Skv``.
 
-A causal sliding window of ``W`` keys (``left = W - 1``, ``right = 0``,
+A causal sliding window of ``W`` keys (``left = W``, ``right = 0``,
 BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
 windowed count the rocKE attention benchmarks report.
 """
@@ -61,7 +62,7 @@ def _nonmasked_pairs(
     offset = kv_seqlen - q_seqlen if bottom_right else 0
     total = 0
     for i in range(q_seqlen):
-        lo = max(i + offset - left, 0) if left is not None else 0
+        lo = max(i + offset - left + 1, 0) if left is not None else 0
         hi = min(i + offset + right + 1, kv_seqlen) if right is not None else kv_seqlen
         total += max(hi - lo, 0)
     return total
@@ -78,7 +79,8 @@ def _attention_terms(
     variable-length node).
 
     Returns None when q/k/v tensor data is incomplete, or when the mask is
-    one hipDNN rejects (a bound below -1, or both deprecated causal flags).
+    one hipDNN rejects (a bound below -1, ``left_bound = 0``, or both
+    deprecated causal flags).
     """
     q = node_tensor(node, "q_tensor_uid", tensors_by_uid)
     k = node_tensor(node, "k_tensor_uid", tensors_by_uid)
@@ -101,7 +103,7 @@ def _attention_terms(
     # extractDiagonalBandParams.
     left = int(node_param(node, "left_bound", -1))
     right = int(node_param(node, "right_bound", -1))
-    if left < -1 or right < -1:
+    if left < -1 or left == 0 or right < -1:
         return None
     causal_top_left = node_param(node, "causal_mask") is True
     causal_bottom_right = node_param(node, "causal_mask_bottom_right") is True

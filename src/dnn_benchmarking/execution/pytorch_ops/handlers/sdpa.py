@@ -246,8 +246,10 @@ def _sdpa_derive_mask(
 
     The deprecated causal booleans take precedence over the modern bounds and
     alignment. Otherwise, bounds describe a diagonal band, with ``-1`` meaning
-    unbounded. ``is_causal`` is reserved for PyTorch's native top-left mask;
-    bottom-right masks are materialized as additive masks.
+    unbounded. ``left_bound = L`` keeps ``L`` keys up to and including the
+    diagonal, as in hipDNN and cuDNN, so the window width is ``L``; hipDNN
+    rejects ``left_bound = 0``. ``is_causal`` is reserved for PyTorch's native
+    top-left mask; bottom-right masks are materialized as additive masks.
     """
     causal = _sdpa_bool(node, "causal_mask")
     bottom_right_causal = _sdpa_bool(node, "causal_mask_bottom_right")
@@ -271,8 +273,10 @@ def _sdpa_derive_mask(
     left = unbounded if left is None else int(left)
     right = unbounded if right is None else int(right)
 
-    if left < unbounded:
-        raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+    if left < unbounded or left == 0:
+        raise ValueError(
+            f"SDPA left_bound {left} is neither unbounded (-1) nor a positive width"
+        )
     if right != 0:
         if right == unbounded and left == unbounded:
             return False, None, False
@@ -282,7 +286,7 @@ def _sdpa_derive_mask(
         )
     if left == unbounded:
         return (False, None, True) if bottom_right else (True, None, False)
-    return False, left + 1, bottom_right
+    return False, left, bottom_right
 
 
 def _sdpa_resolve(

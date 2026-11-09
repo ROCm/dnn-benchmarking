@@ -553,17 +553,18 @@ class TestComputeFlops:
         assert by_bounds == by_flag
 
     def test_sdpa_causal_sliding_window_bottom_right(self):
-        # Causal window of W keys = left W-1, right 0; Sq=4, Skv=6, W=3.
+        # Causal window of W keys = left W, right 0; Sq=4, Skv=6, W=3.
         # offset 2 -> rows keep min(i + 3, 3) = 3 keys each -> 12 pairs, the
         # rocKE benchmark's sum_i min(i + off + 1, W).
-        graph = _sdpa_graph(sq=4, skv=6, left_bound=2, right_bound=0)
+        graph = _sdpa_graph(sq=4, skv=6, left_bound=3, right_bound=0)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
         flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
     def test_sdpa_sliding_window_top_left_clamps_edges(self):
-        # left 1, right 1, Sq=Skv=4 -> rows keep 2,3,3,2 keys = 10 pairs.
-        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1))
+        # left 2 (the diagonal and one key before it), right 1, Sq=Skv=4 ->
+        # rows keep 2,3,3,2 keys = 10 pairs.
+        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=2, right_bound=1))
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
 
     def test_sdpa_deprecated_causal_ignores_alignment_and_bounds(self):
@@ -578,6 +579,7 @@ class TestComputeFlops:
         "attrs",
         [
             {"left_bound": -2},
+            {"left_bound": 0, "right_bound": 0},
             {"causal_mask": True, "right_bound": -5},
             {"causal_mask": True, "causal_mask_bottom_right": True},
         ],

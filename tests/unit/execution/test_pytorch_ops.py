@@ -1570,8 +1570,8 @@ class TestPyTorchOpsNewHandlers:
         [
             ({"causal_mask": True}, True, False, None),
             ({"causal_mask_bottom_right": True}, False, True, None),
-            ({"left_bound": 20, "right_bound": 0}, False, False, 21),
-            ({"left_bound": 20, "right_bound": 0}, True, False, 21),
+            ({"left_bound": 20, "right_bound": 0}, False, False, 20),
+            ({"left_bound": 20, "right_bound": 0}, True, False, 20),
         ],
         ids=["sink-causal", "bottom-right", "window", "sink-window"],
     )
@@ -1714,7 +1714,7 @@ class TestPyTorchOpsNewHandlers:
         "optional_input,attributes,match",
         [
             (None, {"causal_mask_bottom_right": True}, "bottom-right"),
-            (None, {"left_bound": 0, "right_bound": 0}, "sliding-window"),
+            (None, {"left_bound": 1, "right_bound": 0}, "sliding-window"),
             ("sink_token_tensor_uid", {}, "sink_token_tensor_uid"),
             ("cu_seq_len_q_tensor_uid", {}, "cu_seq_len_q_tensor_uid"),
             ("page_table_k_tensor_uid", {}, "page_table_k_tensor_uid"),
@@ -2804,11 +2804,12 @@ class TestPyTorchSdpaPaged:
         torch.testing.assert_close(tensors[4], expected)
 
     def test_paged_sliding_window_masks_each_sequence(self) -> None:
-        """A width-1 band (left/right bound 0) lets query i of each sequence see
-        only that sequence's key i, so O is V's first q_len rows per sequence."""
+        """A width-1 band (left bound 1, right bound 0) lets query i of each
+        sequence see only that sequence's key i, so O is V's first q_len rows
+        per sequence."""
         q, k_pages, v_pages, page_table, _, dense_v = self._build()
         tensors = self._tensors(q, k_pages, v_pages, page_table)
-        pytorch_ops.execute_graph(self._graph(left_bound=0, right_bound=0), tensors)
+        pytorch_ops.execute_graph(self._graph(left_bound=1, right_bound=0), tensors)
 
         rep = self.HQ // self.HKV
         expected = torch.cat(
@@ -3071,8 +3072,11 @@ class TestPyTorchSdpaVarlen:
             8: lengths("kv", self.KV_LENS),
         }
 
-    def _loop(self, tensors, mode=None, sink=None, mask=None):
-        """Rows with nothing live get O = 0 and LSE = -inf (the sink logit if any)."""
+    def _loop(self, tensors, mode=None, sink=None, mask=None, width=None):
+        """Rows with nothing live get O = 0 and LSE = -inf (the sink logit if any).
+
+        ``width`` keeps the ``width`` keys up to and including the diagonal of
+        the ``bottom_right`` mode, where every row at or past ``dead`` has one."""
         q, k, v = tensors[1], tensors[2], tensors[3]
         rep = self.HQ // self.HKV
         o = torch.zeros(self.B, self.HQ, self.SQ, self.D)
@@ -3088,9 +3092,13 @@ class TestPyTorchSdpaVarlen:
             v_b = v[b : b + 1, :, :lkv].repeat_interleave(rep, dim=1)
             keep = None
             if mode == "causal":
-                keep = torch.ones(lq, lkv, dtype=torch.bool).tril()[dead:]
+                keep = torch.ones(lq, lkv, dtype=torch.bool).tril()
             elif mode == "bottom_right":
-                keep = torch.ones(lq, lkv, dtype=torch.bool).tril(lkv - lq)[dead:]
+                keep = torch.ones(lq, lkv, dtype=torch.bool).tril(lkv - lq)
+            if width is not None:
+                keep &= torch.ones(lq, lkv, dtype=torch.bool).triu(lkv - lq - width + 1)
+            if keep is not None:
+                keep = keep[dead:]
             scores = (q_b @ k_b.transpose(-2, -1)) * self.SCALE
             if mask is not None:
                 scores = scores + mask[b : b + 1, :, dead:lq, :lkv]
@@ -3126,6 +3134,34 @@ class TestPyTorchSdpaVarlen:
         expected_o, expected_lse = self._loop(tensors, mode)
 
         pytorch_ops.execute_graph(self._graph(stats=True, cu=cu, **attributes), tensors)
+
+        torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("sink", [False, True], ids=["no-sink", "sink"])
+    def test_bottom_right_window_with_more_queries_than_keys(self, sink) -> None:
+        """Batch 2 (lq=5, lkv=3), bottom-right, width 2: rows 0 and 1 are dead,
+        and row 4 keeps keys 1 and 2 only. The live block starts at row 2, so
+        it must keep the window rather than run as plain causal."""
+        self.Q_LENS, self.KV_LENS = [5, 2, 5], [6, 4, 3]
+        tensors = self._tensors()
+        sink_logits = None
+        if sink:
+            tensors[9] = sink_logits = torch.randn(self.HQ)
+        expected_o, expected_lse = self._loop(
+            tensors, "bottom_right", sink=sink_logits, width=2
+        )
+
+        pytorch_ops.execute_graph(
+            self._graph(
+                stats=True,
+                sink=sink,
+                left_bound=2,
+                right_bound=0,
+                diagonal_alignment="BOTTOM_RIGHT",
+            ),
+            tensors,
+        )
 
         torch.testing.assert_close(tensors[4], expected_o, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(tensors[5], expected_lse, rtol=1e-5, atol=1e-5)
@@ -3191,7 +3227,7 @@ class TestPyTorchSdpaVarlen:
         assert not keep.all() and not keep.any(-1).all()
 
         pytorch_ops.execute_graph(
-            self._graph(stats=True, sink=sink, left_bound=width - 1, right_bound=0),
+            self._graph(stats=True, sink=sink, left_bound=width, right_bound=0),
             tensors,
         )
 
@@ -3885,7 +3921,7 @@ class TestPyTorchSdpaMaskDerivation:
 
         assert _sdpa_derive_mask(self._node(left_bound=127, right_bound=0)) == (
             False,
-            128,
+            127,
             False,
         )
 
@@ -3962,7 +3998,9 @@ class TestPyTorchSdpaMaskDerivation:
     @pytest.mark.parametrize(
         "attributes, match",
         [
-            ({"left_bound": -5}, "neither unbounded nor a width"),
+            ({"left_bound": -5}, "left_bound -5"),
+            # hipDNN rejects a zero-width window.
+            ({"left_bound": 0, "right_bound": 0}, "left_bound 0"),
             ({"right_bound": 3}, "forward-looking band"),
             # hipDNN keeps k <= q + right_bound; an unbounded or positive right
             # edge is not the causal band the reference builds.

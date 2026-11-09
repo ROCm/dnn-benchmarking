@@ -1027,8 +1027,8 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[6].data, expected_stats.numpy(), rtol=1e-6)
 
     def test_sdpa_sliding_window_masks_output_and_stats(self) -> None:
-        """A width-1 band (left/right bound 0) lets each query see only its own
-        key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
+        """A width-1 band (left bound 1, right bound 0) lets each query see only
+        its own key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]], dtype=np.float32)
         v = np.array([[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]], dtype=np.float32)
@@ -1048,7 +1048,7 @@ class TestPyTorchProviderNewOps:
                     "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
                     "attributes": {
                         "dropout_probability": 0.0,
-                        "left_bound": 0,
+                        "left_bound": 1,
                         "right_bound": 0,
                     },
                 }
@@ -1591,7 +1591,7 @@ class TestPyTorchProviderNewOps:
             ({"alibi_mask": True}, "alibi"),
             ({"padding_mask": True}, "padding_mask"),
             ({"right_bound": 1}, "forward-looking band"),
-            ({"left_bound": -5}, "neither unbounded nor a width"),
+            ({"left_bound": -5}, "left_bound -5"),
             (
                 {"causal_mask": True, "causal_mask_bottom_right": True},
                 "mutually exclusive",
