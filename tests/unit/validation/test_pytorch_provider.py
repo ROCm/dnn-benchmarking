@@ -1765,31 +1765,45 @@ class TestPyTorchProviderNewOps:
             outputs[6].data, cudnn_lse.numpy(), rtol=1e-5, atol=1e-6
         )
 
-    def test_sdpa_alibi_backward_matches_autograd(self) -> None:
+    @pytest.mark.parametrize(
+        "q_heads,kv_heads",
+        [(3, 3), (4, 2)],
+        ids=["h3", "gqa-4q-2kv"],
+    )
+    def test_sdpa_alibi_backward_matches_autograd(
+        self, q_heads: int, kv_heads: int
+    ) -> None:
+        """GQA (q_heads != kv_heads) exercises that the ALiBi slope in the
+        backward recomputation is indexed by the query head, not the KV head,
+        the same way the forward path's gqa-4q-2kv case does."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         torch.manual_seed(13)
-        heads, seq, dim = 3, 4, 4
-        q, k, v, do = (torch.randn(1, heads, seq, dim) for _ in range(4))
-        for t in (q, k, v):
-            t.requires_grad_()
-        bias = self._alibi_bias(heads, seq, seq) + self._causal_additive(seq, seq)
+        seq, dim = 4, 4
+        rep = q_heads // kv_heads
+        q = torch.randn(1, q_heads, seq, dim, requires_grad=True)
+        k = torch.randn(1, kv_heads, seq, dim, requires_grad=True)
+        v = torch.randn(1, kv_heads, seq, dim, requires_grad=True)
+        do = torch.randn(1, q_heads, seq, dim)
+        bias = self._alibi_bias(q_heads, seq, seq) + self._causal_additive(seq, seq)
         scale = 0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale + bias
+        k_full = k.repeat_interleave(rep, dim=1)
+        v_full = v.repeat_interleave(rep, dim=1)
+        scores = torch.matmul(q, k_full.transpose(-2, -1)) * scale + bias
         stats = torch.logsumexp(scores, dim=-1, keepdim=True)
-        o = torch.matmul(torch.softmax(scores, dim=-1), v)
+        o = torch.matmul(torch.softmax(scores, dim=-1), v_full)
         dq, dk, dv = torch.autograd.grad(o, (q, k, v), do)
 
-        dims = [1, heads, seq, dim]
+        q_dims = [1, q_heads, seq, dim]
+        kv_dims = [1, kv_heads, seq, dim]
         tensor_list = [
-            {"uid": uid, "dims": dims, "data_type": "float"} for uid in (1, 2, 3, 4, 5)
+            {"uid": uid, "dims": q_dims, "data_type": "float"} for uid in (1, 4, 5, 7)
         ]
         tensor_list += [
-            {"uid": 6, "dims": [1, heads, seq, 1], "data_type": "float"},
-            *(
-                {"uid": uid, "dims": dims, "data_type": "float"}
-                for uid in (7, 8, 9)
-            ),
+            {"uid": uid, "dims": kv_dims, "data_type": "float"} for uid in (2, 3, 8, 9)
         ]
+        tensor_list.append(
+            {"uid": 6, "dims": [1, q_heads, seq, 1], "data_type": "float"}
+        )
         graph_json = {
             "tensors": tensor_list,
             "nodes": [
