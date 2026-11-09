@@ -317,8 +317,8 @@ They are not uniform floats:
   graph sets it.
 - An offset table has `B + 1` entries and starts with 0. Entry `b + 1` is
   the start of batch `b + 1`. That is the start of batch `b` plus its length
-  and its gap, in the unit of the table. Only a graph that has a length
-  source gets gaps. A gap is padding tokens after the live tokens of a
+  and its gap, in the unit of the table. Only a group of tensors that has a
+  `seq_len` gets gaps. A gap is padding tokens after the live tokens of a
   batch, and the length excludes them. With two or more batches, some batch
   starts after a gap. The exception is a graph where no batch before the last
   has room for one. Then every length is at the aligned sequence length, or
@@ -334,7 +334,11 @@ They are not uniform floats:
   `l0 + l1`, and so on, `B + 1` entries, in the dtype of the tensor. A side
   uses `seq_len` or `cu_seq_len`, not both. The two sides can use different
   sources. The key names follow rocm-libraries PR #14560 (forward
-  `SdpaAttributes` only; ALMIOPEN-2935).
+  `SdpaAttributes` only; ALMIOPEN-2935). hipDNN has not decided whether an
+  engine reads `cu_seq_len` as the batch starts (as FlashAttention does) or
+  as lengths only. Thus a group whose only length source is `cu_seq_len` gets
+  no gaps: its batch starts, in tokens, equal `cu_seq_len`, and both readings
+  are correct.
 - Tensors that share one length or offset tensor get one set of values. For
   example, self-attention can use one offset table for Q and K.
 - The lengths and the offsets come from a separate random stream that the
@@ -344,9 +348,10 @@ They are not uniform floats:
 Every tensor of the graph stays logical (shaped by its dims) in the
 reference. The graph layout (offsets, strides) applies only when the tool
 writes inputs to device storage and reads outputs from it. A ragged tensor
-stores each batch at its offset and holds zero elsewhere. Padding of a
-non-ragged tensor (for example the BSHD view of aiter graphs) holds
-generated values that an engine must ignore.
+stores each batch at its offset. Its padding (past each length and between
+batches) holds generated values, as the padding of a non-ragged tensor (for
+example the BSHD view of aiter graphs) and the golden data of hipDNN do. An
+engine must ignore these values.
 
 ## TFLOP/s and GB/s
 

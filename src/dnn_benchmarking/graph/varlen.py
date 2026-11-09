@@ -27,8 +27,10 @@ def _section(node: _Node, name: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _lookup(node: _Node, key: str, sections: Tuple[str, ...]) -> Any:
-    # An explicit null counts as absent, as in the executor's ``_node_param``.
+def node_value(node: _Node, key: str, sections: Tuple[str, ...]) -> Any:
+    """Value of ``key`` in the first of ``sections`` that has it, else at the
+    node's top level. An explicit null counts as absent, as in the executor's
+    ``_node_param``."""
     for name in sections:
         value = _section(node, name).get(key)
         if value is not None:
@@ -37,7 +39,7 @@ def _lookup(node: _Node, key: str, sections: Tuple[str, ...]) -> Any:
 
 
 def _optional_uid(node: _Node, key: str) -> Optional[int]:
-    value = _lookup(node, key, ("inputs", "outputs", "attributes", "parameters"))
+    value = node_value(node, key, ("inputs", "outputs", "attributes", "parameters"))
     return None if value is None else int(value)
 
 
@@ -187,9 +189,9 @@ def padding_rule(node: _Node, operands: SdpaOperands) -> None:
             "SDPA needs a length source (seq_len or cu_seq_len) on both the query "
             "and key side, or on neither"
         )
-    if _lookup(node, "padding_mask", ("parameters", "attributes", "inputs")) and not (
-        has_source["q"] and has_source["kv"]
-    ):
+    if node_value(
+        node, "padding_mask", ("parameters", "attributes", "inputs")
+    ) and not (has_source["q"] and has_source["kv"]):
         raise ValueError(
             "SDPA padding_mask needs seq_len or cu_seq_len on both the query and "
             "key side"
@@ -204,6 +206,9 @@ def check_ragged_shape(
 ) -> None:
     """Refuse a ragged tensor that is not rank 4 with a positive token stride.
 
+    Axes 1 and 3 need a positive stride when their size is above 1: a zero
+    stride broadcasts values the reference keeps apart, and a negative one
+    addresses storage before the batch start. ``strides[0]`` is not used.
     ``label`` names the tensor in the message; ``error`` is the type raised.
     """
     if len(dims) != 4 or len(strides) != 4:
@@ -214,6 +219,12 @@ def check_ragged_shape(
     if strides[2] <= 0:
         raise error(
             f"Ragged {label} needs a positive sequence stride, got strides "
+            f"{list(strides)}"
+        )
+    if any(strides[i] < 0 or (strides[i] == 0 and dims[i] > 1) for i in (1, 3)):
+        raise error(
+            f"Ragged {label} needs a positive stride on each axis of size above "
+            f"1 and no negative stride, got dims {list(dims)} and strides "
             f"{list(strides)}"
         )
 

@@ -417,10 +417,28 @@ class TestRaggedHelpers:
     def test_a_rank_4_shape_with_a_positive_sequence_stride_passes(self) -> None:
         assert check_ragged_shape(DIMS, TOKEN_MAJOR, LABEL) is None
 
+    def test_a_zero_stride_on_a_unit_axis_passes(self) -> None:
+        # One head: its stride addresses nothing, so 0 is no broadcast.
+        assert check_ragged_shape([2, 1, 4, 3], [12, 0, 3, 1], LABEL) is None
+
     @pytest.mark.parametrize(
         "dims, strides",
-        [([2, 4, 3], [12, 3, 1]), (DIMS, [24, 3, 0, 1])],
-        ids=["rank_3", "zero_sequence_stride"],
+        [
+            ([2, 4, 3], [12, 3, 1]),
+            (DIMS, [24, 3, 0, 1]),
+            (DIMS, [24, 0, 6, 1]),
+            (DIMS, [24, 3, 6, 0]),
+            (DIMS, [24, -3, 6, 1]),
+            (DIMS, [24, 3, 6, -1]),
+        ],
+        ids=[
+            "rank_3",
+            "zero_sequence_stride",
+            "broadcast_heads",
+            "broadcast_head_dim",
+            "negative_head_stride",
+            "negative_head_dim_stride",
+        ],
     )
     def test_a_bad_shape_is_refused_naming_the_tensor(self, dims, strides) -> None:
         with pytest.raises(UnsupportedGraphError, match="'q'"):

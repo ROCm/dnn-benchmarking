@@ -25,6 +25,7 @@ from ..graph.tensor_info import TensorInfo, ragged_fields, tensor_label
 from ..graph.varlen import (
     SdpaOperands,
     check_ragged_shape,
+    node_value,
     ragged_token_capacity,
     sdpa_operands,
 )
@@ -152,7 +153,6 @@ def _bound_paged(
 ) -> None:
     """Bound a paged node: key lengths by the page allocation, query lengths
     by the query tensor (a packed query is split over the sequences)."""
-    attributes = node.get("attributes") or {}
     table_dims = graph.dims(table_uid)
     key_tensor = graph.json.get(operands.k)
     page_size = 1
@@ -160,7 +160,7 @@ def _bound_paged(
         page_size = max(int(key_tensor["dims"][2]), 1)
     width = int(table_dims[1]) if table_dims and len(table_dims) > 1 else 1
     allocation = width * page_size if table_dims else page_size
-    cap = attributes.get("max_seq_len_kv")
+    cap = node_value(node, "max_seq_len_kv", ("attributes", "parameters"))
     if cap is not None and int(cap) > 0:
         allocation = min(allocation, int(cap))
     batch = int(table_dims[0]) if table_dims else None
@@ -180,7 +180,7 @@ def _bound_paged(
         query.max_len = page_size
         return
     dims = [int(d) for d in q_main["dims"]]
-    if dims[0] == 1 and (batch is None or batch > 1):
+    if dims[0] == 1:
         query.mode = "partition"
         query.total_q = dims[2]
         query.q_label = _label(q_main)
@@ -417,7 +417,11 @@ def _generate_group(
         # Every start is a multiple of `align`, so a range never passes `limit`.
         limit = max_len // align * align
         lengths = np.minimum(lengths, limit)
-        if seq_uids or cu_uids:
+        # Gaps only with a seq_len. hipDNN has not decided whether cu_seq_len
+        # gives the batch starts (FlashAttention) or only the lengths, so a
+        # group whose only source is cu_seq_len packs its batches: cu_seq_len
+        # then equals the starts, and both readings are valid.
+        if seq_uids:
             room = limit - lengths
             wanted = rng.random(batch) < 0.5
             drawn = rng.integers(1, np.maximum(room, 1) + 1)
@@ -438,7 +442,7 @@ def _generate_group(
         else:
             # The lengths are the ranges, so they must be aligned themselves.
             lengths = np.maximum(align, lengths // align * align)
-        keep_gap = batch > 1 and bool(seq_uids or cu_uids)
+        keep_gap = batch > 1 and bool(seq_uids)
         for tensors in tables.values():
             for tensor in tensors:
                 capacity = ragged_token_capacity(*_shape(tensor))
@@ -508,13 +512,14 @@ def generate_varlen_inputs(
     Lengths are in ``1..S_max`` and vary across batches; with several batches
     one is padded and one is full, and a single batch is padded. A paged key
     side is bounded by ``page_table.dims[1] * page_size`` (and
-    ``max_seq_len_kv``); a packed paged query splits its token count over the
-    sequences. Offset tables start at 0, store the token start of every batch
-    scaled by the tensor's token stride and multiplier, and have a trailing
-    entry for the end. Batches start after gaps of padding tokens only when
-    the group has a ``seq_len`` or ``cu_seq_len`` that excludes the padding;
+    ``max_seq_len_kv``); a packed paged query (one query batch) splits its
+    token count over the sequences. Offset tables start at 0, store the token
+    start of every batch scaled by the tensor's token stride and multiplier,
+    and have a trailing entry for the end. Batches start after gaps of padding
+    tokens only when the group has a ``seq_len`` that excludes the padding;
     then, with several batches, some batch other than the first does when a
-    batch before the last has room for a gap.
+    batch before the last has room for a gap. A group whose only length source
+    is ``cu_seq_len`` has no gaps, so ``cu_seq_len`` equals the batch starts.
 
     Raises :class:`UnsupportedGraphError` when tensors that share an offset
     table read it differently, the offset alignment exceeds a sequence, or the

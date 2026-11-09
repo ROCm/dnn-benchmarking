@@ -16,6 +16,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from dnn_benchmarking.execution.buffer_manager import (  # noqa: E402
+    _decode,
     _encode_to_storage,
     generate_input_data,
 )
@@ -63,7 +64,18 @@ def _layout(kind, heads, seq, tokens, stats):
     return strides, 1 if kind == "element" else strides[2]
 
 
-def _graph(kind, source, shape, attributes, hq=2, hkv=1, shared=False, backward=False):
+def _graph(
+    kind,
+    source,
+    shape,
+    attributes,
+    hq=2,
+    hkv=1,
+    shared=False,
+    backward=False,
+    dtype="float",
+):
+    """``dtype`` is the type of every operand except ``stats``, which is float."""
     sq, skv = shape
     if kind == "fused":
         hkv = hq
@@ -77,7 +89,7 @@ def _graph(kind, source, shape, attributes, hq=2, hkv=1, shared=False, backward=
             "name": name,
             "dims": [B, heads, seq, 1 if stats else D],
             "strides": strides,
-            "data_type": "float",
+            "data_type": "float" if stats else dtype,
             "virtual": False,
         }
         if ragged:
@@ -170,7 +182,7 @@ def _gather(storage, info, batch, input_data):
     """``[heads, length, last]`` valid positions of one batch, by
     ``start + h * s1 + t * s2 + d * s3``; the start is ``off[b] * multiplier``
     for a ragged tensor, from the generated table and the graph's multiplier,
-    and ``b * strides[0]`` for a padded one."""
+    and ``b * strides[0]`` for a padded one. The words are decoded to values."""
     layout = info.varlen
     if info.ragged_offset_tensor_uid is None:
         start = batch * info.strides[0]
@@ -186,7 +198,7 @@ def _gather(storage, info, batch, input_data):
         + np.arange(layout.lengths[batch])[None, :, None] * s2
         + np.arange(last)[None, None, :] * s3
     )
-    return storage[index]
+    return np.asarray(_decode(storage[index], info.dtype), dtype=np.float32)
 
 
 def _gather_all(infos, input_data, uid, array):
@@ -284,11 +296,19 @@ def _shape(mode, shared):
     return (6, 3) if mode == "bottom_right" else (5, 6)
 
 
+# Tolerance of the reference, which runs in the operand type, against the
+# float32 oracle on the same values.
+TOLERANCE = {"float": 1e-5, "half": 2e-3, "bfloat16": 2e-2}
+
+
+@pytest.mark.parametrize("dtype", list(TOLERANCE))
 @pytest.mark.parametrize("mode", list(MODES))
 @pytest.mark.parametrize("case", list(CASES))
-def test_reference_matches_the_dense_loop_on_valid_positions(case, mode):
+def test_reference_matches_the_dense_loop_on_valid_positions(case, mode, dtype):
     kind, source, shared = CASES[case]
-    graph_json = _graph(kind, source, _shape(mode, shared), MODES[mode], shared=shared)
+    graph_json = _graph(
+        kind, source, _shape(mode, shared), MODES[mode], shared=shared, dtype=dtype
+    )
     infos, input_data = _prepare(graph_json)
 
     q = _gather_all(infos, input_data, Q, input_data[Q])
@@ -306,8 +326,9 @@ def test_reference_matches_the_dense_loop_on_valid_positions(case, mode):
         lq, lkv = infos[Q].varlen.lengths[b], infos[K].varlen.lengths[b]
         assert q[b].shape[1] == lq and k[b].shape[1] == lkv
         want_o, want_lse = _oracle_forward(q[b], k[b], v[b], mode)
-        np.testing.assert_allclose(got_o[b], want_o, rtol=1e-5, atol=1e-5)
-        np.testing.assert_allclose(got_lse[b], want_lse, rtol=1e-5, atol=1e-5)
+        tol = TOLERANCE[dtype]
+        np.testing.assert_allclose(got_o[b], want_o, rtol=tol, atol=tol)
+        np.testing.assert_allclose(got_lse[b], want_lse, rtol=tol, atol=tol)
         dead_seen |= mode == "bottom_right" and lq > lkv
     if mode == "bottom_right" and not shared:
         assert dead_seen, "no batch has dead rows; the case checks nothing"

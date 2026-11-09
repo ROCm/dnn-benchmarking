@@ -10,6 +10,7 @@ import pytest
 
 from dnn_benchmarking.execution.buffer_manager import (
     BufferManager,
+    _decode,
     _decode_storage,
     _encode_to_storage,
 )
@@ -17,15 +18,17 @@ from dnn_benchmarking.graph.tensor_info import TensorInfo, VarlenLayout
 
 B, H, D = 2, 2, 3
 LENGTHS = (3, 2)
+# Q-like operands in each storage width; ragged storage is addressed per element.
+DTYPES = ["float", "half", "bfloat16"]
 
 
-def _info(dims, strides, varlen, ragged=True):
+def _info(dims, strides, varlen, ragged=True, data_type="float"):
     info = TensorInfo(
         uid=1,
         name="q",
         dims=list(dims),
         strides=list(strides),
-        data_type="float",
+        data_type=data_type,
         is_virtual=False,
         ragged_offset_tensor_uid=9 if ragged else None,
     )
@@ -54,38 +57,43 @@ def _layouts():
     return {"token_major": token_major, "head_major": head_major, "fused_qkv": fused}
 
 
-def _expected(info, data):
-    """Storage built with the address formula start + h*s1 + t*s2 + d*s3."""
-    storage = np.zeros(info.storage_elements, dtype=np.float32)
+def _valid_positions(info):
+    """``(storage index, logical index)`` of every valid position, by the
+    address formula start + h*s1 + t*s2 + d*s3."""
     s1, s2, s3 = info.strides[1:]
     for b, (start, length) in enumerate(zip(info.varlen.starts, info.varlen.lengths)):
         for h in range(info.dims[1]):
             for t in range(length):
                 for d in range(info.dims[3]):
-                    storage[start + h * s1 + t * s2 + d * s3] = data[b, h, t, d]
-    return storage
+                    yield start + h * s1 + t * s2 + d * s3, (b, h, t, d)
 
 
+@pytest.mark.parametrize("data_type", DTYPES)
 @pytest.mark.parametrize("layout", list(_layouts()))
-def test_ragged_encode_places_valid_positions_by_the_address_formula(layout):
+def test_ragged_encode_places_valid_positions_by_the_address_formula(layout, data_type):
     dims, strides, starts, end = _layouts()[layout]
-    info = _info(dims, strides, VarlenLayout(LENGTHS, starts, end))
-    data = _data(dims)
+    info = _info(dims, strides, VarlenLayout(LENGTHS, starts, end), data_type=data_type)
+    data = _data(dims)  # small integers: exact in every DTYPES entry
 
-    storage = _encode_to_storage(data, info)
+    words = _encode_to_storage(data, info)
 
-    # Equality with a zero-initialised expectation also proves that nothing
-    # outside the valid tokens is written.
-    np.testing.assert_array_equal(storage, _expected(info, data))
-    assert storage.size == info.storage_elements
-    assert info.size_bytes == storage.size * 4
-    assert info.size_bytes >= (max(np.flatnonzero(storage)) + 1) * 4
+    assert words.size == info.storage_elements
+    assert info.size_bytes == words.nbytes
+    values = _decode(words, info.dtype)
+    addressed = np.zeros(words.size, dtype=bool)
+    for index, position in _valid_positions(info):
+        assert values[index] == data[position], (index, position)
+        addressed[index] = True
+    # Padding and gaps hold generated values, as in a padded tensor, not zeros.
+    assert not addressed.all(), "the layout has no padding; the case checks nothing"
+    assert np.all(values[~addressed] != 0)
 
 
+@pytest.mark.parametrize("data_type", DTYPES)
 @pytest.mark.parametrize("layout", list(_layouts()))
-def test_ragged_decode_returns_valid_positions_and_zeros_elsewhere(layout):
+def test_ragged_decode_returns_valid_positions_and_zeros_elsewhere(layout, data_type):
     dims, strides, starts, end = _layouts()[layout]
-    info = _info(dims, strides, VarlenLayout(LENGTHS, starts, end))
+    info = _info(dims, strides, VarlenLayout(LENGTHS, starts, end), data_type=data_type)
     data = _data(dims)
 
     out = _decode_storage(_encode_to_storage(data, info), info)
@@ -95,6 +103,18 @@ def test_ragged_decode_returns_valid_positions_and_zeros_elsewhere(layout):
         expected[b, :, :length, :] = data[b, :, :length, :]
     assert out.shape == tuple(dims)
     np.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("layout", ["token_major", "fused_qkv"])
+def test_ragged_storage_reaches_a_trailing_gap(layout):
+    """The last batch ends two tokens before the table's end entry: the
+    buffer must reach the end entry, not stop at the last valid element."""
+    dims, strides, starts, _ = _layouts()[layout]
+    end = starts[1] + (LENGTHS[1] + 2) * strides[2]
+    info = _info(dims, strides, VarlenLayout(LENGTHS, starts, end))
+
+    assert info.storage_elements == end
+    assert _encode_to_storage(_data(dims), info).size == end
 
 
 def test_ragged_storage_ignores_batch_stride():

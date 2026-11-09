@@ -178,6 +178,26 @@ def _is_packed(tensor_info: TensorInfo) -> bool:
     return True
 
 
+def _fill_repeating(
+    storage: np.ndarray, data: np.ndarray, tensor_info: TensorInfo
+) -> None:
+    """Fill 1-D ``storage`` with the encoded values of ``data``, repeated in C
+    order.
+
+    A ragged tensor's padding (past each batch's length, and the gaps between
+    batches) thus holds generated values, as the padding of a padded tensor
+    and hipDNN's golden data do, rather than zeros an engine might rely on.
+    """
+    if not storage.size:
+        return
+    flat = data.reshape(-1)
+    for start in range(0, storage.size, flat.size):
+        part = storage[start : start + flat.size]
+        source = flat[: part.size]
+        for index in iter_blocks(part.shape):
+            part[index] = _encode(source[index], tensor_info.dtype)
+
+
 def _encode_to_storage(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     """Encode dense logical data into 1-D storage words in the graph layout.
 
@@ -198,8 +218,9 @@ def _encode_to_storage(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     ):
         return data.reshape(-1)
     if ragged:
-        storage = np.zeros(tensor_info.storage_elements, dtype=storage_dtype)
+        storage = np.empty(tensor_info.storage_elements, dtype=storage_dtype)
         data = np.broadcast_to(data, tuple(tensor_info.dims))
+        _fill_repeating(storage, data, tensor_info)
         for batch, view in _ragged_batch_views(storage, tensor_info):
             source = data[batch, :, : view.shape[1], :]
             for index in iter_blocks(view.shape):

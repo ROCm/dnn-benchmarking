@@ -555,18 +555,58 @@ class TestCumulativeLengths:
         out = generate_varlen_inputs(graph, infos, 0)
         assert out[7].shape == (5,) and out[7][0] == 0
 
-    def test_cumulative_lengths_of_a_ragged_group_match_the_table(self) -> None:
-        graph, infos = _ragged_graph(with_seq_len=False)
-        node = graph["nodes"][0]
-        node["inputs"]["cu_seq_len_q_tensor_uid"] = 7
+    @staticmethod
+    def _ragged_cu_graph(seq_len_kv=False, capacity=None):
+        """Ragged graph (table uid 9 counts tokens) with cu_seq_len_q (uid 7),
+        and seq_len_kv (uid 8) when asked. Token-major, or head-major with
+        ``capacity`` tokens in the head stride."""
+        if capacity is None:
+            graph, infos = _ragged_graph(with_seq_len=False)
+        else:
+            heads, head_dim = 2, 8
+            graph, infos = _ragged_graph(
+                with_seq_len=False,
+                heads=heads,
+                head_dim=head_dim,
+                strides=[heads * capacity * head_dim, capacity * head_dim, head_dim, 1],
+                multiplier=head_dim,
+            )
+        inputs = graph["nodes"][0]["inputs"]
+        inputs["cu_seq_len_q_tensor_uid"] = 7
         graph["tensors"].append(
             _tensor_json(7, "CU_Q", [5, 1, 1, 1], data_type="int32")
         )
         infos.append(_info(7, "CU_Q", [5, 1, 1, 1]))
-        for seed in SEEDS:
+        if seq_len_kv:
+            inputs["seq_len_kv_tensor_uid"] = 8
+            graph["tensors"].append(
+                _tensor_json(8, "SEQ_LEN_KV", [4], data_type="int32")
+            )
+            infos.append(_info(8, "SEQ_LEN_KV", [4]))
+        return graph, infos
+
+    @pytest.mark.parametrize("capacity", [None, 31], ids=["token_major", "head_major"])
+    def test_cu_seq_len_alone_equals_the_batch_starts(self, capacity) -> None:
+        # hipDNN has not decided whether cu_seq_len gives the starts; with no
+        # gaps, an engine that reads it either way is right. 31 tokens of
+        # head-major capacity force the lengths to shrink, without a gap.
+        graph, infos = self._ragged_cu_graph(capacity=capacity)
+        for seed in range(40):
+            out = generate_varlen_inputs(graph, infos, seed)
+            np.testing.assert_array_equal(
+                out[9].reshape(-1), out[7].reshape(-1), err_msg=f"seed {seed}"
+            )
+
+    def test_cu_seq_len_beside_a_seq_len_keeps_the_lengths_and_a_gap(self) -> None:
+        # The seq_len on the other side brings gaps; cu_seq_len must still sum
+        # the lengths, so some batch range is longer than its cu_seq_len length.
+        graph, infos = self._ragged_cu_graph(seq_len_kv=True)
+        for seed in range(40):
             out = generate_varlen_inputs(graph, infos, seed)
             lengths = np.diff(out[7].reshape(-1))
-            assert np.all(np.diff(out[9].reshape(-1)) >= lengths)
+            np.testing.assert_array_equal(lengths, out[8], err_msg=f"seed {seed}")
+            ranges = np.diff(out[9].reshape(-1))
+            assert np.any(ranges[:-1] > lengths[:-1]), f"seed {seed}: no gapped start"
 
 
 class TestPagedLengths:
@@ -574,7 +614,7 @@ class TestPagedLengths:
     PAGE_SIZE = 64
     WIDTH = 4
 
-    def _graph(self, total_q=128, max_seq_len_kv=None, batch=3):
+    def _graph(self, total_q=128, batch=3):
         tensors = [
             _tensor_json(1, "Q", [1, 16, total_q, 128]),
             _tensor_json(2, "K", [self.NUM_PAGES, 4, self.PAGE_SIZE, 128]),
@@ -584,9 +624,6 @@ class TestPagedLengths:
             _tensor_json(7, "SEQ_LEN_Q", [batch], data_type="int32"),
             _tensor_json(8, "SEQ_LEN_KV", [batch], data_type="int32"),
         ]
-        attributes = {}
-        if max_seq_len_kv is not None:
-            attributes["max_seq_len_kv"] = max_seq_len_kv
         graph = _graph(
             tensors,
             _node(
@@ -599,7 +636,6 @@ class TestPagedLengths:
                     "seq_len_q_tensor_uid": 7,
                     "seq_len_kv_tensor_uid": 8,
                 },
-                attributes=attributes,
             ),
         )
         infos = [
@@ -618,9 +654,11 @@ class TestPagedLengths:
             assert kv.max() <= self.WIDTH * self.PAGE_SIZE
             assert kv.min() < self.WIDTH * self.PAGE_SIZE
 
-    def test_key_lengths_are_capped_by_max_seq_len_kv(self) -> None:
+    @pytest.mark.parametrize("section", ["attributes", "parameters"])
+    def test_key_lengths_are_capped_by_max_seq_len_kv(self, section) -> None:
         for seed in SEEDS:
-            graph, infos = self._graph(max_seq_len_kv=100)
+            graph, infos = self._graph()
+            graph["nodes"][0].setdefault(section, {})["max_seq_len_kv"] = 100
             kv = generate_input_data(infos, seed, graph_json=graph)[8]
             assert 1 <= kv.min() and kv.max() <= 100
 
@@ -630,6 +668,14 @@ class TestPagedLengths:
             q = generate_input_data(infos, seed, graph_json=graph)[7]
             assert q.min() >= 1
             assert int(q.sum()) == 128
+
+    def test_one_packed_sequence_takes_every_query_token(self) -> None:
+        # Q [1, H, 16, D] with a one-row page table: seq_len_q must cover the
+        # whole query, or the reference O has fewer rows than the engine's.
+        for seed in SEEDS:
+            graph, infos = self._graph(total_q=16, batch=1)
+            q = generate_input_data(infos, seed, graph_json=graph)[7]
+            np.testing.assert_array_equal(q, [16])
 
     def test_page_table_invariants_are_kept(self) -> None:
         graph, infos = self._graph(batch=3)
