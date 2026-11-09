@@ -3045,6 +3045,9 @@ class TestPyTorchSdpaVarlen:
         outputs = {"o_tensor_uid": 4}
         if stats:
             outputs["stats_tensor_uid"] = 5
+        if cu:
+            # cu_seq_len needs padding_mask=true (rocm-libraries#14560 Rule 6c).
+            attributes = {"padding_mask": True, **attributes}
         return {
             "nodes": [
                 {

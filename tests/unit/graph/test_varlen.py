@@ -101,7 +101,7 @@ def test_seq_len_gives_lengths_to_every_operand_without_starts() -> None:
 
 
 def test_cu_seq_len_differences_give_lengths() -> None:
-    graph, data = _scenario(cu=[0, 2, 5])
+    graph, data = _scenario(cu=[0, 2, 5], attrs={"padding_mask": True})
 
     assert _resolve(graph, data)[1].varlen.lengths == (2, 3)
 
@@ -109,6 +109,7 @@ def test_cu_seq_len_differences_give_lengths() -> None:
 def test_a_side_may_use_seq_len_while_the_other_uses_cu_seq_len() -> None:
     graph, data = _scenario(
         seq=[2, 3],
+        attrs={"padding_mask": True},
         extra_inputs={"seq_len_kv_tensor_uid": None, "cu_seq_len_kv_tensor_uid": 12},
     )
     graph["tensors"].append(_tensor(12, "cu", [3, 1, 1, 1], dtype="int32"))
@@ -306,7 +307,10 @@ REFUSALS = {
         seq=[2, 3], extra_inputs={"cu_seq_len_q_tensor_uid": 12}
     ),
     "batch count": lambda: _scenario(seq=[2, 3, 1]),
-    "cu_seq_len batch count": lambda: _scenario(cu=[0, 2]),
+    "cu_seq_len batch count": lambda: _scenario(
+        cu=[0, 2], attrs={"padding_mask": True}
+    ),
+    "cu_seq_len without padding_mask": lambda: _scenario(cu=[0, 2, 5]),
     "paged ragged": lambda: _scenario(
         off=[0, 2, 5],
         extra_inputs={"page_table_k_tensor_uid": 12, "page_table_v_tensor_uid": 12},

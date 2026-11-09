@@ -106,8 +106,10 @@ ragged tensors) follow these rules:
   - an offset table that does not have `B + 1` entries;
   - a ragged tensor that is not an operand of a non-paged SDPA node;
   - an offset or length tensor that a node computes.
-- A paged graph with `cu_seq_len_q_tensor_uid` or `cu_seq_len_kv_tensor_uid`
-  is refused in the same way. The message names the tensor.
+- `cu_seq_len_q_tensor_uid` / `cu_seq_len_kv_tensor_uid` need
+  `padding_mask = true` (hipDNN rocm-libraries#14560 Rule 6c); without it the
+  graph is refused the same way. A paged graph does not take `cu_seq_len` at
+  all: it is refused in the same way, naming the tensor.
 
 In the `stats` output of every SDPA forward node, an infinity in both tensors
 with the same sign is equal. This holds for dense graphs too, for example a

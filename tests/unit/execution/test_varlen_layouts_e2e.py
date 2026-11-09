@@ -143,6 +143,8 @@ def _graph(
         ints(CU_KV, "cu_seq_len_kv", [B + 1, 1, 1, 1])
         inputs["cu_seq_len_q_tensor_uid"] = CU_Q
         inputs["cu_seq_len_kv_tensor_uid"] = CU_KV
+        # cu_seq_len needs padding_mask=true (rocm-libraries#14560 Rule 6c).
+        attributes = {"padding_mask": True, **attributes}
     if backward:
         node = {
             "name": "sdpa_bwd",

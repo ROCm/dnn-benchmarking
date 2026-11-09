@@ -158,7 +158,9 @@ def padding_rule(node: _Node, operands: SdpaOperands) -> None:
 
     Each side takes ``seq_len`` or ``cu_seq_len``, never both, and the sides
     may mix. A non-paged node has a length source on both sides or on neither,
-    and ``padding_mask`` needs both. ``cu_seq_len`` exists on forward only.
+    and ``padding_mask`` needs both. ``cu_seq_len`` needs ``padding_mask =
+    true`` (hipDNN rocm-libraries#14560 Rule 6c; ``seq_len`` alone does not
+    yet, pending ALMIOPEN-2967). ``cu_seq_len`` exists on forward only.
     """
     has_source = {}
     for side in ("q", "kv"):
@@ -189,12 +191,20 @@ def padding_rule(node: _Node, operands: SdpaOperands) -> None:
             "SDPA needs a length source (seq_len or cu_seq_len) on both the query "
             "and key side, or on neither"
         )
-    if node_value(
+    padding_mask = node_value(
         node, "padding_mask", ("parameters", "attributes", "inputs")
-    ) and not (has_source["q"] and has_source["kv"]):
+    )
+    if padding_mask and not (has_source["q"] and has_source["kv"]):
         raise ValueError(
             "SDPA padding_mask needs seq_len or cu_seq_len on both the query and "
             "key side"
+        )
+    if (
+        operands.cu_seq_len_q_tensor_uid is not None
+        or operands.cu_seq_len_kv_tensor_uid is not None
+    ) and not padding_mask:
+        raise ValueError(
+            "SDPA cu_seq_len needs padding_mask = true (rocm-libraries#14560)"
         )
 
 
