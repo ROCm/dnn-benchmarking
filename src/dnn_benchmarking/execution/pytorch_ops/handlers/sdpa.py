@@ -10,6 +10,7 @@ import torch
 from ....common.exceptions import UnsupportedGraphError
 from ....config.benchmark_config import PyTorchSdpaBackendName
 from ....graph.loader import tensors_by_uid
+from ....graph.tensor_info import ragged_fields
 from ....graph.varlen import (
     has_ragged_operand,
     has_varlen_source,
@@ -37,7 +38,10 @@ class _PagedSegment(NamedTuple):
     """One paged sequence, prepared untimed.
 
     ``k`` and ``v`` are the dense K and V for the SDPA call. With sinks they
-    are the fp32 K^T and V of the manual attention instead.
+    are the fp32 K^T and V of the manual attention instead. ``batch`` is the
+    row of a ragged Q/O to read and write; ``None`` for a packed (``dims[0]
+    == 1``) Q/O, whose segments are concatenated along the query axis
+    instead.
     """
 
     q_start: int
@@ -47,6 +51,7 @@ class _PagedSegment(NamedTuple):
     mask: Optional[torch.Tensor]
     is_causal: bool
     enable_gqa: bool
+    batch: Optional[int] = None
 
 
 class _PagedSdpa(NamedTuple):
@@ -56,6 +61,7 @@ class _PagedSdpa(NamedTuple):
     scale: float
     q_float: Optional[torch.Tensor]
     sink: Optional[torch.Tensor]
+    ragged: bool = False
 
 
 class _DenseSdpa(NamedTuple):
@@ -584,6 +590,7 @@ def _plan_paged_sdpa(
     window: Optional[int],
     bottom_right: bool,
     sink: Optional[torch.Tensor],
+    ragged: bool,
 ) -> List[_PagedSegment]:
     """Gather a paged KV cache into dense per-sequence K/V and masks.
 
@@ -595,7 +602,9 @@ def _plan_paged_sdpa(
         is itself the per-sequence indirection, so paged K/V carry no ragged
         offsets)
       * Q is ``[1, num_query_heads, total_q, head_size]``, with the sequences
-        packed along ``total_q``
+        packed along ``total_q``, unless ``ragged``: then Q and O are
+        ``[num_seqs, num_query_heads, S_max, head_size]``, addressed by batch
+        like a non-paged ragged operand.
 
     Each sequence's live KV is ``ceil(len / page_size)`` blocks gathered in page
     order and then trimmed to the exact length, so trailing slots in the last
@@ -654,7 +663,10 @@ def _plan_paged_sdpa(
             ]
         )
 
-        q_seq = q[..., q_start : q_start + q_len, :]
+        if ragged:
+            q_seq = q[seq : seq + 1, :, :q_len, :]
+        else:
+            q_seq = q[..., q_start : q_start + q_len, :]
         if q_seq.ndim == 4:
             k_seq = k_seq.unsqueeze(0)
             v_seq = v_seq.unsqueeze(0)
@@ -676,6 +688,7 @@ def _plan_paged_sdpa(
                     seq_mask,
                     seq_causal,
                     False,
+                    seq if ragged else None,
                 )
             )
             q_start += q_len
@@ -701,7 +714,14 @@ def _plan_paged_sdpa(
         )
         segments.append(
             _PagedSegment(
-                q_start, q_len, k_call, v_call, seq_mask, seq_causal, gqa_call
+                q_start,
+                q_len,
+                k_call,
+                v_call,
+                seq_mask,
+                seq_causal,
+                gqa_call,
+                seq if ragged else None,
             )
         )
         q_start += q_len
@@ -1094,7 +1114,12 @@ def compile_sdpa(
     are built once during priming, so the timed region holds only the op work.
 
     A non-paged varlen or ragged graph runs one SDPA call per batch on the
-    batch's live rows and keys (``_plan_varlen_sdpa``).
+    batch's live rows and keys (``_plan_varlen_sdpa``). A ragged Q/O over a
+    non-ragged paged K/V cache (RFC 0014 limitation 9) runs the same
+    per-sequence loop as a packed paged Q, addressed by batch instead of a
+    running offset, and its output is scattered by batch instead of
+    concatenated (``_plan_paged_sdpa``). Paged backward and paged stats stay
+    unsupported either way.
 
     The ``stats`` output (log-sum-exp) comes from the fused kernel, as in a
     training forward: Q/K/V go in with ``requires_grad`` and the kernel's saved
@@ -1126,6 +1151,7 @@ def compile_sdpa(
     tensors_json = tensors_by_uid(graph_json)
 
     is_paged = operands.is_paged
+    is_paged_ragged = False
     if is_paged:
         if (
             operands.page_table_k_tensor_uid is None
@@ -1136,8 +1162,12 @@ def compile_sdpa(
             raise ValueError("Paged SDPA needs seq_len_kv to bound each sequence")
         if stats_uid is not None:
             raise ValueError("Paged SDPA stats output is not supported")
-        if has_ragged_operand(operands, tensors_json):
-            raise ValueError("Paged SDPA with ragged operands is not supported")
+        if any(
+            ragged_fields(tensors_json.get(uid, {}))[0] is not None
+            for uid in operands.kv_side
+        ):
+            raise ValueError("Paged SDPA K/V cache must stay non-ragged")
+        is_paged_ragged = has_ragged_operand(operands, tensors_json)
     is_varlen = not is_paged and has_varlen_source(node, tensors_json)
 
     # Setup is cached on the assumption that its inputs repeat unchanged every
@@ -1270,9 +1300,10 @@ def compile_sdpa(
             plan.window,
             plan.bottom_right,
             sink,
+            is_paged_ragged,
         )
         q_float = None if sink is None else q.to(dtype=torch.float32)
-        return _PagedSdpa(segments, scale, q_float, sink)
+        return _PagedSdpa(segments, scale, q_float, sink, is_paged_ragged)
 
     def prepare_varlen(
         tensors: Dict[int, torch.Tensor],
@@ -1377,10 +1408,16 @@ def compile_sdpa(
 
         if is_paged:
             paged = setup(tensors, "paged", lambda: prepare_paged(tensors, q, k, v))
+
+            def q_slice(t: torch.Tensor, s: _PagedSegment) -> torch.Tensor:
+                if s.batch is not None:
+                    return t[s.batch : s.batch + 1, :, : s.q_len, :]
+                return t[..., s.q_start : s.q_start + s.q_len, :]
+
             if paged.sink is not None:
                 outputs = [
                     _sink_attention(
-                        paged.q_float[..., s.q_start : s.q_start + s.q_len, :],
+                        q_slice(paged.q_float, s),
                         s.k,
                         s.v,
                         s.mask,
@@ -1389,11 +1426,10 @@ def compile_sdpa(
                     )[0]
                     for s in paged.segments
                 ]
-                o = torch.cat(outputs, dim=-2).to(dtype=q.dtype)
             else:
                 outputs = [
                     execute_selected_sdpa(
-                        q[..., s.q_start : s.q_start + s.q_len, :],
+                        q_slice(q, s),
                         s.k,
                         s.v,
                         attn_mask=s.mask,
@@ -1404,8 +1440,21 @@ def compile_sdpa(
                     )
                     for s in paged.segments
                 ]
+            if paged.ragged:
+                # A ragged Q/O has its own batch axis: scatter each
+                # sequence's output into its row, zero elsewhere, instead of
+                # concatenating along the (nonexistent) packed query axis.
+                o = torch.zeros(
+                    (*q.shape[:-1], int(v.shape[-1])), dtype=q.dtype, device=q.device
+                )
+                for s, out in zip(paged.segments, outputs):
+                    o[s.batch : s.batch + 1, :, : s.q_len, :] = out.to(dtype=o.dtype)
+            else:
+                # Re-packed along the query axis in the order the sequences
+                # were laid out.
                 o = torch.cat(outputs, dim=-2)
-            # Re-packed along the query axis in the order the sequences were laid out.
+                if paged.sink is not None:
+                    o = o.to(dtype=q.dtype)
             _store_tensor(tensors, o_uid, o)
             return
 

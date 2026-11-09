@@ -230,7 +230,7 @@ file does not store them.
 | Key | Type | Meaning |
 |---|---|---|
 | `flops` | int or null | Analytical FLOPs for one launch of the graph. For an SDPA node with variable lengths, it sums the counts over batches. Each count comes from the valid lengths of that batch. A paged graph uses the real KV lengths. `null` when any node has no FLOP formula, or lacks the tensor data its formula needs. A partial count is never reported. `tflops` is then `null` too. |
-| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. A non-paged tensor with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors) counts only its valid elements. Paged K and V containers count their full size. |
+| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. A tensor with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors, including a ragged Q/O over a paged K/V cache) counts only its valid elements. A non-ragged paged K, V, Q or O container counts its full size. |
 | `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. See [clocks](#clocks). |
 
 `--no-metrics` sets these values and the plan `workspace_bytes`, `tflops` and

@@ -95,16 +95,20 @@ ragged tensors) follow these rules:
 
 - A ragged output compares valid positions only. A position at or past the
   length of its batch is not compared, so engines can write any value there.
-- A padded (non-ragged) output and a paged output compare every element.
-  hipDNN defines the padding: rows at or past `seq_len_q` hold O = 0 and
-  `stats = -inf`, and gradients past a length are 0.
+- A padded (non-ragged) output, including a non-ragged paged output,
+  compares every element. hipDNN defines the padding: rows at or past
+  `seq_len_q` hold O = 0 and `stats = -inf`, and gradients past a length are
+  0. A ragged Q/O over a paged K/V cache (RFC 0014 limitation 9) is ragged,
+  not paged, for this rule: it compares valid positions only.
 - `correctness.n_total` counts the compared elements. For a ragged output
   this is not the tensor size.
 - If the tool cannot serve the layout of a graph, it refuses the graph. The
   graph reports the status `no_engines` and the message names the tensor.
   The exit code stays 0. Examples:
   - an offset table that does not have `B + 1` entries;
-  - a ragged tensor that is not an operand of a non-paged SDPA node;
+  - a ragged tensor that is not an operand of any SDPA node;
+  - a ragged K or V operand of a paged node: the page pool itself must stay
+    non-ragged, even when Q, O or `stats` is ragged over it;
   - an offset or length tensor that a node computes.
 - `cu_seq_len_q_tensor_uid` / `cu_seq_len_kv_tensor_uid` need
   `padding_mask = true` (hipDNN rocm-libraries#14560 Rule 6c); without it the

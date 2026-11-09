@@ -601,6 +601,106 @@ def _resolve_node(
                 )
 
 
+def _resolve_paged_node(
+    node: _Node,
+    operands: SdpaOperands,
+    infos: Dict[int, TensorInfo],
+    tensors_json: Dict[int, Dict[str, Any]],
+    computed: Set[int],
+    input_data: Dict[int, Any],
+    layouts: Dict[int, VarlenLayout],
+) -> None:
+    """Resolve the varlen layout of a paged node's ragged Q-side operands.
+
+    Forward only: RFC 0014 limitation 9 is a forward gate, and hipDNN does
+    not serve paged backward at all, ragged or not. The K/V page pool must
+    stay non-ragged; a ragged key-side operand is refused here, as it would
+    be for a non-paged node. Q, O and stats may be ragged over a non-ragged
+    paged K/V cache, sharing one offset table and the same per-batch S_max.
+    Their lengths come from ``seq_len_q``, which paging always requires: the
+    ``total_q / num_sequences`` split ``sdpa_lengths`` falls back to assumes
+    a packed query with no per-batch axis, which a ragged operand (``dims[0]
+    == batches``) does not have.
+    """
+    node_label = f"SDPA node ({node.get('name') or node.get('type')})"
+    if _is_backward(node, operands):
+        for info in (
+            infos[uid]
+            for uid in operands.q_side + operands.kv_side
+            if uid in infos
+        ):
+            if info.is_ragged:
+                raise _refuse(
+                    f"Ragged {info.label} is an operand of a paged SDPA "
+                    "backward node, which is not supported"
+                )
+        return
+    for info in (infos[uid] for uid in operands.kv_side if uid in infos):
+        if info.is_ragged:
+            raise _refuse(
+                f"Ragged {info.label} is an operand of a paged SDPA node's K/V "
+                "cache, which must stay non-ragged"
+            )
+    q_infos = [infos[uid] for uid in operands.q_side if uid in infos]
+    ragged = [ti for ti in q_infos if ti.is_ragged]
+    if not ragged:
+        return
+    if operands.seq_len_q_tensor_uid is None:
+        raise _refuse(
+            f"{node_label}: a ragged Q-side operand over paged K/V needs "
+            "seq_len_q; it has no single total length to split"
+        )
+    s_max = {ti.dims[-2] for ti in ragged}
+    if len(s_max) > 1:
+        raise _refuse(
+            f"{node_label}: ragged Q-side operands disagree on their per-batch "
+            f"capacity: {sorted(s_max)}"
+        )
+    read = partial(read_input_ints, input_data)
+    sources = [operands.seq_len_q_tensor_uid] + [
+        ti.ragged_offset_tensor_uid for ti in ragged
+    ]
+    _check_source_inputs(node_label, sources, computed, input_data, tensors_json)
+    lengths = read(operands.seq_len_q_tensor_uid)
+    batches = len(lengths)
+    offsets = {ti.uid: _ragged_offsets(ti, batches, read) for ti in ragged}
+    for info in q_infos:
+        if info.dims[0] != batches:
+            raise _refuse(
+                f"{info.label} has {info.dims[0]} batches; seq_len_q has {batches}"
+            )
+        bad = [n for n in lengths if n < 0 or n > info.dims[-2]]
+        if bad:
+            raise _refuse(
+                f"{info.label} has lengths {bad} outside 0..{info.dims[-2]}"
+            )
+        if not info.is_ragged:
+            continue
+        table = offsets[info.uid]
+        mult = info.ragged_offset_multiplier
+        spans = offset_spans(table, mult, info.strides[2], info.label)
+        for b, packed in enumerate(spans):
+            if lengths[b] > packed:
+                raise _refuse(
+                    f"{info.label} batch {b}: length {lengths[b]} exceeds its "
+                    f"packed range of {packed} tokens"
+                )
+        _check_overlap(info, table[-1] * mult)
+    for info in ragged:
+        table = offsets[info.uid]
+        mult = info.ragged_offset_multiplier
+        layout = VarlenLayout(
+            lengths=tuple(lengths),
+            starts=tuple(off * mult for off in table[:-1]),
+            end=table[-1] * mult,
+        )
+        if layouts.setdefault(info.uid, layout) != layout:
+            raise _refuse(
+                f"{info.label} gets different varlen layouts from different "
+                "SDPA nodes"
+            )
+
+
 def resolve_varlen_layouts(
     tensor_infos: List[TensorInfo],
     graph_json: Dict[str, Any],
@@ -608,10 +708,11 @@ def resolve_varlen_layouts(
 ) -> List[TensorInfo]:
     """Set the comparison and layout fields that the graph decides per tensor.
 
-    ``varlen`` goes on every operand of each non-paged varlen SDPA node, and
-    ``matching_infinities`` on the ``stats`` output of each SDPA forward node:
-    rows with no live key hold a log-sum-exp of -inf in both the engine and
-    the reference.
+    ``varlen`` goes on every operand of each non-paged varlen SDPA node, on a
+    ragged Q-side operand (Q, O or stats) of a paged node, and
+    ``matching_infinities`` on the ``stats`` output of each SDPA forward
+    node: rows with no live key hold a log-sum-exp of -inf in both the
+    engine and the reference.
 
     Returns copies for the tensors that gain a field and the input list itself
     when none does. Raises UnsupportedGraphError, naming the tensor, for any
@@ -634,28 +735,23 @@ def resolve_varlen_layouts(
         operand_infos = [
             infos[uid] for uid in operands.q_side + operands.kv_side if uid in infos
         ]
+        claimed.update(info.uid for info in operand_infos)
         if operands.is_paged:
-            for info in operand_infos:
-                if info.is_ragged:
-                    raise _refuse(
-                        f"Ragged {info.label} is an operand of a paged SDPA node, "
-                        "which is not supported"
-                    )
             try:
                 padding_rule(node, operands)
             except ValueError as error:
                 where = operand_infos[0].label if operand_infos else "paged SDPA node"
                 raise _refuse(f"{where}: {error}") from error
+            _resolve_paged_node(
+                node, operands, infos, tensors_json, computed, input_data, layouts
+            )
             continue
-        claimed.update(info.uid for info in operand_infos)
         _resolve_node(
             node, operands, infos, tensors_json, computed, input_data, layouts
         )
     for info in tensor_infos:
         if info.is_ragged and info.uid not in claimed:
-            raise _refuse(
-                f"Ragged {info.label} is not an operand of a non-paged SDPA node"
-            )
+            raise _refuse(f"Ragged {info.label} is not an operand of any SDPA node")
     if not layouts and not stats:
         return tensor_infos
     return [

@@ -359,6 +359,97 @@ def test_ragged_tensor_outside_a_non_paged_sdpa_node_is_refused() -> None:
         _resolve(graph, data)
 
 
+def test_ragged_q_and_o_over_non_ragged_paged_kv_resolves() -> None:
+    """RFC 0014 limitation 9: a paged node may take ragged Q/O, sharing one
+    offset table, as long as the K/V page pool stays non-ragged."""
+    graph, data = _scenario(
+        off=[0, 2, 5],
+        seq=[2, 3],
+        ragged=("q", "o"),
+        extra_inputs={"page_table_k_tensor_uid": 12, "page_table_v_tensor_uid": 12},
+    )
+
+    infos = _resolve(graph, data)
+
+    assert infos[1].varlen.lengths == (2, 3)
+    assert infos[1].varlen.starts == (0, 12)
+    assert infos[4].varlen.lengths == (2, 3)
+    assert infos[2].varlen is None  # K stays non-ragged: no layout assigned.
+    assert infos[3].varlen is None  # V stays non-ragged.
+
+
+def test_ragged_kv_over_paged_node_is_refused() -> None:
+    graph, data = _scenario(
+        off=[0, 2, 5],
+        seq=[2, 3],
+        ragged=("q", "o", "k"),
+        extra_inputs={"page_table_k_tensor_uid": 12, "page_table_v_tensor_uid": 12},
+    )
+
+    with pytest.raises(UnsupportedGraphError, match="'k'"):
+        _resolve(graph, data)
+
+
+def test_ragged_q_over_paged_node_without_seq_len_q_is_refused() -> None:
+    graph, data = _scenario(
+        off=[0, 2, 5],
+        ragged=("q", "o"),
+        extra_inputs={"page_table_k_tensor_uid": 12, "page_table_v_tensor_uid": 12},
+    )
+
+    with pytest.raises(UnsupportedGraphError, match="seq_len_q"):
+        _resolve(graph, data)
+
+
+def test_ragged_operand_on_a_paged_backward_node_is_refused() -> None:
+    """Paged backward stays refused regardless of raggedness: RFC 0014
+    limitation 9 is a forward gate, and hipDNN serves no paged backward."""
+    graph = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                    "page_table_k_tensor_uid": 12,
+                    "page_table_v_tensor_uid": 12,
+                },
+                "outputs": {
+                    "dq_tensor_uid": 7,
+                    "dk_tensor_uid": 8,
+                    "dv_tensor_uid": 9,
+                },
+                "attributes": {},
+            }
+        ],
+        "tensors": [
+            _tensor(1, "q", DIMS, TOKEN_MAJOR),
+            _tensor(2, "k", DIMS, TOKEN_MAJOR),
+            _tensor(3, "v", DIMS, TOKEN_MAJOR),
+            _tensor(4, "o", DIMS, TOKEN_MAJOR),
+            _tensor(5, "do", DIMS, TOKEN_MAJOR),
+            _tensor(6, "stats", DIMS, TOKEN_MAJOR),
+            _tensor(
+                7,
+                "dq",
+                DIMS,
+                TOKEN_MAJOR,
+                ragged_offset_tensor_uid=10,
+                ragged_offset_multiplier=6,
+            ),
+            _tensor(8, "dk", DIMS, TOKEN_MAJOR),
+            _tensor(9, "dv", DIMS, TOKEN_MAJOR),
+        ],
+    }
+
+    with pytest.raises(UnsupportedGraphError, match="'dq'"):
+        _resolve(graph, {})
+
+
 def _head_major_tokens(tokens):
     """Q/K/V/O ``[1, 4, tokens, 8]`` over strides ``[32, 8, 8, 1]``, so each
     head holds one token; the offset table is ``[0, tokens]``."""

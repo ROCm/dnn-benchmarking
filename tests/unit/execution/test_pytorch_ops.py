@@ -3019,6 +3019,161 @@ class TestPyTorchSdpaPaged:
             pytorch_ops.compile_graph(graph)
 
 
+class TestPyTorchSdpaPagedRagged:
+    """Ragged Q/O over a non-ragged paged K/V cache (RFC 0014 limitation 9).
+
+    Reuses the page-table gather of ``TestPyTorchSdpaPaged``; only the query
+    side's shape and addressing change, from packed ``[1, H, total_q, D]``
+    (a running offset) to per-batch ``[B, H, S_max, D]`` (addressed by
+    batch), as a ragged tensor decodes after ``buffer_manager`` resolves it.
+    """
+
+    PAGE = 16
+    HQ, HKV, D = 8, 2, 64
+    KV_LENS = [40, 27]
+    Q_LENS = [5, 3]
+    S_MAX = 6  # Above max(Q_LENS): padding rows exist and must read as 0.
+    BLOCKS_PER_SEQ = 4
+    NUM_BLOCKS = 16
+
+    def _build(self, seed: int = 0):
+        torch.manual_seed(seed)
+        num_seqs = len(self.KV_LENS)
+        dense_k = [
+            torch.randn(self.HKV, n, self.D, dtype=torch.float32) for n in self.KV_LENS
+        ]
+        dense_v = [
+            torch.randn(self.HKV, n, self.D, dtype=torch.float32) for n in self.KV_LENS
+        ]
+
+        k_pages = torch.full(
+            (self.NUM_BLOCKS, self.HKV, self.PAGE, self.D), 999.0, dtype=torch.float32
+        )
+        v_pages = torch.full(
+            (self.NUM_BLOCKS, self.HKV, self.PAGE, self.D), -999.0, dtype=torch.float32
+        )
+        page_table = torch.zeros(num_seqs, self.BLOCKS_PER_SEQ, dtype=torch.int32)
+
+        scrambled = [13, 2, 7, 11, 0, 5, 9, 3]
+        nxt = 0
+        for s in range(num_seqs):
+            needed = (self.KV_LENS[s] + self.PAGE - 1) // self.PAGE
+            for b in range(needed):
+                blk = scrambled[nxt]
+                nxt += 1
+                page_table[s, b] = blk
+                lo = b * self.PAGE
+                hi = min(lo + self.PAGE, self.KV_LENS[s])
+                k_pages[blk, :, : hi - lo, :] = dense_k[s][:, lo:hi, :]
+                v_pages[blk, :, : hi - lo, :] = dense_v[s][:, lo:hi, :]
+
+        # Per-batch dense Q, as a ragged tensor decodes: random past each
+        # q_len, to prove the handler never reads or writes there.
+        q = torch.randn(num_seqs, self.HQ, self.S_MAX, self.D, dtype=torch.float32)
+        return q, k_pages, v_pages, page_table, dense_k, dense_v
+
+    def _graph(self, **attr_overrides):
+        attributes = {
+            "causal_mask": False,
+            "causal_mask_bottom_right": False,
+            "padding_mask": False,
+            "alibi_mask": False,
+            "attn_scale_value": 1.0 / (self.D**0.5),
+            "left_bound": -1,
+            "right_bound": -1,
+            "diagonal_alignment": "TOP_LEFT",
+        }
+        attributes.update(attr_overrides)
+        return {
+            "name": "paged_ragged",
+            "compute_data_type": "float",
+            "io_data_type": "float",
+            "tensors": [
+                {
+                    "uid": 1,
+                    "name": "q",
+                    "ragged_offset_tensor_uid": 20,
+                    "ragged_offset_multiplier": 1,
+                },
+                {
+                    "uid": 4,
+                    "name": "o",
+                    "ragged_offset_tensor_uid": 20,
+                    "ragged_offset_multiplier": 1,
+                },
+            ],
+            "nodes": [
+                {
+                    "name": "",
+                    "type": "SdpaAttributes",
+                    "compute_data_type": "float",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "seq_len_q_tensor_uid": 7,
+                        "seq_len_kv_tensor_uid": 8,
+                        "page_table_k_tensor_uid": 5,
+                        "page_table_v_tensor_uid": 6,
+                    },
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": None},
+                    "attributes": attributes,
+                }
+            ],
+        }
+
+    def _tensors(self, q, k_pages, v_pages, page_table):
+        return {
+            1: q,
+            2: k_pages,
+            3: v_pages,
+            5: page_table,
+            6: page_table,
+            7: torch.tensor(self.Q_LENS, dtype=torch.int32),
+            8: torch.tensor(self.KV_LENS, dtype=torch.int32),
+        }
+
+    def test_ragged_query_matches_the_dense_per_sequence_reference(self) -> None:
+        """Each sequence's live rows must match an independent dense SDPA call
+        on that sequence's own gathered K/V; padding rows (q_len..S_MAX) must
+        read back as 0, proving the handler neither reads nor writes there."""
+        import torch.nn.functional as F
+
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+
+        pytorch_ops.execute_graph(self._graph(), tensors)
+
+        o = tensors[4]
+        assert o.shape == (len(self.KV_LENS), self.HQ, self.S_MAX, self.D)
+        rep = self.HQ // self.HKV
+        for s, q_len in enumerate(self.Q_LENS):
+            expected = F.scaled_dot_product_attention(
+                q[s : s + 1, :, :q_len, :],
+                dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                scale=1.0 / (self.D**0.5),
+            )
+            torch.testing.assert_close(o[s : s + 1, :, :q_len, :], expected)
+            assert torch.all(o[s : s + 1, :, q_len:, :] == 0), "padding rows must be 0"
+
+    def test_ragged_kv_over_paged_still_refuses(self) -> None:
+        """The page pool itself must stay non-ragged (RFC 0014 limitation 9)."""
+        q, k_pages, v_pages, page_table, _, _ = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        graph = self._graph()
+        graph["tensors"].append(
+            {
+                "uid": 2,
+                "name": "k",
+                "ragged_offset_tensor_uid": 20,
+                "ragged_offset_multiplier": 1,
+            }
+        )
+        with pytest.raises(UnsupportedGraphError, match="ragged"):
+            pytorch_ops.execute_graph(graph, tensors)
+
+
 # Varlen forward: the per-batch path also copies each batch into the output.
 _VARLEN_TIMED_OPS = _SDPA_TIMED_OPS | {"aten.copy_.default"}
 

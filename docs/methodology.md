@@ -99,7 +99,10 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   still runs.
 - Sliding-window and bottom-right masks, where a graph needs one, are built
   once. The dense per-sequence K and V of paged graphs are also built once. A
-  timed paged iteration does one SDPA call per sequence and one `torch.cat`.
+  timed paged iteration does one SDPA call per sequence, then one
+  `torch.cat` along the query axis for a packed (non-ragged) Q, or a scatter
+  of each sequence's rows into a zeroed per-batch output for a ragged Q
+  (RFC 0014 limitation 9: ragged Q/O over a non-ragged paged K/V cache).
 - A variable-length forward graph (`seq_len`, `cu_seq_len` or ragged
   tensors, without a page table) does one SDPA call per batch. The call
   reads the first `lq` query positions of the batch. It reads the first
