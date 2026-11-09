@@ -158,7 +158,9 @@ def _bound_paged(
     page_size = 1
     if key_tensor and len(key_tensor.get("dims", [])) == 4:
         page_size = max(int(key_tensor["dims"][2]), 1)
-    width = int(table_dims[1]) if table_dims and len(table_dims) > 1 else 1
+    # hipDNN's tables are [B, 1, max_blocks_per_seq, 1]; older graphs use
+    # [B, max_blocks_per_seq]. The width is every dim after the first.
+    width = int(np.prod(table_dims[1:], dtype=np.int64)) if table_dims else 1
     allocation = width * page_size if table_dims else page_size
     cap = node_value(node, "max_seq_len_kv", ("attributes", "parameters"))
     if cap is not None and int(cap) > 0:
@@ -511,15 +513,16 @@ def generate_varlen_inputs(
 
     Lengths are in ``1..S_max`` and vary across batches; with several batches
     one is padded and one is full, and a single batch is padded. A paged key
-    side is bounded by ``page_table.dims[1] * page_size`` (and
-    ``max_seq_len_kv``); a packed paged query (one query batch) splits its
-    token count over the sequences. Offset tables start at 0, store the token
-    start of every batch scaled by the tensor's token stride and multiplier,
-    and have a trailing entry for the end. Batches start after gaps of padding
-    tokens only when the group has a ``seq_len`` that excludes the padding;
-    then, with several batches, some batch other than the first does when a
-    batch before the last has room for a gap. A group whose only length source
-    is ``cu_seq_len`` has no gaps, so ``cu_seq_len`` equals the batch starts.
+    side is bounded by the page table width (the product of its dims after
+    the first) times ``page_size``, and by ``max_seq_len_kv``; a packed paged
+    query (one query batch) splits its token count over the sequences. Offset
+    tables start at 0, store the token start of every batch scaled by the
+    tensor's token stride and multiplier, and have a trailing entry for the
+    end. Batches start after gaps of padding tokens only when the group has a
+    ``seq_len`` that excludes the padding; then, with several batches, some
+    batch other than the first does when a batch before the last has room for
+    a gap. A group whose only length source is ``cu_seq_len`` has no gaps, so
+    ``cu_seq_len`` equals the batch starts.
 
     Raises :class:`UnsupportedGraphError` when tensors that share an offset
     table read it differently, the offset alignment exceeds a sequence, or the

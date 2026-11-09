@@ -99,10 +99,11 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   still runs.
 - Sliding-window and bottom-right masks, where a graph needs one, are built
   once. The dense per-sequence K and V of paged graphs are also built once. A
-  timed paged iteration does one SDPA call per sequence, then one
-  `torch.cat` along the query axis for a packed (non-ragged) Q, or a scatter
-  of each sequence's rows into a zeroed per-batch output for a ragged Q
-  (RFC 0014 limitation 9: ragged Q/O over a non-ragged paged K/V cache).
+  timed paged iteration does one SDPA call per sequence. A packed Q (one
+  batch row for all sequences) then gets one `torch.cat` along the query
+  axis. A Q with one batch row per sequence, padded or ragged, gets a scatter
+  of each sequence's rows into a zeroed per-batch output instead (RFC 0014
+  limitation 9 covers ragged Q/O over a non-ragged paged K/V cache).
 - A variable-length forward graph (`seq_len`, `cu_seq_len` or ragged
   tensors, without a page table) does one SDPA call per batch. The call
   reads the first `lq` query positions of the batch. It reads the first
@@ -164,7 +165,8 @@ the PyTorch row instead of timing the setup.
 Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
-- Paged KV: one SDPA call per sequence and a `torch.cat`.
+- Paged KV: one SDPA call per sequence, then a `torch.cat` or a scatter into
+  a zeroed output.
 - Variable-length lengths (`seq_len`, `cu_seq_len` or ragged tensors): one
   SDPA call per batch.
 - Sliding window or bottom-right causal with a query length above 1 that
@@ -317,7 +319,8 @@ They are not uniform floats:
   batches, one batch is padded (shorter than `S_max`) and one batch is full.
 - For a paged graph, the KV lengths stay within the page allocation:
   `page_table` width times page size, capped by `max_seq_len_kv` when the
-  graph sets it.
+  graph sets it. The width is the product of the table dims after the
+  first: hipDNN's tables are `[B, 1, max_blocks_per_seq, 1]`.
 - An offset table has `B + 1` entries and starts with 0. Entry `b + 1` is
   the start of batch `b + 1`. That is the start of batch `b` plus its length
   and its gap, in the unit of the table. Only a group of tensors that has a

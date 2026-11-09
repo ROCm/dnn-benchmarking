@@ -12,7 +12,6 @@ from ....config.benchmark_config import PyTorchSdpaBackendName
 from ....graph.loader import tensors_by_uid
 from ....graph.tensor_info import ragged_fields
 from ....graph.varlen import (
-    has_ragged_operand,
     has_varlen_source,
     live_rows,
     padding_rule,
@@ -39,9 +38,8 @@ class _PagedSegment(NamedTuple):
 
     ``k`` and ``v`` are the dense K and V for the SDPA call. With sinks they
     are the fp32 K^T and V of the manual attention instead. ``batch`` is the
-    row of a ragged Q/O to read and write; ``None`` for a packed (``dims[0]
-    == 1``) Q/O, whose segments are concatenated along the query axis
-    instead.
+    row of a per-batch Q/O to read and write; ``None`` for a packed Q/O,
+    whose segments are concatenated along the query axis instead.
     """
 
     q_start: int
@@ -55,13 +53,14 @@ class _PagedSegment(NamedTuple):
 
 
 class _PagedSdpa(NamedTuple):
-    """Setup of a paged forward, built once."""
+    """Setup of a paged forward, built once. ``per_batch``: Q and O have one
+    batch row per sequence (see ``_plan_paged_sdpa``)."""
 
     segments: List[_PagedSegment]
     scale: float
     q_float: Optional[torch.Tensor]
     sink: Optional[torch.Tensor]
-    ragged: bool = False
+    per_batch: bool
 
 
 class _DenseSdpa(NamedTuple):
@@ -590,21 +589,25 @@ def _plan_paged_sdpa(
     window: Optional[int],
     bottom_right: bool,
     sink: Optional[torch.Tensor],
-    ragged: bool,
 ) -> List[_PagedSegment]:
     """Gather a paged KV cache into dense per-sequence K/V and masks.
 
-    Layouts, taken from the committed paged bundles rather than assumed:
+    Layouts, taken from the committed paged bundles and hipDNN's
+    ``SdpaFwdNode::validatePagedKv`` rather than assumed:
 
       * paged K/V are ``[num_blocks, num_kv_heads, page_size, head_size]``
-      * the page table is ``[num_seqs, max_blocks_per_seq]`` of int32 block ids
+      * the page table holds int32 block ids, ``[num_seqs, 1,
+        max_blocks_per_seq, 1]`` in hipDNN and ``[num_seqs,
+        max_blocks_per_seq]`` in older graphs; it is read as ``[num_seqs,
+        product of the other dims]``
       * ``seq_len_kv`` is ``[num_seqs]`` LENGTHS (not offsets -- the page table
         is itself the per-sequence indirection, so paged K/V carry no ragged
         offsets)
-      * Q is ``[1, num_query_heads, total_q, head_size]``, with the sequences
-        packed along ``total_q``, unless ``ragged``: then Q and O are
-        ``[num_seqs, num_query_heads, S_max, head_size]``, addressed by batch
-        like a non-paged ragged operand.
+      * Q and O are per batch, ``[num_seqs, num_query_heads, S_max,
+        head_size]``, padded or ragged, when Q has one batch row per
+        sequence. Sequence ``b`` reads the first ``q_len`` rows of Q row
+        ``b``. Otherwise Q is ``[1, num_query_heads, total_q, head_size]``,
+        with the sequences packed along ``total_q``.
 
     Each sequence's live KV is ``ceil(len / page_size)`` blocks gathered in page
     order and then trimmed to the exact length, so trailing slots in the last
@@ -614,8 +617,6 @@ def _plan_paged_sdpa(
     if attn_mask is not None:
         raise ValueError("Paged SDPA with an explicit attn_mask is not supported")
 
-    page_table_k = _tensor(tensors, page_table_k_uid, node)
-    page_table_v = _tensor(tensors, page_table_v_uid, node)
     # Host-resolved once per replay map: a .tolist() here would sync the
     # stream inside the staged timer's gated region and deadlock.
     q_lengths, kv_lengths = sdpa_lengths(
@@ -626,12 +627,20 @@ def _plan_paged_sdpa(
         raise ValueError("Paged SDPA expects rank-4 paged K/V containers")
     page_size = int(k.shape[-2])
     num_seqs = len(kv_lengths)
+    page_table_k = _tensor(tensors, page_table_k_uid, node)
+    page_table_v = _tensor(tensors, page_table_v_uid, node)
     if int(page_table_k.shape[0]) != num_seqs:
         raise ValueError(
             f"Paged SDPA page table has {int(page_table_k.shape[0])} rows for "
             f"{num_seqs} sequences"
         )
-
+    page_table_k = page_table_k.reshape(num_seqs, -1)
+    page_table_v = page_table_v.reshape(int(page_table_v.shape[0]), -1)
+    per_batch = q.ndim == 4 and int(q.shape[0]) == num_seqs
+    if q.ndim == 4 and not per_batch and int(q.shape[0]) != 1:
+        raise ValueError(
+            f"Paged SDPA Q has {int(q.shape[0])} batches for {num_seqs} sequences"
+        )
     segments: List[_PagedSegment] = []
     decided: Dict[_CallForm, bool] = {}
     q_start = 0
@@ -663,7 +672,7 @@ def _plan_paged_sdpa(
             ]
         )
 
-        if ragged:
+        if per_batch:
             q_seq = q[seq : seq + 1, :, :q_len, :]
         else:
             q_seq = q[..., q_start : q_start + q_len, :]
@@ -688,7 +697,7 @@ def _plan_paged_sdpa(
                     seq_mask,
                     seq_causal,
                     False,
-                    seq if ragged else None,
+                    seq if per_batch else None,
                 )
             )
             q_start += q_len
@@ -721,7 +730,7 @@ def _plan_paged_sdpa(
                 seq_mask,
                 seq_causal,
                 gqa_call,
-                seq if ragged else None,
+                seq if per_batch else None,
             )
         )
         q_start += q_len
@@ -1114,12 +1123,13 @@ def compile_sdpa(
     are built once during priming, so the timed region holds only the op work.
 
     A non-paged varlen or ragged graph runs one SDPA call per batch on the
-    batch's live rows and keys (``_plan_varlen_sdpa``). A ragged Q/O over a
-    non-ragged paged K/V cache (RFC 0014 limitation 9) runs the same
-    per-sequence loop as a packed paged Q, addressed by batch instead of a
-    running offset, and its output is scattered by batch instead of
-    concatenated (``_plan_paged_sdpa``). Paged backward and paged stats stay
-    unsupported either way.
+    batch's live rows and keys (``_plan_varlen_sdpa``). A paged Q/O with one
+    batch row per sequence, padded or ragged (RFC 0014 limitation 9: ragged
+    Q/O over a non-ragged paged K/V cache), runs the same per-sequence loop
+    as a packed paged Q, addressed by batch instead of a running offset, and
+    its output is scattered by batch into zeros instead of concatenated
+    (``_plan_paged_sdpa``). Paged backward and paged stats stay unsupported
+    either way.
 
     The ``stats`` output (log-sum-exp) comes from the fused kernel, as in a
     training forward: Q/K/V go in with ``requires_grad`` and the kernel's saved
@@ -1151,7 +1161,6 @@ def compile_sdpa(
     tensors_json = tensors_by_uid(graph_json)
 
     is_paged = operands.is_paged
-    is_paged_ragged = False
     if is_paged:
         if (
             operands.page_table_k_tensor_uid is None
@@ -1167,7 +1176,6 @@ def compile_sdpa(
             for uid in operands.kv_side
         ):
             raise ValueError("Paged SDPA K/V cache must stay non-ragged")
-        is_paged_ragged = has_ragged_operand(operands, tensors_json)
     is_varlen = not is_paged and has_varlen_source(node, tensors_json)
 
     # Setup is cached on the assumption that its inputs repeat unchanged every
@@ -1300,10 +1308,10 @@ def compile_sdpa(
             plan.window,
             plan.bottom_right,
             sink,
-            is_paged_ragged,
         )
         q_float = None if sink is None else q.to(dtype=torch.float32)
-        return _PagedSdpa(segments, scale, q_float, sink, is_paged_ragged)
+        per_batch = any(s.batch is not None for s in segments)
+        return _PagedSdpa(segments, scale, q_float, sink, per_batch)
 
     def prepare_varlen(
         tensors: Dict[int, torch.Tensor],
@@ -1440,10 +1448,10 @@ def compile_sdpa(
                     )
                     for s in paged.segments
                 ]
-            if paged.ragged:
-                # A ragged Q/O has its own batch axis: scatter each
-                # sequence's output into its row, zero elsewhere, instead of
-                # concatenating along the (nonexistent) packed query axis.
+            if paged.per_batch:
+                # A per-batch Q/O, padded or ragged: scatter each sequence's
+                # output into its batch row and leave the rows past its
+                # q_len at 0, as hipDNN defines them.
                 o = torch.zeros(
                     (*q.shape[:-1], int(v.shape[-1])), dtype=q.dtype, device=q.device
                 )

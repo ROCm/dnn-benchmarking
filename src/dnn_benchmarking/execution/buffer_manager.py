@@ -398,7 +398,9 @@ def _generate_paged_input(
     """Structured data for a page table.
 
     A page table must address distinct pages inside the cache, so random page
-    ids are degenerate.
+    ids are degenerate. Its first dim is the sequence count and the product
+    of the others is the width: hipDNN's ``[B, 1, max_blocks_per_seq, 1]``
+    and a rank-2 ``[B, max_blocks_per_seq]`` hold the same ids.
     """
     dims = list(tensor_info.dims)
     dtype = tensor_info.dtype.numpy
@@ -406,7 +408,7 @@ def _generate_paged_input(
     # Distinct pages per sequence, so a gather that ignores the table or
     # collapses sequences produces a visibly different answer.
     num_seqs = int(dims[0])
-    blocks_per_seq = int(dims[1]) if len(dims) > 1 else 1
+    blocks_per_seq = int(np.prod(dims[1:], dtype=np.int64))
     needed = num_seqs * blocks_per_seq
     pool = num_pages if num_pages > 0 else needed
     ids = (np.arange(needed) % max(pool, 1)).astype(dtype)

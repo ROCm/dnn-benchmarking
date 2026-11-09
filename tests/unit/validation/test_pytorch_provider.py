@@ -1737,17 +1737,25 @@ class TestHostMemoryEstimate:
         # 1024 * 1024 float32 mask; the sink tensor itself is negligible.
         assert with_sink - plain >= 3 * 2 * 1024 * 1024 * 4 + 1024 * 1024 * 4
 
-    def test_paged_counts_the_kv_length_the_page_table_addresses(self) -> None:
+    @pytest.mark.parametrize(
+        "table",
+        [lambda w: [4, 1, w, 1], lambda w: [4, w]],
+        ids=["hipdnn_rank4", "rank2"],
+    )
+    def test_paged_counts_the_kv_length_the_page_table_addresses(self, table) -> None:
         """K and V of a paged graph hold pages, not sequences: the gathered KV
-        length is pages per sequence times the page size."""
+        length is pages per sequence (every table dim after the first) times
+        the page size."""
         from dnn_benchmarking.validation.providers.pytorch_provider import (
             estimate_reference_host_bytes as estimate,
         )
 
         q, pages = [4, 2, 64, 16], [64, 2, 16, 16]  # 64 pages of 16 rows
-        one_page = estimate(self._sdpa(q, pages, {}, page_table_dims=[4, 1], sink=True))
+        one_page = estimate(
+            self._sdpa(q, pages, {}, page_table_dims=table(1), sink=True)
+        )
         all_pages = estimate(
-            self._sdpa(q, pages, {}, page_table_dims=[4, 16], sink=True)
+            self._sdpa(q, pages, {}, page_table_dims=table(16), sink=True)
         )
         # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
         # against 16 pages * 16 rows instead of 1 page.

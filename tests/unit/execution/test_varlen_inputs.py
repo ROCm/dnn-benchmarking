@@ -609,18 +609,27 @@ class TestCumulativeLengths:
             assert np.any(ranges[:-1] > lengths[:-1]), f"seed {seed}: no gapped start"
 
 
+#: Page table dims for ``batch`` sequences: hipDNN's ``[B, 1, W, 1]``
+#: (``SdpaFwdNode::validatePagedKv``) and the rank-2 ``[B, W]`` of older graphs.
+PAGE_TABLE_SHAPES = {
+    "hipdnn_rank4": lambda batch, width: [batch, 1, width, 1],
+    "rank2": lambda batch, width: [batch, width],
+}
+
+
 class TestPagedLengths:
     NUM_PAGES = 32
     PAGE_SIZE = 64
     WIDTH = 4
 
-    def _graph(self, total_q=128, batch=3):
+    def _graph(self, total_q=128, batch=3, table="rank2"):
+        table_dims = PAGE_TABLE_SHAPES[table](batch, self.WIDTH)
         tensors = [
             _tensor_json(1, "Q", [1, 16, total_q, 128]),
             _tensor_json(2, "K", [self.NUM_PAGES, 4, self.PAGE_SIZE, 128]),
             _tensor_json(3, "V", [self.NUM_PAGES, 4, self.PAGE_SIZE, 128]),
-            _tensor_json(5, "PAGE_TABLE_K", [batch, self.WIDTH], data_type="int32"),
-            _tensor_json(6, "PAGE_TABLE_V", [batch, self.WIDTH], data_type="int32"),
+            _tensor_json(5, "PAGE_TABLE_K", table_dims, data_type="int32"),
+            _tensor_json(6, "PAGE_TABLE_V", table_dims, data_type="int32"),
             _tensor_json(7, "SEQ_LEN_Q", [batch], data_type="int32"),
             _tensor_json(8, "SEQ_LEN_KV", [batch], data_type="int32"),
         ]
@@ -639,20 +648,24 @@ class TestPagedLengths:
             ),
         )
         infos = [
-            _info(5, "PAGE_TABLE_K", [batch, self.WIDTH]),
-            _info(6, "PAGE_TABLE_V", [batch, self.WIDTH]),
+            _info(5, "PAGE_TABLE_K", table_dims),
+            _info(6, "PAGE_TABLE_V", table_dims),
             _info(7, "SEQ_LEN_Q", [batch]),
             _info(8, "SEQ_LEN_KV", [batch]),
         ]
         return graph, infos
 
-    def test_key_lengths_fit_the_page_table_allocation(self) -> None:
+    @pytest.mark.parametrize("table", list(PAGE_TABLE_SHAPES))
+    def test_key_lengths_fill_the_page_table_allocation(self, table) -> None:
+        # The allocation is the table width (every dim after the first) times
+        # the page size: one batch is full, one is shorter.
+        allocation = self.WIDTH * self.PAGE_SIZE
         for seed in SEEDS:
-            graph, infos = self._graph()
+            graph, infos = self._graph(table=table)
             kv = generate_input_data(infos, seed, graph_json=graph)[8]
             assert kv.min() >= 1
-            assert kv.max() <= self.WIDTH * self.PAGE_SIZE
-            assert kv.min() < self.WIDTH * self.PAGE_SIZE
+            assert kv.max() == allocation
+            assert kv.min() < allocation
 
     @pytest.mark.parametrize("section", ["attributes", "parameters"])
     def test_key_lengths_are_capped_by_max_seq_len_kv(self, section) -> None:
@@ -677,15 +690,17 @@ class TestPagedLengths:
             q = generate_input_data(infos, seed, graph_json=graph)[7]
             np.testing.assert_array_equal(q, [16])
 
-    def test_page_table_invariants_are_kept(self) -> None:
-        graph, infos = self._graph(batch=3)
+    @pytest.mark.parametrize("table", list(PAGE_TABLE_SHAPES))
+    def test_page_table_invariants_are_kept(self, table) -> None:
+        graph, infos = self._graph(batch=3, table=table)
         data = generate_input_data(infos, 0, graph_json=graph)
         for uid in (5, 6):
-            table = data[uid]
-            assert table.shape == (3, self.WIDTH)
-            assert table.max() > 0
-            assert table.max() < self.NUM_PAGES
-            assert len(set(table.reshape(-1).tolist())) == table.size
+            table_data = data[uid]
+            assert table_data.shape == tuple(PAGE_TABLE_SHAPES[table](3, self.WIDTH))
+            assert table_data.max() > 0
+            assert table_data.max() < self.NUM_PAGES
+            ids = table_data.reshape(-1).tolist()
+            assert len(set(ids)) == len(ids) == 3 * self.WIDTH
 
     def test_unpacked_query_lengths_fit_the_query(self) -> None:
         graph, infos = self._graph(batch=3)

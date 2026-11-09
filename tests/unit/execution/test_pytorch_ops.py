@@ -2895,6 +2895,45 @@ class TestPyTorchSdpaPaged:
         expected = self._dense_reference(q, dense_k, dense_v)
         torch.testing.assert_close(tensors[4], expected, rtol=1e-5, atol=1e-5)
 
+    def test_per_batch_queries_without_seq_len_q_take_every_row(self) -> None:
+        """A Q with one batch row per sequence is not split: without
+        seq_len_q, each sequence takes every row of its own batch row."""
+        import torch.nn.functional as F
+
+        rows = 4
+        _, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        q = torch.randn(len(self.KV_LENS), self.HQ, rows, self.D)
+        graph = self._graph()
+        del graph["nodes"][0]["inputs"]["seq_len_q_tensor_uid"]
+        graph["tensors"] = [{"uid": 1, "dims": list(q.shape), "data_type": "float"}]
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+
+        pytorch_ops.execute_graph(graph, tensors)
+
+        rep = self.HQ // self.HKV
+        expected = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    q[s : s + 1],
+                    dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    scale=1.0 / (self.D**0.5),
+                )
+                for s in range(len(self.KV_LENS))
+            ]
+        )
+        torch.testing.assert_close(tensors[4], expected, rtol=1e-5, atol=1e-5)
+
+    def test_query_batches_must_match_the_sequences(self) -> None:
+        """A Q with several batch rows must have one per sequence; hipDNN
+        rejects any other count (SdpaFwdNode::validatePagedKv)."""
+        _, k_pages, v_pages, page_table, _, _ = self._build()
+        q = torch.randn(len(self.KV_LENS) + 1, self.HQ, max(self.Q_LENS), self.D)
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+
+        with pytest.raises(UnsupportedGraphError, match="batches"):
+            pytorch_ops.execute_graph(self._graph(), tensors)
+
     def test_seq_len_q_count_must_match_seq_len_kv(self) -> None:
         q, k_pages, v_pages, page_table, _, _ = self._build()
         tensors = self._tensors(q, k_pages, v_pages, page_table)

@@ -352,8 +352,9 @@ def sdpa_lengths(
     Each side takes ``seq_len``, else ``cu_seq_len`` differences, else the
     offset-table differences of its first ragged operand. A side without a
     source gets its full sequence length. Paged: kv lengths come from
-    ``seq_len_kv``; q lengths from ``seq_len_q`` or ``total_q / num_seqs``.
-    Raises ValueError for a malformed source.
+    ``seq_len_kv``; q lengths from ``seq_len_q``, else the full query length
+    for a Q with one batch row per sequence, else ``total_q / num_seqs`` of a
+    packed Q. Raises ValueError for a malformed source.
     """
     operands = sdpa_operands(node)
     if operands.is_paged:
@@ -366,6 +367,9 @@ def sdpa_lengths(
                 raise ValueError("Paged SDPA seq_len_q/seq_len_kv disagree on num_seqs")
             return q, kv
         total_q = _full_length(operands, "q", tensors_by_uid)
+        q_dims = (tensors_by_uid.get(operands.q) or {}).get("dims") or [1]
+        if kv and int(q_dims[0]) == len(kv):
+            return [total_q] * len(kv), kv
         if not kv or total_q % len(kv):
             raise ValueError(
                 f"Paged SDPA cannot split {total_q} queries across {len(kv)} "
