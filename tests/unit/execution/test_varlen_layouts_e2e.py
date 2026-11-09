@@ -408,3 +408,165 @@ def test_backward_reference_matches_per_batch_autograd(case, mode):
             np.testing.assert_allclose(got[b], want[uid][b], rtol=1e-4, atol=1e-4)
             length = infos[lengths_of].varlen.lengths[b]
             assert not logical[b, :, length:].any()
+
+
+# Paged K/V: a padded or ragged Q and O with one batch row per sequence, over a
+# non-ragged page pool, laid out as hipDNN's paged graphs are
+# (SdpaFwdNode::validatePagedKv; RFC 0014 limitation 9 for a ragged Q/O).
+PAGE, WIDTH, POOL = 4, 3, 10  # page size, pages per sequence, pages in the pool
+PAGED_SQ = 5
+PAGE_TABLE_K, PAGE_TABLE_V, SINK = 40, 41, 42
+
+PAGE_TABLE_DIMS = {
+    "hipdnn_rank4": [B, 1, WIDTH, 1],
+    "rank2": [B, WIDTH],
+}
+
+PAGED_MODES = {
+    "full": {},
+    "causal": {"causal_mask": True},
+    "bottom_right": {"causal_mask_bottom_right": True},
+    "window": {"left_bound": 2, "right_bound": 0},
+    "window_bottom_right": {
+        "left_bound": 2,
+        "right_bound": 0,
+        "diagonal_alignment": "BOTTOM_RIGHT",
+    },
+}
+
+
+def _paged_graph(q_kind, table, attributes, sink, hq=2, hkv=1):
+    tensors = []
+
+    def add(uid, name, dims, strides, data_type="float", **extra):
+        tensors.append(
+            {
+                "uid": uid,
+                "name": name,
+                "dims": dims,
+                "strides": strides,
+                "data_type": data_type,
+                "virtual": False,
+                **extra,
+            }
+        )
+
+    def contiguous(dims):
+        return [int(np.prod(dims[i + 1 :])) for i in range(len(dims))]
+
+    kind = "token_major" if q_kind == "ragged" else "aotriton"
+    strides, mult = _layout(kind, hq, PAGED_SQ, B * PAGED_SQ, False)
+    ragged = (
+        {"ragged_offset_tensor_uid": Q_TABLE, "ragged_offset_multiplier": mult}
+        if q_kind == "ragged"
+        else {}
+    )
+    add(Q, "q", [B, hq, PAGED_SQ, D], strides, **ragged)
+    add(O, "o", [B, hq, PAGED_SQ, D], strides, **ragged)
+    pool = [POOL, hkv, PAGE, D]
+    add(K, "k_pages", pool, contiguous(pool))
+    add(V, "v_pages", pool, contiguous(pool))
+    table_dims = PAGE_TABLE_DIMS[table]
+    add(PAGE_TABLE_K, "page_table_k", table_dims, contiguous(table_dims), "int32")
+    add(PAGE_TABLE_V, "page_table_v", table_dims, contiguous(table_dims), "int32")
+    for uid, name in ((SEQ_LEN_Q, "seq_len_q"), (SEQ_LEN_KV, "seq_len_kv")):
+        add(uid, name, [B, 1, 1, 1], [1, 1, 1, 1], "int32")
+    if q_kind == "ragged":
+        add(Q_TABLE, "q_offsets", [B + 1, 1, 1, 1], [1, 1, 1, 1], "int32")
+    inputs = {
+        "q_tensor_uid": Q,
+        "k_tensor_uid": K,
+        "v_tensor_uid": V,
+        "seq_len_q_tensor_uid": SEQ_LEN_Q,
+        "seq_len_kv_tensor_uid": SEQ_LEN_KV,
+        "page_table_k_tensor_uid": PAGE_TABLE_K,
+        "page_table_v_tensor_uid": PAGE_TABLE_V,
+    }
+    if sink:
+        add(SINK, "sink", [1, hq, 1, 1], [hq, 1, 1, 1])
+        inputs["sink_token_tensor_uid"] = SINK
+    node = {
+        "name": "sdpa_paged",
+        "type": "SdpaAttributes",
+        "inputs": inputs,
+        "outputs": {"o_tensor_uid": O},
+        "attributes": {"attn_scale_value": SCALE, "padding_mask": True, **attributes},
+    }
+    return {"name": "paged", "tensors": tensors, "nodes": [node]}
+
+
+def _paged_keep(mode, lq, lkv):
+    """hipDNN's mask: row ``i`` keeps key ``j <= i + shift``, and with a window
+    of ``L`` keys also ``j > i + shift - L``; ``shift = lkv - lq`` bottom-right."""
+    if mode == "full":
+        return np.ones((lq, lkv), dtype=bool)
+    shift = lkv - lq if mode in ("bottom_right", "window_bottom_right") else 0
+    i, j = np.arange(lq)[:, None], np.arange(lkv)[None, :]
+    keep = j <= i + shift
+    if mode.startswith("window"):
+        keep &= j > i + shift - PAGED_MODES[mode]["left_bound"]
+    return keep
+
+
+def _paged_oracle(q, k, v, keep, sink):
+    """float64 attention of one sequence: ``q`` ``[Hq, lq, D]``, ``k``/``v``
+    ``[Hkv, lkv, D]``, ``sink`` one logit per query head or None. A sink adds
+    ``exp(sink)`` to the softmax denominator. A row with no key is 0."""
+    rep = q.shape[0] // k.shape[0]
+    k, v = np.repeat(k, rep, axis=0), np.repeat(v, rep, axis=0)
+    scores = np.where(keep, np.einsum("hqd,hkd->hqk", q, k) * SCALE, -np.inf)
+    top = scores.max(axis=-1, keepdims=True)
+    if sink is not None:
+        top = np.maximum(top, sink[:, None, None])
+    with np.errstate(invalid="ignore"):
+        weights = np.where(keep, np.exp(scores - top), 0.0)
+    denom = weights.sum(axis=-1, keepdims=True)
+    if sink is not None:
+        denom = denom + np.exp(sink[:, None, None] - top)
+    out = np.zeros((q.shape[0], q.shape[1], v.shape[-1]))
+    return np.divide(weights @ v, denom, out=out, where=denom > 0)
+
+
+@pytest.mark.parametrize("sink", [False, True], ids=["no_sink", "sink"])
+@pytest.mark.parametrize("mode", list(PAGED_MODES))
+@pytest.mark.parametrize("table", list(PAGE_TABLE_DIMS))
+@pytest.mark.parametrize("q_kind", ["ragged", "padded"])
+def test_paged_reference_matches_a_hand_built_per_sequence_loop(
+    q_kind, table, mode, sink
+):
+    """Generated inputs of a paged graph, through layout resolution and the
+    reference, against a per-sequence loop that gathers K/V through the page
+    table and masks by hand. A padded O holds 0 past ``seq_len_q``."""
+    graph_json = _paged_graph(q_kind, table, PAGED_MODES[mode], sink)
+    infos, input_data = _prepare(graph_json)
+    lq_all = [int(n) for n in input_data[SEQ_LEN_Q].reshape(-1)]
+    lkv_all = [int(n) for n in input_data[SEQ_LEN_KV].reshape(-1)]
+
+    reference = PyTorchReferenceProvider().compute_reference(graph_json, input_data)
+    o = reference[O].data
+    assert o.shape == (B, 2, PAGED_SQ, D)
+    if q_kind == "ragged":
+        q = _gather_all(infos, input_data, Q, input_data[Q])
+        got = _gather_all(infos, input_data, O, o)
+    else:
+        q = [input_data[Q][b, :, :lq] for b, lq in enumerate(lq_all)]
+        got = [o[b, :, :lq] for b, lq in enumerate(lq_all)]
+    ids = input_data[PAGE_TABLE_K].reshape(B, -1)
+    sinks = input_data[SINK].reshape(-1).astype(np.float64) if sink else None
+
+    for b, (lq, lkv) in enumerate(zip(lq_all, lkv_all)):
+        blocks = ids[b, : -(-lkv // PAGE)]
+        k_b = np.concatenate([input_data[K][p] for p in blocks], axis=1)[:, :lkv]
+        v_b = np.concatenate([input_data[V][p] for p in blocks], axis=1)[:, :lkv]
+        want = _paged_oracle(
+            np.asarray(q[b], np.float64),
+            k_b.astype(np.float64),
+            v_b.astype(np.float64),
+            _paged_keep(mode, lq, lkv),
+            sinks,
+        )
+        np.testing.assert_allclose(got[b], want, rtol=1e-5, atol=1e-5)
+        if q_kind == "padded":
+            assert not o[b, :, lq:].any(), "a padded O row past seq_len_q is not 0"
+    assert min(lq_all) < PAGED_SQ, "no batch is padded; the case checks nothing"
+    assert max(lkv_all) > PAGE, "no sequence spans two pages; the case checks nothing"
