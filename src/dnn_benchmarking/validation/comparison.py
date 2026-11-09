@@ -123,7 +123,14 @@ def _compare_arrays(
             if _unmatched_nonfinite(xp, ab, eb):
                 return _failure("output contains NaN or Inf values", n_total)
             if _unmatched_nonfinite(xp, eb, ab):
-                return _failure("reference contains NaN or Inf values", n_total)
+                if bool(xp.isnan(eb).any()):
+                    return _failure("reference contains NaN values", n_total)
+                # Every output infinity matched above, so the output is
+                # finite where the reference holds this one.
+                return _failure(
+                    "output is finite where the reference holds an infinity",
+                    n_total,
+                )
     else:
         if not all(bool(xp.isfinite(block(a, i, upcast_a)).all()) for i in blocks):
             return _failure("output contains NaN or Inf values", n_total)

@@ -278,7 +278,11 @@ def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
     assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
 
 
-def _varlen_out(uid, lengths, data_type="float"):
+def _varlen_out(uid, lengths, data_type="float", ragged=True):
+    """A ``[2, 1, 3, 2]`` output with per-batch ``lengths``; ragged batches
+    start at their offsets, padded ones at ``b * strides[0]``."""
+    starts = (0, lengths[0] * 2) if ragged else None
+    end = sum(lengths) * 2 if ragged else None
     return TensorInfo(
         uid=uid,
         name=f"t{uid}",
@@ -287,11 +291,12 @@ def _varlen_out(uid, lengths, data_type="float"):
         data_type=data_type,
         is_virtual=False,
         is_output=True,
-        varlen=VarlenLayout(lengths=lengths),
+        ragged_offset_tensor_uid=9 if ragged else None,
+        varlen=VarlenLayout(lengths=lengths, starts=starts, end=end),
     )
 
 
-def test_varlen_output_ignores_padding_and_counts_valid_elements():
+def test_ragged_output_ignores_padding_and_counts_valid_elements():
     expected = np.ones((2, 1, 3, 2), np.float32)
     actual = expected.copy()
     actual[0, :, 2:, :] = np.nan  # past batch 0's length of 2
@@ -304,6 +309,23 @@ def test_varlen_output_ignores_padding_and_counts_valid_elements():
 
     assert c.tolerance_match is True
     assert c.n_total == (2 + 3) * 2
+
+
+def test_padded_output_compares_its_padding():
+    # hipDNN defines the rows past a length (O = 0, zero gradients), so an
+    # engine that leaves garbage there fails.
+    expected = np.ones((2, 1, 3, 2), np.float32)
+    expected[0, :, 2:, :] = 0.0
+    actual = expected.copy()
+    actual[0, :, 2:, :] = 5.0  # past batch 0's length of 2
+    ref = {1: _ref(expected)}
+    out = _varlen_out(1, (2, 3), ragged=False)
+
+    c = check_correctness(_HostBM({1: actual}), [out], ref, "pytorch", _config())
+
+    assert c.tolerance_match is False
+    assert c.n_mismatch == 2
+    assert c.n_total == 2 * 3 * 2
 
 
 def test_varlen_output_fails_on_a_wrong_valid_value():
@@ -320,7 +342,7 @@ def test_varlen_output_fails_on_a_wrong_valid_value():
     assert c.n_mismatch == 1
 
 
-def test_varlen_device_output_ignores_padding():
+def test_ragged_device_output_ignores_padding():
     torch = pytest.importorskip("torch")
     expected = torch.ones(2, 1, 3, 2)
     actual = expected.clone()

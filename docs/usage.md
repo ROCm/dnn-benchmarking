@@ -93,10 +93,13 @@ These rows do not fail validation (no exit code 3).
 Variable-length and ragged SDPA graphs (graphs with `seq_len`, `cu_seq_len` or
 ragged tensors) follow these rules:
 
-- A non-paged graph compares valid positions only. A position at or past the
+- A ragged output compares valid positions only. A position at or past the
   length of its batch is not compared, so engines can write any value there.
-  A paged graph compares every output element.
-- `correctness.n_total` counts the compared elements, not the tensor size.
+- A padded (non-ragged) output and a paged output compare every element.
+  hipDNN defines the padding: rows at or past `seq_len_q` hold O = 0 and
+  `stats = -inf`, and gradients past a length are 0.
+- `correctness.n_total` counts the compared elements. For a ragged output
+  this is not the tensor size.
 - If the tool cannot serve the layout of a graph, it refuses the graph. The
   graph reports the status `no_engines` and the message names the tensor.
   The exit code stays 0. Examples:

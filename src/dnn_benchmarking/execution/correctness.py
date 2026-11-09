@@ -94,10 +94,16 @@ def _compare_output(
 ) -> Optional[ComparisonResult]:
     """Compare on the GPU when both sides are device tensors, else on the host.
 
-    A variable-length output compares only the valid positions of each batch,
-    and a ``matching_infinities`` output accepts infinities equal in both.
+    A ragged output compares only the valid positions of each batch: its
+    storage holds nothing else. A padded (non-ragged) output compares every
+    position, since hipDNN defines its padding (O = 0 and stats = -inf past
+    ``seq_len_q``, zero gradients past a length). A ``matching_infinities``
+    output accepts infinities equal in both.
     """
-    lengths = tensor_info.varlen.lengths if tensor_info.varlen is not None else None
+    varlen = tensor_info.varlen
+    lengths = (
+        varlen.lengths if varlen is not None and varlen.starts is not None else None
+    )
     matching_infinities = tensor_info.matching_infinities
     if ref.device_data is not None:
         actual = buffer_manager.get_output_tensor(tensor_info.uid)
