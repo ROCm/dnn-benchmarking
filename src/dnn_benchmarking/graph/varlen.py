@@ -625,9 +625,7 @@ def _resolve_paged_node(
     node_label = f"SDPA node ({node.get('name') or node.get('type')})"
     if _is_backward(node, operands):
         for info in (
-            infos[uid]
-            for uid in operands.q_side + operands.kv_side
-            if uid in infos
+            infos[uid] for uid in operands.q_side + operands.kv_side if uid in infos
         ):
             if info.is_ragged:
                 raise _refuse(
@@ -671,9 +669,7 @@ def _resolve_paged_node(
             )
         bad = [n for n in lengths if n < 0 or n > info.dims[-2]]
         if bad:
-            raise _refuse(
-                f"{info.label} has lengths {bad} outside 0..{info.dims[-2]}"
-            )
+            raise _refuse(f"{info.label} has lengths {bad} outside 0..{info.dims[-2]}")
         if not info.is_ragged:
             continue
         table = offsets[info.uid]
