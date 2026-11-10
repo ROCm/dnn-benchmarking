@@ -50,6 +50,7 @@ RUN_CONFIG_KEYS = (
     "hipdnn_cache_dir",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
+    "aiter_rows",
     "metrics",
     "profiling",
 )

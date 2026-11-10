@@ -1633,7 +1633,7 @@ def fake_aiter(fake_torch, monkeypatch):
     return fake
 
 
-def _run_aiter():
+def _run_aiter(**config):
     from dnn_benchmarking.execution.aiter_sdpa import AiterDevice
 
     session = suite_runner.AiterSession(
@@ -1643,7 +1643,7 @@ def _run_aiter():
         PATH,
         GRAPH,
         TENSORS,
-        SuiteConfig(validation=ValidationConfig(provider="pytorch")),
+        SuiteConfig(validation=ValidationConfig(provider="pytorch"), **config),
         Reporter(io.StringIO()),
         [suite_runner.aiter_planner(session)],
     )
@@ -1664,6 +1664,15 @@ def test_aiter_rows_are_auto_then_each_backend(fake_aiter):
     assert graph.results[2].engine_id == "aiter:ck"
     assert graph.results[2].engine_version == "0.1"
     assert graph.results[2].ootb.cpu_build_time_ms == 2.5
+
+
+def test_aiter_rows_auto_runs_only_aiters_own_selection(fake_aiter):
+    graph = _run_aiter(runtime="aiter:auto")
+
+    assert [(r.engine_name, r.verdict) for r in graph.results] == [
+        ("pytorch", "reference"),
+        ("aiter:auto", "passed"),
+    ]
 
 
 def test_aiter_without_a_problem_adds_no_rows(fake_aiter, monkeypatch):

@@ -222,6 +222,9 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "hipdnn_cache_dir": config.hipdnn_cache_dir,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
+        "aiter_rows": (
+            config.aiter_rows.value if RuntimeName.AITER in config.runtimes else None
+        ),
         "metrics": metrics.basic,
         "profiling": {
             "pmc": metrics.pmc_set,

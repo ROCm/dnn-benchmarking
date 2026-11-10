@@ -47,7 +47,7 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). `aiter` launches AITER SDPA forward kernels directly, one row per backend. A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
+| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). `aiter` launches AITER SDPA forward kernels directly: `aiter:auto` (AITER's own selection) and one row per backend; `aiter:auto` runs only the `aiter:auto` row. A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory, or a comma list with one directory for each `--engine` entry. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner. Use with `--hipdnn-cache-dir`. |
@@ -421,6 +421,15 @@ Read the rows as follows:
   the timed call, as their entry points do. The Triton entry point also
   zero-fills it, so these rows include that fill kernel. The other rows
   write the graph's output tensor.
+- Every row is reported on its own, in the table and as one JSON row with
+  `runtime = "aiter"` and `engine.name = "aiter:<backend>"`. The tool does
+  not pick a best AITER row; take the fastest one from the JSON, or compare
+  an AITER result file with `compare --by best`.
+
+`--runtime aiter:auto` runs only `aiter:auto`, AITER's own selection, for
+each graph; it combines with other runtimes like `aiter` does (for example
+`--runtime hipdnn,aiter:auto`). `run.config.aiter_rows` records `auto`, or
+`all` for `--runtime aiter`; the rows keep `runtime = "aiter"`.
 
 Requirements and limits:
 

@@ -16,6 +16,7 @@ from dnn_benchmarking.config import (
     TimingPolicy,
     ValidationConfig,
 )
+from dnn_benchmarking.config.benchmark_config import AiterRows
 
 
 def _namespace(argv: list[str]):
@@ -188,8 +189,33 @@ class TestSuiteConfigValidation:
         assert config.runtime is RuntimeName.HIPDNN
 
     @pytest.mark.parametrize(
+        "runtime, runtimes, aiter_rows",
+        [
+            ("aiter", (RuntimeName.AITER,), AiterRows.ALL),
+            ("aiter:auto", (RuntimeName.AITER,), AiterRows.AUTO),
+            (
+                "aiter:auto,hipdnn",
+                (RuntimeName.HIPDNN, RuntimeName.AITER),
+                AiterRows.AUTO,
+            ),
+            ("hipdnn", (RuntimeName.HIPDNN,), AiterRows.ALL),
+        ],
+    )
+    def test_aiter_auto_is_the_aiter_runtime_with_only_its_auto_row(
+        self, runtime, runtimes, aiter_rows
+    ) -> None:
+        config = SuiteConfig(runtime=runtime)
+        assert (config.runtimes, config.aiter_rows) == (runtimes, aiter_rows)
+
+    @pytest.mark.parametrize(
         "runtime, match",
-        [("hipdnn,rocke,hipdnn", "twice"), ("hipdnn,", "must be one of"), ("x", "x")],
+        [
+            ("hipdnn,rocke,hipdnn", "twice"),
+            ("aiter,aiter:auto", "twice"),
+            ("hipdnn,", "must be one of"),
+            ("x", "x"),
+            ("aiter:ck", "must be one of: .*aiter:auto"),
+        ],
     )
     def test_bad_runtime_list_names_the_flag(self, runtime: str, match: str) -> None:
         with pytest.raises(ValueError, match=f"--runtime .*{match}"):

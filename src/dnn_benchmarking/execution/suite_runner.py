@@ -30,6 +30,7 @@ from typing import (
 
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
+    AiterRows,
     PyTorchSdpaBackendName,
     ReferencePrecision,
     SuiteConfig,
@@ -1286,8 +1287,9 @@ def aiter_session() -> AiterSession:
 def aiter_planner(session: AiterSession) -> GraphPlanner:
     """Plan ``aiter:auto`` and every AITER backend that runs an SDPA graph.
 
-    A graph that AITER cannot run gets no rows and no inputs; alone, its
-    status is ``no_engines``.
+    With ``--runtime aiter:auto`` only ``aiter:auto`` runs. A graph that AITER
+    cannot run gets no rows and no inputs; alone, its status is
+    ``no_engines``.
     """
 
     def plan(
@@ -1300,6 +1302,8 @@ def aiter_planner(session: AiterSession) -> GraphPlanner:
         try:
             problem = aiter_problem(graph_json, tensor_infos)
             backends = backend_rows(problem, session.device)
+            if config.aiter_rows is AiterRows.AUTO:
+                backends = backends[:1]  # aiter:auto comes first
         except UnsupportedGraphError as e:
             return RuntimePlan("aiter", message=str(e))
         except Exception as e:

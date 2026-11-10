@@ -70,6 +70,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
+| `aiter_rows` | string or null | `all` for `--runtime aiter`, `auto` for `--runtime aiter:auto`. `null` unless AITER is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
 | `profiling` | object | Requested profiling passes: `pmc` (set name or null), `trace` (bool), `perf` (bool), `roofline` (bool). |
 

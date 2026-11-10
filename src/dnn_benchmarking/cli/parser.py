@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
+    RUNTIME_VARIANTS,
     RuntimeName,
     MetricsConfig,
     PMC_SET_CHOICES,
@@ -310,11 +311,14 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_parse_runtime_list,
         default=_default(SuiteConfig, "runtime"),
         metavar="RUNTIMES",
-        help="comma list of " + ", ".join(_values(RuntimeName)) + ": "
-        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
+        help="comma list of "
+        + ", ".join([*_values(RuntimeName), *RUNTIME_VARIANTS])
+        + ": hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
         "rocke launches rocKE kernels directly (SDPA forward today); "
-        "aiter launches AITER SDPA forward kernels directly, one row per backend. "
-        "Several runtimes add their rows to each graph, for example hipdnn,rocke",
+        "aiter launches AITER SDPA forward kernels directly: the aiter:auto row "
+        "(AITER's own backend selection) and one row per backend; aiter:auto "
+        "runs only the aiter:auto row. Several runtimes add their rows to each "
+        "graph, for example hipdnn,rocke",
         config_key="runtime",
         config_kind=ConfigKind.SCALAR,
         config_type=str,
