@@ -16,13 +16,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
 from ..common.pytorch_tuning import apply_pytorch_environment
-from ..common.work_dir import tuned_state, work_dir
+from ..common.work_dir import ootb_state, tuned_state, work_dir
 from ..config.benchmark_config import (
     RuntimeName,
     PyTorchSdpaBackendName,
     ReferenceProviderName,
     SuiteConfig,
 )
+from ..execution.oracle import HipdnnTunedRuns
 from ..graph.loader import GraphLoader
 from ..metrics.machine_info import collect_environment_info
 from ..metrics.profiling_orchestrator import check_requested_tools
@@ -157,8 +158,14 @@ def run_suite_cli(
             if config.oracle:
                 _warn_oracle(reporter)
 
+        tuned_runs: Optional[HipdnnTunedRuns] = None
+        if config.oracle and RuntimeName.HIPDNN in config.runtimes:
+            tuned_runs = HipdnnTunedRuns(config)
+            resources.callback(tuned_runs.close)
         try:
-            run_graph = start_runtime(config, reporter, resources)
+            run_graph = start_runtime(
+                config, reporter, resources, tuned_runs=tuned_runs
+            )
         except RuntimeStartupError as e:
             reporter.error(str(e))
             return e.exit_code
@@ -172,7 +179,9 @@ def run_suite_cli(
             )
         if argv is None:
             argv = list(sys.argv)
-        return _run_suite(graph_paths, config, run_graph, output_path, reporter, argv)
+        return _run_suite(
+            graph_paths, config, run_graph, output_path, reporter, argv, tuned_runs
+        )
 
 
 def _output_problem(path: Path) -> Optional[str]:
@@ -230,6 +239,8 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "oracle": config.oracle,
         "autotune": config.autotune,
         "benchmark_work_dir": str(work_dir(config.benchmark_work_dir)),
+        "fresh_state": config.fresh_state,
+        "fast": config.fast,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
         "metrics": metrics.basic,
@@ -242,7 +253,9 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
     }
 
 
-def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
+def _run_one_graph(
+    graph_path: Path, run_graph: GraphRunner, *, stall_gate: bool = True
+) -> GraphResult:
     """Load and run one graph; any failure becomes a graph-level error.
 
     An unsupported graph (e.g. a tensor data type this tool cannot allocate)
@@ -254,7 +267,7 @@ def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
         graph_id = graph_id_for(graph_json)
         loader.validate(graph_json)
         tensor_infos = loader.extract_tensor_info(graph_json)
-        return run_graph(graph_path, graph_json, tensor_infos)
+        return run_graph(graph_path, graph_json, tensor_infos, stall_gate=stall_gate)
     except UnsupportedGraphError as e:
         return GraphResult(
             graph_name=graph_path.stem,
@@ -273,6 +286,34 @@ def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
         )
 
 
+def _run_hipdnn_tuned(
+    suite: SuiteResult,
+    run_graph: GraphRunner,
+    tuned_runs: HipdnnTunedRuns,
+    reporter: Reporter,
+) -> None:
+    """Run the queued ``--oracle`` tuned hipDNN runs after the last graph.
+
+    Rows of one graph must share one timing mode. When the stall gate fails
+    in a tuned run, remeasure every row of that graph without stalling, as a
+    stall in the OOTB pass does, and run the new rows' tuned runs.
+    """
+    rerun = []
+    for stalled in tuned_runs.run(suite.graphs, reporter):
+        reporter.warning(
+            f"{stalled.reason} in a tuned run of {stalled.graph.graph_name}; "
+            "remeasuring every row of this graph without stalling"
+        )
+        index = next(i for i, g in enumerate(suite.graphs) if g is stalled.graph)
+        graph = _run_one_graph(
+            Path(stalled.graph.graph_path), run_graph, stall_gate=False
+        )
+        suite.graphs[index] = graph
+        rerun.append(graph)
+    # Unstalled tuned runs cannot fail the stall gate.
+    tuned_runs.run(rerun, reporter)
+
+
 def _run_suite(
     graph_paths: List[Path],
     config: SuiteConfig,
@@ -280,8 +321,14 @@ def _run_suite(
     output_path: Optional[Path],
     reporter: Reporter,
     argv: List[str],
+    tuned_runs: Optional[HipdnnTunedRuns] = None,
 ) -> int:
-    """Run every graph, writing results as it goes; return the exit code."""
+    """Run every graph, writing results as it goes, then the queued tuned
+    runs; return the exit code.
+
+    With tuned runs, the graph tables print after them, so they show the
+    tuned results, and a graph that a stall remeasured prints only once.
+    """
     environment = collect_environment_info()
     if config.oracle or config.autotune:
         environment["selection_env"] = {n: os.environ.get(n) for n in _SELECTION_ENV}
@@ -313,10 +360,14 @@ def _run_suite(
             reporter.graph_start(i, total, graph_path.stem)
             gr = _run_one_graph(graph_path, run_graph)
             suite.graphs.append(gr)
-            reporter.print_graph_table(gr)
+            if tuned_runs is None:
+                reporter.print_graph_table(gr)
             if time.monotonic() - last_write >= WRITE_INTERVAL_S:
                 write()  # a failure is reported; the final write decides
                 last_write = time.monotonic()
+        if tuned_runs is not None:
+            write()  # every OOTB row is on disk before the tuned child starts
+            _run_hipdnn_tuned(suite, run_graph, tuned_runs, reporter)
         suite.run.finished_at = _now()
         suite.run.complete = True
     except KeyboardInterrupt:
@@ -333,6 +384,9 @@ def _run_suite(
             disarm_watchdog()
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
+    if tuned_runs is not None:
+        for gr in suite.graphs:
+            reporter.print_graph_table(gr)
 
     if interrupted is not None:
         where = (
@@ -391,13 +445,13 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
 
 def _warn_oracle(reporter: Reporter) -> None:
     """State what the tuned run does, and warn when the environment overrides
-    the knob. The OOTB plans run on the command's empty selection state, so
-    no persisted ranking can reach them."""
+    the knob. The OOTB plans run on the OOTB selection state, which no tuned
+    run writes, so no tuned ranking can reach them."""
     reporter.info(
-        "--oracle: each engine gets a tuned run in a child, built with "
+        "--oracle: each hipDNN engine row gets a tuned run, built with "
         "global.benchmarking=1 (kernel ingestor and MIOpen sample kernels; other "
-        "engines re-measure the OOTB plan), on the kept tuned state of the work "
-        "dir"
+        "engines re-measure the OOTB plan); all tuned runs share one child after "
+        "the last graph, on the kept tuned state of the work dir"
     )
     forced = os.environ.get("HIPDNN_FORCE_BENCHMARKING")
     if forced is not None:
@@ -430,13 +484,16 @@ def _report_selection_state(config: SuiteConfig, reporter: Reporter) -> None:
     """State where this run's hipDNN cache and MIOpen user database are (set by
     ``cli.main``), and the tuned state that ``--oracle`` tuned runs use. The
     label follows the paths in effect, so a tuned child reports them right."""
-    tuned = tuned_state(work_dir(config.benchmark_work_dir))
+    work = work_dir(config.benchmark_work_dir)
+    tuned = tuned_state(work)
     cache = os.environ.get("HIPDNN_CACHE_DIR")
     user_db = os.environ.get("MIOPEN_USER_DB_PATH")
-    kind = (
-        "tuned, kept across commands"
-        if (cache, user_db) == (str(tuned.hipdnn_cache), str(tuned.miopen_user_db))
-        else "created empty for this command, removed after it"
+    kept = {
+        tuned.env()["HIPDNN_CACHE_DIR"]: "tuned, kept across commands",
+        ootb_state(work).env()["HIPDNN_CACHE_DIR"]: "OOTB, kept across commands",
+    }
+    in_effect = kept.get(
+        cache or "", "created empty for this command, removed after it"
     )
     oracle = (
         f"; --oracle tuned runs use {tuned.hipdnn_cache.parent}"
@@ -445,7 +502,7 @@ def _report_selection_state(config: SuiteConfig, reporter: Reporter) -> None:
     )
     reporter.info(
         f"selection state: hipDNN cache {cache}, MIOpen user database {user_db} "
-        f"({kind}){oracle}"
+        f"({in_effect}){oracle}"
     )
 
 
@@ -472,16 +529,16 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
         leaked = True
         reporter.warning(
             "HIPDNN_FORCE_BENCHMARKING is set in the environment without "
-            "--autotune; kernels are benchmarked, not heuristic-selected"
+            "--autotune; kernels are benchmarked, not heuristic-selected, and "
+            "the winners stay in the selection state for later runs"
         )
     autotune = config.autotune or leaked
-    if config.autotune and not cache_disabled:
+    if config.autotune and not cache_disabled and not config.fresh_state:
         # The tuned state outlives the command and hipDNN reads cached
         # rankings without benchmarking again.
         reporter.info(
             "--autotune: rankings and find results that earlier commands saved "
-            "in the tuned state are reused; use a new --benchmark-work-dir to "
-            "search again"
+            "in the tuned state are reused; use --fresh-state to search again"
         )
     reporter.info(
         f"kernel selection: {'autotune' if autotune else 'heuristic'}; cache: {cache}"

@@ -91,10 +91,27 @@ class Fake:
         self.torch_outputs_written = False
         self.policies = []
         # (call, handle, HIPDNN_DISABLE_CACHE) per plan build/run, in order;
-        # ("tuned", engine_id, None) per tuned-child start.
+        # ("tuned", engine_id, None) per tuned run queued.
         self.calls = []
-        self.tuned = []  # keyword arguments of each run_hipdnn_tuned call
+        self.tuned = []  # keyword arguments of each queued tuned run
+        self.saved_references = []  # reference outputs of each save
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
+        self.tuned_runs = _TunedRuns(self)
+
+
+class _TunedRuns:
+    """HipdnnTunedRuns stand-in: records what the runner queues."""
+
+    def __init__(self, fake):
+        self._fake = fake
+
+    def save_references(self, reference_outputs):
+        self._fake.saved_references.append(reference_outputs)
+        return Path(f"refs-{len(self._fake.saved_references)}")
+
+    def add(self, **kw):
+        self._fake.calls.append(("tuned", kw["engine_id"], None))
+        self._fake.tuned.append(kw)
 
 
 @pytest.fixture
@@ -185,12 +202,7 @@ def fake(monkeypatch):
         def clocks(self):
             return f.clocks.pop(0) if f.clocks else None
 
-    def run_hipdnn_tuned(**kw):
-        f.calls.append(("tuned", kw["engine_id"], None))
-        f.tuned.append(kw)
-
     monkeypatch.setattr(suite_runner, "Executor", Executor)
-    monkeypatch.setattr(suite_runner, "run_hipdnn_tuned", run_hipdnn_tuned)
     monkeypatch.setattr(suite_runner, "BufferManager", BufferManager)
     monkeypatch.setattr(suite_runner, "GpuSmiProbe", Probe)
     monkeypatch.setitem(
@@ -324,7 +336,7 @@ class _Handle:
         self.stream = stream
 
 
-def _run(handle="default", **config):
+def _run(handle="default", tuned_runs=None, **config):
     out = io.StringIO()
     graph = suite_runner.run_graph(
         PATH,
@@ -332,7 +344,11 @@ def _run(handle="default", **config):
         TENSORS,
         SuiteConfig(**config),
         Reporter(out),
-        [suite_runner.hipdnn_planner(_Handle() if handle == "default" else handle)],
+        [
+            suite_runner.hipdnn_planner(
+                _Handle() if handle == "default" else handle, tuned_runs=tuned_runs
+            )
+        ],
     )
     return graph, out.getvalue()
 
@@ -521,22 +537,40 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
 def test_every_executor_gets_the_run_policy(fake):
     config = dict(warmup_iters=3, benchmark_iters=5, cache_mode="cold")
 
-    _run(oracle=True, **config)
+    _run(tuned_runs=fake.tuned_runs, oracle=True, **config)
 
-    # Discovery, then per engine the prime and the OOTB plan; the tuned run
-    # gets the same config in its child.
+    # Discovery, then per engine the prime and the OOTB plan; the queued
+    # tuned run gets the same policy for its child.
     policy = SuiteConfig(**config).timing_policy
     assert fake.policies == [policy] * 5
-    assert [kw["config"].timing_policy for kw in fake.tuned] == [policy] * 2
+    assert [kw["timing_policy"] for kw in fake.tuned] == [policy] * 2
 
 
-def test_tuned_child_starts_after_the_ootb_row_is_timed_and_validated(fake, reference):
+def test_tuned_run_is_queued_after_the_ootb_row_and_before_profiling(
+    fake, reference, monkeypatch
+):
     """Per engine: one untimed prime, the timed OOTB build, its timed loop and
-    validation, then the tuned child with the graph's references, so the tuned
-    run never shares this process or its selection state."""
+    validation, then the queued tuned run with the graph's references, then
+    the profiling passes. The tuned run itself waits for a child after the
+    last graph, so it never shares this process or its selection state."""
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    def run_profiling_passes(**kw):
+        fake.calls.append(("profile", kw["engine_id"], None))
+        return {}
+
+    monkeypatch.setattr(
+        profiling_orchestrator, "run_profiling_passes", run_profiling_passes
+    )
     handle = _Handle()
 
-    graph, _ = _validate(handle=handle, oracle=True, engine_filter=[1, 2])
+    graph, _ = _validate(
+        handle=handle,
+        tuned_runs=fake.tuned_runs,
+        oracle=True,
+        engine_filter=[1, 2],
+        metrics=MetricsConfig(perf=True),
+    )
 
     assert [(name, arg) for name, arg, _ in fake.calls] == [
         ("prime", handle),
@@ -544,16 +578,40 @@ def test_tuned_child_starts_after_the_ootb_row_is_timed_and_validated(fake, refe
         ("benchmark", handle),
         ("execute_once", handle),
         ("tuned", 1),
+        ("profile", 1),
         ("prime", handle),
         ("prepare", handle),
         ("benchmark", handle),
         ("execute_once", handle),
         ("tuned", 2),
+        ("profile", 2),
     ]
-    for kw in fake.tuned:
-        assert kw["reference_outputs"] is not None
-        assert kw["graph_path"] == PATH
-    assert [r.verdict for r in graph.results if r.role == "engine"] == ["passed"] * 2
+    engines = [r for r in graph.results if r.role == "engine"]
+    assert [id(kw["row"]) for kw in fake.tuned] == [id(r) for r in engines]
+    assert [r.verdict for r in engines] == ["passed"] * 2
+    # The graph's references are saved once and shared by both runs.
+    assert len(fake.saved_references) == 1
+    assert fake.saved_references[0].keys() == {2}
+    assert {kw["reference_dir"] for kw in fake.tuned} == {Path("refs-1")}
+    assert {kw["graph_path"] for kw in fake.tuned} == {PATH}
+
+
+def test_only_successful_engine_rows_queue_a_tuned_run(fake):
+    fake.prepare_errors = {1: ExecutionError("build")}
+
+    graph, _ = _run(tuned_runs=fake.tuned_runs, oracle=True)
+
+    assert [r.status for r in graph.results] == ["error", "success"]
+    assert [(kw["engine_id"], id(kw["row"])) for kw in fake.tuned] == [
+        (2, id(graph.results[1]))
+    ]
+
+
+def test_tuned_run_without_references_saves_none(fake):
+    _run(tuned_runs=fake.tuned_runs, oracle=True)
+
+    assert fake.saved_references == []
+    assert [kw["reference_dir"] for kw in fake.tuned] == [None, None]
 
 
 def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
@@ -1182,8 +1240,8 @@ def test_per_engine_handle_loads_only_that_rows_plugin(fake, monkeypatch):
 
 
 def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
-    """Without --oracle or a profiling flag, no engine gets a tuned run
-    and no profiler child is spawned."""
+    """Without --oracle (no tuned-run queue) or a profiling flag, no row gets
+    oracle results and no profiler child is spawned."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
     called = []
@@ -1195,7 +1253,7 @@ def test_default_run_skips_oracle_and_profiling(fake, monkeypatch):
 
     graph, _ = _run()
 
-    assert (called, fake.tuned) == ([], [])
+    assert called == []
     assert [(r.status, r.oracle, r.extra_metrics) for r in graph.results] == [
         ("success", None, None)
     ] * 2
@@ -1252,7 +1310,6 @@ def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):
         metrics=metrics,
         engine_filter=[2],
         plugin_paths=[Path("/a")],
-        benchmark_work_dir="/w",
     )
 
     assert graph.results[0].extra_metrics == {"perf": {"cycles": "ENG_B"}}
@@ -1266,7 +1323,6 @@ def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):
             warmup_iters=3,
             metrics_config=metrics,
             plugin_path=Path("/a"),
-            work_dir=Path("/w").resolve(),
         )
     ]
     assert fake.events[-3:] == ["buffers_freed", "executor_freed", "profile"]
@@ -1354,16 +1410,24 @@ def test_pytorch_buffers_share_the_executor_device(fake_torch):
     assert fake_torch.torch_buffer_devices == ["cuda:3"]
 
 
-def test_stall_rerun_measures_ootb_again_for_an_engine_that_already_tuned(fake):
-    """Tuned runs happen in children on the tuned state, so engine 1's tuned
-    run before engine 2 stalled cannot reach the rerun's OOTB build."""
+def test_stall_rerun_queues_unstalled_tuned_runs_for_the_rerun_rows(fake, reference):
+    """Engine 1 queued its tuned run before engine 2 stalled. The rerun
+    measures OOTB again, saves the references again for its attempt, and
+    queues every row of the rerun with the unstalled policy, so the tuned
+    child measures like the OOTB rows it is compared with."""
     fake.stall = {2}
 
-    graph, _ = _run(oracle=True)
+    graph, _ = _validate(tuned_runs=fake.tuned_runs, oracle=True)
 
     assert [(r.status, r.ootb.timing.mode) for r in graph.results] == [
         ("success", "events")
     ] * 2
+    rows = {id(r) for r in graph.results}
+    rerun = [kw for kw in fake.tuned if id(kw["row"]) in rows]
+    assert [kw["engine_id"] for kw in rerun] == [1, 2]
+    assert [kw["timing_policy"].stall_gate for kw in rerun] == [False, False]
+    assert len(fake.saved_references) == 2
+    assert {kw["reference_dir"] for kw in rerun} == {Path("refs-2")}
 
 
 def test_stall_failure_on_the_reference_reruns_the_graph(fake_torch):

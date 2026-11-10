@@ -8,21 +8,25 @@ Layout of ``--benchmark-work-dir`` (default :func:`work_dir`)::
     <work>/
       cache/                 compile caches, kept: they only save time
         xdg/  miopen-kernels/  comgr/
-      tuned/                 selection state of tuned runs, kept across commands
-        hipdnn-cache/        HIPDNN_CACHE_DIR (tuned rankings, ingestor winners)
+      ootb/                  selection state of OOTB runs, kept across commands
+        hipdnn-cache/        HIPDNN_CACHE_DIR
         miopen-user-db/      MIOPEN_USER_DB_PATH (MIOpen find results)
-      ootb/temp/run-*/       one per command, removed when the command ends
-        hipdnn-cache/
+      tuned/                 selection state of tuned runs, kept across commands
+        hipdnn-cache/        (tuned rankings, ingestor winners)
         miopen-user-db/
 
-Tuned state serves ``--fast`` and ``--autotune`` runs (the whole process) and
-the tuned runs of ``--oracle`` (child processes, ``execution.oracle``). Every
-other run, the OOTB plans of ``--oracle`` included, gets the empty state of
-its own ``ootb/temp/run-*`` directory, so no earlier command, and no tuned
-run, changes its kernel selection. ``cli.main`` sets the variables.
+OOTB state serves every run that does not tune, ``--fast`` included, and the
+OOTB plans of ``--oracle``. Only such runs write it, so a stored find result
+is the one the heuristic path selects. Tuned state serves ``--autotune`` runs
+and the tuned runs of ``--oracle`` (child processes, ``execution.oracle``).
+With ``--fresh-state``, the process instead gets a new, empty state in the
+system temporary directory (:data:`FRESH_STATE_PREFIX`), removed when the
+command ends. ``cli.main`` sets the variables.
 """
 
+import getpass
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -34,8 +38,8 @@ COMPILE_CACHE_SUBDIRS: Dict[str, str] = {
     "AMD_COMGR_CACHE_DIR": "comgr",
 }
 
-#: Directory under the work directory that holds the per-command OOTB state.
-OOTB_TEMP_SUBDIR = Path("ootb") / "temp"
+#: Prefix of the ``--fresh-state`` directory in the system temporary directory.
+FRESH_STATE_PREFIX = "dnn-bench-state-"
 
 
 @dataclass(frozen=True)
@@ -64,22 +68,32 @@ class SelectionState:
 
 
 def work_dir(benchmark_work_dir: Optional[str]) -> Path:
-    """``--benchmark-work-dir``, else ``$DNN_BENCH_WORKSPACE/work``, else
-    ``~/.cache/dnn-benchmark/work``; ``~`` expanded, absolute."""
+    """The absolute work directory, ``~`` expanded.
+
+    In order: ``--benchmark-work-dir``, ``$DNN_BENCH_WORKSPACE/work``,
+    ``$XDG_CACHE_HOME/dnn-benchmark/work``, else a per-user directory in the
+    system temporary directory. The home directory is not a default: it can
+    be on a network file system, which is slow for the SQLite and comgr
+    caches. ``cli.main`` resolves the path once, before it points
+    ``XDG_CACHE_HOME`` into the work directory.
+    """
     if benchmark_work_dir:
         return Path(benchmark_work_dir).expanduser().resolve()
     workspace = os.environ.get("DNN_BENCH_WORKSPACE")
     if workspace:
         return (Path(workspace).expanduser() / "work").resolve()
-    return Path.home() / ".cache" / "dnn-benchmark" / "work"
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return (Path(xdg_cache).expanduser() / "dnn-benchmark" / "work").resolve()
+    user_dir = f"dnn-benchmark-{getpass.getuser()}"
+    return (Path(tempfile.gettempdir()) / user_dir / "work").resolve()
+
+
+def ootb_state(work: Path) -> SelectionState:
+    """The OOTB selection state, kept across commands."""
+    return SelectionState.under(work / "ootb")
 
 
 def tuned_state(work: Path) -> SelectionState:
     """The tuned selection state, kept across commands."""
     return SelectionState.under(work / "tuned")
-
-
-def uses_tuned_state(fast: bool, autotune: bool) -> bool:
-    """Whether a whole run uses the tuned state: ``--fast`` and
-    ``--autotune``. Other runs get a new, empty OOTB state."""
-    return fast or autotune

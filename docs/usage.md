@@ -51,7 +51,8 @@ the same output format.
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner in the tuned state of the work directory. See [Kernel selection](#kernel-selection---autotune). |
-| `--benchmark-work-dir PATH` | `$DNN_BENCH_WORKSPACE/work`, else `~/.cache/dnn-benchmark/work` | Work directory for the caches and the kernel-selection state. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.benchmark_work_dir`. |
+| `--benchmark-work-dir PATH` | `$DNN_BENCH_WORKSPACE/work`, else `$XDG_CACHE_HOME/dnn-benchmark/work`, else `<system temp dir>/dnn-benchmark-<user>/work` | Work directory for the caches and the kernel-selection state. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.benchmark_work_dir`. |
+| `--fresh-state`, `--no-fresh-state` | off | Runs the command on a new, empty selection state in the system temporary directory, removed when the command ends. Use it for cold first-run numbers. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.fresh_state`. |
 | `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
@@ -146,6 +147,7 @@ maximum host RSS of the process grew by 0.06 GiB to 0.2 GiB.
 | Option | Default | Description |
 |---|---|---|
 | `--oracle`, `--no-oracle` | off | Also build and time a tuned (`global.benchmarking=1`) plan of each engine, and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
+| `--oracle-timeout SECONDS` | 0 | Wall-clock limit for the hipDNN tuned child (all its tuned runs together) and for each PyTorch tuned child. `0` disables the limit. |
 
 ### Output
 
@@ -170,7 +172,7 @@ profiler, after the timed row completes. The timed numbers do not change.
 | `--perf`, `--no-perf` | off | Collect CPU cycles, instructions and IPC with `perf stat`. |
 | `--roofline`, `--no-roofline` | off | Collect HBM and compute ceilings with `rocprof-compute --roof-only` (about 3 extra runs). |
 | `--profiling-output-dir DIR` | `./profiling-output/<utc-timestamp>/` | Root directory for profiler artefacts. With a profiling flag, the tool checks at startup that it can create files there. Without one, the option has no effect and the tool shows a warning. |
-| `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process and for the tuned-PyTorch child of `--oracle`. `0` disables the limit. |
+| `--profiling-timeout SECONDS` | 600 | Wall-clock limit for each profiler process. `0` disables the limit. |
 
 See [Profiling](#profiling) below.
 
@@ -290,8 +292,9 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
   (`python -m dnn_benchmarking.cli.pytorch_tuned_child`). PyTorch keeps conv algorithm
   choices in a process-wide cache whose key ignores `cudnn.benchmark`, so a
   tuned run in the benchmark process would reuse or leak the OOTB choice.
-- The child keeps its TunableOp results file and `MIOPEN_USER_DB_PATH` in a
-  temporary directory. The tool deletes the directory after the run.
+- The child keeps its TunableOp results file in a temporary directory, which
+  the tool deletes after the run. Its MIOpen conv search uses the kept tuned
+  state of the work directory (`<work>/tuned`), as the hipDNN tuned runs do.
 - The child starts after the OOTB buffers are released. It uses the same
   warmup and sampling settings. Its search runs in the untimed first launch.
 - The tool does not validate tuned PyTorch outputs. PyTorch rows have no plan
@@ -299,7 +302,7 @@ GEMM tuning (`PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=1`).
 - `tuning_available` is `true` only when the graph has a convolution or
   matmul node. The child searches no other op, so for example SDPA and
   pointwise graphs report `no-search`.
-- `--profiling-timeout` also bounds the child. A child that times out gives
+- `--oracle-timeout` bounds each child. A child that times out gives
   `oracle_error` and no tuned result.
 - These settings also apply to the `--validate pytorch` reference kernels.
 
@@ -401,22 +404,29 @@ The work directory holds the caches and the kernel-selection state:
 ```text
 <work>/
   cache/                 compile caches, kept: xdg/, miopen-kernels/, comgr/
-  tuned/                 tuned selection state, kept across commands
+  ootb/                  OOTB selection state, kept across commands
     hipdnn-cache/        HIPDNN_CACHE_DIR
     miopen-user-db/      MIOPEN_USER_DB_PATH
-  ootb/temp/run-*/       OOTB selection state of one command, removed at exit
+  tuned/                 tuned selection state, kept across commands
     hipdnn-cache/
     miopen-user-db/
 ```
 
-- `--fast` and `--autotune` runs, and the tuned runs of `--oracle`, use
-  `tuned/`. A later command with the same work directory reuses the hipDNN
-  rankings and the MIOpen find results that earlier tuned runs saved.
-- Every other run, and the OOTB plans of `--oracle`, gets a new, empty
-  `ootb/temp/run-*` directory. No earlier command and no tuned run can change
-  its kernel selection. The directory is per command, not per row: all
-  graphs and rows of the command, the in-process `--validate pytorch`
-  reference included, share it. The tool removes it when the command ends.
+- `--autotune` runs and the tuned runs of `--oracle` use `tuned/`. A later
+  command with the same work directory reuses the hipDNN rankings and the
+  MIOpen find results that earlier tuned runs saved.
+- Every other run, `--fast` included, and the OOTB plans of `--oracle` use
+  `ootb/`. No tuned run writes to it, so no tuned ranking can change its
+  kernel selection. A later command reuses the MIOpen find results that
+  earlier OOTB runs saved there.
+- `--fresh-state` replaces `ootb/` and `tuned/` for one command: the command
+  gets a new, empty state in the system temporary directory (prefix
+  `dnn-bench-state-`), and the tool removes it when the command ends. All
+  graphs and rows of the command share it. The tuned runs of `--oracle`
+  still use `tuned/`. Use it for cold first-run numbers (`first_call_ms`,
+  wall time).
+- A profiling child (see [Profiling](#profiling)) runs on the selection
+  state of its parent, unchanged. It makes no new state.
 - The selection state replaces inherited `HIPDNN_CACHE_DIR` and
   `MIOPEN_USER_DB_PATH` values. The compile caches only save time. They fill
   unset variables, and replace inherited values when you give
@@ -424,7 +434,7 @@ The work directory holds the caches and the kernel-selection state:
 - A work directory that cannot be created stops the run with exit code 2.
 
 The tool states the selection state on stderr, for example
-`selection state: hipDNN cache <work>/ootb/temp/run-x/hipdnn-cache, ...`.
+`selection state: hipDNN cache <work>/ootb/hipdnn-cache, ...`.
 
 ## Kernel selection (`--autotune`)
 
@@ -437,16 +447,16 @@ A hipDNN engine selects a kernel in one of two ways:
   the kernel set.
 
 With the hipDNN backend the tool states the path on stderr, for example
-`kernel selection: heuristic; cache: <work>/ootb/temp/run-x/hipdnn-cache`.
+`kernel selection: heuristic; cache: <work>/ootb/hipdnn-cache`.
 This is an info line, so `-q` hides it.
 
 `--autotune` runs on the tuned state of the work directory, which outlives
 the command. A ranking that an earlier command saved there serves this run
 without a new search, and the tool says so on stderr. To search every
-problem again, use a new work directory:
+problem again, use `--fresh-state`:
 
 ```bash
-dnn-benchmark -g 'graphs/*.json' --autotune --benchmark-work-dir /tmp/work-tuned
+dnn-benchmark -g 'graphs/*.json' --autotune --fresh-state
 ```
 
 The tool shows a warning when `HIPDNN_FORCE_BENCHMARKING` is set to a true
@@ -474,18 +484,19 @@ What the tool does:
    handle) and their in-memory caches stay loaded.
 3. It primes the engine before the first graph only. Every graph still builds
    its own plan, and `build_ms` is that build.
-4. It runs on the tuned state of the work directory (see
+4. It runs on the OOTB state of the work directory (see
    [Work directory](#work-directory---benchmark-work-dir)): the hipDNN cache
    and the MIOpen user database that every graph shares and that later
-   commands reuse. Find results thus carry over from graph to graph and from
-   earlier commands. MIOpen's find dominates the first call of a
-   convolution: on one gfx1151 host, 7 convolution graphs took 475 s with an
-   empty database and 46 s with the database of an earlier run. In such a
-   warm run, `first_call_ms` and the wall time are not comparable with a
-   cold run; `kernel_med` is, when the find selects the same kernel. Use a
-   new `--benchmark-work-dir` for a cold `--fast` run.
-5. Rankings that `--autotune` saved in an earlier command can serve this run
-   (see [Kernel selection](#kernel-selection---autotune)).
+   commands reuse. With `--autotune`, it runs on the tuned state. Find
+   results thus carry over from graph to graph and from earlier commands.
+   MIOpen's find dominates the first call of a convolution: on one gfx1151
+   host, 7 convolution graphs took 475 s with an empty database and 46 s
+   with the database of an earlier run. In such a warm run, `first_call_ms`
+   and the wall time are not comparable with a cold run; `kernel_med` is,
+   when the find selects the same kernel. Use `--fresh-state` for a cold
+   `--fast` run.
+5. With `--autotune`, rankings that an earlier `--autotune` command saved can
+   serve this run (see [Kernel selection](#kernel-selection---autotune)).
 6. After each graph it frees the plan, the workspace and the input and
    output buffers. The tool builds and allocates these for each graph and
    never reuses them for a later row, so keeping them would only hold VRAM.
@@ -499,16 +510,17 @@ Requirements and limits:
   code 2.
 - The hipDNN runtime only. These options stop the run with exit code 2:
   `--validate`, `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline` and a
-  `--runtime` other than `hipdnn`. `--autotune` and `--benchmark-work-dir`
-  work. With `--autotune`, each problem is searched at most once per work
-  directory: not at all when the tuned state already holds its winner.
+  `--runtime` other than `hipdnn`. `--autotune`, `--fresh-state` and
+  `--benchmark-work-dir` work. With `--autotune`, each problem is searched at
+  most once per work directory: not at all when the tuned state already holds
+  its winner.
 - The timing settings (`--warmup`, `--iters`, the stall gate) and the GPU
   clock samples stay as configured.
 - A crash in one graph ends the run. Only the last periodic result write
   survives (at most every 10 s, after a graph ends), with
   `run.complete = false`. Graphs that finished after that write, or every
   graph of a run that crashes within its first 10 s, are not in the file.
-- The result file does not record `--fast`. A graph's numbers can depend on
+- `run.config.fast` records `--fast`. A graph's numbers can depend on
   the graphs that ran before it in the same run (see
   [methodology.md](methodology.md#fast-mode)). Do not compare a `--fast`
   run with a run without it.
@@ -538,14 +550,25 @@ operation graph build and the workspace allocation are not timed.
    Without this build, those costs would go into the OOTB build time only.
    The untimed plan is never executed, so no provider tuning runs.
 2. The tool times and validates the OOTB plan in the `dnn-benchmark`
-   process, on the empty OOTB state of the command.
-3. Then a child process primes the engine, builds the tuned plan, times it
-   with the same timing settings and saves its outputs. The child runs on
-   the tuned state of the work directory (see
+   process, on the OOTB state of the command.
+3. The tool queues the tuned run of each hipDNN row. After the last graph,
+   one child process runs all queued tuned runs in row order. For each run
+   it creates a new handle, primes the engine, builds the tuned plan, times
+   it with the same timing settings and saves its outputs. The child runs
+   on the tuned state of the work directory (see
    [Work directory](#work-directory---benchmark-work-dir)), so the tuned
    search never reaches an OOTB plan. The tool validates the tuned outputs
-   against the same reference. A failed child sets `oracle_error` and keeps
-   the row.
+   against the same reference. With `--validate`, the references stay in
+   the system temporary directory until the tuned runs end.
+4. The child writes the result of each run to its own files. A failed run
+   sets `oracle_error` and keeps the row; the child continues with the next
+   run. When the child crashes or times out (`--oracle-timeout`), only the
+   unfinished runs get `oracle_error`.
+5. When a tuned run fails the stall gate, the tool measures every row of
+   that graph again without the stall gate, then runs the tuned runs of the
+   graph again.
+6. With `--oracle` on the hipDNN runtime, the tool prints the graph tables
+   after the tuned runs, so each table shows the final rows once.
 
 A tuned build prepares every candidate that the provider can sample, so it is
 usually slower than the OOTB build. Providers that support the knob (today the
@@ -574,12 +597,12 @@ failed `correctness` on either side, rows with `tuning_available: false` and
 `reference` rows from averages. See
 [results-schema.md](results-schema.md#oracle).
 
-Each tuned run is a child process on the kept tuned state, and each OOTB plan
-runs on the empty state of its own command. hipDNN keeps a tuned winner in
-memory only in the child, so a stall-gate fallback or a graph listed twice
-measures the OOTB plan again without the tuned kernel. Tuned runs of later
-commands reuse the rankings and find results of earlier ones; use a new
-`--benchmark-work-dir` for a tuned search from nothing. The tool shows a
+The tuned runs use the kept tuned state, and the OOTB plans use the OOTB
+state of the command. hipDNN keeps a tuned winner in memory only in the
+child, so a stall-gate fallback or a graph listed twice measures the OOTB
+plan again without the tuned kernel. Tuned runs of later commands reuse the
+rankings and find results of earlier ones; use a new `--benchmark-work-dir`
+for a tuned search from nothing. The tool shows a
 warning when `HIPDNN_FORCE_BENCHMARKING` is set in the environment: the
 providers apply that variable before the knob, so it reaches both plans.
 `--autotune` sets that variable, so the tool rejects `--oracle --autotune`.

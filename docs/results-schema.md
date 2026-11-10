@@ -67,7 +67,9 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `benchmark_work_dir` | string | The work directory: `--benchmark-work-dir`, else the default. `--fast`, `--autotune` and `--oracle` tuned runs use its kept tuned state, so they can be warm; see [usage.md](usage.md#work-directory---benchmark-work-dir). |
+| `benchmark_work_dir` | string | The work directory: `--benchmark-work-dir`, else the default. Without `--fresh-state`, runs use its kept selection state (`ootb/`, or `tuned/` for `--autotune`), so they can be warm. `--oracle` tuned runs always use `tuned/`. See [usage.md](usage.md#work-directory---benchmark-work-dir). |
+| `fresh_state` | bool | `--fresh-state`: the command ran on a new, empty selection state, removed at exit. `--oracle` tuned runs still used the kept tuned state. |
+| `fast` | bool | `--fast`. Do not compare the numbers of a `--fast` run with a run without it; see [usage.md](usage.md#fast-mode---fast). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |

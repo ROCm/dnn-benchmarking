@@ -402,12 +402,17 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: ``--benchmark-work-dir``: compile caches, the kept tuned selection state
-    #: and the per-command OOTB state (``common.work_dir``). ``None``: the
-    #: default work dir.
+    #: ``--benchmark-work-dir``: compile caches and the kept OOTB and tuned
+    #: selection states (``common.work_dir``). ``None``: the default work dir.
     benchmark_work_dir: Optional[str] = None
+    #: Run this command on a new, empty selection state in the system
+    #: temporary directory instead of a kept one (``common.work_dir``).
+    fresh_state: bool = False
+    #: Wall-clock limit in seconds of the tuned hipDNN child (every tuned
+    #: hipDNN run of the command) and of each tuned PyTorch child; 0: none.
+    oracle_timeout_s: int = 0
     #: Run every graph through one engine in this process: one hipDNN handle
-    #: with only the plugin under test loaded, primed once, and the tuned
+    #: with only the plugin under test loaded, primed once, on the kept OOTB
     #: selection state of the work dir (``common.work_dir``). Needs one
     #: ``--engine`` and a ``--plugin-path`` that names its plugin library.
     fast: bool = False
@@ -478,6 +483,8 @@ class SuiteConfig:
             benchmark_work_dir=(
                 str(args.benchmark_work_dir) if args.benchmark_work_dir else None
             ),
+            fresh_state=args.fresh_state,
+            oracle_timeout_s=args.oracle_timeout,
             fast=args.fast,
         )
 
@@ -518,6 +525,11 @@ class SuiteConfig:
             raise ValueError(
                 "--oracle and --autotune cannot be combined: --autotune tunes "
                 "the OOTB plan too, so the comparison would measure nothing"
+            )
+        if self.oracle_timeout_s < 0:
+            raise ValueError(
+                f"--oracle-timeout must be >= 0 (0 disables); "
+                f"got {self.oracle_timeout_s}"
             )
         (
             self.pytorch_sdpa_backend,

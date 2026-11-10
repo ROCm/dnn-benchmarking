@@ -48,6 +48,8 @@ RUN_CONFIG_KEYS = (
     "oracle",
     "autotune",
     "benchmark_work_dir",
+    "fresh_state",
+    "fast",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
     "metrics",

@@ -354,12 +354,23 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
-        help="work dir: cache/ (compile caches), tuned/ (hipDNN cache and MIOpen "
-        "user DB of --fast, --autotune and --oracle tuned runs, kept) and "
-        "ootb/temp/ (empty state of every other run, removed after it) "
-        "(default: $DNN_BENCH_WORKSPACE/work, else ~/.cache/dnn-benchmark/work)",
+        help="work dir: cache/ (compile caches), ootb/ (hipDNN cache and MIOpen "
+        "user DB of runs that do not tune, --fast included) and tuned/ (the "
+        "same for --autotune and --oracle tuned runs), all kept (default: "
+        "$DNN_BENCH_WORKSPACE/work, else $XDG_CACHE_HOME/dnn-benchmark/work, "
+        "else <tmp>/dnn-benchmark-<user>/work)",
         config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
+    ),
+    _bool_option(
+        ("--fresh-state",),
+        "fresh_state",
+        "Runtime/Selection",
+        SuiteConfig,
+        "fresh_state",
+        "start this command on a new, empty hipDNN cache and MIOpen user DB in "
+        "the system temp dir, removed at exit (cold first-run numbers); "
+        "--oracle tuned runs still use the tuned state",
     ),
     _bool_option(
         ("--fast",),
@@ -444,8 +455,22 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Comparison",
         SuiteConfig,
         "oracle",
-        "also build and time a global.benchmarking=1 plan per engine, and a "
-        "tuned PyTorch run in a child process (much slower; not with --autotune)",
+        "also time a global.benchmarking=1 plan per hipDNN engine (all in one "
+        "child after the last graph) and a tuned PyTorch run per PyTorch row in "
+        "its own child (much slower; not with --autotune)",
+    ),
+    CliOption(
+        flags=("--oracle-timeout",),
+        dest="oracle_timeout",
+        group="Comparison",
+        parser_type=_at_least(int, 0),
+        default=_default(SuiteConfig, "oracle_timeout_s"),
+        metavar="SECONDS",
+        help="timeout of the tuned hipDNN child (all tuned hipDNN runs of the "
+        "command) and of each tuned PyTorch child; 0 (default) disables",
+        config_key="oracle_timeout",
+        config_kind=ConfigKind.SCALAR,
+        config_type=int,
     ),
     # Output
     CliOption(
@@ -552,7 +577,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_at_least(int, 0),
         default=_default(MetricsConfig, "profiling_timeout_s"),
         metavar="SECONDS",
-        help="timeout per profiler or tuned-PyTorch subprocess; 0 disables",
+        help="timeout per profiler subprocess; 0 disables",
         config_key="profiling_timeout",
         config_kind=ConfigKind.SCALAR,
         config_type=int,

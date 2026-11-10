@@ -326,7 +326,8 @@ and the kernel name to find the engine kernel.
 ## Fast mode
 
 With `--fast`, every graph of the run uses the same hipDNN handle, the same
-loaded plugin and the tuned selection state of the work directory (see
+loaded plugin and the kept OOTB selection state of the work directory (the
+tuned state with `--autotune`; see
 [usage.md](usage.md#fast-mode---fast)). This changes what some numbers of a
 graph include:
 
@@ -349,25 +350,27 @@ The order of the graphs can thus change `build_ms` and `first_call_ms`. Do
 not compare them between a `--fast` run and a run without it, or between the
 first graph of a `--fast` run and the later ones.
 
-## Tuned selection state
+## Kept selection state
 
 MIOpen stores its find results in the user database. A convolution's first
 call runs the find when the database has no record for the problem, and the
 find can take minutes per problem: on one gfx1151 host, 7 convolution graphs
 took 475 s on an empty database and 46 s on the database of an earlier run.
 
-`--fast` and `--autotune` runs, and the tuned runs of `--oracle`, read and
-extend the tuned state of the work directory (`<work>/tuned`, see
-[usage.md](usage.md#work-directory---benchmark-work-dir)). The find results
-and rankings of earlier commands remove that setup work. In such a warm run:
+The work directory keeps two selection states (see
+[usage.md](usage.md#work-directory---benchmark-work-dir)).
+`--autotune` runs and the tuned runs of `--oracle` read and extend
+`<work>/tuned`. Every other run, `--fast` included, reads and extends
+`<work>/ootb`. No tuned run writes to `<work>/ootb`. The find results and
+rankings of earlier commands remove that setup work. In such a warm run:
 
 - `first_call_ms` and the run's wall time are smaller; do not compare them
-  with a run on an empty state. Every other run starts on a new, empty state,
-  so its numbers do not depend on earlier commands.
+  with a run on an empty state.
 - `kernel_med` measures the kernel that the stored result selects. It
   compares with a cold run when both select the same kernel.
 
-Use a new `--benchmark-work-dir` to start a tuned run from an empty state.
+Use `--fresh-state` for cold first-run numbers: the command then runs on a
+new, empty state that the tool removes when the command ends.
 
 ## Parity with other harnesses
 
