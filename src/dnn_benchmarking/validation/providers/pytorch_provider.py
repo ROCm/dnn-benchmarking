@@ -61,28 +61,31 @@ def _element_size(tensor_json: Dict[str, Any], graph_json: Dict[str, Any]) -> in
 
 
 def _sdpa_scratch_bytes(
-    node: Dict[str, Any], tensors: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors: Dict[int, Dict[str, Any]],
+    graph_json: Dict[str, Any],
 ) -> int:
-    """float32 scratch of one SDPA node beyond its graph tensors.
+    """Scratch of one SDPA node beyond its graph tensors.
 
     A forward without sinks calls torch's fused SDPA, which keeps no score
-    matrix on the host, unless ALiBi forces an additive mask (below).
-    Backward and a forward with sinks compute scores by hand, one query
-    block at a time: scores/probabilities, d_scores, one reduction
-    temporary, and (backward only) the ALiBi bias. For the whole node: K and
-    V expanded to the query heads, the backward dK/dV accumulators, the full
-    ``[q_len, kv_len]`` band mask of a windowed or bottom-right node with its
-    boolean temporaries (torch takes bottom-right bounds natively when
-    ``q_len == kv_len`` or ``q_len == 1``), and the float32 mask of a sink
-    node with bounds. A paged node counts the KV length its page table can
-    address. ALiBi forces one float32 ``[heads, q_len, kv_len]`` bias in a
-    forward: the real SDPA call takes one mask tensor, built once and reused
-    for every block a sink or stats-fallback path slices from. A backward
-    builds the bias one query block at a time instead, so it adds to the
-    block total rather than this full-size term.
+    matrix on the host. Backward and a forward with sinks compute scores by
+    hand, one query block at a time: scores/probabilities, d_scores and one
+    reduction temporary. For the whole node: K and V expanded to the query
+    heads, the backward dK/dV accumulators, the full ``[q_len, kv_len]`` band
+    mask of a windowed or bottom-right node with its boolean temporaries
+    (torch takes bottom-right bounds natively when ``q_len == kv_len`` or
+    ``q_len == 1``), and the float32 mask of a sink node with bounds. A paged
+    node counts the KV length its page table can address.
+
+    ALiBi builds its bias one query block at a time: a float64 bias and its
+    float32 copy per block. A backward adds them to its score blocks. A
+    forward keeps one full ``[heads, q_len, kv_len]`` mask (broadcast with
+    ``attn_mask``): float32 with sinks, else in the graph dtype for the SDPA
+    call. Below float32, the stats output is then computed again from the
+    float32 bias, in score blocks.
     """
     from ...execution.pytorch_ops.handlers.sdpa import (
-        _SCORE_BLOCK_BYTES,
+        _block_rows,
         _sdpa_bool,
         _sdpa_derive_mask,
     )
@@ -107,13 +110,29 @@ def _sdpa_scratch_bytes(
         causal, window, bottom_right = False, None, False  # reference declines
 
     row_bytes = rows * kv_len * 4  # one query row of float32 scores
-    block_rows = min(q_len, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
+    block_rows = _block_rows(q_len, row_bytes)
     temporaries = 3 if backward or has_sink else 0
+    alibi_mask = 0
+    if alibi and not backward:
+        mask_rows = _broadcast_rows(
+            heads, _dims(_uid_tensor(inputs, "attn_mask_tensor_uid", tensors))
+        )
+        q_size = _element_size(
+            _uid_tensor(inputs, "q_tensor_uid", tensors) or {}, graph_json
+        )
+        alibi_mask = mask_rows * q_len * kv_len * (4 if has_sink else q_size)
+        # The fill keeps a float64 bias, its float32 copy and the float32 sum
+        # with attn_mask per block: 16 bytes per mask element.
+        fill_row = mask_rows * kv_len * 16
+        alibi_mask += fill_row * _block_rows(q_len, fill_row)
+        has_stats = _uid_tensor(node.get("outputs") or {}, "stats_tensor_uid", tensors)
+        if not has_sink and q_size < 4 and has_stats is not None:
+            temporaries = 3
     block = row_bytes * block_rows * temporaries
-    if alibi and backward:
-        # The per-block ALiBi bias has no batch dimension (it broadcasts
-        # across batch), unlike the batch*heads-sized temporaries above.
-        block += heads * kv_len * block_rows * 4
+    if alibi and temporaries:
+        # The per-block ALiBi bias (float64, then float32) has no batch
+        # dimension: it broadcasts across batch, unlike the score blocks.
+        block += heads * kv_len * block_rows * (8 + 4)
     expanded = rows * kv_len * head_dim * 4 * 2
     if backward:
         expanded *= 2
@@ -122,8 +141,14 @@ def _sdpa_scratch_bytes(
     band = q_len * kv_len * (2 * 4 + 2) if needs_band and not backward else 0
     has_bounds = causal or window is not None or bottom_right
     sink_mask = q_len * kv_len * 4 if has_sink and has_bounds else 0
-    alibi_bias = heads * q_len * kv_len * 4 if alibi and not backward else 0
-    return block + expanded + band + sink_mask + alibi_bias
+    return block + expanded + band + sink_mask + alibi_mask
+
+
+def _broadcast_rows(heads: int, mask_dims: List[int]) -> int:
+    """Leading elements of ``[heads, q, kv]`` broadcast with ``mask_dims``."""
+    lead = list(mask_dims[:-2])
+    shape = [1] * (len(lead) - 1) + [heads] if lead else [heads]
+    return prod(max(a, b) for a, b in zip(shape, lead or [1]))
 
 
 def estimate_reference_host_bytes(
@@ -149,7 +174,7 @@ def estimate_reference_host_bytes(
             total += numel * work
     for node in graph_json.get("nodes", []):
         if str(node.get("type", "")).startswith("Sdpa"):
-            total += _sdpa_scratch_bytes(node, tensors)
+            total += _sdpa_scratch_bytes(node, tensors, graph_json)
     return total
 
 

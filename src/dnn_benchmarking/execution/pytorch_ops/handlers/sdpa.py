@@ -278,19 +278,22 @@ def _diagonal_band_mask(
     bottom_right: bool,
     device: torch.device,
     dtype: torch.dtype,
+    rows: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     """Build the additive diagonal-band mask used by hipDNN SDPA.
 
     Bottom-right alignment shifts the diagonal by ``kv_len - q_len``. A
     ``None`` width leaves the lower edge unbounded, producing a causal mask.
+    ``rows`` limits the mask to query rows ``[start, end)``.
     """
-    q_idx = torch.arange(q_len, device=device).unsqueeze(-1)
+    start, end = (0, q_len) if rows is None else rows
+    q_idx = torch.arange(start, end, device=device).unsqueeze(-1)
     k_idx = torch.arange(kv_len, device=device).unsqueeze(0)
     diagonal = q_idx + (kv_len - q_len if bottom_right else 0)
     keep = k_idx <= diagonal
     if width is not None:
         keep &= k_idx > diagonal - width
-    mask = torch.zeros((q_len, kv_len), device=device, dtype=dtype)
+    mask = torch.zeros((end - start, kv_len), device=device, dtype=dtype)
     return mask.masked_fill(~keep, float("-inf"))
 
 
@@ -334,22 +337,104 @@ def _alibi_bias_block(
     return ((k_idx - q_idx) * slopes.reshape(-1, 1, 1)).to(dtype=torch.float32)
 
 
-def _alibi_bias(
+def _alibi_mask_rows(
+    start: int,
+    end: int,
     q_len: int,
     kv_len: int,
-    num_heads: int,
-    device: torch.device,
+    slopes: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    window: Optional[int],
+) -> torch.Tensor:
+    """float32 additive mask of an ALiBi call for query rows ``[start, end)``.
+
+    The ALiBi bias and the explicit ``attn_mask`` go first, the band second
+    (SEM-006). ``_plan_sdpa_common`` leaves ALiBi only top-left causal or
+    top-left windowed bounds, so the band is always part of the mask.
+    """
+    mask = _alibi_bias_block(start, end, kv_len, slopes, slopes.device)
+    if attn_mask is not None:
+        mask = mask + _rows(attn_mask, start, end).to(dtype=torch.float32)
+    return mask.add_(
+        _diagonal_band_mask(
+            q_len,
+            kv_len,
+            window,
+            bottom_right=False,
+            device=mask.device,
+            dtype=torch.float32,
+            rows=(start, end),
+        )
+    )
+
+
+def _alibi_mask(
+    q_len: int,
+    kv_len: int,
+    slopes: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    window: Optional[int],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """cuDNN's ALiBi bias ``(j - i) * slope(h)``, shaped ``[H, Sq, Skv]``.
+    """The whole additive mask of an ALiBi call (``_alibi_mask_rows``).
 
-    ``i`` is the query position, ``j`` the key position, ``h`` the query
-    head. Broadcasts against scores shaped ``[..., H, Sq, Skv]``. For a call
-    that needs the whole bias at once (the real SDPA call, which takes one
-    mask tensor); a blocked caller uses ``_alibi_bias_block`` instead.
+    Shaped ``[H, Sq, Skv]``, or broadcast with ``attn_mask``. For a call that
+    takes the mask in one tensor: the SDPA kernel, in the graph dtype, or the
+    manual fp32 paths. It is filled one query block at a time, so each value
+    is rounded to ``dtype`` once and no full-size float32 copy exists.
     """
-    slopes = _alibi_slopes(num_heads, device, torch.float64)
-    return _alibi_bias_block(0, q_len, kv_len, slopes, device).to(dtype=dtype)
+    shape: Sequence[int] = (int(slopes.numel()), q_len, kv_len)
+    if attn_mask is not None:
+        shape = torch.broadcast_shapes(shape, attn_mask.shape)
+    mask = torch.empty(shape, device=slopes.device, dtype=dtype)
+    # A block holds the float64 bias, its float32 copy and the float32 sum
+    # with ``attn_mask``: 16 bytes per mask element.
+    row_bytes = torch.Size(shape[:-2]).numel() * kv_len * 16
+    for start, end in _row_blocks(q_len, row_bytes):
+        mask[..., start:end, :] = _alibi_mask_rows(
+            start, end, q_len, kv_len, slopes, attn_mask, window
+        )
+    return mask
+
+
+def _alibi_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rep_k: int,
+    scale: float,
+    attn_mask: Optional[torch.Tensor],
+    window: Optional[int],
+) -> torch.Tensor:
+    """float32 log-sum-exp of an ALiBi forward, from the unrounded bias.
+
+    For the one-shot reference, whose SDPA kernel read the bias rounded to
+    the graph dtype. One query block at a time on every device, with each
+    block's mask built on the fly (``_alibi_mask_rows``), so no full-size
+    score or mask tensor exists.
+    """
+    q_len, kv_len = int(q.shape[-2]), int(k.shape[-2])
+    slopes = _alibi_slopes(int(q.shape[-3]), q.device, torch.float64)
+    q_float = q.to(dtype=torch.float32)
+    k_float_t = _fp32_at_query_heads(k, rep_k).transpose(-2, -1)
+    row_bytes = q.shape[:-2].numel() * kv_len * 4
+    return torch.cat(
+        [
+            torch.logsumexp(
+                _scores(
+                    q_float[..., start:end, :],
+                    k_float_t,
+                    _alibi_mask_rows(
+                        start, end, q_len, kv_len, slopes, attn_mask, window
+                    ),
+                    scale,
+                ),
+                -1,
+                keepdim=True,
+            )
+            for start, end in _row_blocks(q_len, row_bytes)
+        ],
+        dim=-2,
+    )
 
 
 def _attention_bounds(
@@ -360,16 +445,12 @@ def _attention_bounds(
     extra_bias: Optional[torch.Tensor],
     is_causal: bool,
     like: torch.Tensor,
-    owns_bias: bool = False,
 ) -> Tuple[Optional[torch.Tensor], bool]:
     """The ``(attn_mask, is_causal)`` pair that expresses a call's bounds.
 
-    ``extra_bias`` is the additive bias already summed by the caller (the
-    explicit ``attn_mask`` and the ALiBi bias). The bias goes onto the scores
-    first and the band second (SEM-006), so the band is added to the bias.
-    ``owns_bias`` marks ``extra_bias`` as a tensor the caller built fresh (an
-    ALiBi bias, never a graph input); only then is adding the band in place
-    safe, since a replayed ``attn_mask`` input must come back unmodified.
+    ``extra_bias`` is the explicit ``attn_mask``. The bias goes onto the
+    scores first and the band second (SEM-006), so the band is added to the
+    bias. ALiBi calls build their mask with ``_alibi_mask`` instead.
 
     torch's SDPA spells only top-left causal natively (``is_causal``). A window
     or a bottom-right alignment needs an additive band mask, unless the bounds
@@ -396,11 +477,7 @@ def _attention_bounds(
         device=like.device,
         dtype=like.dtype,
     )
-    if extra_bias is None:
-        return band, False
-    if owns_bias:
-        return extra_bias.add_(band), False
-    return band + extra_bias, False
+    return (band if extra_bias is None else band + extra_bias), False
 
 
 def _sink_logits(sink: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
@@ -650,21 +727,31 @@ def _fp32_at_query_heads(t: torch.Tensor, rep: int) -> torch.Tensor:
 _SCORE_BLOCK_BYTES = 2 << 30
 
 
+def _block_rows(q_len: int, row_bytes: int) -> int:
+    """Query rows per block when one row takes ``row_bytes``."""
+    return min(max(q_len, 1), max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
+
+
+def _row_blocks(q_len: int, row_bytes: int) -> Sequence[Tuple[int, int]]:
+    """``(start, end)`` query row ranges of at most ``_SCORE_BLOCK_BYTES``
+    each; one empty range when ``q_len`` is 0."""
+    step = _block_rows(q_len, row_bytes)
+    return [
+        (start, min(start + step, q_len)) for start in range(0, max(q_len, 1), step)
+    ]
+
+
 def _query_blocks(q: torch.Tensor, kv_len: int) -> Sequence[Tuple[int, int]]:
-    """``(start, end)`` query row ranges; one empty range when ``q_len`` is 0.
+    """``(start, end)`` query row ranges of the score matrix (``_row_blocks``).
 
     Only host tensors are split. On a GPU the timed PyTorch row and the GPU
     reference keep one block: smaller launches would slow the timed row, and
     a GPU out-of-memory error already falls back to the CPU reference.
     """
     q_len = int(q.shape[-2])
-    step = max(q_len, 1)
-    if q.device.type == "cpu":
-        row_bytes = q.shape[:-2].numel() * kv_len * 4  # one query row of scores
-        step = min(step, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
-    return [
-        (start, min(start + step, q_len)) for start in range(0, max(q_len, 1), step)
-    ]
+    if q.device.type != "cpu":
+        return [(0, q_len)]
+    return _row_blocks(q_len, q.shape[:-2].numel() * kv_len * 4)
 
 
 def _rows(
@@ -851,7 +938,9 @@ def compile_sdpa(
     The ``stats`` output (log-sum-exp) comes from the fused kernel, as in a
     training forward: Q/K/V go in with ``requires_grad`` and the kernel's saved
     log-sum-exp is read back (``fused_logsumexp``). Only a backend that saves
-    none (math) gets a separate score matmul.
+    none (math) gets a separate score matmul. The kernel reads an ALiBi bias
+    rounded to a bf16 or fp16 graph dtype, so the one-shot reference of such
+    a graph computes the log-sum-exp from the float32 bias (``_alibi_stats``).
 
     PyTorch's SDPA has no attention-sink input, so a graph with sinks runs a
     manual fp32 attention (``_sink_attention``); its fp32 operands are built
@@ -937,29 +1026,34 @@ def compile_sdpa(
             sink = _sink_logits(_tensor(tensors, plan.sink_uid, node), q)
         return attn_mask, scale, rep_k, rep_v, sink
 
-    def bounds(q, k, attn_mask):
-        bias = attn_mask
-        owns_bias = False
+    def bounds(q, k, attn_mask, alibi_dtype):
+        """``(attn_mask, is_causal)`` of the call; an ALiBi mask in ``alibi_dtype``."""
         if plan.alibi:
-            alibi = _alibi_bias(
-                int(q.shape[-2]),
-                int(k.shape[-2]),
-                int(q.shape[-3]),
-                q.device,
-                torch.float32,
+            slopes = _alibi_slopes(int(q.shape[-3]), q.device, torch.float64)
+            return (
+                _alibi_mask(
+                    int(q.shape[-2]),
+                    int(k.shape[-2]),
+                    slopes,
+                    attn_mask,
+                    plan.window,
+                    alibi_dtype,
+                ),
+                False,
             )
-            bias = alibi if bias is None else bias + alibi
-            owns_bias = True
         return _attention_bounds(
             int(q.shape[-2]),
             int(k.shape[-2]),
             plan.window,
             plan.bottom_right,
-            bias,
+            attn_mask,
             is_causal,
             q,
-            owns_bias=owns_bias,
         )
+
+    def rounds_alibi(d: _DenseSdpa) -> bool:
+        """Whether the call mask holds the ALiBi bias rounded below float32."""
+        return plan.alibi and torch.finfo(d.attn_mask.dtype).bits < 32
 
     def prepare_sink(
         tensors: Dict[int, torch.Tensor],
@@ -968,7 +1062,7 @@ def compile_sdpa(
         v: torch.Tensor,
     ) -> _SinkSdpa:
         attn_mask, scale, rep_k, rep_v, sink = resolve(tensors, q, k, v)
-        attn_mask, causal = bounds(q, k, attn_mask)
+        attn_mask, causal = bounds(q, k, attn_mask, torch.float32)
         k_t, mask = _score_operands(k, attn_mask, causal, int(q.shape[-2]), rep_k)
         return _SinkSdpa(
             scale,
@@ -986,7 +1080,9 @@ def compile_sdpa(
         v: torch.Tensor,
     ) -> _DenseSdpa:
         attn_mask, scale, rep_k, rep_v, _ = resolve(tensors, q, k, v)
-        attn_mask, causal = bounds(q, k, attn_mask)
+        # The kernel reads the ALiBi bias in the graph dtype. It is rounded
+        # here, once, and never in a timed iteration.
+        attn_mask, causal = bounds(q, k, attn_mask, q.dtype)
         k_op, v_op, enable_gqa = _sdpa_kv_operands(k, v, rep_k, rep_v)
         q_op = q
         if stats_uid is not None:
@@ -1050,10 +1146,18 @@ def compile_sdpa(
             and strict_sdpa_selection() is not PyTorchSdpaBackendName.MATH
         ):
             tensors.note(_STATS_FALLBACK_WARNING)
+        attn_mask = d.attn_mask
+        if rounds_alibi(d):
+            attn_mask = bounds(q, k, mask_input(tensors), torch.float32)[0]
         return (
             q.to(dtype=torch.float32),
-            *_score_operands(k, d.attn_mask, d.is_causal, int(q.shape[-2]), d.rep_k),
+            *_score_operands(k, attn_mask, d.is_causal, int(q.shape[-2]), d.rep_k),
         )
+
+    def mask_input(tensors: Dict[int, torch.Tensor]) -> Optional[torch.Tensor]:
+        if plan.mask_uid is None:
+            return None
+        return _tensor(tensors, plan.mask_uid, node)
 
     # Everything derived from the constant inputs is built once per replay
     # map, during priming. Timed iterations run only the SDPA call(s) and, for
@@ -1107,15 +1211,12 @@ def compile_sdpa(
             return
 
         d = setup(tensors, "dense", lambda: prepare_dense(tensors, q, k, v))
-        call_mask = d.attn_mask
-        if call_mask is not None and call_mask.dtype != d.q.dtype:
-            call_mask = call_mask.to(dtype=d.q.dtype)
         with torch.enable_grad():
             o = execute_selected_sdpa(
                 d.q,
                 d.k,
                 d.v,
-                attn_mask=call_mask,
+                attn_mask=d.attn_mask,
                 dropout_p=dropout_p,
                 is_causal=d.is_causal,
                 scale=d.scale,
@@ -1125,8 +1226,18 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, o)
             return
 
-        stats = fused_logsumexp(o, int(q.shape[-2]))
         _store_tensor(tensors, o_uid, o.detach())
+        if rounds_alibi(d) and not isinstance(tensors, ReplayTensors):
+            # The one-shot reference. The kernel's log-sum-exp saw the bias
+            # rounded to the graph dtype, so take it from the float32 bias.
+            # A timed row keeps the kernel's own, as a training step would.
+            _store_tensor(
+                tensors,
+                stats_uid,
+                _alibi_stats(q, k, d.rep_k, d.scale, mask_input(tensors), plan.window),
+            )
+            return
+        stats = fused_logsumexp(o, int(q.shape[-2]))
         if stats is None:
             stats = _sdpa_stats(
                 *setup(tensors, "stats", lambda: stats_operands(tensors, q, k, d)),

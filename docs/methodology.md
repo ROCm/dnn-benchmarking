@@ -151,7 +151,9 @@ includes a workaround, and the row gets a reference warning:
   so the two differ in where that cost falls. The slopes follow the cuDNN
   schedule and use the query head, so GQA and MQA graphs use the query head
   count. The timed kernel reads the bias as part of one additive mask
-  tensor.
+  tensor in the graph data type, so fp16 and bf16 round the bias. The
+  timed row keeps the log-sum-exp (`stats`) of the kernel, as a training
+  step does. The reference computes `stats` again from the float32 bias.
 - Explicit `attn_mask` bias with a causal mask, a sliding window or
   bottom-right alignment: the tool adds the bias first and applies the band
   second. The kernel reads the sum as one additive mask tensor.

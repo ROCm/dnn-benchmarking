@@ -1958,13 +1958,69 @@ class TestPyTorchProviderNewOps:
                 outputs[uid].data, grad.numpy(), rtol=1e-4, atol=1e-5
             )
 
-    def test_sdpa_alibi_bf16_stats_keep_fp32_precision_with_nonpow2_heads(
-        self,
+    @pytest.mark.parametrize("dtype", ["float", "bfloat16"])
+    def test_sdpa_alibi_forward_correct_across_block_boundaries(
+        self, dtype: str, monkeypatch
     ) -> None:
-        """The ALiBi bias must stay float32 until the SDPA call itself: a low
-        graph precision rounding it first lost log-sum-exp precision, worst
-        with a non-power-of-two head count (H12), where the cuDNN slopes are
-        not exact in bf16."""
+        """The forward builds its ALiBi mask (float32 or bf16 kernel input)
+        and, below float32, the reference stats one query block at a time.
+        A block's bias, ``attn_mask`` rows or window rows at a wrong offset
+        show only once a graph needs more than one block."""
+        import dnn_benchmarking.execution.pytorch_ops.handlers.sdpa as sdpa_mod
+
+        monkeypatch.setattr(sdpa_mod, "_SCORE_BLOCK_BYTES", 512)
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        torch.manual_seed(31)
+        heads, seq, dim, left_bound = 3, 9, 4, 3
+        q = torch.randn(1, heads, seq, dim)
+        k = torch.randn(1, heads, seq, dim)
+        v = torch.randn(1, heads, seq, dim)
+        extra = torch.randn(1, 1, seq, seq)
+        graph_json = self._sdpa_graph(
+            [1, heads, seq, dim],
+            [1, heads, seq, dim],
+            {"left_bound": left_bound, "right_bound": 0, "alibi_mask": True},
+            mask_dims=[1, 1, seq, seq],
+            stats=True,
+        )
+        for tensor in graph_json["tensors"]:
+            if tensor["uid"] in (1, 2, 3, 4):
+                tensor["data_type"] = dtype
+
+        outputs = provider.compute_reference(
+            graph_json, {1: q.numpy(), 2: k.numpy(), 3: v.numpy(), 5: extra.numpy()}
+        )
+
+        torch_dtype = torch.float32 if dtype == "float" else torch.bfloat16
+        q, k, v = (t.to(torch_dtype).float() for t in (q, k, v))
+        # Only the block offsets are under test, not the window width.
+        width = sdpa_mod._sdpa_derive_mask(graph_json["nodes"][0])[1]
+        band = sdpa_mod._diagonal_band_mask(
+            seq, seq, width, bottom_right=False, device="cpu", dtype=torch.float32
+        )
+        mask = self._alibi_bias(heads, seq, seq) + extra + band
+        scores = torch.matmul(q, k.transpose(-2, -1)) * 0.5 + mask
+        expected_lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+        expected_o = torch.matmul(torch.softmax(scores, dim=-1), v)
+        o_tol = 1e-5 if dtype == "float" else 3e-2
+
+        np.testing.assert_allclose(outputs[6].data, expected_lse.numpy(), atol=1e-4)
+        np.testing.assert_allclose(
+            outputs[4].data, expected_o.numpy(), rtol=o_tol, atol=o_tol
+        )
+
+    @pytest.mark.parametrize("fused", [False, True], ids=["cpu-kernel", "saved-lse"])
+    def test_sdpa_alibi_bf16_stats_keep_fp32_precision_with_nonpow2_heads(
+        self, fused: bool, monkeypatch
+    ) -> None:
+        """The SDPA kernel reads the ALiBi bias rounded to bf16, which loses
+        log-sum-exp precision, worst with a non-power-of-two head count (H12),
+        where the cuDNN slopes are not exact in bf16. The reference stats must
+        come from the float32 bias, also when the kernel saves its own
+        log-sum-exp (``fused``: a GPU Flash or efficient kernel, simulated
+        with the log-sum-exp of the rounded bias)."""
+        import dnn_benchmarking.execution.pytorch_ops.handlers.sdpa as sdpa_mod
+
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         torch.manual_seed(23)
         heads, seq, dim = 12, 256, 8
@@ -2002,6 +2058,19 @@ class TestPyTorchProviderNewOps:
             ],
         }
 
+        bias = self._alibi_bias(heads, seq, seq)
+        band = self._causal_additive(seq, seq)
+        bf16_scores = torch.matmul(q_bf.float(), k_bf.float().transpose(-2, -1)) * 0.5
+        exact_lse = torch.logsumexp(bf16_scores + bias + band, dim=-1, keepdim=True)
+        rounded_bias = bias.to(torch.bfloat16).float()
+        rounded_lse = torch.logsumexp(
+            bf16_scores + rounded_bias + band, dim=-1, keepdim=True
+        )
+        if fused:
+            monkeypatch.setattr(
+                sdpa_mod, "fused_logsumexp", lambda o, q_len: rounded_lse
+            )
+
         outputs = provider.compute_reference(
             graph_json,
             {
@@ -2011,14 +2080,6 @@ class TestPyTorchProviderNewOps:
             },
         )
 
-        bias = self._alibi_bias(heads, seq, seq)
-        band = self._causal_additive(seq, seq)
-        bf16_scores = torch.matmul(q_bf.float(), k_bf.float().transpose(-2, -1)) * 0.5
-        exact_lse = torch.logsumexp(bf16_scores + bias + band, dim=-1, keepdim=True)
-        rounded_bias = bias.to(torch.bfloat16).float()
-        rounded_lse = torch.logsumexp(
-            bf16_scores + rounded_bias + band, dim=-1, keepdim=True
-        )
         # The pre-fix rounding error at H12 bf16 was about 3e-3; a correct
         # fp32 bias must land well under that bound, at the exact value.
         worst_if_rounded = (rounded_lse - exact_lse).abs().max().item()
@@ -2168,9 +2229,8 @@ class TestHostMemoryEstimate:
 
     def test_alibi_forward_counts_the_full_bias_tensor(self) -> None:
         """A plain ALiBi forward (no sink) still calls the real fused SDPA
-        kernel once, but that call now takes one [heads, q_len, kv_len]
-        float32 bias tensor; before this fix the estimate did not change
-        with alibi_mask."""
+        kernel once, but that call takes one [heads, q_len, kv_len] mask
+        tensor in the graph dtype (float32 here)."""
         from dnn_benchmarking.validation.providers.pytorch_provider import (
             estimate_reference_host_bytes as estimate,
         )
@@ -2181,10 +2241,35 @@ class TestHostMemoryEstimate:
         with_alibi = estimate(self._sdpa(dims, dims, {**causal, "alibi_mask": True}))
         assert with_alibi - plain >= 2 * 1024 * 1024 * 4
 
+    def test_alibi_bf16_forward_counts_the_stats_score_blocks(self) -> None:
+        """Below float32 the kernel reads a rounded bias, so the reference
+        computes the stats output again from score blocks. The same graph
+        without stats holds no score block."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        def graph(stats: bool) -> dict:
+            dims = [1, 2, 1024, 16]
+            graph_json = self._sdpa(
+                dims, dims, {"causal_mask": True, "alibi_mask": True}
+            )
+            for tensor in graph_json["tensors"]:
+                tensor["data_type"] = "bfloat16"
+            if stats:
+                graph_json["tensors"].append(
+                    {"uid": 9, "dims": [1, 2, 1024, 1], "data_type": "float"}
+                )
+                graph_json["nodes"][0]["outputs"]["stats_tensor_uid"] = 9
+            return graph_json
+
+        # Three score blocks of 2 rows * 1024 * 1024 * 4 B.
+        assert estimate(graph(True)) - estimate(graph(False)) >= 3 * 2 * 1024 * 1024 * 4
+
     def test_alibi_backward_adds_one_block_temporary_not_the_full_bias(self) -> None:
         """Backward recomputes the ALiBi bias one query block at a time
-        inside ``_block_scores``, so it must add only one more block-sized
-        temporary to the existing three, never a full
+        inside ``_block_scores``, so it must add only the block's float64 and
+        float32 bias to the existing three temporaries, never a full
         ``[heads, q_len, kv_len]`` tensor (32 GiB at these dims)."""
         from dnn_benchmarking.validation.providers.pytorch_provider import (
             estimate_reference_host_bytes as estimate,

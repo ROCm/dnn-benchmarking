@@ -2932,6 +2932,18 @@ class TestSdpaTimedRegion:
         assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
         assert bool(set(primed) - _SDPA_TIMED_OPS) == priming_builds_setup
 
+    def test_alibi_timed_run_has_no_setup(self) -> None:
+        """The kernel reads the ALiBi bias in the graph dtype. The bias is
+        built and rounded once, so a bf16 timed run neither builds nor casts
+        it."""
+        primed, timed, _ = _replay_sdpa(
+            self._graph(causal_mask=True, alibi_mask=True),
+            self._tensors(8, 8, torch.bfloat16),
+        )
+
+        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        assert set(primed) - _SDPA_TIMED_OPS
+
     @pytest.mark.parametrize(
         ("selection", "expected_call"),
         [
