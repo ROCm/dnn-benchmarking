@@ -109,9 +109,11 @@ def _sdpa_scratch_bytes(
     row_bytes = rows * kv_len * 4  # one query row of float32 scores
     block_rows = min(q_len, max(1, _SCORE_BLOCK_BYTES // max(row_bytes, 1)))
     temporaries = 3 if backward or has_sink else 0
-    if alibi and backward:
-        temporaries += 1
     block = row_bytes * block_rows * temporaries
+    if alibi and backward:
+        # The per-block ALiBi bias has no batch dimension (it broadcasts
+        # across batch), unlike the batch*heads-sized temporaries above.
+        block += heads * kv_len * block_rows * 4
     expanded = rows * kv_len * head_dim * 4 * 2
     if backward:
         expanded *= 2

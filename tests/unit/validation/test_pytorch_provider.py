@@ -2227,6 +2227,61 @@ class TestHostMemoryEstimate:
         assert 0 < with_alibi - plain < full_bias
         assert with_alibi - plain <= 3 * (1 << 31)  # bounded by the block cap
 
+    def test_alibi_backward_scratch_has_no_batch_dimension(self) -> None:
+        """The per-block ALiBi bias broadcasts across batch
+        (``_alibi_bias_block`` builds no batch dimension), unlike the
+        batch*heads-sized score temporaries it is added to. The ALiBi
+        contribution to the estimate must not scale with batch, even though
+        the surrounding block and expanded terms do."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        def backward_graph(batch, attributes):
+            dims = [batch, 2, 1024, 16]
+            tensors = [
+                {"uid": uid, "dims": dims, "data_type": "float"}
+                for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+            ]
+            tensors.append(
+                {"uid": 6, "dims": [batch, 2, 1024, 1], "data_type": "float"}
+            )
+            return {
+                "tensors": tensors,
+                "nodes": [
+                    {
+                        "type": "SdpaBackwardAttributes",
+                        "inputs": {
+                            "q_tensor_uid": 1,
+                            "k_tensor_uid": 2,
+                            "v_tensor_uid": 3,
+                            "o_tensor_uid": 4,
+                            "do_tensor_uid": 5,
+                            "stats_tensor_uid": 6,
+                        },
+                        "outputs": {
+                            "dq_tensor_uid": 7,
+                            "dk_tensor_uid": 8,
+                            "dv_tensor_uid": 9,
+                        },
+                        "attributes": attributes,
+                    }
+                ],
+            }
+
+        causal = {"causal_mask": True}
+        alibi = {**causal, "alibi_mask": True}
+        plain_b1 = estimate(backward_graph(1, causal))
+        plain_b4 = estimate(backward_graph(4, causal))
+        delta_b1 = estimate(backward_graph(1, alibi)) - plain_b1
+        delta_b4 = estimate(backward_graph(4, alibi)) - plain_b4
+
+        assert delta_b1 == delta_b4
+        # Sanity: batch does scale the surrounding per-block temporaries, so
+        # this is not two deltas of zero agreeing by coincidence.
+        assert delta_b1 > 0
+        assert plain_b4 > plain_b1
+
 
 class TestFloat64Reference:
     """The float64 reference of convolution graphs."""
