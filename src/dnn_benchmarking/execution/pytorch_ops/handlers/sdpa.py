@@ -173,19 +173,20 @@ def _plan_sdpa_common(
     is_causal, window, bottom_right = _sdpa_derive_mask(node)
     alibi = _sdpa_bool(node, "alibi_mask")
     if alibi:
-        # The cuDNN ALiBi form is defined for top-left causal masking only.
+        # hipDNN's reference (isSupportedSdpaAlibi) requires top-left
+        # alignment with right_bound == 0, and allows any left_bound; cuDNN
+        # itself requires only right_bound == 0. Bottom-right alignment and
+        # an unbounded non-causal call are declined; a top-left window is not.
         if bottom_right:
             raise ValueError(
                 "SDPA ALiBi does not support bottom-right causal alignment; "
-                "cuDNN's ALiBi form requires top-left causal masking"
+                "hipDNN's ALiBi form requires top-left alignment"
             )
-        if window is not None:
+        if not is_causal and window is None:
             raise ValueError(
-                "SDPA ALiBi does not support a sliding window; "
-                "cuDNN's ALiBi form requires top-left causal masking"
+                "SDPA ALiBi requires top-left causal masking or a top-left "
+                "sliding window"
             )
-        if not is_causal:
-            raise ValueError("SDPA ALiBi requires top-left causal masking")
 
     scale_uid = _optional_uid(node, "scale_tensor_uid")
     attn_scale_value = _node_param(node, "attn_scale_value", None)
@@ -312,6 +313,27 @@ def _alibi_slopes(
     return torch.pow(2.0, exponents).to(dtype=dtype)
 
 
+def _alibi_bias_block(
+    start: int,
+    end: int,
+    kv_len: int,
+    slopes: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """fp32 ALiBi bias ``(j - i) * slope(h)`` for query rows ``[start, end)``.
+
+    ``slopes`` is cuDNN's per-query-head schedule (``_alibi_slopes``), in
+    float64. Shaped ``[H, end - start, kv_len]``, broadcasting against scores
+    shaped ``[..., H, end - start, kv_len]``. Generated one query block at a
+    time so a blocked caller (``_block_scores``) never holds the full
+    ``[H, q_len, kv_len]`` bias; stays in float32 past this point so a low
+    graph precision never rounds the bias before it reaches the scores.
+    """
+    q_idx = torch.arange(start, end, device=device, dtype=torch.float64).unsqueeze(-1)
+    k_idx = torch.arange(kv_len, device=device, dtype=torch.float64).unsqueeze(0)
+    return ((k_idx - q_idx) * slopes.reshape(-1, 1, 1)).to(dtype=torch.float32)
+
+
 def _alibi_bias(
     q_len: int,
     kv_len: int,
@@ -322,12 +344,12 @@ def _alibi_bias(
     """cuDNN's ALiBi bias ``(j - i) * slope(h)``, shaped ``[H, Sq, Skv]``.
 
     ``i`` is the query position, ``j`` the key position, ``h`` the query
-    head. Broadcasts against scores shaped ``[..., H, Sq, Skv]``.
+    head. Broadcasts against scores shaped ``[..., H, Sq, Skv]``. For a call
+    that needs the whole bias at once (the real SDPA call, which takes one
+    mask tensor); a blocked caller uses ``_alibi_bias_block`` instead.
     """
     slopes = _alibi_slopes(num_heads, device, torch.float64)
-    q_idx = torch.arange(q_len, device=device, dtype=torch.float64).unsqueeze(-1)
-    k_idx = torch.arange(kv_len, device=device, dtype=torch.float64).unsqueeze(0)
-    return ((k_idx - q_idx) * slopes.reshape(-1, 1, 1)).to(dtype=dtype)
+    return _alibi_bias_block(0, q_len, kv_len, slopes, device).to(dtype=dtype)
 
 
 def _attention_bounds(
@@ -338,12 +360,16 @@ def _attention_bounds(
     extra_bias: Optional[torch.Tensor],
     is_causal: bool,
     like: torch.Tensor,
+    owns_bias: bool = False,
 ) -> Tuple[Optional[torch.Tensor], bool]:
     """The ``(attn_mask, is_causal)`` pair that expresses a call's bounds.
 
     ``extra_bias`` is the additive bias already summed by the caller (the
     explicit ``attn_mask`` and the ALiBi bias). The bias goes onto the scores
     first and the band second (SEM-006), so the band is added to the bias.
+    ``owns_bias`` marks ``extra_bias`` as a tensor the caller built fresh (an
+    ALiBi bias, never a graph input); only then is adding the band in place
+    safe, since a replayed ``attn_mask`` input must come back unmodified.
 
     torch's SDPA spells only top-left causal natively (``is_causal``). A window
     or a bottom-right alignment needs an additive band mask, unless the bounds
@@ -370,7 +396,11 @@ def _attention_bounds(
         device=like.device,
         dtype=like.dtype,
     )
-    return (band if extra_bias is None else band + extra_bias), False
+    if extra_bias is None:
+        return band, False
+    if owns_bias:
+        return extra_bias.add_(band), False
+    return band + extra_bias, False
 
 
 def _sink_logits(sink: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
@@ -653,16 +683,27 @@ def _block_scores(
     is_causal: bool,
     start: int,
     scale: float,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """float32 scores of query rows ``start:start+len`` against every key.
 
     The causal mask uses absolute query indices, so key ``j`` is visible to
-    query ``i`` only when ``j <= i`` (top-left alignment).
+    query ``i`` only when ``j <= i`` (top-left alignment). ``alibi_slopes``,
+    when given, adds this block's ALiBi bias only (``_alibi_bias_block``), so
+    memory never grows with ``q_len * kv_len``.
     """
     scores = torch.matmul(q_block.to(dtype=torch.float32), k_f.transpose(-2, -1))
     scores *= scale
     if mask_block is not None:
         scores += mask_block.to(dtype=torch.float32)
+    if alibi_slopes is not None:
+        scores += _alibi_bias_block(
+            start,
+            start + int(scores.shape[-2]),
+            int(scores.shape[-1]),
+            alibi_slopes,
+            scores.device,
+        )
     if is_causal:
         rows = torch.arange(
             start, start + int(scores.shape[-2]), device=scores.device
@@ -898,15 +939,17 @@ def compile_sdpa(
 
     def bounds(q, k, attn_mask):
         bias = attn_mask
+        owns_bias = False
         if plan.alibi:
             alibi = _alibi_bias(
                 int(q.shape[-2]),
                 int(k.shape[-2]),
                 int(q.shape[-3]),
                 q.device,
-                q.dtype,
+                torch.float32,
             )
             bias = alibi if bias is None else bias + alibi
+            owns_bias = True
         return _attention_bounds(
             int(q.shape[-2]),
             int(k.shape[-2]),
@@ -915,6 +958,7 @@ def compile_sdpa(
             bias,
             is_causal,
             q,
+            owns_bias=owns_bias,
         )
 
     def prepare_sink(
@@ -1063,12 +1107,15 @@ def compile_sdpa(
             return
 
         d = setup(tensors, "dense", lambda: prepare_dense(tensors, q, k, v))
+        call_mask = d.attn_mask
+        if call_mask is not None and call_mask.dtype != d.q.dtype:
+            call_mask = call_mask.to(dtype=d.q.dtype)
         with torch.enable_grad():
             o = execute_selected_sdpa(
                 d.q,
                 d.k,
                 d.v,
-                attn_mask=d.attn_mask,
+                attn_mask=call_mask,
                 dropout_p=dropout_p,
                 is_causal=d.is_causal,
                 scale=d.scale,
@@ -1145,15 +1192,11 @@ def compile_sdpa_backward(
             plan.scale_uid,
             plan.attn_scale_value,
         )
-        if plan.alibi:
-            alibi = _alibi_bias(
-                int(q.shape[-2]),
-                int(k.shape[-2]),
-                int(q.shape[1]),
-                q.device,
-                torch.float32,
-            )
-            attn_mask = alibi if attn_mask is None else attn_mask + alibi
+        alibi_slopes = (
+            _alibi_slopes(int(q.shape[1]), q.device, torch.float64)
+            if plan.alibi
+            else None
+        )
 
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
@@ -1174,9 +1217,10 @@ def compile_sdpa_backward(
         if rep_v > 1:
             v_f = v_f.repeat_interleave(rep_v, dim=1)
 
-        # One query block at a time: a block's probs and d_scores are at most
-        # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
-        # dQ rows are independent; dK and dV sum over every query row.
+        # One query block at a time: a block's probs, d_scores and ALiBi bias
+        # are at most _SCORE_BLOCK_BYTES each, so memory does not grow with
+        # q_len * kv_len. dQ rows are independent; dK and dV sum over every
+        # query row.
         dq = torch.empty_like(q_f)
         dk_full = torch.zeros_like(k_f)
         dv_full = torch.zeros_like(v_f)
@@ -1190,6 +1234,7 @@ def compile_sdpa_backward(
                 is_causal,
                 start,
                 scale_value,
+                alibi_slopes,
             )
             probs = scores.sub_(_rows(stats_f, start, end)).exp_()
             row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)

@@ -1510,10 +1510,6 @@ class TestPyTorchProviderNewOps:
                 {"alibi_mask": True, "causal_mask_bottom_right": True},
                 "bottom-right causal alignment",
             ),
-            (
-                {"alibi_mask": True, "left_bound": 3, "right_bound": 0},
-                "sliding window",
-            ),
             ({"padding_mask": True}, "padding masks"),
             ({"right_bound": 1}, "forward-looking band"),
             ({"left_bound": -5}, "neither unbounded nor a width"),
@@ -1700,6 +1696,46 @@ class TestPyTorchProviderNewOps:
         )
         assert not np.allclose(alibi_out, plain.numpy(), rtol=1e-3)
 
+    def test_sdpa_alibi_with_top_left_sliding_window_matches_explicit_bias(
+        self,
+    ) -> None:
+        """hipDNN's ALiBi support (isSupportedSdpaAlibi) allows any
+        left_bound with right_bound == 0, wider than cuDNN's right_bound-only
+        requirement; a top-left window is valid for both, and ALiBi-flagged
+        and explicit-bias-plus-window graphs must agree, the same way the
+        causal case above does."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        torch.manual_seed(17)
+        heads, seq = 3, 6
+        q = torch.randn(1, heads, seq, 4)
+        k = torch.randn(1, heads, seq, 4)
+        v = torch.randn(1, heads, seq, 4)
+        q_dims = kv_dims = [1, heads, seq, 4]
+        window_attrs = {"left_bound": 2, "right_bound": 0}
+        alibi_graph = self._sdpa_graph(
+            q_dims, kv_dims, {**window_attrs, "alibi_mask": True}
+        )
+        bias_graph = self._sdpa_graph(
+            q_dims, kv_dims, window_attrs, mask_dims=[1, heads, seq, seq]
+        )
+        bias = self._alibi_bias(heads, seq, seq)
+        inputs = {1: q.numpy(), 2: k.numpy(), 3: v.numpy()}
+
+        alibi_out = provider.compute_reference(alibi_graph, inputs)[4].data
+        bias_out = provider.compute_reference(bias_graph, {**inputs, 5: bias.numpy()})[
+            4
+        ].data
+
+        np.testing.assert_allclose(alibi_out, bias_out, rtol=1e-5, atol=1e-6)
+        # Without the window every key is visible, so the output must differ.
+        unwindowed = provider.compute_reference(
+            self._sdpa_graph(
+                q_dims, kv_dims, {"causal_mask": True, "alibi_mask": True}
+            ),
+            inputs,
+        )[4].data
+        assert not np.allclose(alibi_out, unwindowed, rtol=1e-3)
+
     def test_sdpa_alibi_slope_follows_the_query_head_not_the_kv_head(self) -> None:
         """Two query heads share one KV head and read identical K/V and Q, so
         only the per-query-head slope can make their outputs differ."""
@@ -1848,6 +1884,149 @@ class TestPyTorchProviderNewOps:
                 outputs[uid].data, grad.numpy(), rtol=1e-4, atol=1e-5
             )
 
+    def test_sdpa_alibi_backward_correct_across_block_boundaries(
+        self, monkeypatch
+    ) -> None:
+        """``_block_scores`` now builds the ALiBi bias from each block's own
+        start offset instead of slicing a precomputed full-size tensor; a
+        wrong offset would only show once a graph needs more than one
+        block."""
+        import dnn_benchmarking.execution.pytorch_ops.handlers.sdpa as sdpa_mod
+
+        monkeypatch.setattr(sdpa_mod, "_SCORE_BLOCK_BYTES", 256)
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        torch.manual_seed(29)
+        heads, seq, dim = 2, 9, 4
+        q = torch.randn(1, heads, seq, dim, requires_grad=True)
+        k = torch.randn(1, heads, seq, dim, requires_grad=True)
+        v = torch.randn(1, heads, seq, dim, requires_grad=True)
+        do = torch.randn(1, heads, seq, dim)
+        bias = self._alibi_bias(heads, seq, seq) + self._causal_additive(seq, seq)
+        scale = 0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale + bias
+        stats = torch.logsumexp(scores, dim=-1, keepdim=True)
+        o = torch.matmul(torch.softmax(scores, dim=-1), v)
+        dq, dk, dv = torch.autograd.grad(o, (q, k, v), do)
+
+        dims = [1, heads, seq, dim]
+        tensor_list = [
+            {"uid": uid, "dims": dims, "data_type": "float"}
+            for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+        ]
+        tensor_list.append({"uid": 6, "dims": [1, heads, seq, 1], "data_type": "float"})
+        graph_json = {
+            "tensors": tensor_list,
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 7,
+                        "dk_tensor_uid": 8,
+                        "dv_tensor_uid": 9,
+                    },
+                    "attributes": {
+                        "causal_mask": True,
+                        "alibi_mask": True,
+                        "attn_scale_value": scale,
+                    },
+                }
+            ],
+        }
+
+        outputs = provider.compute_reference(
+            graph_json,
+            {
+                1: q.detach().numpy(),
+                2: k.detach().numpy(),
+                3: v.detach().numpy(),
+                4: o.detach().numpy(),
+                5: do.numpy(),
+                6: stats.detach().numpy(),
+            },
+        )
+
+        for uid, grad in ((7, dq), (8, dk), (9, dv)):
+            np.testing.assert_allclose(
+                outputs[uid].data, grad.numpy(), rtol=1e-4, atol=1e-5
+            )
+
+    def test_sdpa_alibi_bf16_stats_keep_fp32_precision_with_nonpow2_heads(
+        self,
+    ) -> None:
+        """The ALiBi bias must stay float32 until the SDPA call itself: a low
+        graph precision rounding it first lost log-sum-exp precision, worst
+        with a non-power-of-two head count (H12), where the cuDNN slopes are
+        not exact in bf16."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        torch.manual_seed(23)
+        heads, seq, dim = 12, 256, 8
+        q = torch.randn(1, heads, seq, dim)
+        k = torch.randn(1, heads, seq, dim)
+        q_bf, k_bf = q.to(torch.bfloat16), k.to(torch.bfloat16)
+
+        def tensor(uid, dtype="bfloat16"):
+            return {"uid": uid, "dims": [1, heads, seq, dim], "data_type": dtype}
+
+        graph_json = {
+            "tensors": [
+                tensor(1),
+                tensor(2),
+                tensor(3),
+                tensor(4),
+                {"uid": 6, "dims": [1, heads, seq, 1], "data_type": "float"},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                    },
+                    "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
+                    "attributes": {
+                        "dropout_probability": 0.0,
+                        "attn_scale_value": 0.5,
+                        "causal_mask": True,
+                        "alibi_mask": True,
+                    },
+                }
+            ],
+        }
+
+        outputs = provider.compute_reference(
+            graph_json,
+            {
+                1: q.numpy(),
+                2: k.numpy(),
+                3: torch.randn(1, heads, seq, dim).numpy(),
+            },
+        )
+
+        bias = self._alibi_bias(heads, seq, seq)
+        band = self._causal_additive(seq, seq)
+        bf16_scores = torch.matmul(q_bf.float(), k_bf.float().transpose(-2, -1)) * 0.5
+        exact_lse = torch.logsumexp(bf16_scores + bias + band, dim=-1, keepdim=True)
+        rounded_bias = bias.to(torch.bfloat16).float()
+        rounded_lse = torch.logsumexp(
+            bf16_scores + rounded_bias + band, dim=-1, keepdim=True
+        )
+        # The pre-fix rounding error at H12 bf16 was about 3e-3; a correct
+        # fp32 bias must land well under that bound, at the exact value.
+        worst_if_rounded = (rounded_lse - exact_lse).abs().max().item()
+        assert worst_if_rounded > 1e-3
+        np.testing.assert_allclose(
+            outputs[6].data, exact_lse.numpy(), atol=2e-4, rtol=0
+        )
+
     def test_sdpa_alibi_is_declined_with_paged_attention(self) -> None:
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
@@ -1986,6 +2165,67 @@ class TestHostMemoryEstimate:
         # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
         # against 16 pages * 16 rows instead of 1 page.
         assert all_pages - one_page >= 4 * 2 * 64 * (16 - 1) * 16 * 4
+
+    def test_alibi_forward_counts_the_full_bias_tensor(self) -> None:
+        """A plain ALiBi forward (no sink) still calls the real fused SDPA
+        kernel once, but that call now takes one [heads, q_len, kv_len]
+        float32 bias tensor; before this fix the estimate did not change
+        with alibi_mask."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        dims = [1, 2, 1024, 16]
+        causal = {"causal_mask": True}
+        plain = estimate(self._sdpa(dims, dims, causal))
+        with_alibi = estimate(self._sdpa(dims, dims, {**causal, "alibi_mask": True}))
+        assert with_alibi - plain >= 2 * 1024 * 1024 * 4
+
+    def test_alibi_backward_adds_one_block_temporary_not_the_full_bias(self) -> None:
+        """Backward recomputes the ALiBi bias one query block at a time
+        inside ``_block_scores``, so it must add only one more block-sized
+        temporary to the existing three, never a full
+        ``[heads, q_len, kv_len]`` tensor (32 GiB at these dims)."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        def backward_graph(attributes):
+            dims = [1, 32, 16384, 16384 // 1024]
+            tensors = [
+                {"uid": uid, "dims": dims, "data_type": "float"}
+                for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+            ]
+            tensors.append({"uid": 6, "dims": [1, 32, 16384, 1], "data_type": "float"})
+            return {
+                "tensors": tensors,
+                "nodes": [
+                    {
+                        "type": "SdpaBackwardAttributes",
+                        "inputs": {
+                            "q_tensor_uid": 1,
+                            "k_tensor_uid": 2,
+                            "v_tensor_uid": 3,
+                            "o_tensor_uid": 4,
+                            "do_tensor_uid": 5,
+                            "stats_tensor_uid": 6,
+                        },
+                        "outputs": {
+                            "dq_tensor_uid": 7,
+                            "dk_tensor_uid": 8,
+                            "dv_tensor_uid": 9,
+                        },
+                        "attributes": attributes,
+                    }
+                ],
+            }
+
+        causal = {"causal_mask": True}
+        plain = estimate(backward_graph(causal))
+        with_alibi = estimate(backward_graph({**causal, "alibi_mask": True}))
+        full_bias = 32 * 16384 * 16384 * 4
+        assert 0 < with_alibi - plain < full_bias
+        assert with_alibi - plain <= 3 * (1 << 31)  # bounded by the block cap
 
 
 class TestFloat64Reference:
