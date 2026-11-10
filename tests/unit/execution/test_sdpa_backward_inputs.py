@@ -78,10 +78,35 @@ def _expected(data, scale, q_len, kv_len, keep, rep, mask=None):
             6,
             lambda i, j: i - 1 <= j <= i,
         ),
+        # hipDNN composes a deprecated causal flag with the stored alignment
+        # and bounds (resolveDiagonalBand): the flag only sets right_bound 0.
+        (
+            {
+                "attn_scale_value": 0.3,
+                "causal_mask": True,
+                "diagonal_alignment": "BOTTOM_RIGHT",
+            },
+            3,
+            6,
+            lambda i, j: j <= i + 3,
+        ),
+        (
+            {"attn_scale_value": 0.3, "causal_mask": True, "left_bound": 1},
+            6,
+            6,
+            lambda i, j: i - 1 <= j <= i,
+        ),
         # An absent scale is 1.0 in hipDNN, not 1/sqrt(d).
         ({}, 4, 7, lambda i, j: True),
     ],
-    ids=["causal", "bottom-right", "window", "default-scale"],
+    ids=[
+        "causal",
+        "bottom-right",
+        "window",
+        "causal-bottom-right-alignment",
+        "causal-left-bound",
+        "default-scale",
+    ],
 )
 def test_o_and_stats_are_the_forward_of_qkv(parameters, q_len, kv_len, keep) -> None:
     """GQA (4 query heads over 2 K/V heads), with each mask form."""

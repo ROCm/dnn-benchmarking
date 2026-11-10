@@ -21,15 +21,13 @@ unmasked ``(q, kv)`` pairs per query head:
   For ``head_dim_qk == head_dim_vo`` this is 2.5x forward, the convention
   FlashAttention's benchmarks use.
 
-``P`` is exact. The mask is resolved the way hipDNN's reference executor and
-providers resolve it (``extractDiagonalBandParams`` / ``getMaskType``):
-
-* deprecated ``causal_mask`` -> top-left causal (bounds/alignment ignored);
-* deprecated ``causal_mask_bottom_right`` -> bottom-right causal;
-* otherwise ``left_bound`` / ``right_bound`` / ``diagonal_alignment``, where
-  row ``i`` keeps ``kv`` in ``[i + off - left, i + off + right]`` with
-  ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT); an unset bound is
-  unbounded.
+``P`` is exact. The mask is resolved the way hipDNN's providers resolve it
+(``plan_utils::resolveDiagonalBand``, since rocm-libraries #13065), as
+cuDNN's setters compose: a deprecated causal flag acts as if its setter ran
+first, and the stored bounds and alignment apply on top. See
+:func:`sdpa_band`. Row ``i`` keeps ``kv`` in ``[i + off - left, i + off +
+right]`` with ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT); an unset
+bound is unbounded.
 
 A causal sliding window of ``W`` keys (``left = W - 1``, ``right = 0``,
 BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
@@ -44,25 +42,35 @@ from ._common import node_param, node_tensor
 Band = Tuple[Optional[int], Optional[int], bool]
 
 
-def sdpa_band(node: Dict[str, Any]) -> Optional[Band]:
-    """The node's diagonal band, resolved in the order of hipDNN's
-    ``extractDiagonalBandParams``.
+def sdpa_band(node: Dict[str, Any]) -> Band:
+    """The node's diagonal band, resolved as hipDNN's ``resolveDiagonalBand``.
 
-    Returns None for a mask hipDNN rejects: a bound below -1, or both
-    deprecated causal flags.
+    A deprecated causal flag sets ``right = 0`` unless ``right_bound`` is set
+    (>= 0). ``left_bound`` still applies. ``causal_mask`` keeps the stored
+    alignment; ``causal_mask_bottom_right`` forces BOTTOM_RIGHT.
+
+    Raises ValueError for a mask hipDNN rejects: both deprecated flags, a
+    bound below -1, or an unknown alignment.
     """
-    left = int(node_param(node, "left_bound", -1))
-    right = int(node_param(node, "right_bound", -1))
-    if left < -1 or right < -1:
-        return None
-    causal_top_left = node_param(node, "causal_mask") is True
-    causal_bottom_right = node_param(node, "causal_mask_bottom_right") is True
-    if causal_top_left and causal_bottom_right:
-        return None
-    if causal_top_left or causal_bottom_right:
-        left, right, bottom_right = -1, 0, causal_bottom_right
-    else:
-        bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
+    causal = bool(node_param(node, "causal_mask"))
+    causal_bottom_right = bool(node_param(node, "causal_mask_bottom_right"))
+    if causal and causal_bottom_right:
+        raise ValueError(
+            "SDPA causal_mask and causal_mask_bottom_right are mutually exclusive"
+        )
+    alignment = node_param(node, "diagonal_alignment")
+    if alignment not in ("TOP_LEFT", "BOTTOM_RIGHT", 0, 1, None):
+        raise ValueError(f"Unsupported SDPA diagonal_alignment {alignment!r}")
+    bounds = []
+    for key in ("left_bound", "right_bound"):
+        value = int(node_param(node, key, -1))
+        if value < -1:
+            raise ValueError(f"SDPA {key} {value} is below -1")
+        bounds.append(value)
+    left, right = bounds
+    if causal or causal_bottom_right:
+        right = max(right, 0)
+    bottom_right = causal_bottom_right or alignment in ("BOTTOM_RIGHT", 1)
     return (
         (None if left == -1 else left),
         (None if right == -1 else right),
@@ -95,7 +103,7 @@ def _attention_terms(
     """Return ``(batch * num_q_heads * P, head_dim_qk, head_dim_vo)``.
 
     Returns None when q/k/v tensor data is incomplete, or when the mask is
-    one hipDNN rejects (see :func:`sdpa_band`).
+    one hipDNN rejects (:func:`sdpa_band` raises).
     """
     q = node_tensor(node, "q_tensor_uid", tensors_by_uid)
     k = node_tensor(node, "k_tensor_uid", tensors_by_uid)
@@ -114,8 +122,9 @@ def _attention_terms(
     for d in q_dims[:-2]:
         rows *= int(d)
 
-    band = sdpa_band(node)
-    if band is None:
+    try:
+        band = sdpa_band(node)
+    except ValueError:
         return None
     pairs = _nonmasked_pairs(q_seqlen, kv_seqlen, *band)
     return rows * pairs, int(q_dims[-1]), int(v_dims[-1])

@@ -9,6 +9,7 @@ import torch
 
 from ....common.exceptions import UnsupportedGraphError
 from ....config.benchmark_config import PyTorchSdpaBackendName
+from ....metrics.analytical.sdpa import sdpa_band
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
 from .._sdpa_backend import (
@@ -196,43 +197,21 @@ def _sdpa_derive_mask(
 ) -> Tuple[bool, Optional[int], bool]:
     """Resolve ``(is_causal, window_width, bottom_right)`` as hipDNN does.
 
-    The deprecated causal booleans take precedence over the modern bounds and
-    alignment. Otherwise, bounds describe a diagonal band, with ``-1`` meaning
-    unbounded. ``is_causal`` is reserved for PyTorch's native top-left mask;
-    bottom-right masks are materialized as additive masks.
+    The band comes from :func:`sdpa_band`, hipDNN's composition of the
+    deprecated causal flags with the bounds and alignment. ``is_causal`` is
+    reserved for PyTorch's native top-left mask; bottom-right masks are
+    materialized as additive masks. A band with a forward-looking right edge
+    raises ValueError: the reference cannot express it.
     """
-    causal = _sdpa_bool(node, "causal_mask")
-    bottom_right_causal = _sdpa_bool(node, "causal_mask_bottom_right")
-    if causal and bottom_right_causal:
-        raise ValueError(
-            "SDPA causal_mask and causal_mask_bottom_right are mutually exclusive"
-        )
-    if causal:
-        return True, None, False
-    if bottom_right_causal:
-        return False, None, True
-
-    alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
-    if alignment not in ("TOP_LEFT", "BOTTOM_RIGHT", 0, 1, None):
-        raise ValueError(f"Unsupported SDPA diagonal_alignment {alignment!r}")
-    bottom_right = alignment in ("BOTTOM_RIGHT", 1)
-
-    unbounded = -1
-    left = _node_param(node, "left_bound", unbounded)
-    right = _node_param(node, "right_bound", unbounded)
-    left = unbounded if left is None else int(left)
-    right = unbounded if right is None else int(right)
-
-    if left < unbounded:
-        raise ValueError(f"SDPA left_bound {left} is neither unbounded nor a width")
+    left, right, bottom_right = sdpa_band(node)
+    if right is None and left is None:
+        return False, None, False
     if right != 0:
-        if right == unbounded and left == unbounded:
-            return False, None, False
         raise ValueError(
-            f"SDPA right_bound {right} is a forward-looking band the reference "
-            "cannot express"
+            f"SDPA right_bound {-1 if right is None else right} is a forward-looking "
+            "band the reference cannot express"
         )
-    if left == unbounded:
+    if left is None:
         return (False, None, True) if bottom_right else (True, None, False)
     return False, left + 1, bottom_right
 

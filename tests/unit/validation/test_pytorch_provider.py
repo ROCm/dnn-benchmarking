@@ -1251,7 +1251,9 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
         np.testing.assert_allclose(outputs[6].data, [[[[np.log(3.0)], [np.log(4.0)]]]])
 
-    def test_sdpa_deprecated_causal_mask_overrides_bottom_right_alignment(self) -> None:
+    def test_sdpa_deprecated_causal_mask_keeps_bottom_right_alignment(self) -> None:
+        """hipDNN composes causal_mask with the stored alignment, so this is
+        bottom-right causal: row 0 sees keys 0-2, row 1 sees all four."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.zeros((1, 1, 2, 1), dtype=np.float32)
         k = np.zeros((1, 1, 4, 1), dtype=np.float32)
@@ -1272,7 +1274,7 @@ class TestPyTorchProviderNewOps:
 
         outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
 
-        np.testing.assert_allclose(outputs[4].data, [[[[1.0], [1.5]]]])
+        np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
 
     def test_sdpa_attention_sink_gqa_and_bottom_right_match_explicit_softmax(
         self,
@@ -1508,7 +1510,7 @@ class TestPyTorchProviderNewOps:
             ({"alibi_mask": True}, "alibi/padding"),
             ({"padding_mask": True}, "alibi/padding"),
             ({"right_bound": 1}, "forward-looking band"),
-            ({"left_bound": -5}, "neither unbounded nor a width"),
+            ({"left_bound": -5}, "below -1"),
             (
                 {"causal_mask": True, "causal_mask_bottom_right": True},
                 "mutually exclusive",

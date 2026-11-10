@@ -3271,9 +3271,9 @@ class TestPyTorchSdpaMaskDerivation:
 
         assert _sdpa_derive_mask(self._node()) == (False, None, False)
 
-    def test_the_deprecated_boolean_wins_over_bounds(self) -> None:
-        """hipDNN: causal_mask means top-left causal and the bounds are
-        ignored, so a left bound must not turn it into a window."""
+    def test_the_deprecated_boolean_composes_with_bounds(self) -> None:
+        """hipDNN (resolveDiagonalBand): causal_mask acts as right_bound 0;
+        the stored left bound and alignment still apply."""
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sdpa_derive_mask,
         )
@@ -3284,9 +3284,13 @@ class TestPyTorchSdpaMaskDerivation:
                 left_bound=127,
                 diagonal_alignment="BOTTOM_RIGHT",
             )
-        ) == (True, None, False)
+        ) == (False, 128, True)
+        assert _sdpa_derive_mask(
+            self._node(causal_mask=True, diagonal_alignment="BOTTOM_RIGHT")
+        ) == (False, None, True)
 
-    def test_bottom_right_boolean_wins_over_bounds(self) -> None:
+    def test_bottom_right_boolean_composes_with_bounds(self) -> None:
+        """causal_mask_bottom_right forces BOTTOM_RIGHT and keeps the left bound."""
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
             _sdpa_derive_mask,
         )
@@ -3297,7 +3301,7 @@ class TestPyTorchSdpaMaskDerivation:
                 left_bound=127,
                 diagonal_alignment="TOP_LEFT",
             )
-        ) == (False, None, True)
+        ) == (False, 128, True)
 
     def test_bottom_right_alignment_applies_to_causal_bounds(self) -> None:
         from dnn_benchmarking.execution.pytorch_ops.handlers.sdpa import (
@@ -3396,7 +3400,7 @@ class TestPyTorchSdpaMaskDerivation:
     @pytest.mark.parametrize(
         "attributes, match",
         [
-            ({"left_bound": -5}, "neither unbounded nor a width"),
+            ({"left_bound": -5}, "below -1"),
             ({"right_bound": 3}, "forward-looking band"),
             # hipDNN keeps k <= q + right_bound; an unbounded or positive right
             # edge is not the causal band the reference builds.

@@ -489,8 +489,14 @@ fp16 SDPA backward outputs use `rtol` 4e-3 (about 4 ULP) instead of the fp16
 default of 1e-3. dQ, dK and dV sum over every key or query row. On gfx942 the
 ASM SDPA engine and the AOTriton reference differ by 2 ULP on 1 in 10,000 to
 1 in 50,000 elements (`max_rel_diff` 2^-9), so 1e-3 fails two correct
-kernels. Known wrong gradients miss by 1e3 or more. The source is
-`OP_TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
+kernels. The source is `OP_TOLERANCES` in
+`src/dnn_benchmarking/execution/correctness.py`.
+
+With `--validate pytorch` on a GPU, the SDPA backward reference is the
+output of the fused PyTorch backward kernel (see
+[PyTorch SDPA backward](#pytorch-sdpa-backward)), not the manual fp32
+formula. Before tool version 0.4.0 it was the fp32 formula. On the host the
+reference is still the fp32 formula.
 
 The forward is dense and has no dropout: sequence-length and dropout inputs
 do not change O and `stats`. The forward adds host time to input generation
@@ -510,8 +516,9 @@ The tool does not do these things yet:
   test, and the tolerances must be loose.
 - SDPA reference for every mask. The PyTorch reference supports top-left and
   bottom-right causal bands, bounded left windows with `right_bound = 0`, and
-  attention-sink logits. It follows hipDNN precedence: the deprecated causal
-  booleans override the modern bounds and diagonal alignment. Other masks make
+  attention-sink logits. It resolves the mask as hipDNN does: a deprecated
+  causal boolean acts as `right_bound = 0`, and the stored `left_bound` and
+  diagonal alignment still apply. Other masks make
   the reference decline the graph as unsupported.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill

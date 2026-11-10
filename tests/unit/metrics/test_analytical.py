@@ -548,13 +548,13 @@ class TestComputeFlops:
         flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1))
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
 
-    def test_sdpa_deprecated_causal_ignores_alignment_and_bounds(self):
-        # hipDNN: causal_mask=True means top-left causal regardless of bounds.
+    def test_sdpa_deprecated_causal_composes_with_alignment_and_bounds(self):
+        # hipDNN (resolveDiagonalBand): causal_mask acts as right_bound 0, and
+        # left_bound and the alignment still apply. Sq=8, Skv=4, BOTTOM_RIGHT
+        # offset -4, left 1: rows keep 0,0,0,0,1,2,2,2 keys = 7 pairs.
         graph = _sdpa_graph(causal=True, sq=8, skv=4, left_bound=1)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
-        flops = compute_flops(graph)
-        top_left = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
-        assert flops == top_left
+        assert compute_flops(graph) == 2 * 2 * 64 * 7 * (128 + 128)
 
     @pytest.mark.parametrize(
         "attrs",

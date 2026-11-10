@@ -180,8 +180,8 @@ def sdpa_problem(
         raise UnsupportedGraphError(
             f"rocKE runtime does not support SDPA features: {', '.join(present)}"
         )
-    # The mask resolves as hipDNN resolves it: the deprecated causal booleans
-    # win over the bounds and the alignment.
+    # The mask resolves as hipDNN resolves it: a deprecated causal boolean
+    # acts as right_bound 0, and the bounds and the alignment still apply.
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError as e:

@@ -51,8 +51,7 @@ TOLERANCES = {
 # and round to fp16 once. On gfx942 the ASM SDPA engine and the AOTriton
 # reference land 2 ULP apart (relative 2^-9) on 1 in 10,000 to 1 in 50,000
 # elements, so the fp16 rtol of 1e-3 (1 ULP) fails two correct kernels. 4e-3
-# (~4 ULP at the bottom of the binade) tolerates that; the known wrong
-# gradients miss by 1e3 or more.
+# (~4 ULP at the bottom of the binade) tolerates that.
 OP_TOLERANCES = {
     ("SdpaBackwardAttributes", "half"): (4e-3, 1e-3),
 }

@@ -348,8 +348,9 @@ Requirements and limits:
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
   window. A causal mask (top-left or bottom-right) needs
-  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
-  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. As in
+  hipDNN, the deprecated `causal_mask` flag acts as `right_bound = 0` and
+  keeps `left_bound` and `diagonal_alignment`.
   An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not

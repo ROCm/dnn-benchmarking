@@ -209,8 +209,9 @@ def set_sdpa_backward_inputs(
         }
         if any(uids[name] not in input_data for name in ("q", "k", "v", "o", "stats")):
             continue
-        band = sdpa_band(node)
-        if band is None:
+        try:
+            band = sdpa_band(node)
+        except ValueError:
             continue  # hipDNN rejects the mask, so no engine reads O or stats
         mask_uid = uids["attn_mask"]
         out, stats = attention_forward(
