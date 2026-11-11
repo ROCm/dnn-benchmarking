@@ -9,8 +9,8 @@ import pytest
 from dnn_benchmarking.common.dtypes import get_dtype
 from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.execution.buffer_manager import (
-    _decode_storage_bytes,
-    _encode_to_storage_bytes,
+    _decode_storage,
+    _encode_to_storage,
     _f32_to_fp8,
     _fp8_values,
 )
@@ -43,10 +43,10 @@ def test_storage_bytes_match_registry_size(name: str) -> None:
     tensor = TensorInfo(1, "t", [3, 5], [], name.upper(), is_virtual=False)
     values = np.ones((3, 5), dtype=tensor.dtype.numpy)
 
-    raw = _encode_to_storage_bytes(values, tensor)
+    raw = _encode_to_storage(values, tensor).tobytes()
 
     assert len(raw) == tensor.size_bytes == 15 * get_dtype(name).size
-    np.testing.assert_array_equal(_decode_storage_bytes(raw, tensor), values)
+    np.testing.assert_array_equal(_decode_storage(raw, tensor), values)
 
 
 @pytest.mark.parametrize("name", NAMES)

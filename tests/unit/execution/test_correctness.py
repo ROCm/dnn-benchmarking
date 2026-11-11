@@ -247,7 +247,8 @@ def test_device_e8m0_compares_code_steps():
 
 
 def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
-    """An OOM in the device compare is not a verdict; the host data decides."""
+    """An OOM in the device compare is not a verdict: the host data decides,
+    with the host copy taken from a device-only reference."""
     torch = pytest.importorskip("torch")
     from dnn_benchmarking.execution import correctness
 
@@ -269,7 +270,7 @@ def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
 
     ref = {
         1: ReferenceOutput(
-            data=np.ones(4, np.float32), tensor_uid=1, device_data=torch.zeros(4)
+            data=None, tensor_uid=1, device_data=torch.ones(4, dtype=torch.bfloat16)
         )
     }
 

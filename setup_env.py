@@ -41,15 +41,24 @@ IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
-# Root directories read by hipDNN/provider configure. Only shared/ctest supplies
-# the test category CMake file; the rest of shared/ is unnecessary here.
-ROCM_LIBRARIES_ROOT_DIRS = ("cmake", "shared/ctest")
+# Root directories that setup and the hipDNN/provider configure read. Only
+# shared/ctest supplies a file from shared; the rest of that tree is unnecessary.
+ROCM_LIBRARIES_ROOT_DIRS = (".dvc", "cmake", "shared/ctest")
 ROCM_LIBRARIES_SPARSE_DIRS = (
     *ROCM_LIBRARIES_ROOT_DIRS,
     "projects/hipdnn",
     "dnn-providers",
 )
 HIPDNN_ROOT = ROCM_LIBRARIES_DIR / "projects" / "hipdnn"
+PROVIDER_DESCRIPTOR_ROOT = (
+    ROCM_LIBRARIES_DIR
+    / "dnn-providers"
+    / "hip-kernel-provider"
+    / "src"
+    / "engines"
+    / "kernel_ingestor_engine"
+    / "descriptors"
+)
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
@@ -1270,8 +1279,31 @@ class Setup:
         # pulled in.
         deps = ["build"]
         if not IS_WINDOWS:
-            deps += ["msgpack>=1.0.0", "zstandard>=0.20.0"]
+            deps += [
+                "dvc[s3]>=3,<4",
+                "msgpack>=1.0.0",
+                "zstandard>=0.20.0",
+            ]
         self.pip("install", *deps)
+
+    def pull_provider_artifacts(self) -> None:
+        """Materialize every DVC-backed kernel-ingestor descriptor."""
+        pointers = sorted(PROVIDER_DESCRIPTOR_ROOT.glob("**/*.dvc"))
+        if not pointers:
+            return
+        targets = [
+            pointer.relative_to(ROCM_LIBRARIES_DIR).as_posix() for pointer in pointers
+        ]
+        env = dict(self.env)
+        ca_bundle = env.get("PIP_CERT") or env.get("SSL_CERT_FILE")
+        if ca_bundle:
+            env.setdefault("AWS_CA_BUNDLE", ca_bundle)
+        print(f"Pulling {len(targets)} provider descriptor artifact(s)...")
+        run(
+            [self.py, "-m", "dvc", "pull", *targets],
+            cwd=ROCM_LIBRARIES_DIR,
+            env=env,
+        )
 
     def rocke_args(self, toolchain_prefix: str) -> list[str]:
         """Configure defines that build rocKE and its ingestor engines.
@@ -1514,6 +1546,27 @@ class Setup:
             "--reuse-artifacts to build hipDNN and its bindings.",
         )
 
+    def install_rocke_packages(self) -> None:
+        """Editable-install rocKE's Python packages for ``--runtime rocke``.
+
+        They come from the rocm-libraries checkout that the plugins build
+        from, so rocKE's specs and runtime match the kernels hipDNN ships. The
+        library package provides the generic top-level names ``kernels``,
+        ``builders`` and ``dispatch``; rocKE keeps them in a dedicated venv.
+        """
+        rocke = ROCM_LIBRARIES_DIR / "dnn-providers" / "hip-kernel-provider" / "rocke"
+        if not (rocke / "library" / "pyproject.toml").is_file():
+            warn(
+                f"rocKE sources not found under {rocke}.",
+                "--runtime rocke needs them; check the rocm-libraries checkout.",
+            )
+            return
+        # compat mode writes a .pth to the source root, as rocKE's BUILDING.md
+        # requires. The library resolves `rocke` from the platform install.
+        compat = ("--config-settings", "editable_mode=compat")
+        self.pip("install", *compat, "-e", str(rocke / "platform"))
+        self.pip("install", *compat, "--no-deps", "-e", str(rocke / "library"))
+
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
             self.install_prefix,
@@ -1739,15 +1792,21 @@ class Setup:
             )
         else:
             if self.do_build:
-                stages.append(
-                    ("rocm-libraries sources", self.ensure_rocm_libraries_checkout)
-                )
-                stages.append(("Build dependencies", self.install_build_deps))
+                stages += [
+                    ("rocm-libraries sources", self.ensure_rocm_libraries_checkout),
+                    ("Build dependencies", self.install_build_deps),
+                    ("Provider descriptor artifacts", self.pull_provider_artifacts),
+                ]
             stages += [
                 ("hipDNN and provider plugins", self.build_hipdnn),
                 ("hipDNN Python bindings", self.install_bindings),
-                ("amdsmi and rocprofiler libraries", self.install_runtime_extras),
             ]
+            if not IS_WINDOWS:
+                # The Windows ROCm build of rocKE is untested (see rocke_args).
+                stages.append(("rocKE Python packages", self.install_rocke_packages))
+            stages.append(
+                ("amdsmi and rocprofiler libraries", self.install_runtime_extras)
+            )
         stages.append(("Verify installation", self.verify))
 
         self.n_stages = len(stages)

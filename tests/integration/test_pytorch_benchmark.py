@@ -7,10 +7,13 @@ The timer differs per platform (HIP events on ROCm, torch.cuda
 events on CUDA), so assertions use ``expected_timer()``.
 """
 
+from collections import Counter
+
 import numpy as np
 import pytest
 
 from dnn_benchmarking.config import PyTorchSdpaBackendName, TimingPolicy
+from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.pytorch_buffer_manager import PyTorchCudaBufferManager
 from dnn_benchmarking.execution.pytorch_executor import PyTorchCudaExecutor
@@ -93,6 +96,74 @@ def test_benchmark_times_every_iteration(
     assert m.timer == expected_timer()
     assert m.cache_mode == cache_mode
     assert m.mode == "staged" or m.fallback_reason, m
+
+
+_NO_COPY = {"aten::copy_", "aten::convolution"}
+
+
+@pytest.mark.parametrize(
+    "graph_name, asymmetric, channels_last, forbidden",
+    [
+        pytest.param("sample_conv_dgrad.json", False, False, _NO_COPY, id="dgrad"),
+        pytest.param("sample_conv_dgrad.json", True, False, _NO_COPY, id="dgrad-asym"),
+        pytest.param("sample_conv_dgrad.json", False, True, _NO_COPY, id="dgrad-nhwc"),
+        pytest.param(
+            "sample_conv_dgrad.json", True, True, _NO_COPY, id="dgrad-asym-nhwc"
+        ),
+        # Asymmetric wgrad must pad x, and that pad copies x.
+        pytest.param(
+            "sample_conv_wgrad.json",
+            True,
+            False,
+            {"aten::convolution"},
+            id="wgrad-asym",
+        ),
+    ],
+)
+def test_conv_backward_iteration_runs_only_the_backward_conv(
+    torch_gpu,
+    monkeypatch,
+    graph_name: str,
+    asymmetric: bool,
+    channels_last: bool,
+    forbidden: set,
+) -> None:
+    """A timed dgrad or wgrad iteration runs one backward conv and no extra work.
+
+    A copy or a forward conv in the iteration adds to the PyTorch time and
+    gives a false hipDNN speedup.
+    """
+    _, graph_json, _ = load_graph(graph_name)
+    if asymmetric:
+        # Same output size as the symmetric [1, 1] padding of the sample.
+        params = graph_json["nodes"][0]["parameters"]
+        params["pre_padding"], params["post_padding"] = [0, 0], [2, 2]
+    if channels_last:
+        # NHWC on every tensor, as in the graphs of the reported defect. The
+        # MIOpen path keeps NHWC only with this flag, which the CLI sets.
+        monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+        for tensor in graph_json["tensors"]:
+            _, c, h, w = tensor["dims"]
+            tensor["strides"] = [h * w * c, 1, w * c, c]
+    tensor_infos = GraphLoader().extract_tensor_info(graph_json)
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+
+    profiler = torch_gpu.profiler
+    with PyTorchCudaBufferManager(tensor_infos) as bm:
+        bm.allocate_all()
+        bm.load_input_data(generate_input_data(tensor_infos, 42, graph_json))
+        tensors = bm.get_tensors()
+        # The first call does one-time work (algorithm find, lazy init).
+        executor.execute_once(tensors)
+        with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+            executor.execute_once(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert ops["aten::convolution_backward"] == 1, ops
+    assert not forbidden & ops.keys(), ops
 
 
 def test_flash_aotriton_preference_benchmarks_sdpa(torch_gpu) -> None:
@@ -336,3 +407,42 @@ def test_pytorch_row_returns_vram_after_oom(torch_gpu) -> None:
     assert "out of memory" in (row.error_message or ""), row
     assert torch.cuda.memory_reserved() <= reserved_before
     assert "at row start the GPU had" in row.error_message
+
+
+@pytest.mark.parametrize(
+    "graph_name",
+    ["sample_conv_fwd.json", "sample_conv_dgrad.json", "sample_conv_wgrad.json"],
+)
+def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> None:
+    """With the default config, a convolution graph is validated against a
+    float64 reference computed on the GPU, and that reference equals a
+    float64 computation on the host."""
+    import io
+    from pathlib import Path
+
+    from dnn_benchmarking.config import SuiteConfig, ValidationConfig
+    from dnn_benchmarking.execution import suite_runner
+    from dnn_benchmarking.reporting.reporter import Reporter
+    from dnn_benchmarking.validation import ReferenceProviderRegistry
+    from dnn_benchmarking.validation.reference_provider import ReferencePrecision
+
+    path, graph_json, tensor_infos = load_graph(graph_name)
+    config = SuiteConfig(validation=ValidationConfig(provider="pytorch"))
+    ctx = suite_runner._graph_context(
+        Path(path), graph_json, tensor_infos, config, Reporter(io.StringIO())
+    )
+    row = suite_runner._prepare_references(ctx)
+
+    assert row is not None and row.status == "success", row
+    assert not any("float64 reference not used" in w for w in row.warnings or [])
+    assert ctx.reference_outputs
+    host = ReferenceProviderRegistry.get_provider("pytorch").compute_reference(
+        graph_json, ctx.input_data, precision=ReferencePrecision.FLOAT64
+    )
+    for uid, ref in ctx.reference_outputs.items():
+        assert ref.precision == ReferencePrecision.FLOAT64.value
+        assert ref.device_data is not None and ref.device_data.is_cuda
+        assert ref.device_data.dtype == torch_gpu.float64
+        np.testing.assert_allclose(
+            ref.host_data(), host[uid].host_data(), rtol=1e-12, atol=0
+        )

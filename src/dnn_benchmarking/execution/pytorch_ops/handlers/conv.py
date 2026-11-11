@@ -144,6 +144,67 @@ def compile_conv_fwd(
     return run
 
 
+def _graph_dim_order(
+    graph_json: Dict[str, Any], uid: int, rank: int
+) -> Tuple[int, ...]:
+    """Return the dims of graph tensor ``uid`` from outermost to innermost.
+
+    The order comes from the graph strides. A tensor without strides uses the
+    logical order.
+    """
+    for tensor_json in graph_json.get("tensors", []):
+        if tensor_json.get("uid") == uid:
+            strides = [int(s) for s in tensor_json.get("strides") or []]
+            if len(strides) == rank:
+                # Stable sort: dims with equal strides keep their logical order.
+                return tuple(sorted(range(rank), key=lambda d: -strides[d]))
+            break
+    return tuple(range(rank))
+
+
+def _layout_placeholder(
+    size: Sequence[int], dim_order: Sequence[int], like: torch.Tensor
+) -> torch.Tensor:
+    """Allocate an uninitialized tensor of ``size`` that is dense in ``dim_order``.
+
+    ``aten.convolution_backward`` reads only the shape and the memory layout of
+    the operand that it does not differentiate. It calls ``.contiguous()`` on
+    that operand. A dense placeholder passes that call without a kernel. The
+    zero-stride placeholder of ``torch.nn.grad.conv*_input`` and
+    ``conv*_weight`` does not: each call copies a tensor of the operand size.
+    """
+    physical = like.new_empty([size[d] for d in dim_order])
+    logical_to_physical = [0] * len(dim_order)
+    for position, dim in enumerate(dim_order):
+        logical_to_physical[dim] = position
+    return physical.permute(logical_to_physical)
+
+
+def _conv_backward(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    stride: Tuple[int, ...],
+    padding: Tuple[int, ...],
+    dilation: Tuple[int, ...],
+    groups: int,
+    output_mask: Tuple[bool, bool, bool],
+) -> Tuple[torch.Tensor, ...]:
+    return torch.ops.aten.convolution_backward(
+        grad_output,
+        x,
+        w,
+        None,
+        stride,
+        padding,
+        dilation,
+        False,
+        [0] * len(stride),
+        groups,
+        output_mask,
+    )
+
+
 @register_handler("ConvolutionBwdAttributes")
 def compile_conv_bwd(
     node: Dict[str, Any],
@@ -163,31 +224,32 @@ def compile_conv_bwd(
 
     stride, dilation = _conv_stride_dilation(node)
     pre, post = _conv_padding(node)
-    symmetric = pre == post
-    apply_conv = None if symmetric else _plan_conv_forward(node)
+    if pre == post:
+        # Symmetric padding folds into the conv, as in the engine descriptor.
+        x_size, padding, crop = input_size, pre, None
+    else:
+        # convolution_backward has no asymmetric padding. Compute the gradient
+        # of the padded input, then keep a view of the unpadded part (no kernel).
+        x_size = tuple(input_size[:2]) + tuple(
+            dim + before + after
+            for dim, before, after in zip(input_size[2:], pre, post)
+        )
+        padding = (0,) * len(stride)
+        crop = (slice(None), slice(None)) + tuple(
+            slice(before, before + dim) for dim, before in zip(input_size[2:], pre)
+        )
+    dim_order = _graph_dim_order(graph_json, dx_uid, len(input_size))
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         dy = _tensor(tensors, dy_uid, node)
         w = _tensor(tensors, w_uid, node)
         groups = _conv_group_count(input_size, w.shape)
-        if symmetric:
-            dx = torch.nn.grad.conv2d_input(
-                input_size,
-                w,
-                dy,
-                stride=stride,
-                padding=pre,
-                dilation=dilation,
-                groups=groups,
-            )
-        else:
-            with torch.enable_grad():
-                x = torch.zeros(
-                    input_size, dtype=dy.dtype, device=dy.device, requires_grad=True
-                )
-                y = apply_conv(x, w.detach())
-                y.backward(dy)
-                dx = x.grad.detach()
+        x = _layout_placeholder(x_size, dim_order, dy)
+        dx = _conv_backward(
+            dy, x, w, stride, padding, dilation, groups, (True, False, False)
+        )[0]
+        if crop is not None:
+            dx = dx[crop]
         _store_tensor(tensors, dx_uid, dx)
 
     return run
@@ -213,30 +275,21 @@ def compile_conv_wrw(
     stride, dilation = _conv_stride_dilation(node)
     pre, post = _conv_padding(node)
     symmetric = pre == post
-    apply_conv = None if symmetric else _plan_conv_forward(node)
+    # Symmetric padding folds into the conv. convolution_backward has no
+    # asymmetric padding, so pad x explicitly, as the forward handler does.
+    padding = pre if symmetric else (0,) * len(stride)
+    dim_order = _graph_dim_order(graph_json, dw_uid, len(weight_size))
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
         x = _tensor(tensors, x_uid, node)
         dy = _tensor(tensors, dy_uid, node)
         groups = _conv_group_count(x.shape, weight_size)
-        if symmetric:
-            dw = torch.nn.grad.conv2d_weight(
-                x,
-                weight_size,
-                dy,
-                stride=stride,
-                padding=pre,
-                dilation=dilation,
-                groups=groups,
-            )
-        else:
-            with torch.enable_grad():
-                w = torch.zeros(
-                    weight_size, dtype=x.dtype, device=x.device, requires_grad=True
-                )
-                y = apply_conv(x.detach(), w)
-                y.backward(dy)
-                dw = w.grad.detach()
+        if not symmetric:
+            x = _pad_conv_input(x, pre, post)
+        w = _layout_placeholder(weight_size, dim_order, x)
+        dw = _conv_backward(
+            dy, x, w, stride, padding, dilation, groups, (False, True, False)
+        )[1]
         _store_tensor(tensors, dw_uid, dw)
 
     return run

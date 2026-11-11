@@ -6,9 +6,11 @@ Benchmarking and validation tool for hipDNN graphs.
 > it in build workflows or CI gating.
 
 dnn-benchmarking loads serialized hipDNN graphs (JSON). It runs each graph
-through the installed hipDNN engine plugins, or through PyTorch with
-`--runtime pytorch`. For each engine it measures the device time of one
-launch and, if you ask, compares the output with a PyTorch reference.
+through the installed hipDNN engine plugins, through PyTorch with
+`--runtime pytorch`, or through rocKE SDPA kernels with `--runtime rocke`.
+A comma list such as `--runtime hipdnn,rocke` puts the rows of each runtime
+in the same run. For each engine it measures the device time of one launch
+and, if you ask, compares the output with a PyTorch reference.
 
 - One timed loop for all runtimes. The headline number is the median device
   time per launch (`kernel_med`), measured with a stall-gated event span.
@@ -25,6 +27,9 @@ launch and, if you ask, compares the output with a PyTorch reference.
 - hipDNN backend: an AMD GPU with ROCm, the hipDNN Python bindings
   (`hipdnn_frontend`) and the engine plugins. `setup_env.py` builds them.
 - PyTorch runtime: a ROCm or CUDA build of PyTorch. hipDNN is not necessary.
+- rocKE runtime: a ROCm build of PyTorch and the rocKE Python packages
+  (`setup_env.py` installs them on Linux). See
+  [docs/usage.md](docs/usage.md#rocke-runtime).
 - `--validate pytorch`: any PyTorch build. A CPU build is sufficient.
 - Optional: amdsmi for GPU clocks and throttle status; `rocprofv3`, `perf`
   and `rocprof-compute` for the profiling flags.
@@ -125,17 +130,20 @@ The `Workloads/` directory holds benchmark workload tarballs tracked with
 [DVC](https://dvc.org/). The public DVC remote in `.dvc/config` allows
 anonymous reads.
 
-- `Workloads/headline/`: the curated set for regression monitoring
+- `Workloads/headline/`: the small, curated set for regression monitoring
   (`conv`, `bnorm`, `attn`, `hipblaslt`, `moe`, `norm`). No ROCm engine
   implements RMSNorm or LayerNorm yet, so `norm.tar.gz` has no applicable
   engines today.
 - `Workloads/microbench/`: larger shape sweeps and per-source collections.
 - `Workloads/models/`: workloads for each model.
+- `Workloads/corpus/`: reference collections across models with minimal graph
+  overlap inside each collection. The current collection covers convolution.
 
 ```bash
 python -m pip install "dvc[s3]"
-dvc pull                                   # every workload
-dvc pull Workloads/headline/conv.tar.gz.dvc  # one workload
+dvc pull                                      # every workload
+dvc pull Workloads/headline/conv.tar.gz.dvc   # one headline workload
+dvc pull Workloads/corpus/Convolution/files.tar.gz.dvc  # corpus
 ```
 
 Keep credentials in `.dvc/config.local`, which git ignores.

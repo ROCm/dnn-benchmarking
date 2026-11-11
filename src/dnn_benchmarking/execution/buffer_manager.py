@@ -11,13 +11,16 @@ graph type, and are encoded to raw words only when written to device storage.
 
 import functools
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from ..common.blocks import iter_blocks
 from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
+
 
 # fp8 formats as (exponent bits, mantissa bits); E8M0 is a special case.
 _FP8_FORMATS = {
@@ -138,25 +141,63 @@ def _storage_view(storage: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
     return storage.reshape(tensor_info.dims)
 
 
-def _encode_to_storage_bytes(data: np.ndarray, tensor_info: TensorInfo) -> bytes:
-    """Encode dense logical data into raw storage bytes using graph strides."""
-    storage = np.zeros(
-        tensor_info.storage_elements, dtype=_storage_dtype(tensor_info.dtype)
-    )
-    _storage_view(storage, tensor_info)[...] = _encode(data, tensor_info.dtype)
-    return storage.tobytes()
+def _is_packed(tensor_info: TensorInfo) -> bool:
+    """True when the graph strides are the dense C-order strides of the dims."""
+    if not tensor_info.strides:
+        return True
+    if len(tensor_info.strides) != len(tensor_info.dims):
+        return False  # storage_elements reports the malformed entry
+    expected = 1
+    for dim, stride in zip(reversed(tensor_info.dims), reversed(tensor_info.strides)):
+        if dim != 1 and stride != expected:
+            return False
+        expected *= dim
+    return True
 
 
-def _decode_storage_bytes(data_bytes: bytes, tensor_info: TensorInfo) -> np.ndarray:
-    """Decode raw storage bytes into a dense logical ndarray."""
+def _encode_to_storage(data: np.ndarray, tensor_info: TensorInfo) -> np.ndarray:
+    """Encode dense logical data into 1-D storage words in the graph layout.
+
+    Data that already holds the storage words in a packed layout is returned
+    as a flat view, without a copy. Otherwise the words are encoded block by
+    block straight into the storage array, so no full-size encoded copy or
+    conversion temporary exists.
+    """
+    storage_dtype = _storage_dtype(tensor_info.dtype)
+    data = np.asarray(data)
+    if (
+        data.dtype == storage_dtype
+        and data.shape == tuple(tensor_info.dims)
+        and data.flags.c_contiguous
+        and _is_packed(tensor_info)
+    ):
+        return data.reshape(-1)
+    storage = np.zeros(tensor_info.storage_elements, dtype=storage_dtype)
+    view = _storage_view(storage, tensor_info)
+    data = np.broadcast_to(data, view.shape)
+    for index in iter_blocks(view.shape):
+        view[index] = _encode(data[index], tensor_info.dtype)
+    return storage
+
+
+def _decode_storage(raw: Any, tensor_info: TensorInfo) -> np.ndarray:
+    """Decode raw storage into a dense logical ndarray.
+
+    ``raw`` is any buffer-protocol object (``bytes``, a NumPy array). The
+    words are decoded block by block into the result.
+    """
     storage = np.frombuffer(
-        data_bytes,
+        raw,
         dtype=_storage_dtype(tensor_info.dtype),
         count=tensor_info.storage_elements,
     )
-    return np.ascontiguousarray(
-        _decode(_storage_view(storage, tensor_info), tensor_info.dtype)
-    )
+    view = _storage_view(storage, tensor_info)
+    if storage.dtype == tensor_info.dtype.numpy:
+        return np.ascontiguousarray(view)
+    out = np.empty(view.shape, dtype=tensor_info.dtype.numpy)
+    for index in iter_blocks(view.shape):
+        out[index] = _decode(view[index], tensor_info.dtype)
+    return out
 
 
 def _paged_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
@@ -211,6 +252,93 @@ def _paged_metadata(
     return 0, 0
 
 
+# Convolution operands that can take signed data: the data, filter and
+# incoming-gradient inputs of every convolution direction.
+_CONVOLUTION_OPERAND_KEYS = ("x_tensor_uid", "w_tensor_uid", "dy_tensor_uid")
+# The output of each convolution direction.
+_CONVOLUTION_OUTPUT_KEYS = ("y_tensor_uid", "dx_tensor_uid", "dw_tensor_uid")
+
+
+def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
+    """UIDs of inputs that get zero-mean U[-1, 1) data instead of U[0, 1).
+
+    Non-negative data makes every product in a convolution sum positive, so
+    the sum grows with the number of terms. A backward-weights sum over
+    N*Ho*Wo terms then passes the fp16 maximum (65504) at about 262,000
+    terms. Signed data lets the terms cancel, so the sum grows like
+    sqrt(N*Ho*Wo) instead.
+
+    Only the operands of a convolution with an fp16 output are signed: the
+    overflow happens when the sum is stored as fp16. Other convolutions keep
+    U[0, 1), so their outputs stay far from zero, where the fixed fp32 atol
+    would apply. A tensor that also feeds any other node, including a
+    convolution with a wider output, keeps U[0, 1). A non-convolution node
+    can need non-negative values (for example a batch-norm variance).
+    """
+    if not graph_json:
+        return set()
+    tensors = {
+        int(tensor["uid"]): tensor
+        for tensor in graph_json.get("tensors", []) or []
+        if "uid" in tensor
+    }
+    convolution: Set[int] = set()
+    other: Set[int] = set()
+    for node in graph_json.get("nodes", []) or []:
+        inputs = node.get("inputs") or {}
+        is_convolution = str(node.get("type", "")).startswith("Convolution")
+        if is_convolution and _has_fp16_output(node, tensors, graph_json):
+            convolution.update(
+                int(inputs[key])
+                for key in _CONVOLUTION_OPERAND_KEYS
+                if inputs.get(key) is not None
+            )
+        else:
+            other.update(_input_tensor_uids(inputs))
+    return convolution - other
+
+
+def _has_fp16_output(
+    node: Dict[str, Any],
+    tensors: Dict[int, Dict[str, Any]],
+    graph_json: Dict[str, Any],
+) -> bool:
+    """True when the convolution node stores its output as fp16."""
+    outputs = node.get("outputs") or {}
+    for key in _CONVOLUTION_OUTPUT_KEYS:
+        uid = outputs.get(key)
+        if uid is not None and int(uid) in tensors:
+            return _output_data_type(tensors[int(uid)], graph_json) == "half"
+    return False
+
+
+def _output_data_type(
+    tensor: Dict[str, Any], graph_json: Dict[str, Any]
+) -> Optional[str]:
+    """The data type a convolution stores its output in.
+
+    hipDNN fills an "unset" virtual (fused intermediate) tensor from the
+    graph's intermediate_data_type, and any other "unset" tensor from its
+    io_data_type (:func:`tensor_data_type`).
+    """
+    if tensor.get("virtual") and tensor.get("data_type") == "unset":
+        return graph_json.get("intermediate_data_type") or "unset"
+    return tensor_data_type(tensor, graph_json)
+
+
+def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:
+    """Tensor UIDs in a node's ``inputs`` map. Other keys in that map are
+    attributes (for example a pointwise ``operation``), and a ``*_tensor_uid``
+    key can hold one UID or a list of UIDs."""
+    uids: Set[int] = set()
+    for key, value in inputs.items():
+        if not key.endswith("_tensor_uid") or value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        uids.update(int(uid) for uid in values if uid is not None)
+    return uids
+
+
 def _generate_paged_input(
     tensor_info: TensorInfo,
     role: str,
@@ -253,16 +381,21 @@ def generate_input_data(
     by both hipDNN buffers and reference providers. Floating-point inputs are
     U[0, 1) (non-negative, so batch-norm variances stay valid), drawn as
     float32 and rounded to the graph type; bfloat16 and fp8 values are returned
-    as the exactly representable float32 values. Integer and boolean inputs
-    are zeros, except paged-SDPA roles.
+    as the exactly representable float32 values. The operands of a
+    convolution with an fp16 output are U[-1, 1) instead (see
+    :func:`_signed_input_uids`). Both come from the same
+    draw, so an unsigned tensor gets the same values with or without
+    ``graph_json``. Integer and boolean inputs are zeros, except paged-SDPA
+    roles.
 
-    ``graph_json`` only affects **paged** SDPA graphs: page tables and
-    sequence lengths have invariants random data cannot satisfy (see
-    :func:`_generate_paged_input`).
+    ``graph_json`` selects the signed convolution operands and the **paged**
+    SDPA roles: page tables and sequence lengths have invariants random data
+    cannot satisfy (see :func:`_generate_paged_input`).
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
+    signed_uids = _signed_input_uids(graph_json)
     page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
 
     for tensor_info in tensor_infos:
@@ -286,8 +419,16 @@ def generate_input_data(
             # per-role structured generation (e.g. MoE offsets) is the upgrade path.
             input_data[tensor_info.uid] = np.zeros(tensor_info.dims, dtype=dtype.numpy)
         else:
-            data = rng.random(tensor_info.dims, dtype=np.float32)
-            input_data[tensor_info.uid] = _decode(_encode(data, dtype), dtype)
+            # Draw and round one block at a time straight into the result, so
+            # no full-size float32 draw or conversion temporary exists. The
+            # blocks are drawn in C order, so the values match one full draw.
+            data = np.empty(tensor_info.dims, dtype=dtype.numpy)
+            for index in iter_blocks(data.shape):
+                block = rng.random(data[index].shape, dtype=np.float32)
+                if tensor_info.uid in signed_uids:
+                    block = block * np.float32(2) - np.float32(1)
+                data[index] = _decode(_encode(block, dtype), dtype)
+            input_data[tensor_info.uid] = data
 
     return input_data
 
@@ -371,18 +512,19 @@ class BufferManager:
             return {uid: buffer.ptr() for uid, buffer in self._buffers.items()}
         return {uid: buffer.data_ptr() for uid, buffer in self._buffers.items()}
 
-    def _write_bytes(self, buffer: Any, raw_bytes: bytes) -> None:
-        """Copy graph-layout bytes from the host into one buffer."""
+    def _write_storage(self, buffer: Any, storage: np.ndarray) -> None:
+        """Copy 1-D graph-layout storage words from the host into one buffer."""
         if self._device is None:
-            buffer.copy_from_host(raw_bytes)
+            # DeviceBuffer.copy_from_host accepts only ``bytes``.
+            buffer.copy_from_host(storage.tobytes())
             return
         import torch
 
         with warnings.catch_warnings():
             # copy_ only reads the source, so a read-only view is safe and
-            # avoids a second host copy of the input.
+            # avoids a host copy of the input.
             warnings.simplefilter("ignore", UserWarning)
-            source = torch.frombuffer(raw_bytes, dtype=torch.uint8)
+            source = torch.frombuffer(storage, dtype=torch.uint8)
         buffer.copy_(source)
 
     def load_input_data(self, input_data: Dict[int, np.ndarray]) -> None:
@@ -413,7 +555,7 @@ class BufferManager:
                 )
             buffer = self._buffers.get(tensor_info.uid)
             if buffer is not None:
-                self._write_bytes(buffer, _encode_to_storage_bytes(data, tensor_info))
+                self._write_storage(buffer, _encode_to_storage(data, tensor_info))
 
     def zero_outputs(self) -> None:
         """Zero output tensor buffers.
@@ -455,10 +597,10 @@ class BufferManager:
             return None
 
         if self._device is None:
-            data_bytes = buffer.copy_to_host()
+            raw = buffer.copy_to_host()
         else:
-            data_bytes = buffer.cpu().numpy().tobytes()
-        return _decode_storage_bytes(data_bytes, tensor_info)
+            raw = buffer.cpu().numpy()
+        return _decode_storage(raw, tensor_info)
 
     def get_output_tensor(self, uid: int) -> Optional["torch.Tensor"]:
         """Return a typed logical view of an output buffer without a copy.

@@ -51,9 +51,10 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | `hipdnn` or `pytorch`. |
+| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch` or `rocke`. |
+| `runtimes` | array of string or null | Every selected runtime in run order, for example `["hipdnn", "rocke"]` for `--runtime hipdnn,rocke`. `null` in files written before this key. |
 | `engine_filter` | array of string or null | `--engine` selections as hex engine IDs (same format as `engine.id`). `null` means all discovered engines. |
-| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. |
+| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
@@ -63,6 +64,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
+| `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
 | `hipdnn_cache_dir` | string or null | `--hipdnn-cache-dir`. |
@@ -146,7 +148,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | Runtime that produced the row: `hipdnn` or `pytorch`. |
+| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch` or `rocke`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. |
 | `role` | string | `engine` for a benchmarked engine. `reference` for the timed reference row that `--validate pytorch` adds. |
 | `engine` | object | See [engine](#engine). |
 | `status` | string | `success`, `error` or `skipped`. |
@@ -165,7 +167,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `id` | string or null | Engine ID as `0x` plus 16 upper-case hex digits. `null` for PyTorch rows. |
+| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE rows: the row name, which is stable across runs. `null` for PyTorch rows. |
 | `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
 | `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
 
@@ -251,7 +253,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 
 | Key | Type | Meaning |
 |---|---|---|
-| `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch, or when validation was requested but no usable reference exists (`message` gives the reason). `null` when no comparison ran. |
+| `match` | bool or null | `true` when every output is within tolerance. `false` on a mismatch, or when validation was requested but no usable reference exists (`message` gives the reason). `null` when no comparison ran, also when the tool skipped validation because the CPU reference would not fit in host memory (`message` gives the estimate). |
 | `rtol` | float | Relative tolerance applied, the largest over outputs. For `fp8_e8m0` outputs it applies to log2 values. When no comparison ran (`match` is `false`, `message` is set and `n_total` is `null`), this is `--rtol` when given, else the fp32 default 1e-5, not the tolerance of the output dtype. |
 | `atol` | float | Absolute tolerance applied, with the same rules as `rtol`. When no comparison ran, this is `--atol` when given, else 1e-6. |
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
@@ -259,6 +261,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | `n_mismatch` | int or null | Elements outside tolerance, summed over outputs. |
 | `n_total` | int or null | Elements compared, summed over outputs. |
 | `worst_output_uid` | int or null | Tensor UID of the output with the largest difference. |
+| `reference_precision` | string or null | Arithmetic of the reference that the outputs were compared with: `float64` (a float64 computation from the same inputs, not rounded to the output dtype) or `native` (the graph data types). `native` for graphs outside the float64 scope, for `--reference-precision native`, and when the float64 reference failed. `null` when no comparison ran. See [Reference precision](usage.md#reference-precision). |
 | `message` | string or null | Why `match` is `false` or `null`. |
 
 ### Row warnings
@@ -275,6 +278,7 @@ loop. Paths are relative to the row:
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
+| `float64 reference not used (<reason>); using the graph data types` | `reference` row only. The float64 reference failed or did not fit in memory, so the engine rows of the graph met the native reference. |
 
 The tool never removes samples because of a warning.
 
@@ -346,7 +350,7 @@ it.
 | `reference` | `role` is `reference` and the row ran. |
 | `failed` | Validation found a mismatch, or validation was requested but no usable reference exists. |
 | `passed` | Validation ran and every output is within tolerance. |
-| `unchecked` | The row ran, but no validation result exists. This is not a pass. |
+| `unchecked` | The row ran, but no validation result exists. This is not a pass. Validation that the tool skipped because of the host memory estimate also gives `unchecked`. |
 
 The checks apply in the order of the table. The CLI exit code follows from the
 verdicts of the `engine` rows; `reference` rows do not count. See
