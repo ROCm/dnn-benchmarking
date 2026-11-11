@@ -193,13 +193,13 @@ def test_sdpa_validation_grades_with_repeatable_math_on_gpu(hipdnn, torch_gpu) -
     tensor_infos = GraphLoader().extract_tensor_info(graph_json)
     config = _validate_config()
     with profile(activities=[ProfilerActivity.CPU]) as timed_trace:
-        result = run_graph_all_providers(
+        result = run_graph(
             path,
             graph_json,
             tensor_infos,
             config,
-            hipdnn.Handle(),
             Reporter(output=io.StringIO()),
+            [hipdnn_planner(hipdnn.Handle())],
         )
     _assert_engines_match_reference(result, require_engine=True)
     timed_ops = [
