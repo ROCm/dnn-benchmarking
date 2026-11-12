@@ -648,7 +648,8 @@ _RENAMED_FLAGS = {
     "-b": "use --runtime/-r",
     "--emit-trace": "use --trace",
     "--metrics-tier": "use --metrics or --no-metrics",
-    "--cache-dir": "use --hipdnn-cache-dir",
+    "--cache-dir": "use --benchmark-work-dir",
+    "--hipdnn-cache-dir": "use --benchmark-work-dir",
     "--oracle-mode": "use --oracle; the plan and exhaustive modes are removed",
 }
 _UNRECOGNIZED = "unrecognized arguments: "

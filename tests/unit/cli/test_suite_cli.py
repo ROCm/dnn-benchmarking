@@ -458,7 +458,8 @@ def test_bad_option_combination_with_missing_graph_exits_2(
         (["-b", "pytorch"], "--runtime"),
         (["--emit-trace", "pftrace"], "--trace"),
         (["--metrics-tier=off"], "--no-metrics"),
-        (["--cache-dir", "d"], "--hipdnn-cache-dir"),
+        (["--cache-dir", "d"], "--benchmark-work-dir"),
+        (["--hipdnn-cache-dir", "d"], "--benchmark-work-dir"),
         (["--oracle-mode", "plan"], "--oracle"),
     ],
 )

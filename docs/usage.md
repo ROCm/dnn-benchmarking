@@ -736,15 +736,15 @@ files. A bad option combination thus exits 2 also when no graph file exists.
 The output path, `--profiling-output-dir` and the profiler tools are checked
 after the graph files are found, so a missing graph file exits 1 first.
 
-These flags were renamed in result schema version 2. The usage error names
-the replacement:
+These flags were renamed or removed. The usage error names the
+replacement:
 
 | Old flag | Use |
 |---|---|
 | `--backend`, `-b` | `--runtime`, `-r` |
 | `--emit-trace` | `--trace` |
 | `--metrics-tier` | `--metrics` or `--no-metrics` |
-| `--cache-dir` | `--hipdnn-cache-dir` |
+| `--cache-dir`, `--hipdnn-cache-dir` | `--benchmark-work-dir` |
 | `--oracle-mode` | `--oracle`. The `plan` and `exhaustive` modes are removed. |
 
 ## compare
