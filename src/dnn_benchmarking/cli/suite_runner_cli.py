@@ -519,12 +519,18 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     elif env_switch_on("HIPDNN_FORCE_BENCHMARKING"):
         # Process-wide and inherited from the shell: the run is NOT on the
         # heuristic path even though --autotune was not passed. cli.main
-        # put it on the tuned state, so its winners do not reach OOTB runs.
+        # put it on the tuned (or fresh) state, so its winners do not reach
+        # OOTB runs.
         leaked = True
+        state = (
+            "a new, empty selection state (--fresh-state)"
+            if config.fresh_state
+            else "the tuned selection state"
+        )
         reporter.warning(
             "HIPDNN_FORCE_BENCHMARKING is set in the environment without "
-            "--autotune; kernels are benchmarked, not heuristic-selected, on "
-            "the tuned selection state"
+            f"--autotune; kernels are benchmarked, not heuristic-selected, on "
+            f"{state}"
         )
     autotune = config.autotune or leaked
     if config.autotune and not cache_disabled and not config.fresh_state:
