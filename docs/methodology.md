@@ -556,11 +556,10 @@ ASM SDPA engine and the AOTriton reference differ by 2 ULP on 1 in 10,000 to
 kernels. The source is `OP_TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
-With `--validate pytorch` on a GPU, the SDPA backward reference is the
-output of the fused PyTorch backward kernel (see
-[PyTorch SDPA backward](#pytorch-sdpa-backward)), not the manual fp32
-formula. Before tool version 0.4.0 it was the fp32 formula. On the host the
-reference is still the fp32 formula.
+With `--validate pytorch`, the SDPA backward reference is the manual fp32
+formula, on a GPU and on the host. It reads the graph's O and `stats`. The
+reference pass does not call the fused PyTorch backward kernel: only the
+timed PyTorch row does (see [PyTorch SDPA backward](#pytorch-sdpa-backward)).
 
 The forward is dense and has no dropout: sequence-length and dropout inputs
 do not change O and `stats`, so O of a dropout graph is the forward without
