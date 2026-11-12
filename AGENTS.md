@@ -160,11 +160,25 @@ Rules that keep the design intact:
 - Build every hipDNN plan through `Executor.prepare`, which times only
   `create_execution_plan_ext(engine_id, knobs)` -> `check_support()` ->
   `build_plans()`. Prime each engine with `Executor.prime` before its timed
-  OOTB build, and build the oracle's `global.benchmarking=1` plan right after
-  the OOTB build, so the two build times start from the same process state.
-- Run tuned PyTorch only in the `cli/pytorch_tuned_child.py` child process.
-  PyTorch's conv algorithm cache and MIOpen's user database would otherwise
-  carry tuning into the OOTB measurement.
+  OOTB build.
+- Run every tuned run in a child process: hipDNN in
+  `cli/hipdnn_tuned_child.py`, PyTorch in `cli/pytorch_tuned_child.py`
+  (`execution/oracle.py` starts both). MIOpen reads `MIOPEN_USER_DB_PATH`
+  once per process, and PyTorch's conv algorithm cache is process-wide.
+  Each tuned run gets its own child: two MIOpen tuning searches in one
+  process can deadlock (seen on MI210), and `--oracle-timeout` then costs
+  one row, not the run.
+- `common/work_dir.py` owns the work-directory layout. `cli.main` sets
+  `HIPDNN_CACHE_DIR` and `MIOPEN_USER_DB_PATH` for the process: `--autotune`,
+  a true `HIPDNN_FORCE_BENCHMARKING` in the environment and the PyTorch tuned
+  child use the kept `<work>/tuned` state; every other
+  run, `--fast` included, uses the kept `<work>/ootb` state. `--fresh-state`
+  replaces both with a new, empty state in the system temp dir, removed at
+  exit. A `--internal-profiling-run` child makes no state: it keeps the
+  inherited values and stops with exit code 2 when one is missing. The only
+  other setters build a tuned child's environment before it starts:
+  `execution/oracle._hipdnn_tuned_env` and
+  `common/pytorch_tuning.tuned_subprocess_env`. Do not add more.
 
 ## Tests
 

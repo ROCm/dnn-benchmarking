@@ -325,8 +325,8 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
     A variant applies when its problem fields equal the graph's, it has no
     sliding window and no ragged layout (the graph never has them), and rocKE
     accepts the spec with the graph's batch and sequence lengths. The shipped
-    kernels read those three values as kernel arguments, so the shape does not
-    change the code object.
+    kernels read the shape (and, from rocm-libraries 8149ff0, the head counts)
+    as kernel arguments, so the shape does not change the code object.
     """
     from kernels.gfx950.attention_dense import (
         Gfx950AttentionDenseSpec,
@@ -352,9 +352,9 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
             seqlen_q=problem.seqlen_q,
             seqlen_kv=problem.seqlen_kv,
             # hipDNN launches every variant on the qb_minor grid (its
-            # dispatch.v1 contract), and the descriptor does not record the
-            # block order. rocKE's "auto" picks another order for causal
-            # problems, whose grid this code object does not decode.
+            # dispatch.v1 and v2 contracts), and the descriptor does not
+            # record the block order. rocKE's "auto" picks another order for
+            # causal problems, whose grid this code object does not decode.
             nonpersist_decode="qb_minor",
         )
         # rocKE reports a tile that does not divide the sequence lengths (and

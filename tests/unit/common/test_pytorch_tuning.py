@@ -8,6 +8,7 @@ import os
 import pytest
 
 from dnn_benchmarking.common import pytorch_tuning
+from dnn_benchmarking.common.work_dir import SelectionState
 
 _TUNING_PREFIXES = ("PYTORCH_TUNABLEOP_", "MIOPEN_")
 
@@ -38,19 +39,24 @@ def test_ootb_environment_never_enables_tuning_or_touches_miopen() -> None:
     assert _tuning_vars() == before
 
 
-def test_tuned_subprocess_env_forces_isolated_state(monkeypatch, tmp_path) -> None:
-    """Inherited values would let the tuned child reuse or leak tuning state."""
+def test_tuned_subprocess_env_forces_tuning_and_the_shared_state(
+    monkeypatch, tmp_path
+) -> None:
+    """Inherited values would change what the tuned child tunes; the selection
+    state is the tuned one that every tuned run shares."""
     monkeypatch.setenv("PYTORCH_TUNABLEOP_ENABLED", "0")
     monkeypatch.setenv("PYTORCH_TUNABLEOP_FILENAME", "/stale/results.csv")
-    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/shared/miopen-db")
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", "/ootb/db")
     monkeypatch.setenv("DNN_BENCH_TEST_PASSTHROUGH", "kept")
     parent_before = dict(os.environ)
+    tuned = SelectionState.under(tmp_path / "tuned")
 
-    env = pytorch_tuning.tuned_subprocess_env(str(tmp_path))
+    env = pytorch_tuning.tuned_subprocess_env(str(tmp_path), tuned)
 
     assert env["PYTORCH_TUNABLEOP_ENABLED"] == "1"
     assert env["PYTORCH_TUNABLEOP_TUNING"] == "1"
     assert env["PYTORCH_TUNABLEOP_FILENAME"] == str(tmp_path / "tunableop_results.csv")
-    assert env["MIOPEN_USER_DB_PATH"] == str(tmp_path)
+    assert env["MIOPEN_USER_DB_PATH"] == str(tuned.miopen_user_db)
+    assert env["HIPDNN_CACHE_DIR"] == str(tuned.hipdnn_cache)
     assert env["DNN_BENCH_TEST_PASSTHROUGH"] == "kept"
     assert dict(os.environ) == parent_before

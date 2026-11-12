@@ -15,6 +15,13 @@ All graphs are forward inference operations. The collection covers decode,
 prefill, chunked prefill, grouped-query attention, sliding-window attention,
 and attention-sink shapes.
 
+Twelve graphs have an attention sink: `rocke_sdpa_158` to `rocke_sdpa_165`,
+`rocke_sdpa_167` to `rocke_sdpa_169`, and `rocke_sdpa_171`. The source gave
+each sink as `[H_q]` in the I/O data type. The sinks are normalized to dims
+`[1, H_q, 1, 1]`, strides `[H_q, 1, 1, 1]`, and FLOAT data type for hipDNN's
+`sink_token` rule (rocm-libraries #14358). This change also changes the
+identity hashes of these graphs.
+
 ## Metadata contract
 
 All metadata values are non-empty lists of strings. Every graph has these
