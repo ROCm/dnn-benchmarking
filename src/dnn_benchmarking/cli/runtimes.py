@@ -4,6 +4,7 @@
 """Runtime startup: check each selected runtime once, return a per-graph runner."""
 
 import importlib.util
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -38,11 +39,15 @@ class RuntimeStartupError(Exception):
         self.exit_code = exit_code
 
 
-def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
+def start_runtime(
+    config: SuiteConfig, reporter: Reporter, resources: ExitStack
+) -> GraphRunner:
     """Check every selected runtime (and the reference provider); return the runner.
 
     Each graph runs through the runtimes in ``config.runtimes`` order, and
-    every runtime adds its rows to the same graph result.
+    every runtime adds its rows to the same graph result. The shared hipDNN
+    handle is destroyed when ``resources`` closes, so the caller decides
+    which state (the ``--fast`` MIOpen user database) outlives it.
 
     Raises:
         RuntimeStartupError: a runtime is unavailable (exit 1) or an explicit
@@ -52,6 +57,7 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
     # torch wheel may preload another libhipdnn_backend, so bind the selected
     # hipDNN frontend first. Defer reporting load errors until after the
     # reference check, preserving its startup error when both are unavailable.
+    _check_plugin_paths(config)
     if RuntimeName.HIPDNN in config.runtimes:
         hipdnn, load_error = _load_hipdnn_bindings()
     _check_reference_provider(config)
@@ -59,7 +65,9 @@ def start_runtime(config: SuiteConfig, reporter: Reporter) -> GraphRunner:
     for runtime in config.runtimes:
         if runtime is RuntimeName.HIPDNN:
             handle = _create_hipdnn_handle(config, hipdnn, load_error)
-            planners.append(hipdnn_planner(handle))
+            if handle is not None:
+                resources.callback(hipdnn.destroy_handle, handle)
+            planners.append(hipdnn_planner(handle, prime_once=config.fast))
         else:
             planners.append(_STARTERS[runtime](config, reporter))
     return lambda path, graph_json, infos: run_graph(
@@ -181,15 +189,10 @@ def _create_hipdnn_handle(
 ) -> Any:
     """Create the shared hipDNN handle; None when plugin paths are per engine.
 
-    Handle creation is the authoritative GPU/runtime check for hipDNN.
+    Handle creation is the authoritative GPU/runtime check for hipDNN. With
+    ``--fast`` the plugin path names one plugin library, so the handle loads
+    and initialises only that plugin.
     """
-    missing = [str(p) for p in config.plugin_paths or [] if not p.is_dir()]
-    if missing:
-        raise RuntimeStartupError(
-            f"hipDNN plugin path is not a directory: {', '.join(missing)} "
-            "(check --plugin-path)",
-            exit_code=2,
-        )
     if load_error is not None:
         if isinstance(load_error, ImportError):
             raise RuntimeStartupError(
@@ -224,6 +227,40 @@ def _create_hipdnn_handle(
     if config.engine_filter is not None:
         _check_engines_loaded(hipdnn, handle, config.engine_filter)
     return handle
+
+
+def _check_plugin_paths(config: SuiteConfig) -> None:
+    """Reject unusable ``--plugin-path`` entries before any runtime starts.
+
+    hipDNN takes a plugin directory, whose libraries all load, or one plugin
+    library file, which loads alone; with ``--fast`` the one path must be a
+    library file. rocKE reads the kernel descriptors under plugin
+    directories, so it rejects a file.
+    """
+    paths = config.plugin_paths or []
+    if RuntimeName.HIPDNN in config.runtimes:
+        unusable = [str(p) for p in paths if not (p.is_file() or p.is_dir())]
+        if unusable:
+            raise RuntimeStartupError(
+                "hipDNN plugin path is not a plugin directory or library file: "
+                f"{', '.join(unusable)} (check --plugin-path)",
+                exit_code=2,
+            )
+        if config.fast and not config.plugin_path.is_file():
+            raise RuntimeStartupError(
+                f"--fast: --plugin-path must name one plugin library file "
+                f"(for example .../hipdnn_plugins/engines/libmiopen_plugin.so); "
+                f"got {config.plugin_path}",
+                exit_code=2,
+            )
+    if RuntimeName.ROCKE in config.runtimes:
+        files = [str(p) for p in paths if p.is_file()]
+        if files:
+            raise RuntimeStartupError(
+                "--runtime rocke reads the kernel descriptors under plugin "
+                f"directories; --plugin-path names a file: {', '.join(files)}",
+                exit_code=2,
+            )
 
 
 def _check_engines_loaded(

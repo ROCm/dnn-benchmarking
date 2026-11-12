@@ -3,11 +3,15 @@
 
 """Oracle pass: time a tuned run next to a row's OOTB run.
 
-hipDNN rows get a second plan for the same engine, built with the
-``global.benchmarking`` knob (:func:`build_tuned_plan`) right after the OOTB
-build and timed after the OOTB loop (:func:`run_tuned_plan`). PyTorch rows get
-a tuned run in an isolated child process (:func:`run_pytorch_tuned`). A failed
-tuned run sets ``row.oracle_error`` and never fails the row.
+Every tuned run is a child process, so it can use the tuned selection state
+of the work dir (``common.work_dir``: hipDNN cache and MIOpen user database,
+kept across commands) while the row's OOTB run, in this process, uses the
+OOTB state: MIOpen reads ``MIOPEN_USER_DB_PATH`` once per process. A
+hipDNN row's tuned run builds the same engine with the
+``global.benchmarking`` knob in ``cli/hipdnn_tuned_child.py``
+(:func:`run_hipdnn_tuned`); a PyTorch row's tuned run is the normal CLI in
+``cli/pytorch_tuned_child.py`` (:func:`run_pytorch_tuned`). A failed tuned
+run sets ``row.oracle_error`` and never fails the row.
 """
 
 import json
@@ -15,11 +19,13 @@ import os
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
+import numpy as np
+
+from ..common.work_dir import SelectionState, tuned_state, work_dir
 from ..config.benchmark_config import SuiteConfig
 from ..graph.tensor_info import TensorInfo
 from ..metrics._diagnostic import warn_once
@@ -29,26 +35,15 @@ from ..reporting.statistics import BenchmarkStats, TimingInfo
 from ..reporting.suite_results import OracleResult, ProviderEngineResult
 from ..validation import ReferenceOutput
 from .correctness import check_correctness
-from .executor import Executor
-from .timing import StallFallbackError
+from .timing import Measurement, StallFallbackError
 
 #: hipDNN knob that makes a provider sample its candidate kernels on the first
 #: execute() and keep the fastest (kernel ingestor, MIOpen).
 BENCHMARKING_KNOB = "global.benchmarking"
 
-# A benchmarking plan writes its winner to the hipDNN disk cache, and cache
-# reads are not gated on benchmarking, so a later OOTB row would serve it.
-# ponytail: process-global guard; concurrent execution needs process isolation.
-_TUNED_ENV = {"HIPDNN_DISABLE_CACHE": "1"}
-
-# hipDNN also keeps each winner in memory for the life of the process, even
-# with HIPDNN_DISABLE_CACHE=1, and serves it to every later build of the same
-# graph content and engine, with or without the knob. An OOTB build of a pair
-# listed here would time the tuned kernel. Filled when a tuned plan executes.
-# ponytail: keyed by graph_id (exact JSON), so graphs that differ only in
-# names or UIDs still share hipDNN's content key; a child process per tuned
-# hipDNN pass removes this registry.
-_TUNED_IN_PROCESS: Set[Tuple[str, int]] = set()
+#: Files that ``cli/hipdnn_tuned_child.py`` writes in its directory.
+RESULT_FILE = "result.json"
+FAILURE_FILE = "failure.json"
 
 #: Node types whose PyTorch kernel the tuned child searches: MIOpen
 #: exhaustive conv search (cudnn.benchmark) and TunableOp GEMMs.
@@ -62,33 +57,23 @@ _PYTORCH_TUNABLE_OPS = frozenset(
 )
 
 
-def tuned_in_process(graph_id: str, engine_id: int) -> bool:
-    """True when this engine already executed a tuned plan for this graph."""
-    return (graph_id, engine_id) in _TUNED_IN_PROCESS
+def output_file(out_dir: Path, uid: int) -> Path:
+    """Path of the tuned child's saved output tensor ``uid``."""
+    return out_dir / f"output_{uid}.npy"
 
 
-@contextmanager
-def _tuned_env() -> Iterator[None]:
-    """Disable hipDNN disk caches and restore the prior environment."""
-    previous = {name: os.environ.get(name) for name in _TUNED_ENV}
-    os.environ.update(_TUNED_ENV)
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+@dataclass(frozen=True)
+class _SavedOutputs:
+    """The tuned child's saved outputs, as ``check_correctness`` reads them."""
 
+    out_dir: Path
 
-@dataclass
-class TunedPlan:
-    """A built tuned plan waiting for :func:`run_tuned_plan`."""
+    def get_output_tensor(self, uid: int) -> None:
+        return None  # Host arrays only: compare on the host.
 
-    executor: Executor
-    handle: Any
-    tuning_available: bool
+    def get_output_data(self, uid: int) -> Optional[np.ndarray]:
+        path = output_file(self.out_dir, uid)
+        return np.load(path) if path.is_file() else None
 
 
 def _record_error(row: ProviderEngineResult, what: str, e: Exception) -> None:
@@ -104,89 +89,120 @@ def _set_throughputs(oracle: OracleResult, row: ProviderEngineResult) -> None:
     )
 
 
-def build_tuned_plan(
+def _tuned_state(config: SuiteConfig) -> SelectionState:
+    """The tuned selection state that every tuned run shares, created."""
+    return tuned_state(work_dir(config.benchmark_work_dir)).create()
+
+
+def _child_failure(proc: "subprocess.CompletedProcess[str]") -> str:
+    """The child's last error line, or its last line, for an error message."""
+    lines = [
+        line.strip()
+        for line in f"{proc.stdout or ''}\n{proc.stderr or ''}".splitlines()
+        if line.strip()
+    ]
+    errors = [line for line in lines if "error" in line.lower()]
+    return (errors or lines or ["no output"])[-1]
+
+
+def _hipdnn_tuned_argv(
+    graph_path: Path,
+    engine_id: int,
+    plugin_path: Optional[Path],
+    config: SuiteConfig,
+    out_dir: Path,
+    save_outputs: bool,
+) -> List[str]:
+    """Argv of ``cli/hipdnn_tuned_child.py``, with the full timing policy."""
+    argv = [
+        sys.executable,
+        "-m",
+        "dnn_benchmarking.cli.hipdnn_tuned_child",
+        "--graph",
+        str(graph_path),
+        "--engine",
+        str(engine_id),
+        "--seed",
+        str(config.seed),
+        "--timing-policy",
+        json.dumps(asdict(config.timing_policy)),
+        "--out-dir",
+        str(out_dir),
+    ]
+    if plugin_path is not None:
+        argv += ["--plugin-path", str(plugin_path)]
+    if save_outputs:
+        argv.append("--save-outputs")
+    return argv
+
+
+#: Selection variable that the tuned hipDNN child must run with. Forced, not
+#: defaulted: providers apply ``HIPDNN_FORCE_BENCHMARKING`` over the knob, so
+#: an inherited ``0`` would make the tuned run untuned.
+TUNED_CHILD_ENV = {"HIPDNN_FORCE_BENCHMARKING": "1"}
+
+
+def _hipdnn_tuned_env(config: SuiteConfig) -> Dict[str, str]:
+    """The tuned child's environment: :data:`TUNED_CHILD_ENV` and the tuned
+    selection state (``HIPDNN_CACHE_DIR``, ``MIOPEN_USER_DB_PATH``). An
+    inherited ``HIPDNN_DISABLE_CACHE`` stays as it is."""
+    env = dict(os.environ)
+    env.update(TUNED_CHILD_ENV)
+    env.update(_tuned_state(config).env())
+    return env
+
+
+def run_hipdnn_tuned(
     *,
     row: ProviderEngineResult,
-    handle: Any,
-    engine_id: int,
-    graph_json_str: str,
+    graph_path: Path,
     graph_name: str,
-    config: SuiteConfig,
-) -> Optional[TunedPlan]:
-    """Build this engine's tuned plan right after its OOTB build.
-
-    The tuned plan goes through the same timed build as the OOTB plan, for
-    the same engine, with ``global.benchmarking=1``. Building it before
-    anything executes keeps both build times in the same process state: work
-    in between (the OOTB timed loop, validation) slows a later build.
-
-    Returns:
-        The plan for :func:`run_tuned_plan`, or None after recording
-        ``row.oracle_error``.
-    """
-    try:
-        with _tuned_env():
-            # Isolate MIOpen's mutable per-handle solver map from the OOTB plan.
-            oracle_handle = type(handle)()
-            oracle_handle.set_stream(handle.get_stream())
-            executor = Executor(graph_json_str, config.timing_policy)
-            executor.prepare(
-                oracle_handle, engine_id=engine_id, knobs={BENCHMARKING_KNOB: 1}
-            )
-            # hipDNN ignores a knob the engine does not expose; such a tuned
-            # run re-measures the OOTB configuration.
-            available = BENCHMARKING_KNOB in executor.engine_knob_ids(engine_id)
-        return TunedPlan(executor, oracle_handle, available)
-    except Exception as e:
-        _record_error(row, f"{graph_name} engine {engine_id}", e)
-        return None
-
-
-def run_tuned_plan(
-    *,
-    tuned: TunedPlan,
-    row: ProviderEngineResult,
-    graph_id: str,
-    engine_id: int,
-    graph_name: str,
-    config: SuiteConfig,
-    bm: Any,
-    variant_pack: Dict[int, int],
     tensor_infos: List[TensorInfo],
     reference_outputs: Optional[Dict[int, ReferenceOutput]],
+    engine_id: int,
+    plugin_path: Optional[Path],
+    config: SuiteConfig,
 ) -> None:
-    """Time and validate the tuned plan; attach it as ``row.oracle``.
+    """Time the engine's tuned plan in a child; attach it as ``row.oracle``.
 
-    ``measure`` makes one untimed first launch before the warmups. With
-    benchmarking on, that launch samples every candidate and keeps the
-    fastest, so the search cost lands in ``timing.first_call_ms`` and the
-    tuned plan gets the same warmups as the OOTB plan.
+    Call after the row's OOTB buffers and plans are released, so the child's
+    VRAM does not stack on them. With ``reference_outputs``, the child saves
+    its outputs and this process validates them like the OOTB row's. The
+    child's first, untimed launch runs the search, so the search cost lands
+    in ``timing.first_call_ms``.
+
+    Raises:
+        StallFallbackError: The stall gate failed in the child; the suite
+            runner then remeasures the whole graph without it. Any other
+            failure only sets ``row.oracle_error``.
     """
-    try:
-        with _tuned_env():
-            if tuned.tuning_available:
-                # Before the launch: a search that fails part way may still
-                # leave a winner behind.
-                _TUNED_IN_PROCESS.add((graph_id, engine_id))
-            bm.zero_outputs()
-            m = tuned.executor.benchmark(tuned.handle, variant_pack)
+    what = f"{graph_name} engine {engine_id}"
+    with tempfile.TemporaryDirectory(prefix="dnn-bench-hipdnn-tuned-") as state:
+        out_dir = Path(state)
+        try:
+            result = _run_hipdnn_tuned_child(
+                graph_path,
+                engine_id,
+                plugin_path,
+                config,
+                out_dir,
+                save_outputs=reference_outputs is not None,
+            )
+            m = Measurement(**result["measurement"])
             oracle = OracleResult(
-                tuning_available=tuned.tuning_available,
-                cpu_build_time_ms=tuned.executor.build_time_ms,
+                tuning_available=result["tuning_available"],
+                cpu_build_time_ms=result["build_ms"],
                 timing=TimingInfo.from_measurement(m),
                 gpu_kernel_stats=BenchmarkStats.from_timings(m.kernel_ms),
                 host_stats=BenchmarkStats.from_timings(m.host_ms),
                 workspace_bytes=(
-                    tuned.executor.workspace_size if config.metrics.basic else None
+                    result["workspace_bytes"] if config.metrics.basic else None
                 ),
             )
             _set_throughputs(oracle, row)
-
             if reference_outputs is not None:
-                bm.zero_outputs()
-                tuned.executor.execute_once(tuned.handle, variant_pack)
                 oracle.correctness = check_correctness(
-                    bm,
+                    _SavedOutputs(out_dir),
                     tensor_infos,
                     reference_outputs,
                     config.validation.provider.value,
@@ -195,14 +211,54 @@ def run_tuned_plan(
                 if oracle.correctness.explicitly_failed:
                     warn_once(
                         "oracle_correctness",
-                        f"tuned plan for {graph_name} engine {engine_id} failed "
-                        "validation; no speedup is reported",
+                        f"tuned plan for {what} failed validation; no speedup "
+                        "is reported",
                     )
-        row.oracle = oracle
-    except StallFallbackError:
-        raise  # The suite runner remeasures the whole graph unstalled.
-    except Exception as e:
-        _record_error(row, f"{graph_name} engine {engine_id}", e)
+        except StallFallbackError:
+            raise  # The suite runner remeasures the whole graph unstalled.
+        except Exception as e:
+            _record_error(row, what, e)
+            return
+    row.oracle = oracle
+
+
+def _run_hipdnn_tuned_child(
+    graph_path: Path,
+    engine_id: int,
+    plugin_path: Optional[Path],
+    config: SuiteConfig,
+    out_dir: Path,
+    save_outputs: bool,
+) -> Dict[str, Any]:
+    """Run ``cli/hipdnn_tuned_child.py``; return its ``result.json``.
+
+    Raises:
+        StallFallbackError: The child reports a failed stall gate.
+        RuntimeError: The child failed, timed out (``--oracle-timeout``)
+            or wrote no result.
+    """
+    timeout_s = config.oracle_timeout_s or None
+    argv = _hipdnn_tuned_argv(
+        graph_path, engine_id, plugin_path, config, out_dir, save_outputs
+    )
+    try:
+        proc = run_capped(argv, timeout_s, env=_hipdnn_tuned_env(config))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"tuned hipDNN child timed out after {timeout_s} s (--oracle-timeout)"
+        ) from None
+    failure_path = out_dir / FAILURE_FILE
+    if failure_path.is_file():
+        failure = json.loads(failure_path.read_text())
+        if failure["kind"] == "stall":
+            raise StallFallbackError(failure["message"])
+        raise RuntimeError(failure["message"])
+    result_path = out_dir / RESULT_FILE
+    if proc.returncode != 0 or not result_path.is_file():
+        raise RuntimeError(
+            f"tuned hipDNN child exited {proc.returncode}: {_child_failure(proc)}"
+        )
+    return json.loads(result_path.read_text())
 
 
 def _pytorch_tuned_argv(
@@ -239,6 +295,8 @@ def _pytorch_tuned_argv(
         config.pytorch_sdpa_backend.value,
         "--output",
         str(output),
+        "--benchmark-work-dir",
+        str(work_dir(config.benchmark_work_dir)),
     ]
     if config.pytorch_rocm_fa_library is not None:
         argv += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
@@ -248,40 +306,34 @@ def _pytorch_tuned_argv(
 def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str, Any]:
     """Time tuned PyTorch in a fresh process and return its result row.
 
-    The child owns every piece of tuning state (conv algorithm cache,
-    TunableOp results, MIOpen user database), and the temporary directory
-    that holds it is deleted afterwards, so no OOTB run can observe it.
+    The child owns the conv algorithm cache and the TunableOp results, in a
+    temporary directory that is deleted afterwards. It runs on the tuned
+    selection state of the work dir; no OOTB run uses it.
 
     Raises:
-        RuntimeError: If the child fails, times out (``--profiling-timeout``)
+        RuntimeError: If the child fails, times out (``--oracle-timeout``)
             or reports no successful row.
     """
     from ..common.pytorch_tuning import tuned_subprocess_env
 
     with tempfile.TemporaryDirectory(prefix="dnn-bench-pytorch-tuned-") as state_dir:
         output = Path(state_dir) / "result.json"
-        timeout_s = config.metrics.profiling_timeout_s or None
+        timeout_s = config.oracle_timeout_s or None
         try:
             proc = run_capped(
                 _pytorch_tuned_argv(graph_path, config, output),
                 timeout_s,
-                env=tuned_subprocess_env(state_dir),
+                env=tuned_subprocess_env(state_dir, _tuned_state(config)),
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(
                 f"tuned PyTorch child timed out after {timeout_s} s "
-                "(--profiling-timeout)"
+                "(--oracle-timeout)"
             ) from None
         if not output.is_file():
-            lines = [
-                line.strip()
-                for line in f"{proc.stdout or ''}\n{proc.stderr or ''}".splitlines()
-                if line.strip()
-            ]
-            errors = [line for line in lines if "error" in line.lower()]
-            detail = (errors or lines or ["no output"])[-1]
             raise RuntimeError(
-                f"tuned PyTorch child exited {proc.returncode}: {detail}"
+                f"tuned PyTorch child exited {proc.returncode}: "
+                f"{_child_failure(proc)}"
             )
         document = json.loads(output.read_text())
     rows = [row for graph in document["graphs"] for row in graph["results"]]

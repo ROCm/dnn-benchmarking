@@ -1423,3 +1423,50 @@ def test_activate_puts_the_install_prefix_before_the_toolchain(
         check=True,
     ).stdout
     assert ld_path == "/install/lib:/toolchain/lib"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            (),
+            [
+                (
+                    "install",
+                    "--config-settings",
+                    "editable_mode=compat",
+                    "-e",
+                    "platform",
+                ),
+                (
+                    "install",
+                    "--no-deps",
+                    "--config-settings",
+                    "editable_mode=compat",
+                    "-e",
+                    "library",
+                ),
+            ],
+        ),
+        (
+            ("--no-editable",),
+            [("install", "platform"), ("install", "--no-deps", "library")],
+        ),
+    ],
+)
+def test_rocke_install_honours_no_editable(
+    setup_env, tmp_path, monkeypatch, argv, expected
+) -> None:
+    """A copied --no-editable venv must not point back at the rocKE sources."""
+    rocke = tmp_path / "rl" / "dnn-providers" / "hip-kernel-provider" / "rocke"
+    (rocke / "library").mkdir(parents=True)
+    (rocke / "library" / "pyproject.toml").write_text("")
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", tmp_path / "rl")
+    setup = _setup(setup_env, tmp_path, *argv)
+    calls = []
+    monkeypatch.setattr(setup, "pip", lambda *args: calls.append(args))
+
+    setup.install_rocke_packages()
+
+    package_dirs = {name: str(rocke / name) for name in ("platform", "library")}
+    assert calls == [tuple(package_dirs.get(a, a) for a in call) for call in expected]

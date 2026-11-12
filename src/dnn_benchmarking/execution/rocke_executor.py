@@ -43,6 +43,41 @@ class LoadedVariant(NamedTuple):
     block: Tuple[int, int, int]
 
 
+#: The arguments hipDNN's ``Gfx950AttentionDense`` launch binds, by name: the
+#: graph tensors, then the softmax scale and the graph shape. Each scalar is
+#: the ``SdpaProblem`` field of its name. hipDNN's dispatch.v1 kernels take
+#: the scale, batch and sequence lengths; dispatch.v2 kernels (rocm-libraries
+#: 8149ff0 and later) also take the head counts.
+_VARIANT_TENSOR_ARGS = ("q_ptr", "k_ptr", "v_ptr", "o_ptr")
+_VARIANT_SCALAR_ARGS = frozenset(
+    ("scale", "batch", "seqlen_q", "seqlen_kv", "num_query_heads", "num_kv_heads")
+)
+
+
+def variant_args(
+    arg_names: Tuple[str, ...], problem: SdpaProblem, q, k, v, o
+) -> Dict[str, Any]:
+    """The value of each argument that a catalog variant lists, as hipDNN binds it.
+
+    Raises:
+        ExecutionError: The variant lists an argument that hipDNN's dense
+            launch does not bind, so this tool cannot launch it as hipDNN does.
+    """
+    pointers = dict(zip(_VARIANT_TENSOR_ARGS, (q, k, v, o)))
+    unknown = [
+        n for n in arg_names if n not in pointers and n not in _VARIANT_SCALAR_ARGS
+    ]
+    if unknown:
+        raise ExecutionError(
+            f"the variant takes kernel arguments {unknown} that hipDNN's dense "
+            "attention launch does not bind"
+        )
+    return {
+        n: pointers[n].data_ptr() if n in pointers else getattr(problem, n)
+        for n in arg_names
+    }
+
+
 def load_variant(
     kernel: CatalogKernel,
     problem: SdpaProblem,
@@ -201,18 +236,9 @@ class RockeExecutor:
         kernel = self._kernel
         assert isinstance(kernel, CatalogKernel)
         p = self._problem
+        values = variant_args(kernel.arg_names, p, q, k, v, o)
         variant = load_variant(kernel, p, self._loaded)
         self.build_time_ms = variant.load_ms
-        values = {
-            "q_ptr": q.data_ptr(),
-            "k_ptr": k.data_ptr(),
-            "v_ptr": v.data_ptr(),
-            "o_ptr": o.data_ptr(),
-            "scale": p.scale,
-            "batch": p.batch,
-            "seqlen_q": p.seqlen_q,
-            "seqlen_kv": p.seqlen_kv,
-        }
         config = LaunchConfig(
             stream=int(self._stream.cuda_stream),
             grid=variant.grid,

@@ -61,7 +61,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 |---|---|
 | `--torch-mode {rocm,cuda,cpu,existing,none}` | How to provide PyTorch. Default `rocm`. See [Torch modes](#torch-modes). |
 | `--workspace WORKSPACE` | Root for the venv, the Python bytecode cache and the runtime caches. See [Workspace](#workspace). |
-| `--no-editable` | Install dnn-benchmarking into the venv. The default links to the source tree. |
+| `--no-editable` | Install dnn-benchmarking and the rocKE packages into the venv. The default links to the source tree. |
 | `--torch-index-url URL` | pip index URL for PyTorch. |
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
@@ -95,7 +95,7 @@ On Linux the venv activation script exports these variables:
 |---|---|
 | `ROCM_PATH` | The selected ROCm prefix. |
 | `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
-| `DNN_BENCH_WORKSPACE` | The workspace. dnn-benchmarking puts MIOpen, comgr and XDG caches under it when those variables are not set. |
+| `DNN_BENCH_WORKSPACE` | The workspace. The default `--benchmark-work-dir` is `<workspace>/work`: compile caches, and the kernel-selection state of the runs. |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
 | `AITER_JIT_DIR` | `<venv>/aiter-jit`, where the `AITER` stage compiles AITER's modules. A plain `import aiter` in the venv loads them. |
 
@@ -119,6 +119,16 @@ A CPU-only PyTorch never enables `--runtime pytorch`. It is only for
 Every mode that provides PyTorch needs PyTorch 2.5 or later: the SDPA
 reference passes `enable_gqa` to `F.scaled_dot_product_attention`.
 `--torch-mode existing` does not check the version.
+
+With CPU-only torch, `--validate pytorch` still grades every hipDNN engine
+row: the reference outputs are computed on the CPU. Only the timed `pytorch`
+reference row is skipped, and its `skip_reason` names which of the row's two
+steps failed ("Timing skipped" or "Reference output pass failed"), says that
+engines are still graded, and gives the CPU reference time. The CPU reference
+is much slower for large SDPA graphs (on an MI355X host with 8 cores, the CPU
+reference for B4 H48 fp16 graphs took 2.8 s at S1024, 10 s at S2048 and 65 s
+at S4096, while the whole three-graph run took about 6 s with ROCm torch), so
+use ROCm torch for large correctness runs.
 
 The modes `cpu`, `existing` (with CPU PyTorch) and `none` use
 `--rocm-prefix`, `$ROCM_PATH` or `/opt/rocm` as the prefix. Without
@@ -258,8 +268,11 @@ you turn an engine option off, setup still installs the plugin `.so`. Graphs
 that only that engine supports then report `no engines applicable`.
 
 On Linux, setup also installs the rocKE Python packages (`rocke`, `kernels`,
-`builders`, `dispatch`) into the venv as editable installs from
-`rocm-libraries/dnn-providers/hip-kernel-provider/rocke`. `--runtime rocke`
+`builders`, `dispatch`) into the venv from
+`rocm-libraries/dnn-providers/hip-kernel-provider/rocke`. They are editable
+installs by default; with `--no-editable` setup copies them into the venv, so
+a venv copied without the checkout (as in a multi-stage image) still imports
+them. `--runtime rocke`
 needs them. In a source build they come from the same checkout as the
 plugins, so rocKE's specs and runtime match the kernels that the plugin
 ships. With `--reuse-artifacts`, the plugins come from an earlier build, so

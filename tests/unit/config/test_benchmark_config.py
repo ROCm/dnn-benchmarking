@@ -111,7 +111,6 @@ id = 1
             (["--perf"], "--perf"),
             (["--roofline"], "--roofline"),
             (["--autotune"], "--autotune"),
-            (["--hipdnn-cache-dir", "/c"], "--hipdnn-cache-dir"),
         ],
     )
     def test_pytorch_runtime_rejects_hipdnn_only_options(
@@ -256,6 +255,51 @@ class TestSuiteConfigValidation:
         """Only hipDNN and rocKE fall back to the ROCm plugin directory."""
         config = SuiteConfig.from_namespace(_namespace(["-r", "aiter"]))
         assert (config.runtimes, config.plugin_paths) == ((RuntimeName.AITER,), None)
+
+
+class TestFast:
+    """--fast runs one engine in this process; it rejects what needs more."""
+
+    _BASE = ["--fast", "-e", "MIOPEN_ENGINE", "--plugin-path", "/p/libmiopen.so"]
+
+    def test_one_engine_and_one_plugin_file_is_accepted_with_selection_options(
+        self,
+    ) -> None:
+        argv = [*self._BASE, "--autotune", "--benchmark-work-dir", "/w"]
+        config = SuiteConfig.from_namespace(_namespace(argv))
+        assert (config.fast, config.autotune, config.benchmark_work_dir) == (
+            True,
+            True,
+            str(Path("/w")),
+        )
+
+    @pytest.mark.parametrize(
+        "argv, flag",
+        [
+            (["--validate", "pytorch"], "--validate"),
+            (["--oracle"], "--oracle"),
+            (["--pmc", "basic"], "--pmc"),
+            (["--trace"], "--trace"),
+            (["--perf"], "--perf"),
+            (["--roofline"], "--roofline"),
+            (["-r", "hipdnn,rocke"], "--runtime other than hipdnn"),
+        ],
+    )
+    def test_rejects_what_one_process_cannot_do(self, argv, flag) -> None:
+        with pytest.raises(ValueError, match=f"{flag} not supported with --fast"):
+            SuiteConfig.from_namespace(_namespace([*self._BASE, *argv]))
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--fast", "--plugin-path", "/p/libmiopen.so"],
+            ["--fast", "-e", "1,2", "--plugin-path", "/p/libmiopen.so"],
+        ],
+        ids=["no-engine", "two-engines"],
+    )
+    def test_requires_exactly_one_engine(self, argv) -> None:
+        with pytest.raises(ValueError, match="--fast requires exactly one --engine"):
+            SuiteConfig.from_namespace(_namespace(argv))
 
 
 class TestSuiteConfigPluginPaths:
