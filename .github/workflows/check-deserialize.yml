@@ -43,11 +43,22 @@ jobs:
       - name: Pull DVC-tracked workloads
         run: dvc pull
 
+      # Different tarballs may contain graphs with the same relative path.
       - name: Extract workload tarballs
         run: |
-          mkdir -p /tmp/workloads-extracted
-          find Workloads -iname '*.tar.gz' -print0 \
-            | xargs -0 -n1 -I{} tar xzf {} -C /tmp/workloads-extracted
+          set -o pipefail
+          first_archive="$(find Workloads -iname '*.tar.gz' -print -quit)"
+          if [[ -z "$first_archive" ]]; then
+            echo 'DVC pull materialized no workload tarballs' >&2
+            exit 1
+          fi
+          find Workloads -iname '*.tar.gz' -print0 |
+            while IFS= read -r -d '' archive; do
+              dest="/tmp/workloads-extracted/${archive#Workloads/}"
+              dest="${dest%.tar.gz}"
+              mkdir -p "$dest"
+              tar xzf "$archive" -C "$dest"
+            done
 
       # --level json only exercises dnn_benchmarking's pure-Python
       # GraphLoader, which doesn't know hipDNN's real node contract (tensor
