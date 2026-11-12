@@ -1687,7 +1687,9 @@ class TestPyTorchOpsNewHandlers:
         # change the gradient, which is exactly why autograd cannot be used.
         assert (dq_true - dq_shift).abs().max().item() > 1e-3
 
-    def test_sdpa_backward_rejects_dbias(self) -> None:
+    def test_sdpa_backward_rejects_dbias_without_bias(self) -> None:
+        """hipDNN's dBias is the gradient of the attn_mask bias, so a graph
+        without a bias has no dBias to compute."""
         q = torch.randn(1, 1, 2, 4)
         graph_json = {
             "tensors": [{"uid": 10, "dims": [1, 1, 2, 4]}],
@@ -1716,6 +1718,108 @@ class TestPyTorchOpsNewHandlers:
             pytorch_ops.execute_graph(
                 graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
             )
+
+    @pytest.mark.parametrize(
+        "bias_dims",
+        [(1, 4, 6, 7), (2, 1, 6, 7), (2, 4, 1, 7), (6, 7), (2, 4, 6, 7)],
+        ids=["shared-batch", "shared-heads", "per-key", "rank2", "full"],
+    )
+    @pytest.mark.parametrize(
+        "attrs, keep",
+        [
+            ({}, lambda i, j: True),
+            ({"causal_mask": True}, lambda i, j: j <= i),
+            ({"left_bound": 2, "right_bound": 0}, lambda i, j: i - 2 <= j <= i),
+            ({"causal_mask_bottom_right": True}, lambda i, j: j <= i + 1),
+            ({"causal_mask": True, "alibi_mask": True}, lambda i, j: j <= i),
+        ],
+        ids=["no-band", "causal", "window", "bottom-right", "alibi-causal"],
+    )
+    def test_sdpa_backward_dbias_matches_float64(
+        self, bias_dims, attrs, keep, monkeypatch
+    ) -> None:
+        """dBias is dS = P * (dP - D) before the scale, summed over each
+        broadcast bias dim (hipDNN CpuFpReferenceSdpa::backward). GQA graph,
+        three query blocks of two rows each."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa
+        from dnn_benchmarking.metrics.analytical.sdpa import alibi_slopes
+
+        batch, heads_q, heads_kv, q_len, kv_len, dim = 2, 4, 2, 6, 7, 8
+        # Scores of one query row: 2 batches x 4 heads x 7 keys x 4 bytes.
+        monkeypatch.setattr(
+            sdpa, "_SCORE_BLOCK_BYTES", 2 * batch * heads_q * kv_len * 4
+        )
+        torch.manual_seed(11)
+        scale = dim**-0.5
+        q = torch.randn(batch, heads_q, q_len, dim)
+        k = torch.randn(batch, heads_kv, kv_len, dim)
+        v = torch.randn(batch, heads_kv, kv_len, dim)
+        do = torch.randn(batch, heads_q, q_len, dim)
+        bias = torch.randn(bias_dims)
+
+        # Float64 autograd oracle: the bias broadcasts, so its gradient sums
+        # over every broadcast dim.
+        q64, k64, v64, bias64 = (t.double().requires_grad_() for t in (q, k, v, bias))
+        k_e = k64.repeat_interleave(heads_q // heads_kv, dim=1)
+        v_e = v64.repeat_interleave(heads_q // heads_kv, dim=1)
+        scores = (q64 @ k_e.transpose(-2, -1)) * scale + bias64
+        rows = torch.arange(q_len, dtype=torch.float64).unsqueeze(-1)
+        cols = torch.arange(kv_len, dtype=torch.float64).unsqueeze(0)
+        if attrs.get("alibi_mask"):
+            slopes = torch.from_numpy(alibi_slopes(heads_q)).reshape(heads_q, 1, 1)
+            scores = scores + (cols - rows) * slopes
+        visible = torch.tensor(
+            [[keep(i, j) for j in range(kv_len)] for i in range(q_len)]
+        )
+        scores = scores.masked_fill(~visible, float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+        out = torch.softmax(scores, dim=-1) @ v_e
+        out.backward(do.double())
+
+        graph_json = {
+            "tensors": [
+                {"uid": 7, "dims": list(bias_dims)},
+                {"uid": 13, "dims": list(bias_dims)},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                        "attn_mask_tensor_uid": 7,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 10,
+                        "dk_tensor_uid": 11,
+                        "dv_tensor_uid": 12,
+                        "dbias_tensor_uid": 13,
+                    },
+                    "attributes": {"attn_scale_value": scale, **attrs},
+                }
+            ],
+        }
+        tensors = {
+            1: q,
+            2: k,
+            3: v,
+            4: out.detach().float(),
+            5: do,
+            6: lse.detach().float(),
+            7: bias,
+        }
+        pytorch_ops.execute_graph(graph_json, tensors)
+
+        assert tensors[13].shape == bias.shape
+        torch.testing.assert_close(
+            tensors[13].double(), bias64.grad, rtol=1e-4, atol=1e-5
+        )
+        torch.testing.assert_close(tensors[10].double(), q64.grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(tensors[11].double(), k64.grad, rtol=1e-4, atol=1e-5)
 
     def test_sdpa_backward_rejects_sink(self) -> None:
         graph_json = {

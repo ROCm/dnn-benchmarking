@@ -60,9 +60,11 @@ and `offset` tensors of dims `[1, 1, 1, 1]`. The `model_spec` shapes and
 their sources are in `_MODEL_SPECS` in `tools/sdpa_fwd_to_bwd.py`.
 
 At rocm-libraries `b279712`, the hipDNN ASM SDPA backward engine declines
-dropout, bias, dBias and ALiBi. The PyTorch reference skips dropout and
-dBias graphs, and runs the ALiBi graphs with its fp32 formula. These graphs
-are in the collection so that new engines have a target.
+dropout, bias, dBias and ALiBi. The PyTorch reference skips dropout graphs,
+which include the `t5-large` dBias graph. It computes dBias for the
+`swin-base` and `alphafold2` graphs, and runs the ALiBi graphs with its fp32
+formula. These graphs are in the collection so that new engines have a
+target.
 
 ## Conversion rules
 
