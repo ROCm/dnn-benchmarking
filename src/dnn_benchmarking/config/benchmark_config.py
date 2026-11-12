@@ -49,7 +49,6 @@ RUNTIME_OPTIONS: Dict[RuntimeName, frozenset] = {
             "--perf",
             "--roofline",
             "--autotune",
-            "--hipdnn-cache-dir",
             "--oracle",
             "--plugin-path",
             "--validate pytorch",
@@ -403,10 +402,21 @@ class SuiteConfig:
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
     #: what the shipped kernel set can deliver.
     autotune: bool = False
-    #: Per-run HIPDNN_CACHE_DIR. The winner cache is on disk and outlives the
-    #: job; reads are not gated on benchmarking while writes are, so without an
-    #: explicit empty root an untuned phase can replay a previous tuned ranking.
-    hipdnn_cache_dir: Optional[str] = None
+    #: ``--benchmark-work-dir``: compile caches and the kept OOTB and tuned
+    #: selection states (``common.work_dir``). ``None``: the default work dir.
+    benchmark_work_dir: Optional[str] = None
+    #: Run this command on a new, empty selection state in the system
+    #: temporary directory instead of a kept one (``common.work_dir``).
+    fresh_state: bool = False
+    #: Wall-clock limit in seconds of each tuned child (one per hipDNN or
+    #: PyTorch row); 0: none. Finite by default, so a hung search costs one
+    #: row, not the run.
+    oracle_timeout_s: int = 1800
+    #: Run every graph through one engine in this process: one hipDNN handle
+    #: with only the plugin under test loaded, primed once, on the kept OOTB
+    #: selection state of the work dir (``common.work_dir``). Needs one
+    #: ``--engine`` and a ``--plugin-path`` that names its plugin library.
+    fast: bool = False
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
     #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
@@ -471,9 +481,12 @@ class SuiteConfig:
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
             autotune=args.autotune,
-            hipdnn_cache_dir=(
-                str(args.hipdnn_cache_dir) if args.hipdnn_cache_dir else None
+            benchmark_work_dir=(
+                str(args.benchmark_work_dir) if args.benchmark_work_dir else None
             ),
+            fresh_state=args.fresh_state,
+            oracle_timeout_s=args.oracle_timeout,
+            fast=args.fast,
         )
 
     def __post_init__(self) -> None:
@@ -514,6 +527,11 @@ class SuiteConfig:
                 "--oracle and --autotune cannot be combined: --autotune tunes "
                 "the OOTB plan too, so the comparison would measure nothing"
             )
+        if self.oracle_timeout_s < 0:
+            raise ValueError(
+                f"--oracle-timeout must be >= 0 (0 disables); "
+                f"got {self.oracle_timeout_s}"
+            )
         (
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
@@ -528,7 +546,6 @@ class SuiteConfig:
             ("--perf", self.metrics.perf),
             ("--roofline", self.metrics.roofline),
             ("--autotune", self.autotune),
-            ("--hipdnn-cache-dir", self.hipdnn_cache_dir is not None),
             ("--oracle", self.oracle),
             ("--plugin-path", self.plugin_paths is not None),
             (
@@ -549,6 +566,32 @@ class SuiteConfig:
             raise ValueError(
                 f"{', '.join(dict.fromkeys(flags))} not supported with "
                 f"--runtime {names}"
+            )
+        if self.fast:
+            self._check_fast()
+
+    def _check_fast(self) -> None:
+        """Reject what ``--fast`` cannot do in one process with one engine.
+
+        Validation, the oracle and profiling need torch or other processes.
+        """
+        rejected = [
+            ("--validate", self.validation.enabled),
+            ("--oracle", self.oracle),
+            ("--pmc", self.metrics.pmc_set is not None),
+            ("--trace", self.metrics.trace),
+            ("--perf", self.metrics.perf),
+            ("--roofline", self.metrics.roofline),
+            ("--runtime other than hipdnn", self.runtimes != (RuntimeName.HIPDNN,)),
+        ]
+        flags = [flag for flag, present in rejected if present]
+        if flags:
+            raise ValueError(f"{', '.join(flags)} not supported with --fast")
+        if self.engine_filter is None or len(self.engine_filter) != 1:
+            raise ValueError("--fast requires exactly one --engine")
+        if self.plugin_paths is None or len(self.plugin_paths) != 1:
+            raise ValueError(
+                "--fast requires --plugin-path to name one plugin library file"
             )
 
     @property

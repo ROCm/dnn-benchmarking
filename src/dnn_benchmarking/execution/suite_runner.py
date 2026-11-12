@@ -25,6 +25,7 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -33,6 +34,7 @@ from ..config.benchmark_config import (
     PyTorchSdpaBackendName,
     ReferencePrecision,
     SuiteConfig,
+    TimingPolicy,
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
@@ -51,12 +53,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import (
-    build_tuned_plan,
-    run_pytorch_tuned,
-    run_tuned_plan,
-    tuned_in_process,
-)
+from .oracle import run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
     Catalog,
     RockeKernel,
@@ -85,7 +82,6 @@ class _GraphContext:
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
-    graph_id: str = ""  # hipDNN runs only
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -401,6 +397,46 @@ def _failure_message(error: Exception, memory_at_start: Optional[str]) -> str:
     return message
 
 
+def _row_step(stage: str, fatal: bool) -> Optional[str]:
+    """What a reference row was doing when it failed, or None after both steps.
+
+    The row has two steps, and naming the timed loop is the wrong thing to say
+    about a failure of the second one. A failure after both (``post``: the
+    tuned run, the reference warnings) is neither step.
+    """
+    if stage == "timing":
+        return "Timing failed" if fatal else "Timing skipped"
+    if stage == "reference":
+        return "Reference output pass failed"
+    return None
+
+
+def _failed_pytorch_row(
+    row: ProviderEngineResult,
+    fatal: bool,
+    message: str,
+    role: Literal["engine", "reference"],
+    stage: str,
+) -> ProviderEngineResult:
+    """The failed PyTorch row: which step failed, and its timings if it has any.
+
+    A reference row has two steps. Once the timed loop is through, its numbers
+    are real, so a later failure leaves them on the row instead of replacing
+    it with a reason-only row.
+    """
+    step = _row_step(stage, fatal) if role == "reference" else None
+    if step is not None:
+        message = f"{step} ({message})."
+    if stage == "timing":
+        return _failed_row(_error_or_skip(fatal), row, message)
+    row.status = "error" if fatal else "skipped"
+    if fatal:
+        row.error_message = message
+    else:
+        row.skip_reason = message
+    return row
+
+
 def _time_pytorch_row(
     ctx: _GraphContext, role: Literal["engine", "reference"]
 ) -> Tuple[ProviderEngineResult, Optional[Dict[int, ReferenceOutput]]]:
@@ -411,7 +447,8 @@ def _time_pytorch_row(
     selection is strict. Any other failure of a default-dispatch reference
     is skipped (the CPU reference may still serve); any other failure of a
     strict SDPA selection or of the ``--runtime pytorch`` engine row is an
-    error.
+    error. A reference row that timed cleanly and then failed its output
+    pass keeps the timings it measured.
     """
     config = ctx.config
     strict = config.pytorch_sdpa_backend is not PyTorchSdpaBackendName.DEFAULT
@@ -424,6 +461,10 @@ def _time_pytorch_row(
         engine_version=_package_version("torch"),
     )
     outputs: Optional[Dict[int, ReferenceOutput]] = None
+    # "timing" until the timed loop is done, then "reference" while the
+    # reference output pass runs. Whichever one raises is what the row has to
+    # name, and a "reference" failure leaves real timings on the row.
+    stage = "timing"
     memory_at_start = _gpu_memory_at_row_start()
     try:
         from . import pytorch_ops
@@ -446,13 +487,18 @@ def _time_pytorch_row(
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             row.warnings = (row.warnings or []) + executor.notes
             if role == "reference":
+                stage = "reference"
                 bm.zero_outputs()
-                executor.execute_once(tensors)
+                # Timing above used the selected backend; the outputs the
+                # engine rows are graded against come from repeatable SDPA.
+                with pytorch_ops.reference_sdpa_pass():
+                    executor.execute_once(tensors)
                 # A profiling child allocates its own VRAM, so profiled runs
                 # keep host-only references (and DeviceBuffer I/O).
                 outputs = _pytorch_reference_outputs_from_buffer(
                     bm, keep_device=not config.metrics.opt_in_pass_requested
                 )
+                stage = "post"
         if role == "reference":
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
                 ctx.graph_json
@@ -470,23 +516,48 @@ def _time_pytorch_row(
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
-        return _failed_row(_error_or_skip(strict), row, str(e)), None
+        return _failed_pytorch_row(row, strict, str(e), role, stage), None
     except Exception as e:
         fatal = role == "engine" or strict
         message = _failure_message(e, memory_at_start)
-        return _failed_row(_error_or_skip(fatal), row, message), None
+        return _failed_pytorch_row(row, fatal, message, role, stage), None
     return row, outputs
+
+
+class EnginePrimer:
+    """Primes an engine before its timed build.
+
+    Priming absorbs the engine's one-time build costs (provider setup, cold
+    plugin and kernel file reads), so the timed build starts warm. By default
+    every row primes. With ``once`` (``--fast``: one handle for the whole
+    run) only the first successful prime of each engine runs; later graphs
+    find the engine already warm.
+    """
+
+    def __init__(self, once: bool = False) -> None:
+        self._once = once
+        self._primed: Set[int] = set()
+
+    def prime(
+        self, handle: Any, graph_json_str: str, policy: TimingPolicy, engine_id: int
+    ) -> None:
+        if self._once and engine_id in self._primed:
+            return
+        Executor(graph_json_str, policy).prime(handle, engine_id)
+        self._primed.add(engine_id)
 
 
 def run_single_provider_engine(
     ctx: _GraphContext,
     handle: Any,
+    primer: EnginePrimer,
     engine_id: int,
     engine_name: str,
     engine_version: str,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
-    """Build, time, validate (and optionally tune/profile) one hipDNN engine."""
+    """Build, time and validate one hipDNN engine; then its tuned run and
+    profiling passes, each in a child process."""
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
     row = ProviderEngineResult(
@@ -499,34 +570,14 @@ def run_single_provider_engine(
     )
     memory_at_start = _gpu_memory_at_row_start()
     try:
-        if tuned_in_process(ctx.graph_id, engine_id):
-            # Typically the stall-fallback rerun of a graph whose first
-            # attempt already ran this engine's search, or a repeated graph.
-            raise RuntimeError(
-                "OOTB not measurable: this engine already ran a tuned search on "
-                "this graph in this process, and hipDNN would serve its winner"
-            )
         # Absorb the engine's one-time build costs (provider setup, cold
-        # plugin and kernel file reads) before timing, so the OOTB and tuned
-        # build times start from the same state.
-        Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
+        # plugin and kernel file reads) before the timed build.
+        primer.prime(handle, ctx.graph_json_str, config.timing_policy, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
         row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
-        tuned = (
-            build_tuned_plan(
-                row=row,
-                handle=handle,
-                engine_id=engine_id,
-                graph_json_str=ctx.graph_json_str,
-                graph_name=ctx.graph_name,
-                config=config,
-            )
-            if config.oracle
-            else None
-        )
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -540,23 +591,9 @@ def run_single_provider_engine(
             _validate_row(
                 row, ctx, bm, lambda: executor.execute_once(handle, variant_pack)
             )
-
-            if tuned is not None:
-                run_tuned_plan(
-                    tuned=tuned,
-                    row=row,
-                    graph_id=ctx.graph_id,
-                    engine_id=engine_id,
-                    graph_name=ctx.graph_name,
-                    config=config,
-                    bm=bm,
-                    variant_pack=variant_pack,
-                    tensor_infos=ctx.tensor_infos,
-                    reference_outputs=ctx.reference_outputs,
-                )
-        # Release both workspaces before the profiling child allocates its own
-        # VRAM; holding them roughly doubles peak VRAM on large graphs.
-        del executor, tuned
+        # Release the workspace before a child (tuned run, profiling) allocates
+        # its own VRAM.
+        del executor
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
@@ -568,8 +605,21 @@ def run_single_provider_engine(
             _failure_message(e, memory_at_start),
         )
 
-    # Profiling re-runs the workload after the timed pass, so profiler
-    # overhead cannot pollute the headline numbers.
+    # The tuned run and profiling run after the OOTB pass, each in its own
+    # process: the tuned run uses the kept tuned selection state while this
+    # process uses the OOTB one, and profiler overhead cannot pollute
+    # the headline numbers.
+    if config.oracle:
+        run_hipdnn_tuned(
+            row=row,
+            graph_path=ctx.graph_path,
+            graph_name=ctx.graph_name,
+            tensor_infos=ctx.tensor_infos,
+            reference_outputs=ctx.reference_outputs,
+            engine_id=engine_id,
+            plugin_path=plugin_path,
+            config=config,
+        )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
@@ -727,11 +777,21 @@ def _prepare_references(
             ctx.reference_error = ctx.validation_skip_reason
             warn_once("validation", f"{ctx.graph_name}: {ctx.validation_skip_reason}")
         else:
-            ctx.reference_outputs, ctx.reference_error = (
-                _compute_reference_outputs_once(
+            with Timer() as cpu_timer:
+                cpu_outputs, cpu_error = _compute_reference_outputs_once(
                     provider, ctx.graph_json, ctx.input_data, config
                 )
-            )
+            ctx.reference_outputs, ctx.reference_error = cpu_outputs, cpu_error
+            # The timed row produced no outputs. Its reason already names the
+            # step that failed; add that engines are still graded and what the
+            # CPU fallback cost, since no row times it.
+            if row.status == "skipped" and ctx.reference_outputs is not None:
+                row.skip_reason = (
+                    f"{row.skip_reason} "
+                    "Engine outputs are still validated against reference "
+                    "outputs computed on the CPU, which took "
+                    f"{cpu_timer.elapsed_ms / 1000:.1f} s."
+                )
     return row
 
 
@@ -945,7 +1005,7 @@ def _run_graph(
             errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
             graph.error = "; ".join(errors)
             return graph
-        ctx.graph_json_str, ctx.graph_id = json.dumps(graph_json), graph.graph_id
+        ctx.graph_json_str = json.dumps(graph_json)
         if config.validation.enabled:
             reference_row = _prepare_references(ctx)
             if reference_row is not None:
@@ -956,7 +1016,7 @@ def _run_graph(
     return graph
 
 
-def hipdnn_planner(handle: Any) -> GraphPlanner:
+def hipdnn_planner(handle: Any, prime_once: bool = False) -> GraphPlanner:
     """Plan every selected or discovered hipDNN engine.
 
     Explicit ``--engine`` IDs run in the caller's order; otherwise the graph's
@@ -967,7 +1027,10 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
     Args:
         handle: hipdnn.Handle, or None to create one per engine (per-engine
             plugin paths).
+        prime_once: Prime each engine only before its first build of the run
+            (``--fast``), not before every graph.
     """
+    primer = EnginePrimer(once=prime_once)
 
     def plan(
         graph_path: Path,
@@ -1002,7 +1065,7 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
             "hipdnn",
             engine_ids=engine_ids,
             rows=lambda ctx: [
-                _run_engine_selection(ctx, handle, s.engine_id, s.plugin_path)
+                _run_engine_selection(ctx, handle, primer, s.engine_id, s.plugin_path)
                 for s in selections
             ],
             message=message,
@@ -1015,6 +1078,7 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
 def _run_engine_selection(
     ctx: _GraphContext,
     handle: Any,
+    primer: EnginePrimer,
     engine_id: int,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
@@ -1043,7 +1107,7 @@ def _run_engine_selection(
         ctx.reporter,
         name,
         lambda: run_single_provider_engine(
-            ctx, handle, engine_id, name, version, plugin_path
+            ctx, handle, primer, engine_id, name, version, plugin_path
         ),
     )
 

@@ -18,6 +18,8 @@ hipDNN MIOpen plugin reads them too, so they would also change hipDNN rows.
 import os
 from typing import Dict
 
+from .work_dir import SelectionState
+
 # Always on. Each value is read from the environment by PyTorch itself.
 _DEFAULT_ENV = {
     # PyTorch's MIOpen conv path ignores channels-last strides unless this is
@@ -42,13 +44,16 @@ def apply_pytorch_environment() -> Dict[str, str]:
     return dict(_DEFAULT_ENV)
 
 
-def tuned_subprocess_env(state_dir: str) -> Dict[str, str]:
+def tuned_subprocess_env(state_dir: str, tuned: SelectionState) -> Dict[str, str]:
     """Return the environment for the isolated tuned-PyTorch child process.
 
-    TunableOp tunes GEMMs on first use. MIOpen's user database points at
-    ``state_dir``, so the exhaustive conv search neither reuses earlier tuning
-    nor leaves entries that a later OOTB run, PyTorch or hipDNN, would read.
-    These are forced, not defaulted: an inherited value would break isolation.
+    TunableOp tunes GEMMs on first use, into a results file in ``state_dir``
+    that is deleted with it. MIOpen's exhaustive conv search uses the tuned
+    selection state that every tuned run shares (``common.work_dir``). The
+    child's CLI sets the same state again (``cli.pytorch_tuned_child``); it is
+    also set here, so nothing in the child reads an inherited path first.
+    These are forced, not defaulted: an inherited value would change what the
+    child tunes.
     """
     env = dict(os.environ)
     env.update(
@@ -58,7 +63,7 @@ def tuned_subprocess_env(state_dir: str) -> Dict[str, str]:
             "PYTORCH_TUNABLEOP_FILENAME": os.path.join(
                 state_dir, "tunableop_results.csv"
             ),
-            "MIOPEN_USER_DB_PATH": state_dir,
+            **tuned.env(),
         }
     )
     return env

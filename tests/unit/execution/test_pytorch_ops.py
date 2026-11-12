@@ -1352,11 +1352,19 @@ class TestPyTorchOpsNewHandlers:
                 node("paged", 2, 2, inputs={"page_table_k_tensor_uid": 5}),
                 node("bottom_right", 2, 2, causal_mask_bottom_right=True),
                 node("sink", 2, 2, inputs={"sink_token_tensor_uid": 6}),
+                node("alibi", 2, 2, causal_mask=True, alibi_mask=True),
                 node(
                     "varlen",
                     2,
                     2,
                     inputs={"seq_len_q_tensor_uid": 7, "seq_len_kv_tensor_uid": 8},
+                ),
+                node(
+                    "bias_causal",
+                    2,
+                    2,
+                    causal_mask=True,
+                    inputs={"attn_mask_tensor_uid": 10},
                 ),
             ],
         }
@@ -1371,6 +1379,8 @@ class TestPyTorchOpsNewHandlers:
             "bottom_right",
             "sink",
             "varlen",
+            "alibi",
+            "bias_causal",
         }
         assert "sliding-window" in flagged["window"]
         assert "enable_gqa cannot express" in flagged["hk_ne_hv"]
@@ -1378,6 +1388,8 @@ class TestPyTorchOpsNewHandlers:
         assert "bottom-right" in flagged["bottom_right"]
         assert "attention-sink" in flagged["sink"]
         assert "own SDPA call" in flagged["varlen"]
+        assert "ALiBi" in flagged["alibi"]
+        assert "attn_mask combined with a causal mask" in flagged["bias_causal"]
 
     def test_builtin_rmsnorm_reference_has_no_warning_when_available(self) -> None:
         graph_json = {
@@ -2033,6 +2045,70 @@ class TestPyTorchSdpaBackendSelection:
 
         sdpa_kernel.assert_not_called()
         preferred_library.assert_not_called()
+
+    @staticmethod
+    def _enabled_backends_at_call(state, reference_pass: bool) -> set[str]:
+        """Run one SDPA call and return the PyTorch backends it was allowed."""
+        seen: set[str] = set()
+
+        def recording_sdpa(*args, **kwargs):
+            backends = torch.backends.cuda
+            for name, enabled in (
+                ("flash", backends.flash_sdp_enabled()),
+                ("efficient", backends.mem_efficient_sdp_enabled()),
+                ("math", backends.math_sdp_enabled()),
+            ):
+                if enabled:
+                    seen.add(name)
+            return torch.empty(0)
+
+        with (
+            patch.object(
+                torch.nn.functional,
+                "scaled_dot_product_attention",
+                side_effect=recording_sdpa,
+            ),
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+            pytorch_ops.reference_sdpa_pass() if reference_pass else nullcontext(),
+        ):
+            TestPyTorchSdpaBackendSelection._execute()
+        return seen
+
+    def test_default_reference_pass_runs_on_math_only(self) -> None:
+        """The fused ROCm kernels are not repeatable; a reference must be."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName.DEFAULT)
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"math"}
+        # Timed default-dispatch calls keep every backend PyTorch offers.
+        assert {"flash", "math"} <= self._enabled_backends_at_call(
+            state, reference_pass=False
+        )
+
+    @pytest.mark.parametrize(
+        "selection", ["FLASH", "EFFICIENT", "CUDNN", "OVERRIDEABLE"]
+    )
+    def test_reference_pass_overrides_a_strict_selection(self, selection: str) -> None:
+        """--pytorch-sdpa-backend chooses what is timed. The graded outputs come
+        from MATH whatever it asked for, so they do not move with it."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName[selection])
+
+        assert self._enabled_backends_at_call(state, reference_pass=True) == {"math"}
+
+    def test_strict_selection_reads_as_math_inside_a_reference_pass(self) -> None:
+        """The handler builds its operands for the backend that will run."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+        from dnn_benchmarking.execution.pytorch_ops._sdpa_backend import (
+            strict_sdpa_selection,
+        )
+
+        assert strict_sdpa_selection() is None
+        with pytorch_ops.reference_sdpa_pass():
+            assert strict_sdpa_selection() is PyTorchSdpaBackendName.MATH
+        assert strict_sdpa_selection() is None
 
     @pytest.mark.parametrize("missing", ["sdpa_kernel", "backend_member"])
     def test_missing_public_api_or_backend_member_does_not_call_sdpa(
@@ -2708,7 +2784,9 @@ class TestPyTorchSdpaPaged:
             8: torch.tensor(self.KV_LENS, dtype=torch.int32),
         }
 
-    def _dense_reference(self, q, dense_k, dense_v, is_causal=False):
+    def _dense_reference(
+        self, q, dense_k, dense_v, is_causal=False, bottom_right=False
+    ):
         import torch.nn.functional as F
 
         rep = self.HQ // self.HKV
@@ -2716,13 +2794,21 @@ class TestPyTorchSdpaPaged:
         for s, q_len in enumerate(self.Q_LENS):
             q_s = q[:, :, start : start + q_len, :]
             start += q_len
+            mask = None
+            if bottom_right:
+                # Each sequence's own offset: query i sees keys up to i + Skv - Sq.
+                kv_len = self.KV_LENS[s]
+                rows = torch.arange(q_len).unsqueeze(1)
+                cols = torch.arange(kv_len).unsqueeze(0)
+                mask = cols <= rows + (kv_len - q_len)
             out.append(
                 F.scaled_dot_product_attention(
                     q_s,
                     dense_k[s].repeat_interleave(rep, dim=0).unsqueeze(0),
                     dense_v[s].repeat_interleave(rep, dim=0).unsqueeze(0),
+                    attn_mask=mask,
                     scale=1.0 / (self.D**0.5),
-                    is_causal=is_causal,
+                    is_causal=is_causal and not bottom_right,
                 )
             )
         return torch.cat(out, dim=-2)
@@ -2766,6 +2852,29 @@ class TestPyTorchSdpaPaged:
 
         expected = self._dense_reference(q, dense_k, dense_v, is_causal=True)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"right_bound": 0, "diagonal_alignment": "BOTTOM_RIGHT"},
+            {"causal_mask_bottom_right": True},
+        ],
+    )
+    def test_paged_bottom_right_uses_each_sequences_own_offset(
+        self, attributes: dict
+    ) -> None:
+        """Sequences with different Sq and Skv get different diagonal offsets
+        (35 and 24 here), so one offset for the packed batch fails this."""
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+        tensors = self._tensors(q, k_pages, v_pages, page_table)
+        pytorch_ops.execute_graph(self._graph(**attributes), tensors)
+
+        expected = self._dense_reference(
+            q, dense_k, dense_v, is_causal=True, bottom_right=True
+        )
+        top_left = self._dense_reference(q, dense_k, dense_v, is_causal=True)
+        assert torch.allclose(tensors[4], expected, atol=1e-5)
+        assert not torch.allclose(tensors[4], top_left, atol=1e-3)
 
     def test_paged_decode_bottom_right_sink_matches_explicit_softmax(self) -> None:
         q = torch.zeros(1, self.HQ, 1, self.D)
@@ -3771,6 +3880,18 @@ class TestSdpaTimedRegion:
         assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
         assert bool(set(primed) - _SDPA_TIMED_OPS) == priming_builds_setup
 
+    def test_alibi_timed_run_has_no_setup(self) -> None:
+        """The kernel reads the ALiBi bias in the graph dtype. The bias is
+        built and rounded once, so a bf16 timed run neither builds nor casts
+        it."""
+        primed, timed, _ = _replay_sdpa(
+            self._graph(causal_mask=True, alibi_mask=True),
+            self._tensors(8, 8, torch.bfloat16),
+        )
+
+        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        assert set(primed) - _SDPA_TIMED_OPS
+
     @pytest.mark.parametrize(
         ("selection", "expected_call"),
         [
@@ -3842,6 +3963,34 @@ class TestSdpaTimedRegion:
         )
         scores = (tensors[1] @ tensors[2].transpose(-2, -1)) * 0.5 + mask
         torch.testing.assert_close(tensors[4], scores.softmax(-1) @ tensors[3])
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            {"causal_mask_bottom_right": True},
+            {"diagonal_alignment": "BOTTOM_RIGHT", "right_bound": 0},
+        ],
+        ids=["boolean", "alignment"],
+    )
+    def test_bottom_right_with_more_queries_than_keys_matches_hipdnn(
+        self, attributes
+    ) -> None:
+        """Sq > Skv shifts the diagonal above row 0, so the first queries see no
+        key. hipDNN defines those rows as output 0 and log-sum-exp -inf
+        (CpuFpReferenceSdpa: "For fully masked rows (sumExp = 0), log(0) = -inf
+        which is correct"). The reference pass runs on MATH, whose log-sum-exp
+        comes from this handler, so the graph is graded, not declined."""
+        tensors = self._tensors(8, 8, q_len=5, kv_len=3)
+        with pytorch_ops.reference_sdpa_pass():
+            pytorch_ops.execute_graph(self._graph(stats=True, **attributes), tensors)
+        o, stats = tensors[4], tensors[5]
+
+        keyless, keyed = slice(0, 2), slice(2, 5)
+        assert torch.equal(o[..., keyless, :], torch.zeros_like(o[..., keyless, :]))
+        assert torch.isneginf(stats[..., keyless, :]).all()
+        assert torch.isfinite(o[..., keyed, :]).all()
+        assert torch.isfinite(stats[..., keyed, :]).all()
+        assert o[..., keyed, :].abs().sum() > 0
 
     @pytest.mark.parametrize("attributes", [{}, {"causal_mask": True}])
     def test_stats_timed_run_matches_equal_heads(self, attributes) -> None:

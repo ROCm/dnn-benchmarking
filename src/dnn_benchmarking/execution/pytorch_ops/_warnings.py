@@ -49,9 +49,9 @@ def _sdpa_forward_workarounds(
             "output with a device copy"
         )
     try:
-        _, window, bottom_right = _sdpa_derive_mask(node)
+        causal, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError:
-        window, bottom_right = None, False
+        causal, window, bottom_right = False, None, False
     if window is not None:
         reasons.append(
             "PyTorch SDPA has no sliding-window option, so the window is passed "
@@ -61,6 +61,17 @@ def _sdpa_forward_workarounds(
         reasons.append(
             "the bottom-right causal mask is passed as an additive mask tensor "
             "that the kernel reads (is_causal is top-left only)"
+        )
+    if bool(_node_param(node, "alibi_mask", False)):
+        reasons.append(
+            "ALiBi positional bias is computed manually and passed as an "
+            "additive mask tensor that the kernel reads"
+        )
+    attn_mask_uid = _node_uid(node, "attn_mask_tensor_uid", ("inputs",), required=False)
+    if attn_mask_uid is not None and causal and window is None and not bottom_right:
+        reasons.append(
+            "an explicit attn_mask combined with a causal mask materializes the "
+            "causal band into the mask manually before the SDPA call"
         )
     k_shape = _tensor_shape(graph_json, operands.k)
     v_shape = _tensor_shape(graph_json, operands.v)

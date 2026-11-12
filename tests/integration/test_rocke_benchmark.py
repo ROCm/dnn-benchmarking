@@ -4,6 +4,7 @@
 """rocKE runtime on a live gfx950: real rocKE launches, timed and validated."""
 
 import io
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -92,9 +93,10 @@ def test_hipdnn_and_rocke_rows_share_one_graph_run(hipdnn, rocke_gfx950) -> None
         validation=ValidationConfig(provider="pytorch"),
     )
 
-    result = start_runtime(config, Reporter(output=io.StringIO()))(
-        Path("both.json"), graph, infos
-    )
+    with ExitStack() as resources:
+        result = start_runtime(config, Reporter(output=io.StringIO()), resources)(
+            Path("both.json"), graph, infos
+        )
 
     assert result.status == "ok", (result.error, result.message)
     rows = [(r.runtime, r.role, r.engine_name, r.verdict) for r in result.results]
