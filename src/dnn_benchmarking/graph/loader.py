@@ -22,6 +22,11 @@ def output_uids(graph_json: Dict[str, Any]) -> Set[int]:
     return uids
 
 
+def tensors_by_uid(graph_json: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """Tensor JSON by UID; entries without a ``uid`` are left out."""
+    return {int(t["uid"]): t for t in graph_json.get("tensors") or [] if "uid" in t}
+
+
 def tensor_data_type(
     tensor_json: Dict[str, Any], graph_json: Dict[str, Any]
 ) -> Optional[str]:

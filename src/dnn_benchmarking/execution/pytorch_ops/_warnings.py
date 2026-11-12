@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 
 import torch.nn.functional as F
 
+from ...graph.loader import tensors_by_uid
+from ...graph.varlen import has_varlen_source, sdpa_operands
 from ._common import (
     _effective_compute_type,
     _is_float32_compute,
@@ -25,20 +27,26 @@ def _sdpa_forward_workarounds(
 ) -> List[str]:
     """SDPA forward features PyTorch's SDPA cannot express natively."""
 
-    def uid(key: str) -> Any:
-        return _node_uid(node, key, ("inputs",), required=False)
-
+    operands = sdpa_operands(node)
     reasons: List[str] = []
-    if uid("sink_token_tensor_uid") is not None:
+    sink_uid = _node_uid(node, "sink_token_tensor_uid", ("inputs",), required=False)
+    if sink_uid is not None:
         reasons.append(
             "PyTorch SDPA has no attention-sink input, so attention runs as "
             "separate fp32 matmul, softmax and matmul ops instead of an SDPA kernel"
         )
-    if uid("page_table_k_tensor_uid") is not None:
+    if operands.is_paged:
         reasons.append(
             "PyTorch has no paged SDPA, so K/V are gathered into dense "
             "per-sequence tensors once and each sequence runs as its own SDPA "
-            "call, re-packed with torch.cat"
+            "call, re-packed with torch.cat or written into a zeroed per-batch "
+            "output"
+        )
+    elif has_varlen_source(node, tensors_by_uid(graph_json)):
+        reasons.append(
+            "PyTorch SDPA has no variable-length input, so the valid rows and "
+            "keys of each batch run as their own SDPA call, written into the "
+            "output with a device copy"
         )
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)
@@ -59,18 +67,14 @@ def _sdpa_forward_workarounds(
             "ALiBi positional bias is computed manually and passed as an "
             "additive mask tensor that the kernel reads"
         )
-    if (
-        uid("attn_mask_tensor_uid") is not None
-        and causal
-        and window is None
-        and not bottom_right
-    ):
+    attn_mask_uid = _node_uid(node, "attn_mask_tensor_uid", ("inputs",), required=False)
+    if attn_mask_uid is not None and causal and window is None and not bottom_right:
         reasons.append(
             "an explicit attn_mask combined with a causal mask materializes the "
             "causal band into the mask manually before the SDPA call"
         )
-    k_shape = _tensor_shape(graph_json, uid("k_tensor_uid"))
-    v_shape = _tensor_shape(graph_json, uid("v_tensor_uid"))
+    k_shape = _tensor_shape(graph_json, operands.k)
+    v_shape = _tensor_shape(graph_json, operands.v)
     if k_shape and v_shape and len(k_shape) >= 3 and len(v_shape) >= 3:
         if k_shape[-3] != v_shape[-3]:
             reasons.append(

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -198,13 +199,22 @@ def _row(correctness=None):
     )
 
 
-def _run(tmp_path, row=None, refs=None, config=None, plugin_path=None):
+def _run(
+    tmp_path,
+    row=None,
+    refs=None,
+    config=None,
+    plugin_path=None,
+    matching_infinities=False,
+):
     row = row or _row()
     oracle_mod.run_hipdnn_tuned(
         row=row,
         graph_path=tmp_path / "g.json",
         graph_name="g",
-        tensor_infos=[OUT],
+        tensor_infos=[
+            OUT if not matching_infinities else replace(OUT, matching_infinities=True)
+        ],
         reference_outputs=refs,
         engine_id=5,
         plugin_path=plugin_path,
@@ -341,6 +351,18 @@ def test_no_references_means_no_tuned_validation(fake, tmp_path):
 
     assert ("execute_once", None, None) not in fake.calls
     assert row.oracle.correctness is None
+
+
+def test_tuned_validation_matches_infinities_in_sdpa_stats(fake, tmp_path):
+    """Varlen graphs hold -inf in dead stats rows; the tuned check compares
+    them as equal, as the OOTB check does."""
+    dead = np.full(2, -np.inf, np.float32)
+    fake.output = dead.copy()
+    refs = {1: ReferenceOutput(data=dead.copy(), tensor_uid=1)}
+
+    row = _run(tmp_path, refs=refs, matching_infinities=True)
+
+    assert row.oracle.correctness.tolerance_match
 
 
 def test_failing_tuned_plan_keeps_the_row_verdict(fake, tmp_path):

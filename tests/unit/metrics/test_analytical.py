@@ -10,9 +10,10 @@ counted as 2 FLOPs).
 
 from typing import Any, Dict
 
+import numpy as np
 import pytest
 
-from dnn_benchmarking.graph.tensor_info import TensorInfo
+from dnn_benchmarking.graph.tensor_info import TensorInfo, VarlenLayout
 from dnn_benchmarking.metrics.analytical import (
     compute_flops,
     compute_io_bytes,
@@ -145,6 +146,23 @@ def _sdpa_graph(
             }
         ],
     }
+
+
+def _varlen_sdpa_graph(**kwargs) -> Dict[str, Any]:
+    graph = _sdpa_graph(b=3, hq=4, hkv=4, sq=8, skv=8, d=16, **kwargs)
+    graph["tensors"] += [
+        {"uid": 5, "dims": [3, 1, 1, 1], "data_type": "int32", "virtual": False},
+        {"uid": 6, "dims": [3, 1, 1, 1], "data_type": "int32", "virtual": False},
+    ]
+    graph["nodes"][0]["inputs"].update(seq_len_q_tensor_uid=5, seq_len_kv_tensor_uid=6)
+    return graph
+
+
+_LENGTHS = {
+    5: np.array([3, 8, 5], dtype=np.int32),
+    6: np.array([4, 2, 5], dtype=np.int32),
+}
+_HEADS_AND_DIMS = 2 * 4 * (16 + 16)  # 2 * Hq * (Dqk + Dvo)
 
 
 def _bnorm_graph() -> Dict[str, Any]:
@@ -535,17 +553,18 @@ class TestComputeFlops:
         assert by_bounds == by_flag
 
     def test_sdpa_causal_sliding_window_bottom_right(self):
-        # Causal window of W keys = left W-1, right 0; Sq=4, Skv=6, W=3.
+        # Causal window of W keys = left W, right 0; Sq=4, Skv=6, W=3.
         # offset 2 -> rows keep min(i + 3, 3) = 3 keys each -> 12 pairs, the
         # rocKE benchmark's sum_i min(i + off + 1, W).
-        graph = _sdpa_graph(sq=4, skv=6, left_bound=2, right_bound=0)
+        graph = _sdpa_graph(sq=4, skv=6, left_bound=3, right_bound=0)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
         flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
     def test_sdpa_sliding_window_top_left_clamps_edges(self):
-        # left 1, right 1, Sq=Skv=4 -> rows keep 2,3,3,2 keys = 10 pairs.
-        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1))
+        # left 2 (the diagonal and one key before it), right 1, Sq=Skv=4 ->
+        # rows keep 2,3,3,2 keys = 10 pairs.
+        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=2, right_bound=1))
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
 
     def test_sdpa_deprecated_causal_ignores_alignment_and_bounds(self):
@@ -560,6 +579,7 @@ class TestComputeFlops:
         "attrs",
         [
             {"left_bound": -2},
+            {"left_bound": 0, "right_bound": 0},
             {"causal_mask": True, "right_bound": -5},
             {"causal_mask": True, "causal_mask_bottom_right": True},
         ],
@@ -618,6 +638,72 @@ class TestComputeFlops:
         flops = compute_flops(graph)
         # Causal 8x8 -> 36 pairs; 3 matmuls over D_qk, 2 over D_vo.
         assert flops == 2 * 2 * 64 * 36 * (3 * 192 + 2 * 128)
+
+    def test_sdpa_varlen_causal_top_left_sums_pairs_per_batch(self):
+        # Row i keeps min(i + 1, Skv_b): (Sq 3, Skv 4) -> 1+2+3 = 6;
+        # (8, 2) -> 1 + 7*2 = 15; (5, 5) -> 15.
+        flops = compute_flops(_varlen_sdpa_graph(causal=True), _LENGTHS)
+        assert flops == _HEADS_AND_DIMS * (6 + 15 + 15)
+
+    def test_sdpa_varlen_causal_bottom_right_uses_each_batchs_lengths(self):
+        # Row i keeps clamp(i + Skv_b - Sq_b + 1, 0, Skv_b): (3, 4) -> 2+3+4 = 9;
+        # (8, 2) -> 0,0,0,0,0,0,1,2 = 3; (5, 5) -> 15.
+        graph = _varlen_sdpa_graph(causal=True, bottom_right=True)
+        flops = compute_flops(graph, _LENGTHS)
+        assert flops == _HEADS_AND_DIMS * (9 + 3 + 15)
+
+    def test_sdpa_varlen_noncausal(self):
+        flops = compute_flops(_varlen_sdpa_graph(), _LENGTHS)
+        assert flops == _HEADS_AND_DIMS * (3 * 4 + 8 * 2 + 5 * 5)
+
+    def test_sdpa_varlen_bwd_uses_the_same_pairs(self):
+        graph = _varlen_sdpa_graph(causal=True)
+        node = graph["nodes"][0]
+        node["type"] = "SdpaBackwardAttributes"
+        node["parameters"] = node.pop("attributes")
+        flops = compute_flops(graph, _LENGTHS)
+        assert flops == 2 * 4 * (6 + 15 + 15) * (3 * 16 + 2 * 16)
+
+    def test_sdpa_varlen_without_input_data_counts_from_dims(self):
+        graph = _varlen_sdpa_graph(causal=True)
+        assert compute_flops(graph) == 2 * 3 * 4 * 36 * (16 + 16)
+
+    def test_sdpa_dense_node_ignores_input_data(self):
+        graph = _sdpa_graph(b=2, hq=4, hkv=4, sq=8, skv=8, d=16)
+        assert compute_flops(graph, {}) == compute_flops(graph)
+
+    def test_sdpa_paged_counts_the_real_kv_lengths(self):
+        # K is a page container; its page size (4) is not a sequence length.
+        graph = _sdpa_graph(b=1, hq=4, hkv=2, sq=8, skv=4, d=16)
+        graph["tensors"] += [
+            {"uid": 5, "dims": [2, 3], "data_type": "int32", "virtual": False},
+            {"uid": 6, "dims": [2], "data_type": "int32", "virtual": False},
+            {"uid": 7, "dims": [2], "data_type": "int32", "virtual": False},
+        ]
+        graph["nodes"][0]["inputs"].update(
+            page_table_k_tensor_uid=5,
+            page_table_v_tensor_uid=5,
+            seq_len_q_tensor_uid=6,
+            seq_len_kv_tensor_uid=7,
+        )
+        data = {6: np.array([3, 5], np.int32), 7: np.array([10, 5], np.int32)}
+        flops = compute_flops(graph, data)
+        assert flops == _HEADS_AND_DIMS * (3 * 10 + 5 * 5)
+
+    def test_sdpa_paged_without_seq_len_q_splits_the_queries_evenly(self):
+        # 8 packed queries over 2 sequences: 4 each, against kv lengths 10, 5.
+        graph = _sdpa_graph(b=1, hq=4, hkv=2, sq=8, skv=4, d=16)
+        graph["tensors"] += [
+            {"uid": 5, "dims": [2, 3], "data_type": "int32", "virtual": False},
+            {"uid": 7, "dims": [2], "data_type": "int32", "virtual": False},
+        ]
+        graph["nodes"][0]["inputs"].update(
+            page_table_k_tensor_uid=5,
+            page_table_v_tensor_uid=5,
+            seq_len_kv_tensor_uid=7,
+        )
+        flops = compute_flops(graph, {7: np.array([10, 5], np.int32)})
+        assert flops == _HEADS_AND_DIMS * (4 * 10 + 4 * 5)
 
 
 def _graph(node_type, tensors, inputs, outputs, **params):
@@ -784,6 +870,29 @@ class TestComputeIoBytes:
 
     def test_empty(self):
         assert compute_io_bytes([]) == 0
+
+    def test_counts_only_the_valid_elements_of_a_varlen_tensor(self):
+        infos = [
+            TensorInfo(
+                uid=1,
+                name="q",
+                dims=[2, 4, 5, 8],
+                strides=[160, 40, 8, 1],
+                data_type="half",
+                is_virtual=False,
+                varlen=VarlenLayout(lengths=(2, 3)),
+            ),
+            TensorInfo(
+                uid=2,
+                name="k",
+                dims=[2, 4, 5, 8],
+                strides=[160, 40, 8, 1],
+                data_type="half",
+                is_virtual=False,
+            ),
+        ]
+        # q: (2 + 3) valid positions * 4 heads * 8 dims * 2 bytes; k is dense.
+        assert compute_io_bytes(infos) == 5 * 4 * 8 * 2 + 2 * 4 * 5 * 8 * 2
 
 
 class TestDeriveThroughputs:

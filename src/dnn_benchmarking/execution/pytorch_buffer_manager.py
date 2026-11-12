@@ -75,10 +75,10 @@ class PyTorchCudaBufferManager:
                 )
                 continue
 
-            if tensor_info.strides:
+            if tensor_info.logical_strides:
                 tensor = torch.empty_strided(
                     tensor_info.dims,
-                    tensor_info.strides,
+                    tensor_info.logical_strides,
                     dtype=dtype,
                     device=self._device,
                 )

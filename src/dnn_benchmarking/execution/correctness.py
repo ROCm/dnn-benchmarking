@@ -92,7 +92,19 @@ def _compare_output(
     rtol: float,
     atol: float,
 ) -> Optional[ComparisonResult]:
-    """Compare on the GPU when both sides are device tensors, else on the host."""
+    """Compare on the GPU when both sides are device tensors, else on the host.
+
+    A ragged output compares only the valid positions of each batch: its
+    storage holds nothing else. A padded (non-ragged) output compares every
+    position, since hipDNN defines its padding (O = 0 and stats = -inf past
+    ``seq_len_q``, zero gradients past a length). A ``matching_infinities``
+    output accepts infinities equal in both.
+    """
+    varlen = tensor_info.varlen
+    lengths = (
+        varlen.lengths if varlen is not None and varlen.starts is not None else None
+    )
+    matching_infinities = tensor_info.matching_infinities
     if ref.device_data is not None:
         actual = buffer_manager.get_output_tensor(tensor_info.uid)
         if actual is not None:
@@ -104,6 +116,8 @@ def _compare_output(
                     _compared(ref.device_data, tensor_info),
                     rtol=rtol,
                     atol=atol,
+                    lengths=lengths,
+                    matching_infinities=matching_infinities,
                 )
             except torch.cuda.OutOfMemoryError:
                 pass  # Fall back to the host comparison.
@@ -115,6 +129,8 @@ def _compare_output(
         _compared(ref.host_data(), tensor_info),
         rtol=rtol,
         atol=atol,
+        lengths=lengths,
+        matching_infinities=matching_infinities,
     )
 
 

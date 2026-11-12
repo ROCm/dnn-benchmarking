@@ -40,6 +40,7 @@ from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
 from ..execution.timing import Measurement, StallFallbackError, Timer
 from ..graph.tensor_info import TensorInfo
+from ..graph.varlen import resolve_varlen_layouts
 from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
@@ -294,6 +295,9 @@ def _graph_context(
 ) -> _GraphContext:
     """Generate inputs and per-graph analytical FLOPs/IO (shape-only, once)."""
     graph_name = graph_json.get("name", graph_path.stem)
+    input_data = generate_input_data(tensor_infos, config.seed, graph_json)
+    # Rebind: every consumer, and the analytical IO, sees the resolved layouts.
+    tensor_infos = resolve_varlen_layouts(tensor_infos, graph_json, input_data)
     ctx = _GraphContext(
         graph_path=graph_path,
         graph_json=graph_json,
@@ -301,11 +305,11 @@ def _graph_context(
         tensor_infos=tensor_infos,
         config=config,
         reporter=reporter,
-        input_data=generate_input_data(tensor_infos, config.seed, graph_json),
+        input_data=input_data,
     )
     if config.metrics.basic:
         try:
-            ctx.flops = compute_flops(graph_json)
+            ctx.flops = compute_flops(graph_json, ctx.input_data)
         except Exception as e:
             warn_once("analytical", f"compute_flops failed for {graph_name}: {e}")
         try:
@@ -993,6 +997,10 @@ def _run_graph(
     if any(p.needs_inputs for p in plans):
         try:
             ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
+        except UnsupportedGraphError as e:
+            graph.engine_ids = []
+            graph.message = str(e)
+            return graph
         except Exception as e:
             errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
             graph.error = "; ".join(errors)
