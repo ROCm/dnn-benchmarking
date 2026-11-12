@@ -136,7 +136,7 @@ def _torch_forward(
                     rows_f = torch.arange(start, end, device=device)[:, None]
                     scores += slopes * (key_f - rows_f.to(torch.float32))
                 if left is not None:
-                    scores.masked_fill_(keys < diagonal - left, float("-inf"))
+                    scores.masked_fill_(keys <= diagonal - left, float("-inf"))
                 if right is not None:
                     scores.masked_fill_(keys > diagonal + right, float("-inf"))
                 lse = torch.logsumexp(scores, dim=-1, keepdim=True)
@@ -189,7 +189,7 @@ def _numpy_forward(
                     scores += np.float32(alibi[h]) * (keys[None, :] - query)
                 diagonal = np.arange(start, end)[:, None] + offset
                 if left is not None:
-                    scores[keys[None, :] < diagonal - left] = -np.inf
+                    scores[keys[None, :] <= diagonal - left] = -np.inf
                 if right is not None:
                     scores[keys[None, :] > diagonal + right] = -np.inf
                 peak = scores.max(axis=-1, keepdims=True)

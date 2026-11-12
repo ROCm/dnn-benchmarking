@@ -213,10 +213,12 @@ def _sdpa_derive_mask(
     """Resolve ``(is_causal, window_width, bottom_right)`` as hipDNN does.
 
     The band comes from :func:`sdpa_band`, hipDNN's composition of the
-    deprecated causal flags with the bounds and alignment. ``is_causal`` is
-    reserved for PyTorch's native top-left mask; bottom-right masks are
-    materialized as additive masks. A band with a forward-looking right edge
-    raises ValueError: the reference cannot express it.
+    deprecated causal flags with the bounds and alignment. ``left_bound = L``
+    keeps ``L`` keys up to and including the diagonal, so the window width is
+    ``L``; ``left_bound = 0`` raises ValueError. ``is_causal`` is reserved for
+    PyTorch's native top-left mask; bottom-right masks are materialized as
+    additive masks. A band with a forward-looking right edge raises
+    ValueError: the reference cannot express it.
     """
     left, right, bottom_right = sdpa_band(node)
     if right is None and left is None:
@@ -228,7 +230,7 @@ def _sdpa_derive_mask(
         )
     if left is None:
         return (False, None, True) if bottom_right else (True, None, False)
-    return False, left + 1, bottom_right
+    return False, left, bottom_right
 
 
 def _sdpa_resolve(

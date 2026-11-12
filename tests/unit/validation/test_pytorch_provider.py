@@ -1027,7 +1027,7 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[6].data, expected_stats.numpy(), rtol=1e-6)
 
     def test_sdpa_sliding_window_masks_output_and_stats(self) -> None:
-        """A width-1 band (left/right bound 0) lets each query see only its own
+        """A width-1 band (left_bound 1, right_bound 0) lets each query see only its own
         key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]], dtype=np.float32)
@@ -1048,7 +1048,7 @@ class TestPyTorchProviderNewOps:
                     "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
                     "attributes": {
                         "dropout_probability": 0.0,
-                        "left_bound": 0,
+                        "left_bound": 1,
                         "right_bound": 0,
                     },
                 }

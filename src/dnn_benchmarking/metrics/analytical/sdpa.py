@@ -25,11 +25,13 @@ unmasked ``(q, kv)`` pairs per query head:
 (``plan_utils::resolveDiagonalBand``, since rocm-libraries #13065), as
 cuDNN's setters compose: a deprecated causal flag acts as if its setter ran
 first, and the stored bounds and alignment apply on top. See
-:func:`sdpa_band`. Row ``i`` keeps ``kv`` in ``[i + off - left, i + off +
-right]`` with ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT); an unset
-bound is unbounded.
+:func:`sdpa_band`. Row ``i`` keeps ``kv`` in ``[i + off - left + 1, i + off
++ right]`` with ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT): ``left``
+keys up to and including the diagonal and ``right`` keys past it, as in
+hipDNN (since rocm-libraries #14483) and cuDNN. An unset bound is unbounded,
+and ``left_bound = 0`` is rejected.
 
-A causal sliding window of ``W`` keys (``left = W - 1``, ``right = 0``,
+A causal sliding window of ``W`` keys (``left = W``, ``right = 0``,
 BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
 windowed count the rocKE attention benchmarks report.
 """
@@ -40,7 +42,8 @@ import numpy as np
 
 from ._common import node_param, node_tensor
 
-#: ``(left, right, bottom_right)``; a ``None`` bound is unbounded.
+#: ``(left, right, bottom_right)``; a ``None`` bound is unbounded. ``left``
+#: counts the kept keys up to and including the diagonal (>= 1).
 Band = Tuple[Optional[int], Optional[int], bool]
 
 
@@ -51,8 +54,11 @@ def sdpa_band(node: Dict[str, Any]) -> Band:
     (>= 0). ``left_bound`` still applies. ``causal_mask`` keeps the stored
     alignment; ``causal_mask_bottom_right`` forces BOTTOM_RIGHT.
 
+    ``left_bound = L`` keeps ``L`` keys up to and including the diagonal.
+
     Raises ValueError for a mask hipDNN rejects: both deprecated flags, a
-    bound below -1, or an unknown alignment.
+    bound below -1, ``left_bound = 0`` (it keeps no keys), or an unknown
+    alignment.
     """
     causal = bool(node_param(node, "causal_mask"))
     causal_bottom_right = bool(node_param(node, "causal_mask_bottom_right"))
@@ -70,6 +76,10 @@ def sdpa_band(node: Dict[str, Any]) -> Band:
             raise ValueError(f"SDPA {key} {value} is below -1")
         bounds.append(value)
     left, right = bounds
+    if left == 0:
+        raise ValueError(
+            "SDPA left_bound 0 keeps no keys; use a positive width or -1 (unbounded)"
+        )
     if causal or causal_bottom_right:
         right = max(right, 0)
     bottom_right = causal_bottom_right or alignment in ("BOTTOM_RIGHT", 1)
@@ -110,7 +120,7 @@ def _nonmasked_pairs(
     offset = kv_seqlen - q_seqlen if bottom_right else 0
     total = 0
     for i in range(q_seqlen):
-        lo = max(i + offset - left, 0) if left is not None else 0
+        lo = max(i + offset - left + 1, 0) if left is not None else 0
         hi = min(i + offset + right + 1, kv_seqlen) if right is not None else kv_seqlen
         total += max(hi - lo, 0)
     return total

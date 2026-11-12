@@ -623,15 +623,18 @@ The tool does not do these things yet:
   top-left sliding window. An explicit `attn_mask` bias can combine with a
   causal band or a sliding window. It resolves the mask as hipDNN does: a
   deprecated causal boolean acts as `right_bound = 0`, and the stored
-  `left_bound` and diagonal alignment still apply. Tool versions before
-  0.4.0 let the deprecated boolean override the bounds and the alignment.
-  For a graph that sets a causal boolean with a bound or with
+  `left_bound` and diagonal alignment still apply. As in cuDNN and in hipDNN
+  since rocm-libraries #14483, `left_bound = L` keeps `L` keys up to and
+  including the diagonal, so a window of `L` keys has `left_bound = L`. The
+  same rule sets the FLOP count and the SDPA backward inputs. Tool versions
+  before 0.4.0 let the deprecated boolean override the bounds and the
+  alignment. For a graph that sets a causal boolean with a bound or with
   `BOTTOM_RIGHT`, the FLOP count and the PyTorch and rocKE masks thus
-  changed at 0.4.0. The reference declines
-  these graphs as unsupported: ALiBi with bottom-right alignment or with
-  neither a causal mask nor a sliding window; padding masks; paged or
-  variable-length ALiBi graphs. Other masks also make the reference decline
-  the graph.
+  changed at 0.4.0. The reference declines these graphs as unsupported:
+  `left_bound = 0`, which hipDNN rejects; ALiBi with bottom-right alignment
+  or with neither a causal mask nor a sliding window; padding masks; paged
+  or variable-length ALiBi graphs. Other masks also make the reference
+  decline the graph.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.

@@ -375,7 +375,8 @@ Requirements and limits:
   window. A causal mask (top-left or bottom-right) needs
   `seqlen_q == seqlen_kv`, where the two alignments give the same mask. As in
   hipDNN, the deprecated `causal_mask` flag acts as `right_bound = 0` and
-  keeps `left_bound` and `diagonal_alignment`.
+  keeps `left_bound` and `diagonal_alignment`. `left_bound = 0` is not
+  supported, as in hipDNN.
   An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
