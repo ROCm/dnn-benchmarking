@@ -1227,10 +1227,11 @@ _MATH_BACKWARD_NOTE = (
 class _FusedBackward(NamedTuple):
     """A fused SDPA backward kernel call, built once from a forward probe.
 
-    ``call(do)`` returns ``(dq, dk, dv)`` at the query head count. The other
-    arguments (Q, K/V at the query head count, the graph's O and stats in the
-    layouts of the forward's saved output and log-sum-exp, and the forward's
-    saved scalars) are bound in ``call``.
+    ``call(do)`` returns ``(dq, dk, dv)``; dK and dV have ``rep_k`` and
+    ``rep_v`` times the graph's K/V head count. The other arguments (Q, K/V
+    as the kernel takes them, the graph's O and stats in the layouts of the
+    forward's saved output and log-sum-exp, and the forward's saved scalars)
+    are bound in ``call``.
     """
 
     call: Callable[[torch.Tensor], Tuple[torch.Tensor, ...]]
@@ -1265,8 +1266,15 @@ def _prepare_fused_backward(
     once (untimed) with the graph's Q, K and V, reads which fused kernel ran
     and its saved scalars from the autograd node, and binds the matching ATen
     backward. The timed call then passes the graph's own O and stats, as the
-    hipDNN kernel reads them. K and V are expanded to the query head count
-    here; the timed call sums dK and dV back over each head group.
+    hipDNN kernel reads them.
+
+    GQA/MQA first probes PyTorch's ``enable_gqa`` path on the real-size K/V
+    (``_sdpa_kv_operands``), as a training step does. On ROCm its Flash
+    backward writes dK and dV at the K/V head count, so the timed call has no
+    head-group sum. When that probe does not land on Flash (for example, a
+    mask under default dispatch sends ``enable_gqa`` to math), K and V are
+    expanded to the query head count here, untimed, and the timed call sums
+    dK and dV back over each head group.
 
     The graph's O is copied once into the memory layout of the forward's
     output. The memory-efficient backward needs that layout ([B, S, H, D] in
@@ -1276,19 +1284,17 @@ def _prepare_fused_backward(
     Returns ``None`` when default dispatch chose neither Flash nor
     memory-efficient attention.
     """
-    k_op = k.repeat_interleave(rep_k, dim=-3) if rep_k > 1 else k
-    v_op = v.repeat_interleave(rep_v, dim=-3) if rep_v > 1 else v
-    probe = [t.detach().requires_grad_() for t in (q, k_op, v_op)]
-    with torch.enable_grad():
-        out = execute_selected_sdpa(
-            *probe,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=is_causal,
-            scale=scale,
-        )
+    k_op, v_op, enable_gqa = _sdpa_kv_operands(k, v, rep_k, rep_v)
+    out = _backward_probe(q, k_op, v_op, attn_mask, is_causal, scale, enable_gqa)
+    if enable_gqa and "FlashAttentionBackward" not in _grad_fn_name(out):
+        k_op = k.repeat_interleave(rep_k, dim=-3)
+        v_op = v.repeat_interleave(rep_v, dim=-3)
+        enable_gqa = False
+        out = _backward_probe(q, k_op, v_op, attn_mask, is_causal, scale, False)
+    if enable_gqa:
+        rep_k = rep_v = 1
     grad_fn = out.grad_fn
-    name = grad_fn.name() if grad_fn is not None else ""
+    name = _grad_fn_name(out)
     if "FlashAttentionBackward" in name:
         aten = torch.ops.aten._scaled_dot_product_flash_attention_backward
         lse_saved = _saved(grad_fn, "_saved_logsumexp")
@@ -1345,13 +1351,39 @@ def _prepare_fused_backward(
     lse = torch.zeros_like(lse_saved)
     lse[..., : int(stats.shape[-2])] = stats[..., 0]
     o_kernel = torch.empty_like(out).copy_(o)
-    del out, grad_fn, probe
+    del out, grad_fn
 
     def call(do: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         with native_sdpa_call():
             return kernel(do, o_kernel, lse)
 
     return _FusedBackward(call, rep_k, rep_v)
+
+
+def _grad_fn_name(out: torch.Tensor) -> str:
+    return out.grad_fn.name() if out.grad_fn is not None else ""
+
+
+def _backward_probe(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    """One untimed training forward; its ``grad_fn`` names the fused kernel."""
+    probe = [t.detach().requires_grad_() for t in (q, k, v)]
+    with torch.enable_grad():
+        return execute_selected_sdpa(
+            *probe,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
 
 
 def _sum_head_groups(grad: torch.Tensor, rep: int) -> torch.Tensor:
