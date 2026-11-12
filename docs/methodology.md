@@ -62,6 +62,9 @@ These cases give a graph rows in different modes:
 - The `--validate pytorch` reference row can fall back to `events` mode
   alone (for example, `host sync in enqueue: ...`). The hipDNN engine rows of
   the same graph stay in `staged` mode.
+- With several runtimes (`--runtime hipdnn,pytorch` or `hipdnn,rocke`), a
+  PyTorch or rocKE engine row can fall back to `events` mode alone. The hipDNN
+  rows of the same graph stay in `staged` mode.
 - With `--oracle`, the tuned plan can use a different mode than the OOTB
   plan. The oracle verdict is then `mixed-timing` (see `docs/usage.md`).
 - `--timing-block N` (N > 1) times every row of the run in `block` mode.

@@ -602,8 +602,10 @@ When more than one condition applies, 3 wins over 1, and 1 wins over 0.
 Only `engine` rows count: the `reference` row that `--validate pytorch` adds
 never changes the exit code.
 
-The tool checks the flags and their combinations before it looks for graph
+The tool checks flag values and their combinations before it looks for graph
 files. A bad option combination thus exits 2 also when no graph file exists.
+The output path, `--profiling-output-dir` and the profiler tools are checked
+after the graph files are found, so a missing graph file exits 1 first.
 
 These flags were renamed in result schema version 2. The usage error names
 the replacement:
