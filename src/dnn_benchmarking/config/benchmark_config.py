@@ -408,9 +408,10 @@ class SuiteConfig:
     #: Run this command on a new, empty selection state in the system
     #: temporary directory instead of a kept one (``common.work_dir``).
     fresh_state: bool = False
-    #: Wall-clock limit in seconds of the tuned hipDNN child (every tuned
-    #: hipDNN run of the command) and of each tuned PyTorch child; 0: none.
-    oracle_timeout_s: int = 0
+    #: Wall-clock limit in seconds of each tuned child (one per hipDNN or
+    #: PyTorch row); 0: none. Finite by default, so a hung search costs one
+    #: row, not the run.
+    oracle_timeout_s: int = 1800
     #: Run every graph through one engine in this process: one hipDNN handle
     #: with only the plugin under test loaded, primed once, on the kept OOTB
     #: selection state of the work dir (``common.work_dir``). Needs one

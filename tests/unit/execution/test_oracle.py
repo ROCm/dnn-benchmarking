@@ -25,11 +25,9 @@ from dnn_benchmarking.config.benchmark_config import (
 from dnn_benchmarking.execution import oracle as oracle_mod
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.tensor_info import TensorInfo
-from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
     CorrectnessResult,
-    GraphResult,
     PlanResult,
     ProviderEngineResult,
 )
@@ -72,18 +70,14 @@ class _Fake:
         self.knob_ids = [oracle_mod.BENCHMARKING_KNOB, "miopen.find_mode"]
         self.kernel_ms = [0.5, 0.5, 0.5, 9.0]
         self.output = np.zeros(2, np.float32)
-        self.errors = {}  # (call, engine_id) -> exception that call raises
+        self.prepare_error = None
+        self.benchmark_error = None
         self.calls = []  # (call, engine_id, knobs) in order
         self.policies = []
         self.plugin_paths = []
         self.seeds = []
         self.child_env = {}  # selection variables the child ran with
         self.launches = []  # (argv, timeout_s) of each child launch
-
-    def raise_for(self, call, engine_id):
-        error = self.errors.get((call, engine_id))
-        if error is not None:
-            raise error
 
 
 @pytest.fixture
@@ -95,30 +89,30 @@ def fake(monkeypatch):
         def __init__(self, graph_json_str, policy):
             f.policies.append(policy)
             self.build_time_ms, self.workspace_size = 3.0, 4096
-            self.engine_id = None
 
         def prime(self, handle, engine_id):
             f.calls.append(("prime", engine_id, None))
 
         def prepare(self, handle, engine_id=None, knobs=None):
-            self.engine_id = engine_id
             f.calls.append(("prepare", engine_id, knobs))
-            f.raise_for("prepare", engine_id)
+            if f.prepare_error is not None:
+                raise f.prepare_error
 
         def engine_knob_ids(self, engine_id):
             return list(f.knob_ids)
 
         def benchmark(self, handle, variant_pack):
-            f.calls.append(("benchmark", self.engine_id, None))
-            f.raise_for("benchmark", self.engine_id)
+            f.calls.append(("benchmark", None, None))
+            if f.benchmark_error is not None:
+                raise f.benchmark_error
             return _m(f.kernel_ms, host_ms=0.2)
 
         def execute_once(self, handle, variant_pack):
-            f.calls.append(("execute_once", self.engine_id, None))
+            f.calls.append(("execute_once", None, None))
 
     class BufferManager:
         def __init__(self, tensor_infos):
-            pass
+            self.written = False
 
         def __enter__(self):
             return self
@@ -170,10 +164,6 @@ def fake(monkeypatch):
             code = hipdnn_tuned_child.main(argv[3:])
         return SimpleNamespace(returncode=code, stdout="", stderr="")
 
-    hipdnn = SimpleNamespace(
-        Handle=SimpleNamespace,
-        destroy_handle=lambda handle: f.calls.append(("destroy_handle", None, None)),
-    )
     child = hipdnn_tuned_child
     monkeypatch.setattr(child, "Executor", Executor)
     monkeypatch.setattr(child, "BufferManager", BufferManager)
@@ -183,23 +173,11 @@ def fake(monkeypatch):
     monkeypatch.setattr(
         child, "set_plugin_path", lambda hipdnn, path: f.plugin_paths.append(path)
     )
-    monkeypatch.setitem(sys.modules, "hipdnn_frontend", hipdnn)
+    monkeypatch.setitem(
+        sys.modules, "hipdnn_frontend", SimpleNamespace(Handle=SimpleNamespace)
+    )
     monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
     return f
-
-
-@pytest.fixture
-def new_runs():
-    """Makes ``HipdnnTunedRuns`` and closes them after the test."""
-    made = []
-
-    def make(config):
-        made.append(oracle_mod.HipdnnTunedRuns(config))
-        return made[-1]
-
-    yield make
-    for runs in made:
-        runs.close()
 
 
 def _config(**kw):
@@ -211,65 +189,39 @@ def _pytorch_config(**kw):
     return SuiteConfig(oracle=True, runtime="pytorch", **kw)
 
 
-def _row(correctness=None, engine_id=5):
+def _row(correctness=None):
     return ProviderEngineResult(
         runtime="hipdnn",
-        engine_id=engine_id,
+        engine_id=5,
         status="success",
         ootb=PlanResult(correctness=correctness),
     )
 
 
-def _graph(*rows):
-    return GraphResult(
-        graph_name="g",
-        graph_path="g.json",
-        results=list(rows),
-        engine_ids=[row.engine_id for row in rows],
-    )
-
-
-def _add(runs, tmp_path, row, config, refs=None, plugin_path=None, policy=None):
-    """Queue the tuned run of ``row`` as the suite runner does."""
-    runs.add(
+def _run(tmp_path, row=None, refs=None, config=None, plugin_path=None):
+    row = row or _row()
+    oracle_mod.run_hipdnn_tuned(
         row=row,
         graph_path=tmp_path / "g.json",
         graph_name="g",
         tensor_infos=[OUT],
-        engine_id=row.engine_id,
+        reference_outputs=refs,
+        engine_id=5,
         plugin_path=plugin_path,
-        timing_policy=policy or config.timing_policy,
-        reference_dir=runs.save_references(refs) if refs is not None else None,
+        config=config or _config(),
     )
-
-
-def _quiet():
-    return Reporter(quiet=True)
-
-
-def _run(new_runs, tmp_path, row=None, refs=None, config=None, plugin_path=None):
-    """Queue one row's tuned run and run it; return the row."""
-    row = row or _row()
-    config = config or _config()
-    runs = new_runs(config)
-    _add(runs, tmp_path, row, config, refs=refs, plugin_path=plugin_path)
-    assert runs.run([_graph(row)], _quiet()) == []
     return row
 
 
-def _refs(precision="native"):
-    return {
-        1: ReferenceOutput(
-            data=np.zeros(2, np.float32), tensor_uid=1, precision=precision
-        )
-    }
+def _refs():
+    return {1: ReferenceOutput(data=np.zeros(2, np.float32), tensor_uid=1)}
 
 
-# --- HipdnnTunedRuns --------------------------------------------------------
+# --- run_hipdnn_tuned -------------------------------------------------------
 
 
 def test_tuned_run_is_a_benchmarking_build_of_the_row_engine_with_the_run_policy(
-    fake, new_runs, tmp_path
+    fake, tmp_path
 ):
     """The child primes the engine, builds it with the knob, and times it with
     the parent's full timing policy (stall gate included) and seed."""
@@ -278,9 +230,7 @@ def test_tuned_run_is_a_benchmarking_build_of_the_row_engine_with_the_run_policy
         warmup_iters=3, iters=5, min_time_ms=2.0, stall_gate=False
     )
 
-    _run(
-        new_runs, tmp_path, config=config, plugin_path=tmp_path / "libmiopen_plugin.so"
-    )
+    _run(tmp_path, config=config, plugin_path=tmp_path / "libmiopen_plugin.so")
 
     assert fake.calls[:3] == [
         ("prime", 5, None),
@@ -293,7 +243,7 @@ def test_tuned_run_is_a_benchmarking_build_of_the_row_engine_with_the_run_policy
 
 
 def test_tuned_child_runs_benchmarking_on_the_shared_tuned_state(
-    fake, new_runs, tmp_path, monkeypatch, tuned
+    fake, tmp_path, monkeypatch, tuned
 ):
     """An inherited HIPDNN_FORCE_BENCHMARKING=0 would make the tuned run
     untuned; the tuned hipDNN cache and MIOpen database are the kept ones of
@@ -302,7 +252,7 @@ def test_tuned_child_runs_benchmarking_on_the_shared_tuned_state(
     monkeypatch.setenv("HIPDNN_CACHE_DIR", str(tmp_path / "ootb-cache"))
     monkeypatch.setenv("MIOPEN_USER_DB_PATH", str(tmp_path / "ootb-db"))
 
-    _run(new_runs, tmp_path)
+    _run(tmp_path)
 
     assert fake.child_env == {
         "HIPDNN_FORCE_BENCHMARKING": "1",
@@ -313,63 +263,50 @@ def test_tuned_child_runs_benchmarking_on_the_shared_tuned_state(
     assert os.environ["MIOPEN_USER_DB_PATH"] == str(tmp_path / "ootb-db")
 
 
-def test_the_tuned_state_follows_the_work_dir(fake, new_runs, tmp_path):
-    _run(new_runs, tmp_path, config=_config(benchmark_work_dir=str(tmp_path / "w")))
+def test_the_tuned_state_follows_the_work_dir(fake, tmp_path):
+    _run(tmp_path, config=_config(benchmark_work_dir=str(tmp_path / "w")))
 
     assert fake.child_env["HIPDNN_CACHE_DIR"] == str(
         tmp_path / "w" / "tuned" / "hipdnn-cache"
     )
 
 
-def test_the_child_refuses_an_environment_the_parent_did_not_set(
-    tmp_path, monkeypatch, capsys
-):
+def test_the_child_refuses_an_environment_the_parent_did_not_set(tmp_path, monkeypatch):
     """A child started without the tuned environment would time untuned
-    kernels or use another state; it must fail before any job runs."""
+    kernels or use another state; it must fail, not run."""
     monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "0")
     monkeypatch.delenv("MIOPEN_USER_DB_PATH", raising=False)
     monkeypatch.setenv("HIPDNN_CACHE_DIR", str(tmp_path / "missing"))
-    job = {
-        "graph": "g.json",
-        "engine": 5,
-        "plugin_path": None,
-        "timing_policy": {},
-        "out_dir": str(tmp_path),
-        "save_outputs": False,
-    }
-    manifest = tmp_path / oracle_mod.MANIFEST_FILE
-    manifest.write_text(json.dumps({"seed": 0, "jobs": [job]}))
+    argv = ["--graph", "g.json", "--engine", "5", "--seed", "0"]
+    argv += ["--timing-policy", "{}", "--out-dir", str(tmp_path)]
 
-    assert hipdnn_tuned_child.main(["--manifest", str(manifest)]) == 1
+    assert hipdnn_tuned_child.main(argv) == 1
 
-    assert not (tmp_path / oracle_mod.RESULT_FILE).exists()
-    assert not (tmp_path / oracle_mod.FAILURE_FILE).exists()
-    stderr = capsys.readouterr().err
+    failure = json.loads((tmp_path / oracle_mod.FAILURE_FILE).read_text())
+    assert failure["kind"] == "error"
     names = ("HIPDNN_FORCE_BENCHMARKING", "HIPDNN_CACHE_DIR", "MIOPEN_USER_DB_PATH")
     for name in names:
-        assert name in stderr
+        assert name in failure["message"]
 
 
 @pytest.mark.parametrize("exposed", [True, False])
-def test_tuning_available_follows_the_engine_knobs(fake, new_runs, tmp_path, exposed):
+def test_tuning_available_follows_the_engine_knobs(fake, tmp_path, exposed):
     """hipDNN ignores a knob the engine does not expose; the tuned run then
     re-measures the OOTB configuration and must say so."""
     if not exposed:
         fake.knob_ids = ["miopen.find_mode"]
 
-    assert _run(new_runs, tmp_path).oracle.tuning_available is exposed
+    assert _run(tmp_path).oracle.tuning_available is exposed
 
 
-def test_tuned_run_reports_its_own_build_timing_and_throughput(
-    fake, new_runs, tmp_path
-):
+def test_tuned_run_reports_its_own_build_timing_and_throughput(fake, tmp_path):
     """TFLOP/s and GB/s use the row's analytical FLOPs/bytes over the TUNED
     kernel median (0.5 ms), not the mean or the OOTB median."""
     row = _row()
     row.analytical_flops = 10**9
     row.analytical_io_bytes = 10**6
 
-    o = _run(new_runs, tmp_path, row=row).oracle
+    o = _run(tmp_path, row=row).oracle
 
     assert row.oracle_error is None
     assert o.cpu_build_time_ms == pytest.approx(3.0)
@@ -381,164 +318,61 @@ def test_tuned_run_reports_its_own_build_timing_and_throughput(
     assert o.derived_gbytes_per_s == pytest.approx(2.0)
 
 
-def test_workspace_is_not_reported_with_metrics_off(fake, new_runs, tmp_path):
+def test_workspace_is_not_reported_with_metrics_off(fake, tmp_path):
     config = _config(metrics=MetricsConfig(basic=False))
 
-    assert _run(new_runs, tmp_path, config=config).oracle.workspace_bytes is None
+    assert _run(tmp_path, config=config).oracle.workspace_bytes is None
 
 
-@pytest.mark.parametrize("precision", ["native", "float64"])
-def test_tuned_outputs_are_saved_from_zeroed_buffers_and_validated_here(
-    fake, new_runs, tmp_path, precision
-):
-    row = _run(new_runs, tmp_path, refs=_refs(precision))
+def test_tuned_outputs_are_saved_from_zeroed_buffers_and_validated_here(fake, tmp_path):
+    row = _run(tmp_path, refs=_refs())
 
     assert fake.calls[2:] == [
         ("zero_outputs", None, None),
-        ("benchmark", 5, None),
+        ("benchmark", None, None),
         ("zero_outputs", None, None),
-        ("execute_once", 5, None),
-        ("destroy_handle", None, None),
+        ("execute_once", None, None),
     ]
     assert row.oracle.correctness.tolerance_match
-    assert row.oracle.correctness.reference_precision == precision
 
 
-def test_no_references_means_no_tuned_validation(fake, new_runs, tmp_path):
-    row = _run(new_runs, tmp_path)
+def test_no_references_means_no_tuned_validation(fake, tmp_path):
+    row = _run(tmp_path)
 
-    assert ("execute_once", 5, None) not in fake.calls
+    assert ("execute_once", None, None) not in fake.calls
     assert row.oracle.correctness is None
 
 
-def test_failing_tuned_plan_keeps_the_row_verdict(fake, new_runs, tmp_path):
+def test_failing_tuned_plan_keeps_the_row_verdict(fake, tmp_path):
     passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
     fake.output = np.ones(2, np.float32)
 
-    row = _run(new_runs, tmp_path, row=_row(passed), refs=_refs())
+    row = _run(tmp_path, row=_row(passed), refs=_refs())
 
     assert row.oracle.correctness.explicitly_failed
     assert row.ootb.correctness is passed
     assert row.verdict == "passed"
 
 
-def test_one_child_runs_every_queued_row_in_order_past_a_failed_run(
-    fake, new_runs, tmp_path
-):
-    """One process serves all rows; a row whose run fails gets its own
-    oracle_error and the next row is still timed, on a new handle."""
-    config = _config()
-    rows = [_row(engine_id=e) for e in (5, 6, 7)]
-    runs = new_runs(config)
-    for row in rows:
-        _add(runs, tmp_path, row, config)
-    fake.errors[("prepare", 6)] = ExecutionError("launch failed")
+def test_stall_in_the_child_propagates_for_a_whole_graph_remeasure(fake, tmp_path):
+    fake.benchmark_error = StallFallbackError("watchdog released the stream")
 
-    assert runs.run([_graph(rows[0]), _graph(*rows[1:])], _quiet()) == []
-
-    # One launch, with no time limit by default (--oracle-timeout 0).
-    assert [timeout for _, timeout in fake.launches] == [None]
-    assert [e for call, e, _ in fake.calls if call == "prime"] == [5, 6, 7]
-    assert [call for call, _, _ in fake.calls].count("destroy_handle") == 3
-    assert rows[0].oracle is not None and rows[0].oracle_error is None
-    assert rows[1].oracle is None
-    assert rows[1].oracle_error == "RuntimeError: ExecutionError: launch failed"
-    assert rows[2].oracle is not None and rows[2].oracle_error is None
-
-
-def test_a_stall_returns_the_graph_for_a_whole_graph_remeasure(
-    fake, new_runs, tmp_path
-):
-    """Rows of one graph share one timing mode: a stall in a gated tuned run
-    sends back its graph, and the row gets neither result nor error."""
-    fake.errors[("benchmark", 6)] = StallFallbackError("watchdog released the stream")
-    config = _config()
-    ok, stalled = _row(engine_id=5), _row(engine_id=6)
-    runs = new_runs(config)
-    _add(runs, tmp_path, ok, config)
-    _add(runs, tmp_path, stalled, config)
-    graphs = [_graph(ok), _graph(stalled)]
-
-    result = runs.run(graphs, _quiet())
-
-    assert result == [
-        oracle_mod.StalledGraph(graphs[1], "watchdog released the stream")
-    ]
-    assert stalled.oracle is None and stalled.oracle_error is None
-    assert ok.oracle is not None
-
-
-def test_a_stall_without_the_gate_is_an_oracle_error(fake, new_runs, tmp_path):
-    """A remeasure without the stall gate must end; its stall is a failed
-    tuned run, not another remeasure."""
-    fake.errors[("benchmark", 5)] = StallFallbackError("watchdog released the stream")
-    config = _config()
-    row = _row()
-    runs = new_runs(config)
-    _add(
-        runs,
-        tmp_path,
-        row,
-        config,
-        policy=TimingPolicy(stall_gate=False),
-    )
-
-    assert runs.run([_graph(row)], _quiet()) == []
-    assert row.oracle is None
-    assert row.oracle_error == "RuntimeError: watchdog released the stream"
-
-
-def test_runs_of_rows_outside_the_graphs_do_not_run_and_leave_the_queue(
-    fake, new_runs, tmp_path
-):
-    """A row of a graph attempt that was remeasured is no longer in the
-    suite; its queued run must not run, now or later."""
-    config = _config()
-    kept, dropped = _row(engine_id=5), _row(engine_id=6)
-    runs = new_runs(config)
-    _add(runs, tmp_path, kept, config)
-    _add(runs, tmp_path, dropped, config)
-    graphs = [_graph(kept)]
-
-    runs.run(graphs, _quiet())
-    runs.run([*graphs, _graph(dropped)], _quiet())
-
-    assert [e for call, e, _ in fake.calls if call == "prime"] == [5]
-    assert len(fake.launches) == 1
-    assert dropped.oracle is None and dropped.oracle_error is None
+    with pytest.raises(StallFallbackError, match="watchdog released the stream"):
+        _run(tmp_path)
 
 
 @pytest.mark.parametrize("where", ["prepare", "benchmark"])
-def test_tuned_child_failure_is_an_oracle_error(fake, new_runs, tmp_path, where):
-    fake.errors[(where, 5)] = ExecutionError("launch failed")
+def test_tuned_child_failure_is_an_oracle_error(fake, tmp_path, where):
+    setattr(fake, f"{where}_error", ExecutionError("launch failed"))
 
-    row = _run(new_runs, tmp_path)
+    row = _run(tmp_path)
 
     assert row.oracle is None
     assert row.oracle_error == "RuntimeError: ExecutionError: launch failed"
     assert row.status == "success"
 
 
-def test_a_child_that_stops_without_files_is_an_oracle_error(
-    monkeypatch, new_runs, tmp_path
-):
-    """A crashed child leaves rows without files; they name its last error."""
-
-    def run_capped(argv, timeout_s, env=None):
-        return SimpleNamespace(
-            returncode=-11, stdout="", stderr="RuntimeError: HIP crashed\n"
-        )
-
-    monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
-
-    row = _run(new_runs, tmp_path)
-
-    assert row.oracle is None and row.status == "success"
-    assert "exited -11" in row.oracle_error
-    assert row.oracle_error.endswith("RuntimeError: HIP crashed")
-
-
-def test_tuned_child_timeout_is_an_oracle_error(monkeypatch, new_runs, tmp_path):
+def test_tuned_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
     """A wedged search must not hang the suite: --oracle-timeout bounds it."""
     seen = []
 
@@ -547,14 +381,13 @@ def test_tuned_child_timeout_is_an_oracle_error(monkeypatch, new_runs, tmp_path)
         raise subprocess.TimeoutExpired(argv, timeout_s)
 
     monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
-    config = _config(oracle_timeout_s=7)
+    config = _config()
+    config.oracle_timeout_s = 7
 
-    row = _run(new_runs, tmp_path, config=config)
+    row = _run(tmp_path, config=config)
 
     assert seen == [7]
-    assert row.oracle is None
-    assert "timed out after 7 s" in row.oracle_error
-    assert "--oracle-timeout" in row.oracle_error
+    assert row.oracle is None and "timed out after 7 s" in row.oracle_error
 
 
 # --- run_pytorch_tuned ------------------------------------------------------
@@ -693,7 +526,8 @@ def test_pytorch_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
         raise subprocess.TimeoutExpired(argv, timeout_s)
 
     monkeypatch.setattr(oracle_mod, "run_capped", run_capped)
-    config = _pytorch_config(oracle_timeout_s=7)
+    config = _pytorch_config()
+    config.oracle_timeout_s = 7
 
     row = _run_pytorch(tmp_path, config)
 

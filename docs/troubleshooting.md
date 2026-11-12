@@ -120,7 +120,7 @@ The budget applies *per subprocess*, not per suite — a four-source
 spend up to 4 × the budget under the worst case.
 
 `--profiling-timeout` does not bound the tuned children of `--oracle`. Use
-`--oracle-timeout SECONDS` for them (default `0`, no limit).
+`--oracle-timeout SECONDS` for them (default `1800`, one limit per child).
 
 ### Profiling VRAM headroom
 

@@ -455,9 +455,9 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Comparison",
         SuiteConfig,
         "oracle",
-        "also time a global.benchmarking=1 plan per hipDNN engine (all in one "
-        "child after the last graph) and a tuned PyTorch run per PyTorch row in "
-        "its own child (much slower; not with --autotune)",
+        "also build and time a global.benchmarking=1 plan per engine, and a "
+        "tuned PyTorch run, each in its own child process (much slower; not "
+        "with --autotune)",
     ),
     CliOption(
         flags=("--oracle-timeout",),
@@ -466,8 +466,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_at_least(int, 0),
         default=_default(SuiteConfig, "oracle_timeout_s"),
         metavar="SECONDS",
-        help="timeout of the tuned hipDNN child (all tuned hipDNN runs of the "
-        "command) and of each tuned PyTorch child; 0 (default) disables",
+        help="timeout of each tuned child process (one per row); 0 disables",
         config_key="oracle_timeout",
         config_kind=ConfigKind.SCALAR,
         config_type=int,

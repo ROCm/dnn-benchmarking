@@ -76,7 +76,7 @@ def test_pytorch_runtime_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) 
     monkeypatch.setattr(
         suite_runner_cli,
         "start_runtime",
-        lambda c, r, s, tuned_runs=None: lambda *a, **kw: None,
+        lambda c, r, s: lambda *a: None,
     )
 
     args = create_parser(suppress_defaults=True).parse_args(["-r", "pytorch"])

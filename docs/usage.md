@@ -147,7 +147,7 @@ maximum host RSS of the process grew by 0.06 GiB to 0.2 GiB.
 | Option | Default | Description |
 |---|---|---|
 | `--oracle`, `--no-oracle` | off | Also build and time a tuned (`global.benchmarking=1`) plan of each engine, and a tuned PyTorch run. Cannot be combined with `--autotune`. See [Oracle](#oracle). |
-| `--oracle-timeout SECONDS` | 0 | Wall-clock limit for the hipDNN tuned child (all its tuned runs together) and for each PyTorch tuned child. `0` disables the limit. |
+| `--oracle-timeout SECONDS` | 1800 | Wall-clock limit for each tuned child process (one per row, hipDNN or PyTorch). A child that times out gives `oracle_error` for its row only. `0` disables the limit. |
 
 ### Output
 
@@ -552,24 +552,20 @@ operation graph build and the workspace allocation are not timed.
    The untimed plan is never executed, so no provider tuning runs.
 2. The tool times and validates the OOTB plan in the `dnn-benchmark`
    process, on the OOTB state of the command.
-3. The tool queues the tuned run of each hipDNN row. After the last graph,
-   one child process runs all queued tuned runs in row order. For each run
-   it creates a new handle, primes the engine, builds the tuned plan, times
-   it with the same timing settings and saves its outputs. The child runs
-   on the tuned state of the work directory (see
+3. Then a child process primes the engine, builds the tuned plan, times it
+   with the same timing settings and saves its outputs. Each row gets its
+   own child: two MIOpen tuning searches in one process can deadlock. The
+   child runs on the tuned state of the work directory (see
    [Work directory](#work-directory---benchmark-work-dir)), so the tuned
    search never reaches an OOTB plan. The tool validates the tuned outputs
-   against the same reference. With `--validate`, the references stay in
-   the system temporary directory until the tuned runs end.
-4. The child writes the result of each run to its own files. A failed run
-   sets `oracle_error` and keeps the row; the child continues with the next
-   run. When the child crashes or times out (`--oracle-timeout`), only the
-   unfinished runs get `oracle_error`.
+   against the same reference. A failed child sets `oracle_error` and keeps
+   the row.
+4. `--oracle-timeout` (default 1800 s) bounds each child. A hung search thus
+   costs the tuned result of one row. After Ctrl-C, the partial result file
+   keeps every graph that finished, with its tuned results; the graph that
+   was running is not in it.
 5. When a tuned run fails the stall gate, the tool measures every row of
-   that graph again without the stall gate, then runs the tuned runs of the
-   graph again.
-6. With `--oracle` on the hipDNN runtime, the tool prints the graph tables
-   after the tuned runs, so each table shows the final rows once.
+   that graph again without the stall gate, the tuned runs included.
 
 A tuned build prepares every candidate that the provider can sample, so it is
 usually slower than the OOTB build. Providers that support the knob (today the

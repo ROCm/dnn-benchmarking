@@ -25,7 +25,6 @@ from dnn_benchmarking.cli.main import main as cli_main
 from dnn_benchmarking.cli.parser import create_parser
 from dnn_benchmarking.common import pytorch_tuning
 from dnn_benchmarking.common.work_dir import FRESH_STATE_PREFIX
-from dnn_benchmarking.execution.oracle import StalledGraph
 from dnn_benchmarking.reporting import compare
 from dnn_benchmarking.reporting.reporter import Reporter
 from dnn_benchmarking.reporting.suite_results import (
@@ -94,27 +93,17 @@ def _isolate(monkeypatch):
 
 @pytest.fixture
 def runtime(monkeypatch):
-    """Install a fake runtime; returns a setter taking run_graph(path)->GraphResult.
-
-    ``calls`` holds each started config, ``graph_runs`` each graph run as
-    (path, stall_gate)."""
-    calls: list = []
-    graph_runs: list = []
+    """Install a fake runtime; returns a setter taking run_graph(path)->GraphResult."""
+    calls = []
 
     def install(run: Callable[[Path], GraphResult]) -> None:
-        def start(config, reporter, resources, tuned_runs=None):
+        def start(config, reporter, resources):
             calls.append(config)
-
-            def run_graph(path, graph_json, infos, *, stall_gate=True):
-                graph_runs.append((path, stall_gate))
-                return run(path)
-
-            return run_graph
+            return lambda path, graph_json, infos: run(path)
 
         monkeypatch.setattr(suite_runner_cli, "start_runtime", start)
 
     install.calls = calls  # type: ignore[attr-defined]
-    install.graph_runs = graph_runs  # type: ignore[attr-defined]
     return install
 
 
@@ -259,7 +248,7 @@ from dnn_benchmarking.cli.config_file import apply_config_file
 from dnn_benchmarking.cli.parser import create_parser
 from dnn_benchmarking.reporting.reporter import Reporter
 
-def run_graph(path, graph_json, infos, *, stall_gate=True):
+def run_graph(path, graph_json, infos):
     print("blocked", flush=True)
     mutex = ctypes.create_string_buffer(64)  # zeroed: a default pthread mutex
     libc = ctypes.CDLL(None)
@@ -268,7 +257,7 @@ def run_graph(path, graph_json, infos, *, stall_gate=True):
 
 cli.SIGTERM_GRACE_S = 0.5
 cli.collect_environment_info = lambda: {}
-cli.start_runtime = lambda config, reporter, resources, tuned_runs=None: run_graph
+cli.start_runtime = lambda config, reporter, resources: run_graph
 args = create_parser(suppress_defaults=True).parse_args(["-g", "unused"])
 apply_config_file(args)
 code = cli.run_suite_cli(args, [Path(sys.argv[1])], Reporter(output=io.StringIO()))
@@ -558,87 +547,6 @@ def test_selection_env_recorded_only_for_autotune_or_oracle(tmp_path, runtime) -
     assert env["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
-class _TunedQueue:
-    """HipdnnTunedRuns stand-in. Each run() records its graphs and the
-    results printed so far; a graph named in ``stall`` stalls in its first
-    tuned run."""
-
-    def __init__(self, out: io.StringIO, stall=()) -> None:
-        self.out, self.stall = out, set(stall)
-        self.runs: list = []
-        self.closed = False
-
-    def run(self, graphs, reporter) -> list:
-        self.runs.append((list(graphs), self.out.getvalue()))
-        stalled = [g for g in graphs if g.graph_name in self.stall]
-        self.stall -= {g.graph_name for g in stalled}
-        return [StalledGraph(graph=g, reason="stall gate failed") for g in stalled]
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def _run_oracle(monkeypatch, args, graphs, stall=()) -> tuple:
-    """Run ``--oracle`` with a fake tuned-run queue; return the exit code,
-    the queue and the results output (progress goes to another stream)."""
-    out = io.StringIO()
-    queue = _TunedQueue(out, stall)
-    monkeypatch.setattr(suite_runner_cli, "HipdnnTunedRuns", lambda config: queue)
-    reporter = Reporter(output=out, err=io.StringIO())
-    code = suite_runner_cli.run_suite_cli(_args("--oracle", *args), graphs, reporter)
-    return code, queue, out.getvalue()
-
-
-def test_oracle_graph_tables_print_once_after_the_tuned_runs(
-    tmp_path, runtime, monkeypatch
-) -> None:
-    """The tables show the tuned results, so they print after the tuned runs,
-    each graph once."""
-    runtime(lambda path: _graph(path, [_passed()]))
-
-    code, queue, out = _run_oracle(monkeypatch, (), _graphs(tmp_path, 2))
-
-    assert code == 0
-    (graphs, printed_before), *_ = queue.runs
-    assert [g.graph_name for g in graphs] == ["g0", "g1"]
-    assert {"g0", "g1"}.isdisjoint(printed_before.splitlines())
-    assert [out.splitlines().count(name) for name in ("g0", "g1")] == [1, 1]
-    assert queue.closed
-
-
-def test_tuned_run_stall_reruns_its_graph_unstalled_and_replaces_it(
-    tmp_path, runtime, monkeypatch
-) -> None:
-    """A graph whose tuned run stalled is remeasured without the stall gate,
-    the new result replaces the old one, and its rows get new tuned runs."""
-    attempts: list = []
-
-    def run(path):
-        attempts.append(path.stem)
-        row = _passed()
-        row.warnings = [f"attempt {len(attempts)}"]
-        return _graph(path, [row])
-
-    runtime(run)
-    g0, g1 = _graphs(tmp_path, 2)
-    output = tmp_path / "out.json"
-
-    code, queue, out = _run_oracle(
-        monkeypatch, ("-o", str(output)), [g0, g1], stall=["g0"]
-    )
-
-    assert code == 0
-    assert runtime.graph_runs == [(g0, True), (g1, True), (g0, False)]
-    (first, _), (second, _) = queue.runs
-    assert [g.graph_name for g in second] == ["g0"] and second[0] is not first[0]
-    graphs = SuiteResult.load(output)["graphs"]
-    assert [(g["graph_name"], g["results"][0]["warnings"]) for g in graphs] == [
-        ("g0", ["attempt 3"]),
-        ("g1", ["attempt 2"]),
-    ]
-    assert out.splitlines().count("g0") == 1
-
-
 def _fake_hipdnn(monkeypatch, *, loaded=(), handle_error=None) -> list:
     """Install a fake hipdnn_frontend whose handle knows only ``loaded`` IDs
     (or ``loaded[plugin_path]``); return the plugin-path/Handle call log."""
@@ -688,7 +596,7 @@ def test_per_engine_plugin_paths_check_each_pair_without_a_shared_handle(
     monkeypatch.setattr(
         runtimes,
         "hipdnn_planner",
-        lambda handle, prime_once, tuned_runs: handles.append(handle),
+        lambda handle, prime_once: handles.append(handle),
     )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
     config = suite_runner_cli.SuiteConfig.from_namespace(
@@ -751,7 +659,7 @@ def test_fast_loads_only_the_named_plugin_file(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         runtimes,
         "hipdnn_planner",
-        lambda handle, prime_once, tuned_runs: planners.append(prime_once) or "plan",
+        lambda handle, prime_once: planners.append(prime_once) or "plan",
     )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: None)
     config = suite_runner_cli.SuiteConfig.from_namespace(
@@ -966,7 +874,7 @@ def test_loaded_engine_passes_startup(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         runtimes,
         "hipdnn_planner",
-        lambda handle, prime_once, tuned_runs: handles.append(handle) or "plan",
+        lambda handle, prime_once: handles.append(handle) or "plan",
     )
     monkeypatch.setattr(runtimes, "run_graph", lambda *args: seen.append(args) or "ran")
     config = suite_runner_cli.SuiteConfig.from_namespace(

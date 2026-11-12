@@ -6,12 +6,11 @@
 import importlib.util
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional
 
 from ..common import torch_support
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import RuntimeName, SuiteConfig
-from ..execution.oracle import HipdnnTunedRuns
 from ..execution.suite_runner import (
     GraphPlanner,
     hipdnn_planner,
@@ -20,29 +19,14 @@ from ..execution.suite_runner import (
     rocke_session,
     run_graph,
     set_plugin_path,
-    without_stall_gate,
 )
 from ..reporting.reporter import Reporter
 from ..reporting.suite_results import GraphResult, engine_id_hex
 from ..validation.reference_provider import ReferenceProviderRegistry
 from .parser import TYPED_ENGINE_NAMES
 
-
-class GraphRunner(Protocol):
-    """Runs one graph through every selected runtime.
-
-    ``stall_gate=False`` remeasures a graph whose stall gate failed in an
-    ``--oracle`` tuned run, so all its rows share one timing mode.
-    """
-
-    def __call__(
-        self,
-        graph_path: Path,
-        graph_json: Dict[str, Any],
-        tensor_infos: list,
-        *,
-        stall_gate: bool = True,
-    ) -> GraphResult: ...
+#: ``run_graph(graph_path, graph_json, tensor_infos) -> GraphResult``
+GraphRunner = Callable[[Path, Dict[str, Any], list], GraphResult]
 
 
 class RuntimeStartupError(Exception):
@@ -54,18 +38,14 @@ class RuntimeStartupError(Exception):
 
 
 def start_runtime(
-    config: SuiteConfig,
-    reporter: Reporter,
-    resources: ExitStack,
-    tuned_runs: Optional[HipdnnTunedRuns] = None,
+    config: SuiteConfig, reporter: Reporter, resources: ExitStack
 ) -> GraphRunner:
     """Check every selected runtime (and the reference provider); return the runner.
 
     Each graph runs through the runtimes in ``config.runtimes`` order, and
     every runtime adds its rows to the same graph result. The shared hipDNN
     handle is destroyed when ``resources`` closes, so the caller decides
-    which state (the ``--fast`` MIOpen user database) outlives it. hipDNN
-    engine rows queue their ``--oracle`` tuned runs in ``tuned_runs``.
+    which state (the ``--fast`` MIOpen user database) outlives it.
 
     Raises:
         RuntimeStartupError: a runtime is unavailable (exit 1) or an explicit
@@ -85,25 +65,12 @@ def start_runtime(
             handle = _create_hipdnn_handle(config, hipdnn, load_error)
             if handle is not None:
                 resources.callback(hipdnn.destroy_handle, handle)
-            planners.append(
-                hipdnn_planner(handle, prime_once=config.fast, tuned_runs=tuned_runs)
-            )
+            planners.append(hipdnn_planner(handle, prime_once=config.fast))
         else:
             planners.append(_STARTERS[runtime](config, reporter))
-
-    def run(
-        graph_path: Path,
-        graph_json: Dict[str, Any],
-        tensor_infos: list,
-        *,
-        stall_gate: bool = True,
-    ) -> GraphResult:
-        graph_config = config if stall_gate else without_stall_gate(config)
-        return run_graph(
-            graph_path, graph_json, tensor_infos, graph_config, reporter, planners
-        )
-
-    return run
+    return lambda path, graph_json, infos: run_graph(
+        path, graph_json, infos, config, reporter, planners
+    )
 
 
 def _start_pytorch(config: SuiteConfig, reporter: Reporter) -> GraphPlanner:

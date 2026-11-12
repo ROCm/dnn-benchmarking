@@ -52,7 +52,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import HipdnnTunedRuns, run_pytorch_tuned
+from .oracle import run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
     Catalog,
     RockeKernel,
@@ -81,9 +81,6 @@ class _GraphContext:
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
-    #: ``reference_outputs`` saved for the ``--oracle`` tuned runs, once per
-    #: graph attempt (``HipdnnTunedRuns.save_references``).
-    tuned_reference_dir: Optional[Path] = None
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -554,10 +551,9 @@ def run_single_provider_engine(
     engine_name: str,
     engine_version: str,
     plugin_path: Optional[Path],
-    tuned_runs: Optional[HipdnnTunedRuns] = None,
 ) -> ProviderEngineResult:
-    """Build, time and validate one hipDNN engine; then its profiling passes,
-    each in a child process. With ``tuned_runs``, queue its tuned run."""
+    """Build, time and validate one hipDNN engine; then its tuned run and
+    profiling passes, each in a child process."""
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
     row = ProviderEngineResult(
@@ -605,21 +601,20 @@ def run_single_provider_engine(
             _failure_message(e, memory_at_start),
         )
 
-    # The profiling passes run after the OOTB pass, in their own processes, so
-    # profiler overhead cannot pollute the headline numbers. The tuned run
-    # waits in the queue until the last graph ends.
-    if tuned_runs is not None:
-        if ctx.reference_outputs is not None and ctx.tuned_reference_dir is None:
-            ctx.tuned_reference_dir = tuned_runs.save_references(ctx.reference_outputs)
-        tuned_runs.add(
+    # The tuned run and profiling run after the OOTB pass, each in its own
+    # process: the tuned run uses the kept tuned selection state while this
+    # process uses the OOTB one, and profiler overhead cannot pollute
+    # the headline numbers.
+    if config.oracle:
+        run_hipdnn_tuned(
             row=row,
             graph_path=ctx.graph_path,
             graph_name=ctx.graph_name,
             tensor_infos=ctx.tensor_infos,
+            reference_outputs=ctx.reference_outputs,
             engine_id=engine_id,
             plugin_path=plugin_path,
-            timing_policy=config.timing_policy,
-            reference_dir=ctx.tuned_reference_dir,
+            config=config,
         )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
@@ -899,18 +894,9 @@ def _with_stall_fallback(
     # every frame of the first attempt, with its inputs, references, device
     # buffers and workspaces, until the block exits.
     reporter.warning(f"{reason}; remeasuring every row of this graph without stalling")
-    return run(without_stall_gate(config))
-
-
-def without_stall_gate(config: SuiteConfig) -> SuiteConfig:
-    """A copy of ``config`` whose timing policy does not stall-gate.
-
-    A graph whose stall gate failed is remeasured with it, so that every
-    row of the graph uses the same timing mode.
-    """
     unstalled = copy.copy(config)
     unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
-    return unstalled
+    return run(unstalled)
 
 
 @dataclass
@@ -1022,11 +1008,7 @@ def _run_graph(
     return graph
 
 
-def hipdnn_planner(
-    handle: Any,
-    prime_once: bool = False,
-    tuned_runs: Optional[HipdnnTunedRuns] = None,
-) -> GraphPlanner:
+def hipdnn_planner(handle: Any, prime_once: bool = False) -> GraphPlanner:
     """Plan every selected or discovered hipDNN engine.
 
     Explicit ``--engine`` IDs run in the caller's order; otherwise the graph's
@@ -1039,8 +1021,6 @@ def hipdnn_planner(
             plugin paths).
         prime_once: Prime each engine only before its first build of the run
             (``--fast``), not before every graph.
-        tuned_runs: The queue of ``--oracle`` tuned runs; each successful
-            engine row adds its run. None without ``--oracle``.
     """
     primer = EnginePrimer(once=prime_once)
 
@@ -1077,9 +1057,7 @@ def hipdnn_planner(
             "hipdnn",
             engine_ids=engine_ids,
             rows=lambda ctx: [
-                _run_engine_selection(
-                    ctx, handle, primer, s.engine_id, s.plugin_path, tuned_runs
-                )
+                _run_engine_selection(ctx, handle, primer, s.engine_id, s.plugin_path)
                 for s in selections
             ],
             message=message,
@@ -1095,7 +1073,6 @@ def _run_engine_selection(
     primer: EnginePrimer,
     engine_id: int,
     plugin_path: Optional[Path],
-    tuned_runs: Optional[HipdnnTunedRuns],
 ) -> ProviderEngineResult:
     """One engine row, creating a plugin-scoped handle when none is shared."""
     if handle is None:
@@ -1122,7 +1099,7 @@ def _run_engine_selection(
         ctx.reporter,
         name,
         lambda: run_single_provider_engine(
-            ctx, handle, primer, engine_id, name, version, plugin_path, tuned_runs
+            ctx, handle, primer, engine_id, name, version, plugin_path
         ),
     )
 

@@ -164,10 +164,9 @@ Rules that keep the design intact:
   `cli/hipdnn_tuned_child.py`, PyTorch in `cli/pytorch_tuned_child.py`
   (`execution/oracle.py` starts both). MIOpen reads `MIOPEN_USER_DB_PATH`
   once per process, and PyTorch's conv algorithm cache is process-wide.
-  `oracle.HipdnnTunedRuns` queues the hipDNN tuned runs and runs them all in
-  one child after the last graph, in row order, with a new handle for each
-  run. Each run writes its own result or failure file, so a crash or a
-  timeout (`--oracle-timeout`) loses only the unfinished runs.
+  Each tuned run gets its own child: two MIOpen tuning searches in one
+  process can deadlock (seen on MI210), and `--oracle-timeout` then costs
+  one row, not the run.
 - `common/work_dir.py` owns the work-directory layout. `cli.main` sets
   `HIPDNN_CACHE_DIR` and `MIOPEN_USER_DB_PATH` for the process: `--autotune`,
   a true `HIPDNN_FORCE_BENCHMARKING` in the environment and the PyTorch tuned
