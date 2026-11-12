@@ -174,6 +174,15 @@ The setup runs once, before the timed loop:
    with `requires_grad` inputs and the graph's mask, bounds and scale.
 3. Read from the autograd node which fused kernel ran, and its saved scalars.
 4. Copy `stats` into the log-sum-exp layout of that kernel.
+5. Copy O into the memory layout of the forward's output. For an O in the
+   `[B, H, S, D]` memory order, the memory-efficient backward (AOTriton) of
+   PyTorch 2.9.1 and of the 2.14 nightly on gfx90a gives wrong dK and dV
+   (ALMIOPEN-3256). A training step also passes the forward's output in this
+   layout.
+
+The setup thus reads Q, K, V, O, `stats` and the mask once. If an earlier
+node of the graph computes one of these inputs, the row does not run: its
+setup cannot be outside the timed region.
 
 A timed iteration does one backward kernel call. For GQA and MQA graphs it
 also sums dK and dV over each head group, which is real backward work.

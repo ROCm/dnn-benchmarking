@@ -1227,13 +1227,13 @@ _MATH_BACKWARD_NOTE = (
 class _FusedBackward(NamedTuple):
     """A fused SDPA backward kernel call, built once from a forward probe.
 
-    ``call(do, o)`` returns ``(dq, dk, dv)`` at the query head count. The
-    other arguments (Q, K/V at the query head count, the kernel's
-    log-sum-exp layout filled with the graph's stats, and the forward's
+    ``call(do)`` returns ``(dq, dk, dv)`` at the query head count. The other
+    arguments (Q, K/V at the query head count, the graph's O and stats in the
+    layouts of the forward's saved output and log-sum-exp, and the forward's
     saved scalars) are bound in ``call``.
     """
 
-    call: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, ...]]
+    call: Callable[[torch.Tensor], Tuple[torch.Tensor, ...]]
     rep_k: int
     rep_v: int
 
@@ -1250,6 +1250,7 @@ def _prepare_fused_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor,
     stats: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
     is_causal: bool,
@@ -1266,6 +1267,11 @@ def _prepare_fused_backward(
     backward. The timed call then passes the graph's own O and stats, as the
     hipDNN kernel reads them. K and V are expanded to the query head count
     here; the timed call sums dK and dV back over each head group.
+
+    The graph's O is copied once into the memory layout of the forward's
+    output. The memory-efficient backward needs that layout ([B, S, H, D] in
+    memory): with a [B, H, S, D] O, AOTriton on gfx90a returns wrong dK and dV
+    (ALMIOPEN-3256), and CUDA can read out of bounds (pytorch/pytorch#138772).
 
     Returns ``None`` when default dispatch chose neither Flash nor
     memory-efficient attention.
@@ -1334,14 +1340,16 @@ def _prepare_fused_backward(
         )
 
     # The kernel's log-sum-exp layout ([B, H, Sq], padded on some backends),
-    # filled once with the graph's stats: they are a constant input.
+    # filled once with the graph's stats, and the forward's output layout,
+    # filled once with the graph's O: both are constant inputs.
     lse = torch.zeros_like(lse_saved)
     lse[..., : int(stats.shape[-2])] = stats[..., 0]
+    o_kernel = torch.empty_like(out).copy_(o)
     del out, grad_fn, probe
 
-    def call(do: torch.Tensor, o: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    def call(do: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         with native_sdpa_call():
-            return kernel(do, o, lse)
+            return kernel(do, o_kernel, lse)
 
     return _FusedBackward(call, rep_k, rep_v)
 
@@ -1390,7 +1398,15 @@ def compile_sdpa_backward(
     plan = _plan_sdpa_common(node)
     computed_inputs = [
         uid
-        for uid in (q_uid, k_uid, v_uid, stats_uid, plan.mask_uid, plan.scale_uid)
+        for uid in (
+            q_uid,
+            k_uid,
+            v_uid,
+            o_uid,
+            stats_uid,
+            plan.mask_uid,
+            plan.scale_uid,
+        )
         if uid is not None and _is_computed(graph_json, uid)
     ]
 
@@ -1416,7 +1432,7 @@ def compile_sdpa_backward(
         )
         return attn_mask, causal, float(scale), rep_k, rep_v
 
-    def fused(tensors, q, k, v, stats) -> Optional[_FusedBackward]:
+    def fused(tensors, q, k, v, o, stats) -> Optional[_FusedBackward]:
         if computed_inputs and isinstance(tensors, ReplayTensors):
             raise UnsupportedGraphError(
                 f"SDPA backward inputs {computed_inputs} are computed inside the "
@@ -1434,7 +1450,7 @@ def compile_sdpa_backward(
             )
         attn_mask, causal, scale, rep_k, rep_v = resolve(tensors, q, k, v)
         return _prepare_fused_backward(
-            q, k, v, stats, attn_mask, causal, scale, rep_k, rep_v
+            q, k, v, o, stats, attn_mask, causal, scale, rep_k, rep_v
         )
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
@@ -1458,10 +1474,10 @@ def compile_sdpa_backward(
                     "cannot read the graph's saved stats"
                 )
             kernel = _replay_constant(
-                tensors, ("sdpa_bwd", dq_uid), lambda: fused(tensors, q, k, v, stats)
+                tensors, ("sdpa_bwd", dq_uid), lambda: fused(tensors, q, k, v, o, stats)
             )
             if kernel is not None:
-                dq, dk, dv = kernel.call(do, o)
+                dq, dk, dv = kernel.call(do)
                 _store_tensor(tensors, dq_uid, dq)
                 _store_tensor(tensors, dk_uid, _sum_head_groups(dk, kernel.rep_k))
                 _store_tensor(tensors, dv_uid, _sum_head_groups(dv, kernel.rep_v))
