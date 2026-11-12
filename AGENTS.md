@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Guidance for coding agents (Claude Code, Codex and others) that work in this
-repository. `CLAUDE.md` imports this file. Keep one copy of each rule here.
+repository. Keep one copy of each rule here.
 
 ## Project overview
 
@@ -33,7 +33,7 @@ add a runtime, add a `RuntimeName` member, its options in
 User documentation:
 
 - `README.md`: quick start.
-- `docs/setup.md`: `setup_env.py`.
+- `docs/setup.md`: released wheels and `setup_env.py`.
 - `docs/usage.md`: CLI reference, console output, exit codes, `compare`.
 - `docs/methodology.md`: timing method and known limits.
 - `docs/results-schema.md`: result file schema version 2.
@@ -50,6 +50,11 @@ python3 setup_env.py --torch-mode cuda          # CUDA host: PyTorch runtime onl
 pip install -e ".[test]"                         # package only, into an existing env
 source .workspace/.venv/bin/activate             # sets ROCM_PATH and LD_LIBRARY_PATH
 ```
+
+Released wheels (`tools/build_release_wheels.py`, `release-wheels.yml`) ship
+a per-architecture `hipdnn_runtime` wheel. `common/rocm_runtime.py` preloads
+its hipDNN backend before torch can map the ROCm SDK's copy. See
+`docs/setup.md#released-wheels`.
 
 Each worktree keeps its own `.workspace/` (or `build/`) and `.venv`.
 

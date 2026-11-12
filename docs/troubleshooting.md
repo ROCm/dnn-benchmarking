@@ -25,6 +25,16 @@ $VENV_SITE/triton/backends/amd/lib:\
 $LD_LIBRARY_PATH
 ```
 
+## GPU SMI snapshot disabled
+
+The benchmark logs `[metrics:amdsmi] module not installed; GPU snapshot
+disabled` once and leaves the snapshot JSON fields `None`. The amdsmi bindings
+must match the installed ROCm SDK exactly. The `amdsmi` distribution on PyPI
+does not match, and it segfaults against a nightly SDK. The ROCm SDK ships
+matching sources under `_rocm_sdk_core/share/amd_smi`, but recent nightlies
+omit the `setup.py` that makes them installable. So neither the released wheels
+nor `setup_env.py` can install them today.
+
 ## What each profiling source needs
 
 `setup_env.py` prints this as a `Profiling sources:` block at the end of

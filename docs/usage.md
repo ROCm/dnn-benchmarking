@@ -59,8 +59,9 @@ the same output format.
 
 When `--plugin-path` is not given, the tool uses
 `$ROCM_PATH/lib/hipdnn_plugins/engines`. When `ROCM_PATH` is not set, it uses
-the plugin directory of the pip ROCm SDK. The `setup_env.py` activation script
-sets `ROCM_PATH`.
+the plugins of the installed `hipdnn_runtime` wheel (see
+[Released wheels](setup.md#released-wheels)), and then the plugin directory of
+the pip ROCm SDK. The `setup_env.py` activation script sets `ROCM_PATH`.
 
 ### Validation
 

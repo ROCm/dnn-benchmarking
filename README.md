@@ -25,7 +25,8 @@ and, if you ask, compares the output with a PyTorch reference.
 
 - Python 3.12 or newer.
 - hipDNN backend: an AMD GPU with ROCm, the hipDNN Python bindings
-  (`hipdnn_frontend`) and the engine plugins. `setup_env.py` builds them.
+  (`hipdnn_frontend`) and the engine plugins. The released wheels ship them,
+  or `setup_env.py` builds them.
 - PyTorch runtime: a ROCm or CUDA build of PyTorch. hipDNN is not necessary.
 - rocKE runtime: a ROCm build of PyTorch and the rocKE Python packages
   (`setup_env.py` installs them on Linux). See
@@ -41,8 +42,21 @@ before using `--validate pytorch` with that setup.
 
 ## Quick start
 
-1. Set up the environment (ROCm host). See [docs/setup.md](docs/setup.md)
-   for CUDA hosts, CPU-only PyTorch and Docker.
+1. Set up the environment (ROCm host). On a supported GPU (`gfx90a`,
+   `gfx942`, `gfx950`, `gfx1100`, `gfx1151`), install the released wheels.
+   This needs no compiler, CMake or system ROCm. Take `<tag>` from the
+   [releases page](https://github.com/ROCm/dnn-benchmarking/releases) and
+   replace `gfx942` with the architecture that `rocm_agent_enumerator`
+   reports:
+
+   ```bash
+   python3.12 -m venv .venv && source .venv/bin/activate
+   pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/<tag>/requirements-gfx942.txt
+   ```
+
+   To change hipDNN or the providers, or when no wheel exists for your GPU,
+   build from source. See [docs/setup.md](docs/setup.md) for released wheels,
+   CUDA hosts, CPU-only PyTorch and Docker.
 
    ```bash
    python3 setup_env.py --workspace .workspace
@@ -115,7 +129,7 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 
 | Document | Content |
 |---|---|
-| [docs/setup.md](docs/setup.md) | `setup_env.py`: torch modes, CMake defines, rocm-libraries source, CUDA hosts, Docker. |
+| [docs/setup.md](docs/setup.md) | Released wheels and how to publish them; `setup_env.py`: torch modes, CMake defines, rocm-libraries source, CUDA hosts, Docker. |
 | [docs/usage.md](docs/usage.md) | All CLI options, engine selection, config files, console output, exit codes, `compare`, profiling. |
 | [docs/methodology.md](docs/methodology.md) | What `kernel_med` measures, warmup, cache modes, stop rule, statistics, parity with rocKE and PyTorch, known limits. |
 | [docs/results-schema.md](docs/results-schema.md) | Result file schema version 2 (JSON and CSV). |

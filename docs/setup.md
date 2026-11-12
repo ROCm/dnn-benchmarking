@@ -1,8 +1,56 @@
 # Setup
 
-`setup_env.py` creates a virtual environment, installs PyTorch, builds hipDNN
-and the provider plugins, and installs dnn-benchmarking. It requires Python
-3.12 or newer. `python3 setup_env.py --help` lists every option.
+There are two ways to set up dnn-benchmarking. Both require Python 3.12 or
+newer.
+
+- [Released wheels](#released-wheels): prebuilt hipDNN and engine plugins for
+  each GPU architecture. No compiler, CMake or system ROCm is necessary.
+- `setup_env.py` (source build): creates a virtual environment, installs
+  PyTorch, builds hipDNN and the provider plugins, and installs
+  dnn-benchmarking. Use it to change hipDNN or the providers, or when no wheel
+  exists for your GPU. `python3 setup_env.py --help` lists every option.
+
+## Released wheels
+
+Wheels exist for `gfx90a`, `gfx942`, `gfx950`, `gfx1100` and `gfx1151`.
+
+```bash
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r https://github.com/ROCm/dnn-benchmarking/releases/download/<tag>/requirements-gfx942.txt
+```
+
+Take `<tag>` from the
+[releases page](https://github.com/ROCm/dnn-benchmarking/releases). Replace
+`gfx942` with the architecture that `rocm_agent_enumerator` reports. The
+requirements file pins torch and the ROCm SDK to one nightly. It also installs
+hipDNN and the engine plugins, built from the `rocm-libraries` commit that this
+repository pins. If `ROCM_PATH` is set, it overrides the bundled plugins.
+
+### Releasing wheels
+
+`tools/build_release_wheels.py` builds the per-architecture `hipdnn_runtime`
+wheel, the `hipdnn_frontend` bindings, this package, and a requirements file
+for each architecture. It uses the pinned `rocm-libraries` commit. The ROCm SDK
+wheels bundle an older hipDNN that lacks entry points the bindings need, so the
+runtime wheel ships its own. The tool loads that copy first.
+
+The `release-wheels` workflow builds and publishes a release. Start it
+manually from the Actions tab. The build loads every architecture's payload
+against the pinned ROCm SDK. CI has no GPU, so it runs no benchmark. To
+publish by hand from a pushed commit:
+
+```bash
+TAG=v0.1.0
+python3 tools/build_release_wheels.py \
+    --base-url https://github.com/ROCm/dnn-benchmarking/releases/download/$TAG
+gh release create $TAG dist/*.whl dist/requirements-*.txt \
+    --target "$(git rev-parse HEAD)"
+```
+
+Without `--target`, `gh` tags the newest commit on the default branch, which
+can differ from the commit that built the wheels.
+
+Do not publish to `rocm.nightlies.amd.com`. That index belongs to TheRock.
 
 ## Quick setup (ROCm)
 
