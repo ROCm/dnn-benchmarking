@@ -144,6 +144,19 @@ includes a workaround, and the row gets a reference warning:
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.
+- ALiBi (`alibi_mask`, top-left causal masking or a top-left sliding
+  window): the tool builds the bias `(j - i) * slope(h)` once in setup, for
+  query position `i`, key position `j` and query head `h`, and reuses it
+  every iteration; hipDNN computes the same bias inside the kernel instead,
+  so the two differ in where that cost falls. The slopes follow the cuDNN
+  schedule and use the query head, so GQA and MQA graphs use the query head
+  count. The timed kernel reads the bias as part of one additive mask
+  tensor in the graph data type, so fp16 and bf16 round the bias. The
+  timed row keeps the log-sum-exp (`stats`) of the kernel, as a training
+  step does. The reference computes `stats` again from the float32 bias.
+- Explicit `attn_mask` bias with a causal mask, a sliding window or
+  bottom-right alignment: the tool adds the bias first and applies the band
+  second. The kernel reads the sum as one additive mask tensor.
 
 ### PyTorch convolution backward
 
@@ -491,10 +504,15 @@ The tool does not do these things yet:
   for fp16 and bf16 the reference has the same precision as the result under
   test, and the tolerances must be loose.
 - SDPA reference for every mask. The PyTorch reference supports top-left and
-  bottom-right causal bands, bounded left windows with `right_bound = 0`, and
-  attention-sink logits. It follows hipDNN precedence: the deprecated causal
-  booleans override the modern bounds and diagonal alignment. Other masks make
-  the reference decline the graph as unsupported.
+  bottom-right causal bands, bounded left windows with `right_bound = 0`,
+  attention-sink logits, and ALiBi with top-left causal masking or a
+  top-left sliding window. An explicit `attn_mask` bias can combine with a
+  causal band or a sliding window. It follows hipDNN precedence: the
+  deprecated causal booleans override the modern bounds and diagonal
+  alignment. The reference declines these graphs as unsupported: ALiBi with
+  bottom-right alignment or with neither a causal mask nor a sliding window;
+  padding masks; paged or variable-length ALiBi graphs. Other masks also
+  make the reference decline the graph.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
