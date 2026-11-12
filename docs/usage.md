@@ -276,7 +276,9 @@ support an input.
 When PyTorch runs (`--runtime pytorch` or `--validate pytorch`), the CLI sets
 these PyTorch controls so the PyTorch baseline is not handicapped. The CLI
 overwrites any value already in the environment, so the command line is the
-only control. The tool prints the settings.
+only control. The tool prints the settings. When it replaces a different
+value from the environment, it shows a warning with the variable, the old
+value and the new value. `--quiet` does not hide this warning.
 
 | Setting | Why |
 |---|---|
@@ -563,13 +565,16 @@ operation graph build and the workspace allocation are not timed.
    [Work directory](#work-directory---benchmark-work-dir)), so the tuned
    search never reaches an OOTB plan. The tool validates the tuned outputs
    against the same reference. A failed child sets `oracle_error` and keeps
-   the row.
+   the row. With `--cache-mode cold`, the benchmark process frees its
+   512 MiB flush buffer before each child starts.
 4. `--oracle-timeout` (default 1800 s) bounds each child. A hung search thus
    costs the tuned result of one row. After Ctrl-C, the partial result file
    keeps every graph that finished, with its tuned results; the graph that
    was running is not in it.
-5. When a tuned run fails the stall gate, the tool measures every row of
-   that graph again without the stall gate, the tuned runs included.
+5. When a tuned run fails the stall gate, in the hipDNN or the PyTorch
+   child, the tool measures every row of that graph again without the stall
+   gate, the tuned runs included. Both children then time without the stall
+   gate, as the OOTB rows do.
 
 A tuned build prepares every candidate that the provider can sample, so it is
 usually slower than the OOTB build. Providers that support the knob (today the
@@ -586,7 +591,7 @@ no speedup applies:
 | Label | Meaning |
 |---|---|
 | `no-search` | The engine exposes no `global.benchmarking` knob, or the PyTorch graph has no conv or matmul node, so the tuned run re-measured the OOTB plan. |
-| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned PyTorch child times in `staged` mode. |
+| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. Both tuned children use the stall-gate state of the run, so a stall-gate fallback does not cause this label. |
 | `invalid` | The OOTB or the tuned plan failed validation. |
 | `failed` | The tuned run did not produce a result (`oracle_error`). |
 | `n/a` | No comparison is available. |

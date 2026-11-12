@@ -427,6 +427,10 @@ class SuiteConfig:
     quiet: bool = False
     #: Write the JSON result without whitespace (default: one-space indent).
     compact_json: bool = False
+    #: Allow stall-gated timing (``TimingPolicy.stall_gate``). Not a public
+    #: option: the tuned-PyTorch child gets the parent's value through the
+    #: hidden ``--no-stall-gate`` flag, so both plans use one timing mode.
+    stall_gate: bool = True
     #: Timing loop policy built from the fields above in ``__post_init__``.
     timing_policy: TimingPolicy = field(init=False, repr=False)
     #: Every selected runtime, in run order (see :func:`parse_runtimes`).
@@ -487,6 +491,7 @@ class SuiteConfig:
             fresh_state=args.fresh_state,
             oracle_timeout_s=args.oracle_timeout,
             fast=args.fast,
+            stall_gate=args.stall_gate,
         )
 
     def __post_init__(self) -> None:
@@ -498,6 +503,7 @@ class SuiteConfig:
             max_iters=max(TimingPolicy.max_iters, self.benchmark_iters),
             cache_mode=self.cache_mode,
             timing_block=self.timing_block,
+            stall_gate=self.stall_gate,
         )
         if self.engine_filter is not None and len(self.engine_filter) == 0:
             raise ValueError("--engine must list at least one engine")
