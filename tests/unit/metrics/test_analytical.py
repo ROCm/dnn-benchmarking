@@ -581,6 +581,27 @@ class TestComputeFlops:
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
         assert flops == 655360
 
+    def test_sdpa_causal_mask_bottom_right_alone_is_causal(self):
+        # The boolean-only spelling: causal_mask false, no diagonal_alignment.
+        # Offset Skv-Sq = 2: rows -> 3+4+5 = 12 query-key pairs, not the dense 15.
+        graph = _sdpa_graph(sq=3, skv=5)
+        attributes = graph["nodes"][0]["attributes"]
+        attributes["causal_mask_bottom_right"] = True
+        del attributes["diagonal_alignment"]
+        flops = compute_flops(graph)
+        assert flops == 2 * 2 * 64 * 12 * (128 + 128)
+
+    def test_sdpa_causal_mask_overrides_a_bottom_right_alignment(self):
+        # causal_mask pins the diagonal top-left whatever diagonal_alignment
+        # says, the way hipDNN's extractDiagonalBandParams resolves it:
+        # rows -> 1+2+3 = 6 pairs, not the bottom-right 12.
+        graph = _sdpa_graph(sq=3, skv=5)
+        attributes = graph["nodes"][0]["attributes"]
+        attributes["causal_mask"] = True
+        attributes["diagonal_alignment"] = "BOTTOM_RIGHT"
+        flops = compute_flops(graph)
+        assert flops == 2 * 2 * 64 * 6 * (128 + 128)
+
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.
         flops = compute_flops(_sdpa_graph(sq=128, skv=128, d=128, dv=64))
