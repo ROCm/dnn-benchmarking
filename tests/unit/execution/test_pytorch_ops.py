@@ -1849,6 +1849,35 @@ class TestPyTorchOpsNewHandlers:
                     q, q, q, o, do, lse, {"attn_scale_value": scale}
                 )
 
+    @pytest.mark.parametrize("selection", ["MATH", "FLASH", "EFFICIENT"])
+    def test_sdpa_backward_reference_pass_grades_under_a_strict_selection(
+        self, selection: str
+    ) -> None:
+        """The reference pass of a strictly selected row runs the fp32 formula:
+        it gives the autograd gradients and passes the strict-selection check,
+        which the timed row has to satisfy."""
+        from dnn_benchmarking.config import PyTorchSdpaBackendName
+
+        torch.manual_seed(7)
+        scale = 1.0 / (8**0.5)
+        q, k, v, do = (torch.randn(1, 2, 4, 8) for _ in range(4))
+        o, lse, dq_ref, dk_ref, dv_ref = self._sdpa_autograd_reference(
+            q, k, v, do, scale, False, 1, 1
+        )
+        state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName[selection])
+
+        with (
+            pytorch_ops.use_pytorch_sdpa_backend(state),
+            pytorch_ops.reference_sdpa_pass(),
+        ):
+            dq, dk, dv = self._run_sdpa_backward(
+                q, k, v, o, do, lse, {"attn_scale_value": scale}
+            )
+
+        torch.testing.assert_close(dq, dq_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dk, dk_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dv, dv_ref, rtol=1e-4, atol=1e-4)
+
     def test_sdpa_forward_independent_kv_heads(self) -> None:
         # Hk != Hv (2 and 1, both divide Hq=4): explicit independent repeat.
         torch.manual_seed(5)

@@ -591,16 +591,16 @@ class TestComputeFlops:
         flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
-    def test_sdpa_causal_mask_overrides_a_bottom_right_alignment(self):
-        # causal_mask pins the diagonal top-left whatever diagonal_alignment
-        # says, the way hipDNN's extractDiagonalBandParams resolves it:
-        # rows -> 1+2+3 = 6 pairs, not the bottom-right 12.
+    def test_sdpa_causal_mask_keeps_a_bottom_right_alignment(self):
+        # causal_mask composes with the stored diagonal_alignment, the way
+        # hipDNN's resolveDiagonalBand resolves it (rocm-libraries #13065):
+        # rows -> 3+4+5 = 12 bottom-right pairs, not the top-left 6.
         graph = _sdpa_graph(sq=3, skv=5)
         attributes = graph["nodes"][0]["attributes"]
         attributes["causal_mask"] = True
         attributes["diagonal_alignment"] = "BOTTOM_RIGHT"
         flops = compute_flops(graph)
-        assert flops == 2 * 2 * 64 * 6 * (128 + 128)
+        assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.

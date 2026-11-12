@@ -64,6 +64,22 @@ def reference_sdpa_pass() -> Iterator[None]:
         _REFERENCE_PASS.reset(token)
 
 
+def reference_sdpa_call() -> bool:
+    """In a reference output pass, count the caller's SDPA computation as a
+    native call and return True; else return False.
+
+    The strict selection applies to the timed row, which is what has to prove
+    it reached a native SDPA call. A reference pass computes its outputs on
+    a repeatable path instead, so it counts for that check.
+    """
+    if not _REFERENCE_PASS.get():
+        return False
+    state = _ACTIVE_SDPA_BACKEND.get()
+    if state is not None:
+        state._native_sdpa_executed = True
+    return True
+
+
 @contextmanager
 def use_pytorch_sdpa_backend(
     state: PyTorchSdpaBackendState,
@@ -325,18 +341,12 @@ def execute_selected_sdpa(
     """
     kwargs = _sdpa_kwargs(attn_mask, dropout_p, is_causal, scale, enable_gqa)
     state = _ACTIVE_SDPA_BACKEND.get()
-    if _REFERENCE_PASS.get():
+    if reference_sdpa_call():
         sdpa_kernel, math = _selected_sdp_backend(PyTorchSdpaBackendName.MATH)
         with _SDPA_SELECTION_LOCK, sdpa_kernel(math):
-            result = torch.nn.functional.scaled_dot_product_attention(
+            return torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **kwargs
             )
-        if state is not None:
-            # The strict selection applies to the timed row, which is what has
-            # to prove it reached a native forward SDPA call. This pass makes
-            # one too, so it counts for that check.
-            state._native_forward_sdpa_executed = True
-        return result
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
         with _SDPA_SELECTION_LOCK:
             return torch.nn.functional.scaled_dot_product_attention(

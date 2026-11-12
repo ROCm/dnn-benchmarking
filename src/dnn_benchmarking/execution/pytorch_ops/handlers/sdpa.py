@@ -17,6 +17,7 @@ from .._sdpa_backend import (
     execute_selected_sdpa,
     fused_logsumexp,
     native_sdpa_call,
+    reference_sdpa_call,
     strict_sdpa_selection,
 )
 
@@ -1221,7 +1222,9 @@ def compile_sdpa_backward(
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
 
-        if q.is_cuda:
+        # A reference pass grades the engines, so it uses the repeatable fp32
+        # formula below instead of a fused kernel, whatever the row selected.
+        if not reference_sdpa_call() and q.is_cuda:
             if strict_sdpa_selection() is PyTorchSdpaBackendName.MATH:
                 raise UnsupportedGraphError(
                     "PyTorch's math SDPA backward recomputes the forward and "
