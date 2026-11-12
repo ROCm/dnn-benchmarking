@@ -323,6 +323,56 @@ not from the timed loop. The child also launches input-fill kernels, and a
 graph can launch more than one kernel. Use `pmc.per_kernel[...].dispatches`
 and the kernel name to find the engine kernel.
 
+## Fast mode
+
+With `--fast`, every graph of the run uses the same hipDNN handle, the same
+loaded plugin and the kept OOTB selection state of the work directory (the
+tuned state with `--autotune`; see
+[usage.md](usage.md#fast-mode---fast)). This changes what some numbers of a
+graph include:
+
+- `build_ms` is not the same build in the two modes. The prime builds the
+  plan of the graph itself, untimed. A normal run primes before every graph,
+  so each `build_ms` is the second build of that graph. A `--fast` run primes
+  before the first graph only: its `build_ms` is a second build, and the
+  `build_ms` of every later graph is the first build of that problem on a
+  warm engine. It can include per-problem first-build costs, for example
+  reading that problem's kernel files.
+- `first_call_ms` (`setup`) can be smaller than in a normal run. The MIOpen
+  kernel cache of the handle and the find records of earlier graphs and
+  earlier commands carry over, so a graph with a known convolution problem
+  skips the compile and the find.
+- `kernel_med` measures the same kernel as a normal run when the selection is
+  the same. With `--autotune`, a problem that an earlier graph or command
+  searched reuses that search result.
+
+The order of the graphs can thus change `build_ms` and `first_call_ms`. Do
+not compare them between a `--fast` run and a run without it, or between the
+first graph of a `--fast` run and the later ones.
+
+## Kept selection state
+
+MIOpen stores its find results in the user database. A convolution's first
+call runs the find when the database has no record for the problem, and the
+find can take minutes per problem: on one gfx1151 host, 7 convolution graphs
+took 475 s on an empty database and 46 s on the database of an earlier run.
+
+The work directory keeps two selection states (see
+[usage.md](usage.md#work-directory---benchmark-work-dir)).
+`--autotune` runs, runs with a true `HIPDNN_FORCE_BENCHMARKING` in the
+environment, and the tuned runs of `--oracle` read and extend
+`<work>/tuned`. Every other run, `--fast` included, reads and extends
+`<work>/ootb`. No tuned run writes to `<work>/ootb`. The find results and
+rankings of earlier commands remove that setup work. In such a warm run:
+
+- `first_call_ms` and the run's wall time are smaller; do not compare them
+  with a run on an empty state.
+- `kernel_med` measures the kernel that the stored result selects. It
+  compares with a cold run when both select the same kernel.
+
+Use `--fresh-state` for cold first-run numbers: the command then runs on a
+new, empty state that the tool removes when the command ends.
+
 ## Parity with other harnesses
 
 This table compares the tool with the rocKE runtime timer
