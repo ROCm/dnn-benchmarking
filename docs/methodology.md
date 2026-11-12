@@ -204,6 +204,26 @@ each head group.
 - The CPU reference (`--validate pytorch` on the host) uses the manual fp32
   formula of hipDNN's CPU reference.
 
+A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
+dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
+the bias broadcasts. It has the dims and the data type of the bias. This is
+the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
+from rocm-libraries `4630e167ce1` (#14358). The pinned `b279712` CPU
+reference has no dBias.
+
+- The timed row calls the memory-efficient backward kernel with its bias
+  gradient enabled, and then sums the score-shaped gradient to the bias
+  dims. A training step with a bias that requires a gradient does the same
+  two operations. Flash takes no bias, so it cannot compute dBias.
+- ALiBi graphs and rows that fall back to math run the manual fp32 formula,
+  which also gives dBias.
+- The reference accumulates dBias in fp32 and rounds it to the bias data
+  type once, as hipDNN's CPU reference does. The timed kernel rounds each
+  score-shaped element first. On MI210 the two differ by at most 0.002 on
+  the fp16 `swin-base` graph (values up to 6.1) and the bf16 `alphafold2`
+  graph (values up to 0.55) of the SDPA backward collection. The SDPA
+  backward tolerances apply to dBias unchanged.
+
 ### PyTorch convolution backward
 
 A timed dgrad (`ConvolutionBwdAttributes`) or wgrad

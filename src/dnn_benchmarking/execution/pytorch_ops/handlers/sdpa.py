@@ -1227,7 +1227,8 @@ _MATH_BACKWARD_NOTE = (
 class _FusedBackward(NamedTuple):
     """A fused SDPA backward kernel call, built once from a forward probe.
 
-    ``call(do)`` returns ``(dq, dk, dv)``; dK and dV have ``rep_k`` and
+    ``call(do)`` returns ``(dq, dk, dv)``, and the score-shaped bias gradient
+    after them when it was bound with ``dbias``; dK and dV have ``rep_k`` and
     ``rep_v`` times the graph's K/V head count. The other arguments (Q, K/V
     as the kernel takes them, the graph's O and stats in the layouts of the
     forward's saved output and log-sum-exp, and the forward's saved scalars)
@@ -1258,6 +1259,7 @@ def _prepare_fused_backward(
     scale: float,
     rep_k: int,
     rep_v: int,
+    dbias: bool,
 ) -> Optional[_FusedBackward]:
     """Bind the fused backward kernel the selected forward dispatches to.
 
@@ -1280,6 +1282,10 @@ def _prepare_fused_backward(
     output. The memory-efficient backward needs that layout ([B, S, H, D] in
     memory): with a [B, H, S, D] O, AOTriton on gfx90a returns wrong dK and dV
     (ALMIOPEN-3256), and CUDA can read out of bounds (pytorch/pytorch#138772).
+
+    With ``dbias``, the call also returns the bias gradient, shaped like the
+    scores ``[B, Hq, Sq, Skv]``. Only memory-efficient attention computes
+    it; Flash takes no bias, so a graph with a bias never dispatches to it.
 
     Returns ``None`` when default dispatch chose neither Flash nor
     memory-efficient attention.
@@ -1332,10 +1338,10 @@ def _prepare_fused_backward(
                 seed,
                 offset,
                 0.0,
-                [True, True, True, False],
+                [True, True, True, dbias],
                 causal,
                 scale=scale,
-            )[:3]
+            )[: 4 if dbias else 3]
 
     elif strict_sdpa_selection() is None:
         return None
@@ -1394,6 +1400,19 @@ def _sum_head_groups(grad: torch.Tensor, rep: int) -> torch.Tensor:
     return grad.reshape(batch, heads // rep, rep, length, dim).sum(dim=2)
 
 
+def _add_dbias_rows(
+    dbias: torch.Tensor, d_scores: torch.Tensor, start: int, end: int
+) -> None:
+    """Add the bias gradient of query rows ``start:end`` to ``dbias``.
+
+    ``d_scores`` is the unscaled dS of those rows, ``[B, Hq, rows, Skv]``. dS
+    sums over each bias dim of 1 and each missing leading dim, as hipDNN's
+    ``computeMaskIndex`` maps every broadcast index to 0.
+    """
+    rows = _rows(dbias, start, end)
+    rows += _sum_to_shape(d_scores, rows.shape)
+
+
 @register_handler("SdpaBackwardAttributes")
 def compile_sdpa_backward(
     node: Dict[str, Any],
@@ -1411,12 +1430,15 @@ def compile_sdpa_backward(
     * On the host (the CPU reference), and on a GPU when default dispatch
       picks math, a manual fp32 formula runs. It mirrors hipDNN's CPU
       reference (CpuFpReferenceSdpa::backward).
+
+    dBias (``dbias_tensor_uid``) is the gradient of the ``attn_mask`` bias:
+    the unscaled ``dS = P * (dP - D)``, summed over every dimension that the
+    bias broadcasts. It has the dims and the data type of the bias, as hipDNN
+    requires. The fused path takes it from the memory-efficient kernel, and
+    sums it to the bias dims, as autograd does for a broadcast bias.
     """
     _sdpa_unsupported_if_present(node, ["dropout_scale_inv_tensor_uid"])
-    if _optional_uid(node, "dbias_tensor_uid") is not None:
-        raise ValueError(
-            "SDPA backward dBias gradient is not supported by the PyTorch reference"
-        )
+    dbias_uid = _optional_uid(node, "dbias_tensor_uid")
 
     q_uid = _required_input_uid(node, "q_tensor_uid")
     k_uid = _required_input_uid(node, "k_tensor_uid")
@@ -1428,6 +1450,17 @@ def compile_sdpa_backward(
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
     plan = _plan_sdpa_common(node)
+    if dbias_uid is not None:
+        # hipDNN's dBias has the bias dims (isSupportedSdpaBwdNode).
+        if plan.mask_uid is None:
+            raise ValueError("SDPA backward dBias needs an attn_mask bias tensor")
+        bias_dims = _tensor_shape(graph_json, plan.mask_uid)
+        dbias_dims = _tensor_shape(graph_json, dbias_uid)
+        if bias_dims is not None and dbias_dims not in (None, bias_dims):
+            raise ValueError(
+                f"SDPA backward dBias dims {dbias_dims} differ from the bias "
+                f"dims {bias_dims}"
+            )
     computed_inputs = [
         uid
         for uid in (
@@ -1482,7 +1515,17 @@ def compile_sdpa_backward(
             )
         attn_mask, causal, scale, rep_k, rep_v = resolve(tensors, q, k, v)
         return _prepare_fused_backward(
-            q, k, v, o, stats, attn_mask, causal, scale, rep_k, rep_v
+            q,
+            k,
+            v,
+            o,
+            stats,
+            attn_mask,
+            causal,
+            scale,
+            rep_k,
+            rep_v,
+            dbias_uid is not None,
         )
 
     def run(tensors: Dict[int, torch.Tensor]) -> None:
@@ -1496,6 +1539,7 @@ def compile_sdpa_backward(
         )
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
+        bias = None if dbias_uid is None else _tensor(tensors, plan.mask_uid, node)
 
         # A reference pass grades the engines, so it uses the repeatable fp32
         # formula below instead of a fused kernel, whatever the row selected.
@@ -1509,10 +1553,14 @@ def compile_sdpa_backward(
                 tensors, ("sdpa_bwd", dq_uid), lambda: fused(tensors, q, k, v, o, stats)
             )
             if kernel is not None:
-                dq, dk, dv = kernel.call(do)
+                dq, dk, dv, *dbias_full = kernel.call(do)
                 _store_tensor(tensors, dq_uid, dq)
                 _store_tensor(tensors, dk_uid, _sum_head_groups(dk, kernel.rep_k))
                 _store_tensor(tensors, dv_uid, _sum_head_groups(dv, kernel.rep_v))
+                if bias is not None:
+                    _store_tensor(
+                        tensors, dbias_uid, _sum_to_shape(dbias_full[0], bias.shape)
+                    )
                 return
             if isinstance(tensors, ReplayTensors):
                 tensors.note(_MATH_BACKWARD_NOTE)
@@ -1538,6 +1586,12 @@ def compile_sdpa_backward(
         dq = torch.empty_like(q_f)
         dk_full = torch.zeros_like(k_f)
         dv_full = torch.zeros_like(v_f)
+        # hipDNN accumulates dBias in float32 over the bias dims.
+        dbias = (
+            None
+            if bias is None
+            else torch.zeros(bias.shape, device=q.device, dtype=torch.float32)
+        )
         for start, end in _query_blocks(q, int(k_f.shape[-2])):
             q_block = q_f[..., start:end, :]
             do_block = do_f[..., start:end, :]
@@ -1552,9 +1606,13 @@ def compile_sdpa_backward(
             )
             probs = scores.sub_(_rows(stats, start, end)).exp_()
             row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
-            # d_scores = probs * (do @ v^T - row_dot) * scale
+            # d_scores = probs * (do @ v^T - row_dot) * scale. The bias is added
+            # after the scale, so dBias takes d_scores before the scale.
             d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
-            d_scores.sub_(row_dot).mul_(probs).mul_(scale_value)
+            d_scores.sub_(row_dot).mul_(probs)
+            if dbias is not None:
+                _add_dbias_rows(dbias, d_scores, start, end)
+            d_scores.mul_(scale_value)
             dq[..., start:end, :] = torch.matmul(d_scores, k_f)
             dk_full += torch.matmul(d_scores.transpose(-2, -1), q_block)
             dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
@@ -1563,5 +1621,7 @@ def compile_sdpa_backward(
         _store_tensor(tensors, dq_uid, dq.to(dtype=q.dtype))
         _store_tensor(tensors, dk_uid, _sum_head_groups(dk_full, rep_k).to(k.dtype))
         _store_tensor(tensors, dv_uid, _sum_head_groups(dv_full, rep_v).to(v.dtype))
+        if dbias is not None:
+            _store_tensor(tensors, dbias_uid, dbias.to(dtype=bias.dtype))
 
     return run
