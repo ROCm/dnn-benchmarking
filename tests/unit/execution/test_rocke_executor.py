@@ -25,6 +25,7 @@ from dnn_benchmarking.execution import rocke_executor  # noqa: E402
 from dnn_benchmarking.execution.rocke_executor import (  # noqa: E402
     load_variant,
     paged_views,
+    variant_args,
 )
 
 
@@ -165,3 +166,59 @@ def test_a_grid_other_than_hipdnns_fails_before_the_read(rocke) -> None:
     with pytest.raises(ExecutionError, match=r"grid \(1, 32, 2\).*\(2, 32, 1\)"):
         load_variant(_kernel(), _PROBLEM, {})
     assert rocke.reads == []
+
+
+#: hipDNN's dispatch.v2 list: kernels that read the head counts at runtime
+#: (rocm-libraries 8149ff0 and later).
+_ARGS_V2 = _ARGS + ("num_query_heads", "num_kv_heads")
+
+
+class _Tensor:
+    def __init__(self, ptr):
+        self.ptr = ptr
+
+    def data_ptr(self):
+        return self.ptr
+
+
+_TENSORS = tuple(_Tensor(ptr) for ptr in (0x1000, 0x2000, 0x3000, 0x4000))
+
+
+@pytest.mark.parametrize("args", [_ARGS, _ARGS_V2], ids=["v1", "v2"])
+def test_every_argument_the_descriptor_lists_gets_hipdnns_value(args) -> None:
+    """rocKE's packer needs a value for each signature name; a missing one is
+    ``KeyError: missing kernel arg``. The values are the ones hipDNN passes."""
+    expected = {
+        "q_ptr": 0x1000,
+        "k_ptr": 0x2000,
+        "v_ptr": 0x3000,
+        "o_ptr": 0x4000,
+        "scale": 1.0,
+        "batch": 1,
+        "seqlen_q": 512,
+        "seqlen_kv": 512,
+        "num_query_heads": 32,
+        "num_kv_heads": 8,
+    }
+
+    values = variant_args(_kernel(args=args).arg_names, _PROBLEM, *_TENSORS)
+
+    assert values == {name: expected[name] for name in args}
+
+
+def test_an_argument_hipdnn_does_not_bind_fails_by_name() -> None:
+    with pytest.raises(ExecutionError, match="'sink_ptr'"):
+        variant_args(_ARGS_V2 + ("sink_ptr",), _PROBLEM, *_TENSORS)
+
+
+def test_a_v2_variant_loads_when_rockes_signature_has_the_head_counts(
+    rocke, monkeypatch
+) -> None:
+    dense = sys.modules["kernels.gfx950.attention_dense"]
+    signature = [{"name": n} for n in _ARGS_V2]
+    monkeypatch.setattr(dense, "attention_dense_signature", lambda spec: signature)
+
+    variant = load_variant(_kernel(args=_ARGS_V2), _PROBLEM, {})
+
+    assert rocke.launchers[0]["signature"] == signature
+    assert variant.grid == (2, 32, 1)

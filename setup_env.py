@@ -481,7 +481,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-editable",
         dest="editable_install",
         action="store_false",
-        help="Install dnn-benchmarking into the venv instead of linking to the source tree.",
+        help=(
+            "Install dnn-benchmarking and the rocKE packages into the venv "
+            "instead of linking to the source tree."
+        ),
     )
     parser.add_argument(
         "--torch-index-url",
@@ -1616,12 +1619,14 @@ class Setup:
         )
 
     def install_rocke_packages(self) -> None:
-        """Editable-install rocKE's Python packages for ``--runtime rocke``.
+        """Install rocKE's Python packages for ``--runtime rocke``.
 
         They come from the rocm-libraries checkout that the plugins build
         from, so rocKE's specs and runtime match the kernels hipDNN ships. The
         library package provides the generic top-level names ``kernels``,
         ``builders`` and ``dispatch``; rocKE keeps them in a dedicated venv.
+        ``--no-editable`` copies both packages into the venv so it survives
+        without the source tree.
         """
         rocke = ROCM_LIBRARIES_DIR / "dnn-providers" / "hip-kernel-provider" / "rocke"
         if not (rocke / "library" / "pyproject.toml").is_file():
@@ -1630,11 +1635,18 @@ class Setup:
                 "--runtime rocke needs them; check the rocm-libraries checkout.",
             )
             return
-        # compat mode writes a .pth to the source root, as rocKE's BUILDING.md
-        # requires. The library resolves `rocke` from the platform install.
-        compat = ("--config-settings", "editable_mode=compat")
-        self.pip("install", *compat, "-e", str(rocke / "platform"))
-        self.pip("install", *compat, "--no-deps", "-e", str(rocke / "library"))
+        platform, library = str(rocke / "platform"), str(rocke / "library")
+        if self.editable_install:
+            # compat mode writes a .pth to the source root, as rocKE's
+            # BUILDING.md requires.
+            compat = ("--config-settings", "editable_mode=compat")
+            platform_args: tuple[str, ...] = (*compat, "-e", platform)
+            library_args: tuple[str, ...] = (*compat, "-e", library)
+        else:
+            platform_args, library_args = (platform,), (library,)
+        # The library resolves `rocke` from the platform install.
+        self.pip("install", *platform_args)
+        self.pip("install", "--no-deps", *library_args)
 
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
