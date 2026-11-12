@@ -25,6 +25,7 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -33,6 +34,7 @@ from ..config.benchmark_config import (
     PyTorchSdpaBackendName,
     ReferencePrecision,
     SuiteConfig,
+    TimingPolicy,
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
@@ -50,12 +52,7 @@ from ..reporting.suite_results import (
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
 from .correctness import check_correctness, mismatch, unchecked
-from .oracle import (
-    build_tuned_plan,
-    run_pytorch_tuned,
-    run_tuned_plan,
-    tuned_in_process,
-)
+from .oracle import run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
     Catalog,
     RockeKernel,
@@ -84,7 +81,6 @@ class _GraphContext:
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
     graph_json_str: str = ""  # hipDNN runs only
-    graph_id: str = ""  # hipDNN runs only
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -524,15 +520,40 @@ def _time_pytorch_row(
     return row, outputs
 
 
+class EnginePrimer:
+    """Primes an engine before its timed build.
+
+    Priming absorbs the engine's one-time build costs (provider setup, cold
+    plugin and kernel file reads), so the timed build starts warm. By default
+    every row primes. With ``once`` (``--fast``: one handle for the whole
+    run) only the first successful prime of each engine runs; later graphs
+    find the engine already warm.
+    """
+
+    def __init__(self, once: bool = False) -> None:
+        self._once = once
+        self._primed: Set[int] = set()
+
+    def prime(
+        self, handle: Any, graph_json_str: str, policy: TimingPolicy, engine_id: int
+    ) -> None:
+        if self._once and engine_id in self._primed:
+            return
+        Executor(graph_json_str, policy).prime(handle, engine_id)
+        self._primed.add(engine_id)
+
+
 def run_single_provider_engine(
     ctx: _GraphContext,
     handle: Any,
+    primer: EnginePrimer,
     engine_id: int,
     engine_name: str,
     engine_version: str,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
-    """Build, time, validate (and optionally tune/profile) one hipDNN engine."""
+    """Build, time and validate one hipDNN engine; then its tuned run and
+    profiling passes, each in a child process."""
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
     row = ProviderEngineResult(
@@ -545,34 +566,14 @@ def run_single_provider_engine(
     )
     memory_at_start = _gpu_memory_at_row_start()
     try:
-        if tuned_in_process(ctx.graph_id, engine_id):
-            # Typically the stall-fallback rerun of a graph whose first
-            # attempt already ran this engine's search, or a repeated graph.
-            raise RuntimeError(
-                "OOTB not measurable: this engine already ran a tuned search on "
-                "this graph in this process, and hipDNN would serve its winner"
-            )
         # Absorb the engine's one-time build costs (provider setup, cold
-        # plugin and kernel file reads) before timing, so the OOTB and tuned
-        # build times start from the same state.
-        Executor(ctx.graph_json_str, config.timing_policy).prime(handle, engine_id)
+        # plugin and kernel file reads) before the timed build.
+        primer.prime(handle, ctx.graph_json_str, config.timing_policy, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
         executor.prepare(handle, engine_id=engine_id)
         row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
-        tuned = (
-            build_tuned_plan(
-                row=row,
-                handle=handle,
-                engine_id=engine_id,
-                graph_json_str=ctx.graph_json_str,
-                graph_name=ctx.graph_name,
-                config=config,
-            )
-            if config.oracle
-            else None
-        )
 
         with BufferManager(
             ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
@@ -586,23 +587,9 @@ def run_single_provider_engine(
             _validate_row(
                 row, ctx, bm, lambda: executor.execute_once(handle, variant_pack)
             )
-
-            if tuned is not None:
-                run_tuned_plan(
-                    tuned=tuned,
-                    row=row,
-                    graph_id=ctx.graph_id,
-                    engine_id=engine_id,
-                    graph_name=ctx.graph_name,
-                    config=config,
-                    bm=bm,
-                    variant_pack=variant_pack,
-                    tensor_infos=ctx.tensor_infos,
-                    reference_outputs=ctx.reference_outputs,
-                )
-        # Release both workspaces before the profiling child allocates its own
-        # VRAM; holding them roughly doubles peak VRAM on large graphs.
-        del executor, tuned
+        # Release the workspace before a child (tuned run, profiling) allocates
+        # its own VRAM.
+        del executor
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
     except UnsupportedGraphError as e:
@@ -614,8 +601,21 @@ def run_single_provider_engine(
             _failure_message(e, memory_at_start),
         )
 
-    # Profiling re-runs the workload after the timed pass, so profiler
-    # overhead cannot pollute the headline numbers.
+    # The tuned run and profiling run after the OOTB pass, each in its own
+    # process: the tuned run uses the kept tuned selection state while this
+    # process uses the OOTB one, and profiler overhead cannot pollute
+    # the headline numbers.
+    if config.oracle:
+        run_hipdnn_tuned(
+            row=row,
+            graph_path=ctx.graph_path,
+            graph_name=ctx.graph_name,
+            tensor_infos=ctx.tensor_infos,
+            reference_outputs=ctx.reference_outputs,
+            engine_id=engine_id,
+            plugin_path=plugin_path,
+            config=config,
+        )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
@@ -997,7 +997,7 @@ def _run_graph(
             errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
             graph.error = "; ".join(errors)
             return graph
-        ctx.graph_json_str, ctx.graph_id = json.dumps(graph_json), graph.graph_id
+        ctx.graph_json_str = json.dumps(graph_json)
         if config.validation.enabled:
             reference_row = _prepare_references(ctx)
             if reference_row is not None:
@@ -1008,7 +1008,7 @@ def _run_graph(
     return graph
 
 
-def hipdnn_planner(handle: Any) -> GraphPlanner:
+def hipdnn_planner(handle: Any, prime_once: bool = False) -> GraphPlanner:
     """Plan every selected or discovered hipDNN engine.
 
     Explicit ``--engine`` IDs run in the caller's order; otherwise the graph's
@@ -1019,7 +1019,10 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
     Args:
         handle: hipdnn.Handle, or None to create one per engine (per-engine
             plugin paths).
+        prime_once: Prime each engine only before its first build of the run
+            (``--fast``), not before every graph.
     """
+    primer = EnginePrimer(once=prime_once)
 
     def plan(
         graph_path: Path,
@@ -1054,7 +1057,7 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
             "hipdnn",
             engine_ids=engine_ids,
             rows=lambda ctx: [
-                _run_engine_selection(ctx, handle, s.engine_id, s.plugin_path)
+                _run_engine_selection(ctx, handle, primer, s.engine_id, s.plugin_path)
                 for s in selections
             ],
             message=message,
@@ -1067,6 +1070,7 @@ def hipdnn_planner(handle: Any) -> GraphPlanner:
 def _run_engine_selection(
     ctx: _GraphContext,
     handle: Any,
+    primer: EnginePrimer,
     engine_id: int,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
@@ -1095,7 +1099,7 @@ def _run_engine_selection(
         ctx.reporter,
         name,
         lambda: run_single_provider_engine(
-            ctx, handle, engine_id, name, version, plugin_path
+            ctx, handle, primer, engine_id, name, version, plugin_path
         ),
     )
 

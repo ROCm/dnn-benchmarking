@@ -119,6 +119,9 @@ The budget applies *per subprocess*, not per suite — a four-source
 `--pmc basic --trace --perf --roofline` invocation can
 spend up to 4 × the budget under the worst case.
 
+`--profiling-timeout` does not bound the tuned children of `--oracle`. Use
+`--oracle-timeout SECONDS` for them (default `1800`, one limit per child).
+
 ### Profiling VRAM headroom
 
 The opt-in profiling pass spawns a fresh dnn-benchmarking subprocess

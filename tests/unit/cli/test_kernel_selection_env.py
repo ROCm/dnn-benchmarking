@@ -33,17 +33,23 @@ def test_default_stays_on_the_heuristic_path() -> None:
     assert "HIPDNN_FORCE_BENCHMARKING" not in os.environ
 
 
-def test_autotune_without_cache_dir_is_a_hazard() -> None:
-    [warning] = _warnings(autotune=True)
-    assert "--hipdnn-cache-dir" in warning
+def test_autotune_says_earlier_tuned_results_are_reused() -> None:
+    """The user learns that earlier tuned results are reused and which flag
+    searches again."""
+    lines = _lines(autotune=True)
+    assert [line for line in lines if line.startswith("WARNING")] == []
+    assert any("reuse" in line and "--fresh-state" in line for line in lines)
+    assert any("kernel selection: autotune;" in line for line in lines)
     assert os.environ["HIPDNN_FORCE_BENCHMARKING"] == "1"
 
 
-def test_autotune_with_cache_dir_is_isolated() -> None:
-    lines = _lines(autotune=True, hipdnn_cache_dir="/tmp/phase-x")
-    assert [line for line in lines if line.startswith("WARNING")] == []
-    assert any("kernel selection: autotune;" in line for line in lines)
-    assert os.environ["HIPDNN_CACHE_DIR"] == "/tmp/phase-x"
+def test_autotune_with_the_disk_cache_off_reports_it(monkeypatch) -> None:
+    """With HIPDNN_DISABLE_CACHE set, no earlier ranking can be served: the
+    line says the cache is off and no reuse note is printed."""
+    monkeypatch.setenv("HIPDNN_DISABLE_CACHE", "1")
+    lines = _lines(autotune=True)
+    assert not any("--fresh-state" in line for line in lines)
+    assert any("cache: disabled" in line for line in lines)
 
 
 @pytest.mark.parametrize(
@@ -67,7 +73,11 @@ def test_pytorch_runtime_leaves_hipdnn_environment_alone(tmp_path, monkeypatch) 
         suite_runner_cli, "_apply_tuning_environment", lambda c, r: applied.append(c)
     )
     monkeypatch.setattr(suite_runner_cli, "collect_environment_info", lambda: {})
-    monkeypatch.setattr(suite_runner_cli, "start_runtime", lambda c, r: lambda *a: None)
+    monkeypatch.setattr(
+        suite_runner_cli,
+        "start_runtime",
+        lambda c, r, s: lambda *a: None,
+    )
 
     args = create_parser(suppress_defaults=True).parse_args(["-r", "pytorch"])
     apply_config_file(args)
