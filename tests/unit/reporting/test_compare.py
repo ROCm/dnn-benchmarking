@@ -329,14 +329,41 @@ def test_null_median_written_for_nan_timings_is_unusable(tmp_path, capsys, by):
     assert pair["label"] == ("no B row" if by == "best" else "B no time")
 
 
-def test_malformed_row_exits_2_not_regression(tmp_path, capsys):
+@pytest.mark.parametrize("key", ["verdict", "ootb", "engine"])
+def test_malformed_row_exits_2_not_regression(tmp_path, capsys, key):
     a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
     doc = json.loads(open(a).read())
-    del doc["graphs"][0]["results"][0]["verdict"]
+    del doc["graphs"][0]["results"][0][key]
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps(doc))
     assert main([a, str(bad)]) == 2
-    assert "error:" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # The message names the file, the graph and row, and the missing key.
+    assert str(bad) in err and "'g'" in err and "results[0]" in err
+    assert repr(key) in err
+
+
+def test_malformed_stats_name_the_missing_key(tmp_path, capsys):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
+    doc = json.loads(open(a).read())
+    del doc["graphs"][0]["results"][0]["ootb"]["kernel"]["p75_ms"]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(doc))
+    assert main([str(bad), a]) == 2
+    err = capsys.readouterr().err
+    assert str(bad) in err and "'g'" in err and "'p75_ms'" in err
+
+
+@pytest.mark.parametrize("results", [None, 3, {"0": {}}])
+def test_results_that_are_not_a_list_name_the_graph(tmp_path, capsys, results):
+    a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
+    doc = json.loads(open(a).read())
+    doc["graphs"][0]["results"] = results
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(doc))
+    assert main([a, str(bad)]) == 2
+    err = capsys.readouterr().err
+    assert str(bad) in err and "'g'" in err and "results" in err
 
 
 def test_missing_ref_on_both_sides_is_one_label(tmp_path, capsys):

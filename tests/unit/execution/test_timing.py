@@ -290,19 +290,34 @@ def test_cold_flushes_before_every_events_mode_iteration(monkeypatch, backend) -
     assert len(m.kernel_ms) == 2
 
 
-def test_first_call_ms_covers_first_enqueue_and_its_sync(monkeypatch) -> None:
+@pytest.mark.parametrize("backend", ["hip", "torch"])
+def test_first_call_ms_covers_first_enqueue_and_its_sync(monkeypatch, backend) -> None:
+    """The first-call cost includes the device sync: the enqueue only submits,
+    the compile and the first kernel finish during the sync."""
     log: List[str] = []
     clock = FakeClock()
-    _install_fake_hip(monkeypatch, log, clock=clock)
+    fake = _install_fake_hip(monkeypatch, log, clock=clock)
     calls = []
 
     def enqueue() -> None:
         calls.append(1)
         clock.advance_ms(30.0 if len(calls) == 1 else 1.0)  # first call compiles
 
-    m = measure(enqueue, stream=7, policy=TimingPolicy(warmup_iters=2, iters=1))
+    def device_sync() -> None:
+        log.append("device_sync")
+        clock.advance_ms(20.0)  # the device drains the first call
 
-    assert m.first_call_ms == pytest.approx(30.0)
+    if backend == "torch":
+        _install_fake_torch_cuda(monkeypatch, log)
+        monkeypatch.setattr(sys.modules["torch"].cuda, "synchronize", device_sync)
+    else:
+        monkeypatch.setattr(fake, "hip_device_synchronize", device_sync)
+
+    m = measure(
+        enqueue, stream=7, policy=TimingPolicy(warmup_iters=2, iters=1), timer=backend
+    )
+
+    assert m.first_call_ms == pytest.approx(50.0)
     assert m.warmup_iters == 2
 
 

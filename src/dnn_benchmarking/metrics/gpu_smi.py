@@ -12,18 +12,31 @@ records ``amdsmi_available`` in the environment block.
 
 ``GpuSmiProbe`` targets the GPU the workload runs on: device indices are
 HIP (torch) logical indices, mapped to the amdsmi handle by PCI bus
-address when torch is already imported (this module never imports it, so a
-hipDNN run stays torch-free). Otherwise, or when the address matches no
-amdsmi device, the HIP index is used as the amdsmi index; under
-``HIP_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` remapping that can be
-another physical GPU.
+address. The address comes from torch when torch is already imported, else
+from ``hipDeviceGetPCIBusId`` in the HIP runtime library that the process
+already loaded (hipDNN loads it). This module never imports torch and never
+loads a second HIP runtime. Without an address, the HIP index is used as the
+amdsmi index, unless a device-visibility variable (``HIP_VISIBLE_DEVICES``
+and similar) can remap it to another physical GPU: then the probe records no
+telemetry and warns once.
 """
 
+import ctypes
 import functools
+import os
 import sys
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..common import torch_support
+from ._diagnostic import warn_once
+
+#: Variables with which the HIP runtime hides or reorders physical GPUs.
+_VISIBILITY_ENV = (
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+)
 
 _UNAVAILABLE_VALUES = {"", "N/A", "NA", "NONE", "NULL", "UNSUPPORTED"}
 
@@ -65,21 +78,58 @@ def is_amdsmi_available() -> bool:
 
 
 def _hip_device_bdf(device_index: Optional[int]) -> Optional[str]:
-    """``dddd:bb:dd`` PCI address of a HIP device (None = current), via torch.
+    """``dddd:bb:dd`` PCI address of a HIP device (None = current), or None.
 
-    None unless torch is already imported: importing it takes seconds and
-    starts a second HIP runtime context in a hipDNN run.
+    Uses torch only when it is already imported: importing it takes seconds
+    and starts a second HIP runtime context in a hipDNN run.
     """
-    # ponytail: unmapped HIP index under *_VISIBLE_DEVICES without torch; ask
-    # the HIP runtime (hipDeviceGetPCIBusId) if hipdnn_frontend ever binds it.
-    if "torch" not in sys.modules or not torch_support.gpu_available():
+    if "torch" in sys.modules and torch_support.gpu_available():
+        try:
+            torch = sys.modules["torch"]
+            index = (
+                torch.cuda.current_device() if device_index is None else device_index
+            )
+            p = torch.cuda.get_device_properties(index)
+            return f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}"
+        except Exception:
+            pass
+    return _hip_runtime_bdf(device_index)
+
+
+def _loaded_hip_runtime(maps: str = "/proc/self/maps") -> Optional[Any]:
+    """The HIP runtime library this process already mapped, or None.
+
+    Opens the library by the mapped path, so the dynamic loader returns the
+    loaded copy. A library that is not mapped yet is not loaded: a second
+    HIP runtime would see other devices. Linux only.
+    """
+    try:
+        with open(maps) as f:
+            for line in f:
+                fields = line.split(maxsplit=5)
+                if len(fields) == 6 and "/libamdhip64.so" in fields[5]:
+                    return ctypes.CDLL(fields[5].strip())
+    except OSError:
+        return None
+    return None
+
+
+def _hip_runtime_bdf(device_index: Optional[int]) -> Optional[str]:
+    """PCI address from ``hipDeviceGetPCIBusId`` of the loaded HIP runtime."""
+    hip = _loaded_hip_runtime()
+    if hip is None:
         return None
     try:
-        import torch
-
-        index = torch.cuda.current_device() if device_index is None else device_index
-        p = torch.cuda.get_device_properties(index)
-        return f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}"
+        if device_index is None:
+            current = ctypes.c_int()
+            if hip.hipGetDevice(ctypes.byref(current)) != 0:
+                return None
+            device_index = current.value
+        bus_id = ctypes.create_string_buffer(64)
+        if hip.hipDeviceGetPCIBusId(bus_id, len(bus_id), device_index) != 0:
+            return None
+        # "dddd:bb:dd.f"; the torch address has no function number.
+        return bus_id.value.decode().lower().split(".")[0] or None
     except Exception:
         return None
 
@@ -103,6 +153,15 @@ def _handle_for(device_index: Optional[int]) -> Optional[Any]:
             smi_bdf = _query(lambda: amdsmi.amdsmi_get_gpu_device_bdf(handle), str)
             if smi_bdf is not None and smi_bdf.lower().split(".")[0] == bdf:
                 return handle
+    remap = [v for v in _VISIBILITY_ENV if os.environ.get(v, "").strip()]
+    if remap:
+        # The HIP index can name another physical GPU than the amdsmi index.
+        warn_once(
+            "amdsmi",
+            f"no GPU telemetry: cannot map the HIP device to an amdsmi device "
+            f"under {', '.join(remap)}",
+        )
+        return None
     index = device_index or 0
     return handles[index] if index < len(handles) else None
 

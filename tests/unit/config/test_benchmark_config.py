@@ -5,6 +5,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from dnn_benchmarking.cli.config_file import apply_config_file
@@ -16,6 +17,8 @@ from dnn_benchmarking.config import (
     TimingPolicy,
     ValidationConfig,
 )
+from dnn_benchmarking.execution.buffer_manager import generate_input_data
+from dnn_benchmarking.graph.tensor_info import TensorInfo
 
 
 def _namespace(argv: list[str]):
@@ -65,9 +68,38 @@ id = 1
         assert suite.metrics.basic is False
         assert suite.validation.tolerance_override == (1e-3, 1e-3)
 
-    def test_default_seed_is_fixed(self) -> None:
-        """Inputs are reproducible without --seed (pre-fix default was random)."""
-        assert SuiteConfig.from_namespace(_namespace(["-g", "g.json"])).seed == 0
+    @pytest.mark.parametrize("source", ["cli", "config_file"])
+    def test_inputs_are_reproducible_without_a_seed(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """Two runs without --seed or a config `seed` get the same inputs.
+
+        Regression: the seed default was None, so every run, and every
+        profiling child, drew different random inputs.
+        """
+        argv = ["-g", "g.json"]
+        if source == "config_file":
+            config = tmp_path / "bench.toml"
+            config.write_text('version = 1\ngraphs = ["g.json"]\n')
+            argv = ["--config", str(config)]
+        tensor = TensorInfo(
+            uid=1,
+            name="x",
+            dims=[64],
+            strides=[1],
+            data_type="float",
+            is_virtual=False,
+            is_output=False,
+        )
+
+        first, second = (
+            generate_input_data(
+                [tensor], SuiteConfig.from_namespace(_namespace(argv)).seed
+            )
+            for _ in range(2)
+        )
+
+        np.testing.assert_array_equal(first[1], second[1])
 
     def test_shipped_run_defaults(self) -> None:
         """docs/usage.md documents these; default-path trend numbers depend on them."""
