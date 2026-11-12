@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
-"""Convert SDPA forward workload graphs into their backward equivalents.
+"""Build the SDPA backward corpus from the workload tarballs.
 
-Every dense ``SdpaAttributes`` graph in the given tarballs becomes one
-``SdpaBackwardAttributes`` graph with the same Q, K, V, mask, scale, bounds
-and sequence-length inputs. The forward output O becomes a backward input,
-and the backward adds dO, the fp32 log-sum-exp stats and dQ, dK, dV.
+The corpus has three origins, recorded in ``metadata.origin``:
 
-Forward graphs with no backward equivalent in hipDNN are skipped: paged K/V
-caches, attention sinks, block masks, fp8 descale/scale tensors and dropout.
-Duplicates (canonical JSON without ``name`` and ``metadata``) are kept once,
-with the sources of every copy in ``metadata.source``.
+- ``converted_fwd``: every dense ``SdpaAttributes`` graph becomes one
+  ``SdpaBackwardAttributes`` graph with the same Q, K, V, mask, scale, bounds
+  and sequence-length inputs. The forward output O becomes a backward input,
+  and the backward adds dO, the fp32 log-sum-exp stats and dQ, dK, dV.
+  Forward graphs with no backward equivalent in hipDNN are skipped: paged
+  K/V caches, attention sinks, block masks, fp8 descale/scale tensors and
+  dropout.
+- ``captured_bwd``: ``SdpaBackwardAttributes`` graphs already in the
+  tarballs, unchanged, except that a ``metadata.dropout`` probability the
+  capture did not write into the graph is added (probability, seed and
+  offset).
+- ``model_spec``: training graphs with features no captured workload has
+  (``_MODEL_SPECS``): attention dropout, additive bias with and without
+  dBias, and ALiBi, at the published shapes of the named models.
+
+``metadata.shape`` is ``decode`` (Sq = 1), ``sq_lt_skv``, ``sq_eq_skv`` or
+``sq_gt_skv``. Duplicates (canonical JSON without ``name`` and
+``metadata``) are kept once, with the sources of every copy in
+``metadata.source``.
 
 Usage:
   python tools/sdpa_fwd_to_bwd.py -o Workloads/corpus/SDPABackward/files.tar.gz \\
@@ -89,9 +101,75 @@ _BWD_INPUT_KEYS = (
     "dropout_scale_inv_tensor_uid",
 )
 
+#: Training graphs with features no captured workload has. ``bias`` is the
+#: additive bias shape, ``dbias`` adds its gradient as an output, ``dropout``
+#: is the attention-probability dropout. Shapes are the models' published
+#: configurations (Hugging Face ``config.json`` or the paper).
+_MODEL_SPECS: Tuple[Dict[str, Any], ...] = (
+    {
+        "model": "bert-large-uncased",
+        "source": "config.json: 16 heads, hidden 1024, "
+        "attention_probs_dropout_prob 0.1; pre-training at 512 tokens",
+        "variant": "pretrain_padding_mask_dropout",
+        "dtype": "half",
+        "shape": (16, 16, 16, 512, 512, 64, 64),
+        "bias": "padding",
+        "dropout": 0.1,
+    },
+    {
+        "model": "t5-large",
+        "source": "config.json: 16 heads, d_kv 64, dropout_rate 0.1; learned "
+        "relative position bias shared over the batch",
+        "variant": "encoder_relative_bias_dbias_dropout",
+        "dtype": "bfloat16",
+        "shape": (16, 16, 16, 512, 512, 64, 64),
+        "bias": "shared",
+        "dbias": True,
+        "dropout": 0.1,
+    },
+    {
+        "model": "swin-base",
+        "source": "Swin-B stage 1: 7x7 windows (49 tokens), 4 heads of 32, "
+        "learned relative position bias; 64 images of 56x56 = 4096 windows",
+        "variant": "window_relative_bias_dbias",
+        "dtype": "half",
+        "shape": (4096, 4, 4, 49, 49, 32, 32),
+        "bias": "shared",
+        "dbias": True,
+    },
+    {
+        "model": "alphafold2",
+        "source": "Evoformer MSA row attention with pair bias: 8 heads of 32, "
+        "256-residue crop, 512 MSA rows; the bias comes from the pair stack",
+        "variant": "msa_row_pair_bias_dbias",
+        "dtype": "bfloat16",
+        "shape": (512, 8, 8, 256, 256, 32, 32),
+        "bias": "shared",
+        "dbias": True,
+    },
+    {
+        "model": "bloom-176b",
+        "source": "config.json: 112 heads, hidden 14336, ALiBi, 2048 tokens",
+        "variant": "causal_alibi",
+        "dtype": "bfloat16",
+        "shape": (1, 112, 112, 2048, 2048, 128, 128),
+        "causal": True,
+        "alibi": True,
+    },
+    {
+        "model": "mpt-7b",
+        "source": "config.json: 32 heads, d_model 4096, ALiBi, max_seq_len 2048",
+        "variant": "causal_alibi",
+        "dtype": "bfloat16",
+        "shape": (4, 32, 32, 2048, 2048, 128, 128),
+        "causal": True,
+        "alibi": True,
+    },
+)
+
 
 class Skip(Exception):
-    """The forward graph has no backward equivalent."""
+    """The graph has no backward equivalent."""
 
 
 def _param(node: Dict[str, Any], key: str) -> Any:
@@ -108,6 +186,123 @@ def _contiguous_strides(dims: List[int]) -> List[int]:
         strides.append(step)
         step *= max(int(dim), 1)
     return strides[::-1]
+
+
+def _tensor(uid: int, name: str, dims: List[int], data_type: str) -> Dict[str, Any]:
+    """A non-virtual tensor; rank-4 attention tensors [B, H, S, D] use BSHD."""
+    if name in ("stats", "seed", "offset") or len(dims) != 4 or "bias" in name:
+        strides = _contiguous_strides(dims)
+    else:
+        batch, heads, seq, dim = dims
+        strides = [seq * heads * dim, dim, heads * dim, 1]
+    return {
+        "uid": uid,
+        "name": name,
+        "dims": list(dims),
+        "strides": strides,
+        "data_type": data_type,
+        "virtual": False,
+    }
+
+
+def _add_dropout(graph: Dict[str, Any], probability: float) -> None:
+    """Philox dropout as cuDNN's ``set_dropout``: probability, seed, offset."""
+    node = graph["nodes"][0]
+    uid = max(int(t["uid"]) for t in graph["tensors"]) + 1
+    for offset, name in enumerate(("seed", "offset")):
+        graph["tensors"].append(_tensor(uid + offset, name, [1, 1, 1, 1], "int64"))
+        node["inputs"][f"{name}_tensor_uid"] = uid + offset
+    node["parameters"]["dropout_probability"] = probability
+
+
+def adopt(bwd: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a captured backward graph, with its ``metadata.dropout`` applied."""
+    nodes = bwd.get("nodes", [])
+    if len(nodes) != 1 or nodes[0].get("type") != "SdpaBackwardAttributes":
+        raise Skip("not_single_sdpa_bwd")
+    graph = {k: copy.deepcopy(v) for k, v in bwd.items() if k != "metadata"}
+    metadata = bwd.get("metadata")
+    dropout = float(metadata.get("dropout") or 0.0) if isinstance(metadata, dict) else 0
+    node = graph["nodes"][0]
+    if dropout and not float(_param(node, "dropout_probability") or 0.0):
+        _add_dropout(graph, dropout)
+    return graph
+
+
+def spec_graph(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the backward graph of one ``_MODEL_SPECS`` entry."""
+    batch, heads_q, heads_kv, seq_q, seq_kv, dim, dim_v = spec["shape"]
+    dtype = spec["dtype"]
+    tensors: List[Dict[str, Any]] = []
+
+    def add(name: str, dims: List[int], data_type: str = dtype) -> int:
+        tensors.append(_tensor(len(tensors) + 1, name, dims, data_type))
+        return len(tensors)
+
+    inputs: Dict[str, Optional[int]] = dict.fromkeys(_BWD_INPUT_KEYS)
+    inputs["q_tensor_uid"] = add("query", [batch, heads_q, seq_q, dim])
+    inputs["k_tensor_uid"] = add("key", [batch, heads_kv, seq_kv, dim])
+    inputs["v_tensor_uid"] = add("value", [batch, heads_kv, seq_kv, dim_v])
+    inputs["o_tensor_uid"] = add("output", [batch, heads_q, seq_q, dim_v])
+    inputs["do_tensor_uid"] = add("d_output", [batch, heads_q, seq_q, dim_v])
+    inputs["stats_tensor_uid"] = add("stats", [batch, heads_q, seq_q, 1], "float")
+    bias_dims = {
+        "padding": [batch, 1, 1, seq_kv],
+        "shared": [1, heads_q, seq_q, seq_kv],
+    }.get(spec.get("bias"))
+    if bias_dims:
+        inputs["attn_mask_tensor_uid"] = add("bias", bias_dims)
+    outputs = {
+        "dq_tensor_uid": add("d_query", [batch, heads_q, seq_q, dim]),
+        "dk_tensor_uid": add("d_key", [batch, heads_kv, seq_kv, dim]),
+        "dv_tensor_uid": add("d_value", [batch, heads_kv, seq_kv, dim_v]),
+        "dbias_tensor_uid": add("d_bias", bias_dims) if spec.get("dbias") else None,
+    }
+    parameters = dict.fromkeys(_SHARED_PARAMETERS)
+    parameters.update(
+        alibi_mask=bool(spec.get("alibi")),
+        padding_mask=False,
+        causal_mask=bool(spec.get("causal")),
+        causal_mask_bottom_right=False,
+        attn_scale_value=dim**-0.5,
+        diagonal_alignment="TOP_LEFT",
+    )
+    name = (
+        f"{spec['model']}__{dtype}_bwd_{spec['variant']}_b{batch}_hq{heads_q}"
+        f"_kv{heads_kv}_sq{seq_q}_skv{seq_kv}_d{dim}v{dim_v}"
+    )
+    graph = {
+        "name": name,
+        "compute_data_type": "float",
+        "io_data_type": dtype,
+        "intermediate_data_type": dtype,
+        "tensors": tensors,
+        "nodes": [
+            {
+                "name": "sdpa_backward_node",
+                "type": "SdpaBackwardAttributes",
+                "compute_data_type": "float",
+                "inputs": inputs,
+                "outputs": outputs,
+                "parameters": parameters,
+            }
+        ],
+    }
+    if spec.get("dropout"):
+        _add_dropout(graph, spec["dropout"])
+    return graph
+
+
+def _shape_tag(graph: Dict[str, Any]) -> str:
+    node = graph["nodes"][0]
+    dims = {int(t["uid"]): t["dims"] for t in graph["tensors"]}
+    seq_q = int(dims[int(_param(node, "q_tensor_uid"))][2])
+    seq_kv = int(dims[int(_param(node, "k_tensor_uid"))][2])
+    if seq_q == 1:
+        return "decode"
+    return {-1: "sq_lt_skv", 0: "sq_eq_skv", 1: "sq_gt_skv"}[
+        (seq_q > seq_kv) - (seq_q < seq_kv)
+    ]
 
 
 def convert(fwd: Dict[str, Any]) -> Dict[str, Any]:
@@ -205,14 +400,20 @@ def _model_tags(metadata: Any) -> List[str]:
     return [re.sub(r"[^a-z0-9]+", "_", str(n).lower()).strip("_") for n in names]
 
 
-def iter_forward_graphs(
-    patterns: List[str], root: Path
+def iter_graphs(
+    patterns: List[str], root: Path, exclude: Optional[Path] = None
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
-    """Yield ``(source, graph)`` for each JSON member of the matched tarballs."""
+    """Yield ``(source, graph)`` for each JSON member of the matched tarballs.
+
+    ``exclude`` (the output archive) is never read, so a rebuild does not
+    adopt the previous corpus.
+    """
     paths = sorted(
         {Path(p) for pat in patterns for p in glob.glob(pat, recursive=True)}
     )
     for path in paths:
+        if exclude is not None and path.resolve() == exclude.resolve():
+            continue
         try:
             label = path.resolve().relative_to(root.resolve()).as_posix()
         except ValueError:
@@ -224,36 +425,52 @@ def iter_forward_graphs(
                     yield f"{label}:{member.name}", graph
 
 
-def build(
-    patterns: List[str], root: Path
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
-    """Convert and de-duplicate; return graphs by identity and skip counts."""
-    kept: Dict[str, Dict[str, Any]] = {}
-    skipped: Dict[str, int] = collections.Counter()
-    for source, fwd in iter_forward_graphs(patterns, root):
-        if not any(n.get("type") == "SdpaAttributes" for n in fwd.get("nodes", [])):
+def _graph_origins(
+    patterns: List[str], root: Path, exclude: Optional[Path], skipped: Dict[str, int]
+) -> Iterator[Tuple[str, str, Dict[str, Any], Any]]:
+    """Yield ``(origin, source, backward graph, source metadata)``."""
+    for source, graph in iter_graphs(patterns, root, exclude):
+        types = {n.get("type") for n in graph.get("nodes", [])}
+        if "SdpaAttributes" in types:
+            origin, make = "converted_fwd", convert
+        elif "SdpaBackwardAttributes" in types:
+            origin, make = "captured_bwd", adopt
+        else:
             continue
         try:
-            bwd = convert(fwd)
+            yield origin, source, make(graph), graph.get("metadata")
         except Skip as reason:
             skipped[str(reason)] += 1
-            continue
-        key = identity(bwd)
-        metadata = fwd.get("metadata")
+    for spec in _MODEL_SPECS:
+        yield "model_spec", f"model_spec:{spec['source']}", spec_graph(spec), spec
+
+
+def build(
+    patterns: List[str], root: Path, exclude: Optional[Path] = None
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """Collect and de-duplicate; return graphs by identity and skip counts."""
+    kept: Dict[str, Dict[str, Any]] = {}
+    skipped: Dict[str, int] = collections.Counter()
+    for origin, source, bwd, metadata in _graph_origins(
+        patterns, root, exclude, skipped
+    ):
         entry = kept.setdefault(
-            key,
+            identity(bwd),
             {
                 **bwd,
                 "metadata": {
                     "operation": ["sdpa"],
                     "direction": ["bwd"],
                     "dtype": [bwd["io_data_type"]],
+                    "shape": [_shape_tag(bwd)],
+                    "origin": [],
                     "model": [],
                     "source": [],
                 },
             },
         )
         tags = entry["metadata"]
+        tags["origin"] = sorted(set(tags["origin"]) | {origin})
         tags["source"].append(source)
         tags["model"] = sorted(set(tags["model"]) | set(_model_tags(metadata)))
     for entry in kept.values():
@@ -297,18 +514,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    kept, skipped = build(args.tarballs, args.root)
+    kept, skipped = build(args.tarballs, args.root, args.output)
     graphs = sorted(kept.values(), key=lambda g: g["metadata"]["source"][0])
     _unique_names(graphs)
     write_archive(graphs, args.output, args.prefix)
-    converted = sum(len(g["metadata"]["source"]) for g in graphs)
+    origins = collections.Counter(
+        origin for g in graphs for origin in g["metadata"]["origin"]
+    )
+    sources = sum(len(g["metadata"]["source"]) for g in graphs)
     print(
-        f"{converted} forward graphs converted, {converted - len(graphs)} duplicates, "
-        f"{len(graphs)} unique backward graphs written to {args.output}",
+        f"{sources} source graphs, {sources - len(graphs)} duplicates, "
+        f"{len(graphs)} unique backward graphs written to {args.output}: "
+        + ", ".join(f"{n} {o}" for o, n in sorted(origins.items())),
         file=sys.stderr,
     )
     for reason, count in sorted(skipped.items()):
-        print(f"skipped {count} forward graphs: {reason}", file=sys.stderr)
+        print(f"skipped {count} graphs: {reason}", file=sys.stderr)
     return 0
 
 

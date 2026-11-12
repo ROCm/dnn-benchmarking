@@ -535,8 +535,9 @@ Measure again after a timing change.
 An SDPA backward node reads Q, K, V, the forward output O, the incoming
 gradient dO and the forward log-sum-exp `stats`. The tool draws Q, K, V and
 dO from U[0, 1) like other inputs. It then computes O and `stats` as the
-exact float32 forward of Q, K and V with the graph's scale, mask, bounds and
-GQA layout. The forward runs in PyTorch, on the GPU when one is visible;
+exact float32 forward of Q, K and V with the graph's scale, mask, bounds,
+additive bias, ALiBi and GQA layout. The forward runs in PyTorch, on the GPU
+when one is visible;
 without PyTorch a NumPy fallback gives the same values. O is rounded to its
 graph type. Both runtimes and the reference read these values.
 
@@ -562,7 +563,8 @@ formula. Before tool version 0.4.0 it was the fp32 formula. On the host the
 reference is still the fp32 formula.
 
 The forward is dense and has no dropout: sequence-length and dropout inputs
-do not change O and `stats`. The forward adds host time to input generation
+do not change O and `stats`, so O of a dropout graph is the forward without
+dropout. The forward adds host time to input generation
 before the timed loop. It is proportional to the attention FLOPs of the
 graph. Forward-consistent SDPA backward inputs start at tool version 0.4.0.
 Do not compare SDPA backward results with results from earlier versions.

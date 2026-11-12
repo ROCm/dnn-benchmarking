@@ -25,7 +25,7 @@ import numpy as np
 
 from ..graph.tensor_info import TensorInfo
 from ..metrics.analytical._common import node_param
-from ..metrics.analytical.sdpa import Band, sdpa_band
+from ..metrics.analytical.sdpa import Band, alibi_slopes, sdpa_band
 
 #: Float32 elements of one score block (256 MiB).
 _SCORE_BLOCK_ELEMENTS = 1 << 26
@@ -61,17 +61,20 @@ def attention_forward(
     scale: float,
     mask: Optional[np.ndarray] = None,
     band: Band = (None, None, False),
+    alibi: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Exact float32 attention: ``(O [B, Hq, Sq, Dv], stats [B, Hq, Sq, 1])``.
 
     K and V can have fewer heads than Q (grouped-query attention). ``mask``
-    is an additive bias that broadcasts to ``[B, Hq, Sq, Skv]``. A row with
-    no visible key gets O = 0 and stats = 0, so a backward reads P = 0 for it.
+    is an additive bias that broadcasts to ``[B, Hq, Sq, Skv]``. ``alibi``
+    holds per-query-head slopes (:func:`alibi_slopes`); head ``h`` adds
+    ``alibi[h] * (key - query)``. A row with no visible key gets O = 0 and
+    stats = 0, so a backward reads P = 0 for it.
     """
     torch = _torch()
     if torch is None:
-        return _numpy_forward(q, k, v, scale, mask, band)
-    return _torch_forward(torch, q, k, v, scale, mask, band)
+        return _numpy_forward(q, k, v, scale, mask, band, alibi)
+    return _torch_forward(torch, q, k, v, scale, mask, band, alibi)
 
 
 def _torch_forward(
@@ -82,6 +85,7 @@ def _torch_forward(
     scale: float,
     mask: Optional[np.ndarray],
     band: Band,
+    alibi: Optional[np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """``attention_forward`` in PyTorch, all heads of one batch at a time."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,6 +103,11 @@ def _torch_forward(
     full_mask = (
         None if mask is None else np.broadcast_to(mask, (batch, heads, q_len, kv_len))
     )
+    slopes = (
+        None
+        if alibi is None
+        else torch.from_numpy(alibi.astype(np.float32)).to(device)[:, None, None]
+    )
 
     def on_device(array: np.ndarray, rep: int = 1) -> Any:
         tensor = torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
@@ -107,6 +116,7 @@ def _torch_forward(
 
     with torch.no_grad():
         keys = torch.arange(kv_len, device=device)
+        key_f = keys.to(torch.float32)
         for b in range(batch):
             q_b = on_device(q[b])
             k_t = on_device(k[b], rep_k).transpose(-2, -1)
@@ -117,6 +127,9 @@ def _torch_forward(
                 if full_mask is not None:
                     scores += on_device(full_mask[b, :, start:end])
                 diagonal = torch.arange(start, end, device=device)[:, None] + offset
+                if slopes is not None:
+                    rows_f = torch.arange(start, end, device=device)[:, None]
+                    scores += slopes * (key_f - rows_f.to(torch.float32))
                 if left is not None:
                     scores.masked_fill_(keys < diagonal - left, float("-inf"))
                 if right is not None:
@@ -139,6 +152,7 @@ def _numpy_forward(
     scale: float,
     mask: Optional[np.ndarray],
     band: Band,
+    alibi: Optional[np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """``attention_forward`` in NumPy, one head at a time."""
     batch, heads, q_len, _ = q.shape
@@ -165,6 +179,9 @@ def _numpy_forward(
                 scores *= np.float32(scale)
                 if full_mask is not None:
                     scores += full_mask[b, h, start:end]
+                if alibi is not None:
+                    query = np.arange(start, end, dtype=np.float32)[:, None]
+                    scores += np.float32(alibi[h]) * (keys[None, :] - query)
                 diagonal = np.arange(start, end)[:, None] + offset
                 if left is not None:
                     scores[keys[None, :] < diagonal - left] = -np.inf
@@ -194,8 +211,9 @@ def set_sdpa_backward_inputs(
 
     ``round_to(values, tensor_info)`` rounds float32 values to the tensor's
     logical type. Nodes whose O or stats another node computes are skipped.
-    Dropout and sequence-length inputs are not applied: the forward is dense
-    and dropout-free.
+    The forward applies the band, the attention bias and ALiBi. Dropout and
+    sequence-length inputs are not applied: the forward is dense and
+    dropout-free, so with dropout O differs from the dropped-out forward.
     """
     if not graph_json:
         return
@@ -214,13 +232,15 @@ def set_sdpa_backward_inputs(
         except ValueError:
             continue  # hipDNN rejects the mask, so no engine reads O or stats
         mask_uid = uids["attn_mask"]
+        q = input_data[uids["q"]]
         out, stats = attention_forward(
-            input_data[uids["q"]],
+            q,
             input_data[uids["k"]],
             input_data[uids["v"]],
             _scale(node, input_data),
             None if mask_uid is None else input_data.get(mask_uid),
             band,
+            alibi_slopes(q.shape[1]) if node_param(node, "alibi_mask") else None,
         )
         for name, values in (("o", out), ("stats", stats)):
             info = infos[uids[name]]

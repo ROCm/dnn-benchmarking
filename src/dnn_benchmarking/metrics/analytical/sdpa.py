@@ -36,6 +36,8 @@ windowed count the rocKE attention benchmarks report.
 
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
+
 from ._common import node_param, node_tensor
 
 #: ``(left, right, bottom_right)``; a ``None`` bound is unbounded.
@@ -76,6 +78,23 @@ def sdpa_band(node: Dict[str, Any]) -> Band:
         (None if right == -1 else right),
         bottom_right,
     )
+
+
+def alibi_slopes(num_heads: int) -> np.ndarray:
+    """cuDNN's per-query-head ALiBi slopes (``get_alibi_slope``), float64.
+
+    The geometric schedule covers the closest power of two below or at
+    ``num_heads``. Extra heads use the next power of two's odd-indexed
+    slopes, as cuDNN and common open-source ALiBi implementations do. Head
+    ``h`` adds ``slopes[h] * (key - query)`` to the scaled scores.
+    """
+    base = 1 << (num_heads.bit_length() - 1)
+    exponents = -8.0 * (np.arange(base, dtype=np.float64) + 1.0) / base
+    extra = num_heads - base
+    if extra > 0:
+        odd = np.arange(extra, dtype=np.float64)
+        exponents = np.concatenate([exponents, -4.0 * (2.0 * odd + 1.0) / base])
+    return np.power(2.0, exponents)
 
 
 def _nonmasked_pairs(

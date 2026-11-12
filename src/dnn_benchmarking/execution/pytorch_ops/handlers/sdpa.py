@@ -9,7 +9,7 @@ import torch
 
 from ....common.exceptions import UnsupportedGraphError
 from ....config.benchmark_config import PyTorchSdpaBackendName
-from ....metrics.analytical.sdpa import sdpa_band
+from ....metrics.analytical.sdpa import alibi_slopes, sdpa_band
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
 from .._sdpa_backend import (
@@ -281,20 +281,8 @@ def _diagonal_band_mask(
 def _alibi_slopes(
     num_heads: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """cuDNN's per-query-head ALiBi slopes (``get_alibi_slope``).
-
-    The geometric schedule covers the closest power of two below or at
-    ``num_heads``. Extra heads use the next power of two's odd-indexed
-    slopes, as cuDNN and common open-source ALiBi implementations do.
-    """
-    base = 1 << (num_heads.bit_length() - 1)
-    head = torch.arange(base, device=device, dtype=torch.float64)
-    exponents = -8.0 * (head + 1.0) / base
-    extra = num_heads - base
-    if extra > 0:
-        odd = torch.arange(extra, device=device, dtype=torch.float64)
-        exponents = torch.cat([exponents, -4.0 * (2.0 * odd + 1.0) / base])
-    return torch.pow(2.0, exponents).to(dtype=dtype)
+    """cuDNN's per-query-head ALiBi slopes (:func:`alibi_slopes`)."""
+    return torch.from_numpy(alibi_slopes(num_heads)).to(device=device, dtype=dtype)
 
 
 def _alibi_bias_block(

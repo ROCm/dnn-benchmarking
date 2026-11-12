@@ -147,6 +147,31 @@ def test_additive_mask_enters_the_forward() -> None:
     np.testing.assert_allclose(data[6], stats, rtol=1e-5, atol=1e-6)
 
 
+def test_alibi_enters_the_forward() -> None:
+    """ALiBi adds slope * (key - query) per query head. With 3 heads, cuDNN's
+    schedule gives 2^-4 and 2^-8 for the power-of-two part and 2^-2 for the
+    extra head."""
+    infos = [
+        _info(1, [1, 3, 5, 8], "float"),
+        _info(2, [1, 3, 5, 8], "float"),
+        _info(3, [1, 3, 5, 8], "float"),
+        _info(4, [1, 3, 5, 8], "float"),
+        _info(5, [1, 3, 5, 8], "float"),
+        _info(6, [1, 3, 5, 1], "float"),
+    ]
+    parameters = {"attn_scale_value": 0.5, "causal_mask": True, "alibi_mask": True}
+
+    data = generate_input_data(infos, seed=2, graph_json=_graph(parameters))
+
+    slopes = np.array([2.0**-4, 2.0**-8, 2.0**-2]).reshape(1, 3, 1, 1)
+    distance = np.arange(5)[None, :] - np.arange(5)[:, None]
+    o, stats = _expected(
+        data, 0.5, 5, 5, lambda i, j: j <= i, rep=1, mask=slopes * distance
+    )
+    np.testing.assert_allclose(data[4], o, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(data[6], stats, rtol=1e-5, atol=1e-6)
+
+
 def test_bf16_output_is_rounded_and_blocks_cover_every_row(monkeypatch) -> None:
     """O is stored at the graph type. Score blocks smaller than the query
     length must still give the full-size result."""
