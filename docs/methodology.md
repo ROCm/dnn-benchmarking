@@ -359,7 +359,8 @@ took 475 s on an empty database and 46 s on the database of an earlier run.
 
 The work directory keeps two selection states (see
 [usage.md](usage.md#work-directory---benchmark-work-dir)).
-`--autotune` runs and the tuned runs of `--oracle` read and extend
+`--autotune` runs, runs with a true `HIPDNN_FORCE_BENCHMARKING` in the
+environment, and the tuned runs of `--oracle` read and extend
 `<work>/tuned`. Every other run, `--fast` included, reads and extends
 `<work>/ootb`. No tuned run writes to `<work>/ootb`. The find results and
 rankings of earlier commands remove that setup work. In such a warm run:

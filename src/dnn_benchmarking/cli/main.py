@@ -14,6 +14,7 @@ from ..common.work_dir import (
     COMPILE_CACHE_SUBDIRS,
     FRESH_STATE_PREFIX,
     SelectionState,
+    benchmarks_kernels,
     ootb_state,
     tuned_state,
     work_dir,
@@ -102,7 +103,7 @@ def _configure_work_dir(
     args.benchmark_work_dir = work
     return _configure_cache_env(
         work,
-        tuned=tuned_child or bool(args.autotune),
+        tuned=tuned_child or benchmarks_kernels(bool(args.autotune)),
         fresh=bool(args.fresh_state),
         replace_compile_caches=work_arg is not None and not tuned_child,
     )

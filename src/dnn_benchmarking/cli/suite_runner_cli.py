@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..common.exceptions import UnsupportedGraphError
 from ..common.pytorch_tuning import apply_pytorch_environment
-from ..common.work_dir import ootb_state, tuned_state, work_dir
+from ..common.work_dir import env_switch_on, ootb_state, tuned_state, work_dir
 from ..config.benchmark_config import (
     RuntimeName,
     PyTorchSdpaBackendName,
@@ -42,9 +42,6 @@ WRITE_INTERVAL_S = 10.0
 
 #: Seconds a SIGTERM'd run gets to write its partial file before a forced exit.
 SIGTERM_GRACE_S = 30.0
-
-# Match hipDNN's documented truthy values. Notably, "0" leaves a switch off.
-_TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
 
 #: Variables that decide hipDNN kernel selection; recorded for oracle/autotune.
 _SELECTION_ENV = (
@@ -97,10 +94,6 @@ def _arm_sigterm_watchdog() -> Callable[[], None]:
         os.close(write_fd)
 
     return disarm
-
-
-def _truthy_env(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV
 
 
 def _now() -> str:
@@ -513,7 +506,7 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
     plus one warning per hazard.
     """
     leaked = False
-    cache_disabled = _truthy_env("HIPDNN_DISABLE_CACHE")
+    cache_disabled = env_switch_on("HIPDNN_DISABLE_CACHE")
     if cache_disabled:
         cache = "disabled (HIPDNN_DISABLE_CACHE)"
     else:
@@ -523,14 +516,15 @@ def _apply_tuning_environment(config: SuiteConfig, reporter: Reporter) -> None:
 
     if config.autotune:
         os.environ["HIPDNN_FORCE_BENCHMARKING"] = "1"
-    elif _truthy_env("HIPDNN_FORCE_BENCHMARKING"):
+    elif env_switch_on("HIPDNN_FORCE_BENCHMARKING"):
         # Process-wide and inherited from the shell: the run is NOT on the
-        # heuristic path even though --autotune was not passed.
+        # heuristic path even though --autotune was not passed. cli.main
+        # put it on the tuned state, so its winners do not reach OOTB runs.
         leaked = True
         reporter.warning(
             "HIPDNN_FORCE_BENCHMARKING is set in the environment without "
-            "--autotune; kernels are benchmarked, not heuristic-selected, and "
-            "the winners stay in the selection state for later runs"
+            "--autotune; kernels are benchmarked, not heuristic-selected, on "
+            "the tuned selection state"
         )
     autotune = config.autotune or leaked
     if config.autotune and not cache_disabled and not config.fresh_state:

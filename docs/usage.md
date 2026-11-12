@@ -412,9 +412,10 @@ The work directory holds the caches and the kernel-selection state:
     miopen-user-db/
 ```
 
-- `--autotune` runs and the tuned runs of `--oracle` use `tuned/`. A later
-  command with the same work directory reuses the hipDNN rankings and the
-  MIOpen find results that earlier tuned runs saved.
+- `--autotune` runs, runs with `HIPDNN_FORCE_BENCHMARKING` set to a true
+  value in the environment, and the tuned runs of `--oracle` use `tuned/`. A
+  later command with the same work directory reuses the hipDNN rankings and
+  the MIOpen find results that earlier tuned runs saved.
 - Every other run, `--fast` included, and the OOTB plans of `--oracle` use
   `ootb/`. No tuned run writes to it, so no tuned ranking can change its
   kernel selection. A later command reuses the MIOpen find results that

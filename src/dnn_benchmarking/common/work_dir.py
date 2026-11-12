@@ -17,8 +17,10 @@ Layout of ``--benchmark-work-dir`` (default :func:`work_dir`)::
 
 OOTB state serves every run that does not tune, ``--fast`` included, and the
 OOTB plans of ``--oracle``. Only such runs write it, so a stored find result
-is the one the heuristic path selects. Tuned state serves ``--autotune`` runs
-and the tuned runs of ``--oracle`` (child processes, ``execution.oracle``).
+is the one the heuristic path selects. Tuned state serves ``--autotune`` runs,
+runs with a true ``HIPDNN_FORCE_BENCHMARKING`` in the environment
+(:func:`benchmarks_kernels`), and the tuned runs of ``--oracle`` (child
+processes, ``execution.oracle``).
 With ``--fresh-state``, the process instead gets a new, empty state in the
 system temporary directory (:data:`FRESH_STATE_PREFIX`), removed when the
 command ends. ``cli.main`` sets the variables.
@@ -40,6 +42,24 @@ COMPILE_CACHE_SUBDIRS: Dict[str, str] = {
 
 #: Prefix of the ``--fresh-state`` directory in the system temporary directory.
 FRESH_STATE_PREFIX = "dnn-bench-state-"
+
+# hipDNN's documented truthy values. Notably, "0" leaves a switch off.
+_TRUTHY_ENV = {"1", "true", "on", "yes", "enable", "enabled"}
+
+
+def env_switch_on(name: str) -> bool:
+    """Whether the environment sets the hipDNN switch ``name`` to a true value."""
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV
+
+
+def benchmarks_kernels(autotune: bool) -> bool:
+    """Whether the process benchmarks kernels: ``--autotune``, or
+    ``HIPDNN_FORCE_BENCHMARKING`` set to a true value in the environment.
+
+    Such a run stores the winners of its search, so it must use the tuned
+    state: in the OOTB state, the winners would reach later heuristic runs.
+    """
+    return autotune or env_switch_on("HIPDNN_FORCE_BENCHMARKING")
 
 
 @dataclass(frozen=True)
@@ -85,8 +105,19 @@ def work_dir(benchmark_work_dir: Optional[str]) -> Path:
     xdg_cache = os.environ.get("XDG_CACHE_HOME")
     if xdg_cache:
         return (Path(xdg_cache).expanduser() / "dnn-benchmark" / "work").resolve()
-    user_dir = f"dnn-benchmark-{getpass.getuser()}"
+    user_dir = f"dnn-benchmark-{_user()}"
     return (Path(tempfile.gettempdir()) / user_dir / "work").resolve()
+
+
+def _user() -> str:
+    """The user name, else the numeric uid: a container started with
+    ``--user <uid>`` can have no passwd entry and no ``USER``/``LOGNAME``."""
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError, ImportError):
+        if hasattr(os, "getuid"):
+            return str(os.getuid())
+        raise
 
 
 def ootb_state(work: Path) -> SelectionState:

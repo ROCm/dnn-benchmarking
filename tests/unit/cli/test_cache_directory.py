@@ -122,6 +122,40 @@ def test_a_tuned_child_keeps_the_compile_caches_its_parent_exported(
     assert _state()[0].parent == expected_state
 
 
+@pytest.mark.parametrize(
+    "forced, root", [("1", "tuned"), ("0", "ootb")], ids=["forced", "off"]
+)
+def test_benchmarking_forced_by_the_environment_runs_on_the_tuned_state(
+    tmp_path: Path, monkeypatch, forced: str, root: str
+) -> None:
+    """A HIPDNN_FORCE_BENCHMARKING left in the shell searches like --autotune;
+    its winners must not reach the OOTB state of later heuristic runs."""
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", forced)
+
+    _configure_work_dir(_args(tmp_path), tuned_child=False)
+
+    assert _state()[0].parent == tmp_path / root
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX uid fallback")
+def test_default_work_dir_without_a_user_name_uses_the_uid(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A container started with --user <uid> can have no passwd entry."""
+    import getpass
+
+    def no_user() -> str:
+        raise KeyError("getpwuid(): uid not found")
+
+    monkeypatch.delenv("DNN_BENCH_WORKSPACE")
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(getpass, "getuser", no_user)
+
+    user_dir = f"dnn-benchmark-{os.getuid()}"
+    assert work_dir(None) == tmp_path / user_dir / "work"
+
+
 def test_the_default_work_dir_is_resolved_before_xdg_cache_home_changes(
     tmp_path: Path, monkeypatch
 ) -> None:
