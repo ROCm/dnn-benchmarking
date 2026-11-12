@@ -169,12 +169,14 @@ output and log-sum-exp.
 
 The setup runs once, before the timed loop:
 
-1. Expand K and V to the query head count.
-2. Run the forward once with the current `--pytorch-sdpa-backend` selection,
-   with `requires_grad` inputs and the graph's mask, bounds and scale.
-3. Read from the autograd node which fused kernel ran, and its saved scalars.
-4. Copy `stats` into the log-sum-exp layout of that kernel.
-5. Copy O into the memory layout of the forward's output. For an O in the
+1. Run the forward once with the current `--pytorch-sdpa-backend` selection,
+   with `requires_grad` inputs and the graph's mask, bounds and scale. GQA and
+   MQA graphs use `enable_gqa` on the real-size K and V, as a training step
+   does. If that forward does not run Flash, the tool expands K and V to the
+   query head count and runs the forward again.
+2. Read from the autograd node which fused kernel ran, and its saved scalars.
+3. Copy `stats` into the log-sum-exp layout of that kernel.
+4. Copy O into the memory layout of the forward's output. For an O in the
    `[B, H, S, D]` memory order, the memory-efficient backward (AOTriton) of
    PyTorch 2.9.1 and of the 2.14 nightly on gfx90a gives wrong dK and dV
    (ALMIOPEN-3256). A training step also passes the forward's output in this
@@ -184,8 +186,10 @@ The setup thus reads Q, K, V, O, `stats` and the mask once. If an earlier
 node of the graph computes one of these inputs, the row does not run: its
 setup cannot be outside the timed region.
 
-A timed iteration does one backward kernel call. For GQA and MQA graphs it
-also sums dK and dV over each head group, which is real backward work.
+A timed iteration does one backward kernel call. With `enable_gqa`, the Flash
+backward writes dK and dV at the K/V head count, so the iteration does no
+other work. With expanded K and V, the iteration also sums dK and dV over
+each head group.
 
 - With the default selection, the backward kernel is the one the forward
   dispatches to. If default dispatch chooses neither Flash nor

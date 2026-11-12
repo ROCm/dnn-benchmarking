@@ -577,3 +577,52 @@ def test_strict_sdpa_backward_row_times_only_the_backward_kernel(
     assert m.kernel_ms[0] > 0
     assert ops["aten::scaled_dot_product_attention"] == 1, ops
     assert ops[kernel] > POLICY.iters, ops
+
+
+def test_gqa_sdpa_backward_times_native_gqa_kernel(torch_gpu) -> None:
+    """A GQA backward row times the fused kernel on the real-size K/V.
+
+    A training step with ``enable_gqa`` runs Flash backward on the real-size
+    K/V and gets dK and dV at the K/V head count. A K/V expansion or a dK/dV
+    head-group sum in the timed iterations is work the step does not pay.
+    """
+    torch = torch_gpu
+    torch.manual_seed(0)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                },
+                "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+                "parameters": {"attn_scale_value": 0.125, "causal_mask": True},
+            }
+        ]
+    }
+    q_shape, kv_shape = (2, 8, 128, 64), (2, 2, 128, 64)
+    tensors = {
+        uid: torch.randn(q_shape if uid in (1, 4, 5, 7) else kv_shape).to(
+            "cuda", torch.bfloat16
+        )
+        for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+    }
+    tensors[6] = torch.randn(q_shape[:-1] + (1,), device="cuda")
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+
+    profiler = torch.profiler
+    with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+        executor.benchmark(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert ops["aten::_scaled_dot_product_flash_attention_backward"] > POLICY.iters
+    assert not {"aten::repeat_interleave", "aten::sum"} & ops.keys(), ops
+    assert tensors[8].shape == kv_shape and tensors[9].shape == kv_shape
