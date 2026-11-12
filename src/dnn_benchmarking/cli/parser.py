@@ -155,7 +155,7 @@ def _parse_engine_list(s: str) -> List[int]:
 
 
 def _parse_plugin_path_list(s: str) -> List[Path]:
-    """Parse --plugin-path as a comma-separated list of plugin directories."""
+    """Parse --plugin-path as a comma list of plugin directories or library files."""
     parts = [p for p in (p.strip() for p in s.split(",")) if p]
     if not parts:
         raise argparse.ArgumentTypeError("requires at least one path")
@@ -334,8 +334,8 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Runtime/Selection",
         parser_type=_parse_plugin_path_list,
         metavar="PATHS",
-        help="plugin dir, or comma list matching --engine order "
-        "(default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
+        help="plugin dir or plugin library file, or comma list matching --engine "
+        "order (default: $ROCM_PATH/lib/hipdnn_plugins/engines, else the pip ROCm SDK)",
         config_key="plugin_path",
         config_kind=ConfigKind.PATH_OR_PATH_LIST,
     ),
@@ -346,17 +346,41 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         SuiteConfig,
         "autotune",
         "benchmark candidate kernels on first execute and cache the winner "
-        "(HIPDNN_FORCE_BENCHMARKING=1); pair with --hipdnn-cache-dir",
+        "(HIPDNN_FORCE_BENCHMARKING=1), in the tuned state of the work dir",
     ),
     CliOption(
-        flags=("--hipdnn-cache-dir",),
-        dest="hipdnn_cache_dir",
+        flags=("--benchmark-work-dir",),
+        dest="benchmark_work_dir",
         group="Runtime/Selection",
         parser_type=Path,
         metavar="PATH",
-        help="per-run HIPDNN_CACHE_DIR so tuned winners do not leak between runs",
-        config_key="hipdnn_cache_dir",
+        help="work dir: cache/ (compile caches), ootb/ (hipDNN cache and MIOpen "
+        "user DB of runs that do not tune, --fast included) and tuned/ (the "
+        "same for --autotune and --oracle tuned runs), all kept (default: "
+        "$DNN_BENCH_WORKSPACE/work, else $XDG_CACHE_HOME/dnn-benchmark/work, "
+        "else <tmp>/dnn-benchmark-<user>/work)",
+        config_key="benchmark_work_dir",
         config_kind=ConfigKind.PATH,
+    ),
+    _bool_option(
+        ("--fresh-state",),
+        "fresh_state",
+        "Runtime/Selection",
+        SuiteConfig,
+        "fresh_state",
+        "start this command on a new, empty hipDNN cache and MIOpen user DB in "
+        "the system temp dir, removed at exit (cold first-run numbers); "
+        "--oracle tuned runs still use the tuned state",
+    ),
+    _bool_option(
+        ("--fast",),
+        "fast",
+        "Runtime/Selection",
+        SuiteConfig,
+        "fast",
+        "run every graph through one engine in this process: one handle, only "
+        "the plugin under test loaded, warm caches (requires one -e and "
+        "--plugin-path naming the plugin library file)",
     ),
     _choice_option(
         ("--pytorch-sdpa-backend",),
@@ -432,7 +456,20 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         SuiteConfig,
         "oracle",
         "also build and time a global.benchmarking=1 plan per engine, and a "
-        "tuned PyTorch run in a child process (much slower; not with --autotune)",
+        "tuned PyTorch run, each in its own child process (much slower; not "
+        "with --autotune)",
+    ),
+    CliOption(
+        flags=("--oracle-timeout",),
+        dest="oracle_timeout",
+        group="Comparison",
+        parser_type=_at_least(int, 0),
+        default=_default(SuiteConfig, "oracle_timeout_s"),
+        metavar="SECONDS",
+        help="timeout of each tuned child process (one per row); 0 disables",
+        config_key="oracle_timeout",
+        config_kind=ConfigKind.SCALAR,
+        config_type=int,
     ),
     # Output
     CliOption(
@@ -539,7 +576,7 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_at_least(int, 0),
         default=_default(MetricsConfig, "profiling_timeout_s"),
         metavar="SECONDS",
-        help="timeout per profiler or tuned-PyTorch subprocess; 0 disables",
+        help="timeout per profiler subprocess; 0 disables",
         config_key="profiling_timeout",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
