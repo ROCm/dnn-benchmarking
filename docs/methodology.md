@@ -144,7 +144,7 @@ includes a workaround, and the row gets a reference warning:
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
 - Explicit dropout mask (`dropout_mask` and `dropout_scale`): separate fp32
   ops instead of an SDPA kernel, because PyTorch SDPA takes no dropout mask.
-  The setup is built once, as for attention sinks.
+  The tool builds the setup once, as for attention sinks.
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.
 - ALiBi (`alibi_mask`, top-left causal masking or a top-left sliding
@@ -428,10 +428,18 @@ references, the reference declines these combinations:
 - a `dropout_scale_inv` without a mask, or one that is not one FLOAT
   element;
 - `seed`, `offset` or `rng_dump` without a `dropout_probability`;
+- an `rng_dump` with a `dropout_probability` but without `seed` or `offset`;
 - a `dropout_probability` that is NaN, less than 0, or 1 or more;
 - an `rng_dump` that is not FLOAT, or that does not have the dimensions
   `[B, Hq, Sq, Skv]`;
 - dropout with fp8 scaling.
+
+The reference accepts one combination that the hipDNN develop backward
+reference declines. For a backward node, the tool takes a
+`dropout_probability` of 0 without `seed`, `offset` or a mask as no dropout.
+The hipDNN reference declines any non-null probability in the backward. A
+probability of 0 drops no element, so the gradients are those without
+dropout.
 
 The engine makes a Philox mask, so the mask differs from row to row. A
 reference built from the dump of one row does not apply to another row.
@@ -468,6 +476,10 @@ stream of that `seed` and `offset`. It shows two things:
 The tolerance limits the second result. With bf16 outputs and thousands of
 keys, the tolerance cannot tell the dumped mask from another mask. It also
 cannot find an engine that normalises the softmax again after the mask.
+Another engine can write a correct dump but not apply the scale `1 / (1 - p)`.
+Its outputs are then about `p` too small, relative to the reference. Such an
+engine passes when `p` is below about the relative tolerance of the output
+data type. That tolerance is 0.03 for bf16 and 0.001 for fp16.
 
 ## Parity with other harnesses
 
