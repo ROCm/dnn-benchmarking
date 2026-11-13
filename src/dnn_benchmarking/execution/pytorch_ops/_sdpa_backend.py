@@ -6,7 +6,8 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import RLock
-from typing import Any, Dict, Iterator, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
 
 import torch
 
@@ -62,6 +63,31 @@ def reference_sdpa_pass() -> Iterator[None]:
         yield
     finally:
         _REFERENCE_PASS.reset(token)
+
+
+# The rng_dump of one engine row, by tensor UID: the dropout mask that the
+# Philox reference applies. The dump travels here and not in the tensors map,
+# because the PyTorch buffer managers allocate and zero every output there.
+# The default is immutable, so no caller can write a dump into it.
+_PHILOX_DUMPS: ContextVar[Mapping[int, torch.Tensor]] = ContextVar(
+    "pytorch_philox_dumps",
+    default=MappingProxyType({}),
+)
+
+
+@contextmanager
+def use_philox_dumps(dumps: Mapping[int, torch.Tensor]) -> Iterator[None]:
+    """Make ``dumps`` the Philox dropout masks of the graphs compiled in this scope."""
+    token = _PHILOX_DUMPS.set(dumps)
+    try:
+        yield
+    finally:
+        _PHILOX_DUMPS.reset(token)
+
+
+def current_philox_dumps() -> Mapping[int, torch.Tensor]:
+    """The Philox dropout masks of the active ``use_philox_dumps`` scope."""
+    return _PHILOX_DUMPS.get()
 
 
 @contextmanager

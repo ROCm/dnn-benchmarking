@@ -142,6 +142,9 @@ includes a workaround, and the row gets a reference warning:
 - Sliding window or bottom-right causal with a query length above 1 that
   differs from the KV length: the kernel reads an additive mask tensor.
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
+- Explicit dropout mask (`dropout_mask` and `dropout_scale`): separate fp32
+  ops instead of an SDPA kernel, because PyTorch SDPA takes no dropout mask.
+  The tool builds the setup once, as for attention sinks.
 - Different K and V head counts: the kernel reads K and V expanded to the
   query head count.
 - ALiBi (`alibi_mask`, top-left causal masking or a top-left sliding
@@ -386,6 +389,98 @@ rankings of earlier commands remove that setup work. In such a warm run:
 Use `--fresh-state` for cold first-run numbers: the command then runs on a
 new, empty state that the tool removes when the command ends.
 
+## Dropout validation
+
+`--validate pytorch` follows the hipDNN CPU reference for SDPA dropout. In
+the formulas below, `*` is the element-wise product and `@` is the matrix
+product. `P` is the softmax of the scores before dropout, `M` is the
+dropout mask and `s` is the dropout scale.
+
+- Forward with an explicit mask: `O = (P * M * s) @ V`. The tool multiplies
+  the softmax by the mask and the scale, then by V. `M` is the
+  `dropout_mask` input, with its values as given. A mask dimension of size
+  1 applies to all batches or heads. The head index of `M` is the query
+  head. The `stats` output (log-sum-exp) comes from the softmax before
+  dropout. With attention sinks, the softmax includes the sink before the
+  mask applies.
+- Forward with Philox: the same formula, with the `rng_dump` of the engine
+  row as `M`. The scale is `s = 1 / (1 - p)` in float32, where `p` is
+  `dropout_probability`. At `p = 0` the dump applies as is, with `s = 1`.
+  The tool does not read the values of `seed` and `offset`.
+- Backward with an explicit mask: `inv` is the `dropout_scale_inv` input, or
+  1 when the graph has none. `O` is the forward output that the graph gives.
+  - `D = rowsum(dO * O) * inv`: the row sums of `dO * O`, times `inv`.
+  - `dP = (dO @ V^T) * M`: the mask applies, the scale does not.
+  - `dS = s * P * (dP - D)`.
+  - `dV = (P * M * s)^T @ dO`.
+  - `dQ` and `dK` come from `dS`, as without dropout. `inv` changes only
+    `D`, so only `dQ` and `dK` show a wrong `inv`.
+
+Dropout combines with causal masks, sliding windows, an additive bias, ALiBi
+and attention sinks, where the reference supports that mask. Like the hipDNN
+references, the reference declines these combinations:
+
+- a mask or a scale with `dropout_probability`, `seed`, `offset` or
+  `rng_dump`;
+- a mask without a scale, or a scale without a mask;
+- a mask that is not FLOAT with the dimensions `[B or 1, Hq or 1, Sq, Skv]`,
+  or a scale that is not one FLOAT element;
+- a `dropout_scale_inv` without a mask, or one that is not one FLOAT
+  element;
+- `seed`, `offset` or `rng_dump` without a `dropout_probability`;
+- an `rng_dump` with a `dropout_probability` but without `seed` or `offset`;
+- a `dropout_probability` that is NaN, less than 0, or 1 or more;
+- an `rng_dump` that is not FLOAT, or that does not have the dimensions
+  `[B, Hq, Sq, Skv]`;
+- dropout with fp8 scaling.
+
+The reference accepts one combination that the hipDNN develop backward
+reference declines. For a backward node, the tool takes a
+`dropout_probability` of 0 without `seed`, `offset` or a mask as no dropout.
+The hipDNN reference declines any non-null probability in the backward. A
+probability of 0 drops no element, so the gradients are those without
+dropout.
+
+The engine makes a Philox mask, so the mask differs from row to row. A
+reference built from the dump of one row does not apply to another row.
+The tool thus builds the reference of each engine row from the dump of that
+row, and the graph has no `reference` row. It compares every output except
+the dump.
+
+Before it builds that reference, the tool checks the dump as the hipDNN
+integration tests do. In this check, `n` is the number of elements of the
+dump and `rate` is the fraction of ones. `keep` is `1 - p` in double
+precision, from the float32 `p`:
+
+1. Each value must be 0 or 1. -0.0 counts as 0, and NaN fails. The message
+   names the first bad index.
+2. The keep rate must be in the bound
+   `|rate - keep| <= 6*sqrt(keep*(1-keep)/n) + 1/n`. The first term is 6
+   standard deviations of the rate. The second term allows one element of
+   rounding. An empty dump passes.
+
+The tool fills the dump with NaN before the validation run. An engine that
+does not write the dump thus fails step 1, for all `n` and `p`. Without the
+fill, a dump of zeros can pass step 2 when `n` is small and `p` is high. An
+example is `p = 0.9` and `n = 256`.
+
+The tool does not make the Philox stream again from `seed` and `offset`.
+The hipDNN references do not make it either: they decline a Philox graph
+without `rng_dump`. The check thus does not show that the dump is the
+stream of that `seed` and `offset`. It shows two things:
+
+- The dump is a 0/1 mask at the expected keep rate.
+- The outputs match a reference built from that dump, within the tolerance
+  of the output data type.
+
+The tolerance limits the second result. With bf16 outputs and thousands of
+keys, the tolerance cannot tell the dumped mask from another mask. It also
+cannot find an engine that normalises the softmax again after the mask.
+Another engine can write a correct dump but not apply the scale `1 / (1 - p)`.
+Its outputs are then about `p` too small, relative to the reference. Such an
+engine passes when `p` is below about the relative tolerance of the output
+data type. That tolerance is 0.03 for bf16 and 0.001 for fp16.
+
 ## Parity with other harnesses
 
 This table compares the tool with the rocKE runtime timer
@@ -511,8 +606,15 @@ The tool does not do these things yet:
   deprecated causal booleans override the modern bounds and diagonal
   alignment. The reference declines these graphs as unsupported: ALiBi with
   bottom-right alignment or with neither a causal mask nor a sliding window;
-  padding masks; paged or variable-length ALiBi graphs. Other masks also
-  make the reference decline the graph.
+  padding masks; paged or variable-length ALiBi graphs. For dropout, the
+  reference supports an explicit dropout mask (forward and backward) and
+  Philox forward graphs with an `rng_dump` output (see
+  [Dropout validation](#dropout-validation)). It declines Philox forward
+  graphs without `rng_dump`, Philox backward graphs, and dropout with paged
+  K and V or ragged sequence lengths. With `--validate`, the engine rows of
+  these graphs fail. Some get `unchecked` instead when a CPU reference does
+  not fit in host memory (see [SDPA dropout](usage.md#sdpa-dropout)). Other
+  masks also make the reference decline the graph.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.

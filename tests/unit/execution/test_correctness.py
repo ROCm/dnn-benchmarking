@@ -3,11 +3,17 @@
 
 """Tests for execution.correctness (per-engine output comparison)."""
 
+import math
+
 import numpy as np
 import pytest
 
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
-from dnn_benchmarking.execution.correctness import check_correctness, tolerance_for
+from dnn_benchmarking.execution.correctness import (
+    check_correctness,
+    check_rng_dump,
+    tolerance_for,
+)
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.validation import ReferenceOutput
 
@@ -275,3 +281,126 @@ def test_device_compare_out_of_memory_falls_back_to_host(monkeypatch):
     }
 
     assert check_correctness(DeviceBM(), [_out(1)], ref, "pytorch", _config()).passed
+
+
+def _dump(ones, n, seed=0):
+    """A float32 0/1 dump [1, 1, 1, n] with ``ones`` ones at shuffled places."""
+    values = np.zeros(n, np.float32)
+    values[:ones] = 1.0
+    np.random.default_rng(seed).shuffle(values)
+    return values.reshape(1, 1, 1, n)
+
+
+def _keep_rate_edges(p, n):
+    """The fewest and the most ones that the harness bound accepts."""
+    keep = 1.0 - float(np.float32(p))
+    bound = 6.0 * math.sqrt(keep * (1.0 - keep) / n) + 1.0 / n
+    inside = [k for k in range(n + 1) if abs(k / n - keep) <= bound]
+    assert 0 < inside[0] and inside[-1] < n  # Both edges have a neighbour outside.
+    return inside[0], inside[-1]
+
+
+_P = 0.1
+_N = 1000
+_LOW, _HIGH = _keep_rate_edges(_P, _N)
+
+
+@pytest.mark.parametrize(
+    "value, passes",
+    [
+        (0.5, False),
+        (2.0, False),
+        (np.nan, False),
+        (np.inf, False),
+        (-0.0, True),
+        (1.0, True),
+    ],
+)
+def test_rng_dump_rejects_values_outside_0_1(value, passes):
+    values = _dump(900, _N)
+    values.reshape(-1)[437] = value
+    values.reshape(-1)[800] = value
+
+    c = check_rng_dump(values, _P, _config())
+
+    if passes:
+        assert c is None
+    else:
+        assert c is not None and c.explicitly_failed
+        assert "437" in c.error_message  # The first bad index, not the last.
+
+
+@pytest.mark.parametrize(
+    "n, ones, passes",
+    [
+        (_N, 900, True),
+        (_N, 500, False),
+        (_N, _LOW, True),
+        (_N, _LOW - 1, False),
+        (_N, _HIGH, True),
+        (_N, _HIGH + 1, False),
+        (0, 0, True),
+    ],
+    ids=[
+        "rate_0.9",
+        "rate_0.5",
+        "low_edge",
+        "below_low_edge",
+        "high_edge",
+        "above_high_edge",
+        "empty",
+    ],
+)
+def test_rng_dump_keep_rate_bound(n, ones, passes):
+    c = check_rng_dump(_dump(ones, n), _P, _config())
+
+    if passes:
+        assert c is None
+    else:
+        assert c is not None and c.explicitly_failed
+
+
+@pytest.mark.parametrize("n, passes", [(1, True), (2, False), (1000, False)])
+def test_rng_dump_all_zero_at_p_zero_fails(n, passes):
+    """At p = 0 the bound is 1/n, so one zero (rate 0, keep 1) still passes.
+    The harness has the same bound."""
+    c = check_rng_dump(_dump(0, n), 0.0, _config())
+
+    if passes:
+        assert c is None
+    else:
+        assert c is not None and c.explicitly_failed
+
+
+@pytest.mark.parametrize("p", [1.5, -0.1, 1.0, np.nan])
+def test_rng_dump_with_probability_outside_0_1_fails(p):
+    """The handler accepts p in [0, 1) only. The dump check fails such a row
+    by its probability, whatever the dump holds."""
+    c = check_rng_dump(_dump(0, _N), p, _config())
+
+    assert c is not None and c.explicitly_failed
+    assert "dropout_probability" in c.error_message
+
+
+@pytest.mark.parametrize(
+    "refs",
+    [{1: _ref([1, 2, 3, 4])}, {1: _ref([1, 2, 3, 4]), 2: _ref([0, 0, 0, 0])}],
+    ids=["no_reference", "differing_reference"],
+)
+def test_check_correctness_ignores_the_listed_uids(refs):
+    bm = _HostBM(
+        {
+            1: np.array([1, 2, 3, 4], np.float32),
+            2: np.array([1, 0, 1, 1], np.float32),
+        }
+    )
+    outputs = [_out(1), _out(2)]
+
+    ignored = check_correctness(
+        bm, outputs, refs, "pytorch", _config(), ignore_uids={2}
+    )
+    compared = check_correctness(bm, outputs, refs, "pytorch", _config())
+
+    assert ignored.passed
+    assert ignored.n_total == 4
+    assert compared.explicitly_failed

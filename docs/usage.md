@@ -66,7 +66,7 @@ sets `ROCM_PATH`.
 
 | Option | Default | Description |
 |---|---|---|
-| `--validate {none,pytorch}` | none | Compare each engine output with a PyTorch reference. `pytorch` also adds a timed `reference` row. |
+| `--validate {none,pytorch}` | none | Compare each engine output with a PyTorch reference. `pytorch` also adds a timed `reference` row, except for a Philox forward graph (see [SDPA dropout](#sdpa-dropout)). |
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 | `--reference-precision {float64,native}` | float64 | Arithmetic of the reference for convolution graphs. `float64` computes it in float64 from the same inputs. `native` uses the graph data types, as before. See [Reference precision](#reference-precision). |
@@ -93,14 +93,126 @@ code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
 log2 values of e8m0 outputs. The source is `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
-The reference comes from the timed PyTorch `reference` row on the GPU. If
-that row cannot run (for example, no GPU or a GPU out-of-memory error), and
-no strict `--pytorch-sdpa-backend` is set, the tool computes the reference on
-the CPU. Before it does, it estimates the host memory of the CPU reference.
+Except for a Philox forward graph, the reference comes from the timed PyTorch
+`reference` row on the GPU. That row can fail to run, for example with no GPU
+or after a GPU out-of-memory error. Then, without a strict
+`--pytorch-sdpa-backend`, the tool computes the reference on the CPU. Before
+it does, it estimates the host memory of the CPU reference.
 If the estimate is more than 80 % of the available host memory, the tool
 does not validate the graph. It prints a warning, and the engine rows of the
 graph get the verdict `unchecked` with the reason in `correctness.message`.
 These rows do not fail validation (no exit code 3).
+
+A Philox forward graph has no `reference` row: each engine row gets its own
+reference (see [SDPA dropout](#sdpa-dropout)).
+
+#### SDPA dropout
+
+`--validate pytorch` validates two forms of SDPA dropout:
+
+- Explicit mask: the graph gives the mask as the input `dropout_mask`
+  (`dropout_mask_tensor_uid`) and the scale as the input `dropout_scale`
+  (`dropout_scale_tensor_uid`). A backward node can also have the input
+  `dropout_scale_inv` (`dropout_scale_inv_tensor_uid`).
+- Philox: the engine makes the mask from `dropout_probability` and the
+  inputs `seed` and `offset` (`seed_tensor_uid`, `offset_tensor_uid`). The
+  optional forward output `rng_dump` (`rng_dump_tensor_uid`) holds the mask
+  that the engine used.
+
+A `dropout_probability` of `null` counts as absent. A `dropout_probability`
+of 0 without `rng_dump`, `dropout_mask` or `dropout_scale` is no dropout. A
+backward node must also have no `seed` or `offset`. The formulas of the
+reference are in [Dropout validation](methodology.md#dropout-validation).
+
+The tool fills the dropout inputs as follows:
+
+- `dropout_mask` gets exact 0 and 1 values. The default keep rate (the
+  fraction of ones) is 0.9.
+- `dropout_scale` is `1 / keep rate`. When the graph JSON gives the value
+  of `dropout_scale`, the keep rate is `1 / dropout_scale`.
+- `dropout_scale_inv` is the keep rate, unless the graph JSON gives its
+  value.
+- `seed` and `offset` get nonzero values.
+- All dropout values follow `--seed`. They come from a separate random
+  generator, so the other inputs keep the values that they have without
+  the dropout inputs.
+
+A graph JSON can give a `dropout_scale` value with `1 / dropout_scale`
+outside (0, 1]. The `hipdnn` and `pytorch` runtimes then give a graph error
+(exit code 1, not 3), with or without `--validate`. The graph gets no rows,
+and its `error` starts with `Input data generation failed: `.
+
+An explicit-mask graph gets one reference, as other graphs do.
+
+The tool validates a Philox forward graph only through its `rng_dump` output.
+For each engine row, after the timed loop:
+
+1. The tool fills the `rng_dump` buffer with NaN, zeroes the other
+   outputs and runs the engine one more time.
+2. It checks the dump: each value must be 0 or 1, and the keep rate must
+   be within 6 standard deviations of `1 - dropout_probability`. A dump
+   that the engine did not write still holds NaN, so it fails. A dump that
+   fails the check fails the row.
+3. It builds a reference from the inputs and this dump, and compares the
+   other outputs (for example `O`) with it. It does not compare the dump.
+
+Each engine row thus has its own reference, and a Philox forward graph has
+no `reference` row. The dump check runs in NumPy, so it needs no PyTorch GPU.
+The reference of a row runs on the GPU when PyTorch has one. Without a
+PyTorch GPU, or after a GPU out-of-memory error, it runs on the CPU. The
+host memory rule above applies: a reference that does not fit gives
+`unchecked`. A dump that fails the check still fails the row, because the
+check comes first.
+
+The NaN fill and the read of the dump use up to three times the size of
+the `rng_dump` buffer in host memory. If that is more than 80 % of the
+available host memory, the tool does not run the validation step. The row
+gets the verdict `unchecked` with the reason (no exit code 3), and
+`--oracle` does not validate its tuned plan.
+
+A Philox engine row with `rng_dump` writes the dump in each timed launch.
+Its timings thus include the dump write: they are not the time of a
+training step.
+
+With `--oracle`, the tuned child also fills its `rng_dump` with NaN before
+it saves its outputs. The tool checks that dump and grades the tuned
+outputs against a reference built from it.
+
+The reference declines these graphs. With `--validate pytorch`, their
+engine rows fail (exit code 3) and keep their timings:
+
+- A Philox forward graph without `rng_dump` (a `dropout_probability` above
+  0 and no `dropout_mask` or `dropout_scale`). The message names `rng_dump`,
+  and the graph has no `reference` row. The rows fail also when a CPU
+  reference would not fit in host memory.
+- A Philox forward graph whose `rng_dump` is not FLOAT. The message names
+  `rng_dump`. The tool declines the graph before the NaN fill. The rows thus
+  fail also when a CPU reference or the dump would not fit in host memory.
+- Dropout with paged K and V or with ragged sequence lengths. The message
+  names the feature.
+- A Philox backward graph: a backward node with `seed`, `offset` or a
+  `dropout_probability` other than 0. hipDNN's backward graph has no
+  `rng_dump`, so the reference has no mask.
+- The other dropout combinations that the hipDNN references also decline
+  (see [Dropout validation](methodology.md#dropout-validation)).
+
+Exception: the rows of the last three kinds get `unchecked` when a CPU
+reference would not fit in host memory. This is the host memory rule above.
+
+Other runtimes and options:
+
+- `--runtime pytorch` runs an explicit-mask graph as separate fp32 ops,
+  without a PyTorch SDPA call. The row gets a reference warning. The
+  PyTorch runtime declines Philox graphs.
+- `--runtime rocke` does not run dropout graphs (see
+  [rocKE runtime](#rocke-runtime)).
+- A strict `--pytorch-sdpa-backend` fails the engine rows of an
+  explicit-mask graph, as for attention sinks. The timed `reference` row
+  makes no native SDPA call, so the selected backend is unavailable, and a
+  strict selection has no CPU fallback.
+- The tool validates a Philox forward graph with `rng_dump` whatever
+  `--pytorch-sdpa-backend` says. Its per-row reference makes no native SDPA
+  call.
 
 #### Reference precision
 
@@ -229,7 +341,8 @@ dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
   typed order. hipDNN loads its HIP runtime before torch does, and its rows
   exist before a later runtime can stop the process.
 - All runtimes use the same inputs. `--validate pytorch` gives one reference
-  row per graph, and every engine row is checked against it.
+  row per graph, and every engine row is checked against it. A Philox
+  forward graph is different: see [SDPA dropout](#sdpa-dropout).
 - A runtime that cannot run a graph adds no rows and does not change the
   graph status. A graph is `no engines applicable` only when no runtime runs
   it. The message then gives the reason of each runtime.
@@ -562,7 +675,9 @@ operation graph build and the workspace allocation are not timed.
    child runs on the tuned state of the work directory (see
    [Work directory](#work-directory---benchmark-work-dir)), so the tuned
    search never reaches an OOTB plan. The tool validates the tuned outputs
-   against the same reference. A failed child sets `oracle_error` and keeps
+   against the same reference. For a Philox forward graph, it validates them
+   against a reference built from the child's own `rng_dump` (see
+   [SDPA dropout](#sdpa-dropout)). A failed child sets `oracle_error` and keeps
    the row.
 4. `--oracle-timeout` (default 1800 s) bounds each child. A hung search thus
    costs the tuned result of one row. After Ctrl-C, the partial result file

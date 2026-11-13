@@ -23,6 +23,7 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.execution import oracle as oracle_mod
+from dnn_benchmarking.execution.correctness import check_correctness
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
@@ -42,6 +43,25 @@ OUT = TensorInfo(
     is_virtual=False,
     is_output=True,
 )
+DUMP = TensorInfo(
+    uid=2,
+    name="rng_dump",
+    dims=[2],
+    strides=[1],
+    data_type="float",
+    is_virtual=False,
+    is_output=True,
+)
+# A Philox dropout forward node whose rng_dump output is DUMP.
+PHILOX_GRAPH = {
+    "nodes": [
+        {
+            "type": "SdpaAttributes",
+            "outputs": {"rng_dump_tensor_uid": DUMP.uid},
+            "attributes": {"dropout_probability": 0.5},
+        }
+    ]
+}
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +90,9 @@ class _Fake:
         self.knob_ids = [oracle_mod.BENCHMARKING_KNOB, "miopen.find_mode"]
         self.kernel_ms = [0.5, 0.5, 0.5, 9.0]
         self.output = np.zeros(2, np.float32)
+        self.outputs = {}  # uid -> output; the others are ``output``
+        self.graph = {"nodes": []}
+        self.tensor_infos = [OUT]
         self.prepare_error = None
         self.benchmark_error = None
         self.calls = []  # (call, engine_id, knobs) in order
@@ -126,27 +149,27 @@ def fake(monkeypatch):
         def load_input_data(self, data):
             pass
 
-        def zero_outputs(self):
-            f.calls.append(("zero_outputs", None, None))
+        def zero_outputs(self, nan_uids=()):
+            f.calls.append(("zero_outputs", None, set(nan_uids) or None))
 
         def create_variant_pack(self):
             return {}
 
         def get_output_tensors(self):
-            return [OUT]
+            return [t for t in f.tensor_infos if t.is_output]
 
         def get_output_data(self, uid):
-            return f.output
+            return f.outputs.get(uid, f.output)
 
     class Loader:
         def load_json(self, path):
-            return {"nodes": []}
+            return f.graph
 
         def validate(self, graph_json):
             pass
 
         def extract_tensor_info(self, graph_json):
-            return [OUT]
+            return list(f.tensor_infos)
 
     def generate_input_data(tensor_infos, seed, graph_json):
         f.seeds.append(seed)
@@ -198,23 +221,24 @@ def _row(correctness=None):
     )
 
 
-def _run(tmp_path, row=None, refs=None, config=None, plugin_path=None):
+def _run(tmp_path, row=None, validate=None, config=None, plugin_path=None):
     row = row or _row()
     oracle_mod.run_hipdnn_tuned(
         row=row,
         graph_path=tmp_path / "g.json",
         graph_name="g",
-        tensor_infos=[OUT],
-        reference_outputs=refs,
         engine_id=5,
         plugin_path=plugin_path,
         config=config or _config(),
+        validate=validate,
     )
     return row
 
 
-def _refs():
-    return {1: ReferenceOutput(data=np.zeros(2, np.float32), tensor_uid=1)}
+def _validate():
+    """Grade the saved outputs against a zero reference, as the suite runner does."""
+    refs = {1: ReferenceOutput(data=np.zeros(2, np.float32), tensor_uid=1)}
+    return lambda outputs: check_correctness(outputs, [OUT], refs, "pytorch", _config())
 
 
 # --- run_hipdnn_tuned -------------------------------------------------------
@@ -325,7 +349,7 @@ def test_workspace_is_not_reported_with_metrics_off(fake, tmp_path):
 
 
 def test_tuned_outputs_are_saved_from_zeroed_buffers_and_validated_here(fake, tmp_path):
-    row = _run(tmp_path, refs=_refs())
+    row = _run(tmp_path, validate=_validate())
 
     assert fake.calls[2:] == [
         ("zero_outputs", None, None),
@@ -347,11 +371,46 @@ def test_failing_tuned_plan_keeps_the_row_verdict(fake, tmp_path):
     passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
     fake.output = np.ones(2, np.float32)
 
-    row = _run(tmp_path, row=_row(passed), refs=_refs())
+    row = _run(tmp_path, row=_row(passed), validate=_validate())
 
     assert row.oracle.correctness.explicitly_failed
     assert row.ootb.correctness is passed
     assert row.verdict == "passed"
+
+
+@pytest.mark.parametrize("save", [True, False], ids=["saved", "not-saved"])
+def test_the_child_fills_the_rng_dump_with_nan_before_saving_outputs(
+    fake, tmp_path, save
+):
+    """An engine that does not write its rng_dump then leaves NaN, which the
+    dump check rejects; the timed loop's buffers are zeroed as before."""
+    fake.graph, fake.tensor_infos = PHILOX_GRAPH, [OUT, DUMP]
+    passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
+
+    _run(tmp_path, validate=(lambda outputs: passed) if save else None)
+
+    expected = [("zero_outputs", None, None), ("benchmark", None, None)]
+    if save:
+        expected += [("zero_outputs", None, {DUMP.uid}), ("execute_once", None, None)]
+    assert fake.calls[2:] == expected
+
+
+def test_the_validate_callable_receives_the_childs_saved_dump(fake, tmp_path):
+    fake.graph, fake.tensor_infos = PHILOX_GRAPH, [OUT, DUMP]
+    dump = np.array([1.0, 0.0], np.float32)
+    fake.outputs = {DUMP.uid: dump}
+    verdict = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
+    seen = []
+
+    def validate(outputs):
+        seen.append(outputs.get_output_data(DUMP.uid))
+        return verdict
+
+    row = _run(tmp_path, validate=validate)
+
+    assert len(seen) == 1
+    np.testing.assert_array_equal(seen[0], dump)
+    assert row.oracle.correctness is verdict
 
 
 def test_stall_in_the_child_propagates_for_a_whole_graph_remeasure(fake, tmp_path):
