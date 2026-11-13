@@ -100,6 +100,16 @@ def test_scale_with_keep_rate_outside_0_1_is_refused(scale: float) -> None:
         generate_input_data(infos, seed=0, graph_json=graph)
 
 
+def test_scale_of_one_keeps_every_element() -> None:
+    """A dropout_scale of 1 is a keep rate of exactly 1, the top of (0, 1]."""
+    graph = _graph(_FORWARD, dropout_mask_tensor_uid=10, dropout_scale_tensor_uid=11)
+    infos = [_tensor(10, [1, 1, 4, 4]), _tensor(11, [1], value=1.0)]
+
+    mask = generate_input_data(infos, seed=0, graph_json=graph)[10]
+
+    np.testing.assert_array_equal(mask, np.ones([1, 1, 4, 4]))
+
+
 @pytest.mark.parametrize("data_type", ["int32", "int64"])
 def test_seed_and_offset_are_nonzero_and_deterministic(data_type: str) -> None:
     graph = _graph(_FORWARD, seed_tensor_uid=20, offset_tensor_uid=21)
