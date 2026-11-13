@@ -1397,8 +1397,6 @@ class TestPyTorchProviderNewOps:
     @pytest.mark.parametrize(
         "optional_input",
         [
-            "seed_tensor_uid",
-            "offset_tensor_uid",
             "dropout_mask_tensor_uid",
             "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
@@ -2440,6 +2438,277 @@ class TestSdpaExplicitDropout:
 
         with pytest.raises(UnsupportedGraphError):
             provider.compute_reference(graph, _dropout_inputs(graph, seed=15))
+
+
+#: f32(1) / (f32(1) - f32(p)), the Philox scale as hipDNN evaluates it.
+_P = 0.3
+_PHILOX_SCALE = np.float32(1) / (np.float32(1) - np.float32(_P))
+_DUMP_DIMS = [2, 4, 5, 7]  # [B, Hq, Sq, Skv]
+
+
+def _philox_graph(**graph_kwargs):
+    """A Philox dropout forward with seed, offset and an rng_dump output."""
+    graph_kwargs.setdefault("mask", None)
+    graph_kwargs.setdefault("scale", None)
+    graph_kwargs.setdefault("probability", _P)
+    graph_kwargs.setdefault("seed", True)
+    graph_kwargs.setdefault("offset", True)
+    graph_kwargs.setdefault("dump", _DUMP_DIMS)
+    return _dropout_graph(**graph_kwargs)
+
+
+def _philox_dump(seed, dims=_DUMP_DIMS):
+    """A 0/1 dump at keep 0.7 with both values in every row."""
+    dump = (np.random.default_rng(seed).random(dims) < 0.7).astype(np.float32)
+    if len(dims) == 4 and dims[-1] > 1:
+        dump[..., 0] = 0.0
+        dump[..., 1] = 1.0
+    return dump
+
+
+class TestSdpaPhiloxDropout:
+    """Philox dropout through the engine's rng_dump (R0, R7, R8, R9, R14, R18,
+    R23). A call passes the engine row's dump with ``philox_dumps``."""
+
+    def test_philox_forward_applies_the_given_dump_with_one_over_one_minus_p(
+        self,
+    ) -> None:
+        """p 0.3, not 0.5, so a 1/p scale differs from 1/(1-p). The stats are
+        the log-sum-exp before dropout. The dump is not a reference output."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=21)
+        dump = _philox_dump(22)
+
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        o, lse = dropout_reference(
+            inputs[_Q], inputs[_K], inputs[_V], dump, _PHILOX_SCALE
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+        assert _DUMP not in out
+
+    @pytest.mark.parametrize("kind", list(_MASK_KINDS))
+    def test_philox_forward_composes_with_each_mask_kind(self, kind) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph, ref_kind, bias, sink = _composed(
+            kind,
+            mask=None,
+            scale=None,
+            probability=_P,
+            seed=True,
+            offset=True,
+            dump=_DUMP_DIMS,
+        )
+        inputs = _dropout_inputs(graph, seed=23)
+        dump = _philox_dump(24)
+
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        o, lse = dropout_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            dump,
+            _PHILOX_SCALE,
+            ref_kind,
+            attn_mask=inputs[_ATTN_MASK] if bias else None,
+            sink=inputs[_SINK] if sink else None,
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+
+    def test_philox_reference_uses_the_dump_it_is_given(self) -> None:
+        """Two engine rows with different dumps: each output follows its own
+        dump, so the reference keeps no mask from an earlier call."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=25)
+        dumps = [_philox_dump(26), _philox_dump(27)]
+
+        outputs = [
+            provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+            for dump in dumps
+        ]
+
+        for out, dump in zip(outputs, dumps):
+            o, _ = dropout_reference(
+                inputs[_Q], inputs[_K], inputs[_V], dump, _PHILOX_SCALE
+            )
+            np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        assert not np.allclose(outputs[0][_O].data, outputs[1][_O].data, atol=1e-3)
+
+    def test_philox_dump_in_the_input_tensors_is_ignored(self) -> None:
+        """A buffer manager can hand the zeroed rng_dump buffer over with the
+        inputs. Only ``philox_dumps`` is the dump."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=28)
+        inputs[_DUMP] = np.zeros(_DUMP_DIMS, dtype=np.float32)
+        dump = _philox_dump(29)
+
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            provider.compute_reference(graph, inputs)
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        o, _ = dropout_reference(
+            inputs[_Q], inputs[_K], inputs[_V], dump, _PHILOX_SCALE
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+
+    def test_philox_without_scope_declines_naming_rng_dump(self) -> None:
+        """PyTorch rows of Philox graphs stay declined (R18): they compile
+        outside a ``philox_dumps`` call, before and after one."""
+        from dnn_benchmarking.execution import pytorch_ops
+
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=30)
+
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            pytorch_ops.compile_graph(graph)
+        provider.compute_reference(
+            graph, inputs, philox_dumps={_DUMP: _philox_dump(31)}
+        )
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            pytorch_ops.compile_graph(graph)
+
+    @pytest.mark.parametrize("ones", [False, True], ids=["all_zero", "all_one"])
+    def test_philox_p_zero_with_dump_uses_the_dump_as_is(self, ones) -> None:
+        """At p 0 the scale is 1: an all-zero dump gives O = 0, an all-one dump
+        gives the forward without dropout."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(probability=0.0)
+        inputs = _dropout_inputs(graph, seed=32)
+        dump = np.full(_DUMP_DIMS, 1.0 if ones else 0.0, dtype=np.float32)
+
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        if ones:
+            o, _ = dropout_reference(inputs[_Q], inputs[_K], inputs[_V], dump, 1.0)
+            np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        else:
+            np.testing.assert_array_equal(out[_O].data, 0.0)
+
+    @pytest.mark.parametrize(
+        "graph_kwargs,dump_dims,match",
+        [
+            pytest.param(
+                {"probability": None},
+                _DUMP_DIMS,
+                None,
+                id="rng_dump_without_probability",
+            ),
+            pytest.param(
+                {"probability": None, "dump": None, "offset": False},
+                None,
+                None,
+                id="seed_without_probability",
+            ),
+            pytest.param(
+                {"probability": None, "dump": None, "seed": False},
+                None,
+                None,
+                id="offset_without_probability",
+            ),
+            pytest.param(
+                {
+                    "probability": None,
+                    "seed": False,
+                    "offset": False,
+                    "mask": _FULL,
+                    "scale": (1,),
+                },
+                _DUMP_DIMS,
+                None,
+                id="rng_dump_with_mask_and_scale",
+            ),
+            pytest.param({"seed": False}, _DUMP_DIMS, None, id="rng_dump_without_seed"),
+            pytest.param(
+                {"offset": False}, _DUMP_DIMS, None, id="rng_dump_without_offset"
+            ),
+            pytest.param({"probability": float("nan")}, _DUMP_DIMS, None, id="p_nan"),
+            pytest.param({"probability": -0.1}, _DUMP_DIMS, None, id="p_below_0"),
+            pytest.param({"probability": 1.0}, _DUMP_DIMS, None, id="p_1"),
+            pytest.param({"probability": 1.5}, _DUMP_DIMS, None, id="p_above_1"),
+            pytest.param(
+                {"types": {_DUMP: "half"}}, _DUMP_DIMS, None, id="rng_dump_not_float"
+            ),
+            pytest.param(
+                {"dump": [1, 4, 5, 7]}, [1, 4, 5, 7], None, id="rng_dump_dim0_not_b"
+            ),
+            # Hkv heads: the dump is indexed by the query head.
+            pytest.param(
+                {"dump": [2, 2, 5, 7]}, [2, 2, 5, 7], None, id="rng_dump_dim1_not_hq"
+            ),
+            pytest.param(
+                {"dump": [2, 4, 1, 7]}, [2, 4, 1, 7], None, id="rng_dump_dim2_not_sq"
+            ),
+            pytest.param(
+                {"dump": [2, 4, 5, 1]}, [2, 4, 5, 1], None, id="rng_dump_dim3_not_skv"
+            ),
+            pytest.param(
+                {"dump": None}, None, "rng_dump", id="philox_without_rng_dump"
+            ),
+            pytest.param(
+                {"extra_inputs": {"descale_q_tensor_uid": (16, [1])}},
+                _DUMP_DIMS,
+                None,
+                id="fp8_scaling",
+            ),
+            pytest.param(
+                {"extra_inputs": {"seq_len_kv_tensor_uid": (15, [2])}},
+                _DUMP_DIMS,
+                "seq_len_kv",
+                id="ragged_kv",
+            ),
+        ],
+    )
+    def test_philox_declines(self, graph_kwargs, dump_dims, match) -> None:
+        """One case per R7 rule for Philox (rows 5-9). The dump is in scope,
+        so only the rule can decline the graph."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(**graph_kwargs)
+        dumps = {} if dump_dims is None else {_DUMP: _philox_dump(33, dump_dims)}
+
+        with pytest.raises(UnsupportedGraphError, match=match):
+            provider.compute_reference(
+                graph, _dropout_inputs(graph, seed=34), philox_dumps=dumps
+            )
+
+    def test_sdpa_probability_zero_without_dump_is_no_dropout(self) -> None:
+        """p 0 (not null) with seed and offset and no rng_dump, mask or scale:
+        no dropout, and seed and offset are not read (R8). p 0 with a mask and
+        scale, or with an rng_dump, is another rule."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(probability=0.0, dump=None)
+        inputs = _dropout_inputs(graph, seed=35)
+
+        out = provider.compute_reference(graph, inputs)
+
+        ones = np.ones(_DUMP_DIMS, dtype=np.float32)
+        o, lse = dropout_reference(inputs[_Q], inputs[_K], inputs[_V], ones, 1.0)
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+        explicit = _dropout_graph(probability=0.0)
+        with pytest.raises(UnsupportedGraphError):
+            provider.compute_reference(explicit, _dropout_inputs(explicit, seed=35))
+        philox = _philox_graph(probability=0.0)
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            provider.compute_reference(philox, _dropout_inputs(philox, seed=35))
+
+    @pytest.mark.parametrize("absent", [False, True], ids=["null", "absent"])
+    def test_sdpa_null_probability_with_seed_declines(self, absent) -> None:
+        """A null or absent probability is not 0 (R0): seed and offset need a
+        probability, so the graph is declined, not run without dropout."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(probability=None, dump=None)
+        if absent:
+            del graph["nodes"][0]["attributes"]["dropout_probability"]
+
+        with pytest.raises(UnsupportedGraphError):
+            provider.compute_reference(graph, _dropout_inputs(graph, seed=36))
 
 
 class TestHostMemoryEstimate:

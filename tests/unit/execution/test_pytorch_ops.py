@@ -1442,21 +1442,6 @@ class TestPyTorchOpsNewHandlers:
         else:
             assert warnings
 
-    def test_sdpa_nonzero_dropout_raises(self) -> None:
-        graph_json = {
-            "nodes": [
-                {
-                    "type": "SdpaAttributes",
-                    "inputs": {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3},
-                    "outputs": {"o_tensor_uid": 4},
-                    "attributes": {"dropout_probability": 0.5},
-                }
-            ]
-        }
-        q = torch.randn(1, 1, 2, 4)
-        with pytest.raises(UnsupportedGraphError, match="Nonzero SDPA dropout"):
-            pytorch_ops.execute_graph(graph_json, {1: q, 2: q, 3: q})
-
     @staticmethod
     def _sdpa_autograd_reference(
         q: torch.Tensor,
