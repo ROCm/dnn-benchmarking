@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..common import torch_support
 from ..graph.tensor_info import TensorInfo
 from ..metrics.analytical._common import node_param
 from ..metrics.analytical.sdpa import Band, alibi_slopes, sdpa_band
@@ -46,11 +47,15 @@ def _scale(node: Dict[str, Any], input_data: Dict[int, np.ndarray]) -> float:
 
 
 def _torch() -> Any:
-    """The torch module, or None when it is not installed."""
-    try:
-        import torch
-    except ImportError:
+    """The torch module, or None when it cannot be imported.
+
+    A broken install often fails with OSError or RuntimeError, not
+    ImportError; the NumPy forward then gives the same values.
+    """
+    if not torch_support.module_available():
         return None
+    import torch
+
     return torch
 
 
