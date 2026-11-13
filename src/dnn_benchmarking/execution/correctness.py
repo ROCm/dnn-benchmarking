@@ -3,7 +3,8 @@
 
 """Compare one engine's outputs against the cached reference outputs."""
 
-from typing import Any, Dict, List, Optional, Tuple
+import math
+from typing import Any, Collection, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -85,6 +86,52 @@ def unchecked(config: SuiteConfig, message: str) -> CorrectnessResult:
     )
 
 
+# Elements per chunk of the rng_dump value check (16 MiB of float32).
+_RNG_DUMP_CHUNK = 1 << 22
+
+
+def check_rng_dump(
+    values: np.ndarray, p: float, config: SuiteConfig
+) -> Optional[CorrectnessResult]:
+    """Check an engine's ``rng_dump`` as the hipDNN integration harness does.
+
+    Returns None when the dump is acceptable, else a mismatch. First, every
+    value must be 0.0 or 1.0 (-0.0 is 0; NaN fails). Then the keep rate must
+    be within ``6 * sqrt(keep * (1 - keep) / n) + 1 / n`` of ``keep = 1 - p``,
+    with ``p`` rounded to float32 and the bound in double. An empty dump
+    passes.
+    """
+    flat = np.asarray(values).reshape(-1)
+    n = flat.size
+    ones = 0
+    # Check in chunks so that the temporary masks stay small for a large dump.
+    for start in range(0, n, _RNG_DUMP_CHUNK):
+        chunk = flat[start : start + _RNG_DUMP_CHUNK]
+        bad = (chunk != 0.0) & (chunk != 1.0)  # NaN is not equal to either.
+        if bad.any():
+            index = start + int(np.argmax(bad))
+            return mismatch(
+                config,
+                f"rng_dump value check failed: element {index} is "
+                f"{float(flat[index])}. Every value must be 0 or 1.",
+            )
+        ones += int(np.count_nonzero(chunk == 1.0))
+    if n == 0:
+        return None
+
+    keep = 1.0 - float(np.float32(p))
+    rate = ones / n
+    bound = 6.0 * math.sqrt(keep * (1.0 - keep) / n) + 1.0 / n
+    if abs(rate - keep) > bound:
+        return mismatch(
+            config,
+            f"rng_dump keep rate check failed: {ones} of {n} elements are 1 "
+            f"(rate {rate:.6g}). The rate must be within {bound:.6g} of the "
+            f"keep rate {keep:.6g} (dropout_probability {p}).",
+        )
+    return None
+
+
 def _compare_output(
     buffer_manager: Any,
     tensor_info: TensorInfo,
@@ -124,17 +171,19 @@ def check_correctness(
     ref_outputs: Dict[int, ReferenceOutput],
     reference_provider_name: str,
     config: SuiteConfig,
+    ignore_uids: Collection[int] = (),
 ) -> CorrectnessResult:
     """Compare every graph output against the precomputed reference outputs.
 
     Diffs and counts aggregate over outputs; ``worst_output_uid`` and the
     message come from the output with the largest absolute difference (a
-    failing output wins over a passing one).
+    failing output wins over a passing one). Outputs in ``ignore_uids`` are
+    not compared.
     """
     try:
         compared: List[Tuple[int, float, float, ComparisonResult]] = []
         for ti in tensor_infos:
-            if not ti.is_output:
+            if not ti.is_output or ti.uid in ignore_uids:
                 continue
             ref = ref_outputs.get(ti.uid)
             if ref is None:
