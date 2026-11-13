@@ -16,6 +16,7 @@ from ...common import torch_support
 from ...common.dtypes import get_dtype
 from ...common.exceptions import UnsupportedGraphError
 from ...config.benchmark_config import ReferencePrecision, ReferenceProviderName
+from ...execution.sdpa_dropout import read_dropout
 from ...graph.loader import output_uids, tensor_data_type
 
 from ..reference_provider import (
@@ -67,22 +68,23 @@ def _sdpa_scratch_bytes(
 ) -> int:
     """Scratch of one SDPA node beyond its graph tensors.
 
-    A forward without sinks calls torch's fused SDPA, which keeps no score
-    matrix on the host. Backward and a forward with sinks compute scores by
-    hand, one query block at a time: scores/probabilities, d_scores and one
+    A forward without sinks or dropout calls torch's fused SDPA, which keeps
+    no score matrix on the host. Backward and a forward with sinks or dropout
+    (an explicit mask, or Philox with ``rng_dump``) compute scores by hand,
+    one query block at a time: scores/probabilities, d_scores and one
     reduction temporary. For the whole node: K and V expanded to the query
     heads, the backward dK/dV accumulators, the full ``[q_len, kv_len]`` band
     mask of a windowed or bottom-right node with its boolean temporaries
     (torch takes bottom-right bounds natively when ``q_len == kv_len`` or
-    ``q_len == 1``), and the float32 mask of a sink node with bounds. A paged
-    node counts the KV length its page table can address.
+    ``q_len == 1``), and the float32 mask of a sink or dropout node with
+    bounds. A paged node counts the KV length its page table can address.
 
     ALiBi builds its bias one query block at a time: a float64 bias and its
     float32 copy per block. A backward adds them to its score blocks. A
     forward keeps one full ``[heads, q_len, kv_len]`` mask (broadcast with
-    ``attn_mask``): float32 with sinks, else in the graph dtype for the SDPA
-    call. Below float32, the stats output is then computed again from the
-    float32 bias, in score blocks.
+    ``attn_mask``): float32 with sinks or dropout, else in the graph dtype for
+    the SDPA call. Below float32, the stats output is then computed again
+    from the float32 bias, in score blocks.
     """
     from ...execution.pytorch_ops.handlers.sdpa import (
         _block_rows,
@@ -103,6 +105,12 @@ def _sdpa_scratch_bytes(
         kv_len *= page_table[1]  # pages per sequence * page size
     backward = node.get("type") == "SdpaBackwardAttributes"
     has_sink = _uid_tensor(inputs, "sink_token_tensor_uid", tensors) is not None
+    dropout = read_dropout(node)
+    has_dropout = not backward and (
+        dropout.mask_uid is not None
+        or (dropout.rng_dump_uid is not None and dropout.probability is not None)
+    )
+    manual = has_sink or has_dropout  # a manual fp32 forward
     alibi = _sdpa_bool(node, "alibi_mask")
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)
@@ -111,7 +119,7 @@ def _sdpa_scratch_bytes(
 
     row_bytes = rows * kv_len * 4  # one query row of float32 scores
     block_rows = _block_rows(q_len, row_bytes)
-    temporaries = 3 if backward or has_sink else 0
+    temporaries = 3 if backward or manual else 0
     alibi_mask = 0
     if alibi and not backward:
         mask_rows = _broadcast_rows(
@@ -120,13 +128,13 @@ def _sdpa_scratch_bytes(
         q_size = _element_size(
             _uid_tensor(inputs, "q_tensor_uid", tensors) or {}, graph_json
         )
-        alibi_mask = mask_rows * q_len * kv_len * (4 if has_sink else q_size)
+        alibi_mask = mask_rows * q_len * kv_len * (4 if manual else q_size)
         # The fill keeps a float64 bias, its float32 copy and the float32 sum
         # with attn_mask per block: 16 bytes per mask element.
         fill_row = mask_rows * kv_len * 16
         alibi_mask += fill_row * _block_rows(q_len, fill_row)
         has_stats = _uid_tensor(node.get("outputs") or {}, "stats_tensor_uid", tensors)
-        if not has_sink and q_size < 4 and has_stats is not None:
+        if not manual and q_size < 4 and has_stats is not None:
             temporaries = 3
     block = row_bytes * block_rows * temporaries
     if alibi and temporaries:
@@ -140,7 +148,7 @@ def _sdpa_scratch_bytes(
     # Two float32 masks (zeros, then masked_fill) and two bool masks.
     band = q_len * kv_len * (2 * 4 + 2) if needs_band and not backward else 0
     has_bounds = causal or window is not None or bottom_right
-    sink_mask = q_len * kv_len * 4 if has_sink and has_bounds else 0
+    sink_mask = q_len * kv_len * 4 if manual and has_bounds else 0
     return block + expanded + band + sink_mask + alibi_mask
 
 
