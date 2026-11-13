@@ -62,12 +62,31 @@ def test_size_one_dimension_strides_do_not_matter() -> None:
             ),
             id="window",
         ),
+        # hipDNN composes the deprecated flag with the alignment and the bounds,
+        # so these masks are bottom right or windowed, not plain top-left.
+        pytest.param(
+            lambda g: g["nodes"][0]["attributes"].update(
+                diagonal_alignment="BOTTOM_RIGHT"
+            ),
+            id="flag-with-bottom-right-alignment",
+        ),
+        pytest.param(
+            lambda g: g["nodes"][0]["attributes"].update(left_bound=127),
+            id="flag-with-left-bound",
+        ),
     ],
 )
 def test_unsupported_graphs_are_rejected(mutate) -> None:
     graph = sdpa_graph()
     mutate(graph)
     with pytest.raises(UnsupportedGraphError):
+        _problem(graph)
+
+
+def test_v_head_size_other_than_qk_is_rejected() -> None:
+    """rocKE kernels take one head size; the shared reader accepts 192/128."""
+    graph = sdpa_graph(d=192, d_v=128, causal_mask=False)
+    with pytest.raises(UnsupportedGraphError, match="one head size"):
         _problem(graph)
 
 
@@ -102,8 +121,6 @@ _BOTTOM_RIGHT_BAND = dict(
             id="deprecated-flag",
         ),
         pytest.param(_BOTTOM_RIGHT_BAND, True, id="bounds"),
-        # hipDNN reads the deprecated flag first, so this mask is top-left.
-        pytest.param(dict(diagonal_alignment="BOTTOM_RIGHT"), True, id="flag-wins"),
         pytest.param(
             dict(causal_mask=False, diagonal_alignment="BOTTOM_RIGHT"),
             False,

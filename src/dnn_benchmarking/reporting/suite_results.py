@@ -52,6 +52,7 @@ RUN_CONFIG_KEYS = (
     "fast",
     "pytorch_sdpa_backend",
     "pytorch_rocm_fa_library",
+    "aiter_rows",
     "metrics",
     "profiling",
 )

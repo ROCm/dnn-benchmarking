@@ -1731,3 +1731,92 @@ def test_rocke_rows_without_a_reference(
     engines = [r for r in graph.results if r.role == "engine"]
     assert [e.verdict for e in engines] == [verdict] * 3
     assert all(e.status == "success" for e in engines)
+
+
+@pytest.fixture
+def fake_aiter(fake_torch, monkeypatch):
+    """A bf16 d128 SDPA problem and a fake AITER executor; rows validate
+    against the reference of ``fake_torch``. A row in ``wrong`` writes no
+    output."""
+    from dnn_benchmarking.execution import aiter_executor
+    from dnn_benchmarking.execution.aiter_sdpa import aiter_problem
+    from dnn_benchmarking.graph.loader import GraphLoader
+    from tests.rocke_graphs import sdpa_graph
+
+    fake = fake_torch
+    fake.wrong = set()
+    graph = sdpa_graph(dtype="bfloat16", d=128)
+    problem = aiter_problem(graph, GraphLoader().extract_tensor_info(graph))
+
+    class AiterExecutor:
+        def __init__(self, backend, problem, policy):
+            self.name, self.policy = backend.row_name, policy
+            self.device = "cuda:0"
+            self.build_time_ms = 2.5
+
+        def prepare(self, tensors):
+            pass
+
+        def benchmark(self):
+            return _stall_aware(fake, self.name, self.policy)
+
+        def execute_once(self):
+            fake.torch_outputs_written = self.name not in fake.wrong
+
+    monkeypatch.setattr(suite_runner, "aiter_problem", lambda graph, infos: problem)
+    monkeypatch.setattr(aiter_executor, "AiterExecutor", AiterExecutor)
+    return fake
+
+
+def _run_aiter(**config):
+    from dnn_benchmarking.execution.aiter_sdpa import AiterDevice
+
+    session = suite_runner.AiterSession(
+        device=AiterDevice(arch="gfx942", num_cus=304, gluon=False), version="0.1"
+    )
+    return suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(validation=ValidationConfig(provider="pytorch"), **config),
+        Reporter(io.StringIO()),
+        [suite_runner.aiter_planner(session)],
+    )
+
+
+def test_aiter_rows_are_auto_then_each_backend(fake_aiter):
+    fake_aiter.wrong = {"aiter:asm_v3"}
+
+    graph = _run_aiter()
+
+    assert [(r.runtime, r.engine_name, r.verdict) for r in graph.results] == [
+        ("pytorch", "pytorch", "reference"),
+        ("aiter", "aiter:auto", "passed"),
+        ("aiter", "aiter:ck", "passed"),
+        ("aiter", "aiter:asm_v3", "failed"),
+        ("aiter", "aiter:triton", "passed"),
+    ]
+    assert graph.results[2].engine_id == "aiter:ck"
+    assert graph.results[2].engine_version == "0.1"
+    assert graph.results[2].ootb.cpu_build_time_ms == 2.5
+
+
+def test_aiter_rows_auto_runs_only_aiters_own_selection(fake_aiter):
+    graph = _run_aiter(runtime="aiter:auto")
+
+    assert [(r.engine_name, r.verdict) for r in graph.results] == [
+        ("pytorch", "reference"),
+        ("aiter:auto", "passed"),
+    ]
+
+
+def test_aiter_without_a_problem_adds_no_rows(fake_aiter, monkeypatch):
+    def unsupported(graph, infos):
+        raise UnsupportedGraphError("AITER runtime needs 4-D Q/K/V/O tensors")
+
+    monkeypatch.setattr(suite_runner, "aiter_problem", unsupported)
+
+    graph = _run_aiter()
+
+    assert (graph.status, graph.results) == ("no_engines", [])
+    assert graph.message == "AITER runtime needs 4-D Q/K/V/O tensors"

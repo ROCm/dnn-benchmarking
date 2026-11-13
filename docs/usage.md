@@ -47,7 +47,7 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
+| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). `aiter` launches AITER SDPA forward kernels directly: `aiter:auto` (AITER's own selection) and one row per backend; `aiter:auto` runs only the `aiter:auto` row. A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner in the tuned state of the work directory. See [Kernel selection](#kernel-selection---autotune). |
@@ -225,9 +225,9 @@ dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
   --validate pytorch --timing-block 50 -o results.json
 ```
 
-- The runtimes run in the order `hipdnn`, `pytorch`, `rocke`, whatever the
-  typed order. hipDNN loads its HIP runtime before torch does, and its rows
-  exist before a later runtime can stop the process.
+- The runtimes run in the order `hipdnn`, `pytorch`, `rocke`, `aiter`,
+  whatever the typed order. hipDNN loads its HIP runtime before torch does,
+  and its rows exist before a later runtime can stop the process.
 - All runtimes use the same inputs. `--validate pytorch` gives one reference
   row per graph, and every engine row is checked against it.
 - A runtime that cannot run a graph adds no rows and does not change the
@@ -371,8 +371,11 @@ Requirements and limits:
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
   window. A causal mask (top-left or bottom-right) needs
-  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
-  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask.
+  hipDNN composes the deprecated `causal_mask` and `causal_mask_bottom_right`
+  flags with `left_bound`, `right_bound` and `diagonal_alignment`. A graph
+  that sets a flag together with a `left_bound` other than -1, a
+  `right_bound` above 0, or (for `causal_mask`) `BOTTOM_RIGHT` gets no rows.
   An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
@@ -400,6 +403,102 @@ Each graph's table lists the hipDNN row and the rocKE rows, and `vs_best`
 compares them. Two result files, one for each runtime, also work:
 `compare --by best` pairs the fastest rocKE row with the hipDNN row.
 `--by engine` does not pair them, because the row key includes the runtime.
+
+## AITER runtime
+
+`--runtime aiter` launches AITER SDPA forward kernels directly, without
+hipDNN and without PyTorch's SDPA dispatch. Use it to compare AITER with
+hipDNN on the same graphs. The rows use the same inputs, timed loop, FLOP
+count and result schema as the hipDNN rows. AITER comes from the `aiter`
+submodule of this repository, at the commit that it pins.
+
+Each graph gets these `runtime = "aiter"` rows. The row name is also the
+row's `engine.id`:
+
+| Row | AITER entry point | Runs on |
+|---|---|---|
+| `aiter:auto` | `aiter.flash_attn_func`: AITER selects the backend | gfx90a, gfx942, gfx950; head sizes up to 256 after AITER pads them to a multiple of 8 |
+| `aiter:ck` | `aiter.mha_fwd` (CK tile) | head sizes divisible by 8, up to 256 |
+| `aiter:asm_v3` | `aiter.fmha_v3_fwd` (assembly) | gfx942 and gfx950, bf16, head sizes 128/128 or 192/128 |
+| `aiter:opus` | `aiter.fmha_fwd_bf16_opus_fwd` | gfx950, bf16, head sizes 128/128 or 192/128 |
+| `aiter:native_splitkv` | `aiter.mha_fwd_native_splitkv` | gfx942, bf16, head size 64, when AITER's split-KV heuristic splits the KV |
+| `aiter:triton` | `aiter.ops.triton.attention.mha.flash_attn_func` | gfx942 and gfx950 |
+| `aiter:gluon` | the same function with `backend="gluon"` | gfx950 with Triton 3.6 or later |
+
+AITER selects between its compiled backends with checks inside
+`_flash_attn_forward` that a caller cannot reach. The tool repeats those
+checks for the graphs that this runtime accepts
+(`execution/aiter_sdpa.py`). They follow the pinned AITER commit; a
+submodule bump must check them again. `aiter:auto` is AITER's own choice.
+On this graph form it takes the first of: native split-KV, OPUS (192/128
+only), the assembly kernel when `seqlen_q > 128`, and CK. It pads head
+sizes that are not a multiple of 8 inside the timed call. The `aiter:opus`
+row also runs the 128/128 OPUS kernel, which `aiter:auto` uses only with
+`AITER_ENABLE_FMHA_OPUS=1`.
+
+Read the rows as follows:
+
+- `aiter:auto` is what an AITER user gets from the public API.
+- In the default staged timing, the fastest backend row minus `aiter:auto`
+  is the loss from AITER's own backend selection. In block or events
+  timing, a short kernel's row measures the host launch cost of its entry
+  point instead, and the row gets a `host-bound` warning. Compare such rows
+  in staged timing.
+- `aiter:auto`, `aiter:triton` and `aiter:gluon` allocate their output inside
+  the timed call, as their entry points do. The Triton forward also
+  zero-fills both the output and the LSE buffer on every call, so
+  `aiter:triton` includes two fill kernels. The Gluon forward allocates the
+  output without a fill and skips the LSE buffer, so `aiter:gluon` includes
+  no fill. The other rows write the graph's output tensor.
+- Every row is reported on its own, in the table and as one JSON row with
+  `runtime = "aiter"` and `engine.name = "aiter:<backend>"`. The tool does
+  not pick a best AITER row; take the fastest one from the JSON, or compare
+  an AITER result file with `compare --by best`.
+
+`--runtime aiter:auto` runs only `aiter:auto`, AITER's own selection, for
+each graph; it combines with other runtimes like `aiter` does (for example
+`--runtime hipdnn,aiter:auto`). `run.config.aiter_rows` records `auto`, or
+`all` for `--runtime aiter`; the rows keep `runtime = "aiter"`.
+
+Requirements and limits:
+
+- A ROCm build of PyTorch and the `aiter` package. On Linux with ROCm
+  torch, `setup_env.py` fetches the pinned `aiter` submodule and installs it
+  (see [setup.md](setup.md)).
+- AITER compiles a backend's host module (JIT) the first time the backend
+  runs in an install. It takes its ROCm root from `ROCM_HOME`, else
+  `ROCM_PATH`, and its compiler from the first `hipcc` on `PATH`. The
+  `setup_env.py` environment sets `ROCM_PATH` to the hipDNN prefix, which
+  has no HIP runtime to link. So, with the pip ROCm SDK installed, the tool
+  sets `ROCM_HOME` to the SDK's devel package (unless `ROCM_HOME` is set)
+  and puts the venv's `bin` directory, which holds the SDK's `hipcc`, first
+  on `PATH`. The compiled modules stay in the `aiter-jit` directory of the
+  venv (`AITER_JIT_DIR`, unless it is set). So `--clean` removes them, and
+  each venv compiles against its own torch.
+  `build_ms` is the first launch of the row: the compile on a cold JIT
+  cache (minutes for a CK module), the module load otherwise. Triton
+  compiles each kernel once per process.
+- The same graph form as the rocKE runtime: one `SdpaAttributes` forward
+  node, fp16 or bf16, packed BSHD Q/K/V/O, no mask tensor, dropout,
+  statistics output, paging or sliding window. V and O can have a head size
+  other than Q and K (for example 192/128). AITER aligns a causal mask to
+  the bottom right, so a top-left causal mask needs `seqlen_q ==
+  seqlen_kv`; a bottom-right causal mask runs on any shape. The deprecated
+  causal flags follow the rocKE rule above. An absent `attn_scale_value` is
+  1.0, as in hipDNN.
+- Other arches report `no engines applicable`. With `--runtime aiter` alone,
+  these options stop the run with exit code 2: `--engine`, `--plugin-path`,
+  `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
+  `--fast`.
+- The gfx1250 assembly and FlyDSL forward kernels, FP8 and the varlen entry
+  points have no row.
+
+To compare AITER with hipDNN, run both runtimes in one run:
+
+```bash
+dnn-benchmark -g Workloads/microbench/aiter.tar.gz --runtime hipdnn,aiter \
+  --validate pytorch -o both.json
+```
 
 ## Work directory (`--benchmark-work-dir`)
 

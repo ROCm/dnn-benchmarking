@@ -51,10 +51,10 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch` or `rocke`. |
+| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch`, `rocke` or `aiter`. |
 | `runtimes` | array of string or null | Every selected runtime in run order, for example `["hipdnn", "rocke"]` for `--runtime hipdnn,rocke`. `null` in files written before this key. |
 | `engine_filter` | array of string or null | `--engine` selections as hex engine IDs (same format as `engine.id`). `null` means all discovered engines. |
-| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
+| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`, `--runtime aiter` and `--runtime pytorch,aiter`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
@@ -72,6 +72,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `fast` | bool | `--fast`. Do not compare the numbers of a `--fast` run with a run without it; see [usage.md](usage.md#fast-mode---fast). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
+| `aiter_rows` | string or null | `all` for `--runtime aiter`, `auto` for `--runtime aiter:auto`. `null` unless AITER is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
 | `profiling` | object | Requested profiling passes: `pmc` (set name or null), `trace` (bool), `perf` (bool), `roofline` (bool). |
 
@@ -150,7 +151,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch` or `rocke`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. |
+| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch`, `rocke` or `aiter`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. An `aiter` row has `engine.id` and `engine.name` `aiter:<backend>` (`aiter:auto`, `aiter:ck`, ...), and `engine.version` the `amd-aiter` package version. |
 | `role` | string | `engine` for a benchmarked engine. `reference` for the timed reference row that `--validate pytorch` adds. |
 | `engine` | object | See [engine](#engine). |
 | `status` | string | `success`, `error` or `skipped`. |
@@ -169,7 +170,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE rows: the row name, which is stable across runs. `null` for PyTorch rows. |
+| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE and AITER rows: the row name, which is stable across runs. `null` for PyTorch rows. |
 | `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
 | `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
 
@@ -277,6 +278,7 @@ loop. Paths are relative to the row:
 | `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.timing.samples` is 10 or more. |
 | `outlier: max Nx median` | The slowest sample is more than 2 x `ootb.kernel.median_ms`. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
+| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | `ootb.timing.mode` is `block` or `events`, and `ootb.host.median_ms` is 0.9 x `ootb.kernel.median_ms` or more. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
