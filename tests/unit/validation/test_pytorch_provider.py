@@ -2172,6 +2172,25 @@ class TestPyTorchProviderNewOps:
         self._assert_backward_closed_form(graph, seed=24, inv=1.0)
 
     @pytest.mark.parametrize(
+        "mask",
+        [(2, 4, 5, 7), (1, 4, 5, 7), (2, 1, 5, 7)],
+        ids=["full", "batch_broadcast", "head_broadcast"],
+    )
+    def test_sdpa_backward_explicit_mask_across_block_boundaries(
+        self, mask, monkeypatch
+    ) -> None:
+        """Each query block applies its own rows of the dropout mask, and a
+        broadcast mask reaches every batch or head. GQA (Hq 4, Hkv 2): the
+        mask is indexed by the query head, not the KV head."""
+        import dnn_benchmarking.execution.pytorch_ops.handlers.sdpa as sdpa_mod
+
+        # Scores of two query rows: 2 batches x 4 heads x 7 keys x 4 bytes.
+        monkeypatch.setattr(sdpa_mod, "_SCORE_BLOCK_BYTES", 2 * 2 * 4 * 7 * 4)
+        assert len(sdpa_mod._query_blocks(torch.zeros(2, 4, 5, 8), 7)) == 3
+        graph = self._backward_dropout_graph(mask=mask)
+        self._assert_backward_closed_form(graph, seed=26, inv=1 / _KEEP_SCALE)
+
+    @pytest.mark.parametrize(
         "graph_kwargs,match",
         [
             pytest.param(

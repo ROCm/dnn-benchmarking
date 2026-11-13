@@ -83,7 +83,8 @@ def find_rng_dump(graph_json: Dict[str, Any]) -> Optional[RngDump]:
     """The first forward SDPA node with an ``rng_dump`` and a probability.
 
     hipDNN writes the dump only when the probability is not null
-    (RngDumpHandoff.hpp). Backward nodes have no dump.
+    (RngDumpHandoff.hpp, rocm-libraries #14358; the submodule pin predates
+    it). Backward nodes have no dump.
     """
     for _, dropout in _forward_dropouts(graph_json):
         if dropout.rng_dump_uid is not None and dropout.probability is not None:

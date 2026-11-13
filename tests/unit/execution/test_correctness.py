@@ -372,6 +372,16 @@ def test_rng_dump_all_zero_at_p_zero_fails(n, passes):
         assert c is not None and c.explicitly_failed
 
 
+@pytest.mark.parametrize("p", [1.5, -0.1, 1.0, np.nan])
+def test_rng_dump_with_probability_outside_0_1_fails(p):
+    """The handler accepts p in [0, 1) only. The dump check fails such a row
+    by its probability, whatever the dump holds."""
+    c = check_rng_dump(_dump(0, _N), p, _config())
+
+    assert c is not None and c.explicitly_failed
+    assert "dropout_probability" in c.error_message
+
+
 @pytest.mark.parametrize(
     "refs",
     [{1: _ref([1, 2, 3, 4])}, {1: _ref([1, 2, 3, 4]), 2: _ref([0, 0, 0, 0])}],
