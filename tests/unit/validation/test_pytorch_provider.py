@@ -2504,7 +2504,9 @@ def dropout_reference(q, k, v, mask, s, kind="none", *, attn_mask=None, sink=Non
     """float64 ``O = (P * mask * s) V`` and the pre-dropout log-sum-exp.
 
     The additive mask of ``kind`` is built here from its definition. ``sink``
-    adds one logit per query head to the softmax denominator.
+    adds one logit per query head to the softmax denominator. A query row
+    that sees no key gets ``P = 0`` and a log-sum-exp of -inf, as in
+    CpuFpReferenceSdpa.
     """
     q, k, v = (np.asarray(t, dtype=np.float64) for t in (q, k, v))
     hq, sq, skv = q.shape[1], q.shape[2], k.shape[2]
@@ -2526,10 +2528,11 @@ def dropout_reference(q, k, v, mask, s, kind="none", *, attn_mask=None, sink=Non
     if attn_mask is not None:
         additive = additive + np.asarray(attn_mask, dtype=np.float64)
     scores = q @ k.swapaxes(-1, -2) * _ATTN_SCALE + additive
-    lse = np.log(np.exp(scores).sum(axis=-1, keepdims=True))
+    with np.errstate(divide="ignore"):
+        lse = np.log(np.exp(scores).sum(axis=-1, keepdims=True))
     if sink is not None:
         lse = np.logaddexp(lse, np.asarray(sink, np.float64).reshape(1, -1, 1, 1))
-    probs = np.exp(scores - lse)
+    probs = np.exp(scores - np.maximum(lse, np.finfo(np.float64).min))
     return (probs * np.asarray(mask, dtype=np.float64) * float(s)) @ v, lse
 
 
@@ -2790,6 +2793,39 @@ class TestSdpaPhiloxDropout:
         )
         np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("form", ["explicit_mask", "philox"])
+    def test_dropout_forward_gives_zero_output_for_fully_masked_rows(
+        self, form
+    ) -> None:
+        """Bottom-right causal with Sq 9 > Skv 4: query rows 0-4 see no key.
+        Their output is 0 and their log-sum-exp is -inf, as in
+        CpuFpReferenceSdpa; a NaN output would fail every engine row."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        dims = [2, 4, 9, 4]  # [B, Hq, Sq, Skv]
+        kwargs = {"sq": 9, "skv": 4, "attributes": {"causal_mask_bottom_right": True}}
+        dumps = None
+        if form == "philox":
+            graph = _philox_graph(dump=dims, **kwargs)
+            dumps = {_DUMP: _philox_dump(37, dims)}
+            keep, keep_scale = dumps[_DUMP], _PHILOX_SCALE
+        else:
+            graph = _dropout_graph(mask=dims, **kwargs)
+        inputs = _dropout_inputs(graph, seed=38)
+        if form == "explicit_mask":
+            keep, keep_scale = inputs[_DROP_MASK], _KEEP_SCALE
+
+        out = provider.compute_reference(graph, inputs, philox_dumps=dumps)
+
+        o, lse = dropout_reference(
+            inputs[_Q], inputs[_K], inputs[_V], keep, keep_scale, "bottom_right"
+        )
+        np.testing.assert_array_equal(out[_O].data[..., :5, :], 0.0)
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_array_equal(out[_STATS].data[..., :5, :], -np.inf)
+        np.testing.assert_allclose(
+            out[_STATS].data[..., 5:, :], lse[..., 5:, :], rtol=1e-5, atol=1e-5
+        )
 
     def test_philox_reference_uses_the_dump_it_is_given(self) -> None:
         """Two engine rows with different dumps: each output follows its own

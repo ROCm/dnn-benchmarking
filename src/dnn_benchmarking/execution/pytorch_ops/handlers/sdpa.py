@@ -996,9 +996,12 @@ def _dropout_attention(
     there are sinks (CpuFpReferenceSdpa.hpp). ``keep`` is the dropout mask
     (``[B|1, Hq|1, Sq, Skv]``), not renormalised. ``mask_rows(start, end)``
     gives the additive mask of query rows ``[start, end)``. Returns the fp32
-    output and the log-sum-exp before dropout (the stats). One query block of
-    ``blocks`` at a time; the probabilities overwrite the block's scores.
+    output and the log-sum-exp before dropout (the stats). A query row that
+    sees no key gets ``P = 0`` and stats of -inf, as in CpuFpReferenceSdpa.
+    One query block of ``blocks`` at a time; the probabilities overwrite the
+    block's scores.
     """
+    finite_min = torch.finfo(torch.float32).min
     outputs, stats = [], []
     for start, end in blocks:
         scores = _scores(
@@ -1007,7 +1010,9 @@ def _dropout_attention(
         log_denom = torch.logsumexp(scores, dim=-1, keepdim=True)
         if sink_logits is not None:
             log_denom = torch.logaddexp(log_denom, sink_logits)
-        probs = scores.sub_(log_denom).exp_()
+        # A -inf denominator (no visible key) would give -inf - -inf = NaN. A
+        # finite one keeps exp(-inf - finite) = 0 for those rows.
+        probs = scores.sub_(log_denom.clamp(min=finite_min)).exp_()
         probs.mul_(_rows(keep, start, end)).mul_(keep_scale)
         outputs.append(torch.matmul(probs, v_float))
         stats.append(log_denom)
