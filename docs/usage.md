@@ -133,9 +133,9 @@ The tool fills the dropout inputs as follows:
   generator, so the other inputs keep the values that they have without
   the dropout inputs.
 
-A `dropout_scale` value in the graph JSON with `1 / dropout_scale` outside
-(0, 1] gives a graph error (exit code 1, not 3) with the `hipdnn` or
-`pytorch` runtime, with or without `--validate`. The graph gets no rows,
+A graph JSON can give a `dropout_scale` value with `1 / dropout_scale`
+outside (0, 1]. The `hipdnn` and `pytorch` runtimes then give a graph error
+(exit code 1, not 3), with or without `--validate`. The graph gets no rows,
 and its `error` starts with `Input data generation failed: `.
 
 An explicit-mask graph gets one reference, as other graphs do.
@@ -182,7 +182,7 @@ engine rows fail (exit code 3) and keep their timings:
   and the graph has no `reference` row. The rows fail also when a CPU
   reference would not fit in host memory.
 - A Philox forward graph whose `rng_dump` is not FLOAT. The message names
-  `rng_dump`. The tool declines the graph before the NaN fill, so the rows
+  `rng_dump`. The tool declines the graph before the NaN fill. The rows thus
   fail also when a CPU reference or the dump would not fit in host memory.
 - Dropout with paged K and V or with ragged sequence lengths. The message
   names the feature.
@@ -192,8 +192,8 @@ engine rows fail (exit code 3) and keep their timings:
 - The other dropout combinations that the hipDNN references also decline
   (see [Dropout validation](methodology.md#dropout-validation)).
 
-Exception: when a CPU reference would not fit in host memory, the rows of
-the last three kinds get `unchecked`, as in the host memory rule above.
+Exception: the rows of the last three kinds get `unchecked` when a CPU
+reference would not fit in host memory. This is the host memory rule above.
 
 Other runtimes and options:
 
