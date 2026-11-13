@@ -433,6 +433,18 @@ class TestPagedInputGeneration:
         np.testing.assert_array_equal(data[7], np.full(dims, self.Q_LEN))
         np.testing.assert_array_equal(data[8], np.full(dims, kv))
 
+    def test_packed_query_splits_its_rows_over_the_sequences(self) -> None:
+        """A packed [1, H, total_q, D] Q holds every sequence's rows, so each
+        seq_len_q is a share of total_q, not total_q (the planner would read
+        past Q for every sequence after the first)."""
+        graph = self._graph()
+        graph["tensors"][0]["dims"] = [1, 8, self.NUM_SEQS * 3, 128]
+        dims = [self.NUM_SEQS]
+        data = generate_input_data(
+            [self._int_tensor(7, dims)], seed=0, graph_json=graph
+        )
+        np.testing.assert_array_equal(data[7], np.full(dims, 3))
+
     def test_dense_graph_inputs_are_untouched(self) -> None:
         """A graph with no page table generates exactly what it would without
         the graph."""

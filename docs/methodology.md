@@ -578,11 +578,14 @@ Measure again after a timing change.
 A paged SDPA graph gives K and V as a block container `[num_blocks, H_kv,
 page_size, D]`, and the page tables as int32 `[B, 1, max_blocks_per_seq,
 1]`, as hipDNN and cuDNN require. The tool also reads rank-2 `[B,
-max_blocks_per_seq]` tables. It fills each page table with distinct block
-ids. Every sequence uses its full allocation: `seq_len_q` is the query
-length of Q, and `seq_len_kv` is the table width times the page size,
-capped by `max_seq_len_kv`. A graph with sequence lengths but no page table
-gets 1 for every length.
+max_blocks_per_seq]` tables. It fills the page tables with block ids
+0, 1, 2, ... in sequence order, so no two sequences share a block when the
+container has at least `B * max_blocks_per_seq` blocks. A smaller container
+wraps the ids around its block count. Every sequence uses its full
+allocation: `seq_len_q` is the query length of Q (an equal share of the
+query rows for a packed `[1, H, total_q, D]` Q), and `seq_len_kv` is the
+table width times the page size, capped by `max_seq_len_kv`. A graph with
+sequence lengths but no page table gets 1 for every length.
 
 ## SDPA backward inputs
 

@@ -257,9 +257,10 @@ def _paged_lengths(graph_json: Optional[Dict[str, Any]]) -> Dict[str, int]:
     """Sequence length of each seq_len role of a paged SDPA node.
 
     Every sequence uses its whole page allocation: Q has its full query
-    length (``dims[2]`` of the per-batch Q), and KV has the page-table width
-    times the page size, capped by ``max_seq_len_kv`` when the graph sets it.
-    Empty for a graph with no paged K.
+    length (``dims[2]`` of a per-batch Q, or an equal share of a packed
+    ``[1, H, total_q, D]`` Q, as ``_plan_paged_sdpa`` splits it), and KV has
+    the page-table width times the page size, capped by ``max_seq_len_kv``
+    when the graph sets it. Empty for a graph with no paged K.
     """
     if not graph_json:
         return {}
@@ -279,7 +280,10 @@ def _paged_lengths(graph_json: Optional[Dict[str, Any]]) -> Dict[str, int]:
         attributes = node.get("attributes") or node.get("parameters") or {}
         if attributes.get("max_seq_len_kv") is not None:
             kv_len = min(kv_len, int(attributes["max_seq_len_kv"]))
-        return {"seq_len_q": int(q[2]), "seq_len_kv": kv_len}
+        q_len = int(q[2])
+        if int(q[0]) == 1:
+            q_len //= max(int(table[0]), 1)  # packed: the sequences share Q's rows
+        return {"seq_len_q": q_len, "seq_len_kv": kv_len}
     return {}
 
 
