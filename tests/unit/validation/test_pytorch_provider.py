@@ -2409,31 +2409,44 @@ class TestSdpaExplicitDropout:
             provider.compute_reference(graph, _dropout_inputs(graph, seed=14))
 
     @pytest.mark.parametrize(
-        "graph_kwargs",
+        "graph_kwargs,match",
         [
-            pytest.param({"probability": 0.0}, id="mask_and_scale_with_probability"),
-            pytest.param({"seed": True}, id="mask_and_scale_with_seed"),
-            pytest.param({"offset": True}, id="mask_and_scale_with_offset"),
-            pytest.param({"scale": None}, id="mask_without_scale"),
-            pytest.param({"mask": None}, id="scale_without_mask"),
-            pytest.param({"types": {_DROP_SCALE: "half"}}, id="scale_not_float"),
-            pytest.param({"scale": [2]}, id="scale_not_one_element"),
-            pytest.param({"types": {_DROP_MASK: "half"}}, id="mask_not_float"),
-            pytest.param({"mask": [4, 5, 7]}, id="mask_not_rank_4"),
-            pytest.param({"mask": [3, 4, 5, 7]}, id="mask_dim0_not_b_or_1"),
+            pytest.param(
+                {"probability": 0.0}, None, id="mask_and_scale_with_probability"
+            ),
+            pytest.param({"seed": True}, None, id="mask_and_scale_with_seed"),
+            pytest.param({"offset": True}, None, id="mask_and_scale_with_offset"),
+            # The message names the given key and the missing one.
+            pytest.param(
+                {"scale": None},
+                "dropout_mask_tensor_uid.*dropout_scale_tensor_uid",
+                id="mask_without_scale",
+            ),
+            pytest.param(
+                {"mask": None},
+                "dropout_scale_tensor_uid.*dropout_mask_tensor_uid",
+                id="scale_without_mask",
+            ),
+            pytest.param({"types": {_DROP_SCALE: "half"}}, None, id="scale_not_float"),
+            pytest.param({"scale": [2]}, None, id="scale_not_one_element"),
+            pytest.param({"types": {_DROP_MASK: "half"}}, None, id="mask_not_float"),
+            pytest.param({"mask": [4, 5, 7]}, None, id="mask_not_rank_4"),
+            # Rank 1 with a first dim that would pass the dim0 rule.
+            pytest.param({"mask": [1]}, None, id="mask_rank_1"),
+            pytest.param({"mask": [3, 4, 5, 7]}, None, id="mask_dim0_not_b_or_1"),
             # Hkv heads: the mask is indexed by the query head.
-            pytest.param({"mask": [2, 2, 5, 7]}, id="mask_dim1_not_hq_or_1"),
-            pytest.param({"mask": [2, 4, 1, 7]}, id="mask_dim2_not_sq"),
-            pytest.param({"mask": [2, 4, 5, 1]}, id="mask_dim3_not_skv"),
+            pytest.param({"mask": [2, 2, 5, 7]}, None, id="mask_dim1_not_hq_or_1"),
+            pytest.param({"mask": [2, 4, 1, 7]}, None, id="mask_dim2_not_sq"),
+            pytest.param({"mask": [2, 4, 5, 1]}, None, id="mask_dim3_not_skv"),
         ],
     )
-    def test_sdpa_dropout_declines(self, graph_kwargs) -> None:
+    def test_sdpa_dropout_declines(self, graph_kwargs, match) -> None:
         """One case per R7 rule that hipDNN declines (rows 1-4). Each graph
         differs from a computable one in that rule only."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph = _dropout_graph(**graph_kwargs)
 
-        with pytest.raises(UnsupportedGraphError):
+        with pytest.raises(UnsupportedGraphError, match=match):
             provider.compute_reference(graph, _dropout_inputs(graph, seed=15))
 
 
