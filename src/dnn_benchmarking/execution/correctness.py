@@ -95,12 +95,18 @@ def check_rng_dump(
 ) -> Optional[CorrectnessResult]:
     """Check an engine's ``rng_dump`` as the hipDNN integration harness does.
 
-    Returns None when the dump is acceptable, else a mismatch. First, every
-    value must be 0.0 or 1.0 (-0.0 is 0; NaN fails). Then the keep rate must
-    be within ``6 * sqrt(keep * (1 - keep) / n) + 1 / n`` of ``keep = 1 - p``,
+    Returns None when the dump is acceptable, else a mismatch. First, ``p``
+    must be in [0, 1), the range the reference accepts. Then every value
+    must be 0.0 or 1.0 (-0.0 is 0; NaN fails). Then the keep rate must be
+    within ``6 * sqrt(keep * (1 - keep) / n) + 1 / n`` of ``keep = 1 - p``,
     with ``p`` rounded to float32 and the bound in double. An empty dump
     passes.
     """
+    if not 0.0 <= p < 1.0:  # NaN fails too.
+        return mismatch(
+            config,
+            f"rng_dump check failed: dropout_probability {p} is not in [0, 1)",
+        )
     flat = np.asarray(values).reshape(-1)
     n = flat.size
     ones = 0
