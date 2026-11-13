@@ -8,7 +8,7 @@ equivalent PyTorch operations on the host or on a GPU.
 """
 
 from math import prod
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 import numpy as np
 
@@ -256,6 +256,7 @@ class PyTorchReferenceProvider(ReferenceProvider):
         *,
         precision: ReferencePrecision = ReferencePrecision.NATIVE,
         device: Optional[str] = None,
+        philox_dumps: Optional[Mapping[int, np.ndarray]] = None,
     ) -> Dict[int, ReferenceOutput]:
         """Compute reference outputs using PyTorch.
 
@@ -270,6 +271,10 @@ class PyTorchReferenceProvider(ReferenceProvider):
             precision: ``FLOAT64`` requires :meth:`supports_float64`.
             device: Torch device to compute on; None is the host. GPU
                 outputs stay on the device (``ReferenceOutput.device_data``).
+            philox_dumps: ``rng_dump`` UID -> the engine row's dump, a host
+                float array ``[B, Hq, Sq, Skv]``. Each dump goes to ``device``
+                and the graph runs in its ``use_philox_dumps`` scope. The dump
+                is not put in the tensor map and is not an output.
 
         Returns:
             Mapping of output tensor UID to ReferenceOutput.
@@ -318,7 +323,13 @@ class PyTorchReferenceProvider(ReferenceProvider):
                 tensor = tensor.to(torch.float64)
             tensors[uid] = tensor
 
-        _get_pytorch_ops().execute_graph(graph_json, tensors)
+        pytorch_ops = _get_pytorch_ops()
+        dumps = {
+            uid: torch.as_tensor(dump, device=device)
+            for uid, dump in (philox_dumps or {}).items()
+        }
+        with pytorch_ops.use_philox_dumps(dumps):
+            pytorch_ops.execute_graph(graph_json, tensors)
 
         # NumPy has no bfloat16 or fp8, so those host outputs are returned as
         # the float32 values BufferManager also uses for comparison. Virtual
