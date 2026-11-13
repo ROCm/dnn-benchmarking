@@ -147,7 +147,8 @@ def _forward_dropout_form(dropout: SdpaDropout) -> Optional[str]:
     """The dropout form of a forward node, declined as hipDNN declines it.
 
     An explicit mask comes with a scale and with no probability, seed, offset
-    or ``rng_dump`` (PlanUtils.hpp). Seed, offset and ``rng_dump`` need a
+    or ``rng_dump`` (PlanUtils.hpp, rocm-libraries #14358 and #15066; the
+    submodule pin predates both). Seed, offset and ``rng_dump`` need a
     non-null probability. A probability of 0 without ``rng_dump`` is no
     dropout, and seed and offset are not read. Philox dropout is validated
     only through the engine's ``rng_dump``: it needs a probability in
@@ -993,7 +994,8 @@ def _dropout_attention(
     """fp32 attention with dropout: ``O = (P * keep * keep_scale) V``.
 
     ``P`` is the softmax before dropout, normalised with the sink logits when
-    there are sinks (CpuFpReferenceSdpa.hpp). ``keep`` is the dropout mask
+    there are sinks (CpuFpReferenceSdpa.hpp, rocm-libraries #14358; the
+    submodule pin predates it). ``keep`` is the dropout mask
     (``[B|1, Hq|1, Sq, Skv]``), not renormalised. ``mask_rows(start, end)``
     gives the additive mask of query rows ``[start, end)``. Returns the fp32
     output and the log-sum-exp before dropout (the stats). A query row that
@@ -1067,7 +1069,8 @@ def _check_explicit_dropout(
     """Decline the dropout mask and scale tensors that hipDNN declines.
 
     The mask is FLOAT ``[B|1, Hq|1, Sq, Skv]``, indexed by the query head;
-    the scale is one FLOAT element (PlanUtils.hpp).
+    the scale is one FLOAT element (PlanUtils.hpp, rocm-libraries #14358;
+    the submodule pin predates it).
     """
     b, hq, sq, skv = _attention_dims(node, graph_json)
     dims, data_type = _graph_tensor(
@@ -1100,7 +1103,8 @@ def _philox_dump(
 ) -> torch.Tensor:
     """The engine's ``rng_dump`` of a Philox forward, as its float32 mask.
 
-    The graph's ``rng_dump`` is FLOAT ``[B, Hq, Sq, Skv]`` (PlanUtils.hpp). The
+    The graph's ``rng_dump`` is FLOAT ``[B, Hq, Sq, Skv]`` (PlanUtils.hpp,
+    rocm-libraries #14358; the submodule pin predates it). The
     dump comes from the ``use_philox_dumps`` scope, never from the tensor map:
     a buffer manager puts a zeroed ``rng_dump`` buffer there. Outside a scope
     the graph is declined, so PyTorch rows of Philox graphs stay declined.
@@ -1591,7 +1595,8 @@ def compile_sdpa(
 
 
 def _decline_backward_philox(dropout: SdpaDropout) -> None:
-    """Decline Philox dropout in the backward, as hipDNN does (PlanUtils.hpp).
+    """Decline Philox dropout in the backward, as hipDNN does (PlanUtils.hpp,
+    rocm-libraries #14358; the submodule pin predates it).
 
     Runs before the forward dropout rules of ``_plan_sdpa_common``, whose
     messages name an ``rng_dump`` output that a backward node cannot have.
@@ -1600,7 +1605,8 @@ def _decline_backward_philox(dropout: SdpaDropout) -> None:
     if p is not None and p != 0.0:
         raise ValueError(
             f"SDPA Philox backward dropout (dropout_probability={p}) is not "
-            "supported (rocm-libraries #15643, draft)"
+            "supported: the hipDNN backward graph has no dropout mask output, "
+            "so the reference has no mask to apply (see rocm-libraries #15643)"
         )
     if dropout.seed_uid is not None or dropout.offset_uid is not None:
         raise ValueError(
@@ -1615,7 +1621,8 @@ def _check_backward_dropout(
     """Decline the backward explicit-mask dropout that hipDNN declines.
 
     The backward takes an explicit mask with its scale and an optional
-    one-FLOAT-element ``dropout_scale_inv`` (PlanUtils.hpp).
+    one-FLOAT-element ``dropout_scale_inv`` (PlanUtils.hpp, rocm-libraries
+    #14358; the submodule pin predates it).
     """
     dropout = plan.dropout
     if dropout.scale_inv_uid is not None:
@@ -1654,7 +1661,8 @@ def compile_sdpa_backward(
     ``inv`` (1 when absent), ``P`` stays the softmax before dropout and
     ``D = rowsum(dO * O) * inv``, ``dP = (dO V^T) * M``,
     ``dS = s * P * (dP - D)``, ``dV = (P * M * s)^T dO``
-    (CpuFpReferenceSdpa.hpp).
+    (CpuFpReferenceSdpa.hpp, rocm-libraries #14358; the submodule pin
+    predates it).
     """
     if _optional_uid(node, "dbias_tensor_uid") is not None:
         raise ValueError(
