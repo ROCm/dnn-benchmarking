@@ -1383,6 +1383,42 @@ class TestPyTorchOpsNewHandlers:
         assert "ALiBi" in flagged["alibi"]
         assert "attn_mask combined with a causal mask" in flagged["bias_causal"]
 
+    def test_sdpa_forward_warns_for_an_explicit_dropout_mask(self) -> None:
+        """PyTorch SDPA takes no dropout mask, so the row times separate ops."""
+        graph_json = {
+            "tensors": [
+                {"uid": uid, "dims": dims, "data_type": "float"}
+                for uid, dims in (
+                    (1, [1, 2, 4, 16]),
+                    (2, [1, 2, 4, 16]),
+                    (3, [1, 2, 4, 16]),
+                    (4, [1, 2, 4, 16]),
+                    (5, [1, 2, 4, 4]),
+                    (6, [1]),
+                )
+            ],
+            "nodes": [
+                {
+                    "name": "dropout",
+                    "type": "SdpaAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "dropout_mask_tensor_uid": 5,
+                        "dropout_scale_tensor_uid": 6,
+                    },
+                    "outputs": {"o_tensor_uid": 4},
+                    "attributes": {"dropout_probability": None},
+                }
+            ],
+        }
+
+        warnings = pytorch_ops.get_reference_warnings(graph_json)
+
+        assert len(warnings) == 1
+        assert "dropout mask" in warnings[0]
+
     def test_builtin_rmsnorm_reference_has_no_warning_when_available(self) -> None:
         graph_json = {
             "tensors": [{"uid": 1, "dims": [2, 3, 4]}, {"uid": 2, "dims": [4]}],
@@ -3040,6 +3076,46 @@ class TestSdpaTimedRegion:
 
         assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
         assert set(primed) - _SDPA_TIMED_OPS
+
+    def test_explicit_mask_timed_run_has_no_setup(self) -> None:
+        """An explicit dropout mask runs as separate fp32 ops. The K/V
+        expansion, the bottom-right band and the dropout scale read are built
+        once; a timed run does only the attention math."""
+        torch.manual_seed(9)
+        graph = self._graph(stats=True, causal_mask_bottom_right=True)
+        graph["nodes"][0]["inputs"].update(
+            dropout_mask_tensor_uid=6, dropout_scale_tensor_uid=7
+        )
+        graph["tensors"] = [
+            {"uid": uid, "dims": dims, "data_type": "float"}
+            for uid, dims in (
+                (1, [1, 8, 4, 16]),
+                (2, [1, 2, 6, 16]),
+                (3, [1, 2, 6, 16]),
+                (4, [1, 8, 4, 16]),
+                (5, [1, 8, 4, 1]),
+                (6, [1, 8, 4, 6]),
+                (7, [1]),
+            )
+        ]
+        tensors = self._tensors(2, 2, kv_len=6)
+        tensors[6] = (torch.rand(1, 8, 4, 6) < 0.9).float()
+        tensors[7] = torch.tensor([1 / 0.9])
+
+        primed, timed, _ = _replay_sdpa(graph, tensors)
+
+        setup = (
+            "index",
+            "clone",
+            "_to_copy",
+            "arange",
+            "masked_fill",
+            "repeat_interleave",
+            "_local_scalar_dense",
+        )
+        leaked = [op for op in timed if op.split(".")[1] in setup]
+        assert not leaked, f"setup in timed run: {leaked}"
+        assert any(op.split(".")[1] == "arange" for op in primed)
 
     @pytest.mark.parametrize(
         ("selection", "expected_call"),

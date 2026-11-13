@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 import torch.nn.functional as F
 
+from ..sdpa_dropout import read_dropout
 from ._common import (
     _effective_compute_type,
     _is_float32_compute,
@@ -33,6 +34,12 @@ def _sdpa_forward_workarounds(
         reasons.append(
             "PyTorch SDPA has no attention-sink input, so attention runs as "
             "separate fp32 matmul, softmax and matmul ops instead of an SDPA kernel"
+        )
+    if read_dropout(node).mask_uid is not None:
+        reasons.append(
+            "PyTorch SDPA takes no dropout mask, so attention runs as separate "
+            "fp32 matmul, softmax, dropout mask and matmul ops instead of an "
+            "SDPA kernel"
         )
     if uid("page_table_k_tensor_uid") is not None:
         reasons.append(

@@ -9,6 +9,8 @@ import torch
 
 from ....common.exceptions import UnsupportedGraphError
 from ....config.benchmark_config import PyTorchSdpaBackendName
+from ....graph.loader import tensor_data_type
+from ...sdpa_dropout import SdpaDropout, read_dropout
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
 from .._sdpa_backend import (
@@ -62,15 +64,24 @@ class _DenseSdpa(NamedTuple):
     enable_gqa: bool
 
 
-class _SinkSdpa(NamedTuple):
-    """Setup of a dense forward with sinks (manual fp32 attention)."""
+class _ManualSdpa(NamedTuple):
+    """Setup of a dense forward that runs a manual fp32 attention (sinks or
+    dropout)."""
 
     scale: float
     q_float: torch.Tensor
     k_t: torch.Tensor
     v_float: torch.Tensor
     mask: Optional[torch.Tensor]
-    sink: torch.Tensor
+    sink: Optional[torch.Tensor]
+
+
+class _ExplicitDropoutSdpa(NamedTuple):
+    """Setup of a dense forward with an explicit dropout mask."""
+
+    attention: _ManualSdpa
+    keep: torch.Tensor  # float32 dropout mask
+    keep_scale: float  # dropout_scale
 
 
 def _sdpa_bool(node: Dict[str, Any], key: str, default: bool = False) -> bool:
@@ -112,9 +123,13 @@ def _sdpa_head_repeat(q_heads: int, kv_heads: int, label: str) -> int:
     return q_heads // kv_heads
 
 
+#: Dropout forms of an SDPA node (``_SdpaPlan.dropout_form``). None is no
+#: dropout.
+_EXPLICIT_DROPOUT = "explicit"
+
+
 class _SdpaPlan(NamedTuple):
     mask_uid: Optional[int]
-    dropout_p: float
     is_causal: bool
     scale_uid: Optional[int]
     attn_scale_value: Any
@@ -122,18 +137,51 @@ class _SdpaPlan(NamedTuple):
     bottom_right: bool
     sink_uid: Optional[int]
     alibi: bool
+    dropout: SdpaDropout
+    dropout_form: Optional[str]
+
+
+def _forward_dropout_form(dropout: SdpaDropout) -> Optional[str]:
+    """The dropout form of a forward node, declined as hipDNN declines it.
+
+    An explicit mask comes with a scale and with no probability, seed or
+    offset (PlanUtils.hpp). A non-null probability of 0 is no dropout.
+    """
+    explicit = {
+        "dropout_mask_tensor_uid": dropout.mask_uid,
+        "dropout_scale_tensor_uid": dropout.scale_uid,
+    }
+    given = [key for key, uid in explicit.items() if uid is not None]
+    if given:
+        if (
+            dropout.probability is not None
+            or dropout.seed_uid is not None
+            or dropout.offset_uid is not None
+        ):
+            raise ValueError(
+                f"SDPA {' and '.join(given)} cannot be combined with "
+                "dropout_probability, seed_tensor_uid or offset_tensor_uid"
+            )
+        if len(given) == 1:
+            missing = next(key for key in explicit if key not in given)
+            raise ValueError(f"SDPA {given[0]} needs {missing}")
+        return _EXPLICIT_DROPOUT
+    if dropout.probability is not None and dropout.probability != 0.0:
+        raise ValueError(
+            "Nonzero SDPA dropout cannot be exactly validated against PyTorch"
+        )
+    return None
 
 
 def _plan_sdpa_common(
     node: Dict[str, Any],
     allow_paged: bool = False,
     allow_sink: bool = False,
+    backward: bool = False,
 ) -> _SdpaPlan:
     unsupported = [
         "seed_tensor_uid",
         "offset_tensor_uid",
-        "dropout_mask_tensor_uid",
-        "dropout_scale_tensor_uid",
         "block_mask_tensor_uid",
         "descale_q_tensor_uid",
         "descale_k_tensor_uid",
@@ -142,6 +190,8 @@ def _plan_sdpa_common(
         "scale_s_tensor_uid",
         "scale_o_tensor_uid",
     ]
+    if backward:
+        unsupported += ["dropout_mask_tensor_uid", "dropout_scale_tensor_uid"]
     if not allow_sink:
         unsupported.append("sink_token_tensor_uid")
     if not allow_paged:
@@ -162,12 +212,8 @@ def _plan_sdpa_common(
             "SDPA padding masks are not supported by the PyTorch reference"
         )
 
-    dropout_probability = _node_param(node, "dropout_probability", 0.0)
-    dropout_p = 0.0 if dropout_probability is None else float(dropout_probability)
-    if dropout_p != 0.0:
-        raise ValueError(
-            "Nonzero SDPA dropout cannot be exactly validated against PyTorch"
-        )
+    dropout = read_dropout(node)
+    dropout_form = _forward_dropout_form(dropout)
 
     mask_uid = _optional_uid(node, "attn_mask_tensor_uid")
     is_causal, window, bottom_right = _sdpa_derive_mask(node)
@@ -193,7 +239,6 @@ def _plan_sdpa_common(
     sink_uid = _optional_uid(node, "sink_token_tensor_uid")
     return _SdpaPlan(
         mask_uid=mask_uid,
-        dropout_p=dropout_p,
         is_causal=is_causal,
         scale_uid=scale_uid,
         attn_scale_value=attn_scale_value,
@@ -201,6 +246,8 @@ def _plan_sdpa_common(
         bottom_right=bottom_right,
         sink_uid=sink_uid,
         alibi=alibi,
+        dropout=dropout,
+        dropout_form=dropout_form,
     )
 
 
@@ -526,7 +573,6 @@ def _require_fused_default_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
-    dropout_p: float,
     is_causal: bool,
     scale: Optional[float],
     enable_gqa: bool,
@@ -550,7 +596,7 @@ def _require_fused_default_sdpa(
         k,
         v,
         attn_mask=attn_mask,
-        dropout_p=dropout_p,
+        dropout_p=0.0,
         is_causal=is_causal,
         scale=scale,
         enable_gqa=enable_gqa,
@@ -572,7 +618,6 @@ def _plan_paged_sdpa(
     seq_len_q_uid: Optional[int],
     seq_len_kv_uid: int,
     attn_mask: Optional[torch.Tensor],
-    dropout_p: float,
     is_causal: bool,
     scale: float,
     rep_k: int,
@@ -701,7 +746,6 @@ def _plan_paged_sdpa(
                 k_seq,
                 v_seq,
                 seq_mask,
-                dropout_p,
                 seq_causal,
                 scale,
                 enable_gqa,
@@ -903,6 +947,43 @@ def _sink_attention(
     return torch.cat(outputs, dim=-2), torch.cat(stats, dim=-2)
 
 
+def _dropout_attention(
+    q_float: torch.Tensor,
+    k_float_t: torch.Tensor,
+    v_float: torch.Tensor,
+    mask_rows: Callable[[int, int], Optional[torch.Tensor]],
+    sink_logits: Optional[torch.Tensor],
+    scale: float,
+    keep: torch.Tensor,
+    keep_scale: float,
+    blocks: Sequence[Tuple[int, int]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp32 attention with dropout: ``O = (P * keep * keep_scale) V``.
+
+    ``P`` is the softmax before dropout, normalised with the sink logits when
+    there are sinks (CpuFpReferenceSdpa.hpp). ``keep`` is the dropout mask
+    (``[B|1, Hq|1, Sq, Skv]``), not renormalised. ``mask_rows(start, end)``
+    gives the additive mask of query rows ``[start, end)``. Returns the fp32
+    output and the log-sum-exp before dropout (the stats). One query block of
+    ``blocks`` at a time; the probabilities overwrite the block's scores.
+    """
+    outputs, stats = [], []
+    for start, end in blocks:
+        scores = _scores(
+            q_float[..., start:end, :], k_float_t, mask_rows(start, end), scale
+        )
+        log_denom = torch.logsumexp(scores, dim=-1, keepdim=True)
+        if sink_logits is not None:
+            log_denom = torch.logaddexp(log_denom, sink_logits)
+        probs = scores.sub_(log_denom).exp_()
+        probs.mul_(_rows(keep, start, end)).mul_(keep_scale)
+        outputs.append(torch.matmul(probs, v_float))
+        stats.append(log_denom)
+    if len(outputs) == 1:
+        return outputs[0], stats[0]
+    return torch.cat(outputs, dim=-2), torch.cat(stats, dim=-2)
+
+
 def _is_computed(graph_json: Dict[str, Any], uid: int) -> bool:
     """Whether some node of the graph writes tensor ``uid``."""
     for node in graph_json.get("nodes", []):
@@ -913,6 +994,68 @@ def _is_computed(graph_json: Dict[str, Any], uid: int) -> bool:
             if value == uid or (isinstance(value, list) and uid in value):
                 return True
     return False
+
+
+def _graph_tensor(
+    graph_json: Dict[str, Any], uid: int, key: str
+) -> Tuple[Tuple[int, ...], Optional[str]]:
+    """``(dims, data_type)`` of tensor ``uid`` from the graph's tensor list."""
+    for tensor_json in graph_json.get("tensors", []):
+        if tensor_json.get("uid") == uid:
+            dims = tuple(int(dim) for dim in tensor_json.get("dims", []))
+            return dims, tensor_data_type(tensor_json, graph_json)
+    raise ValueError(f"SDPA {key} {uid} is not in the graph's tensor list")
+
+
+def _attention_dims(
+    node: Dict[str, Any], graph_json: Dict[str, Any]
+) -> Tuple[int, int, int, int]:
+    """``(B, Hq, Sq, Skv)`` of an SDPA node from its Q and K tensors."""
+    q, _ = _graph_tensor(
+        graph_json, _required_input_uid(node, "q_tensor_uid"), "q_tensor_uid"
+    )
+    k, _ = _graph_tensor(
+        graph_json, _required_input_uid(node, "k_tensor_uid"), "k_tensor_uid"
+    )
+    if len(q) != 4 or len(k) != 4:
+        raise ValueError(
+            f"SDPA dropout needs rank-4 Q and K, not {list(q)} and {list(k)}"
+        )
+    return q[0], q[1], q[2], k[2]
+
+
+def _check_explicit_dropout(
+    node: Dict[str, Any], graph_json: Dict[str, Any], dropout: SdpaDropout
+) -> None:
+    """Decline the dropout mask and scale tensors that hipDNN declines.
+
+    The mask is FLOAT ``[B|1, Hq|1, Sq, Skv]``, indexed by the query head;
+    the scale is one FLOAT element (PlanUtils.hpp).
+    """
+    b, hq, sq, skv = _attention_dims(node, graph_json)
+    dims, data_type = _graph_tensor(
+        graph_json, dropout.mask_uid, "dropout_mask_tensor_uid"
+    )
+    if data_type != "float":
+        raise ValueError(f"SDPA dropout mask must be FLOAT, not {data_type!r}")
+    if (
+        len(dims) != 4
+        or dims[0] not in (b, 1)
+        or dims[1] not in (hq, 1)
+        or dims[2:] != (sq, skv)
+    ):
+        raise ValueError(
+            f"SDPA dropout mask dims {list(dims)} are not [B|1, Hq|1, Sq, Skv] "
+            f"= [{b}|1, {hq}|1, {sq}, {skv}]"
+        )
+    dims, data_type = _graph_tensor(
+        graph_json, dropout.scale_uid, "dropout_scale_tensor_uid"
+    )
+    if data_type != "float" or _numel(dims) != 1:
+        raise ValueError(
+            f"SDPA dropout scale must be one FLOAT element, not {data_type!r} "
+            f"with dims {list(dims)}"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -945,6 +1088,12 @@ def compile_sdpa(
     PyTorch's SDPA has no attention-sink input, so a graph with sinks runs a
     manual fp32 attention (``_sink_attention``); its fp32 operands are built
     once too, and its softmax denominator is the stats output.
+
+    PyTorch's SDPA takes no dropout mask either. A graph with an explicit
+    dropout mask runs a manual fp32 attention (``_dropout_attention``) that
+    applies the mask and ``dropout_scale`` to the softmax; its operands are
+    built once, and the stats are the log-sum-exp before dropout. Dropout
+    with paged or ragged K/V is declined.
     """
     _sdpa_unsupported_if_present(
         node,
@@ -961,13 +1110,29 @@ def compile_sdpa(
     v_uid = _required_input_uid(node, "v_tensor_uid")
     o_uid = _required_output_uid(node, "o_tensor_uid")
     plan = _plan_sdpa_common(node, allow_paged=True, allow_sink=True)
-    dropout_p, is_causal = plan.dropout_p, plan.is_causal
+    is_causal = plan.is_causal
     stats_uid = _optional_uid(node, "stats_tensor_uid")
 
     page_table_k_uid = _optional_uid(node, "page_table_k_tensor_uid")
     page_table_v_uid = _optional_uid(node, "page_table_v_tensor_uid")
     seq_len_q_uid = _optional_uid(node, "seq_len_q_tensor_uid")
     seq_len_kv_uid = _optional_uid(node, "seq_len_kv_tensor_uid")
+    if plan.dropout_form is not None:
+        layout = [
+            key
+            for key, uid in (
+                ("page_table_k_tensor_uid", page_table_k_uid),
+                ("page_table_v_tensor_uid", page_table_v_uid),
+                ("seq_len_q_tensor_uid", seq_len_q_uid),
+                ("seq_len_kv_tensor_uid", seq_len_kv_uid),
+            )
+            if uid is not None
+        ]
+        if layout:
+            raise ValueError(
+                "SDPA dropout is not supported with paged or ragged K/V "
+                f"({', '.join(layout)})"
+            )
     is_paged = page_table_k_uid is not None or page_table_v_uid is not None
     if is_paged and plan.alibi:
         raise UnsupportedGraphError("SDPA ALiBi is not supported with paged attention")
@@ -978,6 +1143,8 @@ def compile_sdpa(
             raise ValueError("Paged SDPA needs seq_len_kv to bound each sequence")
         if stats_uid is not None:
             raise ValueError("Paged SDPA stats output is not supported")
+    if plan.dropout_form == _EXPLICIT_DROPOUT:
+        _check_explicit_dropout(node, graph_json, plan.dropout)
 
     # Setup is cached on the assumption that its inputs repeat unchanged every
     # replay. A tensor written by an earlier node breaks that assumption,
@@ -991,6 +1158,8 @@ def compile_sdpa(
             plan.mask_uid,
             plan.scale_uid,
             plan.sink_uid,
+            plan.dropout.mask_uid,
+            plan.dropout.scale_uid,
             page_table_k_uid,
             page_table_v_uid,
             seq_len_q_uid,
@@ -1055,22 +1224,35 @@ def compile_sdpa(
         """Whether the call mask holds the ALiBi bias rounded below float32."""
         return plan.alibi and torch.finfo(d.attn_mask.dtype).bits < 32
 
-    def prepare_sink(
+    def prepare_manual(
         tensors: Dict[int, torch.Tensor],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-    ) -> _SinkSdpa:
+    ) -> _ManualSdpa:
         attn_mask, scale, rep_k, rep_v, sink = resolve(tensors, q, k, v)
         attn_mask, causal = bounds(q, k, attn_mask, torch.float32)
         k_t, mask = _score_operands(k, attn_mask, causal, int(q.shape[-2]), rep_k)
-        return _SinkSdpa(
+        return _ManualSdpa(
             scale,
             q.to(dtype=torch.float32),
             k_t,
             _fp32_at_query_heads(v, rep_v),
             mask,
             sink,
+        )
+
+    def prepare_explicit_dropout(
+        tensors: Dict[int, torch.Tensor],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> _ExplicitDropoutSdpa:
+        mask = _tensor(tensors, plan.dropout.mask_uid, node)
+        return _ExplicitDropoutSdpa(
+            prepare_manual(tensors, q, k, v),
+            mask.to(dtype=torch.float32),
+            _scalar_value(tensors, plan.dropout.scale_uid, node),
         )
 
     def prepare_dense(
@@ -1095,7 +1277,6 @@ def compile_sdpa(
             k_op,
             v_op,
             attn_mask,
-            dropout_p,
             causal,
             scale,
             enable_gqa,
@@ -1120,7 +1301,6 @@ def compile_sdpa(
             seq_len_q_uid,
             seq_len_kv_uid,
             attn_mask,
-            dropout_p,
             is_causal,
             scale,
             rep_k,
@@ -1159,6 +1339,17 @@ def compile_sdpa(
             return None
         return _tensor(tensors, plan.mask_uid, node)
 
+    def store_manual(
+        tensors: Dict[int, torch.Tensor],
+        q: torch.Tensor,
+        o: torch.Tensor,
+        stats: torch.Tensor,
+    ) -> None:
+        """Store the fp32 output of a manual attention and its stats."""
+        _store_tensor(tensors, o_uid, o.to(dtype=q.dtype))
+        if stats_uid is not None:
+            _store_tensor(tensors, stats_uid, stats)
+
     # Everything derived from the constant inputs is built once per replay
     # map, during priming. Timed iterations run only the SDPA call(s) and, for
     # paged graphs, the per-sequence loop and re-pack.
@@ -1188,7 +1379,7 @@ def compile_sdpa(
                         s.k,
                         s.v,
                         attn_mask=s.mask,
-                        dropout_p=dropout_p,
+                        dropout_p=0.0,
                         is_causal=s.is_causal,
                         scale=paged.scale,
                         enable_gqa=paged.enable_gqa,
@@ -1200,14 +1391,33 @@ def compile_sdpa(
             _store_tensor(tensors, o_uid, o)
             return
 
+        if plan.dropout_form == _EXPLICIT_DROPOUT:
+            e = setup(
+                tensors,
+                "dropout",
+                lambda: prepare_explicit_dropout(tensors, q, k, v),
+            )
+            a = e.attention
+            o, stats = _dropout_attention(
+                a.q_float,
+                a.k_t,
+                a.v_float,
+                lambda start, end: _rows(a.mask, start, end),
+                a.sink,
+                a.scale,
+                e.keep,
+                e.keep_scale,
+                _query_blocks(a.q_float, int(a.k_t.shape[-1])),
+            )
+            store_manual(tensors, q, o, stats)
+            return
+
         if plan.sink_uid is not None:
-            s = setup(tensors, "sink", lambda: prepare_sink(tensors, q, k, v))
+            s = setup(tensors, "sink", lambda: prepare_manual(tensors, q, k, v))
             o, stats = _sink_attention(
                 s.q_float, s.k_t, s.v_float, s.mask, s.sink, s.scale
             )
-            _store_tensor(tensors, o_uid, o.to(dtype=q.dtype))
-            if stats_uid is not None:
-                _store_tensor(tensors, stats_uid, stats)
+            store_manual(tensors, q, o, stats)
             return
 
         d = setup(tensors, "dense", lambda: prepare_dense(tensors, q, k, v))
@@ -1217,7 +1427,7 @@ def compile_sdpa(
                 d.k,
                 d.v,
                 attn_mask=d.attn_mask,
-                dropout_p=dropout_p,
+                dropout_p=0.0,
                 is_causal=d.is_causal,
                 scale=d.scale,
                 enable_gqa=d.enable_gqa,
@@ -1278,7 +1488,7 @@ def compile_sdpa_backward(
     dq_uid = _required_output_uid(node, "dq_tensor_uid")
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
-    plan = _plan_sdpa_common(node)
+    plan = _plan_sdpa_common(node, backward=True)
     is_causal = plan.is_causal
     if plan.window is not None or plan.bottom_right:
         raise ValueError(
