@@ -23,10 +23,13 @@ from dnn_benchmarking.config.benchmark_config import (
 )
 from dnn_benchmarking.execution import suite_runner
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
+from dnn_benchmarking.graph.loader import GraphLoader
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics._diagnostic import reset as reset_warnings
 from dnn_benchmarking.reporting.reporter import Reporter
-from dnn_benchmarking.reporting.suite_results import graph_id_for
+from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
+from dnn_benchmarking.reporting.suite_results import OracleResult, graph_id_for
+from tests.rocke_graphs import sdpa_graph
 
 GRAPH = {"name": "g", "nodes": [], "tensors": []}
 PATH = Path("g.json")
@@ -47,6 +50,59 @@ def _tensor(uid, is_output):
 
 
 TENSORS = [_tensor(1, False), _tensor(2, True)]
+
+# Philox dropout graph: q 1, k 2, v 3, o 4 (tests/rocke_graphs.py), rng_dump 5,
+# seed 6, offset 7.
+O_UID, DUMP_UID = 4, 5
+O_SHAPE, DUMP_SHAPE = (1, 2, 4, 8), (1, 2, 4, 4)
+P = 0.9
+
+
+def _philox_graph(rng_dump=True):
+    """An SDPA forward graph with Philox dropout; its tensors, outputs marked."""
+    graph = sdpa_graph(b=1, hq=2, hkv=2, s=4, d=8, dropout_probability=P)
+    node = graph["nodes"][0]
+    for uid, name in ((6, "seed"), (7, "offset")):
+        graph["tensors"].append(
+            {
+                "uid": uid,
+                "name": name,
+                "dims": [1, 1, 1, 1],
+                "strides": [1, 1, 1, 1],
+                "data_type": "int64",
+                "virtual": False,
+            }
+        )
+        node["inputs"][f"{name}_tensor_uid"] = uid
+    if rng_dump:
+        graph["tensors"].append(
+            {
+                "uid": DUMP_UID,
+                "name": "rng_dump",
+                "dims": list(DUMP_SHAPE),
+                "strides": [32, 16, 4, 1],
+                "data_type": "float",
+                "virtual": False,
+            }
+        )
+        node["outputs"]["rng_dump_tensor_uid"] = DUMP_UID
+    return graph, GraphLoader().extract_tensor_info(graph)
+
+
+def _dump(*ones):
+    """A 0/1 dump with 1 at the given flat indices."""
+    dump = np.zeros(DUMP_SHAPE, np.float32)
+    dump.reshape(-1)[list(ones)] = 1.0
+    return dump
+
+
+def _philox_o(dump):
+    """The fake reference's O for ``dump``: a different dump gives another O."""
+    return np.repeat(dump, 2, axis=-1).astype(np.float32)
+
+
+# Two valid dumps at p = 0.9 (n = 32: 3 of 32 kept is within the keep-rate bound).
+DUMP_A, DUMP_B = _dump(0, 5, 9), _dump(1, 6, 30)
 
 
 def _measurement(**kw):
@@ -82,6 +138,12 @@ class Fake:
         self.bench_errors = {}
         self.measurement = {}
         self.engine_output = REF.copy()
+        # (engine_id, uid) -> output of that engine; others get engine_output.
+        self.engine_outputs = {}
+        self.current_engine = None  # engine of the last execute_once
+        # The engine never writes the rng_dump: the buffer keeps its fill.
+        self.dump_unwritten = False
+        self.tuned_outputs = {}  # uid -> output saved by the tuned child
         self.torch_error = None
         self.torch_execute_error = None
         self.clocks = []
@@ -147,13 +209,14 @@ def fake(monkeypatch):
         def execute_once(self, handle, variant_pack):
             self._call("execute_once", handle)
             f.events.append("execute_once")
+            f.current_engine = self.engine_id
 
         def __del__(self):
             f.events.append("executor_freed")
 
     class BufferManager:
         def __init__(self, tensor_infos, device=None):
-            pass
+            self.nan_uids = set()
 
         def __enter__(self):
             return self
@@ -168,8 +231,13 @@ def fake(monkeypatch):
         def load_input_data(self, data):
             pass
 
-        def zero_outputs(self):
-            f.events.append("zero_outputs")
+        def zero_outputs(self, nan_uids=()):
+            f.events.append(
+                ("zero_outputs", tuple(sorted(nan_uids)))
+                if nan_uids
+                else "zero_outputs"
+            )
+            self.nan_uids = set(nan_uids)
 
         def create_variant_pack(self):
             return {}
@@ -179,7 +247,10 @@ def fake(monkeypatch):
 
         def get_output_data(self, uid):
             f.events.append("read_output")
-            return f.engine_output
+            if f.dump_unwritten and uid == DUMP_UID:
+                fill = np.nan if uid in self.nan_uids else 0.0
+                return np.full(DUMP_SHAPE, fill, np.float32)
+            return f.engine_outputs.get((f.current_engine, uid), f.engine_output)
 
     class Probe:
         def clocks(self):
@@ -188,6 +259,16 @@ def fake(monkeypatch):
     def run_hipdnn_tuned(**kw):
         f.calls.append(("tuned", kw["engine_id"], None))
         f.tuned.append(kw)
+        validate = kw.get("validate")
+        saved = SimpleNamespace(
+            get_output_tensor=lambda uid: None, get_output_data=f.tuned_outputs.get
+        )
+        kw["row"].oracle = OracleResult(
+            tuning_available=True,
+            timing=TimingInfo.from_measurement(_measurement()),
+            gpu_kernel_stats=BenchmarkStats.from_timings([0.5] * 10),
+            correctness=validate(saved) if validate is not None else None,
+        )
 
     monkeypatch.setattr(suite_runner, "Executor", Executor)
     monkeypatch.setattr(suite_runner, "run_hipdnn_tuned", run_hipdnn_tuned)
@@ -271,6 +352,7 @@ def fake_torch(fake, monkeypatch):
         float64 = False  # supports_float64
         float64_error = None  # raised by a float64 compute
         float64_output = REF.astype(np.float64)
+        device_error = None  # raised by a Philox reference on a device
 
         def supports_float64(self, graph_json):
             return self.float64
@@ -280,7 +362,21 @@ def fake_torch(fake, monkeypatch):
                 return self.estimated_bytes[precision]
             return self.estimated_bytes
 
-        def compute_reference(self, graph_json, input_data, *, precision, device):
+        def compute_reference(
+            self, graph_json, input_data, *, precision, device, philox_dumps=None
+        ):
+            if philox_dumps is not None:
+                fake.events.append(
+                    ("philox_reference", {u: d.copy() for u, d in philox_dumps.items()})
+                )
+                if device is not None and self.device_error is not None:
+                    raise self.device_error
+                (dump,) = philox_dumps.values()
+                return {
+                    O_UID: suite_runner.ReferenceOutput(
+                        data=_philox_o(dump), tensor_uid=O_UID
+                    )
+                }
             if precision is NATIVE:
                 fake.events.append("cpu_reference")
                 return {2: suite_runner.ReferenceOutput(data=REF.copy(), tensor_uid=2)}
@@ -324,17 +420,17 @@ class _Handle:
         self.stream = stream
 
 
-def _run(handle="default", **config):
+def _run(handle="default", graph=GRAPH, tensors=TENSORS, **config):
     out = io.StringIO()
-    graph = suite_runner.run_graph(
+    result = suite_runner.run_graph(
         PATH,
-        GRAPH,
-        TENSORS,
+        graph,
+        tensors,
         SuiteConfig(**config),
         Reporter(out),
         [suite_runner.hipdnn_planner(_Handle() if handle == "default" else handle)],
     )
-    return graph, out.getvalue()
+    return result, out.getvalue()
 
 
 def _validate(**config):
@@ -1731,3 +1827,46 @@ def test_rocke_rows_without_a_reference(
     engines = [r for r in graph.results if r.role == "engine"]
     assert [e.verdict for e in engines] == [verdict] * 3
     assert all(e.status == "success" for e in engines)
+
+
+# --- Philox dropout ----------------------------------------------------------
+
+
+def _exit_code(graph):
+    from dnn_benchmarking.cli import suite_runner_cli
+
+    return suite_runner_cli._exit_code(SimpleNamespace(graphs=[graph]), True)
+
+
+def test_philox_without_rng_dump_fails_with_a_message_naming_it(fake_torch):
+    """The reference cannot make the Philox stream again; without the engine's
+    dump, validation must fail and say what is missing."""
+    graph_json, tensors = _philox_graph(rng_dump=False)
+
+    graph, _ = _validate(graph=graph_json, tensors=tensors)
+
+    engines = [r for r in graph.results if r.role == "engine"]
+    assert [e.verdict for e in engines] == ["failed", "failed"]
+    assert all("rng_dump" in e.ootb.correctness.error_message for e in engines)
+    assert _exit_code(graph) == 3
+
+
+def test_philox_without_rng_dump_fails_even_when_the_cpu_reference_would_not_fit(
+    fake_torch, monkeypatch
+):
+    """A large graph must not turn the missing rng_dump into "unchecked"."""
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    fake_torch.torch_error = ExecutionError("PyTorch GPU not available")
+    fake_torch.cpu_reference.estimated_bytes = 9 << 30  # over 80% of 10 GiB
+    graph_json, tensors = _philox_graph(rng_dump=False)
+
+    graph, _ = _validate(graph=graph_json, tensors=tensors)
+
+    engines = [r for r in graph.results if r.role == "engine"]
+    assert [e.verdict for e in engines] == ["failed", "failed"]
+    assert all("rng_dump" in e.ootb.correctness.error_message for e in engines)
+    assert _exit_code(graph) == 3

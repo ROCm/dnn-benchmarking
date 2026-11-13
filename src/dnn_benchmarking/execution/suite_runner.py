@@ -61,6 +61,7 @@ from .rocke_sdpa import (
     catalog_kernels,
     sdpa_problem,
 )
+from .sdpa_dropout import philox_without_dump
 
 
 @dataclass
@@ -716,7 +717,8 @@ def _prepare_references(
     PyTorch SDPA selection never falls back to the CPU reference after the
     timed native path fails. The CPU reference is skipped when its estimated
     host memory does not fit (``ctx.validation_skip_reason``): the engine rows
-    are then unchecked, not failed.
+    are then unchecked, not failed. A graph with Philox dropout and no
+    ``rng_dump`` gets no reference: its engine rows fail.
 
     With ``--reference-precision float64`` (the default), a graph the provider
     can compute in float64 gets a float64 reference: on the GPU after the
@@ -727,6 +729,13 @@ def _prepare_references(
     provider, ctx.reference_error = _reference_provider(config, ctx.graph_json)
     if provider is None:
         warn_once("validation", f"{ctx.graph_name}: {ctx.reference_error}")
+        return None
+    # Decide before the host-memory check: a large graph must fail here too,
+    # not become unchecked.
+    philox_error = philox_without_dump(ctx.graph_json)
+    if philox_error is not None:
+        ctx.reference_error = philox_error
+        warn_once("validation", f"{ctx.graph_name}: {philox_error}")
         return None
 
     outputs: Optional[Dict[int, ReferenceOutput]] = None
