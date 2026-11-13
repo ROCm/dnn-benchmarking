@@ -817,10 +817,15 @@ def test_install_aiter_skips_without_fetching(
     assert not (tmp_path / "aiter").exists()
 
 
-def test_install_aiter_installs_in_compat_mode_and_reports_prebuild_failure(
+def test_install_aiter_installs_without_isolation_and_reports_prebuild_failure(
     setup_env, tmp_path, monkeypatch, capsys
 ) -> None:
-    monkeypatch.setattr(setup_env, "AITER_DIR", tmp_path / "aiter")
+    aiter = tmp_path / "aiter"
+    aiter.mkdir()
+    (aiter / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["setuptools>=45", "flydsl==0.4.2"]\n'
+    )
+    monkeypatch.setattr(setup_env, "AITER_DIR", aiter)
     setup = _setup(setup_env, tmp_path)
     setup.installed_torch_mode = "rocm"
     monkeypatch.setattr(setup, "ensure_aiter_checkout", lambda: None)
@@ -834,15 +839,19 @@ def test_install_aiter_installs_in_compat_mode_and_reports_prebuild_failure(
 
     setup.install_aiter()
 
+    # An isolated build hides the venv's Triton from AITER's setup.py, which
+    # then reinstalls Triton; so the build requirements go into the venv.
+    assert installs[-2][0] == ("install", "setuptools>=45", "flydsl==0.4.2")
     # The default editable finder loses to the aiter/ checkout, which imports
     # as an empty namespace package from the repository root.
     args, env = installs[-1]
     assert args == (
         "install",
+        "--no-build-isolation",
         "--config-settings",
         "editable_mode=compat",
         "-e",
-        str(tmp_path / "aiter"),
+        str(aiter),
     )
     assert env["AITER_USE_SYSTEM_TRITON"] == "1"
     assert "Some AITER backends did not compile" in capsys.readouterr().err

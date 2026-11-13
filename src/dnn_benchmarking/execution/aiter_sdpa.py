@@ -4,7 +4,8 @@
 """Select the AITER kernels that run one SDPA forward graph (``--runtime aiter``).
 
 Each graph gets one row for AITER's own dispatch (``aiter.flash_attn_func``)
-and one row for each AITER forward backend that can run the graph:
+when that dispatch has a kernel for the graph, and one row for each AITER
+forward backend that can run the graph:
 
 ========================  ======================================================
 Row                       AITER entry point
@@ -30,7 +31,7 @@ This module needs neither torch nor AITER at import time.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from ..common.exceptions import UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
@@ -167,9 +168,22 @@ def _triton_head_sizes_ok(problem: DenseSdpa) -> bool:
     return pe > 0 and pow2(pe) and pow2(dv)
 
 
+def _padded_head_sizes(p: DenseSdpa) -> Tuple[int, int]:
+    """The head sizes rounded up to a multiple of 8, as flash_attn_func pads."""
+    return (-(-p.head_size_qk // 8) * 8, -(-p.head_size_v // 8) * 8)
+
+
+def _auto_runs(p: DenseSdpa, device: AiterDevice) -> bool:
+    # flash_attn_func pads both head sizes to a multiple of 8. Above 256 no
+    # v3, native, OPUS or FlyDSL path takes a dense fp16/bf16 problem, and the
+    # Triton fallback runs only with CK disabled, so it ends in mha_fwd, which
+    # checks head sizes <= 256 (csrc/py_itfs_ck/mha_fwd_kernels.cu).
+    return max(_padded_head_sizes(p)) <= _CK_MAX_HEAD_SIZE
+
+
 def _ck_runs(p: DenseSdpa, device: AiterDevice) -> bool:
-    # aiter.flash_attn_func pads other head sizes to a multiple of 8 before it
-    # calls mha_fwd; this row launches mha_fwd itself.
+    # mha_fwd takes head sizes that are multiples of 8 up to 256; this row
+    # launches mha_fwd itself, without flash_attn_func's padding.
     heads = (p.head_size_qk, p.head_size_v)
     return all(h % 8 == 0 for h in heads) and max(heads) <= _CK_MAX_HEAD_SIZE
 
@@ -217,8 +231,10 @@ def _gluon_runs(p: DenseSdpa, device: AiterDevice) -> bool:
     return device.gluon and _triton_head_sizes_ok(p)
 
 
-#: Each backend row's name and whether it runs a problem, in row order.
+#: Each row's name and whether it runs a problem, in row order. ``auto`` is
+#: ``aiter:auto``, AITER's own selection through ``flash_attn_func``.
 _BACKENDS = (
+    ("auto", _auto_runs),
     ("ck", _ck_runs),
     ("asm_v3", _asm_v3_runs),
     ("opus", _opus_runs),
@@ -228,19 +244,34 @@ _BACKENDS = (
 )
 
 
-def backend_rows(problem: DenseSdpa, device: AiterDevice) -> List[AiterBackend]:
+def backend_rows(
+    problem: DenseSdpa, device: AiterDevice, auto_only: bool = False
+) -> List[AiterBackend]:
     """The AITER rows that run ``problem``: ``aiter:auto``, then each backend.
 
+    Args:
+        problem: The SDPA problem.
+        device: The GPU facts.
+        auto_only: Consider ``aiter:auto`` only (``--runtime aiter:auto``).
+
     Raises:
-        UnsupportedGraphError: The device is not one of :data:`AITER_ARCHES`.
+        UnsupportedGraphError: The device is not one of :data:`AITER_ARCHES`,
+            or no considered row runs ``problem``.
     """
     if device.arch not in AITER_ARCHES:
         raise UnsupportedGraphError(
             f"AITER runtime runs on {', '.join(AITER_ARCHES)}, not {device.arch}"
         )
-    rows = [AiterBackend("auto")]
-    for name, runs in _BACKENDS:
+    candidates = _BACKENDS[:1] if auto_only else _BACKENDS
+    rows = []
+    for name, runs in candidates:
         if runs(problem, device):
             splits = _native_splits(problem, device.num_cus)
             rows.append(AiterBackend(name, splits if name == "native_splitkv" else 0))
+    if not rows:
+        which = "aiter:auto" if auto_only else "AITER backend"
+        raise UnsupportedGraphError(
+            f"no {which} runs {problem.data_type} head sizes "
+            f"{problem.head_size_qk}/{problem.head_size_v} on {device.arch}"
+        )
     return rows

@@ -293,8 +293,12 @@ On Linux with ROCm torch, the `AITER` stage installs AITER for
    --recursive aiter`) is kept; a commit other than the pin gives a warning.
    With `--reuse-artifacts`, it fetches nothing: without a checkout, it
    skips the stage.
-2. It installs AITER's `requirements.txt` and then AITER as an editable
-   package, with `AITER_USE_SYSTEM_TRITON=1` so torch's Triton stays.
+2. It installs AITER's `requirements.txt` and its build requirements
+   (`[build-system] requires` in `aiter/pyproject.toml`), then AITER as an
+   editable package without build isolation and with
+   `AITER_USE_SYSTEM_TRITON=1`. Both are needed to keep torch's Triton: an
+   isolated build cannot see it, and AITER then runs its own Triton install
+   script.
 3. On a GPU that AITER supports (gfx90a, gfx942, gfx950), it runs every
    AITER backend that `--runtime aiter` runs on that GPU once, for fp16 and
    bf16 with and without a causal mask. This compiles AITER's host modules

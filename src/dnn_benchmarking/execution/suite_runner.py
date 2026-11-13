@@ -1365,9 +1365,9 @@ def aiter_planner(session: AiterSession) -> GraphPlanner:
     ) -> RuntimePlan:
         try:
             problem = aiter_problem(graph_json, tensor_infos)
-            backends = backend_rows(problem, session.device)
-            if config.aiter_rows is AiterRows.AUTO:
-                backends = backends[:1]  # aiter:auto comes first
+            backends = backend_rows(
+                problem, session.device, auto_only=config.aiter_rows is AiterRows.AUTO
+            )
         except UnsupportedGraphError as e:
             return RuntimePlan("aiter", message=str(e))
         except Exception as e:

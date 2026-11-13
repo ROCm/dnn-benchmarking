@@ -65,6 +65,22 @@ AITER_DIR = SCRIPT_DIR / "aiter"
 # code generator of its CK forward kernels.
 AITER_SUBMODULES = ("3rdparty/composable_kernel",)
 
+
+def aiter_build_requires(aiter_dir: Path) -> list[str]:
+    """AITER's build requirements (``[build-system] requires``).
+
+    AITER is installed without build isolation: in an isolated build its
+    setup.py sees neither torch nor torch's Triton, ignores
+    ``AITER_USE_SYSTEM_TRITON`` and runs its install_triton.sh, which
+    uninstalls and reinstalls Triton with the first ``python3`` on ``PATH``.
+    So these requirements go into the venv first.
+    """
+    import tomllib
+
+    with open(aiter_dir / "pyproject.toml", "rb") as f:
+        return list(tomllib.load(f)["build-system"]["requires"])
+
+
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
@@ -1739,11 +1755,11 @@ class Setup:
 
         AITER compiles its host modules (JIT) against the installed torch, so
         it is installed from source (the ``aiter`` submodule) and only with
-        ROCm torch. ``AITER_USE_SYSTEM_TRITON=1`` keeps torch's Triton. On a
-        GPU that AITER supports, the stage then runs every AITER backend once
-        on small problems (``aiter_executor.prebuild``); the compiled modules
-        stay in ``<venv>/aiter-jit``. --reuse-artifacts fetches no AITER
-        sources: it installs an existing ``aiter/`` checkout or skips.
+        ROCm torch, without build isolation (see :func:`aiter_build_requires`).
+        On a GPU that AITER supports, the stage then runs every AITER backend
+        once on small problems (``aiter_executor.prebuild``); the compiled
+        modules stay in ``<venv>/aiter-jit``. --reuse-artifacts fetches no
+        AITER sources: it installs an existing ``aiter/`` checkout or skips.
         """
         if self.installed_torch_mode != "rocm":
             print(
@@ -1762,11 +1778,14 @@ class Setup:
         env = dict(self.env, AITER_USE_SYSTEM_TRITON="1")
         # AITER's runtime imports (pyyaml, ...) are in requirements.txt only.
         self.pip("install", "-r", str(AITER_DIR / "requirements.txt"), env=env)
+        self.pip("install", *aiter_build_requires(AITER_DIR), env=env)
         # compat mode puts aiter/ on sys.path through a .pth file. The default
         # finder loses to the aiter/ checkout itself, which imports as an empty
         # namespace package from the repository root (python -c, python -m).
         compat = ("--config-settings", "editable_mode=compat")
-        self.pip("install", *compat, "-e", str(AITER_DIR), env=env)
+        self.pip(
+            "install", "--no-build-isolation", *compat, "-e", str(AITER_DIR), env=env
+        )
         prebuild = run([self.py, "-c", _AITER_PREBUILD], env=env, check=False)
         if prebuild.returncode != 0:
             warn(

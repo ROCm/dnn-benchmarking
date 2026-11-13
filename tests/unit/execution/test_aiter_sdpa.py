@@ -52,9 +52,14 @@ def test_problem_reads_both_head_sizes_and_the_kv_length() -> None:
 
 def test_top_left_causal_needs_equal_sequence_lengths() -> None:
     """AITER aligns causal masks bottom right, so only a square top-left fits."""
-    with pytest.raises(UnsupportedGraphError, match="bottom right"):
-        _problem(sdpa_graph(s=128, s_kv=512, causal_mask=True))
+    for s_kv in (512, 32):  # more keys than queries, then more queries than keys
+        with pytest.raises(UnsupportedGraphError, match="bottom right"):
+            _problem(sdpa_graph(s=128, s_kv=s_kv, causal_mask=True))
     assert is_causal(_problem(sdpa_graph(s=512, causal_mask=True)))
+
+
+def test_no_mask_is_not_causal() -> None:
+    assert not is_causal(_problem(sdpa_graph(s=128, s_kv=512, causal_mask=False)))
 
 
 def test_bottom_right_causal_runs_on_any_shape() -> None:
@@ -67,6 +72,49 @@ def test_bottom_right_causal_runs_on_any_shape() -> None:
 def test_unsupported_features_name_the_aiter_runtime() -> None:
     with pytest.raises(UnsupportedGraphError, match="AITER runtime .*dropout"):
         _problem(sdpa_graph(dropout_probability=0.1))
+
+
+@pytest.mark.parametrize(
+    "attributes, match",
+    [
+        (dict(causal_mask=True, left_bound=1024), "left_bound 1024"),
+        (dict(causal_mask=True, right_bound=4), "right_bound 4"),
+        (
+            dict(causal_mask=False, causal_mask_bottom_right=True, left_bound=64),
+            "left_bound 64",
+        ),
+        (
+            dict(causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"),
+            "causal_mask with diagonal_alignment BOTTOM_RIGHT",
+        ),
+    ],
+)
+def test_causal_flags_that_hipdnn_composes_with_bounds_are_refused(
+    attributes, match
+) -> None:
+    """hipDNN keeps the bounds and the alignment next to a deprecated causal
+    flag; the shared mask resolver drops them, so the rows would run another
+    mask."""
+    with pytest.raises(UnsupportedGraphError, match=f"AITER runtime .*{match}"):
+        _problem(sdpa_graph(**attributes))
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        # The flag sets right_bound 0, so -1 and 0 give the same mask.
+        dict(causal_mask=True, left_bound=-1, right_bound=0),
+        # causal_mask_bottom_right is bottom right whatever the alignment.
+        dict(causal_mask=False, causal_mask_bottom_right=True),
+        dict(
+            causal_mask=False,
+            causal_mask_bottom_right=True,
+            diagonal_alignment="BOTTOM_RIGHT",
+        ),
+    ],
+)
+def test_causal_flags_without_other_bounds_still_run(attributes) -> None:
+    assert is_causal(_problem(sdpa_graph(**attributes)))
 
 
 @pytest.mark.parametrize(
@@ -118,7 +166,17 @@ def test_unsupported_features_name_the_aiter_runtime() -> None:
             id="gfx90a-has-no-triton-config",
         ),
         pytest.param(GFX950, dict(d=60), ["auto", "triton", "gluon"], id="d-not-x8"),
-        pytest.param(GFX950, dict(d=512), ["auto", "triton", "gluon"], id="d512"),
+        pytest.param(
+            GFX950,
+            dict(d=64, d_v=60, causal_mask=False),
+            ["auto"],
+            id="v-not-x8-no-ck-no-pe-split",
+        ),
+        # flash_attn_func pads 250 to 256, which mha_fwd still takes.
+        pytest.param(GFX950, dict(d=250), ["auto", "triton", "gluon"], id="d250"),
+        # Padded above 256, flash_attn_func has no kernel left.
+        pytest.param(GFX950, dict(d=257), ["triton", "gluon"], id="d257"),
+        pytest.param(GFX950, dict(d=512), ["triton", "gluon"], id="d512"),
         pytest.param(
             GFX950, dict(d=176, d_v=128), ["auto", "ck"], id="pe-not-power-of-two"
         ),
@@ -126,6 +184,38 @@ def test_unsupported_features_name_the_aiter_runtime() -> None:
 )
 def test_backend_rows(device, graph, rows) -> None:
     assert _rows(device, **graph) == rows
+
+
+def test_split_kv_row_carries_the_split_count() -> None:
+    # 8 query tiles on 304 CUs, 64 KV tiles: min(16, 64 / 10 -> 4) = 4 splits.
+    graph = sdpa_graph(
+        b=1, hq=8, hkv=8, s=128, s_kv=4096, dtype="bfloat16", d=64, causal_mask=False
+    )
+    rows = backend_rows(_problem(graph), GFX942)
+    assert [(b.name, b.num_splits) for b in rows] == [
+        ("auto", 0),
+        ("ck", 0),
+        ("native_splitkv", 4),
+        ("triton", 0),
+    ]
+
+
+def test_auto_only_considers_only_aiters_own_selection() -> None:
+    p = _problem(sdpa_graph(dtype="bfloat16", d=128))
+    assert [b.name for b in backend_rows(p, GFX950, auto_only=True)] == ["auto"]
+
+
+@pytest.mark.parametrize("auto_only", [False, True])
+def test_a_problem_that_no_row_runs_is_unsupported(auto_only) -> None:
+    """d512 on gfx90a: no Triton config, and nothing in flash_attn_func."""
+    p = _problem(sdpa_graph(d=512))
+    with pytest.raises(UnsupportedGraphError, match="512/512 on gfx90a"):
+        backend_rows(p, GFX90A, auto_only=auto_only)
+    if not auto_only:  # Triton and Gluon still run it on gfx950
+        assert backend_rows(p, GFX950, auto_only=False)
+    else:
+        with pytest.raises(UnsupportedGraphError, match="no aiter:auto"):
+            backend_rows(p, GFX950, auto_only=True)
 
 
 def test_asm_v3_drops_a_kv_extent_of_4_gib() -> None:

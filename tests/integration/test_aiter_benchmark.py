@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.config.benchmark_config import SuiteConfig, ValidationConfig
 from dnn_benchmarking.graph.loader import GraphLoader
 from dnn_benchmarking.reporting.reporter import Reporter
@@ -38,24 +39,45 @@ _BF16_BOTTOM_RIGHT = dict(
 )
 
 
+_AUTO_AND_CK = {"aiter:auto", "aiter:ck"}
+
+
 @pytest.mark.parametrize(
-    "shape",
+    "shape, expected",
     [
         pytest.param(
             dict(b=2, hq=16, hkv=4, s=512, d=128, dtype="bfloat16"),
+            _AUTO_AND_CK,
             id="bf16-gqa-causal-d128",
         ),
         pytest.param(
             dict(b=2, hq=16, hkv=2, s=256, s_kv=1024, d=192, d_v=128),
+            _AUTO_AND_CK,
             id="bf16-bottom-right-d192-v128",
         ),
         pytest.param(
             dict(b=1, hq=8, hkv=8, s=128, s_kv=4096, d=64),
+            _AUTO_AND_CK,
             id="bf16-bottom-right-split-kv-d64",
+        ),
+        pytest.param(
+            dict(
+                b=1, hq=8, hkv=8, s=128, s_kv=4096, d=64, causal_mask_bottom_right=False
+            ),
+            _AUTO_AND_CK,
+            id="bf16-no-mask-split-kv-d64",
+        ),
+        # Above 256 only the Triton entry point runs (gfx942, gfx950).
+        pytest.param(
+            dict(b=1, hq=4, hkv=4, s=256, d=512, dtype="half"),
+            set(),
+            id="fp16-bottom-right-d512",
         ),
     ],
 )
-def test_every_planned_aiter_row_runs_and_matches_pytorch(aiter_session, shape):
+def test_every_planned_aiter_row_runs_and_matches_pytorch(
+    aiter_session, shape, expected
+):
     """Each backend that the selection plans runs the graph and matches the
     reference: a backend check that admits a shape the kernel cannot run
     fails here."""
@@ -71,10 +93,15 @@ def test_every_planned_aiter_row_runs_and_matches_pytorch(aiter_session, shape):
         validation=ValidationConfig(provider="pytorch"),
     )
     reporter = Reporter(output=io.StringIO())
-    planned = [
-        b.row_name
-        for b in backend_rows(aiter_problem(graph, infos), aiter_session.device)
-    ]
+    try:
+        planned = [
+            b.row_name
+            for b in backend_rows(aiter_problem(graph, infos), aiter_session.device)
+        ]
+    except UnsupportedGraphError:
+        planned = []
+    if not planned and not expected:
+        pytest.skip(f"no AITER row runs this shape on {aiter_session.device.arch}")
 
     result = run_graph(
         Path("aiter.json"),
@@ -87,7 +114,7 @@ def test_every_planned_aiter_row_runs_and_matches_pytorch(aiter_session, shape):
 
     rows = [r for r in result.results if r.role == "engine"]
     assert [r.engine_name for r in rows] == planned
-    assert {"aiter:auto", "aiter:ck"} <= set(planned)
+    assert planned and expected <= set(planned)
     for row in rows:
         assert row.verdict == "passed", (
             row.engine_name,

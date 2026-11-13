@@ -371,8 +371,11 @@ Requirements and limits:
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
   window. A causal mask (top-left or bottom-right) needs
-  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
-  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask.
+  hipDNN composes the deprecated `causal_mask` and `causal_mask_bottom_right`
+  flags with `left_bound`, `right_bound` and `diagonal_alignment`. A graph
+  that sets a flag together with a `left_bound` other than -1, a
+  `right_bound` above 0, or (for `causal_mask`) `BOTTOM_RIGHT` gets no rows.
   An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
@@ -414,7 +417,7 @@ row's `engine.id`:
 
 | Row | AITER entry point | Runs on |
 |---|---|---|
-| `aiter:auto` | `aiter.flash_attn_func`: AITER selects the backend | gfx90a, gfx942, gfx950 |
+| `aiter:auto` | `aiter.flash_attn_func`: AITER selects the backend | gfx90a, gfx942, gfx950; head sizes up to 256 after AITER pads them to a multiple of 8 |
 | `aiter:ck` | `aiter.mha_fwd` (CK tile) | head sizes divisible by 8, up to 256 |
 | `aiter:asm_v3` | `aiter.fmha_v3_fwd` (assembly) | gfx942 and gfx950, bf16, head sizes 128/128 or 192/128 |
 | `aiter:opus` | `aiter.fmha_fwd_bf16_opus_fwd` | gfx950, bf16, head sizes 128/128 or 192/128 |
@@ -442,9 +445,11 @@ Read the rows as follows:
   point instead, and the row gets a `host-bound` warning. Compare such rows
   in staged timing.
 - `aiter:auto`, `aiter:triton` and `aiter:gluon` allocate their output inside
-  the timed call, as their entry points do. The Triton entry point also
-  zero-fills it, so these rows include that fill kernel. The other rows
-  write the graph's output tensor.
+  the timed call, as their entry points do. The Triton forward also
+  zero-fills both the output and the LSE buffer on every call, so
+  `aiter:triton` includes two fill kernels. The Gluon forward allocates the
+  output without a fill and skips the LSE buffer, so `aiter:gluon` includes
+  no fill. The other rows write the graph's output tensor.
 - Every row is reported on its own, in the table and as one JSON row with
   `runtime = "aiter"` and `engine.name = "aiter:<backend>"`. The tool does
   not pick a best AITER row; take the fastest one from the JSON, or compare
@@ -478,8 +483,9 @@ Requirements and limits:
   statistics output, paging or sliding window. V and O can have a head size
   other than Q and K (for example 192/128). AITER aligns a causal mask to
   the bottom right, so a top-left causal mask needs `seqlen_q ==
-  seqlen_kv`; a bottom-right causal mask runs on any shape. An absent
-  `attn_scale_value` is 1.0, as in hipDNN.
+  seqlen_kv`; a bottom-right causal mask runs on any shape. The deprecated
+  causal flags follow the rocKE rule above. An absent `attn_scale_value` is
+  1.0, as in hipDNN.
 - Other arches report `no engines applicable`. With `--runtime aiter` alone,
   these options stop the run with exit code 2: `--engine`, `--plugin-path`,
   `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and

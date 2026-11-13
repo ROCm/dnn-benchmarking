@@ -1,16 +1,20 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""AITER executor: the JIT directory and toolchain set before ``import aiter``."""
+"""AITER executor: the JIT directory and toolchain set before ``import aiter``,
+and the arguments of each AITER entry point."""
 
 import importlib.machinery
 import importlib.util
 import os
 import sys
+import types
 
 import pytest
 
 from dnn_benchmarking.execution import aiter_executor
+from dnn_benchmarking.execution.aiter_sdpa import AiterBackend
+from dnn_benchmarking.execution.sdpa_graph import DenseSdpa
 
 
 def _executable(path):
@@ -85,3 +89,98 @@ def test_unexpanded_sdk_changes_no_toolchain(venv, monkeypatch) -> None:
     aiter_executor.prepare_aiter_environment()
     assert "ROCM_HOME" not in os.environ
     assert os.environ["PATH"] == path
+
+
+@pytest.fixture
+def fake_aiter(monkeypatch):
+    """``aiter.ops.mha`` and the Triton MHA module, recording each call."""
+    calls = []
+
+    def entry(name):
+        return lambda *args, **kwargs: calls.append((name, args, kwargs))
+
+    mha = types.ModuleType("aiter.ops.mha")
+    for name in (
+        "flash_attn_func",
+        "mha_fwd",
+        "fmha_v3_fwd",
+        "fmha_fwd_bf16_opus_fwd",
+        "mha_fwd_native_splitkv",
+    ):
+        setattr(mha, name, entry(name))
+    triton_mha = types.ModuleType("aiter.ops.triton.attention.mha")
+    triton_mha.flash_attn_func = entry("triton.flash_attn_func")
+    ops = types.ModuleType("aiter.ops")
+    ops.mha = mha
+    for name, module in (
+        ("aiter", types.ModuleType("aiter")),
+        ("aiter.ops", ops),
+        ("aiter.ops.mha", mha),
+        ("aiter.ops.triton", types.ModuleType("aiter.ops.triton")),
+        ("aiter.ops.triton.attention", types.ModuleType("aiter.ops.triton.attention")),
+        ("aiter.ops.triton.attention.mha", triton_mha),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return calls
+
+
+def _problem(causal, bottom_right):
+    return DenseSdpa(
+        data_type="bfloat16",
+        batch=1,
+        num_query_heads=8,
+        num_kv_heads=8,
+        seqlen_q=128,
+        seqlen_kv=128,
+        head_size_qk=128,
+        head_size_v=128,
+        causal=causal,
+        bottom_right=bottom_right,
+        scale=0.125,
+        q_uid=1,
+        k_uid=2,
+        v_uid=3,
+        o_uid=4,
+    )
+
+
+#: Each backend: the entry point it calls, the keyword that carries the mask,
+#: and whether it writes the graph's output tensor.
+_ENTRY_POINTS = {
+    "auto": ("flash_attn_func", "causal", False),
+    "ck": ("mha_fwd", "is_causal", True),
+    "asm_v3": ("fmha_v3_fwd", "is_causal", True),
+    "opus": ("fmha_fwd_bf16_opus_fwd", "causal", True),
+    "native_splitkv": ("mha_fwd_native_splitkv", "causal", True),
+    "triton": ("triton.flash_attn_func", "causal", False),
+    "gluon": ("triton.flash_attn_func", "causal", False),
+}
+
+
+@pytest.mark.parametrize("backend", sorted(_ENTRY_POINTS))
+@pytest.mark.parametrize(
+    "causal, bottom_right, expected",
+    [(False, False, False), (True, False, True), (False, True, True)],
+    ids=["no-mask", "top-left", "bottom-right"],
+)
+def test_each_entry_point_gets_the_mask_scale_and_output(
+    fake_aiter, backend, causal, bottom_right, expected
+) -> None:
+    q, k, v, o = object(), object(), object(), object()
+    splits = 4 if backend == "native_splitkv" else 0
+    launch = aiter_executor._launch_for(
+        AiterBackend(backend, splits), _problem(causal, bottom_right), q, k, v, o
+    )
+    launch()
+
+    entry, mask_key, writes_output = _ENTRY_POINTS[backend]
+    [(name, args, kwargs)] = fake_aiter
+    assert name == entry
+    assert args == (q, k, v)
+    assert kwargs[mask_key] is expected
+    assert kwargs["softmax_scale"] == 0.125
+    assert (kwargs.get("out") is o) == writes_output
+    if backend == "native_splitkv":
+        assert kwargs["num_splits"] == 4
+    if backend in ("triton", "gluon"):
+        assert kwargs["backend"] == backend
