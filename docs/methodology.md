@@ -404,7 +404,7 @@ dropout mask and `s` is the dropout scale.
   dropout. With attention sinks, the softmax includes the sink before the
   mask applies.
 - Forward with Philox: the same formula, with the `rng_dump` of the engine
-  row as `M` and `s = 1 / (1 - p)` in float32, where `p` is
+  row as `M`. The scale is `s = 1 / (1 - p)` in float32, where `p` is
   `dropout_probability`. At `p = 0` the dump applies as is, with `s = 1`.
   The tool does not read the values of `seed` and `offset`.
 - Backward with an explicit mask: `inv` is the `dropout_scale_inv` input, or
@@ -440,9 +440,9 @@ row, and the graph has no `reference` row. It compares every output except
 the dump.
 
 Before it builds that reference, the tool checks the dump as the hipDNN
-integration tests do. `n` is the number of elements of the dump, `keep` is
-`1 - p` in double precision (from the float32 `p`), and `rate` is the
-fraction of ones:
+integration tests do. In this check, `n` is the number of elements of the
+dump and `rate` is the fraction of ones. `keep` is `1 - p` in double
+precision, from the float32 `p`:
 
 1. Each value must be 0 or 1. -0.0 counts as 0, and NaN fails. The message
    names the first bad index.
@@ -453,14 +453,21 @@ fraction of ones:
 
 The tool fills the dump with NaN before the validation run. An engine that
 does not write the dump thus fails step 1, for all `n` and `p`. Without the
-fill, a dump of zeros can pass step 2 when `n` is small and `p` is high (for
-example `p = 0.9` and `n = 256`).
+fill, a dump of zeros can pass step 2 when `n` is small and `p` is high. An
+example is `p = 0.9` and `n = 256`.
 
 The tool does not make the Philox stream again from `seed` and `offset`.
 The hipDNN references do not make it either: they decline a Philox graph
 without `rng_dump`. The check thus does not show that the dump is the
-stream of that `seed` and `offset`. It shows that the dump is a 0/1 mask at
-the expected keep rate, and that the engine applied that mask to `O`.
+stream of that `seed` and `offset`. It shows two things:
+
+- The dump is a 0/1 mask at the expected keep rate.
+- The outputs match a reference built from that dump, within the tolerance
+  of the output data type.
+
+The tolerance limits the second result. With bf16 outputs and thousands of
+keys, the tolerance cannot tell the dumped mask from another mask. It also
+cannot find an engine that normalises the softmax again after the mask.
 
 ## Parity with other harnesses
 
