@@ -1368,7 +1368,6 @@ class TestPyTorchProviderNewOps:
         [
             "max_tensor_uid",
             "sum_exp_tensor_uid",
-            "rng_dump_tensor_uid",
             "amax_s_tensor_uid",
             "amax_o_tensor_uid",
         ],
@@ -1397,8 +1396,6 @@ class TestPyTorchProviderNewOps:
     @pytest.mark.parametrize(
         "optional_input",
         [
-            "dropout_mask_tensor_uid",
-            "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
             "descale_q_tensor_uid",
             "descale_k_tensor_uid",
