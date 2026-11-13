@@ -1368,7 +1368,6 @@ class TestPyTorchProviderNewOps:
         [
             "max_tensor_uid",
             "sum_exp_tensor_uid",
-            "rng_dump_tensor_uid",
             "amax_s_tensor_uid",
             "amax_o_tensor_uid",
         ],
@@ -1397,8 +1396,6 @@ class TestPyTorchProviderNewOps:
     @pytest.mark.parametrize(
         "optional_input",
         [
-            "dropout_mask_tensor_uid",
-            "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
             "descale_q_tensor_uid",
             "descale_k_tensor_uid",
@@ -3056,6 +3053,44 @@ class TestHostMemoryEstimate:
         # Three score-sized buffers (2 rows * 1024 * 1024 * 4 B each) plus the
         # 1024 * 1024 float32 mask; the sink tensor itself is negligible.
         assert with_sink - plain >= 3 * 2 * 1024 * 1024 * 4 + 1024 * 1024 * 4
+
+    @pytest.mark.parametrize("form", ["explicit_mask", "philox"])
+    def test_estimate_counts_dropout_scratch(self, form) -> None:
+        """A dropout forward forms scores by hand, one query block at a time,
+        and builds a float32 mask for its bounds. The same graph with the
+        dropout keys removed, its tensors still listed, holds neither."""
+        from dnn_benchmarking.validation.providers.pytorch_provider import (
+            estimate_reference_host_bytes as estimate,
+        )
+
+        dims, scores = [1, 2, 1024, 16], [1, 2, 1024, 1024]
+
+        def graph(dropout: bool) -> dict:
+            graph_json = self._sdpa(dims, dims, {"causal_mask": True})
+            node = graph_json["nodes"][0]
+            if form == "explicit_mask":
+                tensors = {"dropout_mask_tensor_uid": (9, scores)}
+                tensors["dropout_scale_tensor_uid"] = (10, [1])
+            else:
+                tensors = {"rng_dump_tensor_uid": (11, scores)}
+                tensors["seed_tensor_uid"] = (12, [1])
+                tensors["offset_tensor_uid"] = (13, [1])
+                if dropout:
+                    node["attributes"]["dropout_probability"] = 0.3
+            for key, (uid, tensor_dims) in tensors.items():
+                graph_json["tensors"].append(
+                    {"uid": uid, "dims": tensor_dims, "data_type": "float"}
+                )
+                if dropout:
+                    section = "outputs" if key == "rng_dump_tensor_uid" else "inputs"
+                    node[section][key] = uid
+            return graph_json
+
+        # Three score blocks of 2 rows * 1024 * 1024 * 4 B (one block holds
+        # every query row here) plus the 1024 * 1024 float32 causal mask.
+        assert estimate(graph(True)) - estimate(graph(False)) >= (
+            3 * 2 * 1024 * 1024 * 4 + 1024 * 1024 * 4
+        )
 
     def test_paged_counts_the_kv_length_the_page_table_addresses(self) -> None:
         """K and V of a paged graph hold pages, not sequences: the gathered KV
