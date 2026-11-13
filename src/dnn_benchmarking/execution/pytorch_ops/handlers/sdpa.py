@@ -1424,12 +1424,15 @@ def compile_sdpa_backward(
     hipDNN kernel does, and recompute ``P = exp(scores - stats)`` without
     renormalization.
 
-    * On a GPU, the fused Flash or memory-efficient backward kernel runs, the
-      one a training step's forward dispatches to (``_prepare_fused_backward``).
-      On ROCm this is AOTriton or CK. Its setup is built once, untimed.
-    * On the host (the CPU reference), and on a GPU when default dispatch
-      picks math, a manual fp32 formula runs. It mirrors hipDNN's CPU
-      reference (CpuFpReferenceSdpa::backward).
+    * The timed GPU row runs the fused Flash or memory-efficient backward
+      kernel, the one a training step's forward dispatches to
+      (``_prepare_fused_backward``). On ROCm this is AOTriton or CK. Its
+      setup is built once, untimed.
+    * A manual fp32 formula runs on the host (the CPU reference), in a
+      ``--validate pytorch`` reference pass on any device
+      (``reference_sdpa_call``), for ALiBi, and on a GPU when default
+      dispatch picks math. It mirrors hipDNN's CPU reference
+      (CpuFpReferenceSdpa::backward).
 
     dBias (``dbias_tensor_uid``) is the gradient of the ``attn_mask`` bias:
     the unscaled ``dS = P * (dP - D)``, summed over every dimension that the

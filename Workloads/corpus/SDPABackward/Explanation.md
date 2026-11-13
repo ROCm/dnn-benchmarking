@@ -82,7 +82,9 @@ For each forward graph, the converter:
    `alibi_mask`, `padding_mask` and `dropout_probability` to `parameters`.
    When the graph has both `seq_len_q` and `seq_len_kv`, it sets
    `padding_mask = true`, because cuDNN requires the flag with sequence
-   lengths (SEM-008 in hipDNN's `SdpaSemanticsRegister.md`).
+   lengths (SEM-008 in hipDNN's `SdpaSemanticsRegister.md`, rocm-libraries
+   `bfbd6d7d535` and later). At the pinned `b279712`, `SdpaBwdNode` Rule 9
+   checks the `seq_len` shapes only when `padding_mask` is set.
 7. Drops the forward-only attributes (`max_seq_len_kv`, `implementation`,
    `mma_core_mode`, `generate_stats`) and the top-level `_comment`.
 8. Appends `_bwd` to the graph name.
