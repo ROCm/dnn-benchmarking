@@ -38,7 +38,8 @@ def _sdpa_forward_workarounds(
         reasons.append(
             "PyTorch has no paged SDPA, so K/V are gathered into dense "
             "per-sequence tensors once and each sequence runs as its own SDPA "
-            "call, re-packed with torch.cat"
+            "call, re-packed with torch.cat or written into a zeroed per-batch "
+            "output"
         )
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)

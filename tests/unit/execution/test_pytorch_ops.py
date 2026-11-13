@@ -2828,6 +2828,11 @@ class TestPyTorchSdpaPaged:
     the benchmark path and the ``--validate pytorch`` reference path alike -- both
     walk these handlers -- so it is worth pinning against an independent dense
     computation rather than against itself.
+
+    The default layout is hipDNN's (``SdpaFwdNode::validatePagedKv``): Q and O
+    ``[num_seqs, H, S_max, D]``, page tables ``[num_seqs, 1, max_blocks, 1]``
+    and seq_len ``[num_seqs, 1, 1, 1]``. ``packed`` is the older layout: Q and
+    O ``[1, H, total_q, D]``, rank-2 page tables and rank-1 seq_len.
     """
 
     PAGE = 16
@@ -2837,13 +2842,13 @@ class TestPyTorchSdpaPaged:
     BLOCKS_PER_SEQ = 4
     NUM_BLOCKS = 16
 
-    def _build(self, seed: int = 0):
+    def _build(self, seed: int = 0, packed: bool = False):
         """A paged cache that is a known permutation of a dense one.
 
         Blocks are assigned out of order and unused slots are filled with a
         sentinel, so a gather that assumes contiguous blocks -- or that reads past
         a sequence's true length -- produces a visibly wrong answer instead of a
-        subtly wrong one.
+        subtly wrong one. Per-batch Q rows past ``q_len`` hold a sentinel too.
         """
         torch.manual_seed(seed)
         num_seqs = len(self.KV_LENS)
@@ -2875,7 +2880,13 @@ class TestPyTorchSdpaPaged:
                 k_pages[blk, :, : hi - lo, :] = dense_k[s][:, lo:hi, :]
                 v_pages[blk, :, : hi - lo, :] = dense_v[s][:, lo:hi, :]
 
-        q = torch.randn(1, self.HQ, sum(self.Q_LENS), self.D, dtype=torch.float32)
+        if packed:
+            q = torch.randn(1, self.HQ, sum(self.Q_LENS), self.D, dtype=torch.float32)
+            return q, k_pages, v_pages, page_table, dense_k, dense_v
+        q = torch.full((num_seqs, self.HQ, max(self.Q_LENS), self.D), 99.0)
+        for s, q_len in enumerate(self.Q_LENS):
+            q[s, :, :q_len, :] = torch.randn(self.HQ, q_len, self.D)
+        page_table = page_table.reshape(num_seqs, 1, self.BLOCKS_PER_SEQ, 1)
         return q, k_pages, v_pages, page_table, dense_k, dense_v
 
     def _graph(self, **attr_overrides):
@@ -2916,25 +2927,33 @@ class TestPyTorchSdpaPaged:
         }
 
     def _tensors(self, q, k_pages, v_pages, page_table):
+        # hipDNN's seq_len is [num_seqs, 1, 1, 1]; the packed layout's is rank 1.
+        lengths = (-1,) if page_table.ndim == 2 else (-1, 1, 1, 1)
         return {
             1: q,
             2: k_pages,
             3: v_pages,
             5: page_table,
             6: page_table,
-            7: torch.tensor(self.Q_LENS, dtype=torch.int32),
-            8: torch.tensor(self.KV_LENS, dtype=torch.int32),
+            7: torch.tensor(self.Q_LENS, dtype=torch.int32).reshape(lengths),
+            8: torch.tensor(self.KV_LENS, dtype=torch.int32).reshape(lengths),
         }
 
     def _dense_reference(
         self, q, dense_k, dense_v, is_causal=False, bottom_right=False
     ):
+        """Packed Q: the sequences concatenated along the query axis. Per-batch
+        Q: each sequence in its batch row, and 0 in the rows past its q_len."""
         import torch.nn.functional as F
 
         rep = self.HQ // self.HKV
+        packed = q.shape[0] == 1
         out, start = [], 0
         for s, q_len in enumerate(self.Q_LENS):
-            q_s = q[:, :, start : start + q_len, :]
+            if packed:
+                q_s = q[:, :, start : start + q_len, :]
+            else:
+                q_s = q[s : s + 1, :, :q_len, :]
             start += q_len
             mask = None
             if bottom_right:
@@ -2953,10 +2972,16 @@ class TestPyTorchSdpaPaged:
                     is_causal=is_causal and not bottom_right,
                 )
             )
-        return torch.cat(out, dim=-2)
+        if packed:
+            return torch.cat(out, dim=-2)
+        expected = torch.zeros_like(q)
+        for s, (q_len, o) in enumerate(zip(self.Q_LENS, out)):
+            expected[s, :, :q_len, :] = o[0]
+        return expected
 
-    def test_paged_gather_matches_dense_attention(self) -> None:
-        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build()
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_paged_gather_matches_dense_attention(self, packed: bool) -> None:
+        q, k_pages, v_pages, page_table, dense_k, dense_v = self._build(packed=packed)
         tensors = self._tensors(q, k_pages, v_pages, page_table)
         pytorch_ops.execute_graph(self._graph(), tensors)
 
@@ -2971,7 +2996,7 @@ class TestPyTorchSdpaPaged:
         expected = self._dense_reference(q, dense_k, dense_v)
 
         corrupted = page_table.clone()
-        corrupted[0, 0] = 12  # a block holding only the sentinel fill
+        corrupted.view(len(self.KV_LENS), -1)[0, 0] = 12  # only the sentinel fill
         tensors = self._tensors(q, k_pages, v_pages, corrupted)
         pytorch_ops.execute_graph(self._graph(), tensors)
 
@@ -3023,7 +3048,7 @@ class TestPyTorchSdpaPaged:
         k_pages = torch.zeros(1, self.HKV, self.PAGE, self.D)
         v_pages = torch.zeros_like(k_pages)
         v_pages[0, :, :4, 0] = torch.arange(1, 5, dtype=torch.float32)
-        page_table = torch.zeros(1, 1, dtype=torch.int32)
+        page_table = torch.zeros(1, 1, 1, 1, dtype=torch.int32)
         sink = torch.arange(2, self.HQ + 2, dtype=torch.float32).log()
         graph = self._graph(causal_mask_bottom_right=True)
         graph["nodes"][0]["inputs"]["sink_token_tensor_uid"] = 9
@@ -3033,8 +3058,8 @@ class TestPyTorchSdpaPaged:
             3: v_pages,
             5: page_table,
             6: page_table,
-            7: torch.tensor([1], dtype=torch.int32),
-            8: torch.tensor([4], dtype=torch.int32),
+            7: torch.tensor([1], dtype=torch.int32).reshape(1, 1, 1, 1),
+            8: torch.tensor([4], dtype=torch.int32).reshape(1, 1, 1, 1),
             9: sink,
         }
 
@@ -3063,13 +3088,9 @@ class TestPyTorchSdpaPaged:
         pytorch_ops.execute_graph(self._graph(left_bound=1, right_bound=0), tensors)
 
         rep = self.HQ // self.HKV
-        expected = torch.cat(
-            [
-                v[:, :q_len, :].repeat_interleave(rep, dim=0)
-                for v, q_len in zip(dense_v, self.Q_LENS)
-            ],
-            dim=-2,
-        ).unsqueeze(0)
+        expected = torch.zeros_like(q)
+        for s, (v, q_len) in enumerate(zip(dense_v, self.Q_LENS)):
+            expected[s, :, :q_len, :] = v[:, :q_len, :].repeat_interleave(rep, dim=0)
         assert torch.allclose(tensors[4], expected, atol=1e-5)
 
     def test_replay_reads_seq_lens_from_host_once(self, monkeypatch) -> None:
@@ -3124,7 +3145,7 @@ class TestPyTorchSdpaPaged:
         """A sequence needing more blocks than the table holds is a graph error,
         not something to silently truncate."""
         q, k_pages, v_pages, page_table, _, _ = self._build()
-        tensors = self._tensors(q, k_pages, v_pages, page_table[:, :1])
+        tensors = self._tensors(q, k_pages, v_pages, page_table[:, :, :1, :])
         # The registry normalizes a handler ValueError into UnsupportedGraphError.
         with pytest.raises(UnsupportedGraphError, match="page table holds"):
             pytorch_ops.execute_graph(self._graph(), tensors)
@@ -3135,7 +3156,7 @@ class TestPyTorchSdpaPaged:
     )
     def test_timed_run_has_no_gather(self, attributes) -> None:
         """The gather and masks are built once; a timed run only slices Q,
-        calls SDPA per sequence and re-packs."""
+        calls SDPA per sequence and scatters each output into a zeroed O."""
         q, k_pages, v_pages, page_table, _, _ = self._build()
         primed, timed, calls = _replay_sdpa(
             self._graph(**attributes), self._tensors(q, k_pages, v_pages, page_table)
@@ -3143,7 +3164,8 @@ class TestPyTorchSdpaPaged:
 
         heads = (self.HKV, self.HKV, True)
         assert calls == [heads] * (2 * len(self.KV_LENS))
-        assert set(timed) <= _SDPA_TIMED_OPS, f"setup in timed run: {timed}"
+        scatter = {"aten.zeros.default", "aten.copy_.default"}
+        assert set(timed) <= _SDPA_TIMED_OPS | scatter, f"setup in timed run: {timed}"
         assert "aten.index.Tensor" in primed
 
     def test_sink_timed_run_has_no_setup(self) -> None:

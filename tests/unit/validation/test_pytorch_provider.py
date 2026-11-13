@@ -2231,9 +2231,11 @@ class TestHostMemoryEstimate:
         )
 
         q, pages = [4, 2, 64, 16], [64, 2, 16, 16]  # 64 pages of 16 rows
-        one_page = estimate(self._sdpa(q, pages, {}, page_table_dims=[4, 1], sink=True))
+        one_page = estimate(
+            self._sdpa(q, pages, {}, page_table_dims=[4, 1, 1, 1], sink=True)
+        )
         all_pages = estimate(
-            self._sdpa(q, pages, {}, page_table_dims=[4, 16], sink=True)
+            self._sdpa(q, pages, {}, page_table_dims=[4, 1, 16, 1], sink=True)
         )
         # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
         # against 16 pages * 16 rows instead of 1 page.

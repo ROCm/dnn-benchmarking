@@ -370,21 +370,27 @@ class TestPyTorchLoadInputData:
 class TestPagedInputGeneration:
     """Page tables and sequence lengths are integer inputs with invariants
     random data cannot satisfy: a page table must address distinct pages in
-    the cache, and a length must be positive and fit its page allocation."""
+    the cache, and a length must be positive and fit its page allocation and
+    its query rows. The layout is hipDNN's: page tables [B, 1, W, 1] and
+    seq_len [B, 1, 1, 1]."""
 
     PAGE_SIZE = 64
     NUM_PAGES = 128
     NUM_SEQS = 2
     BLOCKS_PER_SEQ = 32
+    Q_LEN = 1  # decode: one query row, shorter than a page
 
-    def _graph(self):
+    def _graph(self, **attributes):
+        table = [self.NUM_SEQS, 1, self.BLOCKS_PER_SEQ, 1]
         return {
             "tensors": [
+                {"uid": 1, "name": "Q", "dims": [self.NUM_SEQS, 8, self.Q_LEN, 128]},
                 {
                     "uid": 2,
                     "name": "K",
                     "dims": [self.NUM_PAGES, 4, self.PAGE_SIZE, 128],
                 },
+                {"uid": 5, "name": "PAGE_TABLE_K", "dims": table},
             ],
             "nodes": [
                 {
@@ -399,7 +405,7 @@ class TestPagedInputGeneration:
                         "seq_len_kv_tensor_uid": 8,
                     },
                     "outputs": {"o_tensor_uid": 4},
-                    "attributes": {},
+                    "attributes": attributes,
                 }
             ],
         }
@@ -408,17 +414,24 @@ class TestPagedInputGeneration:
         return _tensor(uid, "int32", dims=dims, strides=[1] * len(dims))
 
     def test_page_table_spans_multiple_pages_within_the_cache(self) -> None:
-        table = self._int_tensor(5, [self.NUM_SEQS, self.BLOCKS_PER_SEQ])
+        table = self._int_tensor(5, [self.NUM_SEQS, 1, self.BLOCKS_PER_SEQ, 1])
         data = generate_input_data([table], seed=0, graph_json=self._graph())[5]
         assert data.dtype == np.int32
-        assert data.max() > 0, "every sequence would read page 0"
+        rows = data.reshape(self.NUM_SEQS, -1)
+        assert len(np.unique(rows)) == rows.size, "sequences share a page"
         assert data.max() < self.NUM_PAGES, "page id addresses beyond the cache"
 
-    def test_lengths_are_positive_and_fit_the_page_allocation(self) -> None:
-        lengths = self._int_tensor(8, [self.NUM_SEQS])
-        data = generate_input_data([lengths], seed=0, graph_json=self._graph())[8]
-        assert data.min() > 0, "a zero length is an empty sequence"
-        assert data.max() <= self.BLOCKS_PER_SEQ * self.PAGE_SIZE
+    @pytest.mark.parametrize("max_seq_len_kv", [None, 100])
+    def test_lengths_fill_the_page_allocation_and_the_query(
+        self, max_seq_len_kv
+    ) -> None:
+        dims = [self.NUM_SEQS, 1, 1, 1]
+        lengths = [self._int_tensor(7, dims), self._int_tensor(8, dims)]
+        graph = self._graph(max_seq_len_kv=max_seq_len_kv)
+        data = generate_input_data(lengths, seed=0, graph_json=graph)
+        kv = max_seq_len_kv or self.BLOCKS_PER_SEQ * self.PAGE_SIZE
+        np.testing.assert_array_equal(data[7], np.full(dims, self.Q_LEN))
+        np.testing.assert_array_equal(data[8], np.full(dims, kv))
 
     def test_dense_graph_inputs_are_untouched(self) -> None:
         """A graph with no page table generates exactly what it would without

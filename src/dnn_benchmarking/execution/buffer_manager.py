@@ -253,6 +253,36 @@ def _paged_metadata(
     return 0, 0
 
 
+def _paged_lengths(graph_json: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """Sequence length of each seq_len role of a paged SDPA node.
+
+    Every sequence uses its whole page allocation: Q has its full query
+    length (``dims[2]`` of the per-batch Q), and KV has the page-table width
+    times the page size, capped by ``max_seq_len_kv`` when the graph sets it.
+    Empty for a graph with no paged K.
+    """
+    if not graph_json:
+        return {}
+    tensors = {int(t["uid"]): t for t in graph_json.get("tensors", []) or []}
+    for node in graph_json.get("nodes", []) or []:
+        inputs = node.get("inputs") or {}
+        uids = [
+            inputs.get(key)
+            for key in ("q_tensor_uid", "k_tensor_uid", "page_table_k_tensor_uid")
+        ]
+        if None in uids:
+            continue
+        q, k, table = (tensors.get(int(uid), {}).get("dims", []) for uid in uids)
+        if len(q) != 4 or len(k) != 4 or len(table) < 2:
+            continue
+        kv_len = int(np.prod(table[1:], dtype=np.int64)) * int(k[2])
+        attributes = node.get("attributes") or node.get("parameters") or {}
+        if attributes.get("max_seq_len_kv") is not None:
+            kv_len = min(kv_len, int(attributes["max_seq_len_kv"]))
+        return {"seq_len_q": int(q[2]), "seq_len_kv": kv_len}
+    return {}
+
+
 # Convolution operands that can take signed data: the data, filter and
 # incoming-gradient inputs of every convolution direction.
 _CONVOLUTION_OPERAND_KEYS = ("x_tensor_uid", "w_tensor_uid", "dy_tensor_uid")
@@ -343,7 +373,7 @@ def _input_tensor_uids(inputs: Dict[str, Any]) -> Set[int]:
 def _generate_paged_input(
     tensor_info: TensorInfo,
     role: str,
-    page_size: int,
+    length: int,
     num_pages: int,
 ) -> np.ndarray:
     """Structured data for a paged input.
@@ -351,7 +381,9 @@ def _generate_paged_input(
     Random page ids or lengths are degenerate for these roles: a page table
     must address distinct pages inside the cache, and a sequence length must be
     positive and fit its page allocation. They are generated to satisfy those
-    invariants instead.
+    invariants instead. A page table's first dim is the sequence count and the
+    product of the others is the width: hipDNN's ``[B, 1, max_blocks_per_seq,
+    1]`` and a rank-2 ``[B, max_blocks_per_seq]`` hold the same ids.
     """
     dims = list(tensor_info.dims)
     dtype = tensor_info.dtype.numpy
@@ -360,15 +392,15 @@ def _generate_paged_input(
         # Distinct pages per sequence, so a gather that ignores the table or
         # collapses sequences produces a visibly different answer.
         num_seqs = int(dims[0])
-        blocks_per_seq = int(dims[1]) if len(dims) > 1 else 1
+        blocks_per_seq = int(np.prod(dims[1:], dtype=np.int64))
         needed = num_seqs * blocks_per_seq
         pool = num_pages if num_pages > 0 else needed
         ids = (np.arange(needed) % max(pool, 1)).astype(dtype)
         return ids.reshape(dims)
 
     # Sequence lengths fill the cache: every sequence uses its whole page
-    # allocation, which is the largest length the page table can legally address.
-    return np.full(dims, page_size if page_size > 0 else 1, dtype=dtype)
+    # allocation (see _paged_lengths). Without paging, every length is 1.
+    return np.full(dims, length, dtype=dtype)
 
 
 def generate_input_data(
@@ -399,7 +431,8 @@ def generate_input_data(
     input_data: Dict[int, np.ndarray] = {}
     paged_roles = _paged_input_roles(graph_json)
     signed_uids = _signed_input_uids(graph_json)
-    page_size, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
+    _, num_pages = _paged_metadata(graph_json) if paged_roles else (0, 0)
+    lengths = _paged_lengths(graph_json) if paged_roles else {}
 
     for tensor_info in tensor_infos:
         if tensor_info.is_output or tensor_info.is_virtual:
@@ -415,7 +448,7 @@ def generate_input_data(
         role = paged_roles.get(tensor_info.uid)
         if role is not None:
             input_data[tensor_info.uid] = _generate_paged_input(
-                tensor_info, role, page_size, num_pages
+                tensor_info, role, lengths.get(role, 1), num_pages
             )
         elif dtype.numpy.kind in "iub":
             # ponytail: zeros are safe for index/offset tensors (no OOB reads);

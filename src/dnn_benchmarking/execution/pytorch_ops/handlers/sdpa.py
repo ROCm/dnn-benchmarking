@@ -31,7 +31,9 @@ class _PagedSegment(NamedTuple):
     """One paged sequence, prepared untimed.
 
     ``k`` and ``v`` are the dense K and V for the SDPA call. With sinks they
-    are the fp32 K^T and V of the manual attention instead.
+    are the fp32 K^T and V of the manual attention instead. ``batch`` is the
+    row of a per-batch Q/O to read and write; ``None`` for a packed Q/O,
+    whose segments are concatenated along the query axis instead.
     """
 
     q_start: int
@@ -40,16 +42,19 @@ class _PagedSegment(NamedTuple):
     v: torch.Tensor
     mask: Optional[torch.Tensor]
     is_causal: bool
+    batch: Optional[int]
 
 
 class _PagedSdpa(NamedTuple):
-    """Setup of a paged forward, built once."""
+    """Setup of a paged forward, built once. ``per_batch``: Q and O have one
+    batch row per sequence (see ``_plan_paged_sdpa``)."""
 
     segments: List[_PagedSegment]
     scale: float
     enable_gqa: bool
     q_float: Optional[torch.Tensor]
     sink: Optional[torch.Tensor]
+    per_batch: bool
 
 
 class _DenseSdpa(NamedTuple):
@@ -554,15 +559,22 @@ def _plan_paged_sdpa(
 ) -> Tuple[List[_PagedSegment], bool]:
     """Gather a paged KV cache into dense per-sequence K/V and masks.
 
-    Layouts, taken from the committed paged bundles rather than assumed:
+    Layouts, taken from the committed paged bundles and hipDNN's
+    ``SdpaFwdNode::validatePagedKv`` rather than assumed:
 
       * paged K/V are ``[num_blocks, num_kv_heads, page_size, head_size]``
-      * the page table is ``[num_seqs, max_blocks_per_seq]`` of int32 block ids
+      * the page table holds int32 block ids, ``[num_seqs, 1,
+        max_blocks_per_seq, 1]`` in hipDNN and ``[num_seqs,
+        max_blocks_per_seq]`` in older graphs; it is read as ``[num_seqs,
+        product of the other dims]``
       * ``seq_len_kv`` is ``[num_seqs]`` LENGTHS (not offsets -- the page table
         is itself the per-sequence indirection, so paged K/V carry no ragged
         offsets)
-      * Q is ``[1, num_query_heads, total_q, head_size]``, with the sequences
-        packed along ``total_q``
+      * Q and O are per batch, ``[num_seqs, num_query_heads, S_max,
+        head_size]``, when Q has one batch row per sequence. Sequence ``b``
+        reads the first ``q_len`` rows of Q row ``b``. Otherwise Q is ``[1,
+        num_query_heads, total_q, head_size]``, with the sequences packed
+        along ``total_q``.
 
     Each sequence's live KV is ``ceil(len / page_size)`` blocks gathered in page
     order and then trimmed to the exact length, so trailing slots in the last
@@ -585,6 +597,13 @@ def _plan_paged_sdpa(
             f"Paged SDPA page table has {int(page_table_k.shape[0])} rows for "
             f"{num_seqs} sequences"
         )
+    page_table_k = page_table_k.reshape(num_seqs, -1)
+    page_table_v = page_table_v.reshape(int(page_table_v.shape[0]), -1)
+    per_batch = q.ndim == 4 and int(q.shape[0]) == num_seqs
+    if q.ndim == 4 and not per_batch and int(q.shape[0]) != 1:
+        raise ValueError(
+            f"Paged SDPA Q has {int(q.shape[0])} batches for {num_seqs} sequences"
+        )
 
     if seq_len_q_uid is not None:
         # Host-resolved once per replay map: a .tolist() here would sync the
@@ -592,6 +611,9 @@ def _plan_paged_sdpa(
         q_lengths = _host_ints(tensors, seq_len_q_uid, node)
         if len(q_lengths) != num_seqs:
             raise ValueError("Paged SDPA seq_len_q/seq_len_kv disagree on num_seqs")
+    elif per_batch:
+        # No per-sequence Q lengths: each batch row is one full sequence.
+        q_lengths = [int(q.shape[-2])] * num_seqs
     else:
         # No per-sequence Q lengths: the packed Q must divide evenly.
         total_q = int(q.shape[-2])
@@ -634,7 +656,10 @@ def _plan_paged_sdpa(
             ]
         )
 
-        q_seq = q[..., q_start : q_start + q_len, :]
+        if per_batch:
+            q_seq = q[seq : seq + 1, :, :q_len, :]
+        else:
+            q_seq = q[..., q_start : q_start + q_len, :]
         if q_seq.ndim == 4:
             k_seq = k_seq.unsqueeze(0)
             v_seq = v_seq.unsqueeze(0)
@@ -655,6 +680,7 @@ def _plan_paged_sdpa(
                     _fp32_at_query_heads(v_seq, rep_v),
                     seq_mask,
                     seq_causal,
+                    seq if per_batch else None,
                 )
             )
             q_start += q_len
@@ -678,10 +704,26 @@ def _plan_paged_sdpa(
                 enable_gqa,
             )
         segments.append(
-            _PagedSegment(q_start, q_len, k_seq, v_seq, seq_mask, seq_causal)
+            _PagedSegment(
+                q_start,
+                q_len,
+                k_seq,
+                v_seq,
+                seq_mask,
+                seq_causal,
+                seq if per_batch else None,
+            )
         )
         q_start += q_len
     return segments, enable_gqa
+
+
+def _paged_q_rows(q: torch.Tensor, s: _PagedSegment) -> torch.Tensor:
+    """The query rows of one paged sequence: its batch row of a per-batch Q,
+    or its slice of the packed query axis."""
+    if s.batch is None:
+        return q[..., s.q_start : s.q_start + s.q_len, :]
+    return q[s.batch : s.batch + 1, :, : s.q_len, :]
 
 
 def _fp32_at_query_heads(t: torch.Tensor, rep: int) -> torch.Tensor:
@@ -1101,7 +1143,8 @@ def compile_sdpa(
             sink,
         )
         q_float = None if sink is None else q.to(dtype=torch.float32)
-        return _PagedSdpa(segments, scale, enable_gqa, q_float, sink)
+        per_batch = any(s.batch is not None for s in segments)
+        return _PagedSdpa(segments, scale, enable_gqa, q_float, sink, per_batch)
 
     def stats_operands(
         tensors: Dict[int, torch.Tensor],
@@ -1142,20 +1185,19 @@ def compile_sdpa(
             if paged.sink is not None:
                 outputs = [
                     _sink_attention(
-                        paged.q_float[..., s.q_start : s.q_start + s.q_len, :],
+                        _paged_q_rows(paged.q_float, s),
                         s.k,
                         s.v,
                         s.mask,
                         paged.sink,
                         paged.scale,
-                    )[0]
+                    )[0].to(dtype=q.dtype)
                     for s in paged.segments
                 ]
-                o = torch.cat(outputs, dim=-2).to(dtype=q.dtype)
             else:
                 outputs = [
                     execute_selected_sdpa(
-                        q[..., s.q_start : s.q_start + s.q_len, :],
+                        _paged_q_rows(q, s),
                         s.k,
                         s.v,
                         attn_mask=s.mask,
@@ -1166,8 +1208,19 @@ def compile_sdpa(
                     )
                     for s in paged.segments
                 ]
+            if paged.per_batch:
+                # A per-batch Q/O: scatter each sequence's output into its
+                # batch row and leave the rows past its q_len at 0, as hipDNN
+                # defines them.
+                o = torch.zeros(
+                    (*q.shape[:-1], int(v.shape[-1])), dtype=q.dtype, device=q.device
+                )
+                for s, out in zip(paged.segments, outputs):
+                    o[s.batch : s.batch + 1, :, : s.q_len, :] = out
+            else:
+                # Re-packed along the query axis in the order the sequences
+                # were laid out.
                 o = torch.cat(outputs, dim=-2)
-            # Re-packed along the query axis in the order the sequences were laid out.
             _store_tensor(tensors, o_uid, o)
             return
 

@@ -99,7 +99,10 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   still runs.
 - Sliding-window and bottom-right masks, where a graph needs one, and the
   dense per-sequence K and V of paged graphs are built once. A timed paged
-  iteration does one SDPA call per sequence and one `torch.cat`.
+  iteration does one SDPA call per sequence. A packed Q (one batch row for
+  all sequences) then gets one `torch.cat` along the query axis. A Q with
+  one batch row per sequence gets a scatter of each sequence's rows into a
+  zeroed output instead.
 - The `stats` output (log-sum-exp) comes from the fused kernel, as in a
   PyTorch training step. Q, K and V go into the call with `requires_grad`, and
   the tool reads the log-sum-exp that the kernel saves for the backward pass.
@@ -138,7 +141,8 @@ the PyTorch row instead of timing the setup.
 Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
-- Paged KV: one SDPA call per sequence and a `torch.cat`.
+- Paged KV: one SDPA call per sequence, then a `torch.cat` or a scatter into
+  a zeroed output.
 - Sliding window or bottom-right causal with a query length above 1 that
   differs from the KV length: the kernel reads an additive mask tensor.
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
@@ -568,6 +572,17 @@ back to back, in two repeats (92 median pairs):
 
 A time series that crosses this change can show a step on bimodal rows.
 Measure again after a timing change.
+
+## Paged SDPA inputs
+
+A paged SDPA graph gives K and V as a block container `[num_blocks, H_kv,
+page_size, D]`, and the page tables as int32 `[B, 1, max_blocks_per_seq,
+1]`, as hipDNN and cuDNN require. The tool also reads rank-2 `[B,
+max_blocks_per_seq]` tables. It fills each page table with distinct block
+ids. Every sequence uses its full allocation: `seq_len_q` is the query
+length of Q, and `seq_len_kv` is the table width times the page size,
+capped by `max_seq_len_kv`. A graph with sequence lengths but no page table
+gets 1 for every length.
 
 ## SDPA backward inputs
 
