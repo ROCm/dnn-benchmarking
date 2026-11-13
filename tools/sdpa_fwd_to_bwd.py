@@ -9,6 +9,8 @@ The corpus has three origins, recorded in ``metadata.origin``:
   ``SdpaBackwardAttributes`` graph with the same Q, K, V, mask, scale, bounds
   and sequence-length inputs. The forward output O becomes a backward input,
   and the backward adds dO, the fp32 log-sum-exp stats and dQ, dK, dV.
+  A graph with both ``seq_len_q`` and ``seq_len_kv`` gets
+  ``padding_mask = true``, as cuDNN requires.
   Forward graphs with no backward equivalent in hipDNN are skipped: paged
   K/V caches, attention sinks, block masks, fp8 descale/scale tensors and
   dropout.
@@ -366,6 +368,11 @@ def convert(fwd: Dict[str, Any]) -> Dict[str, Any]:
     ):
         parameters[flag] = bool(parameters[flag])
     parameters["diagonal_alignment"] = parameters["diagonal_alignment"] or "TOP_LEFT"
+    # cuDNN requires padding_mask with seq_len tensors (SEM-008), and hipDNN's
+    # SdpaBwdNode checks the seq_len shapes only when padding_mask is set.
+    seq_lens = (inputs["seq_len_q_tensor_uid"], inputs["seq_len_kv_tensor_uid"])
+    if None not in seq_lens:
+        parameters["padding_mask"] = True
 
     used = {u for u in (*inputs.values(), *outputs.values()) if u is not None}
     return {

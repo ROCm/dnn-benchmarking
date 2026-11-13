@@ -78,6 +78,9 @@ For each forward graph, the converter:
 6. Copies the mask attributes (`causal_mask`, `causal_mask_bottom_right`,
    `left_bound`, `right_bound`, `diagonal_alignment`), `attn_scale_value`,
    `alibi_mask`, `padding_mask` and `dropout_probability` to `parameters`.
+   When the graph has both `seq_len_q` and `seq_len_kv`, it sets
+   `padding_mask = true`, because cuDNN requires the flag with sequence
+   lengths (SEM-008 in hipDNN's `SdpaSemanticsRegister.md`).
 7. Drops the forward-only attributes (`max_seq_len_kv`, `implementation`,
    `mma_core_mode`, `generate_stats`) and the top-level `_comment`.
 8. Appends `_bwd` to the graph name.
@@ -114,10 +117,11 @@ duplicates.
 ## Known limits
 
 - The variable-length graphs come from `microbench/aiter` (2,244) and
-  `microbench/aotriton` (5). dnn-benchmarking sets every sequence length to 1
-  for them, as for their forward graphs, so these rows measure a one-token
-  problem. It still generates O and `stats` for the dense shape. Variable
-  sequence length support is tracked in ALMIOPEN-3139.
+  `microbench/aotriton` (5). Their `seq_len_q` and `seq_len_kv` are int32
+  `[B, 1, 1, 1]`, as hipDNN and cuDNN require. dnn-benchmarking sets every
+  sequence length to 1 for them, as for their forward graphs, so these rows
+  measure a one-token problem. It still generates O and `stats` for the
+  dense shape. Variable sequence length support is tracked in ALMIOPEN-3139.
 - The PyTorch reference does not support variable sequence lengths, so these
   graphs have no PyTorch row and no validation.
 - Decode shapes have no training use. They are kept because the collection
