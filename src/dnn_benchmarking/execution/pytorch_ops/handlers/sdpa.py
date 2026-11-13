@@ -177,7 +177,6 @@ def _plan_sdpa_common(
     node: Dict[str, Any],
     allow_paged: bool = False,
     allow_sink: bool = False,
-    backward: bool = False,
 ) -> _SdpaPlan:
     unsupported = [
         "seed_tensor_uid",
@@ -190,8 +189,6 @@ def _plan_sdpa_common(
         "scale_s_tensor_uid",
         "scale_o_tensor_uid",
     ]
-    if backward:
-        unsupported += ["dropout_mask_tensor_uid", "dropout_scale_tensor_uid"]
     if not allow_sink:
         unsupported.append("sink_token_tensor_uid")
     if not allow_paged:
@@ -1458,6 +1455,38 @@ def compile_sdpa(
     return run
 
 
+def _check_backward_dropout(
+    node: Dict[str, Any], graph_json: Dict[str, Any], plan: _SdpaPlan
+) -> None:
+    """Decline the backward dropout that hipDNN declines.
+
+    The backward takes an explicit mask with its scale and an optional
+    one-FLOAT-element ``dropout_scale_inv``, or a non-null probability of 0
+    with no seed or offset (PlanUtils.hpp).
+    """
+    dropout = plan.dropout
+    if dropout.seed_uid is not None or dropout.offset_uid is not None:
+        raise ValueError(
+            "SDPA backward dropout with seed_tensor_uid or offset_tensor_uid is "
+            "not supported"
+        )
+    if dropout.scale_inv_uid is not None:
+        if plan.dropout_form != _EXPLICIT_DROPOUT:
+            raise ValueError(
+                "SDPA dropout_scale_inv_tensor_uid needs dropout_mask_tensor_uid"
+            )
+        dims, data_type = _graph_tensor(
+            graph_json, dropout.scale_inv_uid, "dropout_scale_inv_tensor_uid"
+        )
+        if data_type != "float" or _numel(dims) != 1:
+            raise ValueError(
+                "SDPA dropout_scale_inv must be one FLOAT element, not "
+                f"{data_type!r} with dims {list(dims)}"
+            )
+    if plan.dropout_form == _EXPLICIT_DROPOUT:
+        _check_explicit_dropout(node, graph_json, dropout)
+
+
 @register_handler("SdpaBackwardAttributes")
 def compile_sdpa_backward(
     node: Dict[str, Any],
@@ -1472,8 +1501,13 @@ def compile_sdpa_backward(
     external ``stats`` tensor and always renormalizes its own softmax, so it
     would diverge from hipDNN whenever ``stats`` is not the exact, consistent
     forward LSE.  This handler therefore implements the gradient manually.
+
+    With an explicit dropout mask ``M``, scale ``s`` and ``dropout_scale_inv``
+    ``inv`` (1 when absent), ``P`` stays the softmax before dropout and
+    ``D = rowsum(dO * O) * inv``, ``dP = (dO V^T) * M``,
+    ``dS = s * P * (dP - D)``, ``dV = (P * M * s)^T dO``
+    (CpuFpReferenceSdpa.hpp).
     """
-    _sdpa_unsupported_if_present(node, ["dropout_scale_inv_tensor_uid"])
     if _optional_uid(node, "dbias_tensor_uid") is not None:
         raise ValueError(
             "SDPA backward dBias gradient is not supported by the PyTorch reference"
@@ -1488,7 +1522,9 @@ def compile_sdpa_backward(
     dq_uid = _required_output_uid(node, "dq_tensor_uid")
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
-    plan = _plan_sdpa_common(node, backward=True)
+    plan = _plan_sdpa_common(node)
+    _check_backward_dropout(node, graph_json, plan)
+    dropout = plan.dropout if plan.dropout_form == _EXPLICIT_DROPOUT else None
     is_causal = plan.is_causal
     if plan.window is not None or plan.bottom_right:
         raise ValueError(
@@ -1518,6 +1554,14 @@ def compile_sdpa_backward(
             if plan.alibi
             else None
         )
+        keep = None
+        keep_scale = 1.0
+        if dropout is not None:
+            keep = _tensor(tensors, dropout.mask_uid, node).to(dtype=torch.float32)
+            keep_scale = _scalar_value(tensors, dropout.scale_uid, node)
+            scale_inv = 1.0
+            if dropout.scale_inv_uid is not None:
+                scale_inv = _scalar_value(tensors, dropout.scale_inv_uid, node)
 
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
@@ -1559,11 +1603,19 @@ def compile_sdpa_backward(
             )
             probs = scores.sub_(_rows(stats_f, start, end)).exp_()
             row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
-            # d_scores = probs * (do @ v^T - row_dot) * scale
+            # d_scores = probs * (do @ v^T - row_dot) * scale. With dropout,
+            # dP = (do @ v^T) * keep, D = row_dot * scale_inv and
+            # dS = keep_scale * probs * (dP - D).
             d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
-            d_scores.sub_(row_dot).mul_(probs).mul_(scale_value)
+            if keep is not None:
+                keep_block = _rows(keep, start, end)
+                d_scores.mul_(keep_block)
+                row_dot.mul_(scale_inv)
+            d_scores.sub_(row_dot).mul_(probs).mul_(keep_scale * scale_value)
             dq[..., start:end, :] = torch.matmul(d_scores, k_f)
             dk_full += torch.matmul(d_scores.transpose(-2, -1), q_block)
+            if keep is not None:
+                probs.mul_(keep_block).mul_(keep_scale)
             dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
             del scores, probs, d_scores
 

@@ -1958,6 +1958,268 @@ class TestPyTorchProviderNewOps:
                 outputs[uid].data, grad.numpy(), rtol=1e-4, atol=1e-5
             )
 
+    # Tensor UIDs of the SDPA backward dropout graphs below, after the
+    # forward ones (``_Q`` to ``_DUMP``).
+    _DO, _SCALE_INV, _DQ, _DK, _DV = 13, 14, 15, 16, 17
+
+    @classmethod
+    def _backward_dropout_graph(
+        cls,
+        *,
+        mask=(2, 4, 5, 7),
+        scale=(1,),
+        scale_inv=(1,),
+        probability=None,
+        seed=False,
+        offset=False,
+        attn_mask=None,
+        attributes=None,
+        types=None,
+    ):
+        """An SDPA backward graph (B 2, Hq 4, Hkv 2, Sq 5, Skv 7, D 8) with an
+        explicit dropout mask, its scale and ``dropout_scale_inv`` by default.
+
+        ``mask``, ``scale``, ``scale_inv`` and ``attn_mask`` are dims (None
+        leaves the tensor out). The probability is null by default.
+        """
+        q_dims, kv_dims = [2, 4, 5, 8], [2, 2, 7, 8]
+        tensors = {
+            _Q: q_dims,
+            _K: kv_dims,
+            _V: kv_dims,
+            _O: q_dims,
+            cls._DO: q_dims,
+            _STATS: [2, 4, 5, 1],
+            cls._DQ: q_dims,
+            cls._DK: kv_dims,
+            cls._DV: kv_dims,
+        }
+        inputs = {
+            "q_tensor_uid": _Q,
+            "k_tensor_uid": _K,
+            "v_tensor_uid": _V,
+            "o_tensor_uid": _O,
+            "do_tensor_uid": cls._DO,
+            "stats_tensor_uid": _STATS,
+        }
+        for key, uid, dims in (
+            ("dropout_mask_tensor_uid", _DROP_MASK, mask),
+            ("dropout_scale_tensor_uid", _DROP_SCALE, scale),
+            ("dropout_scale_inv_tensor_uid", cls._SCALE_INV, scale_inv),
+            ("attn_mask_tensor_uid", _ATTN_MASK, attn_mask),
+            ("seed_tensor_uid", _SEED, (1,) if seed else None),
+            ("offset_tensor_uid", _OFFSET, (1,) if offset else None),
+        ):
+            if dims is not None:
+                inputs[key] = uid
+                tensors[uid] = list(dims)
+        types = {_SEED: "int64", _OFFSET: "int64", **(types or {})}
+        return {
+            "tensors": [
+                {"uid": uid, "dims": dims, "data_type": types.get(uid, "float")}
+                for uid, dims in tensors.items()
+            ],
+            "nodes": [
+                {
+                    "name": "sdpa_backward",
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": inputs,
+                    "outputs": {
+                        "dq_tensor_uid": cls._DQ,
+                        "dk_tensor_uid": cls._DK,
+                        "dv_tensor_uid": cls._DV,
+                    },
+                    "attributes": {
+                        "dropout_probability": probability,
+                        "attn_scale_value": _ATTN_SCALE,
+                        **(attributes or {}),
+                    },
+                }
+            ],
+        }
+
+    @classmethod
+    def _backward_dropout_inputs(cls, graph_json, seed):
+        """``_dropout_inputs`` with ``dropout_scale_inv`` = 1/s."""
+        inputs = _dropout_inputs(graph_json, seed)
+        if cls._SCALE_INV in inputs:
+            inputs[cls._SCALE_INV] = np.full(
+                inputs[cls._SCALE_INV].shape, 1 / _KEEP_SCALE, dtype=np.float32
+            )
+        return inputs
+
+    @staticmethod
+    def _dropout_backward_reference(
+        q, k, v, do, mask, s, inv, kind="none", attn_mask=None
+    ):
+        """float64 ``(O, stats, dQ, dK, dV)`` of hipDNN's dropout backward.
+
+        ``O = (P * M * s) V`` with ``P`` the softmax before dropout, then
+        ``D = rowsum(dO * O) * inv``, ``dP = (dO V^T) * M``,
+        ``dS = s * P * (dP - D)`` and ``dV = (P * M * s)^T dO``; dQ and dK
+        take the attention scale from ``dS``. The additive mask of ``kind``
+        (none, causal, alibi) is built here from its definition.
+        """
+        q, k, v, do = (np.asarray(t, dtype=np.float64) for t in (q, k, v, do))
+        mask = np.asarray(mask, dtype=np.float64)
+        batch, hq, sq = q.shape[:3]
+        hkv, skv = k.shape[1], k.shape[2]
+        rep = hq // hkv
+        k_full, v_full = np.repeat(k, rep, axis=1), np.repeat(v, rep, axis=1)
+        i = np.arange(sq)[:, None]
+        j = np.arange(skv)[None, :]
+        causal = kind in ("causal", "alibi")
+        additive = np.where(causal & (j > i), -np.inf, 0.0)
+        if kind == "alibi":
+            slopes = 2.0 ** (-8.0 * np.arange(1, hq + 1) / hq)  # power-of-two heads
+            additive = additive + (j - i) * slopes[:, None, None]
+        if attn_mask is not None:
+            additive = additive + np.asarray(attn_mask, dtype=np.float64)
+        scores = q @ k_full.swapaxes(-1, -2) * _ATTN_SCALE + additive
+        lse = np.log(np.exp(scores).sum(axis=-1, keepdims=True))
+        probs = np.exp(scores - lse)
+        dropped = probs * mask * float(s)
+        o = dropped @ v_full
+        d = (do * o).sum(axis=-1, keepdims=True) * float(inv)
+        dp = (do @ v_full.swapaxes(-1, -2)) * mask
+        ds = float(s) * probs * (dp - d) * _ATTN_SCALE
+        dk = ds.swapaxes(-1, -2) @ q
+        dv = dropped.swapaxes(-1, -2) @ do
+        return (
+            o,
+            lse,
+            ds @ k_full,
+            dk.reshape(batch, hkv, rep, skv, -1).sum(axis=2),
+            dv.reshape(batch, hkv, rep, skv, -1).sum(axis=2),
+        )
+
+    def _assert_backward_closed_form(self, graph_json, seed, inv, kind="none"):
+        """Run ``graph_json`` on the closed form's forward ``O`` and stats and
+        compare dQ, dK and dV with ``_dropout_backward_reference``."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        inputs = self._backward_dropout_inputs(graph_json, seed)
+        dropout = _DROP_MASK in inputs
+        o, lse, *grads = self._dropout_backward_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            inputs[self._DO],
+            inputs[_DROP_MASK] if dropout else 1.0,
+            _KEEP_SCALE if dropout else 1.0,
+            inv,
+            kind,
+            attn_mask=inputs.get(_ATTN_MASK),
+        )
+        inputs[_O] = o.astype(np.float32)
+        inputs[_STATS] = lse.astype(np.float32)
+
+        out = provider.compute_reference(graph_json, inputs)
+
+        for uid, grad in zip((self._DQ, self._DK, self._DV), grads):
+            np.testing.assert_allclose(out[uid].data, grad, rtol=1e-4, atol=1e-4)
+
+    def test_sdpa_backward_explicit_mask_matches_autograd(self) -> None:
+        """With ``dropout_scale_inv`` = 1/s, hipDNN's dropout backward is the
+        gradient of ``O = (P * M * s) V``. inv enters only ``D``, so dQ and dK
+        catch a dropped inv. GQA (Hq 4, Hkv 2): the mask is per query head."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = self._backward_dropout_graph()
+        inputs = self._backward_dropout_inputs(graph, seed=21)
+        q, k, v = (
+            torch.from_numpy(inputs[uid]).double().requires_grad_()
+            for uid in (_Q, _K, _V)
+        )
+        mask = torch.from_numpy(inputs[_DROP_MASK]).double()
+        scores = q @ k.repeat_interleave(2, dim=1).transpose(-2, -1) * _ATTN_SCALE
+        dropped = torch.softmax(scores, dim=-1) * mask * float(_KEEP_SCALE)
+        o = dropped @ v.repeat_interleave(2, dim=1)
+        grads = torch.autograd.grad(
+            o, (q, k, v), torch.from_numpy(inputs[self._DO]).double()
+        )
+        inputs[_O] = o.detach().float().numpy()
+        inputs[_STATS] = (
+            torch.logsumexp(scores, dim=-1, keepdim=True).detach().float().numpy()
+        )
+
+        out = provider.compute_reference(graph, inputs)
+
+        for uid, grad in zip((self._DQ, self._DK, self._DV), grads):
+            np.testing.assert_allclose(
+                out[uid].data, grad.numpy(), rtol=1e-4, atol=1e-4
+            )
+
+    def test_sdpa_backward_scale_inv_absent_uses_one(self) -> None:
+        """Without ``dropout_scale_inv``, ``D = rowsum(dO * O)``: inv is 1,
+        not 1/s."""
+        graph = self._backward_dropout_graph(scale_inv=None)
+        self._assert_backward_closed_form(graph, seed=22, inv=1.0)
+
+    @pytest.mark.parametrize("kind", ["causal_top_left", "additive_bias", "alibi"])
+    def test_sdpa_backward_explicit_mask_composes_with_each_mask_kind(
+        self, kind
+    ) -> None:
+        """The mask kinds the backward reference supports; sliding windows and
+        bottom-right alignment stay declined in the backward."""
+        attributes, ref_kind, bias, _ = _MASK_KINDS[kind]
+        graph = self._backward_dropout_graph(
+            attributes=attributes, attn_mask=[1, 4, 5, 7] if bias else None
+        )
+        self._assert_backward_closed_form(
+            graph, seed=23, inv=1 / _KEEP_SCALE, kind=ref_kind
+        )
+
+    def test_sdpa_backward_probability_zero_is_no_dropout(self) -> None:
+        """A non-null probability of 0 with no seed, offset or mask is the
+        plain backward (R13)."""
+        graph = self._backward_dropout_graph(
+            mask=None, scale=None, scale_inv=None, probability=0.0
+        )
+        self._assert_backward_closed_form(graph, seed=24, inv=1.0)
+
+    @pytest.mark.parametrize(
+        "graph_kwargs",
+        [
+            pytest.param({"mask": None, "scale": None}, id="scale_inv_without_mask"),
+            pytest.param({"types": {_SCALE_INV: "half"}}, id="scale_inv_not_float"),
+            pytest.param({"scale_inv": [2]}, id="scale_inv_not_one_element"),
+            pytest.param(
+                {"mask": None, "scale": None, "scale_inv": None, "probability": 0.1},
+                id="probability_nonzero",
+            ),
+            pytest.param(
+                {
+                    "mask": None,
+                    "scale": None,
+                    "scale_inv": None,
+                    "probability": 0.0,
+                    "seed": True,
+                },
+                id="probability_zero_with_seed",
+            ),
+            pytest.param(
+                {
+                    "mask": None,
+                    "scale": None,
+                    "scale_inv": None,
+                    "probability": 0.0,
+                    "offset": True,
+                },
+                id="probability_zero_with_offset",
+            ),
+            pytest.param({"probability": 0.0}, id="probability_zero_with_mask"),
+        ],
+    )
+    def test_sdpa_backward_dropout_declines(self, graph_kwargs) -> None:
+        """One case per backward R7 rule that hipDNN declines (rows 10-11).
+        Each graph differs from a computable one in that rule only."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = self._backward_dropout_graph(**graph_kwargs)
+
+        with pytest.raises(UnsupportedGraphError):
+            provider.compute_reference(
+                graph, self._backward_dropout_inputs(graph, seed=25)
+            )
+
     @pytest.mark.parametrize("dtype", ["float", "bfloat16"])
     def test_sdpa_alibi_forward_correct_across_block_boundaries(
         self, dtype: str, monkeypatch
