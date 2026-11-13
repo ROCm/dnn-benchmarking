@@ -871,7 +871,8 @@ def _prepare_references(
     are then unchecked, not failed. A graph with Philox dropout and no
     ``rng_dump`` gets no reference: its engine rows fail. A graph with an
     ``rng_dump`` gets no reference row either: each engine row builds its
-    own reference from its dump (:func:`_check_philox_outputs`).
+    own reference from its dump (:func:`_check_philox_outputs`). An
+    ``rng_dump`` that is not a FLOAT graph tensor fails the engine rows.
 
     With ``--reference-precision float64`` (the default), a graph the provider
     can compute in float64 gets a float64 reference: on the GPU after the
@@ -891,6 +892,9 @@ def _prepare_references(
         warn_once("validation", f"{ctx.graph_name}: {philox_error}")
         return None
     if ctx.philox is not None:
+        ctx.reference_error = _rng_dump_type_error(ctx)
+        if ctx.reference_error is not None:
+            warn_once("validation", f"{ctx.graph_name}: {ctx.reference_error}")
         return None
 
     outputs: Optional[Dict[int, ReferenceOutput]] = None
@@ -953,6 +957,23 @@ def _prepare_references(
                     f"{cpu_timer.elapsed_ms / 1000:.1f} s."
                 )
     return row
+
+
+def _rng_dump_type_error(ctx: _GraphContext) -> Optional[str]:
+    """Why the ``rng_dump`` of ``ctx.philox`` cannot be checked, or None.
+
+    The NaN fill before the validation run and the 0/1 check need a FLOAT
+    graph tensor.
+    """
+    uid = ctx.philox.uid
+    dump = next((t for t in ctx.tensor_infos if t.uid == uid), None)
+    if dump is not None and dump.dtype.name == "float":
+        return None
+    found = "no graph tensor" if dump is None else f"data type {dump.data_type}"
+    return (
+        f"rng_dump output (tensor UID {uid}) has {found}; validation needs a "
+        "FLOAT rng_dump"
+    )
 
 
 def _use_float64_reference(

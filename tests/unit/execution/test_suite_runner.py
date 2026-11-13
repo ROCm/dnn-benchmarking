@@ -2161,3 +2161,25 @@ def test_a_tuned_plan_of_a_philox_graph_too_large_for_host_memory_is_not_validat
     (tuned,) = philox.tuned
     assert (tuned.get("validate") is not None) is validated
     assert (row.oracle.correctness is not None) is validated
+
+
+@pytest.mark.parametrize("data_type", ["bfloat16", "unset"])
+def test_a_philox_row_whose_rng_dump_is_not_float_fails_and_keeps_its_timings(
+    philox, data_type
+):
+    """The NaN fill needs a FLOAT dump. "unset" takes the graph's io type
+    (half). The row must fail validation, not become an error row."""
+    graph_json, _ = _philox_graph()
+    dump = next(t for t in graph_json["tensors"] if t["uid"] == DUMP_UID)
+    dump["data_type"] = data_type
+    tensors = GraphLoader().extract_tensor_info(graph_json)
+
+    graph, _ = _validate(graph=graph_json, tensors=tensors, oracle=True)
+
+    (row,) = graph.results
+    assert row.verdict == "failed"
+    assert row.ootb.gpu_kernel_stats is not None
+    assert "rng_dump" in row.ootb.correctness.error_message
+    assert ("zero_outputs", (DUMP_UID,)) not in philox.events
+    assert philox.tuned[0].get("validate") is None
+    assert _exit_code(graph) == 3
