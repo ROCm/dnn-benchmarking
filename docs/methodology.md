@@ -99,7 +99,10 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   still runs.
 - Sliding-window and bottom-right masks, where a graph needs one, and the
   dense per-sequence K and V of paged graphs are built once. A timed paged
-  iteration does one SDPA call per sequence and one `torch.cat`.
+  iteration does one SDPA call per sequence. A packed Q (one batch row for
+  all sequences) then gets one `torch.cat` along the query axis. A Q with
+  one batch row per sequence gets a scatter of each sequence's rows into a
+  zeroed output instead.
 - The `stats` output (log-sum-exp) comes from the fused kernel, as in a
   PyTorch training step. Q, K and V go into the call with `requires_grad`, and
   the tool reads the log-sum-exp that the kernel saves for the backward pass.
@@ -138,7 +141,8 @@ the PyTorch row instead of timing the setup.
 Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
-- Paged KV: one SDPA call per sequence and a `torch.cat`.
+- Paged KV: one SDPA call per sequence, then a `torch.cat` or a scatter into
+  a zeroed output.
 - Sliding window or bottom-right causal with a query length above 1 that
   differs from the KV length: the kernel reads an additive mask tensor.
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
@@ -157,6 +161,78 @@ includes a workaround, and the row gets a reference warning:
 - Explicit `attn_mask` bias with a causal mask, a sliding window or
   bottom-right alignment: the tool adds the bias first and applies the band
   second. The kernel reads the sum as one additive mask tensor.
+
+### PyTorch SDPA backward
+
+A timed SDPA backward iteration calls the fused backward kernel that a
+PyTorch training step uses: `aten::_scaled_dot_product_flash_attention_backward`
+or `aten::_scaled_dot_product_efficient_attention_backward`. On ROCm these run
+AOTriton or CK. The call reads the graph's O and `stats` inputs, as the hipDNN
+kernel does. PyTorch autograd cannot do this, because it keeps its own saved
+output and log-sum-exp.
+
+The setup runs once, before the timed loop:
+
+1. Run the forward once with the current `--pytorch-sdpa-backend` selection,
+   with `requires_grad` inputs and the graph's mask, bounds and scale. GQA and
+   MQA graphs use `enable_gqa` on the real-size K and V, as a training step
+   does. If that forward does not run Flash, the tool expands K and V to the
+   query head count and runs the forward again.
+2. Read from the autograd node which fused kernel ran, and its saved scalars.
+3. Copy `stats` into the log-sum-exp layout of that kernel.
+4. Copy O into the memory layout of the forward's output. For an O in the
+   `[B, H, S, D]` memory order, the memory-efficient backward (AOTriton) of
+   PyTorch 2.9.1 and of the 2.14 nightly on gfx90a gives wrong dK and dV
+   (ALMIOPEN-3256). A training step also passes the forward's output in this
+   layout.
+
+The setup thus reads Q, K, V, O, `stats` and the mask once. If an earlier
+node of the graph computes one of these inputs, the row does not run: its
+setup cannot be outside the timed region.
+
+A timed iteration does one backward kernel call. With `enable_gqa`, the Flash
+backward writes dK and dV at the K/V head count, so the iteration does no
+other work. With expanded K and V, the iteration also sums dK and dV over
+each head group.
+
+- With the default selection, the backward kernel is the one the forward
+  dispatches to. If default dispatch chooses neither Flash nor
+  memory-efficient attention (math, or cuDNN on CUDA), the row runs a manual
+  fp32 backward formula and gets a warning.
+- `--pytorch-sdpa-backend flash` and `efficient` select that kernel. Flash
+  takes no mask tensor, so it fails sliding-window and `attn_mask` graphs, and
+  bottom-right causal graphs with `Sq > 1` and `Sq != Skv`. It also rejects
+  top-left causal graphs with `Sq != Skv`. `--pytorch-rocm-fa-library` applies
+  to the timed backward call too. The tool binds no backward for `math`,
+  `cudnn` and `overrideable`, so the row is an error.
+- The CPU reference (`--validate pytorch` on the host) uses the manual fp32
+  formula of hipDNN's CPU reference.
+- The timed backward gets the same mask as the forward call of step 1. A
+  sliding window, a bottom-right causal band with `Sq != Skv` and a bias
+  reach the kernel as one additive mask tensor, as in the forward (see
+  [PyTorch SDPA setup](#pytorch-sdpa-setup)). ALiBi graphs use the manual
+  fp32 formula. The backward has no static warning for the additive mask;
+  only the fallback to the manual fp32 formula is warned at run time.
+
+A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
+dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
+the bias broadcasts. It has the dims and the data type of the bias. This is
+the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
+from rocm-libraries `4630e167ce1` (#14358), which the pinned `bfbd6d7`
+includes.
+
+- The timed row calls the memory-efficient backward kernel with its bias
+  gradient enabled, and then sums the score-shaped gradient to the bias
+  dims. A training step with a bias that requires a gradient does the same
+  two operations. Flash takes no bias, so it cannot compute dBias.
+- ALiBi graphs and rows that fall back to math run the manual fp32 formula,
+  which also gives dBias.
+- The reference accumulates dBias in fp32 and rounds it to the bias data
+  type once, as hipDNN's CPU reference does. The timed kernel rounds each
+  score-shaped element first. On MI210 the two differ by at most 0.002 on
+  the fp16 `swin-base` graph (values up to 6.1) and the bf16 `alphafold2`
+  graph (values up to 0.55) of the SDPA backward collection. The SDPA
+  backward tolerances apply to dBias unchanged.
 
 ### PyTorch convolution backward
 
@@ -333,8 +409,12 @@ device once. It does not use the timed loop, for two reasons:
 Before each child starts, the parent frees the engine buffers. The child thus
 has the same free VRAM as the timed run. Counter values come from this child,
 not from the timed loop. The child also launches input-fill kernels, and a
-graph can launch more than one kernel. Use `pmc.per_kernel[...].dispatches`
-and the kernel name to find the engine kernel.
+graph can launch more than one kernel. For an SDPA backward graph, the input
+fill includes the PyTorch attention forward that computes O and `stats` (see
+[SDPA backward inputs](#sdpa-backward-inputs)). Its matmul, `exp` and
+`logsumexp` kernels run on the GPU before the graph executes, and the
+profiler records them. Use `pmc.per_kernel[...].dispatches` and the kernel
+name to find the engine kernel.
 
 ## Fast mode
 
@@ -493,6 +573,72 @@ back to back, in two repeats (92 median pairs):
 A time series that crosses this change can show a step on bimodal rows.
 Measure again after a timing change.
 
+## Paged SDPA inputs
+
+A paged SDPA graph gives K and V as a block container `[num_blocks, H_kv,
+page_size, D]`, and the page tables as int32 `[B, 1, max_blocks_per_seq,
+1]`, as hipDNN and cuDNN require. The tool also reads rank-2 `[B,
+max_blocks_per_seq]` tables. It fills the page tables with block ids
+0, 1, 2, ... in sequence order, so no two sequences share a block when the
+container has at least `B * max_blocks_per_seq` blocks. A smaller container
+wraps the ids around its block count. Every sequence uses its full
+allocation: `seq_len_q` is the query length of Q (an equal share of the
+query rows for a packed `[1, H, total_q, D]` Q), and `seq_len_kv` is the
+table width times the page size, capped by `max_seq_len_kv`. A graph with
+sequence lengths but no page table gets 1 for every length.
+
+## SDPA backward inputs
+
+An SDPA backward node reads Q, K, V, the forward output O, the incoming
+gradient dO and the forward log-sum-exp `stats`. The tool draws Q, K, V and
+dO from U[0, 1) like other inputs, and then scales dO (see below). It
+computes O and `stats` as the
+exact float32 forward of Q, K and V with the graph's scale, mask, bounds,
+additive bias, ALiBi and GQA layout. The forward runs in PyTorch, on the GPU
+when one is visible;
+without PyTorch a NumPy fallback gives the same values. O is rounded to its
+graph type. Both runtimes and the reference read these values.
+
+Independent random O and `stats` do not describe a forward pass. On gfx942
+(ALMIOPEN-2976), random values gave gradients of 1e4 to 1e5 and fp16
+overflow, and the ASM SDPA engine failed validation on every graph. An upper
+bound for `stats` without a forward kept the gradients finite but between
+4e-6 and 0.13, so the tolerances could not detect an error. With the forward
+values, the gradients were 1 to 7 and the engine passed on every bf16 graph.
+The kernel times were the same within 1% for all three input forms.
+
+With many keys per query, as in decode shapes, dV and dK elements can all
+be below 1e-3 even with forward values (one query and 4,096 keys without
+GQA: dK up to 2e-4, dV up to 5e-4). The fixed `atol` of 1e-3 would then
+accept an engine that never writes dK or dV. Every gradient is linear in
+dO, so the tool scales dO like AMP loss scaling: when the largest element
+of `dV = P^T dO` is below 0.5, dO is multiplied by the power of two that
+puts it in [0.5, 1). The scale is at most 2^14, so fp16 dO stays finite.
+A power of two keeps dO exact at its graph type. The other gradients scale
+by the same factor. A square shape with Sq = Skv = 1,024 gets no scale,
+because dV is already near 1; its dQ stays below 1e-2.
+
+fp16 SDPA backward outputs use `rtol` 4e-3 (about 4 ULP) instead of the fp16
+default of 1e-3. dQ, dK and dV sum over every key or query row. The value
+was measured on gfx942 against the earlier AOTriton reference: the ASM SDPA
+engine and AOTriton differed by 2 ULP on 1 in 10,000 to 1 in 50,000
+elements (`max_rel_diff` 2^-9), so 1e-3 failed two correct kernels. It is
+not yet measured again against the fp32 reference. The source is
+`OP_TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
+
+With `--validate pytorch`, the SDPA backward reference is the manual fp32
+formula, on a GPU and on the host. It reads the graph's O and `stats`. The
+reference pass does not call the fused PyTorch backward kernel: only the
+timed PyTorch row does (see [PyTorch SDPA backward](#pytorch-sdpa-backward)).
+
+The forward is dense and has no dropout: sequence-length and dropout inputs
+do not change O and `stats`, so O of a dropout graph is the forward without
+dropout. The forward adds host time to input generation
+before the timed loop. It is proportional to the attention FLOPs of the
+graph. Forward-consistent SDPA backward inputs and the scaled dO start at
+tool version 0.4.0. Do not compare SDPA backward results with results from
+earlier versions.
+
 ## Not yet
 
 The tool does not do these things yet:
@@ -507,12 +653,24 @@ The tool does not do these things yet:
   bottom-right causal bands, bounded left windows with `right_bound = 0`,
   attention-sink logits, and ALiBi with top-left causal masking or a
   top-left sliding window. An explicit `attn_mask` bias can combine with a
-  causal band or a sliding window. It follows hipDNN precedence: the
-  deprecated causal booleans override the modern bounds and diagonal
-  alignment. The reference declines these graphs as unsupported: ALiBi with
-  bottom-right alignment or with neither a causal mask nor a sliding window;
-  padding masks; paged or variable-length ALiBi graphs. Other masks also
-  make the reference decline the graph.
+  causal band or a sliding window. It resolves the mask as hipDNN does: a
+  deprecated causal boolean acts as `right_bound = 0`, and the stored
+  `left_bound` and diagonal alignment still apply. As in cuDNN and in hipDNN
+  since rocm-libraries #14483, `left_bound = L` keeps `L` keys up to and
+  including the diagonal, so a window of `L` keys has `left_bound = L`. The
+  same rule sets the FLOP count and the SDPA backward inputs. Before 0.4.0,
+  `left_bound = L` kept `L + 1` keys, so a window graph without a causal
+  boolean has a band one key narrower at 0.4.0, with a different FLOP count,
+  reference and backward inputs. Do not compare window rows across 0.3.0
+  and 0.4.0. Tool versions before 0.4.0 also let the deprecated boolean
+  override the bounds and the alignment. For a graph that sets a causal
+  boolean with a bound or with `BOTTOM_RIGHT`, the FLOP count and the
+  PyTorch and rocKE masks thus changed at 0.4.0. The reference declines
+  these graphs as unsupported:
+  `left_bound = 0`, which hipDNN rejects; ALiBi with bottom-right alignment
+  or with neither a causal mask nor a sliding window; padding masks; paged
+  or variable-length ALiBi graphs. Other masks also make the reference
+  decline the graph.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
@@ -533,6 +691,12 @@ The tool does not do these things yet:
   tool version 0.3.0 (`tool.version` in the result file). Do not compare
   fp16 convolution correctness results with results from earlier versions.
   Signed data for other operations needs a role for each tensor first.
+- Validation of large fp16 SDPA backward gradients. On the six fp16
+  `aotriton_test_perf` graphs (B4, H48, D128, S 1024 to 4096), dK reaches
+  about 440. Against the earlier AOTriton reference, the ASM SDPA engine
+  differed by up to 1.0 on 18 to 194 elements of up to 3e8, where
+  cancellation leaves small values. AOTriton itself differs from an fp32
+  reference by up to 0.13. A norm-based tolerance would decide these rows.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with

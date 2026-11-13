@@ -46,6 +46,18 @@ TOLERANCES = {
     "fp8_e8m0": (0.0, 1.0),
 }
 
+# (rtol, atol) by (producing node type, output dtype); these win over
+# TOLERANCES. SDPA backward dQ/dK/dV sum over every key or query row in fp32
+# and round to fp16 once. The fp16 rtol was measured on gfx942 against the
+# earlier AOTriton reference: the ASM SDPA engine and AOTriton landed 2 ULP
+# apart (relative 2^-9) on 1 in 10,000 to 1 in 50,000 elements, so 1e-3
+# (1 ULP) failed two correct kernels. 4e-3 (~4 ULP at the bottom of the
+# binade) tolerates that. It is not yet measured again against the current
+# fp32 reference.
+OP_TOLERANCES = {
+    ("SdpaBackwardAttributes", "half"): (4e-3, 1e-3),
+}
+
 
 def _compared(data: Any, tensor_info: TensorInfo) -> Any:
     """The values compare() sees: log2 for e8m0 (see TOLERANCES), else ``data``."""
@@ -57,9 +69,13 @@ def _compared(data: Any, tensor_info: TensorInfo) -> Any:
 
 
 def tolerance_for(config: SuiteConfig, tensor_info: TensorInfo) -> Tuple[float, float]:
-    """``--rtol/--atol`` when given, else the dtype default for this output."""
-    return config.validation.tolerance_override or TOLERANCES.get(
-        tensor_info.dtype.name, DEFAULT_TOLERANCE
+    """``--rtol/--atol`` when given, else the op and dtype default for this
+    output (``OP_TOLERANCES``, then ``TOLERANCES``)."""
+    name = tensor_info.dtype.name
+    return (
+        config.validation.tolerance_override
+        or OP_TOLERANCES.get((tensor_info.producer, name))
+        or TOLERANCES.get(name, DEFAULT_TOLERANCE)
     )
 
 

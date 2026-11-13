@@ -192,18 +192,19 @@ scale its source used, usually `1/sqrt(head_dim)`. Such nodes print as
 `NOSCALE` and still exit 0; pass `--strict-scale` to make them failures.
 A causal SDPA node with Sq = 1 whose effective diagonal is top-left attends
 only to key 0, which no decode step means (a decode step is unmasked or
-bottom-right). 80 graphs in the shipped corpus are written that way, so the
+bottom-right). 137 graphs in the shipped corpus are written that way (57 of
+them in `corpus/SDPABackward`), so the
 check prints them as `DECODE` and still exits 0; pass `--strict-decode-mask`
 to make them failures once those graphs are regenerated. Other effective
 top-left causal nodes with Sq != Skv print a warning, because decode and
 chunked prefill workloads almost always use bottom-right alignment.
 
 "Effective" is the mask hipDNN resolves, which is not always the one the JSON
-names. `causal_mask: true` forces `left_bound = -1`, `right_bound = 0` and a
-top-left diagonal, overriding `diagonal_alignment` and any bounds written
-beside it, so `causal_mask: true` with `BOTTOM_RIGHT` still runs top-left.
-Write bottom-right as `causal_mask_bottom_right: true`, or with the bounds:
-`causal_mask: false`, `right_bound: 0`, `diagonal_alignment: BOTTOM_RIGHT`.
+names. A deprecated causal flag acts as `right_bound = 0` when `right_bound`
+is unset, and the stored `left_bound` and `diagonal_alignment` still apply
+(hipDNN's `resolveDiagonalBand`). Thus `causal_mask: true` with
+`BOTTOM_RIGHT` runs bottom-right, and `causal_mask_bottom_right: true` forces
+bottom-right.
 Setting both causal flags fails the check, as hipDNN rejects that pair. Only
 `right_bound >= 0` masks the right side, so a node carrying a `left_bound`
 alone is a window that stays open on the right, which is never causal.

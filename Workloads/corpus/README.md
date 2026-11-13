@@ -9,8 +9,9 @@ The goal is to represent all hipDNN workloads with the smallest practical
 number of graphs. This goal is an admission rule for the folder. It is not a
 claim about the current coverage.
 
-Today, the folder contains one collection. `Convolution/` contains
-9,471 unique convolution geometries from 31 models.
+Today, the folder contains three collections. `Convolution/` contains
+9,471 unique convolution geometries from 31 models. `SDPA/` contains 164
+SDPA forward graphs. `SDPABackward/` contains 4,790 SDPA backward graphs.
 
 ## Golden standard
 
@@ -37,11 +38,13 @@ Use `headline/` for a small and stable regression set. Use `models/` to study
 one model. Use `microbench/` for broad shape sweeps. Use `corpus/` to measure a
 workload class across many representative models.
 
-## Current collection
+## Current collections
 
 | Collection | Scope | Documentation |
 |---|---|---|
 | `Convolution/` | 9,471 unique convolution geometries from 31 models | [Convolution corpus guide](Convolution/Explanation.md) |
+| `SDPA/` | 164 unique SDPA forward graphs from the rocKE Solera performance set | [SDPA corpus guide](SDPA/Explanation.md) |
+| `SDPABackward/` | 4,790 unique SDPA backward graphs: every dense SDPA forward graph in `Workloads/` converted, the captured backward graphs, and training graphs with dropout, bias, dBias and ALiBi | [SDPA backward corpus guide](SDPABackward/Explanation.md) |
 
 The convolution collection includes forward, backward-data, and
 backward-weight graphs. It covers 2-D, 3-D, audio, image, and video workloads.

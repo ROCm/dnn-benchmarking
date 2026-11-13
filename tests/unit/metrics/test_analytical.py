@@ -535,31 +535,34 @@ class TestComputeFlops:
         assert by_bounds == by_flag
 
     def test_sdpa_causal_sliding_window_bottom_right(self):
-        # Causal window of W keys = left W-1, right 0; Sq=4, Skv=6, W=3.
-        # offset 2 -> rows keep min(i + 3, 3) = 3 keys each -> 12 pairs, the
-        # rocKE benchmark's sum_i min(i + off + 1, W).
-        graph = _sdpa_graph(sq=4, skv=6, left_bound=2, right_bound=0)
+        # Causal window of W keys = left W, right 0 (cuDNN's left_bound counts
+        # the diagonal); Sq=4, Skv=6, W=3. offset 2 -> rows keep
+        # min(i + 3, 3) = 3 keys each -> 12 pairs, the rocKE benchmark's
+        # sum_i min(i + off + 1, W).
+        graph = _sdpa_graph(sq=4, skv=6, left_bound=3, right_bound=0)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
         flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
     def test_sdpa_sliding_window_top_left_clamps_edges(self):
-        # left 1, right 1, Sq=Skv=4 -> rows keep 2,3,3,2 keys = 10 pairs.
-        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=1, right_bound=1))
+        # left 2 (diagonal and one key before), right 1, Sq=Skv=4 -> rows keep
+        # 2,3,3,2 keys = 10 pairs.
+        flops = compute_flops(_sdpa_graph(sq=4, skv=4, left_bound=2, right_bound=1))
         assert flops == 2 * 2 * 64 * 10 * (128 + 128)
 
-    def test_sdpa_deprecated_causal_ignores_alignment_and_bounds(self):
-        # hipDNN: causal_mask=True means top-left causal regardless of bounds.
-        graph = _sdpa_graph(causal=True, sq=8, skv=4, left_bound=1)
+    def test_sdpa_deprecated_causal_composes_with_alignment_and_bounds(self):
+        # hipDNN (resolveDiagonalBand): causal_mask acts as right_bound 0, and
+        # left_bound and the alignment still apply. Sq=8, Skv=4, BOTTOM_RIGHT
+        # offset -4, left 2: rows keep 0,0,0,0,1,2,2,2 keys = 7 pairs.
+        graph = _sdpa_graph(causal=True, sq=8, skv=4, left_bound=2)
         graph["nodes"][0]["attributes"]["diagonal_alignment"] = "BOTTOM_RIGHT"
-        flops = compute_flops(graph)
-        top_left = compute_flops(_sdpa_graph(causal=True, sq=8, skv=4))
-        assert flops == top_left
+        assert compute_flops(graph) == 2 * 2 * 64 * 7 * (128 + 128)
 
     @pytest.mark.parametrize(
         "attrs",
         [
             {"left_bound": -2},
+            {"left_bound": 0, "right_bound": 0},
             {"causal_mask": True, "right_bound": -5},
             {"causal_mask": True, "causal_mask_bottom_right": True},
         ],
@@ -591,16 +594,28 @@ class TestComputeFlops:
         flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
-    def test_sdpa_causal_mask_overrides_a_bottom_right_alignment(self):
-        # causal_mask pins the diagonal top-left whatever diagonal_alignment
-        # says, the way hipDNN's extractDiagonalBandParams resolves it:
-        # rows -> 1+2+3 = 6 pairs, not the bottom-right 12.
+    def test_sdpa_causal_mask_keeps_a_bottom_right_alignment(self):
+        # causal_mask composes with the stored diagonal_alignment, the way
+        # hipDNN's resolveDiagonalBand resolves it (rocm-libraries #13065):
+        # rows -> 3+4+5 = 12 bottom-right pairs, not the top-left 6.
         graph = _sdpa_graph(sq=3, skv=5)
         attributes = graph["nodes"][0]["attributes"]
         attributes["causal_mask"] = True
         attributes["diagonal_alignment"] = "BOTTOM_RIGHT"
         flops = compute_flops(graph)
-        assert flops == 2 * 2 * 64 * 6 * (128 + 128)
+        assert flops == 2 * 2 * 64 * 12 * (128 + 128)
+
+    @pytest.mark.parametrize("max_seq_len_kv, skv", [(None, 112), (109, 109)])
+    def test_sdpa_paged_counts_the_logical_kv_length(self, max_seq_len_kv, skv):
+        # K is a block container [B*W, Hkv, page, D]: 7 pages of 16 keys per
+        # sequence, capped by max_seq_len_kv; not the page size 16.
+        graph = _sdpa_graph(b=2, sq=1, skv=16)
+        graph["tensors"][1]["dims"][0] = 14
+        graph["tensors"].append({"uid": 5, "dims": [2, 1, 7, 1]})
+        node = graph["nodes"][0]
+        node["inputs"]["page_table_k_tensor_uid"] = 5
+        node["attributes"]["max_seq_len_kv"] = max_seq_len_kv
+        assert compute_flops(graph) == 2 * 2 * 64 * skv * (128 + 128)
 
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.

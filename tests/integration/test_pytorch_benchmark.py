@@ -12,6 +12,7 @@ from collections import Counter
 import numpy as np
 import pytest
 
+from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.config import PyTorchSdpaBackendName, TimingPolicy
 from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
@@ -446,3 +447,331 @@ def test_default_conv_reference_is_float64_on_the_gpu(torch_gpu, graph_name) -> 
         np.testing.assert_allclose(
             ref.host_data(), host[uid].host_data(), rtol=1e-12, atol=0
         )
+
+
+@pytest.mark.parametrize(
+    "q_heads, kv_heads, q_len, parameters",
+    [
+        (4, 4, 96, {"causal_mask": True}),
+        (4, 4, 64, {"causal_mask": True}),
+        (4, 2, 96, {}),
+        (4, 4, 96, {"left_bound": 15, "right_bound": 0}),
+    ],
+    ids=["causal", "causal-sq-lt-skv", "gqa", "window"],
+)
+@pytest.mark.parametrize("backend", ["default", "flash", "efficient"])
+def test_sdpa_backward_fused_kernel_matches_host_formula(
+    torch_gpu, q_heads: int, kv_heads: int, q_len: int, parameters: dict, backend: str
+) -> None:
+    """The GPU row runs a fused backward kernel on the graph's O and stats.
+    Its gradients match the host formula on the same inputs. Causal is
+    top-left, also with fewer queries than keys."""
+    from dnn_benchmarking.execution import pytorch_ops
+
+    torch = torch_gpu
+    torch.manual_seed(0)
+    batch, kv_len, dim, scale = 2, 96, 64, 0.125
+    q = torch.randn(batch, q_heads, q_len, dim)
+    k = torch.randn(batch, kv_heads, kv_len, dim)
+    v = torch.randn(batch, kv_heads, kv_len, dim)
+    do = torch.randn(batch, q_heads, q_len, dim)
+    keep = torch.ones(q_len, kv_len, dtype=torch.bool)
+    if parameters:
+        keep = keep.tril()
+    if "left_bound" in parameters:
+        keep &= ~torch.ones(q_len, kv_len, dtype=torch.bool).tril(-16)
+    rep = q_heads // kv_heads
+    scores = q @ k.repeat_interleave(rep, 1).transpose(-2, -1) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    stats = torch.logsumexp(scores, -1, keepdim=True)
+    o = torch.softmax(scores, -1) @ v.repeat_interleave(rep, 1)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                },
+                "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+                "parameters": {"attn_scale_value": scale, **parameters},
+            }
+        ]
+    }
+    half = [t.to(torch.bfloat16) for t in (q, k, v, o, do)]
+    host = {**dict(zip(range(1, 6), [t.float() for t in half])), 6: stats}
+    device = {**dict(zip(range(1, 6), [t.cuda() for t in half])), 6: stats.cuda()}
+
+    pytorch_ops.execute_graph(graph_json, host)
+    state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName(backend))
+    if backend == "flash" and ("left_bound" in parameters or q_len != kv_len):
+        # Flash takes no mask, so a strict Flash selection cannot run a
+        # window, and it rejects is_causal when Sq != Skv.
+        with pytest.raises(pytorch_ops.PyTorchSdpaBackendUnavailableError):
+            with pytorch_ops.use_pytorch_sdpa_backend(state):
+                pytorch_ops.execute_graph(graph_json, device)
+        return
+    with pytorch_ops.use_pytorch_sdpa_backend(state):
+        pytorch_ops.execute_graph(graph_json, device)
+
+    for uid in (7, 8, 9):
+        assert device[uid].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            device[uid].float().cpu(), host[uid], rtol=3e-2, atol=3e-2
+        )
+
+
+@pytest.mark.parametrize(
+    "bias_dims, parameters",
+    [
+        ((1, 4, 96, 96), {"causal_mask": True}),
+        ((2, 1, 1, 96), {}),
+    ],
+    ids=["shared-batch-causal", "padding-shape"],
+)
+@pytest.mark.parametrize("backend", ["default", "efficient"])
+def test_sdpa_backward_fused_dbias_matches_host_formula(
+    torch_gpu, bias_dims: tuple, parameters: dict, backend: str
+) -> None:
+    """The GPU row takes dBias from the memory-efficient backward kernel and
+    sums it over the broadcast bias dims. It matches the host fp32 formula,
+    in the bias dims and data type. GQA graph."""
+    from dnn_benchmarking.execution import pytorch_ops
+
+    torch = torch_gpu
+    torch.manual_seed(0)
+    batch, q_heads, kv_heads, seq, dim, scale = 2, 4, 2, 96, 64, 0.125
+    q = torch.randn(batch, q_heads, seq, dim)
+    k = torch.randn(batch, kv_heads, seq, dim)
+    v = torch.randn(batch, kv_heads, seq, dim)
+    do = torch.randn(batch, q_heads, seq, dim)
+    bias = torch.randn(bias_dims)
+    scores = q @ k.repeat_interleave(2, 1).transpose(-2, -1) * scale + bias
+    if parameters:
+        keep = torch.ones(seq, seq, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~keep, float("-inf"))
+    stats = torch.logsumexp(scores, -1, keepdim=True)
+    o = torch.softmax(scores, -1) @ v.repeat_interleave(2, 1)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                    "attn_mask_tensor_uid": 10,
+                },
+                "outputs": {
+                    "dq_tensor_uid": 7,
+                    "dk_tensor_uid": 8,
+                    "dv_tensor_uid": 9,
+                    "dbias_tensor_uid": 11,
+                },
+                "parameters": {"attn_scale_value": scale, **parameters},
+            }
+        ]
+    }
+    half = [t.to(torch.bfloat16) for t in (q, k, v, o, do, bias)]
+    uids = (1, 2, 3, 4, 5, 10)
+    host = {**dict(zip(uids, [t.float() for t in half])), 6: stats}
+    device = {**dict(zip(uids, [t.cuda() for t in half])), 6: stats.cuda()}
+
+    pytorch_ops.execute_graph(graph_json, host)
+    state = pytorch_ops.PyTorchSdpaBackendState(PyTorchSdpaBackendName(backend))
+    with pytorch_ops.use_pytorch_sdpa_backend(state):
+        pytorch_ops.execute_graph(graph_json, device)
+
+    assert device[11].dtype == torch.bfloat16
+    assert device[11].shape == bias_dims
+    torch.testing.assert_close(device[11].float().cpu(), host[11], rtol=3e-2, atol=3e-2)
+
+
+def _sdpa_backward_node(parameters: dict) -> dict:
+    return {
+        "type": "SdpaBackwardAttributes",
+        "inputs": {
+            "q_tensor_uid": 1,
+            "k_tensor_uid": 2,
+            "v_tensor_uid": 3,
+            "o_tensor_uid": 4,
+            "do_tensor_uid": 5,
+            "stats_tensor_uid": 6,
+        },
+        "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+        "parameters": {"attn_scale_value": 0.125, **parameters},
+    }
+
+
+def _sdpa_backward_tensors(torch, shape=(1, 4, 64, 64)) -> dict:
+    tensors = {
+        uid: torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+    }
+    tensors[6] = torch.randn(shape[:-1] + (1,), device="cuda")
+    return tensors
+
+
+@pytest.mark.parametrize("backend", ["default", "efficient"])
+def test_sdpa_backward_with_a_computed_input_is_not_timed(
+    torch_gpu, backend: str
+) -> None:
+    """The fused backward setup copies Q, K, V, O and stats once, before the
+    timed loop. A Q that an earlier node computes would then be stale in
+    every timed iteration, so the row must fail instead of timing it."""
+    torch = torch_gpu
+    torch.manual_seed(0)
+    relu = {
+        "type": "PointwiseAttributes",
+        "compute_data_type": "float",
+        "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": 10},
+        "outputs": {"out_0_tensor_uid": 1},
+    }
+    graph_json = {"nodes": [relu, _sdpa_backward_node({"causal_mask": True})]}
+    tensors = _sdpa_backward_tensors(torch)
+    tensors[10] = tensors[1].clone()
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName(backend)
+    )
+    executor.prepare()
+
+    with pytest.raises(UnsupportedGraphError):
+        executor.benchmark(tensors)
+
+
+def test_alibi_sdpa_backward_runs_the_formula_and_declines_a_fused_kernel(
+    torch_gpu,
+) -> None:
+    """The fused backward kernels take no ALiBi slopes. Default dispatch
+    times the fp32 formula and notes it; a strict selection cannot run."""
+    torch = torch_gpu
+    torch.manual_seed(0)
+    graph_json = {
+        "nodes": [_sdpa_backward_node({"causal_mask": True, "alibi_mask": True})]
+    }
+    tensors = _sdpa_backward_tensors(torch)
+
+    default = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    default.prepare()
+    assert default.benchmark(tensors).kernel_ms[0] > 0
+    assert default.notes
+
+    strict = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT
+    )
+    strict.prepare()
+    with pytest.raises(UnsupportedGraphError):
+        strict.benchmark(tensors)
+
+
+@pytest.mark.parametrize(
+    "backend, kernel",
+    [
+        ("flash", "aten::_scaled_dot_product_flash_attention_backward"),
+        ("efficient", "aten::_scaled_dot_product_efficient_attention_backward"),
+    ],
+)
+def test_strict_sdpa_backward_row_times_only_the_backward_kernel(
+    torch_gpu, backend: str, kernel: str
+) -> None:
+    """A strict SDPA backward row is timed, and its forward probe runs once.
+
+    The timed iterations replay the backward kernel; a forward in them would
+    add to the PyTorch time and give a false hipDNN speedup.
+    """
+    torch = torch_gpu
+    torch.manual_seed(0)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                },
+                "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+                "parameters": {"attn_scale_value": 0.125, "causal_mask": True},
+            }
+        ]
+    }
+    shape = (2, 4, 128, 64)
+    tensors = {
+        uid: torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+    }
+    tensors[6] = torch.randn(shape[:-1] + (1,), device="cuda")
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName(backend)
+    )
+    executor.prepare()
+
+    profiler = torch.profiler
+    with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+        m = executor.benchmark(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert m.kernel_ms[0] > 0
+    assert ops["aten::scaled_dot_product_attention"] == 1, ops
+    assert ops[kernel] > POLICY.iters, ops
+
+
+def test_gqa_sdpa_backward_times_native_gqa_kernel(torch_gpu) -> None:
+    """A GQA backward row times the fused kernel on the real-size K/V.
+
+    A training step with ``enable_gqa`` runs Flash backward on the real-size
+    K/V and gets dK and dV at the K/V head count. A K/V expansion or a dK/dV
+    head-group sum in the timed iterations is work the step does not pay.
+    """
+    torch = torch_gpu
+    torch.manual_seed(0)
+    graph_json = {
+        "nodes": [
+            {
+                "type": "SdpaBackwardAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                    "o_tensor_uid": 4,
+                    "do_tensor_uid": 5,
+                    "stats_tensor_uid": 6,
+                },
+                "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+                "parameters": {"attn_scale_value": 0.125, "causal_mask": True},
+            }
+        ]
+    }
+    q_shape, kv_shape = (2, 8, 128, 64), (2, 2, 128, 64)
+    tensors = {
+        uid: torch.randn(q_shape if uid in (1, 4, 5, 7) else kv_shape).to(
+            "cuda", torch.bfloat16
+        )
+        for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+    }
+    tensors[6] = torch.randn(q_shape[:-1] + (1,), device="cuda")
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    executor.prepare()
+
+    profiler = torch.profiler
+    with profiler.profile(activities=[profiler.ProfilerActivity.CPU]) as prof:
+        executor.benchmark(tensors)
+
+    ops = Counter(event.name for event in prof.events())
+    assert ops["aten::_scaled_dot_product_flash_attention_backward"] > POLICY.iters
+    assert not {"aten::repeat_interleave", "aten::sum"} & ops.keys(), ops
+    assert tensors[8].shape == kv_shape and tensors[9].shape == kv_shape

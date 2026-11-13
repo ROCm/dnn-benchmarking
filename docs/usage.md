@@ -54,7 +54,7 @@ the same output format.
 | `--benchmark-work-dir PATH` | `$DNN_BENCH_WORKSPACE/work`, else `$XDG_CACHE_HOME/dnn-benchmark/work`, else `<system temp dir>/dnn-benchmark-<user>/work` | Work directory for the caches and the kernel-selection state. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.benchmark_work_dir`. |
 | `--fresh-state`, `--no-fresh-state` | off | Runs the command on a new, empty selection state in the system temporary directory, removed when the command ends. Use it for cold first-run numbers. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.fresh_state`. |
 | `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
-| `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
+| `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). SDPA backward graphs run the backward kernel of the selected category (`default`, `flash` or `efficient`); see [PyTorch SDPA backward](methodology.md#pytorch-sdpa-backward). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
 When `--plugin-path` is not given, the tool uses
@@ -90,7 +90,9 @@ The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
 that rounds one ULP the other way still passes. fp8 e8m0 holds only powers of
 two, so it compares log2 values (the code distance) with (0, 1): at most one
 code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
-log2 values of e8m0 outputs. The source is `TOLERANCES` in
+log2 values of e8m0 outputs. fp16 outputs of an SDPA backward node use
+(4e-3, 1e-3); see [SDPA backward inputs](methodology.md#sdpa-backward-inputs).
+The sources are `OP_TOLERANCES` and `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
 The reference comes from the timed PyTorch `reference` row on the GPU. If
@@ -371,8 +373,10 @@ Requirements and limits:
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
   window. A causal mask (top-left or bottom-right) needs
-  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
-  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. As in
+  hipDNN, the deprecated `causal_mask` flag acts as `right_bound = 0` and
+  keeps `left_bound` and `diagonal_alignment`. `left_bound = 0` is not
+  supported, as in hipDNN.
   An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not

@@ -21,6 +21,7 @@ class TensorInfo:
         data_type: Data type name from the graph (e.g., "float", "half").
         is_virtual: Whether this is a virtual (intermediate) tensor.
         is_output: Whether this tensor is marked as a graph output.
+        producer: Node ``type`` of the node that writes this tensor, or None.
         value: Embedded scalar for pass-by-value tensors, else None.
         dtype: Registry entry for ``data_type``; construction raises
             UnsupportedGraphError for an unknown type.
@@ -34,6 +35,7 @@ class TensorInfo:
     is_virtual: bool
     is_output: bool = False
     value: Optional[Any] = None
+    producer: Optional[str] = None
     dtype: DType = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:

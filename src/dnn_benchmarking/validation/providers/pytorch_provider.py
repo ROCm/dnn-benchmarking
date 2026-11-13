@@ -100,7 +100,7 @@ def _sdpa_scratch_bytes(
     q_len, kv_len, head_dim = q[-2], k[-2], q[-1]
     page_table = _dims(_uid_tensor(inputs, "page_table_k_tensor_uid", tensors))
     if len(page_table) >= 2:
-        kv_len *= page_table[1]  # pages per sequence * page size
+        kv_len *= prod(page_table[1:])  # pages per sequence * page size
     backward = node.get("type") == "SdpaBackwardAttributes"
     has_sink = _uid_tensor(inputs, "sink_token_tensor_uid", tensors) is not None
     alibi = _sdpa_bool(node, "alibi_mask")
@@ -138,7 +138,7 @@ def _sdpa_scratch_bytes(
         expanded *= 2
     needs_band = window is not None or (bottom_right and q_len not in (1, kv_len))
     # Two float32 masks (zeros, then masked_fill) and two bool masks.
-    band = q_len * kv_len * (2 * 4 + 2) if needs_band and not backward else 0
+    band = q_len * kv_len * (2 * 4 + 2) if needs_band else 0
     has_bounds = causal or window is not None or bottom_right
     sink_mask = q_len * kv_len * 4 if has_sink and has_bounds else 0
     return block + expanded + band + sink_mask + alibi_mask
