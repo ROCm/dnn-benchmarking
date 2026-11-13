@@ -16,6 +16,12 @@ costs as much as the attention itself, so it runs in PyTorch, on the GPU
 when one is visible. torch is imported only for a graph with an SDPA
 backward node. Without torch, a NumPy forward (single-threaded, much
 slower) gives the same values to float32 rounding.
+
+With U[0, 1) inputs and many keys per query (decode shapes), every dV and
+dK element is below 1e-3, so the fixed ``atol`` accepts an engine that
+never writes them. Every gradient is linear in dO, so the module scales dO
+by a power of two until the largest dV element is near 1, as AMP loss
+scaling does (:func:`_d_out_scale`).
 """
 
 import math
@@ -30,6 +36,8 @@ from ..metrics.analytical.sdpa import Band, alibi_slopes, sdpa_band
 
 #: Float32 elements of one score block (256 MiB).
 _SCORE_BLOCK_ELEMENTS = 1 << 26
+#: Largest dO scale. dO stays below 2^14, inside the fp16 range (65504).
+_MAX_D_OUT_SCALE = 1 << 14
 
 
 def _uid(node: Dict[str, Any], key: str) -> Optional[int]:
@@ -63,12 +71,15 @@ def attention_forward(
     q: np.ndarray,
     k: np.ndarray,
     v: np.ndarray,
+    d_out: np.ndarray,
     scale: float,
     mask: Optional[np.ndarray] = None,
     band: Band = (None, None, False),
     alibi: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Exact float32 attention: ``(O [B, Hq, Sq, Dv], stats [B, Hq, Sq, 1])``.
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Exact float32 attention: ``(O [B, Hq, Sq, Dv], stats [B, Hq, Sq, 1],
+    max |dV|)``, where ``dV = P^T dO`` summed over the query heads of each
+    K/V head.
 
     K and V can have fewer heads than Q (grouped-query attention). ``mask``
     is an additive bias that broadcasts to ``[B, Hq, Sq, Skv]``. ``alibi``
@@ -78,8 +89,8 @@ def attention_forward(
     """
     torch = _torch()
     if torch is None:
-        return _numpy_forward(q, k, v, scale, mask, band, alibi)
-    return _torch_forward(torch, q, k, v, scale, mask, band, alibi)
+        return _numpy_forward(q, k, v, d_out, scale, mask, band, alibi)
+    return _torch_forward(torch, q, k, v, d_out, scale, mask, band, alibi)
 
 
 def _torch_forward(
@@ -87,11 +98,12 @@ def _torch_forward(
     q: np.ndarray,
     k: np.ndarray,
     v: np.ndarray,
+    d_out: np.ndarray,
     scale: float,
     mask: Optional[np.ndarray],
     band: Band,
     alibi: Optional[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """``attention_forward`` in PyTorch, all heads of one batch at a time."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch, heads, q_len, _ = q.shape
@@ -99,6 +111,7 @@ def _torch_forward(
     rep_k, rep_v = heads // k.shape[1], heads // v.shape[1]
     out = np.empty((batch, heads, q_len, v.shape[3]), dtype=np.float32)
     stats = np.empty((batch, heads, q_len, 1), dtype=np.float32)
+    dv_max = 0.0
     left, right, bottom_right = band
     offset = kv_len - q_len if bottom_right else 0
     block = (
@@ -126,6 +139,10 @@ def _torch_forward(
             q_b = on_device(q[b])
             k_t = on_device(k[b], rep_k).transpose(-2, -1)
             v_b = on_device(v[b], rep_v)
+            d_out_b = on_device(d_out[b])
+            dv_b = torch.zeros(
+                (heads, kv_len, v.shape[3]), dtype=torch.float32, device=device
+            )
             for start in range(0, q_len, rows):
                 end = min(start + rows, q_len)
                 scores = torch.matmul(q_b[:, start:end], k_t).mul_(scale)
@@ -144,27 +161,33 @@ def _torch_forward(
                 probs = scores.sub_(lse).exp_()
                 out[b, :, start:end] = torch.matmul(probs, v_b).cpu().numpy()
                 stats[b, :, start:end] = lse.cpu().numpy()
+                dv_b += torch.matmul(probs.transpose(-2, -1), d_out_b[:, start:end])
                 del scores, probs
+            dv_b = dv_b.view(v.shape[1], rep_v, kv_len, v.shape[3]).sum(dim=1)
+            dv_max = max(dv_max, float(dv_b.abs().max()) if dv_b.numel() else 0.0)
+            del dv_b
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    return out, stats
+    return out, stats, dv_max
 
 
 def _numpy_forward(
     q: np.ndarray,
     k: np.ndarray,
     v: np.ndarray,
+    d_out: np.ndarray,
     scale: float,
     mask: Optional[np.ndarray],
     band: Band,
     alibi: Optional[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """``attention_forward`` in NumPy, one head at a time."""
     batch, heads, q_len, _ = q.shape
     kv_len = k.shape[2]
     rep_k, rep_v = heads // k.shape[1], heads // v.shape[1]
     out = np.empty((batch, heads, q_len, v.shape[3]), dtype=np.float32)
     stats = np.empty((batch, heads, q_len, 1), dtype=np.float32)
+    dv_max = 0.0
     left, right, bottom_right = band
     offset = kv_len - q_len if bottom_right else 0
     keys = np.arange(kv_len)
@@ -174,10 +197,12 @@ def _numpy_forward(
     )
 
     for b in range(batch):
+        dv_b = np.zeros((v.shape[1], kv_len, v.shape[3]), dtype=np.float32)
         for h in range(heads):
             q_bh = np.asarray(q[b, h], dtype=np.float32)
             k_t = np.asarray(k[b, h // rep_k], dtype=np.float32).T
             v_bh = np.asarray(v[b, h // rep_v], dtype=np.float32)
+            d_out_bh = np.asarray(d_out[b, h], dtype=np.float32)
             for start in range(0, q_len, rows_per_block):
                 end = min(start + rows_per_block, q_len)
                 scores = q_bh[start:end] @ k_t
@@ -199,11 +224,25 @@ def _numpy_forward(
                 np.exp(scores, out=scores)
                 total = scores.sum(axis=-1, keepdims=True)
                 safe = np.where(visible, total, np.float32(1))
-                out[b, h, start:end] = (scores @ v_bh) / safe
+                scores /= safe
+                out[b, h, start:end] = scores @ v_bh
                 stats[b, h, start:end] = np.where(
                     visible, peak + np.log(safe), np.float32(0)
                 )
-    return out, stats
+                dv_b[h // rep_v] += scores.T @ d_out_bh[start:end]
+        dv_max = max(dv_max, float(np.abs(dv_b).max()) if dv_b.size else 0.0)
+    return out, stats, dv_max
+
+
+def _d_out_scale(dv_max: float) -> int:
+    """Power of two that brings the largest dV element to [0.5, 1).
+
+    Only small gradients are scaled up; a power of two keeps dO exact at
+    its graph type. The scale is at most ``_MAX_D_OUT_SCALE``.
+    """
+    if not 0.0 < dv_max < 0.5:
+        return 1
+    return min(1 << int(math.floor(-math.log2(dv_max))), _MAX_D_OUT_SCALE)
 
 
 def set_sdpa_backward_inputs(
@@ -212,13 +251,14 @@ def set_sdpa_backward_inputs(
     input_data: Dict[int, np.ndarray],
     round_to: Any,
 ) -> None:
-    """Replace the O and stats inputs of each SDPA backward node in place.
+    """Replace the O and stats inputs of each SDPA backward node in place,
+    and scale its dO input by :func:`_d_out_scale`.
 
     ``round_to(values, tensor_info)`` rounds float32 values to the tensor's
-    logical type. Nodes whose O or stats another node computes are skipped.
-    The forward applies the band, the attention bias and ALiBi. Dropout and
-    sequence-length inputs are not applied: the forward is dense and
-    dropout-free, so with dropout O differs from the dropped-out forward.
+    logical type. Nodes whose O, stats or dO another node computes are
+    skipped. The forward applies the band, the attention bias and ALiBi.
+    Dropout and sequence-length inputs are not applied: the forward is dense
+    and dropout-free, so with dropout O differs from the dropped-out forward.
     """
     if not graph_json:
         return
@@ -228,20 +268,30 @@ def set_sdpa_backward_inputs(
             continue
         uids = {
             name: _uid(node, f"{name}_tensor_uid")
-            for name in ("q", "k", "v", "o", "stats", "attn_mask")
+            for name in ("q", "k", "v", "o", "do", "stats", "attn_mask")
         }
-        if any(uids[name] not in input_data for name in ("q", "k", "v", "o", "stats")):
+        if any(
+            uids[name] not in input_data for name in ("q", "k", "v", "o", "do", "stats")
+        ):
             continue
         try:
             band = sdpa_band(node)
         except ValueError:
             continue  # hipDNN rejects the mask, so no engine reads O or stats
         mask_uid = uids["attn_mask"]
-        q = input_data[uids["q"]]
-        out, stats = attention_forward(
+        q, v = input_data[uids["q"]], input_data[uids["v"]]
+        out_shape = (*q.shape[:3], v.shape[3])
+        d_out = input_data[uids["do"]]
+        if d_out.size != math.prod(out_shape):
+            raise ValueError(
+                f"SDPA backward dO tensor {uids['do']} has dims {list(d_out.shape)}; "
+                f"the forward gives {list(out_shape)}"
+            )
+        out, stats, dv_max = attention_forward(
             q,
             input_data[uids["k"]],
-            input_data[uids["v"]],
+            v,
+            d_out.reshape(out_shape),
             _scale(node, input_data),
             None if mask_uid is None else input_data.get(mask_uid),
             band,
@@ -255,3 +305,9 @@ def set_sdpa_backward_inputs(
                     f"the forward gives {list(values.shape)}"
                 )
             input_data[info.uid] = round_to(values.reshape(info.dims), info)
+        d_out_scale = _d_out_scale(dv_max)
+        if d_out_scale > 1:
+            info = infos[uids["do"]]
+            input_data[info.uid] = round_to(
+                d_out.astype(np.float32) * np.float32(d_out_scale), info
+            )

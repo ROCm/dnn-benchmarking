@@ -1,14 +1,17 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""SDPA backward inputs: O and stats are the exact forward of Q, K and V."""
+"""SDPA backward inputs: O and stats are the exact forward of Q, K and V,
+and dO makes the gradients large enough to validate."""
 
 import numpy as np
 import pytest
 
 from dnn_benchmarking.execution import sdpa_backward_inputs
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
+from dnn_benchmarking.execution.correctness import OP_TOLERANCES, TOLERANCES
 from dnn_benchmarking.graph.tensor_info import TensorInfo
+from dnn_benchmarking.validation import compare
 
 
 @pytest.fixture(autouse=True, params=["torch", "numpy"])
@@ -217,3 +220,39 @@ def test_bf16_output_is_rounded_and_blocks_cover_every_row(monkeypatch) -> None:
     assert not (bits & 0xFFFF).any()  # exactly representable in bfloat16
     np.testing.assert_allclose(data[4], o, rtol=2**-8, atol=1e-6)
     np.testing.assert_allclose(data[6], stats, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("data_type", ["half", "bfloat16"])
+def test_unwritten_decode_gradients_fail_validation(data_type) -> None:
+    """With one query over 2,048 keys, U[0, 1) inputs put every dK and dV
+    element below the fixed atol. The scaled dO must make all-zero dK and dV
+    fail at the default SDPA backward tolerance, and keep dO finite."""
+    q_len, kv_len, dim, scale = 1, 2048, 64, 0.125
+    infos = [
+        _info(1, [1, 2, q_len, dim], data_type),
+        _info(2, [1, 2, kv_len, dim], data_type),
+        _info(3, [1, 2, kv_len, dim], data_type),
+        _info(4, [1, 2, q_len, dim], data_type),
+        _info(5, [1, 2, q_len, dim], data_type),
+        _info(6, [1, 2, q_len, 1], "float"),
+    ]
+
+    data = generate_input_data(
+        infos, seed=3, graph_json=_graph({"attn_scale_value": scale})
+    )
+
+    q, k, v, d_out = (data[uid].astype(np.float64) for uid in (1, 2, 3, 5))
+    assert np.isfinite(d_out).all()
+    scores = q @ k.swapaxes(-1, -2) * scale
+    probs = np.exp(scores - scores.max(-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    d_v = probs.swapaxes(-1, -2) @ d_out
+    d_p = d_out @ v.swapaxes(-1, -2)
+    d_s = probs * (d_p - (d_p * probs).sum(-1, keepdims=True))
+    d_k = d_s.swapaxes(-1, -2) @ q * scale
+    rtol, atol = OP_TOLERANCES.get(
+        ("SdpaBackwardAttributes", data_type), TOLERANCES[data_type]
+    )
+    for gradient in (d_k, d_v):
+        result = compare(np.zeros_like(gradient), gradient, rtol=rtol, atol=atol)
+        assert not result.passed

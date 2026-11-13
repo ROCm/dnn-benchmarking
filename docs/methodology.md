@@ -218,8 +218,8 @@ A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
 dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
 the bias broadcasts. It has the dims and the data type of the bias. This is
 the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
-from rocm-libraries `4630e167ce1` (#14358). The pinned `b279712` CPU
-reference has no dBias.
+from rocm-libraries `4630e167ce1` (#14358), which the pinned `bfbd6d7`
+includes.
 
 - The timed row calls the memory-efficient backward kernel with its bias
   gradient enabled, and then sums the score-shaped gradient to the bias
@@ -591,7 +591,8 @@ sequence lengths but no page table gets 1 for every length.
 
 An SDPA backward node reads Q, K, V, the forward output O, the incoming
 gradient dO and the forward log-sum-exp `stats`. The tool draws Q, K, V and
-dO from U[0, 1) like other inputs. It then computes O and `stats` as the
+dO from U[0, 1) like other inputs, and then scales dO (see below). It
+computes O and `stats` as the
 exact float32 forward of Q, K and V with the graph's scale, mask, bounds,
 additive bias, ALiBi and GQA layout. The forward runs in PyTorch, on the GPU
 when one is visible;
@@ -606,12 +607,24 @@ bound for `stats` without a forward kept the gradients finite but between
 values, the gradients were 1 to 7 and the engine passed on every bf16 graph.
 The kernel times were the same within 1% for all three input forms.
 
+With many keys per query, as in decode shapes, dV and dK elements can all
+be below 1e-3 even with forward values (one query and 4,096 keys without
+GQA: dK up to 2e-4, dV up to 5e-4). The fixed `atol` of 1e-3 would then
+accept an engine that never writes dK or dV. Every gradient is linear in
+dO, so the tool scales dO like AMP loss scaling: when the largest element
+of `dV = P^T dO` is below 0.5, dO is multiplied by the power of two that
+puts it in [0.5, 1). The scale is at most 2^14, so fp16 dO stays finite.
+A power of two keeps dO exact at its graph type. The other gradients scale
+by the same factor. A square shape with Sq = Skv = 1,024 gets no scale,
+because dV is already near 1; its dQ stays below 1e-2.
+
 fp16 SDPA backward outputs use `rtol` 4e-3 (about 4 ULP) instead of the fp16
-default of 1e-3. dQ, dK and dV sum over every key or query row. On gfx942 the
-ASM SDPA engine and the AOTriton reference differ by 2 ULP on 1 in 10,000 to
-1 in 50,000 elements (`max_rel_diff` 2^-9), so 1e-3 fails two correct
-kernels. The source is `OP_TOLERANCES` in
-`src/dnn_benchmarking/execution/correctness.py`.
+default of 1e-3. dQ, dK and dV sum over every key or query row. The value
+was measured on gfx942 against the earlier AOTriton reference: the ASM SDPA
+engine and AOTriton differed by 2 ULP on 1 in 10,000 to 1 in 50,000
+elements (`max_rel_diff` 2^-9), so 1e-3 failed two correct kernels. It is
+not yet measured again against the fp32 reference. The source is
+`OP_TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
 
 With `--validate pytorch`, the SDPA backward reference is the manual fp32
 formula, on a GPU and on the host. It reads the graph's O and `stats`. The
@@ -622,8 +635,9 @@ The forward is dense and has no dropout: sequence-length and dropout inputs
 do not change O and `stats`, so O of a dropout graph is the forward without
 dropout. The forward adds host time to input generation
 before the timed loop. It is proportional to the attention FLOPs of the
-graph. Forward-consistent SDPA backward inputs start at tool version 0.4.0.
-Do not compare SDPA backward results with results from earlier versions.
+graph. Forward-consistent SDPA backward inputs and the scaled dO start at
+tool version 0.4.0. Do not compare SDPA backward results with results from
+earlier versions.
 
 ## Not yet
 
@@ -644,11 +658,15 @@ The tool does not do these things yet:
   `left_bound` and diagonal alignment still apply. As in cuDNN and in hipDNN
   since rocm-libraries #14483, `left_bound = L` keeps `L` keys up to and
   including the diagonal, so a window of `L` keys has `left_bound = L`. The
-  same rule sets the FLOP count and the SDPA backward inputs. Tool versions
-  before 0.4.0 let the deprecated boolean override the bounds and the
-  alignment. For a graph that sets a causal boolean with a bound or with
-  `BOTTOM_RIGHT`, the FLOP count and the PyTorch and rocKE masks thus
-  changed at 0.4.0. The reference declines these graphs as unsupported:
+  same rule sets the FLOP count and the SDPA backward inputs. Before 0.4.0,
+  `left_bound = L` kept `L + 1` keys, so a window graph without a causal
+  boolean has a band one key narrower at 0.4.0, with a different FLOP count,
+  reference and backward inputs. Do not compare window rows across 0.3.0
+  and 0.4.0. Tool versions before 0.4.0 also let the deprecated boolean
+  override the bounds and the alignment. For a graph that sets a causal
+  boolean with a bound or with `BOTTOM_RIGHT`, the FLOP count and the
+  PyTorch and rocKE masks thus changed at 0.4.0. The reference declines
+  these graphs as unsupported:
   `left_bound = 0`, which hipDNN rejects; ALiBi with bottom-right alignment
   or with neither a causal mask nor a sliding window; padding masks; paged
   or variable-length ALiBi graphs. Other masks also make the reference
@@ -675,11 +693,10 @@ The tool does not do these things yet:
   Signed data for other operations needs a role for each tensor first.
 - Validation of large fp16 SDPA backward gradients. On the six fp16
   `aotriton_test_perf` graphs (B4, H48, D128, S 1024 to 4096), dK reaches
-  about 440. The ASM SDPA engine and the AOTriton reference differ by up to
-  1.0 on 18 to 194 elements of up to 3e8, where cancellation leaves small
-  values. AOTriton itself differs from an fp32 reference by up to 0.13, so
-  these rows fail validation although the error is small for the scale of
-  dK. An fp32 reference with a norm-based tolerance would decide them.
+  about 440. Against the earlier AOTriton reference, the ASM SDPA engine
+  differed by up to 1.0 on 18 to 194 elements of up to 3e8, where
+  cancellation leaves small values. AOTriton itself differs from an fp32
+  reference by up to 0.13. A norm-based tolerance would decide these rows.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with
