@@ -147,6 +147,16 @@ def _attention_terms(
 
     q_seqlen = int(q_dims[-2])
     kv_seqlen = int(k_dims[-2])
+    table = node_tensor(node, "page_table_k_tensor_uid", tensors_by_uid)
+    table_dims = (table or {}).get("dims") or []
+    if len(table_dims) >= 2:
+        # A paged K is a block container [blocks, H, page_size, D]: a sequence
+        # spans the table width times the page size, capped by max_seq_len_kv
+        # (the lengths the input generator gives every sequence).
+        kv_seqlen *= int(np.prod(table_dims[1:], dtype=np.int64))
+        cap = node_param(node, "max_seq_len_kv")
+        if cap is not None:
+            kv_seqlen = min(kv_seqlen, int(cap))
     rows = 1  # batch * num_q_heads
     for d in q_dims[:-2]:
         rows *= int(d)

@@ -605,6 +605,18 @@ class TestComputeFlops:
         flops = compute_flops(graph)
         assert flops == 2 * 2 * 64 * 12 * (128 + 128)
 
+    @pytest.mark.parametrize("max_seq_len_kv, skv", [(None, 112), (109, 109)])
+    def test_sdpa_paged_counts_the_logical_kv_length(self, max_seq_len_kv, skv):
+        # K is a block container [B*W, Hkv, page, D]: 7 pages of 16 keys per
+        # sequence, capped by max_seq_len_kv; not the page size 16.
+        graph = _sdpa_graph(b=2, sq=1, skv=16)
+        graph["tensors"][1]["dims"][0] = 14
+        graph["tensors"].append({"uid": 5, "dims": [2, 1, 7, 1]})
+        node = graph["nodes"][0]
+        node["inputs"]["page_table_k_tensor_uid"] = 5
+        node["attributes"]["max_seq_len_kv"] = max_seq_len_kv
+        assert compute_flops(graph) == 2 * 2 * 64 * skv * (128 + 128)
+
     def test_sdpa_asymmetric_head_dims(self):
         # head_dim_qk (query last dim) and head_dim_vo (value last dim) are summed separately.
         flops = compute_flops(_sdpa_graph(sq=128, skv=128, d=128, dv=64))
