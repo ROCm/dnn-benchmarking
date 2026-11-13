@@ -420,11 +420,17 @@ Dropout combines with causal masks, sliding windows, an additive bias, ALiBi
 and attention sinks, where the reference supports that mask. Like the hipDNN
 references, the reference declines these combinations:
 
-- a mask or a scale with `dropout_probability`, `seed` or `offset`;
+- a mask or a scale with `dropout_probability`, `seed`, `offset` or
+  `rng_dump`;
 - a mask without a scale, or a scale without a mask;
+- a mask that is not FLOAT with the dimensions `[B or 1, Hq or 1, Sq, Skv]`,
+  or a scale that is not one FLOAT element;
+- a `dropout_scale_inv` without a mask, or one that is not one FLOAT
+  element;
 - `seed`, `offset` or `rng_dump` without a `dropout_probability`;
 - a `dropout_probability` that is NaN, less than 0, or 1 or more;
-- an `rng_dump` that is not FLOAT with the dimensions `[B, Hq, Sq, Skv]`;
+- an `rng_dump` that is not FLOAT, or that does not have the dimensions
+  `[B, Hq, Sq, Skv]`;
 - dropout with fp8 scaling.
 
 The engine makes a Philox mask, so the mask differs from row to row. A
@@ -587,8 +593,9 @@ The tool does not do these things yet:
   [Dropout validation](#dropout-validation)). It declines Philox forward
   graphs without `rng_dump`, Philox backward graphs, and dropout with paged
   K and V or ragged sequence lengths. With `--validate`, the engine rows of
-  these graphs fail (see [SDPA dropout](usage.md#sdpa-dropout)). Other masks
-  also make the reference decline the graph.
+  these graphs fail. Some get `unchecked` instead when a CPU reference does
+  not fit in host memory (see [SDPA dropout](usage.md#sdpa-dropout)). Other
+  masks also make the reference decline the graph.
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.

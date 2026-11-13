@@ -116,9 +116,9 @@ These rows do not fail validation (no exit code 3).
   that the engine used.
 
 A `dropout_probability` of `null` counts as absent. A `dropout_probability`
-of 0 without `rng_dump`, `dropout_mask` or `dropout_scale` is no dropout. The
-formulas of the reference are in
-[Dropout validation](methodology.md#dropout-validation).
+of 0 without `rng_dump`, `dropout_mask` or `dropout_scale` is no dropout. A
+backward node must also have no `seed` or `offset`. The formulas of the
+reference are in [Dropout validation](methodology.md#dropout-validation).
 
 The tool fills the dropout inputs as follows:
 
@@ -134,9 +134,9 @@ The tool fills the dropout inputs as follows:
   the dropout inputs.
 
 A `dropout_scale` value in the graph JSON with `1 / dropout_scale` outside
-(0, 1] gives a graph error (exit code 1, not 3), with or without
-`--validate`. The graph gets no rows, and its `error` starts with
-`Input data generation failed: `.
+(0, 1] gives a graph error (exit code 1, not 3) with the `hipdnn` or
+`pytorch` runtime, with or without `--validate`. The graph gets no rows,
+and its `error` starts with `Input data generation failed: `.
 
 An explicit-mask graph gets one reference, as other graphs do.
 
@@ -155,8 +155,8 @@ For each engine row, after the timed loop:
 Each engine row thus has its own reference, and a Philox forward graph has
 no `reference` row. The dump check runs in NumPy, so it needs no PyTorch GPU.
 The reference of a row runs on the GPU when PyTorch has one. Without a
-PyTorch GPU, or after a GPU out-of-memory error, it runs on the CPU under
-the host memory rule above: a reference that does not fit gives
+PyTorch GPU, or after a GPU out-of-memory error, it runs on the CPU. The
+host memory rule above applies: a reference that does not fit gives
 `unchecked`. A dump that fails the check still fails the row, because the
 check comes first.
 
@@ -175,19 +175,25 @@ it saves its outputs. The tool checks that dump and grades the tuned
 outputs against a reference built from it.
 
 The reference declines these graphs. With `--validate pytorch`, their
-engine rows fail (exit code 3):
+engine rows fail (exit code 3) and keep their timings:
 
 - A Philox forward graph without `rng_dump` (a `dropout_probability` above
   0 and no `dropout_mask` or `dropout_scale`). The message names `rng_dump`,
   and the graph has no `reference` row. The rows fail also when a CPU
   reference would not fit in host memory.
+- A Philox forward graph whose `rng_dump` is not FLOAT. The message names
+  `rng_dump`. The tool declines the graph before the NaN fill, so the rows
+  fail also when a CPU reference or the dump would not fit in host memory.
 - Dropout with paged K and V or with ragged sequence lengths. The message
   names the feature.
 - A Philox backward graph: a backward node with `seed`, `offset` or a
   `dropout_probability` above 0. hipDNN work on these is in rocm-libraries
   #15643 (a draft).
-- The dropout combinations that the hipDNN references also decline (see
-  [Dropout validation](methodology.md#dropout-validation)).
+- The other dropout combinations that the hipDNN references also decline
+  (see [Dropout validation](methodology.md#dropout-validation)).
+
+Exception: when a CPU reference would not fit in host memory, the rows of
+the last three kinds get `unchecked`, as in the host memory rule above.
 
 Other runtimes and options:
 
