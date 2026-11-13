@@ -132,7 +132,7 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
 | `error` | string or null | Graph-level failure, as `ExceptionType: message`. A failure before any row runs has the prefix `Engine discovery failed: ` or `Input data generation failed: `. |
 | `message` | string or null | Why no engine applies, when `status` is `no_engines`: hipDNN's reason, or the unsupported tensor data type. The console shows `no engines applicable: <message>`. |
-| `results` | array | One [row](#row) per engine or reference. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. |
+| `results` | array | One [row](#row) per engine or reference. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. An SDPA forward graph with Philox dropout has no `reference` row, so with `no_engines` its `results` is empty (see [SDPA dropout](usage.md#sdpa-dropout)). |
 
 ### graph_id
 
