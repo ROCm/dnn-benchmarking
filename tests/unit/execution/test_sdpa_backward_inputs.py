@@ -147,6 +147,29 @@ def test_additive_mask_enters_the_forward() -> None:
     np.testing.assert_allclose(data[6], stats, rtol=1e-5, atol=1e-6)
 
 
+def test_a_row_with_no_visible_key_gets_zero_o_and_stats() -> None:
+    """Bottom-right causal with Sq > Skv leaves the first Sq - Skv rows
+    empty. O = 0 and stats = 0 there give P = exp(-inf - 0) = 0 in the
+    backward; stats = -inf would give NaN gradients."""
+    infos = [
+        _info(1, [1, 2, 4, 8], "float"),
+        _info(2, [1, 2, 2, 8], "float"),
+        _info(3, [1, 2, 2, 8], "float"),
+        _info(4, [1, 2, 4, 8], "float"),
+        _info(5, [1, 2, 4, 8], "float"),
+        _info(6, [1, 2, 4, 1], "float"),
+    ]
+    parameters = {"attn_scale_value": 0.5, "causal_mask_bottom_right": True}
+
+    data = generate_input_data(infos, seed=7, graph_json=_graph(parameters))
+
+    assert not data[4][:, :, :2].any() and not data[6][:, :, :2].any()
+    with np.errstate(divide="ignore", invalid="ignore"):  # the empty rows
+        o, stats = _expected(data, 0.5, 4, 2, lambda i, j: j <= i - 2, rep=1)
+    np.testing.assert_allclose(data[4][:, :, 2:], o[:, :, 2:], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(data[6][:, :, 2:], stats[:, :, 2:], rtol=1e-5, atol=1e-6)
+
+
 def test_alibi_enters_the_forward() -> None:
     """ALiBi adds slope * (key - query) per query head. With 3 heads, cuDNN's
     schedule gives 2^-4 and 2^-8 for the power-of-two part and 2^-2 for the
