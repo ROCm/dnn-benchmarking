@@ -617,11 +617,10 @@ def run_single_provider_engine(
             row=row,
             graph_path=ctx.graph_path,
             graph_name=ctx.graph_name,
-            tensor_infos=ctx.tensor_infos,
-            reference_outputs=ctx.reference_outputs,
             engine_id=engine_id,
             plugin_path=plugin_path,
             config=config,
+            validate=_tuned_validator(ctx),
         )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
@@ -677,6 +676,37 @@ def _validate_row(
         row.ootb.correctness = mismatch(
             config, ctx.reference_error or "Reference outputs unavailable"
         )
+
+
+def _tuned_validator(
+    ctx: _GraphContext,
+) -> Optional[Callable[[Any], CorrectnessResult]]:
+    """How to grade the tuned plan's saved outputs, or None for no grading.
+
+    A Philox graph grades the tuned plan's own dump and output, as for the
+    OOTB row. Its tuned plan is not graded when validation is off, when the
+    graph has no usable reference provider, or when the dump does not fit
+    in host memory. Other graphs compare against the reference outputs when
+    they exist. Without a validator the tuned child saves no outputs.
+    """
+    config = ctx.config
+    if (
+        ctx.philox is not None
+        and config.validation.enabled
+        and ctx.reference_error is None
+        and _rng_dump_skip_reason(ctx) is None
+    ):
+        return lambda outputs: _check_philox_outputs(ctx, outputs)
+    reference_outputs = ctx.reference_outputs
+    if reference_outputs is not None:
+        return lambda outputs: check_correctness(
+            outputs,
+            ctx.tensor_infos,
+            reference_outputs,
+            config.validation.provider.value,
+            config,
+        )
+    return None
 
 
 def _rng_dump_skip_reason(ctx: _GraphContext) -> Optional[str]:

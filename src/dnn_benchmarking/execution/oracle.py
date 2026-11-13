@@ -21,20 +21,21 @@ import sys
 import tempfile
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
 from ..common.work_dir import SelectionState, tuned_state, work_dir
 from ..config.benchmark_config import SuiteConfig
-from ..graph.tensor_info import TensorInfo
 from ..metrics._diagnostic import warn_once
 from ..metrics._subprocess import run_capped
 from ..metrics.analytical import derive_throughputs
 from ..reporting.statistics import BenchmarkStats, TimingInfo
-from ..reporting.suite_results import OracleResult, ProviderEngineResult
-from ..validation import ReferenceOutput
-from .correctness import check_correctness
+from ..reporting.suite_results import (
+    CorrectnessResult,
+    OracleResult,
+    ProviderEngineResult,
+)
 from .timing import Measurement, StallFallbackError
 
 #: hipDNN knob that makes a provider sample its candidate kernels on the first
@@ -64,7 +65,7 @@ def output_file(out_dir: Path, uid: int) -> Path:
 
 @dataclass(frozen=True)
 class _SavedOutputs:
-    """The tuned child's saved outputs, as ``check_correctness`` reads them."""
+    """The tuned child's saved outputs, as a ``validate`` callable reads them."""
 
     out_dir: Path
 
@@ -157,19 +158,19 @@ def run_hipdnn_tuned(
     row: ProviderEngineResult,
     graph_path: Path,
     graph_name: str,
-    tensor_infos: List[TensorInfo],
-    reference_outputs: Optional[Dict[int, ReferenceOutput]],
     engine_id: int,
     plugin_path: Optional[Path],
     config: SuiteConfig,
+    validate: Optional[Callable[[Any], CorrectnessResult]],
 ) -> None:
     """Time the engine's tuned plan in a child; attach it as ``row.oracle``.
 
     Call after the row's OOTB buffers and plans are released, so the child's
-    VRAM does not stack on them. With ``reference_outputs``, the child saves
-    its outputs and this process validates them like the OOTB row's. The
-    child's first, untimed launch runs the search, so the search cost lands
-    in ``timing.first_call_ms``.
+    VRAM does not stack on them. With ``validate``, the child saves its
+    outputs and this process grades them with ``validate(outputs)``, where
+    ``outputs`` reads the saved files (:class:`_SavedOutputs`). The child's
+    first, untimed launch runs the search, so the search cost lands in
+    ``timing.first_call_ms``.
 
     Raises:
         StallFallbackError: The stall gate failed in the child; the suite
@@ -186,7 +187,7 @@ def run_hipdnn_tuned(
                 plugin_path,
                 config,
                 out_dir,
-                save_outputs=reference_outputs is not None,
+                save_outputs=validate is not None,
             )
             m = Measurement(**result["measurement"])
             oracle = OracleResult(
@@ -200,14 +201,8 @@ def run_hipdnn_tuned(
                 ),
             )
             _set_throughputs(oracle, row)
-            if reference_outputs is not None:
-                oracle.correctness = check_correctness(
-                    _SavedOutputs(out_dir),
-                    tensor_infos,
-                    reference_outputs,
-                    config.validation.provider.value,
-                    config,
-                )
+            if validate is not None:
+                oracle.correctness = validate(_SavedOutputs(out_dir))
                 if oracle.correctness.explicitly_failed:
                     warn_once(
                         "oracle_correctness",

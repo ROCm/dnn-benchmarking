@@ -647,7 +647,7 @@ def test_tuned_child_starts_after_the_ootb_row_is_timed_and_validated(fake, refe
         ("tuned", 2),
     ]
     for kw in fake.tuned:
-        assert kw["reference_outputs"] is not None
+        assert kw.get("validate") is not None
         assert kw["graph_path"] == PATH
     assert [r.verdict for r in graph.results if r.role == "engine"] == ["passed"] * 2
 
@@ -2100,3 +2100,64 @@ def test_philox_row_retries_on_the_host_after_a_device_out_of_memory(
 
     assert row.verdict == verdict
     assert len(_dumps_seen(philox)) == calls
+
+
+def test_a_philox_tuned_plan_is_validated_with_its_own_dump(philox):
+    philox.tuned_outputs = {DUMP_UID: DUMP_B, O_UID: _philox_o(DUMP_B)}
+
+    (row,) = _run_philox(oracle=True).results
+
+    seen = _dumps_seen(philox)
+    assert len(seen) == 2  # the OOTB row, then the tuned plan
+    np.testing.assert_array_equal(seen[0], DUMP_A)
+    np.testing.assert_array_equal(seen[1], DUMP_B)
+    assert row.oracle.correctness.passed
+
+
+def test_a_tuned_plan_with_a_bad_dump_gets_an_invalid_verdict_and_no_speedup(philox):
+    from dnn_benchmarking.reporting.suite_results import oracle_speedup
+
+    bad = DUMP_B * 0.5
+    philox.tuned_outputs = {DUMP_UID: bad, O_UID: _philox_o(bad)}
+
+    (row,) = _run_philox(oracle=True).results
+
+    assert oracle_speedup(row) is None
+    assert row.oracle.correctness.explicitly_failed
+    assert "rng_dump" in row.oracle.correctness.error_message
+    assert row.verdict == "passed"  # the OOTB verdict stays
+
+
+@pytest.mark.parametrize("dump", [None, np.nan], ids=["missing", "all-nan"])
+def test_a_missing_or_all_nan_tuned_dump_fails(philox, dump):
+    philox.tuned_outputs = {O_UID: _philox_o(DUMP_A)}
+    if dump is not None:
+        philox.tuned_outputs[DUMP_UID] = np.full(DUMP_SHAPE, dump, np.float32)
+
+    (row,) = _run_philox(oracle=True).results
+
+    correctness = row.oracle.correctness
+    assert correctness is not None and correctness.explicitly_failed
+    assert "rng_dump" in correctness.error_message
+
+
+@pytest.mark.parametrize(
+    "available, validated", [(470, False), (500, True)], ids=["over", "under"]
+)
+def test_a_tuned_plan_of_a_philox_graph_too_large_for_host_memory_is_not_validated(
+    philox, monkeypatch, available, validated
+):
+    """Same budget as the OOTB row: 3 x 128 dump bytes against 80% of the
+    available memory. No validator means the child saves no outputs."""
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=available)
+    )
+    philox.tuned_outputs = {DUMP_UID: DUMP_A, O_UID: _philox_o(DUMP_A)}
+
+    (row,) = _run_philox(oracle=True).results
+
+    (tuned,) = philox.tuned
+    assert (tuned.get("validate") is not None) is validated
+    assert (row.oracle.correctness is not None) is validated
