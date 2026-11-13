@@ -218,8 +218,7 @@ A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
 dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
 the bias broadcasts. It has the dims and the data type of the bias. This is
 the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
-from rocm-libraries `4630e167ce1` (#14358). The pinned `b279712` CPU
-reference has no dBias.
+since rocm-libraries `4630e167ce1` (#14358).
 
 - The timed row calls the memory-efficient backward kernel with its bias
   gradient enabled, and then sums the score-shaped gradient to the bias
@@ -613,6 +612,18 @@ ASM SDPA engine and the AOTriton reference differ by 2 ULP on 1 in 10,000 to
 kernels. The source is `OP_TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
+bf16 SDPA backward outputs use `atol` 2e-3 instead of the bf16 default of
+1e-3. The `rtol` stays at 3e-2. The gfx950 FlyDSL engines round dS to bf16
+before the dQ product. A float64 check of three graphs gave a dQ relative L2
+error of 3.7e-3 for both engines and 1.7e-3 for the fp32 reference. dK and dV
+had the same error as the reference. Near zero, a dQ element was up to
+1.22e-3 from the reference. With `atol` 1e-3, two correct graphs of the bf16
+corpus failed on one or two elements each:
+`bf16_b16_hq64_kv8_sq2048_skv2048_d128_causal_bwd` and
+`llama3.1-tp8__generation_idx361_b128_hq8_kv1_dqk128_dvo128_sq4_skv131072_causal_bwd`.
+fp32 outputs keep the default (1e-5, 1e-6): all 81 fp32 graphs passed on
+gfx950.
+
 With `--validate pytorch`, the SDPA backward reference is the manual fp32
 formula, on a GPU and on the host. It reads the graph's O and `stats`. The
 reference pass does not call the fused PyTorch backward kernel: only the
@@ -624,6 +635,74 @@ dropout. The forward adds host time to input generation
 before the timed loop. It is proportional to the attention FLOPs of the
 graph. Forward-consistent SDPA backward inputs start at tool version 0.4.0.
 Do not compare SDPA backward results with results from earlier versions.
+
+## SDPA backward engines
+
+These hipDNN engines serve `SdpaBackwardAttributes` at the pinned
+`rocm-libraries`:
+
+| Engine | Architectures | Data types |
+|---|---|---|
+| `hipkernel:flydsl_sdpa_bwd_split` | gfx950, gfx11 (`gfx11-generic`) | bf16, fp16, fp32 |
+| `hipkernel:flydsl_sdpa_bwd_merged` | gfx950 | bf16, fp16 |
+| `ASM_SDPA_ENGINE` | gfx942 | bf16, fp16 |
+
+gfx90a has no SDPA backward engine. The split engine runs three launches
+(prep, dK and dV, dQ). The merged engine runs one launch. Both engines are
+deterministic: they use no atomic additions. On gfx950, three runs gave
+bitwise identical gradients on a GQA graph, a dBias graph and an fp32 graph.
+hipDNN cannot serialize their plans. hipDNN ranks split before merged, so
+the merged engine runs by default only when split declines a graph. The tool
+times every applicable engine.
+
+On gfx950 (MI355X, rocm-libraries `6f5898efb5a`), a `--validate pytorch` run
+of the 4,790 graphs of `Workloads/corpus/SDPABackward` gave these results.
+The 43 graphs with the most work ran with `--runtime hipdnn,pytorch` and
+without `--validate`, so they have timing only. The run used `--warmup 5
+--iters 20` and one process for each GPU.
+
+| Engine | Data type | Graphs | Served | Passed | Failed | Not validated | Declined |
+|---|---|---|---|---|---|---|---|
+| split | bf16 | 2,969 | 1,699 | 1,626 | 3 | 70 | 1,270 |
+| split | fp16 | 1,739 | 529 | 524 | 5 | 0 | 1,210 |
+| split | fp32 | 82 | 81 | 81 | 0 | 0 | 1 |
+| merged | bf16 | 2,969 | 1,174 | 1,133 | 3 | 38 | 1,795 |
+| merged | fp16 | 1,739 | 408 | 402 | 6 | 0 | 1,331 |
+| merged | fp32 | 82 | 0 | 0 | 0 | 0 | 82 |
+
+- Every failed row is a reference limit, not a wrong gradient. The five
+  dropout graphs have no PyTorch reference, because the reference has no
+  dropout. The other failures are fp16 `aotriton_test_perf` graphs (three on
+  split, four on merged), as described in [Not yet](#not-yet).
+- Not validated: the reference needs more host memory than the node has, or
+  the graph is in the timing-only set.
+- Both engines decline variable-length graphs without `padding_mask`
+  (2,249), then strides that are not a multiple of 8 elements (168), head
+  dims above 512 (60) and ALiBi (2). Split also declines a dBias stride that
+  is not a multiple of 16 bytes (`swin-base`, fp16) and a Q head slab past
+  32-bit byte offsets (`deepseek_v4__dsv4_pro`, Sq 16,384, D 512). Merged
+  also declines fp32 (81), Dqk different from Dv (441), head dims 257 to 512
+  (78) and 129 graphs that no merged object covers (head dims 40 and 80, fp16
+  160, some bias layouts). hipDNN logs each decline cause at
+  `HIPDNN_LOG_LEVEL=info`.
+
+PyTorch (the AOTriton backward) time divided by engine time, over graphs
+without a sliding window:
+
+| Engine | Data type | Graphs | Geometric mean | Median | Engine faster |
+|---|---|---|---|---|---|
+| split | bf16 | 1,610 | 1.56 | 1.41 | 1,204 |
+| split | fp16 | 514 | 1.23 | 1.15 | 342 |
+| split | fp32 | 81 | 2.03 | 2.18 | 80 |
+| merged | bf16 | 1,121 | 0.85 | 0.79 | 362 |
+| merged | fp16 | 392 | 0.87 | 0.94 | 174 |
+
+Do not compare sliding-window graphs this way: PyTorch has no fused window
+backward, so the timed row uses an explicit mask (up to 140 times slower).
+The split engine is slowest against PyTorch on small bf16 MQA graphs with 128
+query heads and Dqk 192, Dv 128 (for example
+`bf16_b1_hq128_kv1_sq2_skv21_dqk192_dv128_noncausal_bwd`: 0.58 ms against
+0.05 ms).
 
 ## Not yet
 
@@ -679,7 +758,11 @@ The tool does not do these things yet:
   1.0 on 18 to 194 elements of up to 3e8, where cancellation leaves small
   values. AOTriton itself differs from an fp32 reference by up to 0.13, so
   these rows fail validation although the error is small for the scale of
-  dK. An fp32 reference with a norm-based tolerance would decide them.
+  dK. On gfx950 the FlyDSL engines fail on 1 to 10 elements of four of these
+  graphs. A float64 check shows that the engines and the fp32 reference have
+  the same dK and dV error (relative L2 2.1e-4, about half an fp16 ULP):
+  the two sides round to opposite neighbors. An fp32 reference with a
+  norm-based tolerance would decide them.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with

@@ -59,9 +59,24 @@ Dropout uses cuDNN's Philox form: `dropout_probability` with int64 `seed`
 and `offset` tensors of dims `[1, 1, 1, 1]`. The `model_spec` shapes and
 their sources are in `_MODEL_SPECS` in `tools/sdpa_fwd_to_bwd.py`.
 
-At rocm-libraries `b279712`, the hipDNN ASM SDPA backward engine declines
-dropout, bias, dBias and ALiBi. The PyTorch reference skips dropout graphs,
-which include the `t5-large` dBias graph. It computes dBias for the
+These hipDNN engines serve the collection at rocm-libraries `6f5898efb5a`:
+
+| Engine | Architectures | Serves | Declines |
+|---|---|---|---|
+| `hipkernel:flydsl_sdpa_bwd_split` | gfx950, gfx11 | bf16, fp16 and fp32; GQA and MQA; Dqk different from Dv; head dims up to 512; windows; bias and dBias; dropout | Variable length without `padding_mask`, strides that are not a multiple of 8 elements, head dims above 512, ALiBi |
+| `hipkernel:flydsl_sdpa_bwd_merged` | gfx950 | bf16 and fp16 with equal Q/K and V head dims up to 256, except head dims 40 and 80 and fp16 160 | The split declines, and fp32, Dqk different from Dv, head dims above 256 |
+| `ASM_SDPA_ENGINE` | gfx942 | bf16 and fp16 | Dropout, bias, dBias, ALiBi |
+
+On gfx950 the split engine serves 2,309 graphs (bf16 1,699, fp16 529,
+fp32 81) and the merged engine 1,582. All 2,249 variable-length graphs
+decline: they set `seq_len_q` and `seq_len_kv` without `padding_mask`. The
+results by engine and data type are in
+[methodology](../../../docs/methodology.md#sdpa-backward-engines). gfx90a has
+no SDPA backward engine.
+
+The PyTorch reference has no dropout. With `--validate pytorch`, the engine
+rows of the five dropout graphs (the `t5-large` dBias graph included) thus
+fail with a reference error. The reference computes dBias for the
 `swin-base` and `alphafold2` graphs, and runs the ALiBi graphs with its fp32
 formula. These graphs are in the collection so that new engines have a
 target.

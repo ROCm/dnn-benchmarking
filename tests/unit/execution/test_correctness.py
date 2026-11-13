@@ -126,8 +126,8 @@ def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
     assert c.n_mismatch == 1
 
 
-def _graph_outputs(node_type):
-    """Output TensorInfo of a one-node fp16 graph, through the loader."""
+def _graph_outputs(node_type, data_type="half"):
+    """Output TensorInfo of a one-node graph, through the loader."""
     graph = {
         "tensors": [
             {
@@ -135,7 +135,7 @@ def _graph_outputs(node_type):
                 "name": "y",
                 "dims": [4],
                 "strides": [1],
-                "data_type": "half",
+                "data_type": data_type,
                 "virtual": False,
             }
         ],
@@ -158,6 +158,27 @@ def test_fp16_sdpa_backward_tolerates_two_ulp(node_type, actual, passes):
     bm = _HostBM({1: np.array(actual, np.float32)})
 
     c = check_correctness(bm, _graph_outputs(node_type), ref, "pytorch", _config())
+
+    assert c.tolerance_match is passes
+
+
+@pytest.mark.parametrize(
+    "node_type, actual, passes",
+    [
+        # A near-zero bf16 dQ element 1.22e-3 off: the gfx950 FlyDSL engines
+        # round dS to bf16 before the dQ product.
+        ("SdpaBackwardAttributes", [1.22e-3, 0.0, 0.0, 0.0], True),
+        ("SdpaBackwardAttributes", [2.5e-3, 0.0, 0.0, 0.0], False),
+        ("PointwiseAttributes", [1.22e-3, 0.0, 0.0, 0.0], False),
+    ],
+)
+def test_bf16_sdpa_backward_tolerates_near_zero_rounding(node_type, actual, passes):
+    ref = {1: _ref([0.0, 0.0, 0.0, 0.0])}
+    bm = _HostBM({1: np.array(actual, np.float32)})
+
+    c = check_correctness(
+        bm, _graph_outputs(node_type, "bfloat16"), ref, "pytorch", _config()
+    )
 
     assert c.tolerance_match is passes
 

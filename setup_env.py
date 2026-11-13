@@ -546,8 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
             "absent, because argparse reads a bare '-DFOO=ON' as an option "
             "rather than a value unless it is written '--cmake-arg=-DFOO=ON'. "
             "On Linux, rocKE (HIPKERNELPROVIDER_ENABLE_ROCKE, "
-            "HIPDNN_ENABLE_KERNEL_INGESTOR) is ON by default; set both OFF to "
-            "skip it."
+            "HIPDNN_ENABLE_KERNEL_INGESTOR) and FlyDSL "
+            "(HIPKERNELPROVIDER_ENABLE_FLYDSL) are ON by default; set them OFF "
+            "to skip them."
         ),
     )
     parser.add_argument(
@@ -1309,18 +1310,25 @@ class Setup:
         )
 
     def rocke_args(self, toolchain_prefix: str) -> list[str]:
-        """Configure defines that build rocKE and its ingestor engines.
+        """Configure defines that build rocKE, FlyDSL and their ingestor engines.
 
         Every rocKE engine, including descriptor-backed ones such as
-        hipkernel:Gfx950AttentionDense, ships only with both gates ON. Linux
+        hipkernel:Gfx950AttentionDense, ships only with both rocKE gates ON.
+        FlyDSL's prebuilt objects (for example the SDPA backward engines
+        hipkernel:flydsl_sdpa_bwd_split and hipkernel:flydsl_sdpa_bwd_merged)
+        ship only with the ingestor ON too. pull_provider_artifacts fetches
+        their DVC directories; REQUIRE_DVC_DESCRIPTORS makes a missing one a
+        configure error, not an engine that silently ships no kernels. Linux
         only: the Windows ROCm build of rocKE is untested, so Windows keeps the
-        rocm-libraries defaults (both OFF).
+        rocm-libraries defaults (all OFF).
         """
         if IS_WINDOWS:
             return []
         args = [
             "-DHIPKERNELPROVIDER_ENABLE_ROCKE=ON",
             "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
+            "-DHIPKERNELPROVIDER_ENABLE_FLYDSL=ON",
+            "-DHIPKERNELPROVIDER_REQUIRE_DVC_DESCRIPTORS=ON",
             "-DHIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON",
             f"-DPython3_EXECUTABLE={self.py}",
             # The ingestor headers' std::stable_sort trips libstdc++ 12's

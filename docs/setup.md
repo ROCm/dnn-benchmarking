@@ -248,19 +248,37 @@ Write the `-D` form with `=` (`--cmake-arg=-DFOO=ON`). With a space, argparse
 reads `-DFOO=ON` as an option.
 
 ```bash
-# Build without rocKE and its descriptor-backed engines
+# Build without rocKE, FlyDSL and their descriptor-backed engines
 python3 setup_env.py \
   --cmake-arg HIPKERNELPROVIDER_ENABLE_ROCKE=OFF \
+  --cmake-arg HIPKERNELPROVIDER_ENABLE_FLYDSL=OFF \
   --cmake-arg HIPDNN_ENABLE_KERNEL_INGESTOR=OFF
 
 # The -D form needs '='
 python3 setup_env.py --cmake-arg HIPDNN_ENABLE_SDPA=OFF --cmake-arg=-DCMAKE_BUILD_TYPE=Debug
 ```
 
-On Linux, rocKE and its descriptor-backed engines are on by default
-(`hipkernel:Gfx950AttentionDense` on gfx950). On Windows they are off. When
-you turn an engine option off, setup still installs the plugin `.so`. Graphs
-that only that engine supports then report `no engines applicable`.
+On Linux, rocKE, FlyDSL and their descriptor-backed engines are on by default
+(`HIPKERNELPROVIDER_ENABLE_ROCKE`, `HIPKERNELPROVIDER_ENABLE_FLYDSL` and
+`HIPDNN_ENABLE_KERNEL_INGESTOR`). On Windows they are off. Setup also sets
+`HIPKERNELPROVIDER_REQUIRE_DVC_DESCRIPTORS=ON`: when stage 6 did not pull a
+descriptor directory, the configure fails. Without it, the engine of that
+directory ships no kernels and you get no message at run time. When you turn
+an engine option off, setup still installs the plugin `.so`. Graphs that only
+that engine supports then report `no engines applicable`.
+
+These hipDNN engines serve SDPA backward (`SdpaBackwardAttributes`) at the
+pinned `rocm-libraries`:
+
+| Engine | Architectures | Data types | Build option |
+|---|---|---|---|
+| `hipkernel:flydsl_sdpa_bwd_split` | gfx950, gfx11 (`gfx11-generic`: gfx1100 to gfx1103, gfx1150 to gfx1153) | bf16, fp16, fp32 | `HIPKERNELPROVIDER_ENABLE_FLYDSL` |
+| `hipkernel:flydsl_sdpa_bwd_merged` | gfx950 | bf16, fp16 | `HIPKERNELPROVIDER_ENABLE_FLYDSL` |
+| `ASM_SDPA_ENGINE` | gfx942 | bf16, fp16 | `ENABLE_ASM_SDPA_ENGINE` |
+
+gfx90a has no SDPA backward engine. The FlyDSL engines have no Windows build
+in this setup. With FlyDSL on, the FlyDSL SDPA forward and RMSNorm engines
+also ship.
 
 On Linux, setup also installs the rocKE Python packages (`rocke`, `kernels`,
 `builders`, `dispatch`) into the venv from

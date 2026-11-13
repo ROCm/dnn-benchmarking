@@ -52,8 +52,15 @@ TOLERANCES = {
 # reference land 2 ULP apart (relative 2^-9) on 1 in 10,000 to 1 in 50,000
 # elements, so the fp16 rtol of 1e-3 (1 ULP) fails two correct kernels. 4e-3
 # (~4 ULP at the bottom of the binade) tolerates that.
+# bf16: the gfx950 FlyDSL engines round dS to bf16 before the dQ product, so
+# dQ carries about 2x the rounding error of the fp32 reference (relative L2
+# 3.7e-3 against 1.7e-3, both measured against float64). Near zero, an element
+# lands up to 1.22e-3 from the reference, more than the bf16 atol of 1e-3: two
+# of 1,800 bf16 corpus graphs failed on one or two dQ elements. atol 2e-3
+# tolerates that; rtol keeps the bf16 default.
 OP_TOLERANCES = {
     ("SdpaBackwardAttributes", "half"): (4e-3, 1e-3),
+    ("SdpaBackwardAttributes", "bfloat16"): (3e-2, 2e-3),
 }
 
 
