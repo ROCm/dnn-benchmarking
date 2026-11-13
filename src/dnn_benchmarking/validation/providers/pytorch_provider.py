@@ -138,7 +138,7 @@ def _sdpa_scratch_bytes(
         expanded *= 2
     needs_band = window is not None or (bottom_right and q_len not in (1, kv_len))
     # Two float32 masks (zeros, then masked_fill) and two bool masks.
-    band = q_len * kv_len * (2 * 4 + 2) if needs_band and not backward else 0
+    band = q_len * kv_len * (2 * 4 + 2) if needs_band else 0
     has_bounds = causal or window is not None or bottom_right
     sink_mask = q_len * kv_len * 4 if has_sink and has_bounds else 0
     return block + expanded + band + sink_mask + alibi_mask
