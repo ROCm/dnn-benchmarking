@@ -1870,3 +1870,233 @@ def test_philox_without_rng_dump_fails_even_when_the_cpu_reference_would_not_fit
     assert [e.verdict for e in engines] == ["failed", "failed"]
     assert all("rng_dump" in e.ootb.correctness.error_message for e in engines)
     assert _exit_code(graph) == 3
+
+
+def _philox_engines(fake, dumps):
+    """Each engine writes its own dump and the O that dump gives."""
+    for engine_id, dump in dumps.items():
+        fake.engine_outputs[(engine_id, DUMP_UID)] = dump
+        fake.engine_outputs[(engine_id, O_UID)] = _philox_o(dump)
+
+
+@pytest.fixture
+def philox(fake_torch, monkeypatch):
+    """One engine that writes DUMP_A and its O; no PyTorch GPU."""
+    from dnn_benchmarking.common import torch_support
+
+    monkeypatch.setattr(torch_support, "gpu_available", lambda: False)
+    fake_torch.discovered = [1]
+    _philox_engines(fake_torch, {1: DUMP_A})
+    return fake_torch
+
+
+def _run_philox(**config):
+    graph_json, tensors = _philox_graph()
+    return _validate(graph=graph_json, tensors=tensors, **config)[0]
+
+
+def _is_philox_reference(event):
+    return isinstance(event, tuple) and event[0] == "philox_reference"
+
+
+def _dumps_seen(fake):
+    """The dump that each Philox reference call received, in order."""
+    return [e[1][DUMP_UID] for e in fake.events if _is_philox_reference(e)]
+
+
+def test_a_row_with_a_valid_dump_and_matching_output_passes(philox):
+    graph = _run_philox()
+
+    # Each row builds its own reference: no reference row, no PyTorch row.
+    assert [(r.role, r.verdict) for r in graph.results] == [("engine", "passed")]
+    assert philox.torch_buffer_devices == []
+    assert "cpu_reference" not in philox.events
+
+
+def test_each_engine_row_is_graded_against_its_own_dump(philox):
+    philox.discovered = [1, 2]
+    _philox_engines(philox, {1: DUMP_A, 2: DUMP_B})
+
+    graph = _run_philox()
+
+    assert [r.verdict for r in graph.results] == ["passed", "passed"]
+    seen = _dumps_seen(philox)
+    assert len(seen) == 2
+    np.testing.assert_array_equal(seen[0], DUMP_A)
+    np.testing.assert_array_equal(seen[1], DUMP_B)
+
+    # Row 1 with row 2's O: its own dump gives another reference.
+    philox.engine_outputs[(1, O_UID)] = _philox_o(DUMP_B)
+
+    graph = _run_philox()
+
+    assert [r.verdict for r in graph.results] == ["failed", "passed"]
+
+
+@pytest.mark.parametrize(
+    "dump",
+    [
+        pytest.param(DUMP_A * 0.5, id="value-outside-0-1"),
+        pytest.param(np.ones(DUMP_SHAPE, np.float32), id="keep-rate-off"),
+    ],
+)
+def test_a_dump_outside_zero_one_or_off_the_keep_rate_fails_before_any_reference_runs(
+    philox, dump
+):
+    _philox_engines(philox, {1: dump})
+
+    (row,) = _run_philox().results
+
+    assert _dumps_seen(philox) == []
+    assert row.verdict == "failed"
+    assert "rng_dump" in row.ootb.correctness.error_message
+
+
+def test_an_engine_that_never_writes_the_dump_fails(philox):
+    """At p = 0.9 and n = 32, an all-zero dump passes the keep-rate bound, and
+    O matches the reference of a zero dump: only the NaN fill exposes it."""
+    philox.dump_unwritten = True
+    philox.engine_outputs[(1, O_UID)] = _philox_o(np.zeros(DUMP_SHAPE, np.float32))
+
+    (row,) = _run_philox().results
+
+    assert row.verdict == "failed"
+    assert "rng_dump" in row.ootb.correctness.error_message
+    fill = philox.events.index(("zero_outputs", (DUMP_UID,)))
+    assert philox.events[fill + 1] == "execute_once"
+
+
+def test_the_rng_dump_output_is_not_compared(philox):
+    """The reference has no rng_dump output; only O is compared."""
+    (row,) = _run_philox().results
+
+    assert row.verdict == "passed"
+    assert row.ootb.correctness.worst_output_uid == O_UID
+    assert row.ootb.correctness.n_total == int(np.prod(O_SHAPE))
+
+
+def test_a_wrong_output_fails_with_a_valid_dump(philox):
+    philox.engine_outputs[(1, O_UID)] = _philox_o(DUMP_A) + 1.0
+
+    (row,) = _run_philox().results
+
+    assert row.verdict == "failed"
+    assert row.ootb.correctness.worst_output_uid == O_UID
+
+
+def test_validation_runs_after_the_timed_loop_for_philox(philox):
+    _run_philox()
+
+    events = [
+        "philox_reference" if _is_philox_reference(e) else e for e in philox.events
+    ]
+    start = events.index("zero_outputs")
+    assert events[start : start + 6] == [
+        "zero_outputs",
+        ("benchmark", 1, True),
+        ("zero_outputs", (DUMP_UID,)),
+        "execute_once",
+        "read_output",
+        "philox_reference",
+    ]
+
+
+@pytest.mark.parametrize(
+    "dump, estimated_bytes, verdict",
+    [
+        pytest.param(DUMP_A, 0, "passed", id="fits"),
+        pytest.param(DUMP_A, 9 << 30, "unchecked", id="reference-too-large"),
+        pytest.param(DUMP_A * 0.5, 9 << 30, "failed", id="bad-dump-first"),
+    ],
+)
+def test_philox_row_without_a_torch_gpu_is_graded_on_the_host(
+    philox, monkeypatch, dump, estimated_bytes, verdict
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    philox.cpu_reference.estimated_bytes = estimated_bytes  # 80% of 10 GiB fits
+    _philox_engines(philox, {1: dump})
+
+    (row,) = _run_philox().results
+
+    assert row.verdict == verdict
+    if verdict == "unchecked":
+        assert row.ootb.correctness.error_message
+
+
+@pytest.mark.parametrize("validate", [True, False])
+def test_philox_validation_off_leaves_rows_alone(philox, validate):
+    graph_json, tensors = _philox_graph()
+    config = dict(validation=ValidationConfig(provider="pytorch")) if validate else {}
+
+    graph, _ = _run(graph=graph_json, tensors=tensors, **config)
+
+    (row,) = graph.results
+    filled = ("zero_outputs", (DUMP_UID,)) in philox.events
+    assert (filled, bool(_dumps_seen(philox))) == (validate, validate)
+    assert row.verdict == ("passed" if validate else "unchecked")
+
+
+@pytest.mark.parametrize(
+    "available, fits", [(470, False), (500, True)], ids=["over", "under"]
+)
+def test_a_philox_row_whose_dump_does_not_fit_host_memory_is_unchecked_before_any_fill(
+    philox, monkeypatch, available, fits
+):
+    """The fill and read of a 128-byte dump peak at 3 x 128 = 384 bytes; the
+    budget is 80% of the available memory (376 or 400 bytes here)."""
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=available)
+    )
+
+    graph = _run_philox(oracle=True)
+
+    (row,) = graph.results
+    if fits:
+        assert row.verdict == "passed"
+        return
+    assert row.verdict == "unchecked"
+    assert "host memory" in row.ootb.correctness.error_message
+    assert _exit_code(graph) == 0
+    timed = philox.events.index(("benchmark", 1, True))
+    assert ("zero_outputs", (DUMP_UID,)) not in philox.events
+    assert "execute_once" not in philox.events[timed:]
+    assert row.oracle.correctness is None
+
+
+@pytest.mark.parametrize(
+    "error, estimated_bytes, verdict, calls",
+    [
+        pytest.param("oom", 0, "passed", 2, id="oom-retried-on-host"),
+        pytest.param("oom", 9 << 30, "unchecked", 1, id="oom-host-too-small"),
+        pytest.param("other", 0, "failed", 1, id="other-error-no-retry"),
+    ],
+)
+def test_philox_row_retries_on_the_host_after_a_device_out_of_memory(
+    philox, monkeypatch, error, estimated_bytes, verdict, calls
+):
+    import psutil
+    import torch
+
+    from dnn_benchmarking.common import torch_support
+
+    monkeypatch.setattr(torch_support, "gpu_available", lambda: True)
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=10 << 30)
+    )
+    philox.cpu_reference.estimated_bytes = estimated_bytes
+    philox.cpu_reference.device_error = (
+        torch.cuda.OutOfMemoryError("HIP out of memory")
+        if error == "oom"
+        else RuntimeError("device reference exploded")
+    )
+
+    (row,) = _run_philox().results
+
+    assert row.verdict == verdict
+    assert len(_dumps_seen(philox)) == calls
