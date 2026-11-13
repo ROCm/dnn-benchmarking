@@ -1,5 +1,5 @@
 outs:
-- md5: 45d692f85cda75a959c01d2a2a304cfc
-  size: 52315
+- md5: 0638ce1ffd5cea5583fb512c4660d209
+  size: 52915
   hash: md5
   path: cudnn_attention_inference.tar.gz
