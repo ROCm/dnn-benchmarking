@@ -203,6 +203,12 @@ each head group.
   `cudnn` and `overrideable`, so the row is an error.
 - The CPU reference (`--validate pytorch` on the host) uses the manual fp32
   formula of hipDNN's CPU reference.
+- The timed backward gets the same mask as the forward call of step 1. A
+  sliding window, a bottom-right causal band with `Sq != Skv` and a bias
+  reach the kernel as one additive mask tensor, as in the forward (see
+  [PyTorch SDPA setup](#pytorch-sdpa-setup)). ALiBi graphs use the manual
+  fp32 formula. The backward has no static warning for the additive mask;
+  only the fallback to the manual fp32 formula is warned at run time.
 
 A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
 dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
