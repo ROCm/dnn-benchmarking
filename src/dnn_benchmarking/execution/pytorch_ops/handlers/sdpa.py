@@ -1590,21 +1590,34 @@ def compile_sdpa(
     return run
 
 
-def _check_backward_dropout(
-    node: Dict[str, Any], graph_json: Dict[str, Any], plan: _SdpaPlan
-) -> None:
-    """Decline the backward dropout that hipDNN declines.
+def _decline_backward_philox(dropout: SdpaDropout) -> None:
+    """Decline Philox dropout in the backward, as hipDNN does (PlanUtils.hpp).
 
-    The backward takes an explicit mask with its scale and an optional
-    one-FLOAT-element ``dropout_scale_inv``, or a non-null probability of 0
-    with no seed or offset (PlanUtils.hpp).
+    Runs before the forward dropout rules of ``_plan_sdpa_common``, whose
+    messages name an ``rng_dump`` output that a backward node cannot have.
     """
-    dropout = plan.dropout
+    p = dropout.probability
+    if p is not None and p != 0.0:
+        raise ValueError(
+            f"SDPA Philox backward dropout (dropout_probability={p}) is not "
+            "supported (rocm-libraries #15643, draft)"
+        )
     if dropout.seed_uid is not None or dropout.offset_uid is not None:
         raise ValueError(
             "SDPA backward dropout with seed_tensor_uid or offset_tensor_uid is "
             "not supported"
         )
+
+
+def _check_backward_dropout(
+    node: Dict[str, Any], graph_json: Dict[str, Any], plan: _SdpaPlan
+) -> None:
+    """Decline the backward explicit-mask dropout that hipDNN declines.
+
+    The backward takes an explicit mask with its scale and an optional
+    one-FLOAT-element ``dropout_scale_inv`` (PlanUtils.hpp).
+    """
+    dropout = plan.dropout
     if dropout.scale_inv_uid is not None:
         if plan.dropout_form != _EXPLICIT_DROPOUT:
             raise ValueError(
@@ -1657,6 +1670,7 @@ def compile_sdpa_backward(
     dq_uid = _required_output_uid(node, "dq_tensor_uid")
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
+    _decline_backward_philox(read_dropout(node))
     plan = _plan_sdpa_common(node)
     _check_backward_dropout(node, graph_json, plan)
     dropout = plan.dropout if plan.dropout_form == _EXPLICIT_DROPOUT else None
