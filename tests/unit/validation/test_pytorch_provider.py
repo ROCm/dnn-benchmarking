@@ -2172,14 +2172,32 @@ class TestPyTorchProviderNewOps:
         self._assert_backward_closed_form(graph, seed=24, inv=1.0)
 
     @pytest.mark.parametrize(
-        "graph_kwargs",
+        "graph_kwargs,match",
         [
-            pytest.param({"mask": None, "scale": None}, id="scale_inv_without_mask"),
-            pytest.param({"types": {_SCALE_INV: "half"}}, id="scale_inv_not_float"),
-            pytest.param({"scale_inv": [2]}, id="scale_inv_not_one_element"),
+            pytest.param(
+                {"mask": None, "scale": None}, None, id="scale_inv_without_mask"
+            ),
+            pytest.param(
+                {"types": {_SCALE_INV: "half"}}, None, id="scale_inv_not_float"
+            ),
+            pytest.param({"scale_inv": [2]}, None, id="scale_inv_not_one_element"),
+            # The message names the backward Philox subject.
             pytest.param(
                 {"mask": None, "scale": None, "scale_inv": None, "probability": 0.1},
+                "Philox backward",
                 id="probability_nonzero",
+            ),
+            pytest.param(
+                {
+                    "mask": None,
+                    "scale": None,
+                    "scale_inv": None,
+                    "probability": 0.1,
+                    "seed": True,
+                    "offset": True,
+                },
+                "Philox backward",
+                id="probability_nonzero_with_seed_and_offset",
             ),
             pytest.param(
                 {
@@ -2189,6 +2207,7 @@ class TestPyTorchProviderNewOps:
                     "probability": 0.0,
                     "seed": True,
                 },
+                None,
                 id="probability_zero_with_seed",
             ),
             pytest.param(
@@ -2199,21 +2218,24 @@ class TestPyTorchProviderNewOps:
                     "probability": 0.0,
                     "offset": True,
                 },
+                None,
                 id="probability_zero_with_offset",
             ),
-            pytest.param({"probability": 0.0}, id="probability_zero_with_mask"),
+            pytest.param({"probability": 0.0}, None, id="probability_zero_with_mask"),
         ],
     )
-    def test_sdpa_backward_dropout_declines(self, graph_kwargs) -> None:
+    def test_sdpa_backward_dropout_declines(self, graph_kwargs, match) -> None:
         """One case per backward R7 rule that hipDNN declines (rows 10-11).
-        Each graph differs from a computable one in that rule only."""
+        Each graph differs from a computable one in that rule only. A backward
+        node has no ``rng_dump``, so no message may name it."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph = self._backward_dropout_graph(**graph_kwargs)
 
-        with pytest.raises(UnsupportedGraphError):
+        with pytest.raises(UnsupportedGraphError, match=match) as declined:
             provider.compute_reference(
                 graph, self._backward_dropout_inputs(graph, seed=25)
             )
+        assert "rng_dump" not in str(declined.value)
 
     @pytest.mark.parametrize("dtype", ["float", "bfloat16"])
     def test_sdpa_alibi_forward_correct_across_block_boundaries(
