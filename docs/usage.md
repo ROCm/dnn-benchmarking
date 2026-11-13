@@ -66,7 +66,7 @@ sets `ROCM_PATH`.
 
 | Option | Default | Description |
 |---|---|---|
-| `--validate {none,pytorch}` | none | Compare each engine output with a PyTorch reference. `pytorch` also adds a timed `reference` row. |
+| `--validate {none,pytorch}` | none | Compare each engine output with a PyTorch reference. `pytorch` also adds a timed `reference` row, except for a Philox forward graph (see [SDPA dropout](#sdpa-dropout)). |
 | `--rtol TOL` | dtype-aware | Relative tolerance. If you give only `--rtol` or only `--atol`, the value sets both. |
 | `--atol TOL` | dtype-aware | Absolute tolerance. |
 | `--reference-precision {float64,native}` | float64 | Arithmetic of the reference for convolution graphs. `float64` computes it in float64 from the same inputs. `native` uses the graph data types, as before. See [Reference precision](#reference-precision). |
@@ -93,14 +93,18 @@ code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
 log2 values of e8m0 outputs. The source is `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
-The reference comes from the timed PyTorch `reference` row on the GPU. If
-that row cannot run (for example, no GPU or a GPU out-of-memory error), and
-no strict `--pytorch-sdpa-backend` is set, the tool computes the reference on
-the CPU. Before it does, it estimates the host memory of the CPU reference.
+Except for a Philox forward graph, the reference comes from the timed PyTorch
+`reference` row on the GPU. That row can fail to run, for example with no GPU
+or after a GPU out-of-memory error. Then, without a strict
+`--pytorch-sdpa-backend`, the tool computes the reference on the CPU. Before
+it does, it estimates the host memory of the CPU reference.
 If the estimate is more than 80 % of the available host memory, the tool
 does not validate the graph. It prints a warning, and the engine rows of the
 graph get the verdict `unchecked` with the reason in `correctness.message`.
 These rows do not fail validation (no exit code 3).
+
+A Philox forward graph has no `reference` row: each engine row gets its own
+reference (see [SDPA dropout](#sdpa-dropout)).
 
 #### SDPA dropout
 
@@ -140,7 +144,7 @@ and its `error` starts with `Input data generation failed: `.
 
 An explicit-mask graph gets one reference, as other graphs do.
 
-A Philox forward graph is validated only through its `rng_dump` output.
+The tool validates a Philox forward graph only through its `rng_dump` output.
 For each engine row, after the timed loop:
 
 1. The tool fills the `rng_dump` buffer with NaN, zeroes the other
@@ -187,8 +191,8 @@ engine rows fail (exit code 3) and keep their timings:
 - Dropout with paged K and V or with ragged sequence lengths. The message
   names the feature.
 - A Philox backward graph: a backward node with `seed`, `offset` or a
-  `dropout_probability` above 0. hipDNN work on these is in rocm-libraries
-  #15643 (a draft).
+  `dropout_probability` other than 0. hipDNN's backward graph has no
+  `rng_dump`, so the reference has no mask.
 - The other dropout combinations that the hipDNN references also decline
   (see [Dropout validation](methodology.md#dropout-validation)).
 
@@ -206,7 +210,7 @@ Other runtimes and options:
   explicit-mask graph, as for attention sinks. The timed `reference` row
   makes no native SDPA call, so the selected backend is unavailable, and a
   strict selection has no CPU fallback.
-- A Philox forward graph with `rng_dump` is validated whatever
+- The tool validates a Philox forward graph with `rng_dump` whatever
   `--pytorch-sdpa-backend` says. Its per-row reference makes no native SDPA
   call.
 
