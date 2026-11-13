@@ -1719,6 +1719,44 @@ class TestPyTorchOpsNewHandlers:
                 graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats}
             )
 
+    def test_sdpa_backward_rejects_dbias_dims_other_than_the_bias_dims(self) -> None:
+        """hipDNN's dBias has the dims of the bias (isSupportedSdpaBwdNode).
+        A dBias at the full score shape for a broadcast bias is declined, not
+        filled with a gradient summed to other dims."""
+        q = torch.randn(1, 1, 2, 4)
+        graph_json = {
+            "tensors": [
+                {"uid": 7, "dims": [1, 1, 1, 2]},
+                {"uid": 13, "dims": [1, 1, 2, 2]},
+            ],
+            "nodes": [
+                {
+                    "type": "SdpaBackwardAttributes",
+                    "inputs": {
+                        "q_tensor_uid": 1,
+                        "k_tensor_uid": 2,
+                        "v_tensor_uid": 3,
+                        "o_tensor_uid": 4,
+                        "do_tensor_uid": 5,
+                        "stats_tensor_uid": 6,
+                        "attn_mask_tensor_uid": 7,
+                    },
+                    "outputs": {
+                        "dq_tensor_uid": 10,
+                        "dk_tensor_uid": 11,
+                        "dv_tensor_uid": 12,
+                        "dbias_tensor_uid": 13,
+                    },
+                }
+            ],
+        }
+        stats = torch.zeros(1, 1, 2, 1)
+        bias = torch.zeros(1, 1, 1, 2)
+        with pytest.raises(UnsupportedGraphError):
+            pytorch_ops.execute_graph(
+                graph_json, {1: q, 2: q, 3: q, 4: q, 5: q, 6: stats, 7: bias}
+            )
+
     @pytest.mark.parametrize(
         "bias_dims",
         [(1, 4, 6, 7), (2, 1, 6, 7), (2, 4, 1, 7), (6, 7), (2, 4, 6, 7)],

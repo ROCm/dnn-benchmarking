@@ -12,6 +12,7 @@ from collections import Counter
 import numpy as np
 import pytest
 
+from dnn_benchmarking.common.exceptions import UnsupportedGraphError
 from dnn_benchmarking.config import PyTorchSdpaBackendName, TimingPolicy
 from dnn_benchmarking.graph import GraphLoader
 from dnn_benchmarking.execution.buffer_manager import generate_input_data
@@ -591,6 +592,85 @@ def test_sdpa_backward_fused_dbias_matches_host_formula(
     assert device[11].dtype == torch.bfloat16
     assert device[11].shape == bias_dims
     torch.testing.assert_close(device[11].float().cpu(), host[11], rtol=3e-2, atol=3e-2)
+
+
+def _sdpa_backward_node(parameters: dict) -> dict:
+    return {
+        "type": "SdpaBackwardAttributes",
+        "inputs": {
+            "q_tensor_uid": 1,
+            "k_tensor_uid": 2,
+            "v_tensor_uid": 3,
+            "o_tensor_uid": 4,
+            "do_tensor_uid": 5,
+            "stats_tensor_uid": 6,
+        },
+        "outputs": {"dq_tensor_uid": 7, "dk_tensor_uid": 8, "dv_tensor_uid": 9},
+        "parameters": {"attn_scale_value": 0.125, **parameters},
+    }
+
+
+def _sdpa_backward_tensors(torch, shape=(1, 4, 64, 64)) -> dict:
+    tensors = {
+        uid: torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for uid in (1, 2, 3, 4, 5, 7, 8, 9)
+    }
+    tensors[6] = torch.randn(shape[:-1] + (1,), device="cuda")
+    return tensors
+
+
+@pytest.mark.parametrize("backend", ["default", "efficient"])
+def test_sdpa_backward_with_a_computed_input_is_not_timed(
+    torch_gpu, backend: str
+) -> None:
+    """The fused backward setup copies Q, K, V, O and stats once, before the
+    timed loop. A Q that an earlier node computes would then be stale in
+    every timed iteration, so the row must fail instead of timing it."""
+    torch = torch_gpu
+    torch.manual_seed(0)
+    relu = {
+        "type": "PointwiseAttributes",
+        "compute_data_type": "float",
+        "inputs": {"operation": "relu_fwd", "in_0_tensor_uid": 10},
+        "outputs": {"out_0_tensor_uid": 1},
+    }
+    graph_json = {"nodes": [relu, _sdpa_backward_node({"causal_mask": True})]}
+    tensors = _sdpa_backward_tensors(torch)
+    tensors[10] = tensors[1].clone()
+    executor = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName(backend)
+    )
+    executor.prepare()
+
+    with pytest.raises(UnsupportedGraphError):
+        executor.benchmark(tensors)
+
+
+def test_alibi_sdpa_backward_runs_the_formula_and_declines_a_fused_kernel(
+    torch_gpu,
+) -> None:
+    """The fused backward kernels take no ALiBi slopes. Default dispatch
+    times the fp32 formula and notes it; a strict selection cannot run."""
+    torch = torch_gpu
+    torch.manual_seed(0)
+    graph_json = {
+        "nodes": [_sdpa_backward_node({"causal_mask": True, "alibi_mask": True})]
+    }
+    tensors = _sdpa_backward_tensors(torch)
+
+    default = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.DEFAULT
+    )
+    default.prepare()
+    assert default.benchmark(tensors).kernel_ms[0] > 0
+    assert default.notes
+
+    strict = PyTorchCudaExecutor(
+        graph_json, POLICY, pytorch_sdpa_backend=PyTorchSdpaBackendName.EFFICIENT
+    )
+    strict.prepare()
+    with pytest.raises(UnsupportedGraphError):
+        strict.benchmark(tensors)
 
 
 @pytest.mark.parametrize(
