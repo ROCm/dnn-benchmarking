@@ -22,6 +22,7 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.execution import suite_runner
+from dnn_benchmarking.execution.buffer_manager import generate_input_data
 from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
 from dnn_benchmarking.graph.loader import GraphLoader
 from dnn_benchmarking.graph.tensor_info import TensorInfo
@@ -58,9 +59,9 @@ O_SHAPE, DUMP_SHAPE = (1, 2, 4, 8), (1, 2, 4, 4)
 P = 0.9
 
 
-def _philox_graph(rng_dump=True):
+def _philox_graph(rng_dump=True, p=P):
     """An SDPA forward graph with Philox dropout; its tensors, outputs marked."""
-    graph = sdpa_graph(b=1, hq=2, hkv=2, s=4, d=8, dropout_probability=P)
+    graph = sdpa_graph(b=1, hq=2, hkv=2, s=4, d=8, dropout_probability=p)
     node = graph["nodes"][0]
     for uid, name in ((6, "seed"), (7, "offset")):
         graph["tensors"].append(
@@ -2183,3 +2184,80 @@ def test_a_philox_row_whose_rng_dump_is_not_float_fails_and_keeps_its_timings(
     assert ("zero_outputs", (DUMP_UID,)) not in philox.events
     assert philox.tuned[0].get("validate") is None
     assert _exit_code(graph) == 3
+
+
+# p = 0.4: at n = 32 every keep rate from 0.05 to 1 passes the dump check, so a
+# complemented dump reaches the reference.
+E2E_P = 0.4
+
+
+def _expected_philox_o(inputs, dump, p):
+    """O = (P * dump / (1 - p)) V, with P the causal softmax, in float64.
+
+    The graph has no attention scale, so the scores are not scaled (hipDNN
+    applies 1.0, not 1 / sqrt(d)).
+    """
+    q, k, v = (inputs[uid].astype(np.float64) for uid in (1, 2, 3))
+    scores = q @ np.swapaxes(k, -1, -2)
+    s_q, s_kv = scores.shape[-2:]
+    # sdpa_graph sets a top-left causal mask: query i sees keys 0..i.
+    scores[..., np.triu(np.ones((s_q, s_kv), bool), k=1)] = -np.inf
+    probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probs /= probs.sum(axis=-1, keepdims=True)
+    return ((probs * dump / (1.0 - p)) @ v).astype(np.float16)
+
+
+@pytest.fixture
+def real_reference(fake, monkeypatch):
+    """The real PyTorch reference on the host; a fake engine writes a Philox
+    dump and the O that the dump gives."""
+    pytest.importorskip("torch")
+    from dnn_benchmarking.common import torch_support
+
+    monkeypatch.setattr(torch_support, "gpu_available", lambda: False)
+    fake.discovered = [1]
+    graph_json, tensors = _philox_graph(p=E2E_P)
+    inputs = generate_input_data(tensors, SuiteConfig().seed, graph_json)
+    dump = (np.random.default_rng(31).random(DUMP_SHAPE) < 1 - E2E_P).astype(np.float32)
+    fake.e2e = SimpleNamespace(
+        graph=graph_json,
+        tensors=tensors,
+        dump=dump,
+        o=_expected_philox_o(inputs, dump, E2E_P),
+    )
+    return fake
+
+
+@pytest.mark.parametrize("case", ["own-dump", "flipped-o", "dump-complement"])
+def test_a_philox_row_is_graded_end_to_end_against_the_real_reference(
+    real_reference, case
+):
+    e2e = real_reference.e2e
+    dump, o = e2e.dump, e2e.o
+    if case == "flipped-o":
+        o = np.flip(o, axis=2)  # query rows in reverse order
+    elif case == "dump-complement":
+        dump = 1.0 - dump  # a valid dump, but not the one O used
+    real_reference.engine_outputs = {(1, DUMP_UID): dump, (1, O_UID): o}
+
+    graph, _ = _validate(graph=e2e.graph, tensors=e2e.tensors)
+
+    (row,) = graph.results
+    correctness = row.ootb.correctness
+    expected = "passed" if case == "own-dump" else "failed"
+    assert row.verdict == expected, correctness
+    assert correctness.worst_output_uid == O_UID, correctness
+
+
+def test_philox_row_passes_under_a_strict_sdpa_backend(real_reference):
+    """The per-row reference makes no native SDPA call, so it must run
+    outside the strict backend scope."""
+    e2e = real_reference.e2e
+    real_reference.engine_outputs = {(1, DUMP_UID): e2e.dump, (1, O_UID): e2e.o}
+
+    graph, _ = _validate(
+        graph=e2e.graph, tensors=e2e.tensors, pytorch_sdpa_backend="math"
+    )
+
+    (row,) = graph.results
+    assert row.verdict == "passed", row.ootb.correctness
