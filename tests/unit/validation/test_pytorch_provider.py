@@ -1397,8 +1397,6 @@ class TestPyTorchProviderNewOps:
     @pytest.mark.parametrize(
         "optional_input",
         [
-            "seed_tensor_uid",
-            "offset_tensor_uid",
             "dropout_mask_tensor_uid",
             "dropout_scale_tensor_uid",
             "block_mask_tensor_uid",
@@ -2125,6 +2123,592 @@ class TestPyTorchProviderNewOps:
                     7: np.array([2], dtype=np.int32),
                 },
             )
+
+
+# UIDs of the SDPA dropout graphs below.
+_Q, _K, _V, _O, _ATTN_MASK, _STATS = 1, 2, 3, 4, 5, 6
+_DROP_MASK, _DROP_SCALE, _SINK, _SEED, _OFFSET, _DUMP = 7, 8, 9, 10, 11, 12
+_ATTN_SCALE = 0.5
+_KEEP_SCALE = np.float32(1 / 0.8)
+_LEFT_BOUND = 2
+_FULL = "full"
+_INT_INPUTS = ("seed", "offset", "page_table", "seq_len")
+
+
+def _dropout_graph(
+    *,
+    b=2,
+    hq=4,
+    hkv=2,
+    sq=5,
+    skv=7,
+    d=8,
+    mask=_FULL,
+    scale=(1,),
+    probability=None,
+    seed=False,
+    offset=False,
+    dump=None,
+    attn_mask=None,
+    sink=False,
+    attributes=None,
+    types=None,
+    extra_inputs=None,
+):
+    """An SDPA forward graph with an explicit dropout mask by default.
+
+    ``mask``, ``scale``, ``dump`` and ``attn_mask`` are dims (None leaves the
+    tensor out). The probability is null by default, the shipped form.
+    """
+    types = types or {}
+    tensors = {
+        _Q: [b, hq, sq, d],
+        _K: [b, hkv, skv, d],
+        _V: [b, hkv, skv, d],
+        _O: [b, hq, sq, d],
+        _STATS: [b, hq, sq, 1],
+    }
+    inputs = {"q_tensor_uid": _Q, "k_tensor_uid": _K, "v_tensor_uid": _V}
+    outputs = {"o_tensor_uid": _O, "stats_tensor_uid": _STATS}
+    if mask == _FULL:
+        mask = [b, hq, sq, skv]
+    for key, uid, dims in (
+        ("dropout_mask_tensor_uid", _DROP_MASK, mask),
+        ("dropout_scale_tensor_uid", _DROP_SCALE, scale),
+        ("attn_mask_tensor_uid", _ATTN_MASK, attn_mask),
+        ("sink_token_tensor_uid", _SINK, [hq] if sink else None),
+        ("seed_tensor_uid", _SEED, [1] if seed else None),
+        ("offset_tensor_uid", _OFFSET, [1] if offset else None),
+    ):
+        if dims is not None:
+            inputs[key] = uid
+            tensors[uid] = list(dims)
+    if dump is not None:
+        outputs["rng_dump_tensor_uid"] = _DUMP
+        tensors[_DUMP] = list(dump)
+    for key, (uid, dims) in (extra_inputs or {}).items():
+        inputs[key] = uid
+        tensors[uid] = list(dims)
+
+    def data_type(uid, key):
+        if uid in types:
+            return types[uid]
+        return "int64" if any(name in key for name in _INT_INPUTS) else "float"
+
+    keys = {uid: key for key, uid in {**inputs, **outputs}.items()}
+    return {
+        "tensors": [
+            {"uid": uid, "dims": dims, "data_type": data_type(uid, keys[uid])}
+            for uid, dims in tensors.items()
+        ],
+        "nodes": [
+            {
+                "name": "sdpa",
+                "type": "SdpaAttributes",
+                "inputs": inputs,
+                "outputs": outputs,
+                "attributes": {
+                    "dropout_probability": probability,
+                    "attn_scale_value": _ATTN_SCALE,
+                    **(attributes or {}),
+                },
+            }
+        ],
+    }
+
+
+def _dropout_inputs(graph_json, seed):
+    """Inputs of ``graph_json``: a 0/1 dropout mask at keep 0.8 with one zero
+    column and one column of 1.5 (used as given), the scale 1/0.8, ints of 1
+    for seed, offset and sequence tensors, normal floats for the rest."""
+    rng = np.random.default_rng(seed)
+    dims = {t["uid"]: t["dims"] for t in graph_json["tensors"]}
+    data = {}
+    for key, uid in graph_json["nodes"][0]["inputs"].items():
+        shape = dims[uid]
+        if uid == _DROP_MASK:
+            mask = (rng.random(shape) < 0.8).astype(np.float32)
+            if len(shape) == 4 and shape[-1] > 1:
+                mask[..., 0] = 1.5
+                mask[..., 1] = 0.0
+            data[uid] = mask
+        elif uid == _DROP_SCALE:
+            data[uid] = np.full(shape, _KEEP_SCALE, dtype=np.float32)
+        elif any(name in key for name in _INT_INPUTS):
+            data[uid] = np.ones(shape, dtype=np.int64)
+        else:
+            data[uid] = rng.standard_normal(shape).astype(np.float32)
+    return data
+
+
+def dropout_reference(q, k, v, mask, s, kind="none", *, attn_mask=None, sink=None):
+    """float64 ``O = (P * mask * s) V`` and the pre-dropout log-sum-exp.
+
+    The additive mask of ``kind`` is built here from its definition. ``sink``
+    adds one logit per query head to the softmax denominator.
+    """
+    q, k, v = (np.asarray(t, dtype=np.float64) for t in (q, k, v))
+    hq, sq, skv = q.shape[1], q.shape[2], k.shape[2]
+    k = np.repeat(k, hq // k.shape[1], axis=1)
+    v = np.repeat(v, hq // v.shape[1], axis=1)
+    i = np.arange(sq)[:, None]
+    j = np.arange(skv)[None, :]
+    visible = {
+        "none": np.ones((sq, skv), dtype=bool),
+        "causal": j <= i,
+        "alibi": j <= i,
+        "bottom_right": j <= i + (skv - sq),
+        "window": (j <= i) & (j >= i - _LEFT_BOUND),
+    }[kind]
+    additive = np.where(visible, 0.0, -np.inf)
+    if kind == "alibi":
+        slopes = 2.0 ** (-8.0 * np.arange(1, hq + 1) / hq)  # power-of-two heads
+        additive = additive + (j - i) * slopes[:, None, None]
+    if attn_mask is not None:
+        additive = additive + np.asarray(attn_mask, dtype=np.float64)
+    scores = q @ k.swapaxes(-1, -2) * _ATTN_SCALE + additive
+    lse = np.log(np.exp(scores).sum(axis=-1, keepdims=True))
+    if sink is not None:
+        lse = np.logaddexp(lse, np.asarray(sink, np.float64).reshape(1, -1, 1, 1))
+    probs = np.exp(scores - lse)
+    return (probs * np.asarray(mask, dtype=np.float64) * float(s)) @ v, lse
+
+
+#: Mask kinds that compose with dropout (R14): graph attributes, the
+#: ``dropout_reference`` kind, and whether the graph has a bias or sinks.
+_MASK_KINDS = {
+    "causal_top_left": ({"causal_mask": True}, "causal", False, False),
+    "causal_bottom_right": ({"causal_mask_bottom_right": True}, "bottom_right", False, False),
+    "sliding_window": ({"left_bound": _LEFT_BOUND, "right_bound": 0}, "window", False, False),
+    "additive_bias": ({}, "none", True, False),
+    "alibi": ({"causal_mask": True, "alibi_mask": True}, "alibi", False, False),
+    "sinks": ({}, "none", False, True),
+}  # fmt: skip
+
+
+def _composed(kind, **graph_kwargs):
+    """A dropout graph with the mask kind ``kind`` and its reference kwargs."""
+    attributes, ref_kind, bias, sink = _MASK_KINDS[kind]
+    graph = _dropout_graph(
+        attributes=attributes,
+        attn_mask=[1, 4, 5, 7] if bias else None,  # [1, Hq, Sq, Skv]
+        sink=sink,
+        **graph_kwargs,
+    )
+    return graph, ref_kind, bias, sink
+
+
+class TestSdpaExplicitDropout:
+    """Explicit-mask dropout in the SDPA forward reference (R6, R7, R14, R15)."""
+
+    @pytest.mark.parametrize(
+        "mask_dims",
+        [[2, 4, 5, 7], [1, 4, 5, 7], [2, 1, 5, 7], [1, 1, 5, 7]],
+        ids=["B,Hq", "1,Hq", "B,1", "1,1"],
+    )
+    def test_sdpa_explicit_mask_forward_matches_closed_form(self, mask_dims) -> None:
+        """GQA (Hq 4, Hkv 2): the mask head index is the query head. The
+        stats are the log-sum-exp before dropout."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _dropout_graph(mask=mask_dims)
+        inputs = _dropout_inputs(graph, seed=11)
+
+        out = provider.compute_reference(graph, inputs)
+
+        o, lse = dropout_reference(
+            inputs[_Q], inputs[_K], inputs[_V], inputs[_DROP_MASK], _KEEP_SCALE
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("kind", list(_MASK_KINDS))
+    def test_sdpa_explicit_mask_composes_with_each_mask_kind(self, kind) -> None:
+        """With sinks, P is normalised with the sink before ``M * s``."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph, ref_kind, bias, sink = _composed(kind)
+        inputs = _dropout_inputs(graph, seed=12)
+
+        out = provider.compute_reference(graph, inputs)
+
+        o, lse = dropout_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            inputs[_DROP_MASK],
+            _KEEP_SCALE,
+            ref_kind,
+            attn_mask=inputs[_ATTN_MASK] if bias else None,
+            sink=inputs[_SINK] if sink else None,
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "mask_dims", [[2, 4, 9, 11], [1, 1, 9, 11]], ids=["B,Hq", "1,1"]
+    )
+    def test_sdpa_explicit_mask_blocks_match_one_block(
+        self, mask_dims, monkeypatch
+    ) -> None:
+        """Nine query rows in blocks of two: each block must take its own rows
+        of the dropout mask and of the bias. Every query sees a key."""
+        from dnn_benchmarking.execution.pytorch_ops.handlers import sdpa as sdpa_mod
+
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _dropout_graph(
+            sq=9,
+            skv=11,
+            mask=mask_dims,
+            attn_mask=[1, 4, 9, 11],
+            attributes={"causal_mask_bottom_right": True},
+        )
+        inputs = _dropout_inputs(graph, seed=13)
+        one_block = provider.compute_reference(graph, inputs)
+
+        # Scores of one query row: 2 batches x 4 heads x 11 keys x 4 bytes.
+        monkeypatch.setattr(sdpa_mod, "_SCORE_BLOCK_BYTES", 2 * 2 * 4 * 11 * 4)
+        assert len(sdpa_mod._query_blocks(torch.zeros(2, 4, 9, 8), 11)) == 5
+        blocked = provider.compute_reference(graph, inputs)
+
+        o, lse = dropout_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            inputs[_DROP_MASK],
+            _KEEP_SCALE,
+            "bottom_right",
+            attn_mask=inputs[_ATTN_MASK],
+        )
+        for uid, expected in ((_O, o), (_STATS, lse)):
+            np.testing.assert_allclose(
+                blocked[uid].data, one_block[uid].data, rtol=1e-6, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                blocked[uid].data, expected, rtol=1e-5, atol=1e-5
+            )
+
+    @pytest.mark.parametrize(
+        "extra_inputs,feature",
+        [
+            (
+                {
+                    "page_table_k_tensor_uid": (13, [2, 1]),
+                    "page_table_v_tensor_uid": (14, [2, 1]),
+                    "seq_len_kv_tensor_uid": (15, [2]),
+                },
+                "page_table",
+            ),
+            ({"seq_len_q_tensor_uid": (15, [2])}, "seq_len_q"),
+            ({"seq_len_kv_tensor_uid": (15, [2])}, "seq_len_kv"),
+        ],
+        ids=["paged", "ragged_q", "ragged_kv"],
+    )
+    def test_sdpa_dropout_declined_for_paged_and_ragged_kv(
+        self, extra_inputs, feature
+    ) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _dropout_graph(extra_inputs=extra_inputs)
+
+        with pytest.raises(UnsupportedGraphError, match=feature):
+            provider.compute_reference(graph, _dropout_inputs(graph, seed=14))
+
+    @pytest.mark.parametrize(
+        "graph_kwargs",
+        [
+            pytest.param({"probability": 0.0}, id="mask_and_scale_with_probability"),
+            pytest.param({"seed": True}, id="mask_and_scale_with_seed"),
+            pytest.param({"offset": True}, id="mask_and_scale_with_offset"),
+            pytest.param({"scale": None}, id="mask_without_scale"),
+            pytest.param({"mask": None}, id="scale_without_mask"),
+            pytest.param({"types": {_DROP_SCALE: "half"}}, id="scale_not_float"),
+            pytest.param({"scale": [2]}, id="scale_not_one_element"),
+            pytest.param({"types": {_DROP_MASK: "half"}}, id="mask_not_float"),
+            pytest.param({"mask": [4, 5, 7]}, id="mask_not_rank_4"),
+            pytest.param({"mask": [3, 4, 5, 7]}, id="mask_dim0_not_b_or_1"),
+            # Hkv heads: the mask is indexed by the query head.
+            pytest.param({"mask": [2, 2, 5, 7]}, id="mask_dim1_not_hq_or_1"),
+            pytest.param({"mask": [2, 4, 1, 7]}, id="mask_dim2_not_sq"),
+            pytest.param({"mask": [2, 4, 5, 1]}, id="mask_dim3_not_skv"),
+        ],
+    )
+    def test_sdpa_dropout_declines(self, graph_kwargs) -> None:
+        """One case per R7 rule that hipDNN declines (rows 1-4). Each graph
+        differs from a computable one in that rule only."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _dropout_graph(**graph_kwargs)
+
+        with pytest.raises(UnsupportedGraphError):
+            provider.compute_reference(graph, _dropout_inputs(graph, seed=15))
+
+
+#: f32(1) / (f32(1) - f32(p)), the Philox scale as hipDNN evaluates it.
+_P = 0.3
+_PHILOX_SCALE = np.float32(1) / (np.float32(1) - np.float32(_P))
+_DUMP_DIMS = [2, 4, 5, 7]  # [B, Hq, Sq, Skv]
+
+
+def _philox_graph(**graph_kwargs):
+    """A Philox dropout forward with seed, offset and an rng_dump output."""
+    graph_kwargs.setdefault("mask", None)
+    graph_kwargs.setdefault("scale", None)
+    graph_kwargs.setdefault("probability", _P)
+    graph_kwargs.setdefault("seed", True)
+    graph_kwargs.setdefault("offset", True)
+    graph_kwargs.setdefault("dump", _DUMP_DIMS)
+    return _dropout_graph(**graph_kwargs)
+
+
+def _philox_dump(seed, dims=_DUMP_DIMS):
+    """A 0/1 dump at keep 0.7 with both values in every row."""
+    dump = (np.random.default_rng(seed).random(dims) < 0.7).astype(np.float32)
+    if len(dims) == 4 and dims[-1] > 1:
+        dump[..., 0] = 0.0
+        dump[..., 1] = 1.0
+    return dump
+
+
+class TestSdpaPhiloxDropout:
+    """Philox dropout through the engine's rng_dump (R0, R7, R8, R9, R14, R18,
+    R23). A call passes the engine row's dump with ``philox_dumps``."""
+
+    def test_philox_forward_applies_the_given_dump_with_one_over_one_minus_p(
+        self,
+    ) -> None:
+        """p 0.3, not 0.5, so a 1/p scale differs from 1/(1-p). The stats are
+        the log-sum-exp before dropout. The dump is not a reference output."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=21)
+        dump = _philox_dump(22)
+
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        o, lse = dropout_reference(
+            inputs[_Q], inputs[_K], inputs[_V], dump, _PHILOX_SCALE
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+        assert _DUMP not in out
+
+    @pytest.mark.parametrize("kind", list(_MASK_KINDS))
+    def test_philox_forward_composes_with_each_mask_kind(self, kind) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph, ref_kind, bias, sink = _composed(
+            kind,
+            mask=None,
+            scale=None,
+            probability=_P,
+            seed=True,
+            offset=True,
+            dump=_DUMP_DIMS,
+        )
+        inputs = _dropout_inputs(graph, seed=23)
+        dump = _philox_dump(24)
+
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        o, lse = dropout_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            dump,
+            _PHILOX_SCALE,
+            ref_kind,
+            attn_mask=inputs[_ATTN_MASK] if bias else None,
+            sink=inputs[_SINK] if sink else None,
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+
+    def test_philox_reference_uses_the_dump_it_is_given(self) -> None:
+        """Two engine rows with different dumps: each output follows its own
+        dump, so the reference keeps no mask from an earlier call."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=25)
+        dumps = [_philox_dump(26), _philox_dump(27)]
+
+        outputs = [
+            provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+            for dump in dumps
+        ]
+
+        for out, dump in zip(outputs, dumps):
+            o, _ = dropout_reference(
+                inputs[_Q], inputs[_K], inputs[_V], dump, _PHILOX_SCALE
+            )
+            np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        assert not np.allclose(outputs[0][_O].data, outputs[1][_O].data, atol=1e-3)
+
+    def test_philox_dump_in_the_input_tensors_is_ignored(self) -> None:
+        """A buffer manager can hand the zeroed rng_dump buffer over with the
+        inputs. Only ``philox_dumps`` is the dump."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=28)
+        inputs[_DUMP] = np.zeros(_DUMP_DIMS, dtype=np.float32)
+        dump = _philox_dump(29)
+
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            provider.compute_reference(graph, inputs)
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        o, _ = dropout_reference(
+            inputs[_Q], inputs[_K], inputs[_V], dump, _PHILOX_SCALE
+        )
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+
+    def test_philox_without_scope_declines_naming_rng_dump(self) -> None:
+        """PyTorch rows of Philox graphs stay declined (R18): they compile
+        outside a ``philox_dumps`` call, before and after one."""
+        from dnn_benchmarking.execution import pytorch_ops
+
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph()
+        inputs = _dropout_inputs(graph, seed=30)
+
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            pytorch_ops.compile_graph(graph)
+        provider.compute_reference(
+            graph, inputs, philox_dumps={_DUMP: _philox_dump(31)}
+        )
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            pytorch_ops.compile_graph(graph)
+
+    @pytest.mark.parametrize("ones", [False, True], ids=["all_zero", "all_one"])
+    def test_philox_p_zero_with_dump_uses_the_dump_as_is(self, ones) -> None:
+        """At p 0 the scale is 1: an all-zero dump gives O = 0, an all-one dump
+        gives the forward without dropout."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(probability=0.0)
+        inputs = _dropout_inputs(graph, seed=32)
+        dump = np.full(_DUMP_DIMS, 1.0 if ones else 0.0, dtype=np.float32)
+
+        out = provider.compute_reference(graph, inputs, philox_dumps={_DUMP: dump})
+
+        if ones:
+            o, _ = dropout_reference(inputs[_Q], inputs[_K], inputs[_V], dump, 1.0)
+            np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        else:
+            np.testing.assert_array_equal(out[_O].data, 0.0)
+
+    @pytest.mark.parametrize(
+        "graph_kwargs,dump_dims,match",
+        [
+            pytest.param(
+                {"probability": None},
+                _DUMP_DIMS,
+                None,
+                id="rng_dump_without_probability",
+            ),
+            pytest.param(
+                {"probability": None, "dump": None, "offset": False},
+                None,
+                None,
+                id="seed_without_probability",
+            ),
+            pytest.param(
+                {"probability": None, "dump": None, "seed": False},
+                None,
+                None,
+                id="offset_without_probability",
+            ),
+            pytest.param(
+                {
+                    "probability": None,
+                    "seed": False,
+                    "offset": False,
+                    "mask": _FULL,
+                    "scale": (1,),
+                },
+                _DUMP_DIMS,
+                None,
+                id="rng_dump_with_mask_and_scale",
+            ),
+            pytest.param({"seed": False}, _DUMP_DIMS, None, id="rng_dump_without_seed"),
+            pytest.param(
+                {"offset": False}, _DUMP_DIMS, None, id="rng_dump_without_offset"
+            ),
+            pytest.param({"probability": float("nan")}, _DUMP_DIMS, None, id="p_nan"),
+            pytest.param({"probability": -0.1}, _DUMP_DIMS, None, id="p_below_0"),
+            pytest.param({"probability": 1.0}, _DUMP_DIMS, None, id="p_1"),
+            pytest.param({"probability": 1.5}, _DUMP_DIMS, None, id="p_above_1"),
+            pytest.param(
+                {"types": {_DUMP: "half"}}, _DUMP_DIMS, None, id="rng_dump_not_float"
+            ),
+            pytest.param(
+                {"dump": [1, 4, 5, 7]}, [1, 4, 5, 7], None, id="rng_dump_dim0_not_b"
+            ),
+            # Hkv heads: the dump is indexed by the query head.
+            pytest.param(
+                {"dump": [2, 2, 5, 7]}, [2, 2, 5, 7], None, id="rng_dump_dim1_not_hq"
+            ),
+            pytest.param(
+                {"dump": [2, 4, 1, 7]}, [2, 4, 1, 7], None, id="rng_dump_dim2_not_sq"
+            ),
+            pytest.param(
+                {"dump": [2, 4, 5, 1]}, [2, 4, 5, 1], None, id="rng_dump_dim3_not_skv"
+            ),
+            pytest.param(
+                {"dump": None}, None, "rng_dump", id="philox_without_rng_dump"
+            ),
+            pytest.param(
+                {"extra_inputs": {"descale_q_tensor_uid": (16, [1])}},
+                _DUMP_DIMS,
+                None,
+                id="fp8_scaling",
+            ),
+            pytest.param(
+                {"extra_inputs": {"seq_len_kv_tensor_uid": (15, [2])}},
+                _DUMP_DIMS,
+                "seq_len_kv",
+                id="ragged_kv",
+            ),
+        ],
+    )
+    def test_philox_declines(self, graph_kwargs, dump_dims, match) -> None:
+        """One case per R7 rule for Philox (rows 5-9). The dump is in scope,
+        so only the rule can decline the graph."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(**graph_kwargs)
+        dumps = {} if dump_dims is None else {_DUMP: _philox_dump(33, dump_dims)}
+
+        with pytest.raises(UnsupportedGraphError, match=match):
+            provider.compute_reference(
+                graph, _dropout_inputs(graph, seed=34), philox_dumps=dumps
+            )
+
+    def test_sdpa_probability_zero_without_dump_is_no_dropout(self) -> None:
+        """p 0 (not null) with seed and offset and no rng_dump, mask or scale:
+        no dropout, and seed and offset are not read (R8). p 0 with a mask and
+        scale, or with an rng_dump, is another rule."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(probability=0.0, dump=None)
+        inputs = _dropout_inputs(graph, seed=35)
+
+        out = provider.compute_reference(graph, inputs)
+
+        ones = np.ones(_DUMP_DIMS, dtype=np.float32)
+        o, lse = dropout_reference(inputs[_Q], inputs[_K], inputs[_V], ones, 1.0)
+        np.testing.assert_allclose(out[_O].data, o, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out[_STATS].data, lse, rtol=1e-5, atol=1e-5)
+        explicit = _dropout_graph(probability=0.0)
+        with pytest.raises(UnsupportedGraphError):
+            provider.compute_reference(explicit, _dropout_inputs(explicit, seed=35))
+        philox = _philox_graph(probability=0.0)
+        with pytest.raises(UnsupportedGraphError, match="rng_dump"):
+            provider.compute_reference(philox, _dropout_inputs(philox, seed=35))
+
+    @pytest.mark.parametrize("absent", [False, True], ids=["null", "absent"])
+    def test_sdpa_null_probability_with_seed_declines(self, absent) -> None:
+        """A null or absent probability is not 0 (R0): seed and offset need a
+        probability, so the graph is declined, not run without dropout."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = _philox_graph(probability=None, dump=None)
+        if absent:
+            del graph["nodes"][0]["attributes"]["dropout_probability"]
+
+        with pytest.raises(UnsupportedGraphError):
+            provider.compute_reference(graph, _dropout_inputs(graph, seed=36))
 
 
 class TestHostMemoryEstimate:
