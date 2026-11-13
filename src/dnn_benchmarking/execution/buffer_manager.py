@@ -10,8 +10,10 @@ graph type, and are encoded to raw words only when written to device storage.
 """
 
 import functools
+import math
+import struct
 import warnings
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Collection, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -30,6 +32,9 @@ _FP8_FORMATS = {
     "fp8_e4m3_fnuz": (4, 3),
     "fp8_e5m2_fnuz": (5, 2),
 }
+
+# One float32 NaN in little-endian storage order.
+_NAN_WORD = struct.pack("<f", math.nan)
 
 
 def _f32_to_bf16(data_f32: np.ndarray) -> np.ndarray:
@@ -557,14 +562,28 @@ class BufferManager:
             if buffer is not None:
                 self._write_storage(buffer, _encode_to_storage(data, tensor_info))
 
-    def zero_outputs(self) -> None:
+    def zero_outputs(self, nan_uids: Collection[int] = ()) -> None:
         """Zero output tensor buffers.
+
+        Outputs in ``nan_uids`` are filled with float32 NaN instead: every
+        4-byte word of the buffer, padding included. An engine that does not
+        write such an output then leaves NaN, which no 0/1 check accepts.
 
         Raises:
             ExecutionError: If buffers not allocated.
+            ValueError: If an output in ``nan_uids`` is not FLOAT.
         """
         if not self._buffers:
             raise ExecutionError("Buffers not allocated. Call allocate_all() first.")
+
+        for uid in nan_uids:
+            tensor_info = self._tensor_info_by_uid.get(uid)
+            if tensor_info is None or tensor_info.dtype.name != "float":
+                data_type = None if tensor_info is None else tensor_info.data_type
+                raise ValueError(
+                    f"Cannot fill tensor UID {uid} with NaN: only a FLOAT "
+                    f"output can be filled (data type {data_type})"
+                )
 
         for tensor_info in self._tensor_infos:
             if not tensor_info.is_output:
@@ -573,15 +592,25 @@ class BufferManager:
             buffer = self._buffers.get(tensor_info.uid)
             if buffer is None:
                 continue
+            fill_nan = tensor_info.uid in nan_uids
             if self._device is None:
-                buffer.zeros()
+                if fill_nan:
+                    # One bytes object of the full storage size, padding
+                    # included: DeviceBuffer.copy_from_host accepts only bytes.
+                    buffer.copy_from_host(_NAN_WORD * (tensor_info.size_bytes // 4))
+                else:
+                    buffer.zeros()
+            elif fill_nan:
+                import torch
+
+                buffer.view(torch.float32).fill_(math.nan)
             else:
                 buffer.zero_()
 
         if self._device is not None:
             import torch
 
-            # zero_() runs on torch's stream; hipDNN runs on the handle stream.
+            # The fills run on torch's stream; hipDNN runs on the handle stream.
             if torch.device(self._device).type == "cuda":
                 torch.cuda.synchronize()
 
