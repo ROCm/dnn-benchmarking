@@ -29,6 +29,7 @@ from typing import (
     Tuple,
 )
 
+from ..common import torch_support
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
     PyTorchSdpaBackendName,
@@ -45,13 +46,14 @@ from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
 from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
 from ..reporting.suite_results import (
+    CorrectnessResult,
     GraphResult,
     ProviderEngineResult,
     engine_id_hex,
     graph_id_for,
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
-from .correctness import check_correctness, mismatch, unchecked
+from .correctness import check_correctness, check_rng_dump, mismatch, unchecked
 from .oracle import run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
     Catalog,
@@ -61,6 +63,7 @@ from .rocke_sdpa import (
     catalog_kernels,
     sdpa_problem,
 )
+from .sdpa_dropout import RngDump, find_rng_dump, philox_without_dump
 
 
 @dataclass
@@ -80,6 +83,9 @@ class _GraphContext:
     reference_error: Optional[str] = None
     # Set when validation was skipped on purpose (rows stay unchecked).
     validation_skip_reason: Optional[str] = None
+    # The rng_dump output of a Philox dropout graph: each engine row is graded
+    # against a reference built from its own dump.
+    philox: Optional[RngDump] = None
     graph_json_str: str = ""  # hipDNN runs only
 
 
@@ -302,6 +308,7 @@ def _graph_context(
         config=config,
         reporter=reporter,
         input_data=generate_input_data(tensor_infos, config.seed, graph_json),
+        philox=find_rng_dump(graph_json),
     )
     if config.metrics.basic:
         try:
@@ -610,11 +617,10 @@ def run_single_provider_engine(
             row=row,
             graph_path=ctx.graph_path,
             graph_name=ctx.graph_name,
-            tensor_infos=ctx.tensor_infos,
-            reference_outputs=ctx.reference_outputs,
             engine_id=engine_id,
             plugin_path=plugin_path,
             config=config,
+            validate=_tuned_validator(ctx),
         )
     if config.metrics.opt_in_pass_requested:
         _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
@@ -634,9 +640,27 @@ def _validate_row(
     host memory), the row is unchecked. When ``--validate`` has no usable
     reference for another reason, the row fails, so ``--validate`` stays a
     hard gate.
+
+    A Philox dropout graph runs the engine once more with its ``rng_dump``
+    buffer filled with NaN and the other outputs zeroed. The row is then
+    graded against its own dump (:func:`_check_philox_outputs`). When the
+    host copies of the dump do not fit in host memory, the engine does not
+    run again and the row is unchecked.
     """
     config = ctx.config
-    if ctx.reference_outputs is not None:
+    if (
+        ctx.philox is not None
+        and config.validation.enabled
+        and ctx.reference_error is None
+    ):
+        skip_reason = _rng_dump_skip_reason(ctx)
+        if skip_reason is not None:
+            row.ootb.correctness = unchecked(config, skip_reason)
+            return
+        bm.zero_outputs(nan_uids={ctx.philox.uid})
+        execute_once()
+        row.ootb.correctness = _check_philox_outputs(ctx, bm)
+    elif ctx.reference_outputs is not None:
         bm.zero_outputs()
         execute_once()
         row.ootb.correctness = check_correctness(
@@ -652,6 +676,134 @@ def _validate_row(
         row.ootb.correctness = mismatch(
             config, ctx.reference_error or "Reference outputs unavailable"
         )
+
+
+def _tuned_validator(
+    ctx: _GraphContext,
+) -> Optional[Callable[[Any], CorrectnessResult]]:
+    """How to grade the tuned plan's saved outputs, or None for no grading.
+
+    A Philox graph grades the tuned plan's own dump and output, as for the
+    OOTB row. Its tuned plan is not graded when validation is off, when the
+    graph has no usable reference provider, or when the dump does not fit
+    in host memory. Other graphs compare against the reference outputs when
+    they exist. Without a validator the tuned child saves no outputs.
+    """
+    config = ctx.config
+    if (
+        ctx.philox is not None
+        and config.validation.enabled
+        and ctx.reference_error is None
+        and _rng_dump_skip_reason(ctx) is None
+    ):
+        return lambda outputs: _check_philox_outputs(ctx, outputs)
+    reference_outputs = ctx.reference_outputs
+    if reference_outputs is not None:
+        return lambda outputs: check_correctness(
+            outputs,
+            ctx.tensor_infos,
+            reference_outputs,
+            config.validation.provider.value,
+            config,
+        )
+    return None
+
+
+def _rng_dump_skip_reason(ctx: _GraphContext) -> Optional[str]:
+    """Why the ``rng_dump`` of ``ctx.philox`` is not checked, or None.
+
+    The NaN fill writes one ``bytes`` object of the buffer size. The read
+    holds the copied bytes, a vector and the decoded array at once. The peak
+    is thus 3 x ``size_bytes``; the fill is freed before the read.
+    """
+    dump = next((t for t in ctx.tensor_infos if t.uid == ctx.philox.uid), None)
+    if dump is None:
+        return None
+    shortfall = _host_bytes_shortfall(3 * dump.size_bytes, "the rng_dump check")
+    if shortfall is None:
+        return None
+    reason = f"validation skipped: {shortfall}"
+    warn_once("validation", f"{ctx.graph_name}: {reason}")
+    return reason
+
+
+def _check_philox_outputs(ctx: _GraphContext, outputs: Any) -> CorrectnessResult:
+    """Grade the outputs of one plan of a Philox graph against its own dump.
+
+    ``outputs`` has ``get_output_data`` and ``get_output_tensor``: the row's
+    buffer manager, or the tuned child's saved outputs. The dump check runs
+    first. Then the reference applies this dump as its dropout mask, and
+    every output except the dump is compared.
+    """
+    config, philox = ctx.config, ctx.philox
+    dump = outputs.get_output_data(philox.uid)
+    if dump is None:
+        return mismatch(config, f"rng_dump output (tensor UID {philox.uid}) is missing")
+    bad_dump = check_rng_dump(dump, philox.probability, config)
+    if bad_dump is not None:
+        return bad_dump
+    provider, error = _reference_provider(config, ctx.graph_json)
+    if provider is None:
+        return mismatch(config, error or "Reference outputs unavailable")
+    reference = None
+    try:
+        reference, failure = _philox_reference(ctx, provider, dump)
+        if failure is not None:
+            return failure
+        return check_correctness(
+            outputs,
+            ctx.tensor_infos,
+            reference,
+            config.validation.provider.value,
+            config,
+            ignore_uids={philox.uid},
+        )
+    finally:
+        # Drop the reference before the release, so its VRAM is returned.
+        reference = None
+        _release_torch_cache()
+
+
+def _philox_reference(
+    ctx: _GraphContext, provider: ReferenceProvider, dump: Any
+) -> Tuple[Optional[Dict[int, ReferenceOutput]], Optional[CorrectnessResult]]:
+    """The reference outputs for ``dump``, or the verdict when there are none.
+
+    The reference runs on the GPU when PyTorch has one. After a GPU
+    out-of-memory error, or without a GPU, it runs on the host when it fits
+    in host memory. No SDPA backend scope is entered: the Philox path makes
+    no native SDPA call, so a strict scope would raise.
+    """
+    config = ctx.config
+
+    def compute(device: Optional[str]) -> Dict[int, ReferenceOutput]:
+        return provider.compute_reference(
+            ctx.graph_json,
+            ctx.input_data,
+            precision=ReferencePrecision.NATIVE,
+            device=device,
+            philox_dumps={ctx.philox.uid: dump},
+        )
+
+    if torch_support.gpu_available():
+        try:
+            return compute("cuda"), None
+        except Exception as e:
+            import torch
+
+            if not isinstance(e, torch.cuda.OutOfMemoryError):
+                return None, mismatch(config, str(e))
+        # Outside the except block: its traceback holds the failed attempt.
+        _release_torch_cache()
+    shortfall = _host_memory_shortfall(provider, ctx.graph_json)
+    if shortfall is not None:
+        reason = f"validation skipped: {shortfall}"
+        warn_once("validation", f"{ctx.graph_name}: {reason}")
+        return None, unchecked(config, reason)
+    try:
+        return compute(None), None
+    except Exception as e:
+        return None, mismatch(config, str(e))
 
 
 def _error_or_skip(fatal: bool) -> Callable[..., ProviderEngineResult]:
@@ -716,7 +868,10 @@ def _prepare_references(
     PyTorch SDPA selection never falls back to the CPU reference after the
     timed native path fails. The CPU reference is skipped when its estimated
     host memory does not fit (``ctx.validation_skip_reason``): the engine rows
-    are then unchecked, not failed.
+    are then unchecked, not failed. A graph with Philox dropout and no
+    ``rng_dump`` gets no reference: its engine rows fail. A graph with an
+    ``rng_dump`` gets no reference row either: each engine row builds its
+    own reference from its dump (:func:`_check_philox_outputs`).
 
     With ``--reference-precision float64`` (the default), a graph the provider
     can compute in float64 gets a float64 reference: on the GPU after the
@@ -727,6 +882,15 @@ def _prepare_references(
     provider, ctx.reference_error = _reference_provider(config, ctx.graph_json)
     if provider is None:
         warn_once("validation", f"{ctx.graph_name}: {ctx.reference_error}")
+        return None
+    # Decide before the host-memory check: a large graph must fail here too,
+    # not become unchecked.
+    philox_error = philox_without_dump(ctx.graph_json)
+    if philox_error is not None:
+        ctx.reference_error = philox_error
+        warn_once("validation", f"{ctx.graph_name}: {philox_error}")
+        return None
+    if ctx.philox is not None:
         return None
 
     outputs: Optional[Dict[int, ReferenceOutput]] = None
@@ -839,8 +1003,9 @@ def _note_native_reference(
     warn_once("validation", f"{ctx.graph_name}: {note}")
 
 
-#: Share of the available host memory the CPU reference may use; the rest is
-#: left for the engine rows of the same graph and for the estimate's error.
+#: Share of the available host memory the CPU reference (or the host copies
+#: of an rng_dump) may use; the rest is left for the engine rows of the same
+#: graph and for the estimate's error.
 _REFERENCE_HOST_FRACTION = 0.8
 
 
@@ -849,12 +1014,20 @@ def _host_memory_shortfall(
     graph_json: Dict[str, Any],
     precision: ReferencePrecision = ReferencePrecision.NATIVE,
 ) -> Optional[str]:
-    """Why the CPU reference would not fit in host memory, or None.
+    """Why the CPU reference would not fit in host memory, or None."""
+    kind = "float64 " if precision is ReferencePrecision.FLOAT64 else ""
+    return _host_bytes_shortfall(
+        provider.estimate_host_bytes(graph_json, precision),
+        f"the {kind}CPU reference",
+    )
 
-    Without an estimate or a reading of the available memory, the reference
+
+def _host_bytes_shortfall(needed: Optional[int], what: str) -> Optional[str]:
+    """Why ``what`` (``needed`` bytes) would not fit in host memory, or None.
+
+    Without an estimate or a reading of the available memory, the work
     runs as before.
     """
-    needed = provider.estimate_host_bytes(graph_json, precision)
     if needed is None:
         return None
     try:
@@ -867,9 +1040,8 @@ def _host_memory_shortfall(
     if needed <= available * _REFERENCE_HOST_FRACTION:
         return None
     gib = float(1 << 30)
-    kind = "float64 " if precision is ReferencePrecision.FLOAT64 else ""
     return (
-        f"the {kind}CPU reference needs about {needed / gib:.1f} GiB "
+        f"{what} needs about {needed / gib:.1f} GiB "
         f"of host memory and {available / gib:.1f} GiB is available"
     )
 
