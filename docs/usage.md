@@ -39,7 +39,7 @@ the same output format.
 | `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of `max(10000, --iters)` samples applies. |
 | `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each warmup and timed iteration. |
 | `--timing-block N` | 1 | Launches per timed sample. `1` times each launch on its own. `N > 1` uses rocKE block timing: before each sample, `--warmup` untimed launches and a drain; then `N` back-to-back launches in one event pair, recorded as `elapsed / N`. The first sample is discarded. Requires `--cache-mode warm`. |
-| `-s`, `--seed SEED` | 0 | Random seed for the input data. |
+| `-s`, `--seed SEED` | 0 | Random seed for the input data. The lengths (`seq_len`), the cumulative lengths (`cu_seq_len`) and the ragged offset tables of a graph are the same for the same seed. |
 
 [methodology.md](methodology.md) explains each value.
 
@@ -101,6 +101,36 @@ If the estimate is more than 80 % of the available host memory, the tool
 does not validate the graph. It prints a warning, and the engine rows of the
 graph get the verdict `unchecked` with the reason in `correctness.message`.
 These rows do not fail validation (no exit code 3).
+
+Variable-length and ragged SDPA graphs (graphs with `seq_len`, `cu_seq_len` or
+ragged tensors) follow these rules:
+
+- A ragged output compares valid positions only. A position at or past the
+  length of its batch is not compared, so engines can write any value there.
+- A padded (non-ragged) output, including a non-ragged paged output,
+  compares every element. hipDNN defines the padding: rows at or past
+  `seq_len_q` hold O = 0 and `stats = -inf`, and gradients past a length are
+  0. A ragged Q/O over a paged K/V cache (RFC 0014 limitation 9) is ragged,
+  not paged, for this rule: it compares valid positions only.
+- `correctness.n_total` counts the compared elements. For a ragged output
+  this is not the tensor size.
+- If the tool cannot serve the layout of a graph, it refuses the graph. The
+  graph reports the status `no_engines` and the message names the tensor.
+  The exit code stays 0. Examples:
+  - an offset table that does not have `B + 1` entries;
+  - a ragged tensor that is not an operand of any SDPA node;
+  - a ragged K or V operand of a paged node: the page pool itself must stay
+    non-ragged, even when Q, O or `stats` is ragged over it;
+  - an offset or length tensor that a node computes.
+- `cu_seq_len_q_tensor_uid` / `cu_seq_len_kv_tensor_uid` need
+  `padding_mask = true` (hipDNN rocm-libraries#14560 Rule 6c); without it the
+  graph is refused the same way. A paged graph does not take `cu_seq_len` at
+  all: it is refused in the same way, naming the tensor.
+
+In the `stats` output of every SDPA forward node, an infinity in both tensors
+with the same sign is equal. This holds for dense graphs too, for example a
+bottom-right mask with `Sq > Skv`. A row with no visible key has
+`stats = -inf`, or the sink logit when the graph has sink tokens.
 
 #### Reference precision
 
@@ -384,6 +414,11 @@ Requirements and limits:
   reports the time of the first load. For the auto row it also includes the
   compile and the first launch, because rocKE compiles the unified kernel
   inside its launch call.
+- Graphs with `seq_len`, `cu_seq_len` or ragged tensors do not apply. A
+  graph is a ragged graph when a tensor sets `ragged_offset_tensor_uid`.
+  `seq_len` means the `seq_len_q_tensor_uid` and `seq_len_kv_tensor_uid`
+  inputs; `cu_seq_len` means the `cu_seq_len_q_tensor_uid` and
+  `cu_seq_len_kv_tensor_uid` inputs.
 - `--plugin-path` selects the descriptor directory. With `--runtime rocke`
   alone, these options stop the run with exit code 2: `--engine`, `--oracle`,
   `--pmc`, `--trace`, `--perf`, `--roofline` and `--autotune`.

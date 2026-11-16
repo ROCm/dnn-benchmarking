@@ -100,7 +100,7 @@ def _sdpa_scratch_bytes(
     q_len, kv_len, head_dim = q[-2], k[-2], q[-1]
     page_table = _dims(_uid_tensor(inputs, "page_table_k_tensor_uid", tensors))
     if len(page_table) >= 2:
-        kv_len *= page_table[1]  # pages per sequence * page size
+        kv_len *= prod(page_table[1:])  # pages per sequence * page size
     backward = node.get("type") == "SdpaBackwardAttributes"
     has_sink = _uid_tensor(inputs, "sink_token_tensor_uid", tensors) is not None
     alibi = _sdpa_bool(node, "alibi_mask")

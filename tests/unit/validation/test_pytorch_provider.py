@@ -1027,8 +1027,8 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[6].data, expected_stats.numpy(), rtol=1e-6)
 
     def test_sdpa_sliding_window_masks_output_and_stats(self) -> None:
-        """A width-1 band (left/right bound 0) lets each query see only its own
-        key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
+        """A width-1 band (left bound 1, right bound 0) lets each query see only
+        its own key: O == V and stats == q_i . k_i. Unmasked stats would differ."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.array([[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]], dtype=np.float32)
         v = np.array([[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]], dtype=np.float32)
@@ -1048,7 +1048,7 @@ class TestPyTorchProviderNewOps:
                     "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 6},
                     "attributes": {
                         "dropout_probability": 0.0,
-                        "left_bound": 0,
+                        "left_bound": 1,
                         "right_bound": 0,
                     },
                 }
@@ -1470,17 +1470,9 @@ class TestPyTorchProviderNewOps:
                 {1: q, 2: q, 3: q, 5: np.array([1], dtype=np.int32)},
             )
 
-    @pytest.mark.parametrize(
-        "optional_input", ["seq_len_q_tensor_uid", "seq_len_kv_tensor_uid"]
-    )
-    def test_sdpa_forward_varlen_without_a_page_table_is_dense(
-        self, optional_input: str
-    ) -> None:
-        """Sequence lengths alone do not make a graph paged. Without a page table
-        there is nothing to gather, so the graph runs as the dense one it is."""
-        provider = ReferenceProviderRegistry.get_provider("pytorch")
-        q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
-        graph_json = {
+    @staticmethod
+    def _varlen_graph(attributes: dict, **length_inputs: int) -> dict:
+        return {
             "nodes": [
                 {
                     "type": "SdpaAttributes",
@@ -1488,19 +1480,110 @@ class TestPyTorchProviderNewOps:
                         "q_tensor_uid": 1,
                         "k_tensor_uid": 2,
                         "v_tensor_uid": 3,
-                        optional_input: 5,
+                        **length_inputs,
                     },
                     "outputs": {"o_tensor_uid": 4},
-                    "attributes": {"dropout_probability": 0.0},
+                    "attributes": {"dropout_probability": 0.0, **attributes},
                 }
             ],
         }
 
+    @pytest.mark.parametrize(
+        "attributes",
+        [{}, {"causal_mask": True}, {"causal_mask_bottom_right": True}],
+        ids=["full", "causal", "bottom-right"],
+    )
+    def test_sdpa_forward_varlen_matches_a_per_batch_dense_loop(
+        self, attributes: dict
+    ) -> None:
+        """Sequence lengths without a page table bound each batch: only its
+        valid rows and keys take part, and rows past a length come out zero."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        rng = np.random.default_rng(0)
+        q = rng.standard_normal((3, 2, 5, 4)).astype(np.float32)
+        k = rng.standard_normal((3, 2, 6, 4)).astype(np.float32)
+        v = rng.standard_normal((3, 2, 6, 4)).astype(np.float32)
+        q_lens, kv_lens = [5, 2, 3], [6, 4, 1]
+        graph_json = self._varlen_graph(
+            {"attn_scale_value": 0.5, **attributes},
+            seq_len_q_tensor_uid=5,
+            seq_len_kv_tensor_uid=6,
+        )
+
         result = provider.compute_reference(
             graph_json,
-            {1: q, 2: q, 3: q, 5: np.array([2], dtype=np.int32)},
+            {
+                1: q,
+                2: k,
+                3: v,
+                5: np.array(q_lens, dtype=np.int32),
+                6: np.array(kv_lens, dtype=np.int32),
+            },
         )
-        assert 4 in result
+
+        out = result[4].data
+        causal = bool(attributes.get("causal_mask"))
+        for b, (lq, lkv) in enumerate(zip(q_lens, kv_lens)):
+            scores = (q[b, :, :lq] @ k[b, :, :lkv].swapaxes(-1, -2)) * 0.5
+            if causal:
+                keep = np.tril(np.ones((lq, lkv), dtype=bool))
+            elif attributes:
+                keep = np.tril(np.ones((lq, lkv), dtype=bool), lkv - lq)
+            else:
+                keep = np.ones((lq, lkv), dtype=bool)
+            scores = np.where(keep, scores, -np.inf)
+            peak = np.max(scores, axis=-1, keepdims=True)
+            peak = np.where(np.isfinite(peak), peak, 0.0)
+            probs = np.exp(scores - peak)
+            total = probs.sum(axis=-1, keepdims=True)
+            probs = np.divide(probs, total, out=np.zeros_like(probs), where=total > 0)
+            np.testing.assert_allclose(
+                out[b, :, :lq], probs @ v[b, :, :lkv], rtol=1e-5, atol=1e-5
+            )
+            assert not out[b, :, lq:].any()
+
+    def test_sdpa_forward_paged_refuses_cu_seq_len(self) -> None:
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
+        graph_json = self._varlen_graph(
+            {},
+            page_table_k_tensor_uid=5,
+            page_table_v_tensor_uid=6,
+            seq_len_kv_tensor_uid=7,
+            cu_seq_len_q_tensor_uid=8,
+        )
+
+        with pytest.raises(UnsupportedGraphError, match="cu_seq_len_q"):
+            provider.compute_reference(
+                graph_json,
+                {
+                    1: q,
+                    2: q,
+                    3: q,
+                    5: np.zeros((1, 1), dtype=np.int32),
+                    6: np.zeros((1, 1), dtype=np.int32),
+                    7: np.array([2], dtype=np.int32),
+                    8: np.array([0, 2], dtype=np.int32),
+                },
+            )
+
+    @pytest.mark.parametrize(
+        "length_inputs",
+        [{"seq_len_q_tensor_uid": 5}, {"seq_len_kv_tensor_uid": 5}],
+        ids=["q-only", "kv-only"],
+    )
+    def test_sdpa_forward_one_sided_seq_len_is_refused(
+        self, length_inputs: dict
+    ) -> None:
+        """The non-paged seq_len pair is both-or-neither."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        q = np.array([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=np.float32)
+
+        with pytest.raises(UnsupportedGraphError, match="padding_mask"):
+            provider.compute_reference(
+                self._varlen_graph({}, **length_inputs),
+                {1: q, 2: q, 3: q, 5: np.array([2], dtype=np.int32)},
+            )
 
     @pytest.mark.parametrize(
         "attributes,match",
@@ -1510,9 +1593,9 @@ class TestPyTorchProviderNewOps:
                 {"alibi_mask": True, "causal_mask_bottom_right": True},
                 "bottom-right causal alignment",
             ),
-            ({"padding_mask": True}, "padding masks"),
+            ({"padding_mask": True}, "padding_mask"),
             ({"right_bound": 1}, "forward-looking band"),
-            ({"left_bound": -5}, "neither unbounded nor a width"),
+            ({"left_bound": -5}, "left_bound -5"),
             (
                 {"causal_mask": True, "causal_mask_bottom_right": True},
                 "mutually exclusive",
@@ -2211,17 +2294,25 @@ class TestHostMemoryEstimate:
         # 1024 * 1024 float32 mask; the sink tensor itself is negligible.
         assert with_sink - plain >= 3 * 2 * 1024 * 1024 * 4 + 1024 * 1024 * 4
 
-    def test_paged_counts_the_kv_length_the_page_table_addresses(self) -> None:
+    @pytest.mark.parametrize(
+        "table",
+        [lambda w: [4, 1, w, 1], lambda w: [4, w]],
+        ids=["hipdnn_rank4", "rank2"],
+    )
+    def test_paged_counts_the_kv_length_the_page_table_addresses(self, table) -> None:
         """K and V of a paged graph hold pages, not sequences: the gathered KV
-        length is pages per sequence times the page size."""
+        length is pages per sequence (every table dim after the first) times
+        the page size."""
         from dnn_benchmarking.validation.providers.pytorch_provider import (
             estimate_reference_host_bytes as estimate,
         )
 
         q, pages = [4, 2, 64, 16], [64, 2, 16, 16]  # 64 pages of 16 rows
-        one_page = estimate(self._sdpa(q, pages, {}, page_table_dims=[4, 1], sink=True))
+        one_page = estimate(
+            self._sdpa(q, pages, {}, page_table_dims=table(1), sink=True)
+        )
         all_pages = estimate(
-            self._sdpa(q, pages, {}, page_table_dims=[4, 16], sink=True)
+            self._sdpa(q, pages, {}, page_table_dims=table(16), sink=True)
         )
         # One block of scores for every (batch, head) row: 4 * 2 * 64 queries
         # against 16 pages * 16 rows instead of 1 page.

@@ -134,9 +134,12 @@ def _node_uid(
         section = _node_section(node, section_name)
         if key in section and section[key] is not None:
             return int(section[key])
-    attrs = _node_section(node, "attributes")
-    if key in attrs and attrs[key] is not None:
-        return int(attrs[key])
+    # Same sections as the variable-length operand reader (graph/varlen.py),
+    # so a key is found or missed the same way by every SDPA check.
+    for fallback in ("attributes", "parameters"):
+        section = _node_section(node, fallback)
+        if key in section and section[key] is not None:
+            return int(section[key])
     if key in node and node[key] is not None:
         return int(node[key])
     if required:
