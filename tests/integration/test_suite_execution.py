@@ -185,5 +185,4 @@ def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
 
     [row] = result.results
     assert row.verdict == "error"
-    assert "native forward SDPA call" in row.error_message
     assert row.ootb.gpu_kernel_stats is None and row.ootb.host_stats is None

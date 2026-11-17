@@ -62,17 +62,22 @@ def test_size_one_dimension_strides_do_not_matter() -> None:
             ),
             id="window",
         ),
-        # hipDNN composes the deprecated flag with the alignment and the bounds,
-        # so these masks are bottom right or windowed, not plain top-left.
-        pytest.param(
-            lambda g: g["nodes"][0]["attributes"].update(
-                diagonal_alignment="BOTTOM_RIGHT"
-            ),
-            id="flag-with-bottom-right-alignment",
-        ),
+        # hipDNN composes the deprecated flag with the bounds, so this mask is
+        # a sliding window, not plain top-left.
         pytest.param(
             lambda g: g["nodes"][0]["attributes"].update(left_bound=127),
             id="flag-with-left-bound",
+        ),
+        pytest.param(
+            lambda g: g["nodes"][0]["inputs"].update(cu_seq_len_q_tensor_uid=5),
+            id="cu_seq_len_q",
+        ),
+        pytest.param(
+            lambda g: g["nodes"][0]["inputs"].update(cu_seq_len_kv_tensor_uid=5),
+            id="cu_seq_len_kv",
+        ),
+        pytest.param(
+            lambda g: g["tensors"][0].update(ragged_offset_tensor_uid=5), id="ragged"
         ),
     ],
 )
@@ -121,6 +126,10 @@ _BOTTOM_RIGHT_BAND = dict(
             id="deprecated-flag",
         ),
         pytest.param(_BOTTOM_RIGHT_BAND, True, id="bounds"),
+        # hipDNN composes causal_mask with the alignment: a bottom-right mask.
+        pytest.param(
+            dict(diagonal_alignment="BOTTOM_RIGHT"), True, id="flag-with-alignment"
+        ),
         pytest.param(
             dict(causal_mask=False, diagonal_alignment="BOTTOM_RIGHT"),
             False,

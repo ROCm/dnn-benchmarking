@@ -15,10 +15,11 @@ because a benchmark graph that omits it is measuring 1.0 rather than the scale
 its source used. --strict-scale makes it a failure.
 
 They also check the causal diagonal of SDPA graphs with Sq != Skv, using the
-mask hipDNN actually runs: causal_mask overrides diagonal_alignment and the
-written bounds, and setting both causal_mask and causal_mask_bottom_right is
+mask hipDNN actually runs (dnn_benchmarking's sdpa_band): a deprecated causal
+flag acts as right_bound = 0 and keeps the stored diagonal_alignment, and
+setting both causal_mask and causal_mask_bottom_right is
 rejected. An effective top-left diagonal with Sq = 1 attends only to key 0,
-which no decode step means. 80 graphs in the shipped corpus are written that
+which no decode step means. 137 graphs in the shipped corpus are written that
 way, so it is reported as DECODE and does not fail the run;
 --strict-decode-mask makes it a failure once those graphs are regenerated.
 Any other effective top-left causal graph with Sq != Skv is printed as a
@@ -76,37 +77,30 @@ def sdpa_mask_flag_conflicts(graph):
     return conflicts
 
 
-# hipDNN resolves the mask before any plan sees it (PlanUtils.hpp
-# ::extractDiagonalBandParams): causal_mask forces left_bound=-1, right_bound=0
-# and top-left, overriding diagonal_alignment and any written bounds;
-# causal_mask_bottom_right forces the same band bottom-right. The band itself
-# masks the right side only when right_bound >= 0
-# (CpuFpReferenceSdpa.hpp::isMasked), so a left_bound on its own is a window
-# that stays open on the right and is not causal.
-def _sdpa_is_causal(attrs):
-    return bool(
-        attrs.get("causal_mask")
-        or attrs.get("causal_mask_bottom_right")
-        or attrs.get("right_bound") == 0
-    )
+def _sdpa_is_top_left_causal(node):
+    """True when hipDNN runs the node's band as top-left with right_bound 0.
 
+    The band comes from sdpa_band, hipDNN's resolveDiagonalBand: a deprecated
+    causal flag acts as right_bound = 0, and the stored left_bound and
+    diagonal_alignment still apply. The band masks the right side only when
+    right_bound >= 0 (CpuFpReferenceSdpa.hpp::isMasked), so a left_bound on its
+    own is a window that stays open on the right and is not causal.
+    """
+    from dnn_benchmarking.metrics.analytical.sdpa import sdpa_band
 
-def _sdpa_is_bottom_right(attrs):
-    if attrs.get("causal_mask_bottom_right"):
-        return True
-    # causal_mask wins over the alignment, so causal_mask + BOTTOM_RIGHT is
-    # still run top-left.
-    return not attrs.get("causal_mask") and (
-        attrs.get("diagonal_alignment") == "BOTTOM_RIGHT"
-    )
+    try:
+        _, right, bottom_right = sdpa_band(node)
+    except ValueError:
+        return False  # hipDNN rejects the mask; sdpa_mask_flag_conflicts reports it
+    return right == 0 and not bottom_right
 
 
 def sdpa_top_left_mismatches(graph):
     """(errors, warnings) for SDPA nodes whose effective causal diagonal is
     top-left while Sq != Skv.
 
-    "Effective" is what hipDNN runs, not what the JSON names: causal_mask
-    overrides diagonal_alignment. Sq and Skv come from the Q and K dims. A
+    "Effective" is what hipDNN runs, not what the JSON names (see
+    _sdpa_is_top_left_causal). Sq and Skv come from the Q and K dims. A
     paged K is a block container, so its Skv is unknown and only the Sq = 1
     rule applies.
     """
@@ -115,8 +109,7 @@ def sdpa_top_left_mismatches(graph):
     for node in graph.get("nodes") or []:
         if node.get("type") not in _SDPA_NODE_TYPES:
             continue
-        attrs = node.get("attributes") or node.get("parameters") or {}
-        if not _sdpa_is_causal(attrs) or _sdpa_is_bottom_right(attrs):
+        if not _sdpa_is_top_left_causal(node):
             continue
         inputs = node.get("inputs") or {}
         q_dims = dims.get(inputs.get("q_tensor_uid"))

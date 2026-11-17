@@ -25,6 +25,8 @@ _UNSUPPORTED_INPUTS = (
     "scale_tensor_uid",
     "seq_len_q_tensor_uid",
     "seq_len_kv_tensor_uid",
+    "cu_seq_len_q_tensor_uid",
+    "cu_seq_len_kv_tensor_uid",
     "seed_tensor_uid",
     "offset_tensor_uid",
     "dropout_mask_tensor_uid",
@@ -91,33 +93,6 @@ def is_packed_bshd(dims: Sequence[int], strides: Sequence[int]) -> bool:
     return all(n == 1 or s == p for n, s, p in zip(dims, strides, packed))
 
 
-def _deprecated_causal_conflict(node: Dict[str, Any]) -> str:
-    """Why a deprecated causal flag and the bounds give two masks, or ``""``.
-
-    hipDNN composes ``causal_mask`` and ``causal_mask_bottom_right`` with the
-    bounds and the alignment (``extractDiagonalBandParams``, SEM-002 "compose,
-    as cuDNN does"): the flag sets ``right_bound`` 0 when it is -1, the stored
-    ``left_bound`` and ``right_bound`` still apply, and ``causal_mask`` takes
-    ``diagonal_alignment``. The shared mask resolver lets the flag win
-    instead, so the graph forms where the two differ are refused here.
-    """
-    from .pytorch_ops._common import _node_param as node_param
-
-    causal = bool(node_param(node, "causal_mask", False))
-    if not (causal or node_param(node, "causal_mask_bottom_right", False)):
-        return ""
-    left = node_param(node, "left_bound", -1)
-    right = node_param(node, "right_bound", -1)
-    alignment = node_param(node, "diagonal_alignment", "TOP_LEFT")
-    if left is not None and int(left) != -1:
-        return f"a causal flag with left_bound {left} (a sliding window)"
-    if right is not None and int(right) > 0:
-        return f"a causal flag with right_bound {right}"
-    if causal and alignment in ("BOTTOM_RIGHT", 1):
-        return "causal_mask with diagonal_alignment BOTTOM_RIGHT"
-    return ""
-
-
 def dense_sdpa(
     graph_json: Dict[str, Any], tensor_infos: List[TensorInfo], runtime: str
 ) -> DenseSdpa:
@@ -152,15 +127,17 @@ def dense_sdpa(
             present.append(flag)
     if _node_param(node, "generate_stats", False):
         present.append("generate_stats")
+    # The planner sees unresolved TensorInfo; ``is_ragged`` needs no layout.
+    if any(info.is_ragged for info in tensor_infos):
+        present.append("ragged_offset_tensor_uid")
     if float(_node_param(node, "dropout_probability", 0.0) or 0.0) != 0.0:
         present.append("dropout_probability")
     if present:
         raise UnsupportedGraphError(
             f"{runtime} runtime does not support SDPA features: {', '.join(present)}"
         )
-    conflict = _deprecated_causal_conflict(node)
-    if conflict:
-        raise UnsupportedGraphError(f"{runtime} runtime does not support {conflict}")
+    # The mask resolves as hipDNN resolves it: a deprecated causal boolean
+    # acts as right_bound 0, and the bounds and the alignment still apply.
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError as e:

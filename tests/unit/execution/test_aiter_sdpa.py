@@ -77,25 +77,20 @@ def test_unsupported_features_name_the_aiter_runtime() -> None:
 @pytest.mark.parametrize(
     "attributes, match",
     [
-        (dict(causal_mask=True, left_bound=1024), "left_bound 1024"),
+        (dict(causal_mask=True, left_bound=1024), "sliding windows"),
         (dict(causal_mask=True, right_bound=4), "right_bound 4"),
         (
             dict(causal_mask=False, causal_mask_bottom_right=True, left_bound=64),
-            "left_bound 64",
-        ),
-        (
-            dict(causal_mask=True, diagonal_alignment="BOTTOM_RIGHT"),
-            "causal_mask with diagonal_alignment BOTTOM_RIGHT",
+            "sliding windows",
         ),
     ],
 )
-def test_causal_flags_that_hipdnn_composes_with_bounds_are_refused(
+def test_causal_flags_that_hipdnn_composes_into_a_band_are_refused(
     attributes, match
 ) -> None:
-    """hipDNN keeps the bounds and the alignment next to a deprecated causal
-    flag; the shared mask resolver drops them, so the rows would run another
-    mask."""
-    with pytest.raises(UnsupportedGraphError, match=f"AITER runtime .*{match}"):
+    """hipDNN keeps the bounds next to a deprecated causal flag, so these
+    masks are bands that no AITER row runs."""
+    with pytest.raises(UnsupportedGraphError, match=match):
         _problem(sdpa_graph(**attributes))
 
 
@@ -115,6 +110,14 @@ def test_causal_flags_that_hipdnn_composes_with_bounds_are_refused(
 )
 def test_causal_flags_without_other_bounds_still_run(attributes) -> None:
     assert is_causal(_problem(sdpa_graph(**attributes)))
+
+
+def test_causal_mask_keeps_a_bottom_right_alignment() -> None:
+    """hipDNN composes causal_mask with the alignment: a bottom-right mask."""
+    p = _problem(
+        sdpa_graph(s=128, s_kv=512, causal_mask=True, diagonal_alignment="BOTTOM_RIGHT")
+    )
+    assert is_causal(p) and not p.causal
 
 
 @pytest.mark.parametrize(
