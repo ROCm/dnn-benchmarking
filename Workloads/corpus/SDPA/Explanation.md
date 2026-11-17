@@ -24,8 +24,9 @@ identity hashes of these graphs.
 
 ## Metadata contract
 
-All metadata values are non-empty lists of strings. Every graph has these
-seven keys:
+All metadata values are non-empty lists of strings. The tags follow the
+convention in [the corpus README](../README.md#metadata-tags). Every graph has
+these eleven keys:
 
 - `operation`: `sdpa`;
 - `direction`: `fwd`;
@@ -33,11 +34,23 @@ seven keys:
 - `layout`: `bshd`;
 - `model_family`: `llm`;
 - `model`: normalized lowercase model identifiers;
-- `mode`: `inference`.
+- `mode`: `inference`;
+- `attention_type`: `gqa` or `mha`;
+- `mask`: `causal`, `none`, or `sliding_window`;
+- `phase`: `prefill`, `chunked_prefill`, or `decode`;
+- `sink`: `true` or `false`.
 
-Model identifiers use lowercase letters, digits, and underscores. For example,
-`Llama-3-8B` becomes `llama3_8b`, and `gpt-oss-120b/20b` becomes
-`gpt_oss_120b_20b`.
+Model identifiers use lowercase letters, digits, and underscores. A family
+name joins its version number. For example, `Llama-3-8B` becomes `llama3_8b`,
+and `GPT-3-13B-class` becomes `gpt3_13b_class`. A graph that two models share
+lists both models: the `gpt-oss-120b/20b` source label becomes `gpt_oss_120b`
+and `gpt_oss_20b`. The `Qwen3-Next` label becomes `qwen3_next_80b_a3b`, the
+identifier of the only Qwen3-Next model.
+
+The graph tensors and the SDPA node give `attention_type`, `mask`, `phase`,
+and `sink`. The source labels `gfx950_dense_test` and `d64_serving_gqa8` are
+test-case names, not model names. The collection keeps them as `model`
+values.
 
 ## Identity rule
 

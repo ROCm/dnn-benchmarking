@@ -38,6 +38,62 @@ Use `headline/` for a small and stable regression set. Use `models/` to study
 one model. Use `microbench/` for broad shape sweeps. Use `corpus/` to measure a
 workload class across many representative models.
 
+## Metadata tags
+
+Graphs in `headline/`, `models/`, `corpus/`, and the
+`microbench/cudnn_attention_inference`, `microbench/cudnn_attention_training`,
+and `microbench/cudnn_bench_moe` sets use one tag convention. The tags are in
+the top-level `metadata` object of each graph. hipDNN does not read this
+object, and `dnn-benchmark` does not read it.
+
+Rules:
+
+1. Each value is a sorted array of unique lowercase strings.
+2. A value is a short label. Do not write sentences or notes in a tag.
+3. Do not copy a value that the graph already contains, such as a dimension,
+   a scale, or an epsilon.
+4. Omit a key when the source does not give its value. Do not write a guess.
+5. Write the keys in the order of the table below.
+
+| Key | Values | Applies to |
+|---|---|---|
+| `operation` | `convolution`, `sdpa`, `matmul`, `moe_grouped_matmul`, `pointwise`, `batchnorm`, `rmsnorm`, `layernorm` (one for each node type in the graph) | All graphs |
+| `direction` | `fwd`; `dgrad` or `wgrad` for convolution and MoE gradients; `bwd` for other gradients | All graphs |
+| `dtype` | `float32`, `float16`, `bfloat16`, `float8_e4m3` (the graph I/O data type) | All graphs |
+| `layout` | `nchw` or `nhwc` (convolution, batch normalization); `bshd` or `bhsd` (SDPA) | Graphs with a layout |
+| `model_family` | `llm`, `cls`, `detection`, `diffusion`, `segmentation`, `superres`, `video3d`, `med3d`, `audio1d`, `multimodal`, `ssm`, `synthetic` | Graphs with a known model |
+| `model` | Model identifiers, such as `llama3_8b` or `resnet50` | Graphs with a known model |
+| `mode` | `inference`, `training` | Graphs with a known capture mode |
+| `size` | Source workload size label | `corpus/Convolution` |
+| `from_transpose` | `true`, `false` | `corpus/Convolution` |
+| `convolution_type` | `pointwise`, `standard`, `strided`, `depthwise`, `grouped`, `dilated`, `transposed` | Convolution graphs |
+| `attention_type` | `mha`, `gqa`, `mqa`, `mla` | SDPA graphs |
+| `mask` | `none`, `causal`, `sliding_window` | SDPA graphs |
+| `phase` | `prefill`, `chunked_prefill`, `decode` | SDPA graphs, MoE graphs with a known phase |
+| `sink` | `true`, `false` | SDPA graphs |
+| `activation` | `swiglu`, `swiglu_clamped`, `swiglu_oai`, `situglu` | MoE graphs with a fused gated activation |
+| `tensor_parallel` | `1`, `2`, `4`, `8` | `microbench/cudnn_attention_inference` |
+| `suite` | `regular`, `extended` | `headline/attn`, `headline/moe` |
+| `priority` | `p0`, `p1`, `p2` | `headline/attn`, `headline/moe` |
+| `purpose` | `acceptance`, `perf_diagnostic`, `frontier`, `coverage_gap`, `ep_scaling` | `headline/attn`, `headline/moe` |
+
+A model identifier uses lowercase letters, digits, and underscores. A family
+name joins its version number: `Llama-3.1-405B` becomes `llama3_1_405b`, and
+`GPT-3` becomes `gpt3`. When two or more models use the same graph, `model`
+contains all of them.
+
+Tag meanings:
+
+- `mode` is `training` for every gradient graph. A forward normalization
+  graph that saves its statistics is also a `training` graph.
+- `attention_type` is `mla` when the source names multi-head latent attention
+  or when the query-key and value head dimensions differ. Otherwise the head
+  counts set it: equal counts give `mha`, one key-value head gives `mqa`, and
+  other counts give `gqa`.
+- `phase` comes from the source when the source gives it. Otherwise one query
+  token gives `decode`, a query shorter than the key-value sequence gives
+  `chunked_prefill`, and equal lengths give `prefill`.
+- `mask` is `sliding_window` when the SDPA node has a left or right bound.
 ## Current collections
 
 | Collection | Scope | Documentation |
