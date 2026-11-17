@@ -40,9 +40,7 @@ workload class across many representative models.
 
 ## Metadata tags
 
-Graphs in `headline/`, `models/`, `corpus/`, and the
-`microbench/cudnn_attention_inference`, `microbench/cudnn_attention_training`,
-and `microbench/cudnn_bench_moe` sets use one tag convention. The tags are in
+All graphs in the `Workloads/` sets use one tag convention. The tags are in
 the top-level `metadata` object of each graph. hipDNN does not read this
 object, and `dnn-benchmark` does not read it.
 
@@ -60,11 +58,11 @@ Rules:
 
 | Key | Values | Applies to |
 |---|---|---|
-| `operation` | `convolution`, `sdpa`, `matmul`, `moe_grouped_matmul`, `pointwise`, `batchnorm`, `rmsnorm`, `layernorm` (one for each node type in the graph) | All graphs |
+| `operation` | `convolution`, `sdpa`, `matmul`, `moe_grouped_matmul`, `pointwise`, `batchnorm`, `rmsnorm`, `layernorm`, `block_scale_quantize`, `block_scale_dequantize`, `resample`, `reduction` (one for each node type in the graph) | All graphs |
 | `direction` | `fwd`; `dgrad` or `wgrad` for convolution and MoE gradients; `bwd` for other gradients | All graphs |
 | `dtype` | `float32`, `float16`, `bfloat16`, `float8_e4m3` (the graph I/O data type) | All graphs |
-| `source_dtype` | `float16`, `fp8_block`, `mxfp4`, `nvfp4` (the source precision, when the graph uses a different data type) | Graphs whose source precision is not `dtype` |
-| `layout` | `nchw` or `nhwc` (convolution, batch normalization); `bshd` or `bhsd` (SDPA) | Graphs with a layout |
+| `source_dtype` | `float16`, `fp8`, `fp8_block`, `fp6`, `mxfp8`, `mxfp4`, `nvfp4` (the source precision, when the graph uses a different data type) | Graphs whose source precision is not `dtype` |
+| `layout` | `nchw` or `nhwc` (convolution, batch normalization, resample); `bshd` or `bhsd` (SDPA) | Graphs with a layout |
 | `model_family` | `llm`, `cls`, `detection`, `diffusion`, `segmentation`, `superres`, `video3d`, `med3d`, `audio1d`, `multimodal`, `ssm`, `synthetic` | Graphs with a known model |
 | `model` | Model identifiers, such as `llama3_8b` or `resnet50` | Graphs with a known model |
 | `mode` | `inference`, `training` | Graphs with a known capture mode |
@@ -75,11 +73,12 @@ Rules:
 | `mask` | `none`, `causal`, `sliding_window` | SDPA graphs |
 | `phase` | `prefill`, `chunked_prefill`, `decode` | SDPA graphs, MoE graphs with a known phase |
 | `sink` | `true`, `false` | SDPA graphs |
+| `source_feature` | `doc_mask`, `varlen` (an SDPA feature of the source that the graph does not express) | SDPA graphs whose source uses such a feature |
 | `activation` | `swiglu`, `swiglu_clamped`, `swiglu_oai`, `situglu` | MoE graphs with a fused gated activation |
 | `tensor_parallel` | `1`, `2`, `4`, `8` | `microbench/cudnn_attention_inference` |
-| `suite` | `regular`, `extended` | `headline/attn`, `headline/moe` |
-| `priority` | `p0`, `p1`, `p2` | `headline/attn`, `headline/moe` |
-| `purpose` | `acceptance`, `perf_diagnostic`, `frontier`, `coverage_gap`, `ep_scaling` | `headline/attn`, `headline/moe` |
+| `suite` | `regular`, `extended` | `headline/attn`, `headline/moe`, `microbench/rocke` |
+| `priority` | `p0`, `p1`, `p2` | `headline/attn`, `headline/moe`, `microbench/rocke` |
+| `purpose` | `acceptance`, `perf_diagnostic`, `frontier`, `coverage_gap`, `ep_scaling` | `headline/attn`, `headline/moe`, `microbench/rocke` |
 
 A model identifier uses lowercase letters, digits, and underscores. A family
 name joins its version number: `Llama-3.1-405B` becomes `llama3_1_405b`, and
