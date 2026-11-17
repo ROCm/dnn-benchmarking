@@ -48,6 +48,8 @@ _UNSUPPORTED_INPUTS = (
     "scale_tensor_uid",
     "seq_len_q_tensor_uid",
     "seq_len_kv_tensor_uid",
+    "cu_seq_len_q_tensor_uid",
+    "cu_seq_len_kv_tensor_uid",
     "seed_tensor_uid",
     "offset_tensor_uid",
     "dropout_mask_tensor_uid",
@@ -174,14 +176,17 @@ def sdpa_problem(
             present.append(flag)
     if _node_param(node, "generate_stats", False):
         present.append("generate_stats")
+    # The planner sees unresolved TensorInfo; ``is_ragged`` needs no layout.
+    if any(info.is_ragged for info in tensor_infos):
+        present.append("ragged_offset_tensor_uid")
     if float(_node_param(node, "dropout_probability", 0.0) or 0.0) != 0.0:
         present.append("dropout_probability")
     if present:
         raise UnsupportedGraphError(
             f"rocKE runtime does not support SDPA features: {', '.join(present)}"
         )
-    # The mask resolves as hipDNN resolves it: the deprecated causal booleans
-    # win over the bounds and the alignment.
+    # The mask resolves as hipDNN resolves it: a deprecated causal boolean
+    # acts as right_bound 0, and the bounds and the alignment still apply.
     try:
         causal, window, bottom_right = _sdpa_derive_mask(node)
     except ValueError as e:

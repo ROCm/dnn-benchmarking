@@ -29,6 +29,7 @@ from ..execution.executor import Executor
 from ..execution.suite_runner import set_plugin_path
 from ..execution.timing import device_sync
 from ..graph.loader import GraphLoader
+from ..graph.varlen import resolve_varlen_layouts
 
 
 def _fail(msg: str) -> int:
@@ -72,11 +73,13 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
 
         executor = Executor(json.dumps(graph_json), policy)
         executor.prepare(handle, engine_id=engine_id)
+        # graph_json matters for paged and varlen SDPA: page tables and
+        # sequence lengths need valid integers, not uniform noise.
+        input_data = generate_input_data(tensor_infos, args.seed, graph_json)
+        tensor_infos = resolve_varlen_layouts(tensor_infos, graph_json, input_data)
         with BufferManager(tensor_infos) as bm:
             bm.allocate_all()
-            # graph_json matters for paged SDPA: page tables and sequence
-            # lengths need valid integers, not uniform noise.
-            bm.load_input_data(generate_input_data(tensor_infos, args.seed, graph_json))
+            bm.load_input_data(input_data)
             vp = bm.create_variant_pack()
             # No Executor.benchmark(): rocprofv3 --pmc serializes dispatches
             # and deadlocks on the staged timer's stall gate. No execute_once()

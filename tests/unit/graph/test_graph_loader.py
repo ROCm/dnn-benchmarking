@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from dnn_benchmarking.common.exceptions import GraphLoadError, UnsupportedGraphError
-from dnn_benchmarking.graph import GraphLoader, output_uids
+from dnn_benchmarking.graph import GraphLoader, TensorInfo, output_uids
 
 
 def _tensor(uid, data_type="float", **extra):
@@ -104,3 +104,34 @@ def test_extract_marks_list_outputs_and_drops_virtual(tmp_path: Path) -> None:
     assert not infos[1].is_output
     assert infos[2].is_output
     assert infos[2].element_size == 2
+
+
+def test_from_json_parses_ragged_offset_keys() -> None:
+    info = TensorInfo.from_json(
+        _tensor(1, ragged_offset_tensor_uid=7, ragged_offset_multiplier=96)
+    )
+
+    assert info.is_ragged
+    assert (info.ragged_offset_tensor_uid, info.ragged_offset_multiplier) == (7, 96)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"ragged_offset_tensor_uid": None, "ragged_offset_multiplier": None},
+    ],
+)
+def test_from_json_without_ragged_keys_is_not_ragged(extra) -> None:
+    info = TensorInfo.from_json(_tensor(1, **extra))
+
+    assert not info.is_ragged
+    assert info.ragged_offset_multiplier == 1
+
+
+@pytest.mark.parametrize("multiplier", [0, -3])
+def test_from_json_rejects_a_ragged_multiplier_below_one(multiplier) -> None:
+    with pytest.raises(GraphLoadError, match="ragged_offset_multiplier"):
+        TensorInfo.from_json(
+            _tensor(1, ragged_offset_tensor_uid=7, ragged_offset_multiplier=multiplier)
+        )
