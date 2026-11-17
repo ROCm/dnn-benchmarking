@@ -100,6 +100,7 @@ src/dnn_benchmarking/
 │   ├── rocke_executor.py     # rocKE runtime: load and launch one rocKE kernel
 │   ├── kpack.py              # rocKE runtime: read hipDNN's code objects (librocm_kpack)
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
+│   ├── sdpa_backward_inputs.py # forward-consistent O and stats for SDPA backward inputs
 │   ├── varlen_inputs.py      # seq_len, cu_seq_len and ragged offset-table inputs
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers

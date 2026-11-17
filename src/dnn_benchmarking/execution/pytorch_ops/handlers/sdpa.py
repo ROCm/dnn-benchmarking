@@ -18,12 +18,15 @@ from ....graph.varlen import (
     sdpa_lengths,
     sdpa_operands,
 )
+from ....metrics.analytical.sdpa import alibi_slopes, sdpa_band
 from .._common import *  # noqa: F401,F403
 from .._registry import CompiledOp, register_handler
 from .._sdpa_backend import (
     default_sdpa_avoids_math,
     execute_selected_sdpa,
     fused_logsumexp,
+    native_sdpa_call,
+    reference_sdpa_call,
     strict_sdpa_selection,
 )
 
@@ -261,47 +264,23 @@ def _sdpa_derive_mask(
 ) -> Tuple[bool, Optional[int], bool]:
     """Resolve ``(is_causal, window_width, bottom_right)`` as hipDNN does.
 
-    The deprecated causal booleans take precedence over the modern bounds and
-    alignment. Otherwise, bounds describe a diagonal band, with ``-1`` meaning
-    unbounded. ``left_bound = L`` keeps ``L`` keys up to and including the
-    diagonal, as in hipDNN and cuDNN, so the window width is ``L``; hipDNN
-    rejects ``left_bound = 0``. ``is_causal`` is reserved for PyTorch's native
-    top-left mask; bottom-right masks are materialized as additive masks.
+    The band comes from :func:`sdpa_band`, hipDNN's composition of the
+    deprecated causal flags with the bounds and alignment. ``left_bound = L``
+    keeps ``L`` keys up to and including the diagonal, so the window width is
+    ``L``; ``left_bound = 0`` raises ValueError. ``is_causal`` is reserved for
+    PyTorch's native top-left mask; bottom-right masks are materialized as
+    additive masks. A band with a forward-looking right edge raises
+    ValueError: the reference cannot express it.
     """
-    causal = _sdpa_bool(node, "causal_mask")
-    bottom_right_causal = _sdpa_bool(node, "causal_mask_bottom_right")
-    if causal and bottom_right_causal:
-        raise ValueError(
-            "SDPA causal_mask and causal_mask_bottom_right are mutually exclusive"
-        )
-    if causal:
-        return True, None, False
-    if bottom_right_causal:
-        return False, None, True
-
-    alignment = _node_param(node, "diagonal_alignment", "TOP_LEFT")
-    if alignment not in ("TOP_LEFT", "BOTTOM_RIGHT", 0, 1, None):
-        raise ValueError(f"Unsupported SDPA diagonal_alignment {alignment!r}")
-    bottom_right = alignment in ("BOTTOM_RIGHT", 1)
-
-    unbounded = -1
-    left = _node_param(node, "left_bound", unbounded)
-    right = _node_param(node, "right_bound", unbounded)
-    left = unbounded if left is None else int(left)
-    right = unbounded if right is None else int(right)
-
-    if left < unbounded or left == 0:
-        raise ValueError(
-            f"SDPA left_bound {left} is neither unbounded (-1) nor a positive width"
-        )
+    left, right, bottom_right = sdpa_band(node)
+    if right is None and left is None:
+        return False, None, False
     if right != 0:
-        if right == unbounded and left == unbounded:
-            return False, None, False
         raise ValueError(
-            f"SDPA right_bound {right} is a forward-looking band the reference "
-            "cannot express"
+            f"SDPA right_bound {-1 if right is None else right} is a forward-looking "
+            "band the reference cannot express"
         )
-    if left == unbounded:
+    if left is None:
         return (False, None, True) if bottom_right else (True, None, False)
     return False, left, bottom_right
 
@@ -356,20 +335,8 @@ def _diagonal_band_mask(
 def _alibi_slopes(
     num_heads: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """cuDNN's per-query-head ALiBi slopes (``get_alibi_slope``).
-
-    The geometric schedule covers the closest power of two below or at
-    ``num_heads``. Extra heads use the next power of two's odd-indexed
-    slopes, as cuDNN and common open-source ALiBi implementations do.
-    """
-    base = 1 << (num_heads.bit_length() - 1)
-    head = torch.arange(base, device=device, dtype=torch.float64)
-    exponents = -8.0 * (head + 1.0) / base
-    extra = num_heads - base
-    if extra > 0:
-        odd = torch.arange(extra, device=device, dtype=torch.float64)
-        exponents = torch.cat([exponents, -4.0 * (2.0 * odd + 1.0) / base])
-    return torch.pow(2.0, exponents).to(dtype=dtype)
+    """cuDNN's per-query-head ALiBi slopes (:func:`alibi_slopes`)."""
+    return torch.from_numpy(alibi_slopes(num_heads)).to(device=device, dtype=dtype)
 
 
 def _alibi_bias_block(
@@ -804,6 +771,7 @@ def _plan_paged_sdpa(
         raise ValueError(
             f"Paged SDPA Q has {int(q.shape[0])} batches for {num_seqs} sequences"
         )
+
     segments: List[_PagedSegment] = []
     decided: Dict[_CallForm, bool] = {}
     q_start = 0
@@ -1737,38 +1705,229 @@ def compile_sdpa(
     return run
 
 
+_MATH_BACKWARD_NOTE = (
+    "PyTorch SDPA: no fused backward kernel applies (default dispatch chose "
+    "neither the Flash nor the memory-efficient kernel, or the graph uses "
+    "ALiBi or variable lengths), so the backward runs as a manual fp32 "
+    "flash-attention formula"
+)
+
+
+class _FusedBackward(NamedTuple):
+    """A fused SDPA backward kernel call, built once from a forward probe.
+
+    ``call(do)`` returns ``(dq, dk, dv)``, and the score-shaped bias gradient
+    after them when it was bound with ``dbias``; dK and dV have ``rep_k`` and
+    ``rep_v`` times the graph's K/V head count. The other arguments (Q, K/V
+    as the kernel takes them, the graph's O and stats in the layouts of the
+    forward's saved output and log-sum-exp, and the forward's saved scalars)
+    are bound in ``call``.
+    """
+
+    call: Callable[[torch.Tensor], Tuple[torch.Tensor, ...]]
+    rep_k: int
+    rep_v: int
+
+
+def _saved(grad_fn: Any, *names: str) -> Any:
+    """The first saved forward value of ``grad_fn`` among ``names``."""
+    for name in names:
+        if hasattr(grad_fn, name):
+            return getattr(grad_fn, name)
+    raise AttributeError(f"{grad_fn.name()} saved none of {names}")
+
+
+def _prepare_fused_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    stats: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+    rep_k: int,
+    rep_v: int,
+    dbias: bool,
+) -> Optional[_FusedBackward]:
+    """Bind the fused backward kernel the selected forward dispatches to.
+
+    A training step's forward chooses the kernel, and its backward replays the
+    same kernel with the saved output and log-sum-exp. This runs that forward
+    once (untimed) with the graph's Q, K and V, reads which fused kernel ran
+    and its saved scalars from the autograd node, and binds the matching ATen
+    backward. The timed call then passes the graph's own O and stats, as the
+    hipDNN kernel reads them.
+
+    GQA/MQA first probes PyTorch's ``enable_gqa`` path on the real-size K/V
+    (``_sdpa_kv_operands``), as a training step does. On ROCm its Flash
+    backward writes dK and dV at the K/V head count, so the timed call has no
+    head-group sum. When that probe does not land on Flash (for example, a
+    mask under default dispatch sends ``enable_gqa`` to math), K and V are
+    expanded to the query head count here, untimed, and the timed call sums
+    dK and dV back over each head group.
+
+    The graph's O is copied once into the memory layout of the forward's
+    output. The memory-efficient backward needs that layout ([B, S, H, D] in
+    memory): with a [B, H, S, D] O, AOTriton on gfx90a returns wrong dK and dV
+    (ALMIOPEN-3256), and CUDA can read out of bounds (pytorch/pytorch#138772).
+
+    With ``dbias``, the call also returns the bias gradient, shaped like the
+    scores ``[B, Hq, Sq, Skv]``. Only memory-efficient attention computes
+    it; Flash takes no bias, so a graph with a bias never dispatches to it.
+
+    Returns ``None`` when default dispatch chose neither Flash nor
+    memory-efficient attention.
+    """
+    k_op, v_op, enable_gqa = _sdpa_kv_operands(k, v, rep_k, rep_v)
+    out = _backward_probe(q, k_op, v_op, attn_mask, is_causal, scale, enable_gqa)
+    if enable_gqa and "FlashAttentionBackward" not in _grad_fn_name(out):
+        k_op = k.repeat_interleave(rep_k, dim=-3)
+        v_op = v.repeat_interleave(rep_v, dim=-3)
+        enable_gqa = False
+        out = _backward_probe(q, k_op, v_op, attn_mask, is_causal, scale, False)
+    if enable_gqa:
+        rep_k = rep_v = 1
+    grad_fn = out.grad_fn
+    name = _grad_fn_name(out)
+    if "FlashAttentionBackward" in name:
+        aten = torch.ops.aten._scaled_dot_product_flash_attention_backward
+        lse_saved = _saved(grad_fn, "_saved_logsumexp")
+        args = (
+            _saved(grad_fn, "_saved_cum_seq_q"),
+            _saved(grad_fn, "_saved_cum_seq_k"),
+            _saved(grad_fn, "_saved_max_q"),
+            _saved(grad_fn, "_saved_max_k"),
+            0.0,
+            _saved(grad_fn, "_saved_is_causal"),
+            _saved(grad_fn, "_saved_rng_state", "_saved_philox_seed"),
+            _saved(grad_fn, "_saved_unused", "_saved_philox_offset"),
+        )
+
+        def kernel(do, o, lse):
+            return aten(do, q, k_op, v_op, o, lse, *args, scale=scale)
+
+    elif "EfficientAttentionBackward" in name:
+        aten = torch.ops.aten._scaled_dot_product_efficient_attention_backward
+        lse_saved = _saved(grad_fn, "_saved_log_sumexp", "_saved_logsumexp")
+        bias = _saved(grad_fn, "_saved_attn_bias")
+        seed = _saved(grad_fn, "_saved_philox_seed")
+        offset = _saved(grad_fn, "_saved_philox_offset")
+        causal = _saved(grad_fn, "_saved_is_causal")
+
+        def kernel(do, o, lse):
+            return aten(
+                do,
+                q,
+                k_op,
+                v_op,
+                bias,
+                o,
+                lse,
+                seed,
+                offset,
+                0.0,
+                [True, True, True, dbias],
+                causal,
+                scale=scale,
+            )[: 4 if dbias else 3]
+
+    elif strict_sdpa_selection() is None:
+        return None
+    else:
+        raise UnsupportedGraphError(
+            f"PyTorch SDPA backward: the selected forward ran {name or 'no fused kernel'}, "
+            "whose backward this tool does not bind"
+        )
+
+    # The kernel's log-sum-exp layout ([B, H, Sq], padded on some backends),
+    # filled once with the graph's stats, and the forward's output layout,
+    # filled once with the graph's O: both are constant inputs.
+    lse = torch.zeros_like(lse_saved)
+    lse[..., : int(stats.shape[-2])] = stats[..., 0]
+    o_kernel = torch.empty_like(out).copy_(o)
+    del out, grad_fn
+
+    def call(do: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        with native_sdpa_call():
+            return kernel(do, o_kernel, lse)
+
+    return _FusedBackward(call, rep_k, rep_v)
+
+
+def _grad_fn_name(out: torch.Tensor) -> str:
+    return out.grad_fn.name() if out.grad_fn is not None else ""
+
+
+def _backward_probe(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    """One untimed training forward; its ``grad_fn`` names the fused kernel."""
+    probe = [t.detach().requires_grad_() for t in (q, k, v)]
+    with torch.enable_grad():
+        return execute_selected_sdpa(
+            *probe,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+
+def _sum_head_groups(grad: torch.Tensor, rep: int) -> torch.Tensor:
+    """Sum a gradient at the query head count over each group of ``rep`` heads."""
+    if rep == 1:
+        return grad
+    batch, heads, length, dim = grad.shape
+    return grad.reshape(batch, heads // rep, rep, length, dim).sum(dim=2)
+
+
+def _add_dbias_rows(
+    dbias: torch.Tensor, d_scores: torch.Tensor, start: int, end: int
+) -> None:
+    """Add the bias gradient of query rows ``start:end`` to ``dbias``.
+
+    ``d_scores`` is the unscaled dS of those rows, ``[B, Hq, rows, Skv]``. dS
+    sums over each bias dim of 1 and each missing leading dim, as hipDNN's
+    ``computeMaskIndex`` maps every broadcast index to 0.
+    """
+    rows = _rows(dbias, start, end)
+    rows += _sum_to_shape(d_scores, rows.shape)
+
+
 def _sdpa_gradients(
     q_f: torch.Tensor,
     k_f: torch.Tensor,
     v_f: torch.Tensor,
     o_f: torch.Tensor,
     do_f: torch.Tensor,
-    stats_f: torch.Tensor,
+    stats: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
     is_causal: bool,
     scale: float,
-    rep_k: int,
-    rep_v: int,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp32 ``(dQ, dK, dV)`` of one dense backward, dK and dV at the K and V heads.
+    """fp32 ``(dQ, dK, dV)`` of one backward, dK and dV at the query head count.
 
-    Consumes the saved ``stats`` directly (see ``compile_sdpa_backward``).
+    ``k_f`` and ``v_f`` are float32 at the query head count. The saved
+    ``stats`` are consumed directly (see ``compile_sdpa_backward``). The bias
+    gradient is added to ``dbias`` when it is given.
     """
-    head_dim = int(q_f.shape[-1])
-    k_heads = int(k_f.shape[1])
-    v_heads = int(v_f.shape[1])
-    if rep_k > 1:
-        k_f = k_f.repeat_interleave(rep_k, dim=1)
-    if rep_v > 1:
-        v_f = v_f.repeat_interleave(rep_v, dim=1)
-
-    # One query block at a time: a block's probs and d_scores are at most
-    # _SCORE_BLOCK_BYTES each, so memory does not grow with q_len * kv_len.
-    # dQ rows are independent; dK and dV sum over every query row.
+    # One query block at a time: a block's probs, d_scores and ALiBi bias
+    # are at most _SCORE_BLOCK_BYTES each, so memory does not grow with
+    # q_len * kv_len. dQ rows are independent; dK and dV sum over every
+    # query row.
     dq = torch.empty_like(q_f)
-    dk_full = torch.zeros_like(k_f)
-    dv_full = torch.zeros_like(v_f)
+    dk = torch.zeros_like(k_f)
+    dv = torch.zeros_like(v_f)
     for start, end in _query_blocks(q_f, int(k_f.shape[-2])):
         q_block = q_f[..., start:end, :]
         do_block = do_f[..., start:end, :]
@@ -1781,28 +1940,20 @@ def _sdpa_gradients(
             scale,
             alibi_slopes,
         )
-        probs = scores.sub_(_rows(stats_f, start, end)).exp_()
+        probs = scores.sub_(_rows(stats, start, end)).exp_()
         row_dot = (do_block * o_f[..., start:end, :]).sum(dim=-1, keepdim=True)
-        # d_scores = probs * (do @ v^T - row_dot) * scale
+        # d_scores = probs * (do @ v^T - row_dot) * scale. The bias is added
+        # after the scale, so dBias takes d_scores before the scale.
         d_scores = torch.matmul(do_block, v_f.transpose(-2, -1))
-        d_scores.sub_(row_dot).mul_(probs).mul_(scale)
+        d_scores.sub_(row_dot).mul_(probs)
+        if dbias is not None:
+            _add_dbias_rows(dbias, d_scores, start, end)
+        d_scores.mul_(scale)
         dq[..., start:end, :] = torch.matmul(d_scores, k_f)
-        dk_full += torch.matmul(d_scores.transpose(-2, -1), q_block)
-        dv_full += torch.matmul(probs.transpose(-2, -1), do_block)
+        dk += torch.matmul(d_scores.transpose(-2, -1), q_block)
+        dv += torch.matmul(probs.transpose(-2, -1), do_block)
         del scores, probs, d_scores
-
-    batch, seq_kv = dk_full.shape[0], dk_full.shape[2]
-    if rep_k > 1:
-        dk_f = dk_full.view(batch, k_heads, rep_k, seq_kv, head_dim).sum(dim=2)
-    else:
-        dk_f = dk_full
-    if rep_v > 1:
-        dv_f = dv_full.view(batch, v_heads, rep_v, seq_kv, int(v_f.shape[-1])).sum(
-            dim=2
-        )
-    else:
-        dv_f = dv_full
-    return dq, dk_f, dv_f
+    return dq, dk, dv
 
 
 @register_handler("SdpaBackwardAttributes")
@@ -1812,19 +1963,33 @@ def compile_sdpa_backward(
 ) -> CompiledOp:
     """Plan scaled dot-product attention backward.
 
-    Mirrors hipDNN's CPU reference (CpuFpReferenceSdpa::backward): the saved
-    softmax statistics ``stats`` (forward log-sum-exp) are consumed directly to
-    recompute probabilities as ``P = exp(scores - stats)`` without
-    renormalization.  PyTorch's built-in SDPA autograd cannot consume an
-    external ``stats`` tensor and always renormalizes its own softmax, so it
-    would diverge from hipDNN whenever ``stats`` is not the exact, consistent
-    forward LSE.  This handler therefore implements the gradient manually.
+    Both paths read the graph's O and ``stats`` (forward log-sum-exp), as the
+    hipDNN kernel does, and recompute ``P = exp(scores - stats)`` without
+    renormalization.
+
+    * The timed GPU row runs the fused Flash or memory-efficient backward
+      kernel, the one a training step's forward dispatches to
+      (``_prepare_fused_backward``). On ROCm this is AOTriton or CK. Its
+      setup is built once, untimed.
+    * A manual fp32 formula runs on the host (the CPU reference), in a
+      ``--validate pytorch`` reference pass on any device
+      (``reference_sdpa_call``), for ALiBi, for variable lengths, and on a
+      GPU when default dispatch picks math. It mirrors hipDNN's CPU
+      reference (CpuFpReferenceSdpa::backward).
+
+    A non-paged varlen node (``seq_len_q`` / ``seq_len_kv`` or ragged
+    offsets) runs the formula per batch on the batch's live rows and keys;
+    gradients past a length stay 0. Varlen with bottom-right or sliding-window
+    bounds is not supported.
+
+    dBias (``dbias_tensor_uid``) is the gradient of the ``attn_mask`` bias:
+    the unscaled ``dS = P * (dP - D)``, summed over every dimension that the
+    bias broadcasts. It has the dims and the data type of the bias, as hipDNN
+    requires. The fused path takes it from the memory-efficient kernel, and
+    sums it to the bias dims, as autograd does for a broadcast bias.
     """
     _sdpa_unsupported_if_present(node, ["dropout_scale_inv_tensor_uid"])
-    if _optional_uid(node, "dbias_tensor_uid") is not None:
-        raise ValueError(
-            "SDPA backward dBias gradient is not supported by the PyTorch reference"
-        )
+    dbias_uid = _optional_uid(node, "dbias_tensor_uid")
 
     q_uid = _required_input_uid(node, "q_tensor_uid")
     k_uid = _required_input_uid(node, "k_tensor_uid")
@@ -1836,24 +2001,42 @@ def compile_sdpa_backward(
     dk_uid = _required_output_uid(node, "dk_tensor_uid")
     dv_uid = _required_output_uid(node, "dv_tensor_uid")
     plan = _plan_sdpa_common(node)
+    operands = sdpa_operands(node)
     tensors_json = tensors_by_uid(graph_json)
-    is_varlen = not sdpa_operands(node).is_paged and has_varlen_source(
-        node, tensors_json
-    )
-    is_causal = plan.is_causal
-    if plan.window is not None or plan.bottom_right:
+    is_varlen = not operands.is_paged and has_varlen_source(node, tensors_json)
+    if is_varlen and (plan.window is not None or plan.bottom_right):
         raise ValueError(
-            "SDPA bottom-right/sliding-window bounds are not supported by the "
-            "PyTorch reference backward"
+            "SDPA bottom-right/sliding-window bounds with variable lengths are "
+            "not supported by the PyTorch reference backward"
         )
+    if dbias_uid is not None:
+        # hipDNN's dBias has the bias dims (isSupportedSdpaBwdNode).
+        if plan.mask_uid is None:
+            raise ValueError("SDPA backward dBias needs an attn_mask bias tensor")
+        bias_dims = _tensor_shape(graph_json, plan.mask_uid)
+        dbias_dims = _tensor_shape(graph_json, dbias_uid)
+        if bias_dims is not None and dbias_dims not in (None, bias_dims):
+            raise ValueError(
+                f"SDPA backward dBias dims {dbias_dims} differ from the bias "
+                f"dims {bias_dims}"
+            )
+    computed_inputs = [
+        uid
+        for uid in (
+            q_uid,
+            k_uid,
+            v_uid,
+            o_uid,
+            stats_uid,
+            plan.mask_uid,
+            plan.scale_uid,
+            operands.seq_len_q_tensor_uid,
+            operands.seq_len_kv_tensor_uid,
+        )
+        if uid is not None and _is_computed(graph_json, uid)
+    ]
 
-    def run(tensors: Dict[int, torch.Tensor]) -> None:
-        q = _tensor(tensors, q_uid, node)
-        k = _tensor(tensors, k_uid, node)
-        v = _tensor(tensors, v_uid, node)
-        o = _tensor(tensors, o_uid, node)
-        do = _tensor(tensors, do_uid, node)
-        stats = _tensor(tensors, stats_uid, node)
+    def resolve(tensors, q, k, v):
         attn_mask, scale, rep_k, rep_v = _sdpa_resolve(
             node,
             tensors,
@@ -1864,70 +2047,150 @@ def compile_sdpa_backward(
             plan.scale_uid,
             plan.attn_scale_value,
         )
+        attn_mask, causal = _attention_bounds(
+            int(q.shape[-2]),
+            int(k.shape[-2]),
+            plan.window,
+            plan.bottom_right,
+            attn_mask,
+            plan.is_causal,
+            q,
+        )
+        return attn_mask, causal, float(scale), rep_k, rep_v
+
+    def fused(tensors, q, k, v, o, stats) -> Optional[_FusedBackward]:
+        if computed_inputs and isinstance(tensors, ReplayTensors):
+            raise UnsupportedGraphError(
+                f"SDPA backward inputs {computed_inputs} are computed inside the "
+                "graph, so the PyTorch baseline cannot build their setup outside "
+                "the timed region"
+            )
+        if plan.alibi or is_varlen:
+            # The fused backward kernels take no ALiBi slopes and no lengths;
+            # the fp32 formula adds the bias block by block and runs each
+            # batch on its live rows and keys.
+            if strict_sdpa_selection() is None:
+                return None
+            raise UnsupportedGraphError(
+                "PyTorch SDPA backward: ALiBi and variable lengths have no fused "
+                "backward kernel; use the default --pytorch-sdpa-backend"
+            )
+        attn_mask, causal, scale, rep_k, rep_v = resolve(tensors, q, k, v)
+        return _prepare_fused_backward(
+            q,
+            k,
+            v,
+            o,
+            stats,
+            attn_mask,
+            causal,
+            scale,
+            rep_k,
+            rep_v,
+            dbias_uid is not None,
+        )
+
+    def run(tensors: Dict[int, torch.Tensor]) -> None:
+        q = _tensor(tensors, q_uid, node)
+        k = _tensor(tensors, k_uid, node)
+        v = _tensor(tensors, v_uid, node)
+        o = _tensor(tensors, o_uid, node)
+        do = _tensor(tensors, do_uid, node)
+        stats = _require_fp32_stat(
+            _tensor(tensors, stats_uid, node), "SDPA stats (log-sum-exp)"
+        )
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
+        bias = None if dbias_uid is None else _tensor(tensors, plan.mask_uid, node)
+
+        # A reference pass grades the engines, so it uses the repeatable fp32
+        # formula below instead of a fused kernel, whatever the row selected.
+        if not reference_sdpa_call() and q.is_cuda:
+            if strict_sdpa_selection() is PyTorchSdpaBackendName.MATH:
+                raise UnsupportedGraphError(
+                    "PyTorch's math SDPA backward recomputes the forward and "
+                    "cannot read the graph's saved stats"
+                )
+            kernel = _replay_constant(
+                tensors, ("sdpa_bwd", dq_uid), lambda: fused(tensors, q, k, v, o, stats)
+            )
+            if kernel is not None:
+                dq, dk, dv, *dbias_full = kernel.call(do)
+                _store_tensor(tensors, dq_uid, dq)
+                _store_tensor(tensors, dk_uid, _sum_head_groups(dk, kernel.rep_k))
+                _store_tensor(tensors, dv_uid, _sum_head_groups(dv, kernel.rep_v))
+                if bias is not None:
+                    _store_tensor(
+                        tensors, dbias_uid, _sum_to_shape(dbias_full[0], bias.shape)
+                    )
+                return
+            if isinstance(tensors, ReplayTensors):
+                tensors.note(_MATH_BACKWARD_NOTE)
+
+        attn_mask, is_causal, scale_value, rep_k, rep_v = _replay_constant(
+            tensors, ("sdpa_bwd_bounds", dq_uid), lambda: resolve(tensors, q, k, v)
+        )
         alibi_slopes = (
             _alibi_slopes(int(q.shape[1]), q.device, torch.float64)
             if plan.alibi
             else None
         )
-
-        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-            raise ValueError("SDPA backward expects rank-4 q/k/v tensors [B, H, S, D]")
-
         q_f = q.to(dtype=torch.float32)
-        k_f = k.to(dtype=torch.float32)
-        v_f = v.to(dtype=torch.float32)
+        k_f = _fp32_at_query_heads(k, rep_k)
+        v_f = _fp32_at_query_heads(v, rep_v)
         o_f = o.to(dtype=torch.float32)
         do_f = do.to(dtype=torch.float32)
-        stats_f = _require_fp32_stat(stats, "SDPA stats (log-sum-exp)")
-        scale_value = float(scale)
+        # hipDNN accumulates dBias in float32 over the bias dims.
+        dbias = (
+            None
+            if bias is None
+            else torch.zeros(bias.shape, device=q.device, dtype=torch.float32)
+        )
 
         if not is_varlen:
-            dq, dk_f, dv_f = _sdpa_gradients(
+            dq, dk, dv = _sdpa_gradients(
                 q_f,
                 k_f,
                 v_f,
                 o_f,
                 do_f,
-                stats_f,
+                stats,
                 attn_mask,
                 is_causal,
                 scale_value,
-                rep_k,
-                rep_v,
                 alibi_slopes,
+                dbias,
             )
         else:
             # Per batch on the valid slices. Gradients past a length stay 0.
-            # Backward refuses bottom-right and window bounds, so no live row
+            # Varlen refuses bottom-right and window bounds, so no live row
             # is dead.
             q_lens, kv_lens = _sdpa_varlen_lengths(node, tensors_json, tensors, q, k)
             dq = torch.zeros_like(q_f)
-            dk_f = torch.zeros_like(k_f)
-            dv_f = torch.zeros_like(v_f)
+            dk = torch.zeros_like(k_f)
+            dv = torch.zeros_like(v_f)
             for b, (lq, lkv) in enumerate(zip(q_lens, kv_lens)):
                 if lq == 0 or lkv == 0:
                     continue
                 one = slice(b, b + 1)
-                dq_b, dk_b, dv_b = _sdpa_gradients(
+                dq[one, :, :lq], dk[one, :, :lkv], dv[one, :, :lkv] = _sdpa_gradients(
                     q_f[one, :, :lq],
                     k_f[one, :, :lkv],
                     v_f[one, :, :lkv],
                     o_f[one, :, :lq],
                     do_f[one, :, :lq],
-                    stats_f[one, :, :lq],
+                    stats[one, :, :lq],
                     _batch_attn_mask(attn_mask, b, 0, lq, lkv),
                     is_causal,
                     scale_value,
-                    rep_k,
-                    rep_v,
                     alibi_slopes,
+                    _batch_attn_mask(dbias, b, 0, lq, lkv),
                 )
-                dq[one, :, :lq] = dq_b
-                dk_f[one, :, :lkv] = dk_b
-                dv_f[one, :, :lkv] = dv_b
 
         _store_tensor(tensors, dq_uid, dq.to(dtype=q.dtype))
-        _store_tensor(tensors, dk_uid, dk_f.to(dtype=k.dtype))
-        _store_tensor(tensors, dv_uid, dv_f.to(dtype=v.dtype))
+        _store_tensor(tensors, dk_uid, _sum_head_groups(dk, rep_k).to(k.dtype))
+        _store_tensor(tensors, dv_uid, _sum_head_groups(dv, rep_v).to(v.dtype))
+        if dbias is not None:
+            _store_tensor(tensors, dbias_uid, dbias.to(dtype=bias.dtype))
 
     return run

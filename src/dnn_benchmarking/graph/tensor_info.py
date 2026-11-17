@@ -60,6 +60,7 @@ class TensorInfo:
         data_type: Data type name from the graph (e.g., "float", "half").
         is_virtual: Whether this is a virtual (intermediate) tensor.
         is_output: Whether this tensor is marked as a graph output.
+        producer: Node ``type`` of the node that writes this tensor, or None.
         value: Embedded scalar for pass-by-value tensors, else None.
         ragged_offset_tensor_uid: UID of the offset table that places each batch
             in storage, or None for a dense or padded tensor.
@@ -81,6 +82,7 @@ class TensorInfo:
     is_virtual: bool
     is_output: bool = False
     value: Optional[Any] = None
+    producer: Optional[str] = None
     ragged_offset_tensor_uid: Optional[int] = None
     ragged_offset_multiplier: int = 1
     varlen: Optional[VarlenLayout] = field(default=None, compare=False)

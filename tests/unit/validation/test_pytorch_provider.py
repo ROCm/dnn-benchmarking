@@ -1251,7 +1251,9 @@ class TestPyTorchProviderNewOps:
         np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
         np.testing.assert_allclose(outputs[6].data, [[[[np.log(3.0)], [np.log(4.0)]]]])
 
-    def test_sdpa_deprecated_causal_mask_overrides_bottom_right_alignment(self) -> None:
+    def test_sdpa_deprecated_causal_mask_keeps_bottom_right_alignment(self) -> None:
+        """hipDNN composes causal_mask with the stored alignment, so this is
+        bottom-right causal: row 0 sees keys 0-2, row 1 sees all four."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         q = np.zeros((1, 1, 2, 1), dtype=np.float32)
         k = np.zeros((1, 1, 4, 1), dtype=np.float32)
@@ -1272,7 +1274,7 @@ class TestPyTorchProviderNewOps:
 
         outputs = provider.compute_reference(graph_json, {1: q, 2: k, 3: v})
 
-        np.testing.assert_allclose(outputs[4].data, [[[[1.0], [1.5]]]])
+        np.testing.assert_allclose(outputs[4].data, [[[[2.0], [2.5]]]])
 
     def test_sdpa_attention_sink_gqa_and_bottom_right_match_explicit_softmax(
         self,
@@ -1595,7 +1597,7 @@ class TestPyTorchProviderNewOps:
             ),
             ({"padding_mask": True}, "padding_mask"),
             ({"right_bound": 1}, "forward-looking band"),
-            ({"left_bound": -5}, "left_bound -5"),
+            ({"left_bound": -5}, "below -1"),
             (
                 {"causal_mask": True, "causal_mask_bottom_right": True},
                 "mutually exclusive",
@@ -2216,7 +2218,14 @@ class TestHostMemoryEstimate:
     without sinks runs on the fused kernel and holds no score matrix."""
 
     @staticmethod
-    def _sdpa(q_dims, k_dims, attributes, page_table_dims=None, sink=False):
+    def _sdpa(
+        q_dims,
+        k_dims,
+        attributes,
+        page_table_dims=None,
+        sink=False,
+        node_type="SdpaAttributes",
+    ):
         def tensor(uid, dims, data_type="float"):
             return {"uid": uid, "dims": dims, "data_type": data_type}
 
@@ -2245,7 +2254,7 @@ class TestHostMemoryEstimate:
             "tensors": tensors,
             "nodes": [
                 {
-                    "type": "SdpaAttributes",
+                    "type": node_type,
                     "inputs": inputs,
                     "outputs": {"o_tensor_uid": 4},
                     "attributes": attributes,
@@ -2253,6 +2262,7 @@ class TestHostMemoryEstimate:
             ],
         }
 
+    @pytest.mark.parametrize("node_type", ["SdpaAttributes", "SdpaBackwardAttributes"])
     @pytest.mark.parametrize(
         "attributes",
         [
@@ -2260,24 +2270,26 @@ class TestHostMemoryEstimate:
             {"left_bound": 255, "right_bound": 0},
         ],
     )
-    def test_band_masks_count_the_full_mask(self, attributes) -> None:
+    def test_band_masks_count_the_full_mask(self, attributes, node_type) -> None:
         """Bottom-right and windowed masks are built at [q_len, kv_len] in
-        float32 (twice) before SDPA runs; causal and unmasked graphs are not.
-        Bottom-right with q_len == kv_len is native causal and builds none."""
+        float32 (twice) before SDPA runs, forward and backward; causal and
+        unmasked graphs are not. Bottom-right with q_len == kv_len is native
+        causal and builds none."""
         from dnn_benchmarking.validation.providers.pytorch_provider import (
             estimate_reference_host_bytes as estimate,
         )
 
+        def graph(q, k, attributes):
+            return self._sdpa(q, k, attributes, node_type=node_type)
+
         q, k = [1, 2, 1024, 16], [1, 2, 512, 16]
-        unmasked = estimate(self._sdpa(q, k, {}))
-        assert estimate(self._sdpa(q, k, {"causal_mask": True})) == unmasked
-        masked = estimate(self._sdpa(q, k, attributes))
+        unmasked = estimate(graph(q, k, {}))
+        assert estimate(graph(q, k, {"causal_mask": True})) == unmasked
+        masked = estimate(graph(q, k, attributes))
         assert masked - unmasked >= 1024 * 512 * 4 * 2
         square = [1, 2, 1024, 16]
         native = {"causal_mask_bottom_right": True}
-        assert estimate(self._sdpa(q, square, native)) == estimate(
-            self._sdpa(q, square, {})
-        )
+        assert estimate(graph(q, square, native)) == estimate(graph(q, square, {}))
 
     def test_sink_forward_counts_score_blocks_and_the_float32_mask(self) -> None:
         """A forward with sinks forms scores by hand and builds a float32 mask

@@ -21,22 +21,22 @@ unmasked ``(q, kv)`` pairs per query head:
   For ``head_dim_qk == head_dim_vo`` this is 2.5x forward, the convention
   FlashAttention's benchmarks use.
 
-``P`` is exact. The mask is resolved the way hipDNN's reference executor and
-providers resolve it (``extractDiagonalBandParams`` / ``getMaskType``):
-
-* deprecated ``causal_mask`` -> top-left causal (bounds/alignment ignored);
-* deprecated ``causal_mask_bottom_right`` -> bottom-right causal;
-* otherwise ``left_bound`` / ``right_bound`` / ``diagonal_alignment``, where
-  row ``i`` keeps ``kv`` in ``[i + off - left + 1, i + off + right]`` with
-  ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT): ``left`` keys up to
-  and including the diagonal and ``right`` keys past it (hipDNN and cuDNN);
-  an unset bound is unbounded, and ``left_bound = 0`` is rejected.
+``P`` is exact. The mask is resolved the way hipDNN's providers resolve it
+(``plan_utils::resolveDiagonalBand``, since rocm-libraries #13065), as
+cuDNN's setters compose: a deprecated causal flag acts as if its setter ran
+first, and the stored bounds and alignment apply on top. See
+:func:`sdpa_band`. Row ``i`` keeps ``kv`` in ``[i + off - left + 1, i + off
++ right]`` with ``off = 0`` (TOP_LEFT) or ``Skv - Sq`` (BOTTOM_RIGHT): ``left``
+keys up to and including the diagonal and ``right`` keys past it, as in
+hipDNN (since rocm-libraries #14483) and cuDNN. An unset bound is unbounded,
+and ``left_bound = 0`` is rejected.
 
 For a variable-length node (per-batch ``seq_len`` / ``cu_seq_len`` or ragged
 offsets, or a paged node) the count is a sum over batches,
 ``num_q_heads * sum_b P(Sq_b, Skv_b)``, with the live lengths read from the
 input data. Without input data, or for a dense node, the tensor dims give
-``Sq`` and ``Skv``.
+``Sq`` and ``Skv``; a paged node then takes ``Skv`` as the page-table width
+times the page size, capped by ``max_seq_len_kv``.
 
 A causal sliding window of ``W`` keys (``left = W``, ``right = 0``,
 BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
@@ -45,8 +45,74 @@ windowed count the rocKE attention benchmarks report.
 
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
+
 from ...graph.varlen import ReadInts, sdpa_lengths
 from ._common import node_param, node_tensor
+
+#: ``(left, right, bottom_right)``; a ``None`` bound is unbounded. ``left``
+#: counts the kept keys up to and including the diagonal (>= 1).
+Band = Tuple[Optional[int], Optional[int], bool]
+
+
+def sdpa_band(node: Dict[str, Any]) -> Band:
+    """The node's diagonal band, resolved as hipDNN's ``resolveDiagonalBand``.
+
+    A deprecated causal flag sets ``right = 0`` unless ``right_bound`` is set
+    (>= 0). ``left_bound`` still applies. ``causal_mask`` keeps the stored
+    alignment; ``causal_mask_bottom_right`` forces BOTTOM_RIGHT.
+
+    ``left_bound = L`` keeps ``L`` keys up to and including the diagonal.
+
+    Raises ValueError for a mask hipDNN rejects: both deprecated flags, a
+    bound below -1, ``left_bound = 0`` (it keeps no keys), or an unknown
+    alignment.
+    """
+    causal = bool(node_param(node, "causal_mask"))
+    causal_bottom_right = bool(node_param(node, "causal_mask_bottom_right"))
+    if causal and causal_bottom_right:
+        raise ValueError(
+            "SDPA causal_mask and causal_mask_bottom_right are mutually exclusive"
+        )
+    alignment = node_param(node, "diagonal_alignment")
+    if alignment not in ("TOP_LEFT", "BOTTOM_RIGHT", 0, 1, None):
+        raise ValueError(f"Unsupported SDPA diagonal_alignment {alignment!r}")
+    bounds = []
+    for key in ("left_bound", "right_bound"):
+        value = int(node_param(node, key, -1))
+        if value < -1:
+            raise ValueError(f"SDPA {key} {value} is below -1")
+        bounds.append(value)
+    left, right = bounds
+    if left == 0:
+        raise ValueError(
+            "SDPA left_bound 0 keeps no keys; use a positive width or -1 (unbounded)"
+        )
+    if causal or causal_bottom_right:
+        right = max(right, 0)
+    bottom_right = causal_bottom_right or alignment in ("BOTTOM_RIGHT", 1)
+    return (
+        (None if left == -1 else left),
+        (None if right == -1 else right),
+        bottom_right,
+    )
+
+
+def alibi_slopes(num_heads: int) -> np.ndarray:
+    """cuDNN's per-query-head ALiBi slopes (``get_alibi_slope``), float64.
+
+    The geometric schedule covers the closest power of two below or at
+    ``num_heads``. Extra heads use the next power of two's odd-indexed
+    slopes, as cuDNN and common open-source ALiBi implementations do. Head
+    ``h`` adds ``slopes[h] * (key - query)`` to the scaled scores.
+    """
+    base = 1 << (num_heads.bit_length() - 1)
+    exponents = -8.0 * (np.arange(base, dtype=np.float64) + 1.0) / base
+    extra = num_heads - base
+    if extra > 0:
+        odd = np.arange(extra, dtype=np.float64)
+        exponents = np.concatenate([exponents, -4.0 * (2.0 * odd + 1.0) / base])
+    return np.power(2.0, exponents)
 
 
 def _nonmasked_pairs(
@@ -79,8 +145,7 @@ def _attention_terms(
     variable-length node).
 
     Returns None when q/k/v tensor data is incomplete, or when the mask is
-    one hipDNN rejects (a bound below -1, ``left_bound = 0``, or both
-    deprecated causal flags).
+    one hipDNN rejects (:func:`sdpa_band` raises).
     """
     q = node_tensor(node, "q_tensor_uid", tensors_by_uid)
     k = node_tensor(node, "k_tensor_uid", tensors_by_uid)
@@ -95,30 +160,25 @@ def _attention_terms(
 
     q_seqlen = int(q_dims[-2])
     kv_seqlen = int(k_dims[-2])
+    table = node_tensor(node, "page_table_k_tensor_uid", tensors_by_uid)
+    table_dims = (table or {}).get("dims") or []
+    if len(table_dims) >= 2:
+        # A paged K is a block container [blocks, H, page_size, D]: without
+        # the lengths, a sequence spans the table width times the page size,
+        # capped by max_seq_len_kv (the longest sequence the input generator
+        # gives).
+        kv_seqlen *= int(np.prod(table_dims[1:], dtype=np.int64))
+        cap = node_param(node, "max_seq_len_kv")
+        if cap is not None:
+            kv_seqlen = min(kv_seqlen, int(cap))
     rows = 1  # batch * num_q_heads
     for d in q_dims[:-2]:
         rows *= int(d)
 
-    # Validate and resolve the mask in the order of hipDNN's
-    # extractDiagonalBandParams.
-    left = int(node_param(node, "left_bound", -1))
-    right = int(node_param(node, "right_bound", -1))
-    if left < -1 or left == 0 or right < -1:
+    try:
+        band = sdpa_band(node)
+    except ValueError:
         return None
-    causal_top_left = node_param(node, "causal_mask") is True
-    causal_bottom_right = node_param(node, "causal_mask_bottom_right") is True
-    if causal_top_left and causal_bottom_right:
-        return None
-    if causal_top_left or causal_bottom_right:
-        left, right, bottom_right = -1, 0, causal_bottom_right
-    else:
-        bottom_right = node_param(node, "diagonal_alignment") in ("BOTTOM_RIGHT", 1)
-
-    band = (
-        None if left == -1 else left,
-        None if right == -1 else right,
-        bottom_right,
-    )
     lengths = (
         sdpa_lengths(node, tensors_by_uid, read_ints) if read_ints is not None else None
     )

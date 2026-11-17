@@ -5,10 +5,10 @@
 
 A decode graph whose effective diagonal is top-left with Sq = 1 attends only to
 key 0 of its cache. The cudnn_attention_inference extraction wrote 228 decode
-graphs that way. "Effective" is what hipDNN runs: causal_mask overrides
-diagonal_alignment and the written bounds, so causal_mask + BOTTOM_RIGHT is
-still top-left. Sq = 1 fails the check; other Sq != Skv top-left graphs are
-reported as warnings.
+graphs that way. "Effective" is what hipDNN runs (resolveDiagonalBand): a
+deprecated causal flag acts as right_bound = 0 and keeps diagonal_alignment, so
+causal_mask + BOTTOM_RIGHT is bottom-right. Sq = 1 fails the check; other
+Sq != Skv top-left graphs are reported as warnings.
 """
 
 import importlib.util
@@ -51,9 +51,9 @@ def _graph(sq, skv, paged=False, **attrs):
     }
 
 
-# What the JSON says versus what hipDNN runs. causal_mask pins the diagonal
-# top-left whatever diagonal_alignment says, so _FIX_KIT (the form 180 of the
-# 251 #70 fix-kit graphs use) is a top-left graph wearing a bottom-right label.
+# What the JSON says versus what hipDNN runs. causal_mask acts as right_bound = 0
+# and keeps diagonal_alignment, so _FIX_KIT (the form 180 of the 251 #70
+# fix-kit graphs use) runs bottom-right.
 _TOP_LEFT = {"causal_mask": True, "diagonal_alignment": "TOP_LEFT"}
 _FIX_KIT = {"causal_mask": True, "diagonal_alignment": "BOTTOM_RIGHT"}
 _BOTTOM_RIGHT = {
@@ -71,13 +71,6 @@ _BOTTOM_RIGHT = {
         _graph(1, 64, paged=True, **_TOP_LEFT),
         _graph(1, 4096, left_bound=127, **_TOP_LEFT),
         _graph(1, 4096, left_bound=-1, right_bound=0, diagonal_alignment="TOP_LEFT"),
-        # The #70 fix kit's form: the alignment claims bottom-right, hipDNN
-        # discards it and the query still sees only key 0.
-        _graph(1, 4096, **_FIX_KIT),
-        _graph(1, 64, paged=True, **_FIX_KIT),
-        # The fix kit's windowed decode graph (gpt-oss SWA sq1_skv4096): the
-        # bounds are discarded along with the alignment.
-        _graph(1, 4096, left_bound=127, right_bound=0, **_FIX_KIT),
     ],
 )
 def test_top_left_decode_with_one_query_is_an_error(tool, graph) -> None:
@@ -91,7 +84,6 @@ def test_top_left_decode_with_one_query_is_an_error(tool, graph) -> None:
     "graph",
     [
         _graph(171, 4096, **_TOP_LEFT),
-        _graph(171, 4096, **_FIX_KIT),
     ],
 )
 def test_top_left_with_unequal_lengths_is_a_warning(tool, graph) -> None:
@@ -117,6 +109,12 @@ def test_top_left_with_unequal_lengths_is_a_warning(tool, graph) -> None:
         _graph(1, 4096),
         _graph(1, 4096, left_bound=-1, right_bound=-1, diagonal_alignment="TOP_LEFT"),
         _graph(2048, 2048, **_TOP_LEFT),
+        _graph(1, 4096, **_FIX_KIT),
+        _graph(1, 64, paged=True, **_FIX_KIT),
+        _graph(171, 4096, **_FIX_KIT),
+        # The fix kit's windowed decode graph (gpt-oss SWA sq1_skv4096): the
+        # bounds and the alignment both apply.
+        _graph(1, 4096, left_bound=127, right_bound=0, **_FIX_KIT),
         _graph(2048, 2048, **_FIX_KIT),
     ],
 )
@@ -150,7 +148,7 @@ def test_both_causal_flags_are_a_conflict(tool) -> None:
 def test_the_cli_reports_decode_graphs_and_fails_only_under_strict(
     tool, tmp_path, monkeypatch, capsys
 ) -> None:
-    (tmp_path / "decode.json").write_text(json.dumps(_graph(1, 4096, **_FIX_KIT)))
+    (tmp_path / "decode.json").write_text(json.dumps(_graph(1, 4096, **_TOP_LEFT)))
     (tmp_path / "chunk.json").write_text(json.dumps(_graph(171, 4096, **_TOP_LEFT)))
     (tmp_path / "fixed.json").write_text(json.dumps(_graph(1, 4096, **_BOTTOM_RIGHT)))
     (tmp_path / "both.json").write_text(
