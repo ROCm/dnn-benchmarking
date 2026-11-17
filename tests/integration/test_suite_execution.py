@@ -147,9 +147,10 @@ def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) 
     assert ootb["build_ms"] > 0 and oracle["build_ms"] > 0
     assert oracle["kernel"]["median_ms"] > 0
     assert oracle["tuning_available"] is True
-    # The provider applied the knob in the tuned child (MiopenUtils.hpp
-    # ScopedTuningPolicy). A child that builds with knobs={} logs only
-    # "benchmarking=0".
+    # The tuned child ran with MIOpen benchmarking on (the knob, or the forced
+    # HIPDNN_FORCE_BENCHMARKING=1). The unit test
+    # test_tuned_run_is_a_benchmarking_build_of_the_row_engine_with_the_run_policy
+    # pins the knob itself.
     text = log.read_text() if log.is_file() else ""
     assert "(benchmarking=1)" in text, text[-2000:]
 
