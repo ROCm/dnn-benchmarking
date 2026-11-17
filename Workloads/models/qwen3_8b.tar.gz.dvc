@@ -1,5 +1,5 @@
 outs:
-- md5: ba20468b7075bdcfc8cef7fbbf5d644d
-  size: 1836
+- md5: e0d58ab5e2856dbe8b9e0aed9b25c97a
+  size: 1894
   hash: md5
   path: qwen3_8b.tar.gz

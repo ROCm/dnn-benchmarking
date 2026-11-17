@@ -45,7 +45,9 @@ name joins its version number. For example, `Llama-3-8B` becomes `llama3_8b`,
 and `GPT-3-13B-class` becomes `gpt3_13b_class`. A graph that two models share
 lists both models: the `gpt-oss-120b/20b` source label becomes `gpt_oss_120b`
 and `gpt_oss_20b`. The `Qwen3-Next` label becomes `qwen3_next_80b_a3b`, the
-identifier of the only Qwen3-Next model.
+identifier of the only Qwen3-Next model. `model` also contains the models in
+the `shared_by` list of the source rows (`mimo_v2_5` on 2 graphs and `qwen3_8b`
+on 2 graphs).
 
 The graph tensors and the SDPA node give `attention_type`, `mask`, `phase`,
 and `sink`. The source labels `gfx950_dense_test` (9 graphs) and

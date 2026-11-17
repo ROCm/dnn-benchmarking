@@ -85,7 +85,9 @@ name joins its version number: `Llama-3.1-405B` becomes `llama3_1_405b`, and
 `GPT-3` becomes `gpt3`. When two or more models use the same graph, `model`
 contains all of them. A source label that names a test case and not a model,
 such as `gfx950_dense_test`, becomes `model` `synthetic` and `model_family`
-`synthetic`.
+`synthetic`. Shapes from library tests and benchmark sweeps that name no
+model (for example `microbench/aiter`, `microbench/hipkittens`, and
+`microbench/pytorch`) also get `model` and `model_family` `synthetic`.
 
 Tag meanings:
 
