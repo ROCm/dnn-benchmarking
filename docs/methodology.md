@@ -722,8 +722,15 @@ formula, on a GPU and on the host. It reads the graph's O and `stats`. The
 reference pass does not call the fused PyTorch backward kernel: only the
 timed PyTorch row does (see [PyTorch SDPA backward](#pytorch-sdpa-backward)).
 
-The forward is dense and has no dropout: sequence-length and dropout inputs
-do not change O and `stats`, so O of a dropout graph is the forward without
+A graph with sequence lengths (`seq_len_q` and `seq_len_kv`, or ragged
+tensors) gets the forward of each batch on its first `lq` query rows over
+its first `lkv` keys, with the generated lengths (see
+[Input data for variable-length SDPA](#input-data-for-variable-length-sdpa)).
+The engines and the reference read these rows. A bottom-right band follows
+the live lengths. The rows past `lq` keep the forward of the full shape. The
+dO scale uses the largest dV element of the per-batch forwards.
+
+The forward has no dropout, so O of a dropout graph is the forward without
 dropout. The forward adds host time to input generation
 before the timed loop. It is proportional to the attention FLOPs of the
 graph. Forward-consistent SDPA backward inputs and the scaled dO start at

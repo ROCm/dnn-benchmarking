@@ -93,9 +93,11 @@ The converter skips a forward graph that has a paged K/V cache, attention
 sinks, a block mask, fp8 scale or descale tensors, or dropout.
 
 dnn-benchmarking generates O and `stats` as the exact float32 forward of the
-generated Q, K and V, with the bias and ALiBi. It does not apply dropout, so
-O of a dropout graph is the forward without dropout. It scales dO by a power
-of two when the largest dV element would be below 0.5, as in decode graphs.
+generated Q, K and V, with the bias and ALiBi. For a graph with `seq_len_q`
+and `seq_len_kv`, the forward of each batch uses its live query rows and
+keys. It does not apply dropout, so O of a dropout graph is the forward
+without dropout. It scales dO by a power of two when the largest dV element
+would be below 0.5, as in decode graphs.
 See [methodology](../../../docs/methodology.md#sdpa-backward-inputs).
 
 ## Metadata contract
@@ -123,12 +125,12 @@ duplicates.
 
 - The variable-length graphs come from `microbench/aiter` (2,244) and
   `microbench/aotriton` (5). Their `seq_len_q` and `seq_len_kv` are int32
-  `[B, 1, 1, 1]`, as hipDNN and cuDNN require. dnn-benchmarking sets every
-  sequence length to 1 for them, as for their forward graphs, so these rows
-  measure a one-token problem. It still generates O and `stats` for the
-  dense shape. Variable sequence length support is tracked in ALMIOPEN-3139.
-- The PyTorch reference does not support variable sequence lengths, so these
-  graphs have no PyTorch row and no validation.
+  `[B, 1, 1, 1]`, as hipDNN and cuDNN require. dnn-benchmarking generates a
+  varied length for each batch (one padded and one full batch when B > 1),
+  and O and `stats` for the live rows of each batch. The PyTorch reference
+  runs these graphs per batch with the manual fp32 backward formula; the
+  timed PyTorch row also uses that formula, because no fused kernel takes
+  lengths.
 - Decode shapes have no training use. They are kept because the collection
   converts every forward graph that has a backward equivalent. Use
   `metadata.shape` to separate them from training shapes.

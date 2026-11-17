@@ -198,6 +198,48 @@ def test_alibi_enters_the_forward() -> None:
     np.testing.assert_allclose(data[6], stats, rtol=1e-5, atol=1e-6)
 
 
+def test_varlen_rows_are_the_forward_of_the_live_rows_and_keys() -> None:
+    """With seq_len and padding_mask, batch b is read on its first lq rows
+    over its first lkv keys. O and stats there are the forward of that slice,
+    not of the dense shape (non-causal: every row sees the padded keys)."""
+    batch, q_len, kv_len = 4, 6, 9
+    dims = {
+        1: [batch, 4, q_len, 8],
+        2: [batch, 2, kv_len, 8],
+        3: [batch, 2, kv_len, 8],
+        4: [batch, 4, q_len, 8],
+        5: [batch, 4, q_len, 8],
+        6: [batch, 4, q_len, 1],
+        11: [batch, 1, 1, 1],
+        12: [batch, 1, 1, 1],
+    }
+    infos = [_info(uid, d, "int32" if uid > 10 else "float") for uid, d in dims.items()]
+    graph = _graph({"attn_scale_value": 0.3, "padding_mask": True})
+    graph["nodes"][0]["inputs"].update(
+        seq_len_q_tensor_uid=11, seq_len_kv_tensor_uid=12
+    )
+    graph["tensors"] = [
+        {"uid": uid, "dims": d, "data_type": info.data_type}
+        for (uid, d), info in zip(dims.items(), infos)
+    ]
+
+    data = generate_input_data(infos, seed=4, graph_json=graph)
+
+    q_lens, kv_lens = data[11].reshape(-1), data[12].reshape(-1)
+    assert q_lens.min() < q_len and kv_lens.min() < kv_len, "no padded batch"
+    for b, (lq, lkv) in enumerate(zip(q_lens, kv_lens)):
+        live = {
+            1: data[1][b : b + 1, :, :lq],
+            2: data[2][b : b + 1, :, :lkv],
+            3: data[3][b : b + 1, :, :lkv],
+        }
+        o, stats = _expected(live, 0.3, lq, lkv, lambda i, j: True, rep=2)
+        np.testing.assert_allclose(data[4][b : b + 1, :, :lq], o, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(
+            data[6][b : b + 1, :, :lq], stats, rtol=1e-5, atol=1e-6
+        )
+
+
 def test_bf16_output_is_rounded_and_blocks_cover_every_row(monkeypatch) -> None:
     """O is stored at the graph type. Score blocks smaller than the query
     length must still give the full-size result."""

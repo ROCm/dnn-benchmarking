@@ -11,11 +11,14 @@ tolerance can tell a correct kernel from a wrong one. On gfx942 the kernel
 times were the same for random and for consistent inputs (ALMIOPEN-2976).
 
 This module computes O and stats with an exact float32 forward over the
-generated Q, K and V, as a training step would produce them. The forward
-costs as much as the attention itself, so it runs in PyTorch, on the GPU
-when one is visible. torch is imported only for a graph with an SDPA
-backward node. Without torch, a NumPy forward (single-threaded, much
-slower) gives the same values to float32 rounding.
+generated Q, K and V, as a training step would produce them. A node with
+per-batch lengths (``seq_len`` or ragged offsets) gets, for each batch, the
+forward of its first ``lq`` query rows over its first ``lkv`` keys: the rows
+engines and the reference read. Rows past ``lq`` keep the dense forward.
+The forward costs as much as the attention itself, so it runs in PyTorch, on
+the GPU when one is visible. torch is imported only for a graph with an SDPA
+backward node. Without torch, a NumPy forward (single-threaded, much slower)
+gives the same values to float32 rounding.
 
 With U[0, 1) inputs and many keys per query (decode shapes), every dV and
 dK element is below 1e-3, so the fixed ``atol`` accepts an engine that
@@ -30,7 +33,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ..common import torch_support
+from ..graph.loader import tensors_by_uid
 from ..graph.tensor_info import TensorInfo
+from ..graph.varlen import read_input_ints, sdpa_lengths, sdpa_operands
 from ..metrics.analytical._common import node_param
 from ..metrics.analytical.sdpa import Band, alibi_slopes, sdpa_band
 
@@ -245,6 +250,42 @@ def _d_out_scale(dv_max: float) -> int:
     return min(1 << int(math.floor(-math.log2(dv_max))), _MAX_D_OUT_SCALE)
 
 
+def _batch_mask(
+    mask: Optional[np.ndarray], batch: int, q_len: int, kv_len: int
+) -> Optional[np.ndarray]:
+    """Batch ``batch``, query rows ``:q_len`` and keys ``:kv_len`` of an
+    additive mask, as the PyTorch reference slices it. Size-1 broadcast dims
+    stay whole."""
+    if mask is None:
+        return None
+    if mask.ndim == 4 and mask.shape[0] > 1:
+        mask = mask[batch : batch + 1]
+    if mask.ndim >= 2 and mask.shape[-2] > 1:
+        mask = mask[..., :q_len, :]
+    if mask.ndim >= 2 and mask.shape[-1] > 1:
+        mask = mask[..., :kv_len]
+    return mask
+
+
+def _lengths(
+    node: Dict[str, Any],
+    graph_json: Dict[str, Any],
+    input_data: Dict[int, np.ndarray],
+) -> Optional[Tuple[List[int], List[int]]]:
+    """Per-batch ``(q_lengths, kv_lengths)`` of a non-paged node, None when
+    it is dense or another node computes its lengths."""
+    if sdpa_operands(node).is_paged:
+        return None
+    try:
+        return sdpa_lengths(
+            node,
+            tensors_by_uid(graph_json),
+            lambda uid: read_input_ints(input_data, uid),
+        )
+    except KeyError:
+        return None  # a computed length: its values are not known here
+
+
 def set_sdpa_backward_inputs(
     graph_json: Optional[Dict[str, Any]],
     tensor_infos: List[TensorInfo],
@@ -257,8 +298,10 @@ def set_sdpa_backward_inputs(
     ``round_to(values, tensor_info)`` rounds float32 values to the tensor's
     logical type. Nodes whose O, stats or dO another node computes are
     skipped. The forward applies the band, the attention bias and ALiBi.
-    Dropout and sequence-length inputs are not applied: the forward is dense
-    and dropout-free, so with dropout O differs from the dropped-out forward.
+    With per-batch lengths, the rows below each ``lq`` come from the forward
+    over the batch's live rows and keys, and the dO scale comes from those
+    forwards only. Dropout is not applied: with dropout, O differs from the
+    dropped-out forward.
     """
     if not graph_json:
         return
@@ -279,7 +322,7 @@ def set_sdpa_backward_inputs(
         except ValueError:
             continue  # hipDNN rejects the mask, so no engine reads O or stats
         mask_uid = uids["attn_mask"]
-        q, v = input_data[uids["q"]], input_data[uids["v"]]
+        q, k, v = (input_data[uids[name]] for name in ("q", "k", "v"))
         out_shape = (*q.shape[:3], v.shape[3])
         d_out = input_data[uids["do"]]
         if d_out.size != math.prod(out_shape):
@@ -287,16 +330,35 @@ def set_sdpa_backward_inputs(
                 f"SDPA backward dO tensor {uids['do']} has dims {list(d_out.shape)}; "
                 f"the forward gives {list(out_shape)}"
             )
+        d_out_4d = d_out.reshape(out_shape)
+        scale = _scale(node, input_data)
+        mask = None if mask_uid is None else input_data.get(mask_uid)
+        alibi = alibi_slopes(q.shape[1]) if node_param(node, "alibi_mask") else None
         out, stats, dv_max = attention_forward(
-            q,
-            input_data[uids["k"]],
-            v,
-            d_out.reshape(out_shape),
-            _scale(node, input_data),
-            None if mask_uid is None else input_data.get(mask_uid),
-            band,
-            alibi_slopes(q.shape[1]) if node_param(node, "alibi_mask") else None,
+            q, k, v, d_out_4d, scale, mask, band, alibi
         )
+        lengths = _lengths(node, graph_json, input_data)
+        if lengths is not None:
+            # The live rows of each batch, sliced as the PyTorch reference
+            # slices them. Bottom-right bands follow the live lengths.
+            dv_max = 0.0
+            for b, (lq, lkv) in enumerate(zip(*lengths)):
+                if lq <= 0 or lkv <= 0:
+                    continue
+                one = slice(b, b + 1)
+                out_b, stats_b, dv_b = attention_forward(
+                    q[one, :, :lq],
+                    k[one, :, :lkv],
+                    v[one, :, :lkv],
+                    d_out_4d[one, :, :lq],
+                    scale,
+                    _batch_mask(mask, b, lq, lkv),
+                    band,
+                    alibi,
+                )
+                out[one, :, :lq] = out_b
+                stats[one, :, :lq] = stats_b
+                dv_max = max(dv_max, dv_b)
         for name, values in (("o", out), ("stats", stats)):
             info = infos[uids[name]]
             if math.prod(info.dims) != values.size:
