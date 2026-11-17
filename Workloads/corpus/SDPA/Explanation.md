@@ -32,7 +32,7 @@ these eleven keys:
 - `direction`: `fwd`;
 - `dtype`: `bfloat16` or `float16`;
 - `layout`: `bshd`;
-- `model_family`: `llm`;
+- `model_family`: `llm`, or `synthetic` for test cases;
 - `model`: normalized lowercase model identifiers;
 - `mode`: `inference`;
 - `attention_type`: `gqa` or `mha`;
@@ -48,9 +48,9 @@ and `gpt_oss_20b`. The `Qwen3-Next` label becomes `qwen3_next_80b_a3b`, the
 identifier of the only Qwen3-Next model.
 
 The graph tensors and the SDPA node give `attention_type`, `mask`, `phase`,
-and `sink`. The source labels `gfx950_dense_test` and `d64_serving_gqa8` are
-test-case names, not model names. The collection keeps them as `model`
-values.
+and `sink`. The source labels `gfx950_dense_test` (9 graphs) and
+`d64_serving_gqa8` (4 graphs) are test-case names, not model names. These
+graphs have `model` `synthetic` and `model_family` `synthetic`.
 
 ## Identity rule
 

@@ -54,12 +54,16 @@ Rules:
    a scale, or an epsilon.
 4. Omit a key when the source does not give its value. Do not write a guess.
 5. Write the keys in the order of the table below.
+6. Do not merge files outside `corpus/` that contain the same executable
+   graph. Each file keeps its own tags. Only a `corpus/` collection removes
+   duplicate graphs (see [Duplicate policy](#duplicate-policy)).
 
 | Key | Values | Applies to |
 |---|---|---|
 | `operation` | `convolution`, `sdpa`, `matmul`, `moe_grouped_matmul`, `pointwise`, `batchnorm`, `rmsnorm`, `layernorm` (one for each node type in the graph) | All graphs |
 | `direction` | `fwd`; `dgrad` or `wgrad` for convolution and MoE gradients; `bwd` for other gradients | All graphs |
 | `dtype` | `float32`, `float16`, `bfloat16`, `float8_e4m3` (the graph I/O data type) | All graphs |
+| `source_dtype` | `float16`, `fp8_block`, `mxfp4`, `nvfp4` (the source precision, when the graph uses a different data type) | Graphs whose source precision is not `dtype` |
 | `layout` | `nchw` or `nhwc` (convolution, batch normalization); `bshd` or `bhsd` (SDPA) | Graphs with a layout |
 | `model_family` | `llm`, `cls`, `detection`, `diffusion`, `segmentation`, `superres`, `video3d`, `med3d`, `audio1d`, `multimodal`, `ssm`, `synthetic` | Graphs with a known model |
 | `model` | Model identifiers, such as `llama3_8b` or `resnet50` | Graphs with a known model |
@@ -80,16 +84,21 @@ Rules:
 A model identifier uses lowercase letters, digits, and underscores. A family
 name joins its version number: `Llama-3.1-405B` becomes `llama3_1_405b`, and
 `GPT-3` becomes `gpt3`. When two or more models use the same graph, `model`
-contains all of them.
+contains all of them. A source label that names a test case and not a model,
+such as `gfx950_dense_test`, becomes `model` `synthetic` and `model_family`
+`synthetic`.
 
 Tag meanings:
 
 - `mode` is `training` for every gradient graph. A forward normalization
   graph that saves its statistics is also a `training` graph.
-- `attention_type` is `mla` when the source names multi-head latent attention
-  or when the query-key and value head dimensions differ. Otherwise the head
-  counts set it: equal counts give `mha`, one key-value head gives `mqa`, and
-  other counts give `gqa`.
+- `attention_type` is `mla` when the source names multi-head latent attention,
+  when the model uses it (DeepSeek-V4), or when the query-key and value head
+  dimensions differ. Otherwise the head counts set it: equal counts give
+  `mha`, one key-value head gives `mqa`, and other counts give `gqa`.
+- `source_dtype` is present when hipDNN cannot express the source precision,
+  or when the graph uses another data type than the source. The graph then
+  uses `dtype`, for example `bfloat16`.
 - `phase` comes from the source when the source gives it. Otherwise one query
   token gives `decode`, a query shorter than the key-value sequence gives
   `chunked_prefill`, and equal lengths give `prefill`.
