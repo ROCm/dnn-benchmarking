@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
+    RUNTIME_VARIANTS,
     RuntimeName,
     MetricsConfig,
     PMC_SET_CHOICES,
@@ -310,10 +311,14 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         parser_type=_parse_runtime_list,
         default=_default(SuiteConfig, "runtime"),
         metavar="RUNTIMES",
-        help="comma list of " + ", ".join(_values(RuntimeName)) + ": "
-        "hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
-        "rocke launches rocKE kernels directly (SDPA forward today). "
-        "Several runtimes add their rows to each graph, for example hipdnn,rocke",
+        help="comma list of "
+        + ", ".join([*_values(RuntimeName), *RUNTIME_VARIANTS])
+        + ": hipdnn runs engine plugins; pytorch runs the graph through PyTorch; "
+        "rocke launches rocKE kernels directly (SDPA forward today); "
+        "aiter launches AITER SDPA forward kernels directly: the aiter:auto row "
+        "(AITER's own backend selection) and one row per backend; aiter:auto "
+        "runs only the aiter:auto row. Several runtimes add their rows to each "
+        "graph, for example hipdnn,rocke",
         config_key="runtime",
         config_kind=ConfigKind.SCALAR,
         config_type=str,
@@ -601,6 +606,7 @@ examples:
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
   dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
   dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke --timing-block 50
+  dnn-benchmark -g graphs/sample_sdpa.json --runtime hipdnn,aiter --validate pytorch
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
 engines:

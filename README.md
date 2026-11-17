@@ -7,7 +7,8 @@ Benchmarking and validation tool for hipDNN graphs.
 
 dnn-benchmarking loads serialized hipDNN graphs (JSON). It runs each graph
 through the installed hipDNN engine plugins, through PyTorch with
-`--runtime pytorch`, or through rocKE SDPA kernels with `--runtime rocke`.
+`--runtime pytorch`, through rocKE SDPA kernels with `--runtime rocke`, or
+through AITER SDPA kernels with `--runtime aiter`.
 A comma list such as `--runtime hipdnn,rocke` puts the rows of each runtime
 in the same run. For each engine it measures the device time of one launch
 and, if you ask, compares the output with a PyTorch reference.
@@ -30,6 +31,9 @@ and, if you ask, compares the output with a PyTorch reference.
 - rocKE runtime: a ROCm build of PyTorch and the rocKE Python packages
   (`setup_env.py` installs them on Linux). See
   [docs/usage.md](docs/usage.md#rocke-runtime).
+- AITER runtime: a ROCm build of PyTorch and AITER from the `aiter`
+  submodule (`setup_env.py` installs it on Linux). See
+  [docs/usage.md](docs/usage.md#aiter-runtime).
 - `--validate pytorch`: any PyTorch build. A CPU build is sufficient.
 - Optional: amdsmi for GPU clocks and throttle status; `rocprofv3`, `perf`
   and `rocprof-compute` for the profiling flags.

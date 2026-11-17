@@ -13,6 +13,8 @@ from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import RuntimeName, SuiteConfig
 from ..execution.suite_runner import (
     GraphPlanner,
+    aiter_planner,
+    aiter_session,
     hipdnn_planner,
     pytorch_plan,
     rocke_planner,
@@ -105,11 +107,37 @@ def _start_rocke(config: SuiteConfig, reporter: Reporter) -> GraphPlanner:
     return rocke_planner(session)
 
 
+def _start_aiter(config: SuiteConfig, reporter: Reporter) -> GraphPlanner:
+    _check_torch_gpu("aiter")
+    if not torch_support.is_rocm_build():
+        raise RuntimeStartupError(
+            "--runtime aiter: AITER kernels need a ROCm build of torch"
+        )
+    # From the repository root, an uninstalled aiter/ submodule directory
+    # imports as a namespace package, which has no origin.
+    spec = importlib.util.find_spec("aiter")
+    if spec is None or spec.origin is None:
+        raise RuntimeStartupError(
+            "--runtime aiter: the aiter package is not importable; run "
+            "setup_env.py on Linux with ROCm torch, or `pip install "
+            "--config-settings editable_mode=compat -e aiter` from the "
+            "repository root"
+        )
+    try:
+        session = aiter_session()
+    except Exception as e:
+        raise RuntimeStartupError(
+            f"--runtime aiter: AITER does not load: {type(e).__name__}: {e}"
+        ) from e
+    return aiter_planner(session)
+
+
 #: Startup of each runtime except hipDNN, whose bindings must load before
 #: torch (see :func:`start_runtime`). A new runtime adds one entry here.
 _STARTERS: Dict[RuntimeName, Callable[[SuiteConfig, Reporter], GraphPlanner]] = {
     RuntimeName.PYTORCH: _start_pytorch,
     RuntimeName.ROCKE: _start_rocke,
+    RuntimeName.AITER: _start_aiter,
 }
 
 

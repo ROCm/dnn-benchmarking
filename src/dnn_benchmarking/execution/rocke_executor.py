@@ -30,16 +30,6 @@ from .rocke_sdpa import (
 from .timing import Measurement, Timer, is_hip_available, measure
 
 
-def device_arch(device: torch.device) -> str:
-    """GPU architecture name without feature flags (``gfx950``)."""
-    return str(torch.cuda.get_device_properties(device).gcnArchName).split(":")[0]
-
-
-def device_num_cus(device: torch.device) -> int:
-    """Compute-unit count, which rocKE's dispatcher uses to size grids."""
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
-
-
 class LoadedVariant(NamedTuple):
     """A catalog variant ready to launch with hipDNN's geometry.
 
@@ -273,7 +263,7 @@ class RockeExecutor:
             max_seqlen_q=p.seqlen_q,
             max_seqlen_k=p.seqlen_kv,
             dtype=p.dtype,
-            num_cus=device_num_cus(self._device),
+            num_cus=torch_support.device_num_cus(self._device),
         )
         views = paged_views(p, bs, q, k, v, o)
         # Force the dispatcher's path: "auto" would fall back to rocKE's
