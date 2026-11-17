@@ -182,16 +182,15 @@ def test_flash_aotriton_preference_benchmarks_sdpa(torch_gpu) -> None:
     assert m.kernel_ms[0] > 0 and m.host_ms[0] > 0
 
 
-def test_gqa_math_fallback_is_skipped_not_timed(torch_gpu) -> None:
-    """A GQA call no fused kernel accepts would run math, which copies K/V to
-    the query head count inside the timed call. The benchmark refuses it; the
-    one-shot reference still computes it.
-
-    A sliding window forces this on every arch: Flash takes no mask, and
-    Efficient needs equal Q/K/V head counts. If a torch release lifts either
-    limit, this test fails and the methodology note needs an update.
+def test_gqa_window_is_timed_fused_or_refused(torch_gpu) -> None:
+    """Default dispatch sends a GQA sliding window to math: Flash takes no
+    mask, and Efficient needs equal Q/K/V head counts. Math copies K/V to the
+    query head count inside the timed call. The benchmark either times a
+    fused kernel on K/V expanded in setup, or refuses the graph when math
+    would serve even that. It never times math; the one-shot reference still
+    computes the graph.
     """
-    from dnn_benchmarking.common.exceptions import UnsupportedGraphError
+    from torch.nn.attention import SDPBackend, sdpa_kernel
 
     torch = torch_gpu
     graph_json = {
@@ -217,8 +216,12 @@ def test_gqa_math_fallback_is_skipped_not_timed(torch_gpu) -> None:
     )
     executor.prepare()
 
-    with pytest.raises(UnsupportedGraphError, match="math backend"):
-        executor.benchmark(tensors)
+    # With math disabled, a timed call that needs math raises RuntimeError.
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        try:
+            executor.benchmark(tensors)
+        except UnsupportedGraphError as error:
+            assert "math backend" in str(error)
     executor.execute_once(tensors)
     assert tensors[4].shape == (1, 8, 128, 64)
 
