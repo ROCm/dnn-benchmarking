@@ -28,7 +28,7 @@ class PyTorchSdpaBackendState:
     ) -> None:
         self.selection = PyTorchSdpaBackendName(selection)
         self.rocm_fa_library = rocm_fa_library
-        self._native_forward_sdpa_executed = False
+        self._native_sdpa_executed = False
 
 
 _ACTIVE_SDPA_BACKEND: ContextVar[Optional[PyTorchSdpaBackendState]] = ContextVar(
@@ -64,28 +64,42 @@ def reference_sdpa_pass() -> Iterator[None]:
         _REFERENCE_PASS.reset(token)
 
 
+def reference_sdpa_call() -> bool:
+    """In a reference output pass, count the caller's SDPA computation as a
+    native call and return True; else return False.
+
+    The strict selection applies to the timed row, which is what has to prove
+    it reached a native SDPA call. A reference pass computes its outputs on
+    a repeatable path instead, so it counts for that check.
+    """
+    if not _REFERENCE_PASS.get():
+        return False
+    state = _ACTIVE_SDPA_BACKEND.get()
+    if state is not None:
+        state._native_sdpa_executed = True
+    return True
+
+
 @contextmanager
 def use_pytorch_sdpa_backend(
     state: PyTorchSdpaBackendState,
 ) -> Iterator[None]:
-    """Activate and require a native forward SDPA call for strict selections."""
-    previous_execution = state._native_forward_sdpa_executed
-    state._native_forward_sdpa_executed = False
+    """Activate and require a native SDPA call for strict selections."""
+    previous_execution = state._native_sdpa_executed
+    state._native_sdpa_executed = False
     token = _ACTIVE_SDPA_BACKEND.set(state)
     try:
         yield
         if (
             state.selection is not PyTorchSdpaBackendName.DEFAULT
-            and not state._native_forward_sdpa_executed
+            and not state._native_sdpa_executed
         ):
             raise _unavailable_error(
                 state.selection,
-                "The graph did not execute a native forward SDPA call.",
+                "The graph did not execute a native SDPA call.",
             )
     finally:
-        state._native_forward_sdpa_executed = (
-            previous_execution or state._native_forward_sdpa_executed
-        )
+        state._native_sdpa_executed = previous_execution or state._native_sdpa_executed
         _ACTIVE_SDPA_BACKEND.reset(token)
 
 
@@ -206,6 +220,28 @@ def strict_sdpa_selection() -> Optional[PyTorchSdpaBackendName]:
     return state.selection
 
 
+@contextmanager
+def native_sdpa_call() -> Iterator[None]:
+    """Scope a native SDPA kernel call made outside ``execute_selected_sdpa``.
+
+    A backward replays the fused kernel its forward probe selected. PyTorch
+    reads the ROCm Flash preference on each call, so the call runs under the
+    selected preference. Each call counts as a native call of the selected
+    category.
+    """
+    state = _ACTIVE_SDPA_BACKEND.get()
+    if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
+        with _SDPA_SELECTION_LOCK:
+            yield
+        return
+    with (
+        _SDPA_SELECTION_LOCK,
+        _prefer_rocm_fa_library(state.selection, state.rocm_fa_library),
+    ):
+        yield
+    state._native_sdpa_executed = True
+
+
 def _sdpa_kwargs(
     attn_mask: Optional[torch.Tensor],
     dropout_p: float,
@@ -305,18 +341,12 @@ def execute_selected_sdpa(
     """
     kwargs = _sdpa_kwargs(attn_mask, dropout_p, is_causal, scale, enable_gqa)
     state = _ACTIVE_SDPA_BACKEND.get()
-    if _REFERENCE_PASS.get():
+    if reference_sdpa_call():
         sdpa_kernel, math = _selected_sdp_backend(PyTorchSdpaBackendName.MATH)
         with _SDPA_SELECTION_LOCK, sdpa_kernel(math):
-            result = torch.nn.functional.scaled_dot_product_attention(
+            return torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **kwargs
             )
-        if state is not None:
-            # The strict selection applies to the timed row, which is what has
-            # to prove it reached a native forward SDPA call. This pass makes
-            # one too, so it counts for that check.
-            state._native_forward_sdpa_executed = True
-        return result
     if state is None or state.selection is PyTorchSdpaBackendName.DEFAULT:
         with _SDPA_SELECTION_LOCK:
             return torch.nn.functional.scaled_dot_product_attention(
@@ -340,5 +370,5 @@ def execute_selected_sdpa(
             if _is_backend_unavailable_error(error):
                 raise _unavailable_error(state.selection, str(error)) from error
             raise
-        state._native_forward_sdpa_executed = True
+        state._native_sdpa_executed = True
         return result

@@ -231,3 +231,125 @@ def test_block_boundaries_do_not_change_the_result(monkeypatch, block_elements) 
         assert result.worst_index == (0, 2, 1)
         assert result.max_rel_diff == pytest.approx(0.5 / 10.0)
     np.testing.assert_array_equal(expected, reference)
+
+
+def _varlen_pair():
+    expected = np.ones((2, 2, 4, 3), dtype=np.float32)
+    return expected.copy(), expected
+
+
+def test_lengths_exclude_padding_from_the_comparison() -> None:
+    actual, expected = _varlen_pair()
+    actual[0, :, 2:, :] = np.nan  # batch 0 is valid up to 2
+    actual[1, :, 3:, :] = 1e9  # batch 1 is valid up to 3
+
+    host = compare(actual, expected, rtol=0.0, atol=0.0, lengths=[2, 3])
+    assert host.passed
+    assert host.n_total == (2 + 3) * 2 * 3
+    assert host.max_abs_diff == 0.0
+    torch = pytest.importorskip("torch")
+    device = compare(
+        torch.from_numpy(actual),
+        torch.from_numpy(expected),
+        rtol=0.0,
+        atol=0.0,
+        lengths=[2, 3],
+    )
+    assert device.passed and device.n_total == host.n_total
+
+
+def test_lengths_still_fail_a_wrong_value_inside_the_valid_range() -> None:
+    actual, expected = _varlen_pair()
+    actual[0, :, 2:, :] = 5.0  # padding: ignored
+    actual[1, 1, 2, 1] = 4.0  # valid for batch 1 (length 3)
+
+    host = compare(actual, expected, rtol=0.0, atol=0.1, lengths=[2, 3])
+
+    assert not host.passed
+    assert host.n_mismatch == 1
+    assert host.worst_index == (1, 1, 2, 1)  # an index of the full tensor
+    assert host.max_abs_diff == 3.0
+    assert "1/30" in host.message
+
+
+def test_lengths_report_the_cross_batch_maximum_and_the_first_worst_index() -> None:
+    actual, expected = _varlen_pair()
+    actual[0, 0, 0, 0] = 1.5  # abs 0.5, rel 0.5
+    expected[1, 0, 0, 0] = 4.0
+    actual[1, 0, 0, 0] = 4.5  # abs 0.5 (a tie), rel 0.125
+
+    for result in _both(actual, expected, rtol=0.0, atol=0.0, lengths=[2, 3]):
+        assert result.n_mismatch == 2
+        assert result.max_abs_diff == 0.5
+        assert result.max_rel_diff == pytest.approx(0.5)
+        assert result.worst_index[0] == 0
+
+
+def test_lengths_fail_a_nan_inside_the_valid_range() -> None:
+    actual, expected = _varlen_pair()
+    actual[1, 0, 0, 0] = np.nan
+
+    result = compare(actual, expected, rtol=0.0, atol=0.0, lengths=[1, 4])
+
+    assert not result.passed
+    assert result.n_total == (1 + 4) * 2 * 3
+    assert "NaN or Inf" in result.message
+
+
+def test_zero_length_batches_contribute_nothing() -> None:
+    actual, expected = _varlen_pair()
+    actual[:] = np.nan
+
+    result = compare(actual, expected, rtol=0.0, atol=0.0, lengths=[0, 0])
+
+    assert result.passed
+    assert result.n_total == 0
+
+
+def test_lengths_reject_a_wrong_count_or_range() -> None:
+    actual, expected = _varlen_pair()
+
+    with pytest.raises(ValueError):
+        compare(actual, expected, rtol=0.0, atol=0.0, lengths=[1])
+    with pytest.raises(ValueError):
+        compare(actual, expected, rtol=0.0, atol=0.0, lengths=[1, 5])
+
+
+def test_matching_infinities_pass_only_when_requested() -> None:
+    expected = np.array([1.0, -np.inf, 2.0], dtype=np.float32)
+    actual = expected.copy()
+
+    strict = compare(actual, expected, rtol=0.0, atol=0.0)
+    lenient = compare(actual, expected, rtol=0.0, atol=0.0, matching_infinities=True)
+
+    assert not strict.passed
+    assert lenient.passed
+    assert lenient.n_total == 3 and lenient.n_mismatch == 0
+    assert lenient.max_abs_diff == 0.0
+
+
+def test_matching_infinities_still_compare_the_finite_values() -> None:
+    expected = np.array([1.0, -np.inf, 2.0], dtype=np.float32)
+    actual = np.array([1.0, -np.inf, 3.0], dtype=np.float32)
+
+    for result in _both(actual, expected, rtol=0.0, atol=0.1, matching_infinities=True):
+        assert result.n_mismatch == 1
+        assert result.worst_index == (2,)
+
+
+@pytest.mark.parametrize(
+    "actual, expected",
+    [
+        ([np.inf], [-np.inf]),  # opposite signs
+        ([np.inf], [1.0]),  # infinity against a finite value
+        ([1.0], [-np.inf]),
+        ([np.nan], [np.nan]),  # NaN is never equal
+    ],
+)
+def test_matching_infinities_reject_everything_else(actual, expected) -> None:
+    a = np.array(actual, dtype=np.float32)
+    e = np.array(expected, dtype=np.float32)
+
+    for result in _both(a, e, rtol=0.0, atol=0.0, matching_infinities=True):
+        assert not result.passed
+        assert result.max_abs_diff == float("inf")

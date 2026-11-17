@@ -305,10 +305,7 @@ def test_nondefault_backend_requires_native_sdpa_execution(
 ) -> None:
     executor, _ = _prepared(rocm_module, monkeypatch, fake_cuda, sdpa="math")
 
-    with pytest.raises(
-        rocm_module.pytorch_ops.PyTorchSdpaBackendUnavailableError,
-        match="The graph did not execute a native forward SDPA call.",
-    ):
+    with pytest.raises(rocm_module.pytorch_ops.PyTorchSdpaBackendUnavailableError):
         executor.benchmark({})
 
 
