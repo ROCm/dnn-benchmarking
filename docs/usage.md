@@ -253,7 +253,7 @@ The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 its rows to the same graph, in one process and one result file:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+dnn-benchmark -g Workloads/corpus/SDPA/files.tar.gz --runtime hipdnn,rocke \
   --validate pytorch --timing-block 50 -o results.json
 ```
 
@@ -430,7 +430,7 @@ Requirements and limits:
 To compare rocKE with hipDNN, run both runtimes in one run:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+dnn-benchmark -g Workloads/corpus/SDPA/files.tar.gz --runtime hipdnn,rocke \
   -e hipkernel:Gfx950AttentionDense --timing-block 50 -o both.json
 ```
 

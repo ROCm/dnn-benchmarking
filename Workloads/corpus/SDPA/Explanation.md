@@ -4,6 +4,9 @@ This collection contains scaled dot-product attention (SDPA) graphs from the
 rocKE SDPA Solera performance set.
 The source file SHA-256 value is
 `948f7fce7bb16bbf8a91f307c44dc1709e91a2277a6e540af692f3e2488d3c79`.
+The repository also kept the 172 source graphs, with 32 convolution graphs,
+as `Workloads/microbench/rocke.tar.gz`. That set is removed. This collection
+is now the only copy of these SDPA graphs.
 
 ## Contents
 

@@ -73,12 +73,11 @@ Rules:
 | `mask` | `none`, `causal`, `sliding_window` | SDPA graphs |
 | `phase` | `prefill`, `chunked_prefill`, `decode` | SDPA graphs, MoE graphs with a known phase |
 | `sink` | `true`, `false` | SDPA graphs |
-| `source_feature` | `doc_mask`, `varlen` (an SDPA feature of the source that the graph does not express) | SDPA graphs whose source uses such a feature |
 | `activation` | `swiglu`, `swiglu_clamped`, `swiglu_oai`, `situglu` | MoE graphs with a fused gated activation |
 | `tensor_parallel` | `1`, `2`, `4`, `8` | `microbench/cudnn_attention_inference` |
-| `suite` | `regular`, `extended` | `headline/attn`, `headline/moe`, `microbench/rocke` |
-| `priority` | `p0`, `p1`, `p2` | `headline/attn`, `headline/moe`, `microbench/rocke` |
-| `purpose` | `acceptance`, `perf_diagnostic`, `frontier`, `coverage_gap`, `ep_scaling` | `headline/attn`, `headline/moe`, `microbench/rocke` |
+| `suite` | `regular`, `extended` | `headline/attn`, `headline/moe` |
+| `priority` | `p0`, `p1`, `p2` | `headline/attn`, `headline/moe` |
+| `purpose` | `acceptance`, `perf_diagnostic`, `frontier`, `coverage_gap`, `ep_scaling` | `headline/attn`, `headline/moe` |
 
 A model identifier uses lowercase letters, digits, and underscores. A family
 name joins its version number: `Llama-3.1-405B` becomes `llama3_1_405b`, and
