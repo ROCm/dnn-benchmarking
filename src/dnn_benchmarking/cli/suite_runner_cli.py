@@ -227,6 +227,9 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "fast": config.fast,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
+        "aiter_rows": (
+            config.aiter_rows.value if RuntimeName.AITER in config.runtimes else None
+        ),
         "metrics": metrics.basic,
         "profiling": {
             "pmc": metrics.pmc_set,

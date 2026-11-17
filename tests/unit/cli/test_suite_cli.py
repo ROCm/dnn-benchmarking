@@ -495,6 +495,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "fast": False,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
+        "aiter_rows": None,  # AITER not selected
         "metrics": True,
         "profiling": {
             "pmc": None,

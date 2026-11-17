@@ -87,6 +87,11 @@ class BenchmarkStats:
 # under 2x (the slowest sample in the docs/methodology.md matmul run is 1.3x).
 NOISY_IQR = 0.05
 OUTLIER_RATIO = 2.0
+# HOST_BOUND: a block or events span cannot be shorter than the host's submit
+# time for the same launches. When the median submit reaches 90 % of the
+# median span, the span measures the host (MI210: a 12 us AITER kernel reads
+# 24 us in block mode with a 23.7 us submit), not the kernel.
+HOST_BOUND = 0.9
 
 
 def noise_warnings(stats: BenchmarkStats) -> List[str]:
@@ -103,6 +108,25 @@ def noise_warnings(stats: BenchmarkStats) -> List[str]:
     if stats.median_ms > 0 and stats.max_ms > OUTLIER_RATIO * stats.median_ms:
         warnings.append(f"outlier: max {stats.max_ms / stats.median_ms:.1f}x median")
     return warnings
+
+
+def host_bound_warnings(
+    kernel: BenchmarkStats, host: BenchmarkStats, mode: str
+) -> List[str]:
+    """Flag a kernel time that the host submit time sets.
+
+    Block and events spans include the host's launch gaps. The staged span
+    starts after the host has enqueued the work, so it is never host-bound.
+    """
+    if mode == "staged" or kernel.median_ms <= 0:
+        return []
+    ratio = host.median_ms / kernel.median_ms
+    if ratio < HOST_BOUND:
+        return []
+    return [
+        f"host-bound: submit is {ratio:.0%} of kernel_med in {mode} timing; "
+        "the time is launch cost, not device time"
+    ]
 
 
 @dataclass
