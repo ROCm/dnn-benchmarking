@@ -35,6 +35,7 @@ class RuntimeName(str, Enum):
     HIPDNN = "hipdnn"
     PYTORCH = "pytorch"
     ROCKE = "rocke"
+    AITER = "aiter"
 
 
 #: Options that only some runtimes honour. An option is accepted when at least
@@ -57,28 +58,62 @@ RUNTIME_OPTIONS: Dict[RuntimeName, frozenset] = {
     RuntimeName.PYTORCH: frozenset({"--oracle"}),
     # --plugin-path locates the shipped rocKE descriptors.
     RuntimeName.ROCKE: frozenset({"--plugin-path", "--validate pytorch"}),
+    RuntimeName.AITER: frozenset({"--validate pytorch"}),
 }
 
 
-def parse_runtimes(value: Any) -> Tuple[RuntimeName, ...]:
-    """Parse ``--runtime`` (one name or a comma list) into run order.
+class AiterRows(str, Enum):
+    """The AITER rows of each graph."""
 
-    The order is :class:`RuntimeName` order, not the typed order: hipDNN
-    loads its HIP runtime before torch does, and its rows exist before a
-    later runtime can fault the process.
+    #: ``--runtime aiter``: ``aiter:auto`` and every AITER backend that runs
+    #: the graph.
+    ALL = "all"
+    #: ``--runtime aiter:auto``: ``aiter:auto`` only, AITER's own backend
+    #: selection (out of the box).
+    AUTO = "auto"
+
+
+#: ``--runtime`` names that select one runtime with fewer rows.
+RUNTIME_VARIANTS: Dict[str, Tuple[RuntimeName, AiterRows]] = {
+    "aiter:auto": (RuntimeName.AITER, AiterRows.AUTO),
+}
+
+
+def parse_runtime_selection(value: Any) -> Tuple[Tuple[RuntimeName, ...], AiterRows]:
+    """Parse ``--runtime`` (one name or a comma list): runtimes and AITER rows.
+
+    The runtimes are in :class:`RuntimeName` order, not the typed order:
+    hipDNN loads its HIP runtime before torch does, and its rows exist before
+    a later runtime can fault the process. ``aiter:auto`` selects the AITER
+    runtime with only its ``aiter:auto`` row.
     """
     text = value.value if isinstance(value, RuntimeName) else str(value)
     names = [part.strip() for part in text.split(",")]
-    try:
-        selected = {RuntimeName(name) for name in names}
-    except ValueError as e:
-        choices = ", ".join(r.value for r in RuntimeName)
-        raise ValueError(
-            f"must be one of: {choices}, or a comma list of them; got {text!r}"
-        ) from e
-    if len(selected) != len(names):
-        raise ValueError(f"lists a runtime twice: {text!r}")
-    return tuple(name for name in RuntimeName if name in selected)
+    selected = set()
+    aiter_rows = AiterRows.ALL
+    for name in names:
+        if name in RUNTIME_VARIANTS:
+            runtime, aiter_rows = RUNTIME_VARIANTS[name]
+        else:
+            try:
+                runtime = RuntimeName(name)
+            except ValueError as e:
+                choices = ", ".join(
+                    [*(r.value for r in RuntimeName), *RUNTIME_VARIANTS]
+                )
+                raise ValueError(
+                    f"must be one of: {choices}, or a comma list of them; got {text!r}"
+                ) from e
+        if runtime in selected:
+            raise ValueError(f"lists a runtime twice: {text!r}")
+        selected.add(runtime)
+    return tuple(name for name in RuntimeName if name in selected), aiter_rows
+
+
+def parse_runtimes(value: Any) -> Tuple[RuntimeName, ...]:
+    """The runtimes of ``--runtime``, in run order (see
+    :func:`parse_runtime_selection`)."""
+    return parse_runtime_selection(value)[0]
 
 
 class PyTorchSdpaBackendName(str, Enum):
@@ -374,9 +409,11 @@ class SuiteConfig:
             (``hipdnn`` runs discovered engine plugins, ``pytorch`` runs the
             graph through the PyTorch executor as a single engine row,
             ``rocke`` launches rocKE kernels directly (SDPA forward today),
-            one row per kernel). Several runtimes add their rows to the same
-            graph. After ``__post_init__`` it holds the first runtime and
-            ``runtimes`` holds all of them.
+            one row per kernel; ``aiter`` launches AITER SDPA forward
+            kernels directly, one row per backend, and ``aiter:auto`` only
+            AITER's own selection). Several runtimes add
+            their rows to the same graph. After ``__post_init__`` it holds
+            the first runtime and ``runtimes`` holds all of them.
         pytorch_sdpa_backend: Strict PyTorch SDPA category selection for
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
@@ -431,6 +468,9 @@ class SuiteConfig:
     timing_policy: TimingPolicy = field(init=False, repr=False)
     #: Every selected runtime, in run order (see :func:`parse_runtimes`).
     runtimes: Tuple[RuntimeName, ...] = field(init=False)
+    #: The AITER rows of each graph; ``aiter:auto`` in ``--runtime`` selects
+    #: :attr:`AiterRows.AUTO`.
+    aiter_rows: AiterRows = field(init=False)
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "SuiteConfig":
@@ -442,8 +482,8 @@ class SuiteConfig:
         hip-kernel-provider descriptors there.
         """
         plugin_paths = args.plugin_path
-        if plugin_paths is None and parse_runtimes(args.runtime) != (
-            RuntimeName.PYTORCH,
+        if plugin_paths is None and {RuntimeName.HIPDNN, RuntimeName.ROCKE} & set(
+            parse_runtimes(args.runtime)
         ):
             from ..common.rocm_runtime import default_hipdnn_plugin_paths
 
@@ -516,7 +556,7 @@ class SuiteConfig:
                         "--plugin-path entry count must be 1 or match --engine count"
                     )
         try:
-            self.runtimes = parse_runtimes(self.runtime)
+            self.runtimes, self.aiter_rows = parse_runtime_selection(self.runtime)
         except ValueError as e:
             raise ValueError(f"--runtime {e}") from e
         self.runtime = self.runtimes[0]

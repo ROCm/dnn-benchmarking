@@ -2,3 +2,7 @@
 	path = rocm-libraries
 	url = https://github.com/ROCm/rocm-libraries.git
 	branch = develop
+[submodule "aiter"]
+	path = aiter
+	url = https://github.com/ROCm/aiter.git
+	branch = main
