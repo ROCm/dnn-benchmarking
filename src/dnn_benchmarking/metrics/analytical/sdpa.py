@@ -31,6 +31,13 @@ keys up to and including the diagonal and ``right`` keys past it, as in
 hipDNN (since rocm-libraries #14483) and cuDNN. An unset bound is unbounded,
 and ``left_bound = 0`` is rejected.
 
+For a variable-length node (per-batch ``seq_len`` / ``cu_seq_len`` or ragged
+offsets, or a paged node) the count is a sum over batches,
+``num_q_heads * sum_b P(Sq_b, Skv_b)``, with the live lengths read from the
+input data. Without input data, or for a dense node, the tensor dims give
+``Sq`` and ``Skv``; a paged node then takes ``Skv`` as the page-table width
+times the page size, capped by ``max_seq_len_kv``.
+
 A causal sliding window of ``W`` keys (``left = W``, ``right = 0``,
 BOTTOM_RIGHT) therefore counts ``sum_i min(i + off + 1, W)`` pairs — the same
 windowed count the rocKE attention benchmarks report.
@@ -40,6 +47,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from ...graph.varlen import ReadInts, sdpa_lengths
 from ._common import node_param, node_tensor
 
 #: ``(left, right, bottom_right)``; a ``None`` bound is unbounded. ``left``
@@ -127,9 +135,14 @@ def _nonmasked_pairs(
 
 
 def _attention_terms(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors_by_uid: Dict[int, Dict[str, Any]],
+    read_ints: Optional[ReadInts] = None,
 ) -> Optional[Tuple[int, int, int]]:
     """Return ``(batch * num_q_heads * P, head_dim_qk, head_dim_vo)``.
+
+    ``read_ints(uid)`` reads an integer input tensor (the live lengths of a
+    variable-length node).
 
     Returns None when q/k/v tensor data is incomplete, or when the mask is
     one hipDNN rejects (:func:`sdpa_band` raises).
@@ -150,9 +163,10 @@ def _attention_terms(
     table = node_tensor(node, "page_table_k_tensor_uid", tensors_by_uid)
     table_dims = (table or {}).get("dims") or []
     if len(table_dims) >= 2:
-        # A paged K is a block container [blocks, H, page_size, D]: a sequence
-        # spans the table width times the page size, capped by max_seq_len_kv
-        # (the lengths the input generator gives every sequence).
+        # A paged K is a block container [blocks, H, page_size, D]: without
+        # the lengths, a sequence spans the table width times the page size,
+        # capped by max_seq_len_kv (the longest sequence the input generator
+        # gives).
         kv_seqlen *= int(np.prod(table_dims[1:], dtype=np.int64))
         cap = node_param(node, "max_seq_len_kv")
         if cap is not None:
@@ -165,15 +179,26 @@ def _attention_terms(
         band = sdpa_band(node)
     except ValueError:
         return None
+    lengths = (
+        sdpa_lengths(node, tensors_by_uid, read_ints) if read_ints is not None else None
+    )
+    if lengths is not None:
+        num_q_heads = int(q_dims[-3])
+        pairs = sum(
+            _nonmasked_pairs(lq, lkv, *band) for lq, lkv in zip(lengths[0], lengths[1])
+        )
+        return num_q_heads * pairs, int(q_dims[-1]), int(v_dims[-1])
     pairs = _nonmasked_pairs(q_seqlen, kv_seqlen, *band)
     return rows * pairs, int(q_dims[-1]), int(v_dims[-1])
 
 
 def sdpa_fwd_flops(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors_by_uid: Dict[int, Dict[str, Any]],
+    read_ints: Optional[ReadInts] = None,
 ) -> Optional[int]:
     """FLOPs for SdpaAttributes: ``2 * B * Hq * P * (Dqk + Dvo)``."""
-    terms = _attention_terms(node, tensors_by_uid)
+    terms = _attention_terms(node, tensors_by_uid, read_ints)
     if terms is None:
         return None
     pairs, head_dim_qk, head_dim_vo = terms
@@ -181,10 +206,12 @@ def sdpa_fwd_flops(
 
 
 def sdpa_bwd_flops(
-    node: Dict[str, Any], tensors_by_uid: Dict[int, Dict[str, Any]]
+    node: Dict[str, Any],
+    tensors_by_uid: Dict[int, Dict[str, Any]],
+    read_ints: Optional[ReadInts] = None,
 ) -> Optional[int]:
     """FLOPs for SdpaBackwardAttributes: ``2 * B * Hq * P * (3*Dqk + 2*Dvo)``."""
-    terms = _attention_terms(node, tensors_by_uid)
+    terms = _attention_terms(node, tensors_by_uid, read_ints)
     if terms is None:
         return None
     pairs, head_dim_qk, head_dim_vo = terms

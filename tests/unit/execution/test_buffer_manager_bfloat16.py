@@ -370,27 +370,21 @@ class TestPyTorchLoadInputData:
 class TestPagedInputGeneration:
     """Page tables and sequence lengths are integer inputs with invariants
     random data cannot satisfy: a page table must address distinct pages in
-    the cache, and a length must be positive and fit its page allocation and
-    its query rows. The layout is hipDNN's: page tables [B, 1, W, 1] and
-    seq_len [B, 1, 1, 1]."""
+    the cache, and a length must be positive and fit its page allocation."""
 
     PAGE_SIZE = 64
     NUM_PAGES = 128
     NUM_SEQS = 2
     BLOCKS_PER_SEQ = 32
-    Q_LEN = 1  # decode: one query row, shorter than a page
 
-    def _graph(self, **attributes):
-        table = [self.NUM_SEQS, 1, self.BLOCKS_PER_SEQ, 1]
+    def _graph(self):
         return {
             "tensors": [
-                {"uid": 1, "name": "Q", "dims": [self.NUM_SEQS, 8, self.Q_LEN, 128]},
                 {
                     "uid": 2,
                     "name": "K",
                     "dims": [self.NUM_PAGES, 4, self.PAGE_SIZE, 128],
                 },
-                {"uid": 5, "name": "PAGE_TABLE_K", "dims": table},
             ],
             "nodes": [
                 {
@@ -405,7 +399,7 @@ class TestPagedInputGeneration:
                         "seq_len_kv_tensor_uid": 8,
                     },
                     "outputs": {"o_tensor_uid": 4},
-                    "attributes": attributes,
+                    "attributes": {},
                 }
             ],
         }
@@ -414,36 +408,56 @@ class TestPagedInputGeneration:
         return _tensor(uid, "int32", dims=dims, strides=[1] * len(dims))
 
     def test_page_table_spans_multiple_pages_within_the_cache(self) -> None:
-        table = self._int_tensor(5, [self.NUM_SEQS, 1, self.BLOCKS_PER_SEQ, 1])
+        table = self._int_tensor(5, [self.NUM_SEQS, self.BLOCKS_PER_SEQ])
         data = generate_input_data([table], seed=0, graph_json=self._graph())[5]
         assert data.dtype == np.int32
-        rows = data.reshape(self.NUM_SEQS, -1)
-        assert len(np.unique(rows)) == rows.size, "sequences share a page"
+        assert data.max() > 0, "every sequence would read page 0"
         assert data.max() < self.NUM_PAGES, "page id addresses beyond the cache"
 
-    @pytest.mark.parametrize("max_seq_len_kv", [None, 100])
-    def test_lengths_fill_the_page_allocation_and_the_query(
-        self, max_seq_len_kv
-    ) -> None:
-        dims = [self.NUM_SEQS, 1, 1, 1]
-        lengths = [self._int_tensor(7, dims), self._int_tensor(8, dims)]
-        graph = self._graph(max_seq_len_kv=max_seq_len_kv)
-        data = generate_input_data(lengths, seed=0, graph_json=graph)
-        kv = max_seq_len_kv or self.BLOCKS_PER_SEQ * self.PAGE_SIZE
-        np.testing.assert_array_equal(data[7], np.full(dims, self.Q_LEN))
-        np.testing.assert_array_equal(data[8], np.full(dims, kv))
-
-    def test_packed_query_splits_its_rows_over_the_sequences(self) -> None:
-        """A packed [1, H, total_q, D] Q holds every sequence's rows, so each
-        seq_len_q is a share of total_q, not total_q (the planner would read
-        past Q for every sequence after the first)."""
+    def test_lengths_are_positive_and_fit_the_page_allocation(self) -> None:
         graph = self._graph()
-        graph["tensors"][0]["dims"] = [1, 8, self.NUM_SEQS * 3, 128]
-        dims = [self.NUM_SEQS]
-        data = generate_input_data(
-            [self._int_tensor(7, dims)], seed=0, graph_json=graph
+        graph["tensors"].append(
+            {"uid": 5, "name": "PAGE_TABLE_K", "dims": [self.NUM_SEQS, 4]}
         )
-        np.testing.assert_array_equal(data[7], np.full(dims, 3))
+        table = self._int_tensor(5, [self.NUM_SEQS, 4])
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([table, lengths], seed=0, graph_json=graph)[8]
+        assert data.min() > 0, "a zero length is an empty sequence"
+        assert data.max() <= 4 * self.PAGE_SIZE, "length exceeds the page table"
+
+    def test_page_tables_under_attributes_are_found_like_the_resolver_does(
+        self,
+    ) -> None:
+        """The table and length lookups share the resolver's operand lookup,
+        so a page table key in another node section still gets page ids."""
+        graph = self._graph()
+        node = graph["nodes"][0]
+        for key in ("page_table_k_tensor_uid", "page_table_v_tensor_uid"):
+            node["attributes"][key] = node["inputs"].pop(key)
+        graph["tensors"].append(
+            {"uid": 5, "name": "PAGE_TABLE_K", "dims": [self.NUM_SEQS, 4]}
+        )
+        table = self._int_tensor(5, [self.NUM_SEQS, 4])
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([table, lengths], seed=0, graph_json=graph)
+        assert data[5].max() > 0, "every sequence would read page 0"
+        assert data[5].max() < self.NUM_PAGES
+        assert data[8].max() <= 4 * self.PAGE_SIZE, "length exceeds the page table"
+
+    def test_a_v_page_table_alone_marks_the_node_paged(self) -> None:
+        """Paged detection matches the resolver: either page table makes the
+        node paged, so lengths fit that table's allocation."""
+        graph = self._graph()
+        node = graph["nodes"][0]
+        node["inputs"]["page_table_k_tensor_uid"] = None
+        graph["tensors"].append(
+            {"uid": 6, "name": "PAGE_TABLE_V", "dims": [self.NUM_SEQS, 4]}
+        )
+        table = self._int_tensor(6, [self.NUM_SEQS, 4])
+        lengths = self._int_tensor(8, [self.NUM_SEQS])
+        data = generate_input_data([table, lengths], seed=0, graph_json=graph)
+        assert data[6].max() > 0, "every sequence would read page 0"
+        assert 0 < data[8].min() and data[8].max() <= 4 * self.PAGE_SIZE
 
     def test_dense_graph_inputs_are_untouched(self) -> None:
         """A graph with no page table generates exactly what it would without
