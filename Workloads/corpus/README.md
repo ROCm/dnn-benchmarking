@@ -73,8 +73,11 @@ Rules:
 | `mask` | `none`, `causal`, `sliding_window` | SDPA graphs |
 | `phase` | `prefill`, `chunked_prefill`, `decode` | SDPA graphs, MoE graphs with a known phase |
 | `sink` | `true`, `false` | SDPA graphs |
+| `dropout` | Attention dropout probability of the source, such as `0.1`, when the graph has no dropout inputs | `headline/attn` (read by `tools/sdpa_fwd_to_bwd.py`) |
+| `source_feature` | `sink` (an SDPA feature of the source that the graph does not express) | SDPA graphs whose source uses such a feature |
 | `activation` | `swiglu`, `swiglu_clamped`, `swiglu_oai`, `situglu` | MoE graphs with a fused gated activation |
 | `tensor_parallel` | `1`, `2`, `4`, `8` | `microbench/cudnn_attention_inference` |
+| `origin` | `converted_fwd`, `captured_bwd`, `model_spec` | `corpus/SDPABackward` |
 | `suite` | `regular`, `extended` | `headline/attn`, `headline/moe` |
 | `priority` | `p0`, `p1`, `p2` | `headline/attn`, `headline/moe` |
 | `purpose` | `acceptance`, `perf_diagnostic`, `frontier`, `coverage_gap`, `ep_scaling` | `headline/attn`, `headline/moe` |
@@ -101,8 +104,9 @@ Tag meanings:
   uses `dtype`, for example `bfloat16`.
 - `phase` comes from the source when the source gives it. Otherwise one query
   token gives `decode`, a query shorter than the key-value sequence gives
-  `chunked_prefill`, and equal lengths give `prefill`.
+  `chunked_prefill`, and other lengths give `prefill`.
 - `mask` is `sliding_window` when the SDPA node has a left or right bound.
+
 ## Current collections
 
 | Collection | Scope | Documentation |

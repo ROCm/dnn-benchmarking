@@ -124,7 +124,7 @@ def test_forward_only_features_are_skipped(tool, inputs, reason) -> None:
 
 def test_captured_dropout_metadata_adds_philox_dropout_once(tool) -> None:
     bwd = tool.convert(_forward())
-    captured = {**bwd, "metadata": {"dropout": 0.1}}
+    captured = {**bwd, "metadata": {"dropout": ["0.1"]}}
 
     adopted = tool.adopt(captured)
     node = adopted["nodes"][0]
@@ -134,7 +134,7 @@ def test_captured_dropout_metadata_adds_philox_dropout_once(tool) -> None:
         uids
     )
     # A graph that already has dropout keeps its own probability and inputs.
-    again = tool.adopt({**adopted, "metadata": {"dropout": 0.3}})
+    again = tool.adopt({**adopted, "metadata": {"dropout": ["0.3"]}})
     assert again["nodes"][0] == node
     assert len(again["tensors"]) == len(adopted["tensors"])
 
@@ -147,3 +147,30 @@ def test_identity_ignores_name_and_metadata_only(tool) -> None:
 
     assert tool.identity(renamed) == tool.identity(bwd)
     assert tool.identity(changed) != tool.identity(bwd)
+
+
+def test_tags_follow_the_convention_and_union_the_sources(tool) -> None:
+    """Duplicates keep every source model; one ``mla`` source marks the graph
+    ``mla`` even though its head dims are equal (absorbed MLA)."""
+    bwd = tool.convert(_forward())
+    sources = [
+        {"model": ["kimi_k3"], "model_family": ["llm"], "attention_type": ["mla"]},
+        {"model": ["synthetic"], "model_family": ["synthetic"]},
+    ]
+
+    tags = tool.tags(bwd, ["converted_fwd", "converted_fwd"], sources)
+
+    assert tags == {
+        "operation": ["sdpa"],
+        "direction": ["bwd"],
+        "dtype": ["float16"],
+        "layout": ["bhsd"],
+        "model_family": ["llm", "synthetic"],
+        "model": ["kimi_k3", "synthetic"],
+        "mode": ["training"],
+        "attention_type": ["mla"],
+        "mask": ["causal"],
+        "phase": ["chunked_prefill"],
+        "sink": ["false"],
+        "origin": ["converted_fwd"],
+    }

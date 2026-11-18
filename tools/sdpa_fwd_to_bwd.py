@@ -22,10 +22,12 @@ The corpus has three origins, recorded in ``metadata.origin``:
   (``_MODEL_SPECS``): attention dropout, additive bias with and without
   dBias, and ALiBi, at the published shapes of the named models.
 
-``metadata.shape`` is ``decode`` (Sq = 1), ``sq_lt_skv``, ``sq_eq_skv`` or
-``sq_gt_skv``. Duplicates (canonical JSON without ``name`` and
-``metadata``) are kept once, with the sources of every copy in
-``metadata.source``.
+The metadata follows the workload tag convention
+(``Workloads/corpus/README.md``, ``Metadata tags``). The backward graph gives
+``dtype``, ``layout``, ``mask``, ``phase`` and ``sink``; ``mode`` is
+``training``. ``model``, ``model_family`` and an ``mla`` ``attention_type``
+are the union over the source graphs. Duplicates (canonical JSON without
+``name`` and ``metadata``) are kept once, with the union of their tags.
 
 Usage:
   python tools/sdpa_fwd_to_bwd.py -o Workloads/corpus/SDPABackward/files.tar.gz \\
@@ -174,6 +176,31 @@ class Skip(Exception):
     """The graph has no backward equivalent."""
 
 
+#: Graph I/O data type -> convention ``dtype`` value.
+_DTYPES = {
+    "half": "float16",
+    "bfloat16": "bfloat16",
+    "float": "float32",
+    "fp8_e4m3": "float8_e4m3",
+}
+
+#: Convention key order of the tags this tool writes.
+_TAG_ORDER = (
+    "operation",
+    "direction",
+    "dtype",
+    "layout",
+    "model_family",
+    "model",
+    "mode",
+    "attention_type",
+    "mask",
+    "phase",
+    "sink",
+    "origin",
+)
+
+
 def _param(node: Dict[str, Any], key: str) -> Any:
     for section in ("inputs", "outputs", "attributes", "parameters"):
         value = (node.get(section) or {}).get(key)
@@ -224,7 +251,8 @@ def adopt(bwd: Dict[str, Any]) -> Dict[str, Any]:
         raise Skip("not_single_sdpa_bwd")
     graph = {k: copy.deepcopy(v) for k, v in bwd.items() if k != "metadata"}
     metadata = bwd.get("metadata")
-    dropout = float(metadata.get("dropout") or 0.0) if isinstance(metadata, dict) else 0
+    values = metadata.get("dropout") if isinstance(metadata, dict) else None
+    dropout = float(values[0]) if values else 0.0
     node = graph["nodes"][0]
     if dropout and not float(_param(node, "dropout_probability") or 0.0):
         _add_dropout(graph, dropout)
@@ -295,16 +323,84 @@ def spec_graph(spec: Dict[str, Any]) -> Dict[str, Any]:
     return graph
 
 
-def _shape_tag(graph: Dict[str, Any]) -> str:
+def _graph_tags(graph: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Convention tags that the backward graph itself gives."""
     node = graph["nodes"][0]
-    dims = {int(t["uid"]): t["dims"] for t in graph["tensors"]}
-    seq_q = int(dims[int(_param(node, "q_tensor_uid"))][2])
-    seq_kv = int(dims[int(_param(node, "k_tensor_uid"))][2])
+    tensors = {int(t["uid"]): t for t in graph["tensors"]}
+    q, k, v = (tensors[int(_param(node, f"{n}_tensor_uid"))] for n in ("q", "k", "v"))
+    heads_q, seq_q, dim = (int(d) for d in q["dims"][1:])
+    heads_kv, seq_kv = int(k["dims"][1]), int(k["dims"][2])
+    if int(v["dims"][3]) != dim:
+        attention = "mla"
+    elif heads_kv == heads_q:
+        attention = "mha"
+    else:
+        attention = "mqa" if heads_kv == 1 else "gqa"
+    if (
+        _param(node, "left_bound") is not None
+        or _param(node, "right_bound") is not None
+    ):
+        mask = "sliding_window"
+    elif _param(node, "causal_mask") or _param(node, "causal_mask_bottom_right"):
+        mask = "causal"
+    else:
+        mask = "none"
     if seq_q == 1:
-        return "decode"
-    return {-1: "sq_lt_skv", 0: "sq_eq_skv", 1: "sq_gt_skv"}[
-        (seq_q > seq_kv) - (seq_q < seq_kv)
-    ]
+        phase = "decode"
+    else:
+        phase = "chunked_prefill" if seq_q < seq_kv else "prefill"
+    out = {
+        "operation": ["sdpa"],
+        "direction": ["bwd"],
+        "dtype": [_DTYPES[graph["io_data_type"]]],
+        "mode": ["training"],
+        "attention_type": [attention],
+        "mask": [mask],
+        "phase": [phase],
+        "sink": ["false"],
+    }
+    layout = _layout(q, k)
+    if layout:
+        out["layout"] = [layout]
+    return out
+
+
+def _layout(q: Dict[str, Any], k: Dict[str, Any]) -> Optional[str]:
+    """``bshd`` or ``bhsd`` from the Q (or K) strides; None when they cannot tell."""
+    for tensor in (q, k):
+        dims, strides = tensor["dims"], tensor["strides"]
+        if dims[1] != 1 and dims[2] != 1:
+            return "bshd" if strides[1] < strides[2] else "bhsd"
+    # One query row and one KV head: the size-1 sequence stride still shows
+    # the layout of the generator (H*D for bshd, D for bhsd).
+    heads, dim = q["dims"][1], q["dims"][3]
+    if heads > 1 and q["strides"][1] == dim:
+        return {heads * dim: "bshd", dim: "bhsd"}.get(q["strides"][2])
+    return None
+
+
+def tags(
+    graph: Dict[str, Any], origins: List[str], sources: List[Any]
+) -> Dict[str, List[str]]:
+    """Convention metadata of one backward graph.
+
+    ``sources`` holds the metadata of every source graph: the tags of a
+    workload graph, or the ``_MODEL_SPECS`` entry of a ``model_spec`` graph.
+    """
+    out = _graph_tags(graph)
+    union: Dict[str, set] = {"model": set(), "model_family": set()}
+    for metadata in sources:
+        if not isinstance(metadata, dict):
+            continue
+        union["model"].update(_model_tags(metadata))
+        union["model_family"].update(metadata.get("model_family") or [])
+        if "mla" in (metadata.get("attention_type") or []):
+            out["attention_type"] = ["mla"]
+    for key, values in union.items():
+        if values:
+            out[key] = sorted(values)
+    out["origin"] = sorted(set(origins))
+    return {key: out[key] for key in _TAG_ORDER if key in out}
 
 
 def convert(fwd: Dict[str, Any]) -> Dict[str, Any]:
@@ -455,34 +551,30 @@ def _graph_origins(
 def build(
     patterns: List[str], root: Path, exclude: Optional[Path] = None
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
-    """Collect and de-duplicate; return graphs by identity and skip counts."""
-    kept: Dict[str, Dict[str, Any]] = {}
+    """Collect and de-duplicate.
+
+    Return ``{identity: (graph, sources)}`` and the skip counts. ``sources``
+    are the ``<tarball>:<member>`` (or ``model_spec:...``) labels of every
+    copy; the first one orders and names the graph.
+    """
+    found: Dict[str, Dict[str, Any]] = {}
     skipped: Dict[str, int] = collections.Counter()
     for origin, source, bwd, metadata in _graph_origins(
         patterns, root, exclude, skipped
     ):
-        entry = kept.setdefault(
-            identity(bwd),
-            {
-                **bwd,
-                "metadata": {
-                    "operation": ["sdpa"],
-                    "direction": ["bwd"],
-                    "dtype": [bwd["io_data_type"]],
-                    "shape": [_shape_tag(bwd)],
-                    "origin": [],
-                    "model": [],
-                    "source": [],
-                },
-            },
+        entry = found.setdefault(
+            identity(bwd), {"graph": bwd, "origins": [], "sources": [], "tags": []}
         )
-        tags = entry["metadata"]
-        tags["origin"] = sorted(set(tags["origin"]) | {origin})
-        tags["source"].append(source)
-        tags["model"] = sorted(set(tags["model"]) | set(_model_tags(metadata)))
-    for entry in kept.values():
-        if not entry["metadata"]["model"]:
-            del entry["metadata"]["model"]
+        entry["origins"].append(origin)
+        entry["sources"].append(source)
+        entry["tags"].append(metadata)
+    kept = {
+        key: (
+            {**e["graph"], "metadata": tags(e["graph"], e["origins"], e["tags"])},
+            e["sources"],
+        )
+        for key, e in found.items()
+    }
     return kept, dict(skipped)
 
 
@@ -522,13 +614,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     kept, skipped = build(args.tarballs, args.root, args.output)
-    graphs = sorted(kept.values(), key=lambda g: g["metadata"]["source"][0])
+    ordered = sorted(kept.values(), key=lambda entry: entry[1][0])
+    graphs = [graph for graph, _ in ordered]
     _unique_names(graphs)
     write_archive(graphs, args.output, args.prefix)
     origins = collections.Counter(
         origin for g in graphs for origin in g["metadata"]["origin"]
     )
-    sources = sum(len(g["metadata"]["source"]) for g in graphs)
+    sources = sum(len(labels) for _, labels in ordered)
     print(
         f"{sources} source graphs, {sources - len(graphs)} duplicates, "
         f"{len(graphs)} unique backward graphs written to {args.output}: "
