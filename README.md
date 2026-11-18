@@ -26,7 +26,10 @@ and, if you ask, compares the output with a PyTorch reference.
 
 - Python 3.12 or newer.
 - hipDNN backend: an AMD GPU with ROCm, the hipDNN Python bindings
-  (`hipdnn_frontend`) and the engine plugins. `setup_env.py` builds them.
+  (`hipdnn_frontend`) and the engine plugins. `setup_env.py` builds them
+  from `rocm-libraries` `develop`, or from the branch, tag or commit that
+  `--rocm-libraries-ref` names. Result files record the commit. See
+  [docs/setup.md](docs/setup.md#rocm-libraries-source).
 - PyTorch runtime: a ROCm or CUDA build of PyTorch. hipDNN is not necessary.
 - rocKE runtime: a ROCm build of PyTorch and the rocKE Python packages
   (`setup_env.py` installs them on Linux). See

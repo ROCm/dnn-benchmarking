@@ -107,14 +107,24 @@ jobs:
           python-version: '3.12'
 
       # No --gpu-arch: detected from the runner's own GPU, so this job works
-      # on any GPU runner label.
+      # on any GPU runner label. rocm-libraries is not pinned: setup builds
+      # develop, or the ROCM_LIBRARIES_REF repository variable (a branch, tag
+      # or full commit) when it is set, for example while develop is broken.
       - name: Full rocm-mode build
         env:
           PIP_NO_CACHE_DIR: "1"
+          ROCM_LIBRARIES_REF: ${{ vars.ROCM_LIBRARIES_REF || 'develop' }}
         run: |
           python setup_env.py \
             --workspace .ci-gpu-workspace \
+            --rocm-libraries-ref "$ROCM_LIBRARIES_REF" \
             -y
+
+      - name: Log the rocm-libraries commit
+        run: |
+          python -c 'import json, sys; r = json.load(open(sys.argv[1])); print("rocm-libraries", r["ref"] + ":", r["rocm_libraries_commit"])' \
+            .ci-gpu-workspace/.venv/dnn-bench-rocm-libraries.json |
+            tee -a "$GITHUB_STEP_SUMMARY"
 
       # activate (not $VENV/python) for the ROCM_PATH/LD_LIBRARY_PATH that
       # conftest.py's plugin discovery needs. No -m filter: gpu tests run here.

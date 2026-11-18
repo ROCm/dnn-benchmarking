@@ -34,6 +34,7 @@ _ENVIRONMENT_KEYS = {
     "cuda_version",
     "cudnn_version",
     "hipdnn_version",
+    "rocm_libraries_commit",
     "python_version",
     "torch_version",
     "amdsmi_available",

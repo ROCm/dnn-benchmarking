@@ -11,9 +11,9 @@ updates:
         patterns:
           - "*"
 
-  # rocm-libraries and aiter. Dependabot takes one entry per ecosystem and
-  # directory, so both submodules share this entry and its title form:
-  # "chore(deps): bump <submodule> from <old> to <new>".
+  # aiter, the only submodule. rocm-libraries is not a submodule: setup_env.py
+  # builds its develop branch unless --rocm-libraries-ref names another ref.
+  # Title form: "chore(deps): bump aiter from <old> to <new>".
   - package-ecosystem: "gitsubmodule"
     directory: "/"
     cooldown:

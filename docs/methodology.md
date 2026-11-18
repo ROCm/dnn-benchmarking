@@ -250,8 +250,8 @@ A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
 dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
 the bias broadcasts. It has the dims and the data type of the bias. This is
 the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
-from rocm-libraries `4630e167ce1` (#14358), which the pinned `bfbd6d7`
-includes.
+from rocm-libraries `4630e167ce1` (#14358). Every `develop` commit since
+then includes it.
 
 - The timed row calls the memory-efficient backward kernel with its bias
   gradient enabled, and then sums the score-shaped gradient to the bias

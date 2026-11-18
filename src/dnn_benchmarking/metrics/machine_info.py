@@ -11,6 +11,7 @@ process has already imported it: importing it takes seconds.
 """
 
 import importlib.util
+import json
 import os
 import platform
 import re
@@ -130,6 +131,32 @@ def _hipdnn_version() -> Optional[str]:
     return getattr(hipdnn_frontend, "__version__", None)
 
 
+#: The venv record that setup_env.py writes after it builds hipDNN
+#: (``ROCM_LIBRARIES_RECORD`` there). setup_env.py cannot import this package,
+#: so both files name it.
+ROCM_LIBRARIES_RECORD = "dnn-bench-rocm-libraries.json"
+
+
+def _rocm_libraries_commit() -> Optional[str]:
+    """The rocm-libraries commit that setup_env.py built hipDNN from.
+
+    None when the venv has no record: hipDNN came from elsewhere, or setup
+    built no hipDNN (CUDA hosts).
+    """
+    record = Path(sys.prefix) / ROCM_LIBRARIES_RECORD
+    try:
+        commit = json.loads(record.read_text())["rocm_libraries_commit"]
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        warn_once("machine_info", f"cannot read {record}: {e!r}")
+        return None
+    if not isinstance(commit, str):
+        warn_once("machine_info", f"{record} has no commit string: {commit!r}")
+        return None
+    return commit
+
+
 def collect_environment_info() -> Dict[str, Any]:
     """Host, GPU and software versions for the result ``environment`` block.
 
@@ -154,6 +181,7 @@ def collect_environment_info() -> Dict[str, Any]:
         "gpu_model": gpu_model,
         "gpu_arch": gpu_arch,
         "hipdnn_version": _hipdnn_version(),
+        "rocm_libraries_commit": _rocm_libraries_commit(),
         "python_version": platform.python_version(),
         "amdsmi_available": amdsmi_available,
     }

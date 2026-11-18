@@ -487,9 +487,29 @@ def _git(*args, cwd=None):
     )
 
 
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _advance_origin(tmp_path: Path, name: str) -> str:
+    """Commit on the source repo, push its develop to origin; return the commit."""
+    src = tmp_path / "src"
+    (src / "projects/hipdnn" / name).write_text(name)
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", name, cwd=src)
+    _git("push", "-q", str(tmp_path / "origin.git"), "HEAD:refs/heads/develop", cwd=src)
+    return _head(src)
+
+
 @pytest.fixture
 def rocm_libraries(setup_env, tmp_path, monkeypatch):
-    """Point setup_env at a local bare origin; return the checkout path."""
+    """Point setup_env at a local bare origin with a develop branch; return
+    the checkout path."""
     if shutil.which("git") is None:
         pytest.skip("git unavailable")
     src = tmp_path / "src"
@@ -504,32 +524,24 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
     ):
         (src / rel).parent.mkdir(parents=True, exist_ok=True)
         (src / rel).write_text(rel)
-    _git("init", "-q", "-b", "main", cwd=src)
+    _git("init", "-q", "-b", "develop", cwd=src)
     _git("add", ".", cwd=src)
     _git("commit", "-q", "-m", "init", cwd=src)
     origin = tmp_path / "origin.git"
     _git("clone", "-q", "--bare", str(src), str(origin))
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".gitmodules").write_text(
-        '[submodule "rocm-libraries"]\n'
-        "\tpath = rocm-libraries\n"
-        f"\turl = {origin.as_uri()}\n"
-        "\tbranch = main\n"
-    )
-    monkeypatch.setattr(setup_env, "SCRIPT_DIR", repo)
-    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", repo / "rocm-libraries")
-    return repo / "rocm-libraries"
+    checkout = tmp_path / "repo" / "rocm-libraries"
+    checkout.parent.mkdir()
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_URL", origin.as_uri())
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", checkout)
+    return checkout
 
 
 def test_failed_fetch_leaves_no_checkout_to_reuse(
     setup_env, tmp_path, rocm_libraries
 ) -> None:
-    setup = _setup(setup_env, tmp_path)
-    # Branch names bypass the --rocm-libraries-ref SHA check; the local
-    # origin has no fixed commit id to pin.
-    setup.rocm_libraries_ref = "no-such-ref"
+    # A full commit is fetched without a lookup; this one is not in origin.
+    setup = _setup(setup_env, tmp_path, "--rocm-libraries-ref", "f" * 40)
 
     with pytest.raises(subprocess.CalledProcessError):
         setup.ensure_rocm_libraries_checkout()
@@ -538,8 +550,7 @@ def test_failed_fetch_leaves_no_checkout_to_reuse(
     assert not rocm_libraries.with_name("rocm-libraries.partial").exists()
 
     # The retry fetches instead of reusing a half-made checkout.
-    setup.rocm_libraries_ref = "main"
-    setup.ensure_rocm_libraries_checkout()
+    _setup(setup_env, tmp_path).ensure_rocm_libraries_checkout()
     assert (rocm_libraries / "CMakePresets.json").is_file()
     assert (rocm_libraries / "projects" / "hipdnn" / "CMakeLists.txt").is_file()
     assert not (rocm_libraries / "projects" / "other").exists()
@@ -552,7 +563,6 @@ def test_non_git_directory_is_kept_without_confirmation(
     (rocm_libraries / "notes.txt").write_text("mine")
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
     setup = _setup(setup_env, tmp_path)
-    setup.rocm_libraries_ref = "main"
 
     with pytest.raises(SystemExit):
         setup.ensure_rocm_libraries_checkout()
@@ -560,35 +570,40 @@ def test_non_git_directory_is_kept_without_confirmation(
     assert (rocm_libraries / "notes.txt").read_text() == "mine"
 
 
-def test_rocm_libraries_ref_must_be_a_full_sha(setup_env) -> None:
+def test_rocm_libraries_ref_takes_a_commit_or_a_ref_name(setup_env) -> None:
     parser = setup_env.build_parser()
-    args = parser.parse_args(["--rocm-libraries-ref", "A" * 40])
-    assert args.rocm_libraries_ref == "a" * 40
-    for bad in ("a" * 12, "main"):
+    assert parser.parse_args([]).rocm_libraries_ref == "develop"
+    for given, expected in (
+        ("A" * 40, "a" * 40),
+        ("release/rocm-rel-7.1", "release/rocm-rel-7.1"),
+    ):
+        args = parser.parse_args(["--rocm-libraries-ref", given])
+        assert args.rocm_libraries_ref == expected
+    for bad in ("", "a b", "~1"):
         with pytest.raises(SystemExit):
             parser.parse_args(["--rocm-libraries-ref", bad])
 
 
-def _head(repo: Path) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def test_rocm_libraries_ref_pins_the_fetched_commit(
+def test_default_ref_fetches_the_develop_commit(
     setup_env, tmp_path, capsys, rocm_libraries
 ) -> None:
-    src = tmp_path / "src"
-    pinned = _head(src)
-    # Move the origin branch past the pin: only the SHA fetches `pinned`.
-    (src / "projects/hipdnn/new.txt").write_text("new")
-    _git("add", ".", cwd=src)
-    _git("commit", "-q", "-m", "next", cwd=src)
-    _git("fetch", "-q", str(src), "main:main", cwd=tmp_path / "origin.git")
-    tip = _head(src)
+    tip = _advance_origin(tmp_path, "next.txt")
+
+    _setup(setup_env, tmp_path).ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == tip
+    assert (rocm_libraries / "projects/hipdnn/next.txt").is_file()
+    out, err = capsys.readouterr()
+    assert tip in out
+    assert "WARNING" not in err
+
+
+def test_commit_ref_is_fetched_as_given(
+    setup_env, tmp_path, capsys, rocm_libraries
+) -> None:
+    pinned = _head(tmp_path / "src")
+    # Move develop past the commit: only the commit itself fetches `pinned`.
+    _advance_origin(tmp_path, "next.txt")
 
     _setup(
         setup_env, tmp_path, "--rocm-libraries-ref", pinned
@@ -597,12 +612,123 @@ def test_rocm_libraries_ref_pins_the_fetched_commit(
     assert _head(rocm_libraries) == pinned
     assert "WARNING" not in capsys.readouterr().err
 
-    # A reused checkout is not refetched, but one off the pin is reported.
+
+def test_branch_is_fetched_at_the_commit_it_resolved_to(
+    setup_env, tmp_path, monkeypatch, rocm_libraries
+) -> None:
+    """A push between the lookup and the fetch does not change the build."""
+    resolve = setup_env.resolve_remote_commit
+    looked_up = _head(tmp_path / "src")
+
+    def resolve_then_push(url, ref):
+        commit = resolve(url, ref)
+        _advance_origin(tmp_path, "pushed-meanwhile.txt")
+        return commit
+
+    monkeypatch.setattr(setup_env, "resolve_remote_commit", resolve_then_push)
+
+    _setup(setup_env, tmp_path).ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == looked_up
+    assert not (rocm_libraries / "projects/hipdnn/pushed-meanwhile.txt").exists()
+
+
+def test_annotated_tag_resolves_to_its_commit(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
+    src = tmp_path / "src"
+    tagged = _head(src)
+    _git("tag", "-a", "rocm-7.1.0", "-m", "release", cwd=src)
+    _git("push", "-q", str(tmp_path / "origin.git"), "rocm-7.1.0", cwd=src)
+    _advance_origin(tmp_path, "next.txt")
+
     _setup(
-        setup_env, tmp_path, "--rocm-libraries-ref", tip
+        setup_env, tmp_path, "--rocm-libraries-ref", "rocm-7.1.0"
     ).ensure_rocm_libraries_checkout()
-    assert _head(rocm_libraries) == pinned
-    assert f"not the pinned {tip[:12]}" in capsys.readouterr().err
+
+    assert _head(rocm_libraries) == tagged
+
+
+@pytest.mark.parametrize(
+    ("ref", "reachable", "reason"),
+    [
+        ("no-such-branch", True, "no branch or tag named 'no-such-branch'"),
+        # An abbreviated commit is no ref name either.
+        ("abcdef123456", True, "no branch or tag named 'abcdef123456'"),
+        ("develop", False, "git ls-remote"),
+    ],
+)
+def test_unresolvable_ref_fails_before_fetching(
+    setup_env, tmp_path, monkeypatch, capsys, rocm_libraries, ref, reachable, reason
+) -> None:
+    if not reachable:
+        missing = tmp_path / "missing.git"
+        monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_URL", missing.as_uri())
+
+    with pytest.raises(SystemExit):
+        _setup(
+            setup_env, tmp_path, "--rocm-libraries-ref", ref
+        ).ensure_rocm_libraries_checkout()
+
+    assert reason in capsys.readouterr().err
+    assert not rocm_libraries.exists()
+    assert not rocm_libraries.with_name("rocm-libraries.partial").exists()
+
+
+def test_ref_naming_a_branch_and_a_tag_at_different_commits_fails(
+    setup_env, tmp_path, capsys, rocm_libraries
+) -> None:
+    src = tmp_path / "src"
+    _git("tag", "develop", cwd=src)
+    _git("push", "-q", str(tmp_path / "origin.git"), "refs/tags/develop", cwd=src)
+    _advance_origin(tmp_path, "next.txt")
+
+    with pytest.raises(SystemExit):
+        _setup(setup_env, tmp_path).ensure_rocm_libraries_checkout()
+
+    assert "names the branch" in capsys.readouterr().err
+
+
+def test_reused_checkout_at_another_commit_is_built_and_reported(
+    setup_env, tmp_path, capsys, rocm_libraries
+) -> None:
+    old = _head(tmp_path / "src")
+    _setup(setup_env, tmp_path).ensure_rocm_libraries_checkout()
+    tip = _advance_origin(tmp_path, "next.txt")
+    capsys.readouterr()
+
+    setup = _setup(setup_env, tmp_path)
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == old
+    out, err = capsys.readouterr()
+    assert f"Reusing rocm-libraries/ at {old}" in out
+    assert f"not at develop ({tip[:12]})" in err
+
+
+def test_build_records_the_checkout_commit_for_the_results(
+    setup_env, tmp_path, monkeypatch, rocm_libraries
+) -> None:
+    from dnn_benchmarking.metrics import machine_info
+
+    built = _head(tmp_path / "src")
+    _setup(setup_env, tmp_path).ensure_rocm_libraries_checkout()
+    _advance_origin(tmp_path, "next.txt")
+    # The reused checkout stays at `built`, and that is the commit built.
+    setup = _setup(setup_env, tmp_path)
+    setup.ensure_rocm_libraries_checkout()
+    setup.venv_dir.mkdir(parents=True)
+
+    setup.write_rocm_libraries_record()
+
+    record = json.loads((setup.venv_dir / setup_env.ROCM_LIBRARIES_RECORD).read_text())
+    assert record == {
+        "rocm_libraries_commit": built,
+        "ref": "develop",
+        "url": setup_env.ROCM_LIBRARIES_URL,
+    }
+    monkeypatch.setattr(sys, "prefix", str(setup.venv_dir))
+    assert machine_info.collect_environment_info()["rocm_libraries_commit"] == built
 
 
 def test_sparse_checkout_takes_only_the_shared_subtree_configure_reads(
@@ -610,8 +736,6 @@ def test_sparse_checkout_takes_only_the_shared_subtree_configure_reads(
 ) -> None:
     """hipDNN's configure reads shared/ctest. The rest of shared/ is dead weight."""
     setup = _setup(setup_env, tmp_path)
-    setup.rocm_libraries_ref = "main"
-
     setup.ensure_rocm_libraries_checkout()
 
     assert (rocm_libraries / "shared/ctest/TestCategories.cmake").is_file()
@@ -624,7 +748,6 @@ def test_an_older_sparse_checkout_gains_the_root_dirs_added_since(
     setup_env, tmp_path, rocm_libraries
 ) -> None:
     setup = _setup(setup_env, tmp_path)
-    setup.rocm_libraries_ref = "main"
     setup.ensure_rocm_libraries_checkout()
     # What a setup_env.py from before cmake/ and shared/ctest/ staged.
     _git(
@@ -646,11 +769,9 @@ def test_an_older_sparse_checkout_gains_the_root_dirs_added_since(
 def test_a_full_checkout_is_not_made_sparse(
     setup_env, tmp_path, rocm_libraries
 ) -> None:
-    """`git submodule update --init` gives a full checkout; leave it alone."""
+    """A full clone (e.g. the former submodule checkout); leave it alone."""
     _git("clone", "-q", str(tmp_path / "origin.git"), str(rocm_libraries))
     setup = _setup(setup_env, tmp_path)
-    setup.rocm_libraries_ref = "main"
-
     setup.ensure_rocm_libraries_checkout()
 
     assert (rocm_libraries / "shared/tensile/big.bin").is_file()
@@ -1183,6 +1304,8 @@ def test_hipdnn_reuse_keeps_prepared_venv_and_does_not_fetch_sources(
     assert prepared.probe("import hipdnn_frontend").returncode != 0
     marker = prepared.venv_dir / "keep-me"
     marker.write_text("original venv")
+    record = prepared.venv_dir / setup_env.ROCM_LIBRARIES_RECORD
+    record.write_text('{"rocm_libraries_commit": "built-earlier"}\n')
     checkout = tmp_path / "full-sources"
     checkout.mkdir()
     source_marker = checkout / "keep-me"
@@ -1219,6 +1342,8 @@ def test_hipdnn_reuse_keeps_prepared_venv_and_does_not_fetch_sources(
     assert setup.env["ROCM_PATH"] == prefix
     assert setup.get_torch_mode() == (mode if mode != "none" else "missing")
     assert marker.read_text() == "original venv"
+    # Nothing was built, so the commit recorded by the earlier build stands.
+    assert record.read_text() == '{"rocm_libraries_commit": "built-earlier"}\n'
     assert (frontend / "__init__.py").read_text() == (
         "raise OSError('no native runtime')\n"
     )

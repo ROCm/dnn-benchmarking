@@ -41,6 +41,10 @@ IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
+ROCM_LIBRARIES_URL = "https://github.com/ROCm/rocm-libraries.git"
+# --rocm-libraries-ref default. Setup resolves it to a commit when it runs.
+ROCM_LIBRARIES_DEFAULT_REF = "develop"
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}")
 # Root directories that setup and the hipDNN/provider configure read. Only
 # shared/ctest supplies a file from shared; the rest of that tree is unnecessary.
 ROCM_LIBRARIES_ROOT_DIRS = (".dvc", "cmake", "shared/ctest")
@@ -115,6 +119,12 @@ TORCH_RECORD = "dnn-bench-torch.json"
 # differently is wiped.
 BUILD_RECORD = "dnn-bench-prefixes.json"
 
+# Written into the venv after setup builds hipDNN: the rocm-libraries commit it
+# built, the requested ref and the URL. dnn_benchmarking.metrics.machine_info
+# reads it into the result environment. It is not in BUILD_RECORD: a changed
+# commit must rebuild incrementally, not wipe the build dir.
+ROCM_LIBRARIES_RECORD = "dnn-bench-rocm-libraries.json"
+
 
 # --- Small process helpers -------------------------------------------------
 
@@ -178,6 +188,57 @@ def git_output(args) -> str:
     """Run git and return its stdout, stripped; raise on nonzero exit."""
     result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+
+def resolve_remote_commit(url: str, ref: str) -> str:
+    """The commit that ``ref`` names in the repository at ``url``.
+
+    A full 40-character commit is used as given, without network access. A
+    branch or tag name is resolved once with `git ls-remote`, so the fetch
+    that follows asks for that exact commit even when the branch moves. Exit
+    with an error when the remote cannot be read, when ``ref`` names no branch
+    or tag, or when it names a branch and a tag at different commits.
+    """
+    if _COMMIT_ID.fullmatch(ref.lower()):
+        return ref.lower()
+    branch = f"refs/heads/{ref}"
+    tag = f"refs/tags/{ref}"
+    # An annotated tag lists the tag object; its peeled entry is the commit.
+    peeled_tag = f"{tag}^{{}}"
+    result = subprocess.run(
+        ["git", "ls-remote", url, branch, tag, peeled_tag],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        fail(
+            f"could not resolve '{ref}': `git ls-remote {url}` exited "
+            f"{result.returncode}.",
+            result.stderr.strip(),
+            "A full 40-character commit needs no lookup.",
+        )
+    listed = {}
+    for line in result.stdout.splitlines():
+        commit, _, name = line.partition("\t")
+        listed[name] = commit
+    found = {}
+    if branch in listed:
+        found["branch"] = listed[branch]
+    if peeled_tag in listed or tag in listed:
+        found["tag"] = listed.get(peeled_tag, listed.get(tag))
+    if not found:
+        fail(
+            f"{url} has no branch or tag named '{ref}'.",
+            "Pass a branch name, a tag name or a full 40-character commit.",
+        )
+    if len(set(found.values())) > 1:
+        fail(
+            f"'{ref}' names the branch at {found['branch'][:12]} and the tag "
+            f"at {found['tag'][:12]} in {url}.",
+            "Pass the full 40-character commit that you want.",
+        )
+    return next(iter(found.values()))
 
 
 def default_workspace() -> Path:
@@ -430,14 +491,18 @@ sys.exit(1 if failed else 0)
 # --- CLI -------------------------------------------------------------------
 
 
-def _commit_sha(value: str) -> str:
-    """--rocm-libraries-ref: a full 40-hex commit id, lowercased."""
-    sha = value.strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+def _git_ref(value: str) -> str:
+    """--rocm-libraries-ref: a full 40-hex commit (lowercased), or a branch or
+    tag name that setup resolves with `git ls-remote`."""
+    ref = value.strip()
+    if _COMMIT_ID.fullmatch(ref.lower()):
+        return ref.lower()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", ref):
         raise argparse.ArgumentTypeError(
-            f"expected a full 40-character commit SHA, got {value!r}"
+            f"expected a branch name, a tag name or a full 40-character "
+            f"commit, got {value!r}"
         )
-    return sha
+    return ref
 
 
 def _cmake_define(value: str) -> str:
@@ -570,15 +635,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--rocm-libraries-ref",
-        type=_commit_sha,
-        metavar="SHA",
+        type=_git_ref,
+        default=ROCM_LIBRARIES_DEFAULT_REF,
+        metavar="REF",
         help=(
-            "Full 40-character rocm-libraries commit to fetch when "
-            "rocm-libraries/ is absent. "
-            "Default: the submodule commit pinned in this repository (`git "
-            "rev-parse HEAD:rocm-libraries`). Needed where no git metadata "
-            "exists (Docker builds, source tarballs); without it setup falls "
-            "back to the moving .gitmodules branch and warns."
+            "rocm-libraries commit to build: a full 40-character commit, used "
+            "as given, or a branch or tag name, resolved to its current commit "
+            "with `git ls-remote`. Setup fetches that commit when "
+            "rocm-libraries/ is absent, and warns when an existing checkout "
+            "is at another commit. Default: %(default)s"
         ),
     )
     parser.add_argument(
@@ -684,26 +749,21 @@ class Setup:
     # -- rocm-libraries checkout --------------------------------------------
 
     def ensure_rocm_libraries_checkout(self) -> None:
-        """Fetch rocm-libraries if absent.
+        """Resolve --rocm-libraries-ref to a commit; fetch it if absent.
 
-        It is a git submodule (see .gitmodules), so `git submodule update
-        --init` also works. This is the fast path used only when the directory
-        isn't already a checkout: a sparse, blobless clone of the pinned
-        submodule commit (or --rocm-libraries-ref), limited to the hipDNN/
+        This repository does not pin rocm-libraries. The ref (default
+        ROCM_LIBRARIES_DEFAULT_REF) is resolved to one commit, and only that
+        commit is fetched: a sparse, blobless clone limited to the hipDNN/
         provider sources and root CMake tooling this script builds.
-        To build against a different ref, check it out directly, e.g.
-        `git -C rocm-libraries fetch --depth 1 origin <ref> &&
+        An existing checkout is reused as-is and only reported. To build
+        another commit in it, check that commit out directly, e.g.
+        `git -C rocm-libraries fetch --depth 1 origin <sha> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
-        gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        ref = self.rocm_libraries_ref or self._pinned_submodule_commit(
-            "rocm-libraries",
-            "The hipDNN/provider build is not reproducible. Pass "
-            "--rocm-libraries-ref <sha> (`git rev-parse "
-            "HEAD:rocm-libraries` in a checkout of this repository).",
-        )
-        # Only a full commit id can be compared with HEAD; a branch moves.
-        pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
+        ref = self.rocm_libraries_ref
+        commit = resolve_remote_commit(ROCM_LIBRARIES_URL, ref)
+        if commit != ref:
+            print(f"rocm-libraries {ref} is at {commit}.")
 
         if (ROCM_LIBRARIES_DIR / ".git").exists():
             # A sparse clone made by an older setup lacks root dirs added since.
@@ -716,14 +776,19 @@ class Setup:
                 run_git(
                     ["-C", str(ROCM_LIBRARIES_DIR), "sparse-checkout", "add", *missing]
                 )
-            # An existing checkout is reused as-is, so a pin bump or a broken
-            # sparse clone would otherwise go unnoticed.
+            # An existing checkout is reused as-is, so a newer requested
+            # commit or a broken sparse clone would otherwise go unnoticed.
             head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
-            if pinned and head != ref:
+            print(f"Reusing rocm-libraries/ at {head}.")
+            if head != commit:
+                target = commit[:12] if commit == ref else f"{ref} ({commit[:12]})"
                 warn(
-                    f"rocm-libraries is at {head[:12]}, not the pinned {ref[:12]}. "
-                    "Check out that commit in rocm-libraries/ (e.g. `git submodule "
-                    "update rocm-libraries`) or delete the directory to fetch it."
+                    f"rocm-libraries/ is at {head[:12]}, not at {target}. "
+                    "Setup builds the existing checkout.",
+                    f"To build {commit[:12]}, check it out in rocm-libraries/ "
+                    f"(`git -C rocm-libraries fetch --depth 1 origin {commit} && "
+                    "git -C rocm-libraries checkout FETCH_HEAD`) or delete the "
+                    "directory to fetch it.",
                 )
             if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
                 warn(
@@ -732,16 +797,16 @@ class Setup:
                 )
             return
 
-        # An uninitialised submodule leaves an empty directory; anything else
-        # here is not ours to delete without asking.
+        # A checkout of this repository from before rocm-libraries stopped
+        # being a submodule can leave an empty directory; anything else here
+        # is not ours to delete without asking.
         if ROCM_LIBRARIES_DIR.exists() and any(ROCM_LIBRARIES_DIR.iterdir()):
             self._confirm(
                 f"replace {ROCM_LIBRARIES_DIR}, which is not a git checkout and "
                 "is not empty"
             )
-        url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
         print(
-            f"Fetching rocm-libraries ({ref}) via sparse checkout "
+            f"Fetching rocm-libraries {commit} via sparse checkout "
             f"({', '.join(ROCM_LIBRARIES_SPARSE_DIRS)})..."
         )
         # Clone beside the target and move it in only once checked out: a
@@ -759,7 +824,7 @@ class Setup:
                     "--filter=blob:none",
                     "--sparse",
                     "--no-checkout",
-                    url,
+                    ROCM_LIBRARIES_URL,
                     str(staging),
                 ]
             )
@@ -769,7 +834,7 @@ class Setup:
             # older.
             run_git([*git, "sparse-checkout", "init", "--cone"])
             run_git([*git, "sparse-checkout", "set", *ROCM_LIBRARIES_SPARSE_DIRS])
-            run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
+            run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", commit])
             run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
         except BaseException:
             if staging.exists():
@@ -1647,6 +1712,22 @@ class Setup:
                     encoding="ascii",
                 )
 
+    def write_rocm_libraries_record(self) -> None:
+        """Record the rocm-libraries commit that hipDNN was built from.
+
+        The commit is the HEAD of rocm-libraries/, which an existing checkout
+        can hold at another commit than --rocm-libraries-ref names.
+        --reuse-artifacts builds nothing, so it keeps the earlier record.
+        """
+        head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
+        record = {
+            "rocm_libraries_commit": head,
+            "ref": self.rocm_libraries_ref,
+            "url": ROCM_LIBRARIES_URL,
+        }
+        (self.venv_dir / ROCM_LIBRARIES_RECORD).write_text(json.dumps(record) + "\n")
+        print(f"Built hipDNN from rocm-libraries {head}.")
+
     def build_hipdnn(self) -> None:
         """Build (or, with --reuse-artifacts, locate) hipDNN and the provider
         plugins, then point the venv's environment at them."""
@@ -1658,7 +1739,10 @@ class Setup:
         print(f"Using hipDNN/ROCm prefix: {install_prefix}")
         toolchain_prefix = self.toolchain_prefix
         if self.do_build:
+            # A failed build must not leave the record of an earlier commit.
+            (self.venv_dir / ROCM_LIBRARIES_RECORD).unlink(missing_ok=True)
             self.build_superbuild(install_prefix, toolchain_prefix)
+            self.write_rocm_libraries_record()
         elif not self.prefix_has_hipdnn(install_prefix):
             fail(
                 "--reuse-artifacts was passed, but hipDNN CMake configs "

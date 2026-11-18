@@ -23,9 +23,10 @@ stages are:
    libraries and toolchain are used for the build.
 3. `dnn-benchmarking package`: install dnn-benchmarking (editable unless
    `--no-editable`).
-4. `rocm-libraries sources`: fetch `rocm-libraries` if it is absent (see
-   [rocm-libraries source](#rocm-libraries-source)). Skipped with
-   `--reuse-artifacts`, which builds nothing from these sources.
+4. `rocm-libraries sources`: resolve `--rocm-libraries-ref` (default
+   `develop`) to a commit, and fetch that commit if `rocm-libraries/` is
+   absent (see [rocm-libraries source](#rocm-libraries-source)). Skipped
+   with `--reuse-artifacts`, which builds nothing from these sources.
 5. `Build dependencies`: pip packages the source build needs. Skipped with
    `--reuse-artifacts`.
 6. `Provider descriptor artifacts`: `dvc pull` the DVC-tracked
@@ -68,7 +69,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
 | `--no-aiter` | Skip the `AITER` stage. Only `--runtime aiter` needs it. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
-| `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
+| `--rocm-libraries-ref REF` | `rocm-libraries` to build: a full 40-character commit, used as given, or a branch or tag name, resolved to its commit. Default `develop`. See [rocm-libraries source](#rocm-libraries-source). |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
 | `-y`, `--yes` | Answer yes to every prompt. Required when stdin is not a terminal and a prompt would show. |
 
@@ -206,28 +207,60 @@ On Windows the default is `gfx1151`.
 
 ## rocm-libraries source
 
-`rocm-libraries/` is a git submodule. It holds the hipDNN and provider
-sources.
+`rocm-libraries/` holds the hipDNN and provider sources. It is not a git
+submodule, and this repository does not pin a `rocm-libraries` commit. Setup
+builds the commit that `--rocm-libraries-ref` names. The default is the head
+of `develop` when setup runs.
 
-- When `rocm-libraries/` is absent, setup does a sparse, blobless clone of
-  the pinned submodule commit (`git rev-parse HEAD:rocm-libraries`). The clone
-  contains only `cmake`, `shared/ctest`, `projects/hipdnn` and
-  `dnn-providers`, not the full monorepo. `shared/ctest` carries the CMake
-  file that declares hipDNN's test categories; the rest of `shared/` (Tensile
-  and friends) stays out.
-- Where no git metadata exists (Docker builds, source tarballs), give
-  `--rocm-libraries-ref SHA`. Without it, setup uses the moving
-  `.gitmodules` branch and shows a warning.
-- Setup uses an existing checkout as it is. A checkout from
-  `git submodule update --init` also works. Setup shows a warning when the
-  checkout is not at the pinned commit. When that checkout is sparse and was
-  made by an older setup, the root directories added since are added to its
-  sparse set; a full checkout is left alone.
-
-To build against a different commit, check it out directly:
+1. Setup resolves the ref to one commit:
+   - A full 40-character commit is used as given. Setup does no network
+     lookup for it.
+   - A branch or tag name is resolved with `git ls-remote` on
+     `https://github.com/ROCm/rocm-libraries.git`. Setup prints
+     `rocm-libraries <ref> is at <commit>`.
+   - Setup stops with an error when the remote cannot be read, when no
+     branch or tag has that name, or when a branch and a tag of that name
+     point to different commits. It does not use an earlier commit instead.
+     An abbreviated commit is not a ref name, so it also stops setup.
+2. When `rocm-libraries/` is absent, setup does a sparse, blobless clone and
+   fetches that commit by its id, so a push to the branch during setup does
+   not change the build. The clone contains only `.dvc`, `cmake`,
+   `shared/ctest`, `projects/hipdnn` and `dnn-providers`, not the full
+   monorepo. `shared/ctest` carries the CMake file that declares hipDNN's
+   test categories; the rest of `shared/` (Tensile and friends) stays out.
+3. Setup uses an existing checkout as it is, and prints its commit as
+   `Reusing rocm-libraries/ at <commit>`. When that commit is not the
+   resolved commit, setup shows a warning and builds the existing checkout.
+   When the checkout is sparse and was made by an older setup, the root
+   directories added since are added to its sparse set; a full checkout is
+   left alone.
+4. After the hipDNN build, setup writes
+   `<workspace>/.venv/dnn-bench-rocm-libraries.json`:
+   `{"rocm_libraries_commit": <commit>, "ref": <ref>, "url": <url>}`. The
+   commit is the one that setup built, that is, the `HEAD` of
+   `rocm-libraries/`. Result files copy it to
+   `environment.rocm_libraries_commit` (see
+   [results-schema.md](results-schema.md#environment)).
+   `--reuse-artifacts` builds nothing, so it keeps the earlier record.
 
 ```bash
-git -C rocm-libraries fetch --depth 1 origin <ref>
+python3 setup_env.py                                         # develop head
+python3 setup_env.py --rocm-libraries-ref release/rocm-rel-7.1
+python3 setup_env.py --rocm-libraries-ref <40-character commit>
+```
+
+CI (`setup.yml` gpu-test and `check-deserialize.yml`) builds `develop`. When
+`develop` is broken, set the `ROCM_LIBRARIES_REF` repository variable to a
+known-good branch, tag or commit. Each job prints the commit that it built
+in its log and in the job summary.
+
+An existing checkout from before `rocm-libraries` stopped being a submodule
+stays in place as an untracked directory, and setup keeps using it. To build
+the requested commit instead, delete `rocm-libraries/`, or check the commit
+out directly:
+
+```bash
+git -C rocm-libraries fetch --depth 1 origin <commit>
 git -C rocm-libraries checkout FETCH_HEAD
 ```
 
@@ -372,12 +405,25 @@ from the local checkout:
 | `--container-command CMD` | `docker` | Container command. |
 | `--device-target TARGET` | `gfx942` | ROCm PyTorch architecture: `gfx90a`, `gfx942`, `gfx950`, `gfx1151` or `gfx1152`. |
 | `--tag TAG` | `dnn-benchmark-performance:<device-target>` | Image tag. |
+| `--rocm-libraries-ref REF` | `develop` | `rocm-libraries` to build: a full 40-character commit, or a branch or tag name. |
 | `-- ARGS...` | none | More arguments for the container build command. |
 
-The script passes the pinned `rocm-libraries` commit to the build, because
-the build context has no `.git`. The image runs `setup_env.py --torch-mode
-rocm --no-editable -y` with the venv in `/opt/dnn-benchmark/.venv`. The
-entry point is `dnn-benchmark`, so arguments go straight to the tool:
+The script resolves `--rocm-libraries-ref` to a commit on the host, with the
+same rule as `setup_env.py`, so the host needs `git` and `python3`. It
+passes the commit as the `ROCM_LIBRARIES_COMMIT` build argument. The build
+fails when that argument is not a full
+40-character commit. The image carries the commit in the label
+`com.amd.dnn-benchmark.rocm-libraries-commit`:
+
+```bash
+docker inspect --format \
+  '{{ index .Config.Labels "com.amd.dnn-benchmark.rocm-libraries-commit" }}' \
+  dnn-benchmark-performance:gfx942
+```
+
+The image runs `setup_env.py --torch-mode rocm --no-editable -y` with the
+venv in `/opt/dnn-benchmark/.venv`. The entry point is `dnn-benchmark`, so
+arguments go straight to the tool:
 
 ```bash
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \

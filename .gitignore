@@ -54,6 +54,9 @@ kubeconfig.*
 results.json
 *.log
 .planning/
+# setup_env.py fetches rocm-libraries here, through a staging directory
+/rocm-libraries/
+/rocm-libraries.partial/
 
 # Crash artifacts (e.g. ROCm/GPU process core dumps)
 core

@@ -101,6 +101,7 @@ The CLI collects these values one time, at suite start.
 | `cuda_version` | string | The `cuda` value of `torch/version.py` for a CUDA PyTorch. `null` for a ROCm PyTorch. |
 | `cudnn_version` | string | cuDNN version. Set only for a CUDA PyTorch that the process has already imported. |
 | `hipdnn_version` | string | `hipdnn_frontend.__version__`. |
+| `rocm_libraries_commit` | string | The full `rocm-libraries` commit that `setup_env.py` built hipDNN from. The tool reads it from `dnn-bench-rocm-libraries.json` in the venv of the running Python (`sys.prefix`). `null` when the venv has no such record: hipDNN came from somewhere else, or setup built no hipDNN (CUDA hosts). Files written before this key was added do not have it; `schema_version` stays 2. See [setup.md](setup.md#rocm-libraries-source). |
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
