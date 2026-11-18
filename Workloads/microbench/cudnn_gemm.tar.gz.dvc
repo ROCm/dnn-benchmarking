@@ -1,5 +1,5 @@
 outs:
-- md5: 636aed51c7de3590566227a324727762
-  size: 3866
+- md5: 2149219238c13fb5b0fc29ee18e147f3
+  size: 3842
   hash: md5
   path: cudnn_gemm.tar.gz

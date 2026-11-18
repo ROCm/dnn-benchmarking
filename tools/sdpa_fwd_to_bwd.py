@@ -15,9 +15,9 @@ The corpus has three origins, recorded in ``metadata.origin``:
   K/V caches, attention sinks, block masks, fp8 descale/scale tensors and
   dropout.
 - ``captured_bwd``: ``SdpaBackwardAttributes`` graphs already in the
-  tarballs, unchanged, except that a ``metadata.dropout`` probability the
-  capture did not write into the graph is added (probability, seed and
-  offset).
+  tarballs, unchanged, except that a dropout probability the capture did not
+  write into the graph (``_CAPTURED_DROPOUT``) is added (probability, seed
+  and offset).
 - ``model_spec``: training graphs with features no captured workload has
   (``_MODEL_SPECS``): attention dropout, additive bias with and without
   dBias, and ALiBi, at the published shapes of the named models.
@@ -244,15 +244,26 @@ def _add_dropout(graph: Dict[str, Any], probability: float) -> None:
     node["parameters"]["dropout_probability"] = probability
 
 
+#: Attention dropout of captured backward graphs whose capture did not write
+#: it into the graph, by graph name. The source is the ``dropout`` field of
+#: ``bench_cases_attn_bwd.json`` (Workloads/headline/attn MANIFEST.md).
+_CAPTURED_DROPOUT = {
+    "llama-3-8b-sft__bf16_bwd_causal_gqa_dropout_bf16_idx18_b4_hq32_kv8"
+    "_sq4096_skv4096_d128v128_causal_bwd": 0.1,
+    "llama-3-8b-sft__bf16_bwd_causal_gqa_dropout_sweep_bf16_idx35_b2_hq32_kv8"
+    "_sq8192_skv8192_d128v128_causal_bwd": 0.1,
+    "vit-l-14__fp16_bwd_vision_noncausal_dropout_fp16_idx21_b8_hq16_kv16"
+    "_sq257_skv257_d64v64_full_bwd": 0.1,
+}
+
+
 def adopt(bwd: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a captured backward graph, with its ``metadata.dropout`` applied."""
+    """Return a captured backward graph, with its ``_CAPTURED_DROPOUT`` applied."""
     nodes = bwd.get("nodes", [])
     if len(nodes) != 1 or nodes[0].get("type") != "SdpaBackwardAttributes":
         raise Skip("not_single_sdpa_bwd")
     graph = {k: copy.deepcopy(v) for k, v in bwd.items() if k != "metadata"}
-    metadata = bwd.get("metadata")
-    values = metadata.get("dropout") if isinstance(metadata, dict) else None
-    dropout = float(values[0]) if values else 0.0
+    dropout = _CAPTURED_DROPOUT.get(bwd.get("name"), 0.0)
     node = graph["nodes"][0]
     if dropout and not float(_param(node, "dropout_probability") or 0.0):
         _add_dropout(graph, dropout)

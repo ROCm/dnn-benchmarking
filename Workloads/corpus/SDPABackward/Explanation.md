@@ -56,7 +56,7 @@ ALiBi. The collection adds them:
 
 | Graph | Origin | Feature |
 |---|---|---|
-| `llama-3-8b-sft` (2 graphs), `vit-l-14` | `captured_bwd` | Dropout 0.1 from the capture's `metadata.dropout` |
+| `llama-3-8b-sft` (2 graphs), `vit-l-14` | `captured_bwd` | Dropout 0.1 from the capture's source case (`_CAPTURED_DROPOUT` in `tools/sdpa_fwd_to_bwd.py`) |
 | `bert-large-uncased`, 16 x 512 tokens | `model_spec` | Padding bias `[B, 1, 1, S]`, dropout 0.1 |
 | `t5-large` encoder, 16 x 512 tokens | `model_spec` | Relative position bias `[1, H, S, S]` with dBias, dropout 0.1 |
 | `swin-base` stage 1, 4,096 windows of 49 tokens | `model_spec` | Relative position bias with dBias |
@@ -149,9 +149,9 @@ lexical order and combines the tags of duplicates.
 - Decode shapes have no training use. They are kept because the collection
   converts every forward graph that has a backward equivalent. Use
   `metadata.phase` to separate them from training shapes.
-- The captured `gpt-oss-120b` sink graph in `headline/attn` has
-  `metadata.source_feature` `sink`, but hipDNN has no backward sink input yet
-  (ALMIOPEN-3020), so the graph has no sink.
+- The captured `gpt-oss-120b` sink graph in `headline/attn` comes from a
+  source case with an attention sink, but hipDNN has no backward sink input
+  yet (ALMIOPEN-3020), so the graph has no sink.
 
 ## Regenerate
 

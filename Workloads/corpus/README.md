@@ -55,13 +55,16 @@ Rules:
 6. Do not merge files outside `corpus/` that contain the same executable
    graph. Each file keeps its own tags. Only a `corpus/` collection removes
    duplicate graphs (see [Duplicate policy](#duplicate-policy)).
+7. Do not add a key that fewer than 1% of all `Workloads/` graphs would
+   carry. For this reason, `source_dtype`, `activation`, `dropout`, and
+   `source_feature` were removed (each was on fewer than 0.5% of the
+   23,149 graphs).
 
 | Key | Values | Applies to |
 |---|---|---|
 | `operation` | `convolution`, `sdpa`, `matmul`, `moe_grouped_matmul`, `pointwise`, `batchnorm`, `rmsnorm`, `layernorm`, `block_scale_quantize`, `block_scale_dequantize`, `resample`, `reduction` (one for each node type in the graph) | All graphs |
 | `direction` | `fwd`; `dgrad` or `wgrad` for convolution and MoE gradients; `bwd` for other gradients | All graphs |
 | `dtype` | `float32`, `float16`, `bfloat16`, `float8_e4m3` (the graph I/O data type) | All graphs |
-| `source_dtype` | `float16`, `fp8`, `fp8_block`, `fp6`, `mxfp8`, `mxfp4`, `nvfp4` (the source precision, when the graph uses a different data type) | Graphs whose source precision is not `dtype` |
 | `layout` | `nchw` or `nhwc` (convolution, batch normalization, resample); `bshd` or `bhsd` (SDPA) | Graphs with a layout |
 | `model_family` | `llm`, `cls`, `detection`, `diffusion`, `segmentation`, `superres`, `video3d`, `med3d`, `audio1d`, `multimodal`, `ssm`, `synthetic` | Graphs with a known model |
 | `model` | Model identifiers, such as `llama3_8b` or `resnet50` | Graphs with a known model |
@@ -73,9 +76,6 @@ Rules:
 | `mask` | `none`, `causal`, `sliding_window` | SDPA graphs |
 | `phase` | `prefill`, `chunked_prefill`, `decode` | SDPA graphs, MoE graphs with a known phase |
 | `sink` | `true`, `false` | SDPA graphs |
-| `dropout` | Attention dropout probability of the source, such as `0.1`, when the graph has no dropout inputs | `headline/attn` (read by `tools/sdpa_fwd_to_bwd.py`) |
-| `source_feature` | `sink` (an SDPA feature of the source that the graph does not express) | SDPA graphs whose source uses such a feature |
-| `activation` | `swiglu`, `swiglu_clamped`, `swiglu_oai`, `situglu` | MoE graphs with a fused gated activation |
 | `tensor_parallel` | `1`, `2`, `4`, `8` | `microbench/cudnn_attention_inference` |
 | `origin` | `converted_fwd`, `captured_bwd`, `model_spec` | `corpus/SDPABackward` |
 | `suite` | `regular`, `extended` | `headline/attn`, `headline/moe` |
@@ -99,9 +99,6 @@ Tag meanings:
   when the model uses it (DeepSeek-V4), or when the query-key and value head
   dimensions differ. Otherwise the head counts set it: equal counts give
   `mha`, one key-value head gives `mqa`, and other counts give `gqa`.
-- `source_dtype` is present when hipDNN cannot express the source precision,
-  or when the graph uses another data type than the source. The graph then
-  uses `dtype`, for example `bfloat16`.
 - `phase` comes from the source when the source gives it. Otherwise one query
   token gives `decode`, a query shorter than the key-value sequence gives
   `chunked_prefill`, and other lengths give `prefill`.

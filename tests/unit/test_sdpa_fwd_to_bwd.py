@@ -122,11 +122,11 @@ def test_forward_only_features_are_skipped(tool, inputs, reason) -> None:
     assert str(skipped.value) == reason
 
 
-def test_captured_dropout_metadata_adds_philox_dropout_once(tool) -> None:
+def test_captured_dropout_adds_philox_dropout_once(tool, monkeypatch) -> None:
     bwd = tool.convert(_forward())
-    captured = {**bwd, "metadata": {"dropout": ["0.1"]}}
+    monkeypatch.setitem(tool._CAPTURED_DROPOUT, bwd["name"], 0.1)
 
-    adopted = tool.adopt(captured)
+    adopted = tool.adopt(bwd)
     node = adopted["nodes"][0]
     assert node["parameters"]["dropout_probability"] == 0.1
     uids = {t["uid"] for t in adopted["tensors"]}
@@ -134,7 +134,8 @@ def test_captured_dropout_metadata_adds_philox_dropout_once(tool) -> None:
         uids
     )
     # A graph that already has dropout keeps its own probability and inputs.
-    again = tool.adopt({**adopted, "metadata": {"dropout": ["0.3"]}})
+    monkeypatch.setitem(tool._CAPTURED_DROPOUT, bwd["name"], 0.3)
+    again = tool.adopt(adopted)
     assert again["nodes"][0] == node
     assert len(again["tensors"]) == len(adopted["tensors"])
 
