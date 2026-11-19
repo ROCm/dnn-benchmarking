@@ -59,7 +59,8 @@ Dropout uses cuDNN's Philox form: `dropout_probability` with int64 `seed`
 and `offset` tensors of dims `[1, 1, 1, 1]`. The `model_spec` shapes and
 their sources are in `_MODEL_SPECS` in `tools/sdpa_fwd_to_bwd.py`.
 
-These hipDNN engines serve the collection at rocm-libraries `6f5898efb5a`:
+These hipDNN engines serve the collection at rocm-libraries `9d6ee0c`
+(the rocm-libraries#15643 merge):
 
 | Engine | Architectures | Serves | Declines |
 |---|---|---|---|

@@ -770,8 +770,11 @@ hipDNN cannot serialize their plans. hipDNN ranks split before merged, so
 the merged engine runs by default only when split declines a graph. The tool
 times every applicable engine.
 
-On gfx950 (MI355X, rocm-libraries `6f5898efb5a`), a `--validate pytorch` run
+On gfx950 (MI355X, rocm-libraries `6f5898efb5a`, a rocm-libraries#15643
+commit before the merge), a `--validate pytorch` run
 of the 4,790 graphs of `Workloads/corpus/SDPABackward` gave these results.
+The pinned merge `9d6ee0c` also serves 16-bit graphs with V head dims 257
+to 384 on the split engine, which that commit declined.
 The 43 graphs with the most work ran with `--runtime hipdnn,pytorch` and
 without `--validate`, so they have timing only. The run used `--warmup 5
 --iters 20` and one process for each GPU. It ran before tool changes that
