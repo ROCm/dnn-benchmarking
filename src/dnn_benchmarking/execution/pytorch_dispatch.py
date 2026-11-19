@@ -101,8 +101,17 @@ def profile_launch(launch: Callable[[], None]) -> List[Dict[str, Any]]:
 
     ``launch`` must synchronize its stream, so every kernel it starts ends
     inside the profiled span.
+
+    Raises:
+        RuntimeError: A profiler session is already active in this process.
+            Kineto runs one session at a time, so a second one would stop the
+            caller's session.
     """
+    import torch
     from torch.profiler import ProfilerActivity, profile
+
+    if torch._C._autograd._profiler_enabled():
+        raise RuntimeError("a torch.profiler session is already active")
 
     os.environ.setdefault("KINETO_LOG_LEVEL", _KINETO_SILENT)
     with warnings.catch_warnings():

@@ -526,6 +526,10 @@ it. The first profiler start in a process can take about one second.
   `oracle.dispatch` shows the kernels that tuning selected.
 - The tool sets `KINETO_LOG_LEVEL=6` when it is not set. The profiler then
   writes no lines on stderr. A failed capture gives a row warning.
+- When a `torch.profiler` session is already active in the process (for
+  example, a caller that profiles the run), the tool does not start a second
+  one. Kineto runs one session at a time, and a second one stops the first.
+  The row then has no `dispatch` and gets a warning.
 
 ## Profiling child process
 

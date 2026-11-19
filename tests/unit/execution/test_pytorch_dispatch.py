@@ -150,6 +150,20 @@ def test_a_real_trace_names_the_forced_backend():
     assert found == {"math": "math", "flash": "flash"}
 
 
+def test_an_active_profiler_session_is_left_running():
+    """A caller's own torch.profiler session must keep recording: a second
+    session would stop it, so the capture refuses instead."""
+    torch = pytest.importorskip("torch")
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU]) as outer:
+        with pytest.raises(RuntimeError, match="already active"):
+            pytorch_dispatch.profile_launch(lambda: torch.ones(2).relu())
+        torch.ones(2).neg()
+
+    assert "aten::neg" in {event.name for event in outer.events()}
+
+
 class _FaBackend(enum.Enum):
     """Stand-in for ``torch._C._ROCmFABackend``."""
 
