@@ -75,9 +75,8 @@ jobs:
 
       # No GPU required: from_json + validate + build_operation_graph only
       # assemble and finalize the backend operation-graph descriptor, no
-      # plan build or kernel execution. --no-aiter: the AITER stage builds
-      # AITER's JIT, which needs a ROCm install that this runner lacks, and
-      # the opgraph check does not use AITER. rocm-libraries is not pinned:
+      # plan build or kernel execution. The AITER stage installs AITER and,
+      # without a GPU, compiles no kernels. rocm-libraries is not pinned:
       # setup builds develop, or the ROCM_LIBRARIES_REF repository variable
       # (a branch, tag or full commit) when it is set.
       - name: Build hipDNN (no GPU)
@@ -85,7 +84,7 @@ jobs:
           PIP_NO_CACHE_DIR: "1"
           ROCM_LIBRARIES_REF: ${{ vars.ROCM_LIBRARIES_REF || 'develop' }}
         run: |
-          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y --no-aiter \
+          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y \
             --rocm-libraries-ref "$ROCM_LIBRARIES_REF"
 
       - name: Log the rocm-libraries commit
