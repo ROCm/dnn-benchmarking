@@ -218,7 +218,10 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
     sliding window and no ragged layout (the graph never has them), and rocKE
     accepts the spec with the graph's batch and sequence lengths. The shipped
     kernels read the shape (and, from rocm-libraries 8149ff0, the head counts)
-    as kernel arguments, so the shape does not change the code object.
+    as kernel arguments, so the shape does not change the code object. From
+    rocm-libraries 1423e5c (#14901), the descriptors do not record head
+    counts: one variant serves every head configuration, and the spec takes
+    the graph's head counts.
     """
     from kernels.gfx950.attention_dense import (
         Gfx950AttentionDenseSpec,
@@ -231,8 +234,9 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
         if (
             spec.get("dtype") != problem.dtype
             or spec.get("head_size") != problem.head_size
-            or spec.get("num_query_heads") != problem.num_query_heads
-            or spec.get("num_kv_heads") != problem.num_kv_heads
+            or spec.get("num_query_heads", problem.num_query_heads)
+            != problem.num_query_heads
+            or spec.get("num_kv_heads", problem.num_kv_heads) != problem.num_kv_heads
             or bool(spec.get("causal")) != problem.causal
             or spec.get("sliding_window")
             or spec.get("ragged")
@@ -241,6 +245,8 @@ def catalog_kernels(catalog: Catalog, problem: SdpaProblem) -> List[CatalogKerne
         shaped = dict(
             spec,
             batch=problem.batch,
+            num_query_heads=problem.num_query_heads,
+            num_kv_heads=problem.num_kv_heads,
             seqlen_q=problem.seqlen_q,
             seqlen_kv=problem.seqlen_kv,
             # hipDNN launches every variant on the qb_minor grid (its
