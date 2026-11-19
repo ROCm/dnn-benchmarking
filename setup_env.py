@@ -1860,6 +1860,12 @@ class Setup:
             return
         self.ensure_aiter_checkout()
         env = dict(self.env, AITER_USE_SYSTEM_TRITON="1")
+        # AITER's setup.py reads the HIP version from ROCM_HOME, else
+        # ROCM_PATH. ROCM_PATH is the hipDNN prefix (the libraries wheel with
+        # ROCm torch), which has no hipconfig and no version file. Without
+        # /opt/rocm or a hipconfig on PATH, the build then stops with "ROCm
+        # version file not found". The toolchain prefix has both.
+        env.setdefault("ROCM_HOME", self.toolchain_prefix)
         # AITER's runtime imports (pyyaml, ...) are in requirements.txt only.
         self.pip("install", "-r", str(AITER_DIR / "requirements.txt"), env=env)
         self.pip("install", *aiter_build_requires(AITER_DIR), env=env)

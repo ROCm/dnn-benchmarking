@@ -331,7 +331,13 @@ On Linux with ROCm torch, the `AITER` stage installs AITER for
    editable package without build isolation and with
    `AITER_USE_SYSTEM_TRITON=1`. Both are needed to keep torch's Triton: an
    isolated build cannot see it, and AITER then runs its own Triton install
-   script.
+   script. The AITER build and step 3 also get `ROCM_HOME` set to the ROCm
+   toolchain prefix (rocm-sdk-devel in `rocm` torch mode), unless
+   `ROCM_HOME` is already set. AITER reads the HIP version from
+   `ROCM_HOME`, else from `ROCM_PATH`. `ROCM_PATH` is the hipDNN prefix,
+   which has no HIP version file. Without `ROCM_HOME`, a host without
+   `/opt/rocm` stops with "ROCm version file not found". `ROCM_PATH` is
+   not changed.
 3. On a GPU that AITER supports (gfx90a, gfx942, gfx950), it runs every
    AITER backend that `--runtime aiter` runs on that GPU once, for fp16 and
    bf16 with and without a causal mask. This compiles AITER's host modules

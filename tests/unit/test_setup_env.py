@@ -938,9 +938,11 @@ def test_install_aiter_skips_without_fetching(
     assert not (tmp_path / "aiter").exists()
 
 
-def test_install_aiter_installs_without_isolation_and_reports_prebuild_failure(
-    setup_env, tmp_path, monkeypatch, capsys
-) -> None:
+def _install_aiter(setup_env, tmp_path, monkeypatch, toolchain: str = "/toolchain"):
+    """Prepare install_aiter with pip and the prebuild faked.
+
+    Returns ``(aiter dir, pip calls, prebuild envs, Setup)``.
+    """
     aiter = tmp_path / "aiter"
     aiter.mkdir()
     (aiter / "pyproject.toml").write_text(
@@ -949,14 +951,24 @@ def test_install_aiter_installs_without_isolation_and_reports_prebuild_failure(
     monkeypatch.setattr(setup_env, "AITER_DIR", aiter)
     setup = _setup(setup_env, tmp_path)
     setup.installed_torch_mode = "rocm"
+    setup.toolchain_prefix = toolchain
     monkeypatch.setattr(setup, "ensure_aiter_checkout", lambda: None)
     installs = []
     monkeypatch.setattr(setup, "pip", lambda *a, env=None: installs.append((a, env)))
-    monkeypatch.setattr(
-        setup_env,
-        "run",
-        lambda cmd, **k: subprocess.CompletedProcess(cmd, returncode=1),
-    )
+    prebuilds = []
+
+    def fake_run(cmd, env=None, **k):
+        prebuilds.append(env)
+        return subprocess.CompletedProcess(cmd, returncode=1)
+
+    monkeypatch.setattr(setup_env, "run", fake_run)
+    return aiter, installs, prebuilds, setup
+
+
+def test_install_aiter_installs_without_isolation_and_reports_prebuild_failure(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    aiter, installs, _, setup = _install_aiter(setup_env, tmp_path, monkeypatch)
 
     setup.install_aiter()
 
@@ -976,6 +988,43 @@ def test_install_aiter_installs_without_isolation_and_reports_prebuild_failure(
     )
     assert env["AITER_USE_SYSTEM_TRITON"] == "1"
     assert "Some AITER backends did not compile" in capsys.readouterr().err
+
+
+def _aiter_rocm_root(env: dict) -> str:
+    """The ROCm root where AITER's setup.py looks for the HIP version."""
+    return env.get("ROCM_HOME") or env.get("ROCM_PATH")
+
+
+@pytest.mark.parametrize("user_rocm_home", [None, "/opt/my-rocm"])
+def test_install_aiter_reads_the_hip_version_from_the_toolchain(
+    setup_env, tmp_path, monkeypatch, user_rocm_home
+) -> None:
+    """With ROCm torch, ROCM_PATH is the hipDNN prefix, the libraries wheel.
+
+    It has no hipconfig and no version file. Without /opt/rocm, AITER's
+    setup.py then failed with "ROCm version file not found". A ROCM_HOME
+    that the user sets still wins.
+    """
+    libraries = tmp_path / "_rocm_sdk_libraries"
+    devel = tmp_path / "_rocm_sdk_devel"
+    (devel / "bin").mkdir(parents=True)
+    (devel / "bin" / "hipconfig").write_text("")
+    _, installs, prebuilds, setup = _install_aiter(
+        setup_env, tmp_path, monkeypatch, toolchain=str(devel)
+    )
+    setup.env["ROCM_PATH"] = str(libraries)
+    setup.env.pop("ROCM_HOME", None)
+    if user_rocm_home:
+        setup.env["ROCM_HOME"] = user_rocm_home
+
+    setup.install_aiter()
+
+    build_env, prebuild_env = installs[-1][1], prebuilds[-1]
+    expected = user_rocm_home or str(devel)
+    for env in (build_env, prebuild_env):
+        assert _aiter_rocm_root(env) == expected
+        # Plugin discovery and the activation script keep the hipDNN prefix.
+        assert env["ROCM_PATH"] == str(libraries)
 
 
 # --- venv reuse ----------------------------------------------------------------
