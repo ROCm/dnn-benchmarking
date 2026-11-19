@@ -840,8 +840,9 @@ A graph with no applicable engine shows the reason from hipDNN.
 
 `-v` adds a block for each row with the plugin path, costs (build, first
 call, row total), timing mode, a statistics table for kernel and submit time,
-clocks before and after the loop, FLOPs, I/O and VRAM, correctness, oracle and
-profiling results, and all warnings.
+clocks before and after the loop, FLOPs, I/O and VRAM, correctness, the
+PyTorch SDPA backend and GPU kernels (`dispatch` lines), oracle and profiling
+results, and all warnings.
 
 ### Result files
 

@@ -10,7 +10,7 @@ import torch
 from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
-from . import pytorch_ops
+from . import pytorch_dispatch, pytorch_ops
 from .timing import Measurement, is_hip_available, measure
 
 
@@ -63,6 +63,8 @@ class PyTorchCudaExecutor:
         self._compiled: Optional[pytorch_ops.CompiledGraph] = None
         # Row warnings that handlers found while priming the last benchmark().
         self.notes: List[str] = []
+        # The last benchmark()'s primed inputs, for capture_dispatch().
+        self._replay: Optional[pytorch_ops.ReplayTensors] = None
 
     def prepare(self) -> None:
         """Validate and compile the graph and pin the execution stream.
@@ -110,6 +112,7 @@ class PyTorchCudaExecutor:
         stream = self._get_stream()
         replay = pytorch_ops.ReplayTensors(tensors)
         self.notes = replay.notes
+        self._replay = replay
         # One stream context around the whole loop: entering it per iteration
         # would put its host cost inside the submit bracket.
         with torch.cuda.device(self._device), torch.cuda.stream(stream):
@@ -120,6 +123,45 @@ class PyTorchCudaExecutor:
                 timer=self._timer,
                 torch_stream=stream,
             )
+
+    def capture_dispatch(self) -> Dict[str, Any]:
+        """Profile one untimed launch of the timed path; return what it ran.
+
+        The launch replays the inputs that the last ``benchmark()`` primed, so
+        handler setup (fused-kernel probes, layout copies, host reads) does
+        not run again. The device is drained first, so no input-fill, warmup
+        or cache-flush kernel is in the trace. Call it once, after
+        ``benchmark()``: it releases the primed inputs.
+
+        Returns:
+            The plan's ``dispatch`` object: ``sdpa_backend``, ``fa_library``
+            (Flash on ROCm only) and ``kernels``, the distinct GPU kernel
+            names in order of first launch.
+
+        Raises:
+            ExecutionError: If ``benchmark()`` did not run first.
+        """
+        stream = self._get_stream()
+        replay, self._replay = self._replay, None
+        if replay is None:
+            raise ExecutionError("capture_dispatch() needs a benchmark() first.")
+
+        def launch() -> None:
+            self._execute_graph(replay)
+            stream.synchronize()
+
+        with torch.cuda.device(self._device), torch.cuda.stream(stream):
+            torch.cuda.synchronize()
+            events = pytorch_dispatch.profile_launch(launch)
+        backend = pytorch_dispatch.sdpa_backend(events)
+        flash = backend is not None and "flash" in backend.split(",")
+        return {
+            "sdpa_backend": backend,
+            "fa_library": (
+                pytorch_ops.rocm_fa_library(self._sdpa_backend_state) if flash else None
+            ),
+            "kernels": pytorch_dispatch.kernel_names(events),
+        }
 
     def _get_stream(self) -> Any:
         """Return the PyTorch stream used by all graph execution."""

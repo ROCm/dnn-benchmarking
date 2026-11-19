@@ -427,6 +427,8 @@ def _child_row(
     kernel_ms=(0.25, 0.25, 0.3),
     mode="staged",
     fallback_reason=None,
+    dispatch=None,
+    warnings=(),
 ):
     timing_info = TimingInfo(
         mode=mode,
@@ -439,10 +441,12 @@ def _child_row(
     return {
         "status": status,
         "message": message,
+        "warnings": list(warnings),
         "ootb": {
             "timing": timing_info.to_dict(),
             "kernel": BenchmarkStats.from_timings(kernel_ms).to_dict(),
             "host": BenchmarkStats.from_timings([0.5, 0.5, 0.5]).to_dict(),
+            "dispatch": dispatch,
         },
     }
 
@@ -603,6 +607,34 @@ def test_pytorch_tuned_row_comes_from_the_child_ootb_plan(child, tmp_path):
     assert o.host_stats.median_ms == pytest.approx(0.5)
     # 1e9 FLOPs over the child's 0.25 ms kernel median.
     assert o.derived_tflops_per_s == pytest.approx(4.0)
+
+
+def test_pytorch_tuned_dispatch_and_its_warnings_come_from_the_child(child, tmp_path):
+    """Tuning can pick other kernels, so the tuned plan records the child's
+    dispatch, and a capture failure in the child is not lost with its stderr."""
+    tuned = {"sdpa_backend": "efficient", "fa_library": None, "kernels": None}
+    child.result = {
+        "graphs": [
+            {
+                "results": [
+                    _child_row(
+                        dispatch=tuned,
+                        warnings=[
+                            "noisy: IQR 9% of median",
+                            "dispatch not recorded: the profiler saw no GPU kernel",
+                        ],
+                    )
+                ]
+            }
+        ]
+    }
+
+    row = _run_pytorch(tmp_path)
+
+    assert row.oracle.dispatch == tuned
+    assert row.warnings == [
+        "tuned run: dispatch not recorded: the profiler saw no GPU kernel"
+    ]
 
 
 @pytest.mark.parametrize(

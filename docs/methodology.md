@@ -498,6 +498,35 @@ clocks right after the timed loop: `sclk_mhz`, `mclk_mhz`, `power_w`,
 `temp_hotspot_c` and `throttle_status`. The row gets the warning `throttled`
 when `throttle_status` is not 0. The tool does not set or lock clocks.
 
+## PyTorch dispatch record
+
+A PyTorch row records which SDPA backend and which GPU kernels its timed path
+ran, in the plan's `dispatch` object (see
+[results-schema.md](results-schema.md#dispatch)). After the timed loop, the
+tool runs the graph one more time under `torch.profiler`, with CPU and GPU
+activities:
+
+1. The tool synchronizes the device. No input-fill, warmup or cache-flush
+   kernel is then in the trace.
+2. It runs one launch with the inputs that the timed loop primed. The setup
+   of the first call (fused-kernel probes, layout copies, host reads) does
+   not run again, so its kernels are not in the trace.
+3. It synchronizes the stream and stops the profiler.
+
+The launch is not timed and gives no sample. `elapsed_s` of the row includes
+it. The first profiler start in a process can take about one second.
+
+- `kernels` holds the `kernel` events of the trace. Copies and fills are not
+  kernels.
+- `sdpa_backend` comes from the ATen SDPA op that the launch called, for
+  example `aten::_scaled_dot_product_flash_attention`.
+- On a reference row, the launch uses the timed backend selection, not the
+  MATH selection of the reference output pass.
+- With `--oracle`, the tuned child process records its own launch, so
+  `oracle.dispatch` shows the kernels that tuning selected.
+- The tool sets `KINETO_LOG_LEVEL=6` when it is not set. The profiler then
+  writes no lines on stderr. A failed capture gives a row warning.
+
 ## Profiling child process
 
 `--pmc`, `--trace`, `--perf` and `--roofline` do not change the timed

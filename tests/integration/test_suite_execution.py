@@ -174,6 +174,56 @@ def test_pytorch_runtime_times_graph(torch_gpu, graph_name: str) -> None:
     assert row.ootb.timing.timer == expected_timer()
 
 
+@pytest.mark.parametrize(
+    "graph_name, selection",
+    [
+        ("sample_sdpa.json", PyTorchSdpaBackendName.DEFAULT),
+        ("sample_sdpa.json", PyTorchSdpaBackendName.FLASH),
+        ("sample_sdpa.json", PyTorchSdpaBackendName.EFFICIENT),
+        ("sample_sdpa.json", PyTorchSdpaBackendName.MATH),
+        ("sample_sdpa_backward.json", PyTorchSdpaBackendName.DEFAULT),
+        ("sample_sdpa_backward.json", PyTorchSdpaBackendName.EFFICIENT),
+    ],
+)
+def test_pytorch_sdpa_row_records_its_backend_and_kernels(
+    torch_gpu, graph_name: str, selection: PyTorchSdpaBackendName
+) -> None:
+    """The row names the GPU kernels of one launch of its timed path, and the
+    SDPA backend that a strict selection forced."""
+    from dnn_benchmarking.common import torch_support
+
+    path, graph_json, tensor_infos = load_graph(graph_name)
+    config = SuiteConfig(
+        warmup_iters=1,
+        benchmark_iters=2,
+        runtime=RuntimeName.PYTORCH,
+        pytorch_sdpa_backend=selection,
+    )
+    result = run_graph(
+        path,
+        graph_json,
+        tensor_infos,
+        config,
+        Reporter(output=io.StringIO()),
+        [pytorch_plan],
+    )
+
+    [row] = result.results
+    if selection is not PyTorchSdpaBackendName.DEFAULT and row.status != "success":
+        pytest.skip(f"{selection.value} SDPA does not run here: {row.error_message}")
+    assert row.status == "success", row.error_message or row.skip_reason
+    dispatch = json.loads(json.dumps(row.to_dict()))["ootb"]["dispatch"]
+    kernels = dispatch["kernels"]
+    assert kernels and len(set(kernels)) == len(kernels), (dispatch, row.warnings)
+    if selection is not PyTorchSdpaBackendName.DEFAULT:
+        assert dispatch["sdpa_backend"] == selection.value, dispatch
+    flash = dispatch["sdpa_backend"] == "flash"
+    if flash and torch_support.is_rocm_build():
+        assert dispatch["fa_library"] in {"aotriton", "ck"}, dispatch
+    else:
+        assert dispatch["fa_library"] is None, dispatch
+
+
 def test_nondefault_sdpa_backend_errors_without_native_sdpa(torch_gpu) -> None:
     """A strict SDPA selection rejects a graph that never reaches native SDPA."""
     path, graph_json, tensor_infos = load_graph("sample_conv_fwd.json")

@@ -57,6 +57,8 @@ RUN_CONFIG_KEYS = (
     "profiling",
 )
 PROFILING_KEYS = ("pmc", "trace", "perf", "roofline")
+# Keys of a plan's ``dispatch`` object (PyTorch rows only).
+DISPATCH_KEYS = ("sdpa_backend", "fa_library", "kernels")
 ENVIRONMENT_KEYS = (
     "hostname",
     "cpu_model",
@@ -239,6 +241,9 @@ class PlanResult:
         derived_tflops_per_s: Graph FLOPs over the kernel median.
         derived_gbytes_per_s: Graph I/O bytes over the kernel median.
         correctness: Comparison of this plan's outputs with the reference.
+        dispatch: PyTorch rows: what one untimed launch of the timed path
+            ran (keys per :data:`DISPATCH_KEYS`). None on other rows, or
+            when the capture failed.
     """
 
     cpu_build_time_ms: Optional[float] = None
@@ -249,6 +254,7 @@ class PlanResult:
     derived_tflops_per_s: Optional[float] = None
     derived_gbytes_per_s: Optional[float] = None
     correctness: Optional[CorrectnessResult] = None
+    dispatch: Optional[Dict[str, Any]] = None
 
     def plan_dict(self) -> Dict[str, Any]:
         """Convert to the v2 plan object (``ootb`` and ``oracle``)."""
@@ -262,6 +268,11 @@ class PlanResult:
             "gbps": self.derived_gbytes_per_s,
             "correctness": (
                 self.correctness.to_dict() if self.correctness is not None else None
+            ),
+            "dispatch": (
+                _with_keys(self.dispatch, DISPATCH_KEYS)
+                if self.dispatch is not None
+                else None
             ),
         }
 
