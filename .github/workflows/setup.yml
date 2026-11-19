@@ -107,14 +107,24 @@ jobs:
           python-version: '3.12'
 
       # No --gpu-arch: detected from the runner's own GPU, so this job works
-      # on any GPU runner label.
+      # on any GPU runner label. ROCm PyTorch is the newest nightly that
+      # Quartz reports as built and not failing tests for that GPU, or the
+      # ROCM_VERSION repository variable when it is set.
       - name: Full rocm-mode build
         env:
           PIP_NO_CACHE_DIR: "1"
+          ROCM_VERSION: ${{ vars.ROCM_VERSION }}
         run: |
           python setup_env.py \
             --workspace .ci-gpu-workspace \
+            ${ROCM_VERSION:+--rocm-version "$ROCM_VERSION"} \
             -y
+
+      - name: Log the ROCm build
+        run: |
+          python -c 'import json, sys; r = json.load(open(sys.argv[1])); print("ROCm", r["rocm_version"], "built", r["build_date"], "from TheRock", r["therock_commit"], "(" + r["source"] + "), untested:", r["untested"])' \
+            .ci-gpu-workspace/.venv/dnn-bench-rocm-build.json |
+            tee -a "$GITHUB_STEP_SUMMARY"
 
       # activate (not $VENV/python) for the ROCM_PATH/LD_LIBRARY_PATH that
       # conftest.py's plugin discovery needs. No -m filter: gpu tests run here.

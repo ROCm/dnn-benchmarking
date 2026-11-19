@@ -4,6 +4,7 @@ set -euo pipefail
 container_command="docker"
 device_target="gfx942"
 tag=""
+rocm_version=""
 build_args=()
 
 usage() {
@@ -16,12 +17,17 @@ Options:
   --container-command CMD  Container command. Default: docker
   --device-target TARGET   ROCm PyTorch GPU architecture. Default: gfx942
   --tag TAG                Image tag. Default: dnn-benchmark-performance:<device-target>
+  --rocm-version VERSION   ROCm wheel version to install, for example
+                           10.3.0a20261117. Default: the newest nightly that
+                           Quartz reports as built for the device target,
+                           selected on this host.
   -h, --help               Show this help.
 
 Examples:
   ./build-dnn-benchmark-performance-image.sh
   ./build-dnn-benchmark-performance-image.sh --container-command podman
   ./build-dnn-benchmark-performance-image.sh --device-target gfx950
+  ./build-dnn-benchmark-performance-image.sh --rocm-version 10.3.0a20261117
 EOF
 }
 
@@ -40,6 +46,11 @@ while [[ $# -gt 0 ]]; do
         --tag|-t)
             [[ $# -ge 2 ]] || { echo "--tag requires a value" >&2; exit 2; }
             tag="$2"
+            shift 2
+            ;;
+        --rocm-version)
+            [[ $# -ge 2 ]] || { echo "--rocm-version requires a value" >&2; exit 2; }
+            rocm_version="$2"
             shift 2
             ;;
         -h|--help)
@@ -78,10 +89,32 @@ if [[ -z "${rocm_libraries_ref}" ]]; then
     echo "WARNING: could not resolve the rocm-libraries submodule commit; the image will build its moving branch." >&2
 fi
 
+# Select the ROCm nightly here, with the same rule as setup_env.py. The image
+# then installs and labels that ROCm build even when a newer nightly appears.
+resolved="$(python3 - "${repo_root}/setup_env.py" "${device_target}" "${rocm_version}" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("setup_env", sys.argv[1])
+setup_env = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(setup_env)
+device_target, rocm_version = sys.argv[2:]
+if rocm_version:
+    build = setup_env.describe_rocm_version(rocm_version, "", "linux", device_target)
+else:
+    build = setup_env.select_quartz_nightly("linux", device_target)
+print(build.rocm_version, build.index_url)
+PY
+)"
+read -r rocm_version rocm_index_url <<<"${resolved}"
+echo "ROCm ${rocm_version} from ${rocm_index_url}"
+
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" "${container_command}" build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance-linux" \
     --build-arg "DEVICE_TARGET=${device_target}" \
     --build-arg "ROCM_LIBRARIES_REF=${rocm_libraries_ref}" \
+    --build-arg "ROCM_VERSION=${rocm_version}" \
+    --build-arg "ROCM_TORCH_INDEX_URL=${rocm_index_url}" \
     -t "${tag}" \
     "${build_args[@]}" \
     "${repo_root}"
