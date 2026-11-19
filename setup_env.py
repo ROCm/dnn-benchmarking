@@ -22,6 +22,8 @@ top level; any such probe runs in a subprocess against the *venv* interpreter.
 
 import argparse
 import contextlib
+import dataclasses
+import datetime
 import functools
 import json
 import os
@@ -33,8 +35,10 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import NoReturn
+from typing import Dict, NoReturn, Optional, Tuple
 
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -91,6 +95,24 @@ ROCM_NIGHTLY_BASE = "https://nightly.repo.amd.com/rocm"
 # and Windows always resolve the exact same torch/rocm-sdk-* build.
 ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-next/"
 
+# Quartz (https://github.com/ROCm/Quartz) publishes one status.json for each
+# TheRock nightly. Setup reads it to pick the ROCm PyTorch nightly. The
+# consumer guide is docs/status-json in that repository.
+QUARTZ_NIGHTLY_URL = "https://raw.githubusercontent.com/ROCm/quartz/main/nightly/"
+# The status.json schema major that setup reads. A newer minor only adds
+# optional fields; another major can move the fields that setup reads.
+QUARTZ_SCHEMA_MAJOR = "2"
+# Setup searches the newest nightly and the nightlies of this many days in
+# total, then stops with an error.
+QUARTZ_LOOKBACK_DAYS = 14
+QUARTZ_TIMEOUT_S = 30
+# The Quartz test suites (pipelines.<suite>.test) whose result for the GPU
+# architecture setup checks.
+QUARTZ_TEST_SUITES = ("rocm", "pytorch")
+# The ROCm wheel version of a nightly, for example 10.3.0a20261117. The group
+# is the build date.
+_NIGHTLY_VERSION = re.compile(r"\d+\.\d+\.\d+a(\d{8})")
+
 # Windows has no rocm_agent_enumerator/rocminfo to detect the local arch with,
 # so fall back to a default target known to have published wheels.
 WINDOWS_DEFAULT_GPU_ARCH = "gfx1151"
@@ -114,6 +136,13 @@ TORCH_RECORD = "dnn-bench-torch.json"
 # -D define after it drops off the configure line, so a dir configured
 # differently is wiped.
 BUILD_RECORD = "dnn-bench-prefixes.json"
+
+# Written into the venv after setup installs ROCm PyTorch: the ROCm wheel
+# version, the TheRock build date and commit from Quartz, the Quartz test
+# suites with no result for the GPU architecture, and what selected
+# the build. dnn_benchmarking.metrics.machine_info reads it into the result
+# environment, and a reused venv checks --rocm-version against it.
+ROCM_BUILD_RECORD = "dnn-bench-rocm-build.json"
 
 
 # --- Small process helpers -------------------------------------------------
@@ -198,6 +227,268 @@ def git_output(args) -> str:
     """Run git and return its stdout, stripped; raise on nonzero exit."""
     result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+
+# --- ROCm nightly selection (Quartz) ----------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RocmBuild:
+    """The TheRock build that setup installs ROCm PyTorch from.
+
+    ``rocm_version`` is the ROCm wheel version that pip pins; "" installs the
+    newest build on ``index_url``. ``build_date``, ``therock_commit``,
+    ``status_url`` and ``untested`` come from the Quartz status.json, or are
+    None when setup did not read one. ``untested`` names the Quartz test
+    suites with no result for the GPU architecture. ``source`` names what
+    selected the build.
+    """
+
+    rocm_version: str
+    index_url: str
+    source: str
+    build_date: Optional[str] = None
+    therock_commit: Optional[str] = None
+    status_url: Optional[str] = None
+    untested: Optional[Tuple[str, ...]] = None
+
+
+def quartz_platform() -> str:
+    """The ``summary`` key of this host's platform in a Quartz status.json."""
+    return "windows" if IS_WINDOWS else "linux"
+
+
+def fetch_quartz_text(url: str) -> Optional[str]:
+    """The body of ``url``, or None when the server answers 404 Not Found.
+
+    A nightly that did not run has no status.json, so 404 is an expected
+    answer. Every other failure stops setup with the URL.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=QUARTZ_TIMEOUT_S) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        fail(f"cannot read {url}: {exc}")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        fail(f"cannot read {url}: {exc}")
+
+
+def _parse_quartz_status(url: str, body: str) -> dict:
+    """The status.json document in ``body``; exit when setup cannot read it."""
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        fail(f"{url} is not valid JSON: {exc}")
+    major = str(document.get("schema_version", "")).split(".")[0]
+    if major != QUARTZ_SCHEMA_MAJOR:
+        fail(
+            f"{url} has status.json schema {document.get('schema_version')!r}; "
+            f"setup reads schema {QUARTZ_SCHEMA_MAJOR}.x only.",
+            "Update the Quartz reader in setup_env.py, or pass --rocm-version.",
+        )
+    return document
+
+
+def _quartz_status_url(build_date: str) -> str:
+    return f"{QUARTZ_NIGHTLY_URL}{build_date}/status.json"
+
+
+def quartz_arch_matches(gpu_arch: str, target: str) -> bool:
+    """True when the TheRock build target ``target`` covers ``gpu_arch``.
+
+    Quartz lists the targets that TheRock built: one GPU (``gfx90a``,
+    ``gfx950-dcgpu``) or a family whose last character is ``X``
+    (``gfx94X-dcgpu`` covers gfx942, ``gfx110X-all`` covers gfx1100 to
+    gfx1103). The part after ``-`` names a product line, not a GPU.
+    """
+    family = target.split("-", 1)[0].lower()
+    arch = gpu_arch.lower()
+    if family.endswith("x"):
+        return len(arch) == len(family) and arch.startswith(family[:-1])
+    return arch == family
+
+
+def quartz_target(targets, gpu_arch: str) -> Optional[str]:
+    """The TheRock build target among ``targets`` that covers ``gpu_arch``.
+
+    A target for the one GPU wins over a family target. None when no
+    target covers ``gpu_arch``.
+    """
+    matches = [target for target in targets if quartz_arch_matches(gpu_arch, target)]
+    exact = [t for t in matches if not t.split("-", 1)[0].lower().endswith("x")]
+    return (exact or matches or [None])[0]
+
+
+def quartz_arch_tests(
+    document: dict, platform_name: str, gpu_arch: str
+) -> Tuple[Dict[str, Tuple[str, str]], Tuple[str, ...]]:
+    """The Quartz test results of ``gpu_arch`` on ``platform_name``.
+
+    Returns ``{suite: (target, status)}`` for each suite in QUARTZ_TEST_SUITES
+    that has a test entry for a target that covers ``gpu_arch``, and the
+    suites without one. Setup reads the status of the target only. Quartz
+    rolls the PyTorch variants up into it: ``failure`` when a variant failed,
+    else ``in_progress`` while a variant runs.
+    """
+    pipelines = document.get("pipelines", {})
+    results = {}
+    untested = []
+    for suite in QUARTZ_TEST_SUITES:
+        entries = pipelines.get(suite, {}).get("test", {}).get(platform_name, {})
+        target = quartz_target(entries, gpu_arch)
+        if target is None:
+            untested.append(suite)
+        else:
+            results[suite] = (target, str(entries[target].get("status") or "absent"))
+    return results, tuple(untested)
+
+
+def quartz_rejection(document: dict, platform_name: str, gpu_arch: str) -> str:
+    """Why the build cannot supply ROCm PyTorch for ``gpu_arch``; "" if it can.
+
+    Setup needs the ROCm and the PyTorch build of ``platform_name`` to be
+    ``success``, and ``gpu_arch`` among the built architectures. The ROCm and
+    PyTorch tests of ``gpu_arch`` must be ``success`` when Quartz has them; a
+    suite with no entry for ``gpu_arch`` does not reject the build. Setup does
+    not read the test counters or ``overall_status``: they fold in every
+    architecture, and some are routinely red. The result names every check
+    that fails, separated by "; ".
+    """
+    if document.get("release_type") != "nightly":
+        return f"release_type is {document.get('release_type')!r}, not 'nightly'"
+    if document.get("build_variant", "release") != "release":
+        return f"build_variant is {document.get('build_variant')!r}"
+    if not _NIGHTLY_VERSION.fullmatch(str(document.get("rocm_version", ""))):
+        return f"rocm_version {document.get('rocm_version')!r} is not a nightly"
+    summary = document.get("summary", {}).get(platform_name)
+    if not summary:
+        return f"no {platform_name} build"
+    reasons = []
+    if quartz_target(summary.get("architectures", []), gpu_arch) is None:
+        reasons.append(f"{gpu_arch} is not among its {platform_name} architectures")
+    for pipeline in ("rocm", "pytorch"):
+        status = summary.get(pipeline, {}).get("build", {}).get("status")
+        if status != "success":
+            reasons.append(f"{platform_name} {pipeline} build is {status or 'absent'}")
+    if not summary.get("urls", {}).get("wheels"):
+        reasons.append(f"no {platform_name} wheels URL")
+    results, _ = quartz_arch_tests(document, platform_name, gpu_arch)
+    for suite, (target, status) in results.items():
+        if status != "success":
+            reasons.append(f"{platform_name} {suite} tests of {target} are {status}")
+    return "; ".join(reasons)
+
+
+def _rocm_build_from_quartz(
+    document: dict,
+    url: str,
+    platform_name: str,
+    gpu_arch: str,
+    source: str,
+    index_url: str = "",
+) -> RocmBuild:
+    """The build that ``document`` describes. An explicit ``index_url`` wins
+    over the wheels URL of the document."""
+    urls = document.get("summary", {}).get(platform_name, {}).get("urls", {})
+    _, untested = quartz_arch_tests(document, platform_name, gpu_arch)
+    return RocmBuild(
+        rocm_version=document["rocm_version"],
+        index_url=index_url or urls.get("wheels") or ROCM_TORCH_INDEX_URL,
+        source=source,
+        build_date=document.get("build_date") or None,
+        therock_commit=document.get("therock_commit") or None,
+        status_url=url,
+        untested=untested,
+    )
+
+
+def _newest_quartz_nightly() -> datetime.date:
+    """The build date of the nightly that ``nightly/latest.json`` names.
+
+    The pointer is a git symlink, so raw GitHub serves its target path (for
+    example ``20261118/status.json``) instead of the document.
+    """
+    url = f"{QUARTZ_NIGHTLY_URL}latest.json"
+    body = fetch_quartz_text(url)
+    if body is None:
+        fail(f"Quartz publishes no {url}.", "Pass --rocm-version to install a build.")
+    if body.lstrip().startswith("{"):
+        build_date = str(_parse_quartz_status(url, body).get("build_date", ""))
+    else:
+        build_date = body.strip().split("/", 1)[0]
+    try:
+        return datetime.datetime.strptime(build_date, "%Y%m%d").date()
+    except ValueError:
+        fail(f"{url} names no nightly build date: {body.strip()[:80]!r}")
+
+
+def select_quartz_nightly(platform_name: str, gpu_arch: str) -> RocmBuild:
+    """The newest nightly that Quartz reports usable for ``gpu_arch``.
+
+    Setup starts at ``nightly/latest.json`` and goes back one day at a time,
+    QUARTZ_LOOKBACK_DAYS days in total, because the newest nightly can be
+    failed or still running. It exits with every rejected build and its
+    reason when no build qualifies.
+    """
+    newest = _newest_quartz_nightly()
+    rejected = []
+    for days_back in range(QUARTZ_LOOKBACK_DAYS):
+        build_date = (newest - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
+        url = _quartz_status_url(build_date)
+        body = fetch_quartz_text(url)
+        if body is None:
+            rejected.append(f"  {build_date}: no status.json")
+            continue
+        document = _parse_quartz_status(url, body)
+        reason = quartz_rejection(document, platform_name, gpu_arch)
+        if reason:
+            rejected.append(
+                f"  {build_date} ({document.get('rocm_version')}): {reason}"
+            )
+            continue
+        return _rocm_build_from_quartz(document, url, platform_name, gpu_arch, "quartz")
+    fail(
+        f"Quartz reports no usable ROCm nightly for {platform_name} {gpu_arch} in "
+        f"the {QUARTZ_LOOKBACK_DAYS} days up to {newest:%Y%m%d}:",
+        *rejected,
+        "Pass --rocm-version VERSION to install a specific build.",
+    )
+
+
+def describe_rocm_version(
+    rocm_version: str, index_url: str, platform_name: str, gpu_arch: str
+) -> RocmBuild:
+    """The --rocm-version build, with its Quartz metadata when Quartz has it.
+
+    An explicit version is installed even when Quartz reports it unusable,
+    so an older run can be reproduced; setup only warns. A version that is
+    not a nightly, or a nightly from before Quartz, has no build date or
+    TheRock commit. ``index_url`` is --torch-index-url, "" when not given.
+    """
+    match = _NIGHTLY_VERSION.fullmatch(rocm_version)
+    url = _quartz_status_url(match[1]) if match else ""
+    body = fetch_quartz_text(url) if url else None
+    document = _parse_quartz_status(url, body) if body is not None else {}
+    if document.get("rocm_version") != rocm_version:
+        warn(
+            f"Quartz has no nightly status.json for ROCm {rocm_version}.",
+            "The results record no TheRock build date, commit or test coverage "
+            "for it.",
+        )
+        return RocmBuild(
+            rocm_version, index_url or ROCM_TORCH_INDEX_URL, "--rocm-version"
+        )
+    reason = quartz_rejection(document, platform_name, gpu_arch)
+    if reason:
+        warn(
+            f"Quartz reports that ROCm {rocm_version} is not usable: {reason}.",
+            "Installing it because --rocm-version names it.",
+        )
+    return _rocm_build_from_quartz(
+        document, url, platform_name, gpu_arch, "--rocm-version", index_url
+    )
 
 
 def default_workspace() -> Path:
@@ -454,6 +745,16 @@ def _commit_sha(value: str) -> str:
     return sha
 
 
+def _rocm_version(value: str) -> str:
+    """--rocm-version: a ROCm wheel version such as 10.3.0a20261117."""
+    version = value.strip()
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+!-]*", version):
+        raise argparse.ArgumentTypeError(
+            f"expected a ROCm wheel version such as 10.3.0a20261117, got {value!r}"
+        )
+    return version
+
+
 def _cmake_define(value: str) -> str:
     """Normalise a --cmake-arg value to a `-DNAME=VALUE` CMake define.
 
@@ -492,7 +793,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="rocm",
         help=(
             "Select how torch is provided. Default: rocm\n"
-            "  rocm: install ROCm torch nightly, use ROCm libraries/toolchain "
+            "  rocm: install the ROCm torch nightly that Quartz reports as "
+            "built, with no failed tests for the GPU arch (see --rocm-version), "
+            "use ROCm libraries/toolchain "
             "from the torch wheel's bundled ROCm SDK packages, and build local "
             "hipDNN/provider artifacts when absent.\n"
             "  cuda: install CUDA torch from PyPI (or --torch-index-url) for the "
@@ -529,7 +832,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--torch-index-url",
         default="",
-        help="Override the pip index URL used for torch.",
+        help=(
+            "Override the pip index URL used for torch. In rocm mode without "
+            "--rocm-version, setup does not read Quartz and installs the "
+            "newest ROCm torch on this index."
+        ),
+    )
+    parser.add_argument(
+        "--rocm-version",
+        type=_rocm_version,
+        default=None,
+        metavar="VERSION",
+        help=(
+            "ROCm wheel version for --torch-mode rocm, for example "
+            "10.3.0a20261117. Setup installs it even when Quartz reports it "
+            "failed, to reproduce an older run. Default: the newest nightly "
+            f"of the last {QUARTZ_LOOKBACK_DAYS} days whose ROCm and PyTorch "
+            "builds Quartz reports as success for the GPU architecture, with "
+            "no failed or unfinished ROCm or PyTorch tests of that "
+            "architecture."
+        ),
     )
     parser.add_argument(
         "--gpu-arch",
@@ -576,7 +898,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Delete and recreate the virtual environment and wipe the hipDNN/"
             "provider and binding CMake build directories. By default setup "
             "reuses the existing venv (and its torch) and rebuilds incrementally; "
-            "changing its --torch-mode, --gpu-arch or --torch-index-url then "
+            "changing its --torch-mode, --gpu-arch, --torch-index-url or "
+            "--rocm-version then "
             "requires --clean. A build directory configured with other CMake "
             "arguments (another --workspace, --rocm-prefix, GPU arch or "
             "--cmake-arg) is wiped without --clean."
@@ -642,6 +965,7 @@ class Setup:
         self.rocm_libraries_ref = args.rocm_libraries_ref
         self.gpu_arch_override = args.gpu_arch
         self.torch_index_url = args.torch_index_url
+        self.rocm_version = args.rocm_version
         self.editable_install = args.editable_install
         self.extra_cmake_args = list(args.cmake_args)
         self.resolved_torch_index_url = ""
@@ -1150,12 +1474,15 @@ class Setup:
                 "--rocm-prefix.",
             )
 
+        # The devel package must match the ROCm wheels already in the venv.
+        version = (self._read_venv_record(ROCM_BUILD_RECORD) or {}).get("rocm_version")
+        package = f"rocm-sdk-devel=={version}" if version else "rocm-sdk-devel"
         print(
             "ROCm SDK compiler/toolchain prefix not found; installing "
-            f"rocm-sdk-devel from {index_url}...",
+            f"{package} from {index_url}...",
             file=sys.stderr,
         )
-        self.pip("install", "--pre", "rocm-sdk-devel", "--index-url", index_url)
+        self.pip("install", "--pre", package, "--index-url", index_url)
 
         root = self._rocm_sdk_devel_root(report_errors=True)
         if root:
@@ -1359,41 +1686,107 @@ class Setup:
                 return
             arch = self._require_gpu_arch()
             print(f"GPU arch: {arch}")
-            print(f"Installing ROCm PyTorch from {index_url}")
-            # ROCm nightlies are pre-release, so --pre lets pip select them.
-            # device-<arch> is the pip extra that pulls the matching
-            # rocm-sdk-device-<arch> package; the base rocm-sdk-core/-libraries
-            # packages are OS/arch-agnostic on this index, so Linux and
-            # Windows always resolve the exact same nightly.
-            self.pip(
-                "install",
-                "--pre",
-                f"torch[device-{arch}]",
-                f"rocm[libraries,devel,device-{arch}]",
-                "--index-url",
-                index_url,
-            )
+            build = self.select_rocm_build(arch)
+            index_url = self.resolved_torch_index_url = build.index_url
+            self.install_rocm_torch(build, arch)
 
         self.installed_torch_mode = self.get_torch_mode()
         self.require_torch_mode(mode)
         (self.venv_dir / TORCH_RECORD).write_text(
             json.dumps({"torch_index_url": index_url, "gpu_arch": arch}) + "\n"
         )
+        if mode == "rocm":
+            self.write_rocm_build_record(build)
+
+    def select_rocm_build(self, arch: str) -> RocmBuild:
+        """The ROCm build to install: --rocm-version, else the newest build on
+        --torch-index-url, else the newest nightly that Quartz reports usable."""
+        platform_name = quartz_platform()
+        if self.rocm_version:
+            return describe_rocm_version(
+                self.rocm_version, self.torch_index_url, platform_name, arch
+            )
+        if self.torch_index_url:
+            return RocmBuild("", self.torch_index_url, "--torch-index-url")
+        print(f"Selecting the ROCm nightly from Quartz ({QUARTZ_NIGHTLY_URL})")
+        return select_quartz_nightly(platform_name, arch)
+
+    def install_rocm_torch(self, build: RocmBuild, arch: str) -> None:
+        """Install ROCm PyTorch and the ROCm SDK wheels of ``build``."""
+        if build.rocm_version:
+            print(
+                f"Installing ROCm PyTorch for ROCm {build.rocm_version} "
+                f"(TheRock {build.therock_commit or 'commit unknown'}, "
+                f"built {build.build_date or 'on an unknown date'}) "
+                f"from {build.index_url}"
+            )
+        else:
+            print(f"Installing the newest ROCm PyTorch from {build.index_url}")
+        if build.untested:
+            print(
+                f"Quartz has no {' or '.join(build.untested)} test result for "
+                f"{arch} in this nightly; setup records it as untested."
+            )
+        # The torch wheel requires rocm[libraries]==<its ROCm version>, so the
+        # pin on rocm also selects a torch of that build.
+        pin = f"=={build.rocm_version}" if build.rocm_version else ""
+        # ROCm nightlies are pre-release, so --pre lets pip select them.
+        # device-<arch> is the pip extra that pulls the matching
+        # rocm-sdk-device-<arch> package; the base rocm-sdk-core/-libraries
+        # packages are OS/arch-agnostic on this index, so Linux and
+        # Windows always resolve the exact same nightly.
+        self.pip(
+            "install",
+            "--pre",
+            f"torch[device-{arch}]",
+            f"rocm[libraries,devel,device-{arch}]{pin}",
+            "--index-url",
+            build.index_url,
+        )
+
+    def installed_rocm_version(self) -> str:
+        """The version of the ``rocm`` package in the venv."""
+        result = self.probe("import importlib.metadata as m; print(m.version('rocm'))")
+        if result.returncode != 0:
+            fail(
+                "cannot read the version of the installed rocm package.",
+                result.stderr.strip(),
+            )
+        return result.stdout.strip()
+
+    def write_rocm_build_record(self, build: RocmBuild) -> None:
+        """Record the installed ROCm build for the result environment."""
+        record = {
+            "rocm_version": build.rocm_version or self.installed_rocm_version(),
+            "build_date": build.build_date,
+            "therock_commit": build.therock_commit,
+            "source": build.source,
+            "status_url": build.status_url,
+            "index_url": build.index_url,
+            "untested": None if build.untested is None else list(build.untested),
+        }
+        (self.venv_dir / ROCM_BUILD_RECORD).write_text(json.dumps(record) + "\n")
+
+    def _read_venv_record(self, name: str) -> Optional[dict]:
+        """A JSON record that setup wrote into the venv, or None when absent
+        or unreadable."""
+        try:
+            return json.loads((self.venv_dir / name).read_text())
+        except (OSError, ValueError):
+            return None
 
     def require_same_torch_source(self, check_arch: bool = False) -> None:
         """Fail when an explicit flag differs from what the reused venv holds.
 
-        Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
-        the TORCH_RECORD written when setup installed torch. A venv without
-        the record (torch installed some other way) cannot be checked. With
+        Compares --torch-index-url (and, with ``check_arch``, --gpu-arch and
+        --rocm-version) with the TORCH_RECORD and ROCM_BUILD_RECORD written
+        when setup installed torch. A venv without the record (torch
+        installed some other way) cannot be checked. With
         ``check_arch`` and no --gpu-arch, the build uses the recorded arch,
         and fails when the detected GPU has another arch; with no
         --torch-index-url, the toolchain uses the recorded index.
         """
-        try:
-            record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
-        except (OSError, ValueError):
-            record = None
+        record = self._read_venv_record(TORCH_RECORD)
         if (
             check_arch
             and not self.gpu_arch_override
@@ -1420,22 +1813,30 @@ class Setup:
             self.resolved_torch_index_url = record.get(
                 "torch_index_url", self.resolved_torch_index_url
             )
-        checks = [("--torch-index-url", self.torch_index_url, "torch_index_url")]
+        checks = [
+            ("--torch-index-url", self.torch_index_url, TORCH_RECORD, "torch_index_url")
+        ]
         if check_arch:
-            checks.append(("--gpu-arch", self.gpu_arch_override, "gpu_arch"))
-        for flag, value, key in checks:
+            checks.append(
+                ("--gpu-arch", self.gpu_arch_override, TORCH_RECORD, "gpu_arch")
+            )
+            checks.append(
+                ("--rocm-version", self.rocm_version, ROCM_BUILD_RECORD, "rocm_version")
+            )
+        for flag, value, record_name, key in checks:
             if not value:
                 continue
-            if record is None:
+            recorded = self._read_venv_record(record_name)
+            if recorded is None:
                 warn(
-                    f"{self.venv_dir} has no {TORCH_RECORD}, so setup cannot check "
+                    f"{self.venv_dir} has no {record_name}, so setup cannot check "
                     f"that its torch matches {flag} {value}.",
                     "Pass --clean if it does not.",
                 )
-            elif record.get(key) != value:
+            elif recorded.get(key) != value:
                 fail(
                     f"{flag} {value} differs from the "
-                    f"'{record.get(key) or 'default'}' that {self.venv_dir} "
+                    f"'{recorded.get(key) or 'default'}' that {self.venv_dir} "
                     "was set up with.",
                     "Pass --clean to recreate the virtual environment, or use "
                     "another --workspace.",
@@ -2176,6 +2577,8 @@ def main(argv=None) -> int:
         parser.error(
             "--clean deletes the virtual environment --torch-mode existing reuses"
         )
+    if args.rocm_version and args.torch_mode != "rocm":
+        parser.error("--rocm-version needs --torch-mode rocm")
     setup = Setup(args)
     try:
         return setup.run()

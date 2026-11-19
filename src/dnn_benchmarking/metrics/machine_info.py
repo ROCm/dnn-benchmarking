@@ -11,6 +11,7 @@ process has already imported it: importing it takes seconds.
 """
 
 import importlib.util
+import json
 import os
 import platform
 import re
@@ -130,6 +131,47 @@ def _hipdnn_version() -> Optional[str]:
     return getattr(hipdnn_frontend, "__version__", None)
 
 
+#: The venv record that setup_env.py writes after it installs ROCm PyTorch
+#: (``ROCM_BUILD_RECORD`` there).
+ROCM_BUILD_RECORD = "dnn-bench-rocm-build.json"
+
+
+def _rocm_build() -> Dict[str, Any]:
+    """The ROCm build that setup_env.py installed, for the result environment.
+
+    ``rocm_build_version`` is the ROCm wheel version. ``rocm_build_date``,
+    ``therock_commit`` and ``rocm_build_untested`` come from the Quartz
+    status.json of that build; ``rocm_build_untested`` lists the Quartz test
+    suites with no result for the GPU architecture. Each value is None when
+    the venv has no record (ROCm from somewhere else) or the record does not
+    know it.
+    """
+    keys = {
+        "rocm_build_version": "rocm_version",
+        "rocm_build_date": "build_date",
+        "therock_commit": "therock_commit",
+    }
+    build: Dict[str, Any] = dict.fromkeys([*keys, "rocm_build_untested"])
+    path = Path(sys.prefix) / ROCM_BUILD_RECORD
+    try:
+        record = json.loads(path.read_text())
+    except FileNotFoundError:
+        return build
+    except (OSError, ValueError) as e:
+        warn_once("machine_info", f"cannot read {path}: {e!r}")
+        return build
+    if not isinstance(record, dict):
+        warn_once("machine_info", f"{path} is not a JSON object")
+        return build
+    for key, record_key in keys.items():
+        value = record.get(record_key)
+        build[key] = value if isinstance(value, str) else None
+    untested = record.get("untested")
+    if isinstance(untested, list) and all(isinstance(s, str) for s in untested):
+        build["rocm_build_untested"] = untested
+    return build
+
+
 def collect_environment_info() -> Dict[str, Any]:
     """Host, GPU and software versions for the result ``environment`` block.
 
@@ -154,6 +196,7 @@ def collect_environment_info() -> Dict[str, Any]:
         "gpu_model": gpu_model,
         "gpu_arch": gpu_arch,
         "hipdnn_version": _hipdnn_version(),
+        **_rocm_build(),
         "python_version": platform.python_version(),
         "amdsmi_available": amdsmi_available,
     }

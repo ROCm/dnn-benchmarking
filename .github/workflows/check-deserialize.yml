@@ -49,14 +49,25 @@ jobs:
 
       # No GPU required: from_json + validate + build_operation_graph only
       # assemble and finalize the backend operation-graph descriptor, no
-      # plan build or kernel execution. The check imports only
-      # hipdnn_frontend, so --no-aiter skips the AITER build, which needs a
-      # ROCm version file that this runner does not have.
+      # plan build or kernel execution. ROCm PyTorch is the newest nightly
+      # that Quartz reports as built and not failing tests for the arch, or
+      # the ROCM_VERSION repository variable when it is set. The arch is
+      # gfx942, not gfx90a: Quartz reports failed gfx90a ROCm tests on most
+      # nightlies, and this build does not run on a GPU. The check imports
+      # only hipdnn_frontend, so --no-aiter skips the AITER build.
       - name: Build hipDNN (no GPU)
         env:
           PIP_NO_CACHE_DIR: "1"
+          ROCM_VERSION: ${{ vars.ROCM_VERSION }}
         run: |
-          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y --no-aiter
+          python setup_env.py --gpu-arch gfx942 --workspace .ci-workspace -y --no-aiter \
+            ${ROCM_VERSION:+--rocm-version "$ROCM_VERSION"}
+
+      - name: Log the ROCm build
+        run: |
+          python -c 'import json, sys; r = json.load(open(sys.argv[1])); print("ROCm", r["rocm_version"], "built", r["build_date"], "from TheRock", r["therock_commit"], "(" + r["source"] + "), untested:", r["untested"])' \
+            .ci-workspace/.venv/dnn-bench-rocm-build.json |
+            tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Check opgraph-level graph deserialization
         run: |

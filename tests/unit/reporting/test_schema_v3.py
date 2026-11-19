@@ -37,7 +37,8 @@ ENV_KEYS = {
     "kernel_version", "gpu_model", "gpu_arch", "gpu_compute_units", "gpu_hbm_gb",
     "gpu_pcie_link", "amdgpu_driver_version", "gpu_power_cap_w",
     "gpu_max_sclk_mhz", "gpu_compute_partition", "rocm_version", "cuda_version",
-    "cudnn_version", "hipdnn_version", "python_version", "torch_version",
+    "cudnn_version", "hipdnn_version", "rocm_build_version", "rocm_build_date",
+    "therock_commit", "rocm_build_untested", "python_version", "torch_version",
     "amdsmi_available", "selection_env",
 }  # fmt: skip
 SUMMARY_KEYS = {

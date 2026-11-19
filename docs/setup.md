@@ -20,8 +20,9 @@ stages are:
 
 1. `Virtual environment`: create `<workspace>/.venv`, or reuse it. See
    [Reusing a venv](#reusing-a-venv).
-2. `PyTorch (--torch-mode rocm)`: detect the GPU architecture and install the
-   matching ROCm PyTorch nightly (`torch[device-<arch>]`). Its ROCm SDK
+2. `PyTorch (--torch-mode rocm)`: detect the GPU architecture, select the
+   ROCm nightly (see [ROCm nightly selection](#rocm-nightly-selection)) and
+   install its ROCm PyTorch (`torch[device-<arch>]`). Its ROCm SDK
    libraries and toolchain are used for the build.
 3. `dnn-benchmarking package`: install dnn-benchmarking (editable unless
    `--no-editable`).
@@ -67,7 +68,8 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--torch-mode {rocm,cuda,cpu,existing,none}` | How to provide PyTorch. Default `rocm`. See [Torch modes](#torch-modes). |
 | `--workspace WORKSPACE` | Root for the venv, the Python bytecode cache and the runtime caches. See [Workspace](#workspace). |
 | `--no-editable` | Install dnn-benchmarking and the rocKE packages into the venv. The default links to the source tree. |
-| `--torch-index-url URL` | pip index URL for PyTorch. |
+| `--torch-index-url URL` | pip index URL for PyTorch. In `rocm` mode without `--rocm-version`, setup does not read Quartz and installs the newest build on this index. |
+| `--rocm-version VERSION` | ROCm wheel version for `--torch-mode rocm`, for example `10.3.0a20261117`. Default: the newest nightly that Quartz reports as built, with no failed tests for the GPU architecture. See [ROCm nightly selection](#rocm-nightly-selection). |
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
@@ -112,7 +114,7 @@ dnn-benchmarking finds the engine plugins in
 
 | Mode | PyTorch | hipDNN and providers | Use |
 |---|---|---|---|
-| `rocm` (default) | ROCm nightly for the detected architecture | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
+| `rocm` (default) | ROCm nightly for the detected architecture, selected with Quartz | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
 | `cuda` | CUDA PyTorch from PyPI, or `--torch-index-url` | Not built. No bindings, no amdsmi, no `ROCM_PATH` | `--runtime pytorch` on NVIDIA GPUs. |
 | `cpu` | CPU-only PyTorch | Built from source, or reused from the installed prefix with a prepared CPU venv and `--reuse-artifacts`. | CI and `--validate pytorch` with a system ROCm. |
 | `existing` | Keep the PyTorch in the venv | ROCm PyTorch: its SDK libraries. CUDA PyTorch: the `cuda` path. CPU PyTorch: the installed ROCm. | Reuse a venv. |
@@ -145,7 +147,8 @@ PyTorch and the bindings, but reinstalls the dnn-benchmarking package.
 It rejects a fresh hipDNN reuse venv, `--clean` or a different torch
 mode before changing the workspace. In `cpu` and `rocm` modes, setup
 checks a recorded torch source. It rejects mismatched explicit
-`--torch-index-url` and ROCm `--gpu-arch` flags before modifying the venv.
+`--torch-index-url`, and ROCm `--gpu-arch` and `--rocm-version` flags, before
+modifying the venv.
 For example, after preparing `.workspace/.venv` with CPU PyTorch and
 the bindings:
 
@@ -208,6 +211,81 @@ architecture, give `--gpu-arch`:
 | MI350 | `gfx950` |
 
 On Windows the default is `gfx1151`.
+
+## ROCm nightly selection
+
+[Quartz](https://github.com/ROCm/Quartz) publishes a `status.json` for each
+TheRock nightly. In `--torch-mode rocm`, setup reads these files to select
+the ROCm nightly that it installs:
+
+1. Setup reads `nightly/latest.json` from
+   `https://raw.githubusercontent.com/ROCm/quartz/main/`. This gives the build
+   date of the newest nightly.
+2. Setup reads `nightly/<build date>/status.json` for that day and for each
+   earlier day, 14 days in total. It takes the first nightly that has all of
+   these, for the platform of the host (`linux` or `windows`) and the GPU
+   architecture:
+   - `summary.<platform>.rocm.build.status` is `success`.
+   - `summary.<platform>.pytorch.build.status` is `success`.
+   - `summary.<platform>.architectures` has a TheRock target for the GPU
+     architecture. A target that ends in `X` is a family: `gfx94X-dcgpu`
+     covers `gfx942`, `gfx110X-all` covers `gfx1100` to `gfx1103`.
+   - `summary.<platform>.urls.wheels` is set.
+   - `pipelines.rocm.test.<platform>.<target>.status` is `success`, when
+     this entry exists.
+   - `pipelines.pytorch.test.<platform>.<target>.status` is `success`, when
+     this entry exists. Quartz rolls the results of the PyTorch variants up
+     into this status: `failure` when a variant failed, else `in_progress`
+     while a variant runs.
+3. Setup installs `rocm[libraries,devel,device-<arch>]==<rocm_version>` and
+   `torch[device-<arch>]` from that wheels URL. The torch wheel requires the
+   `rocm` version that it was built with, so pip installs the torch of the
+   same nightly.
+4. When no nightly in the 14 days qualifies, setup stops with an error that
+   lists each nightly and each reason it was rejected, for example
+   `linux rocm tests of gfx94X-dcgpu are failure`. Setup does not install an
+   unchecked build instead.
+
+A test entry that is `failure`, `in_progress`, `cancelled` or any value
+other than `success` rejects the nightly. A missing test entry does not:
+Quartz does not run every suite on every architecture. For example, the
+nightlies 20261113 to 20261119 have no ROCm test entry for `gfx950-dcgpu`.
+Setup then accepts the nightly, prints the suites without a result, and
+records them as untested.
+
+Setup does not read the test counters, `pipelines.pytorch.test_full` or
+`summary.overall_status`. These include all architectures and test suites
+that often fail, so almost no nightly has an overall `success`. Setup also
+stops when a `status.json` has a schema major other than 2.
+
+To install a known build, for example to repeat an older run, give its
+version:
+
+```bash
+python3 setup_env.py --rocm-version 10.3.0a20261114
+```
+
+Setup installs that version even when Quartz reports it as failed, and shows
+a warning that names each failed build or test of the GPU architecture.
+`--torch-index-url` gives another index. `--torch-index-url` without
+`--rocm-version` installs the newest build on that index and does not read
+Quartz.
+
+After the install, setup writes `<workspace>/.venv/dnn-bench-rocm-build.json`:
+the ROCm wheel version, the TheRock build date and commit from Quartz, the
+untested suites (`untested`, for example `["rocm"]`), the `status.json` URL,
+the index URL, and what selected the build (`quartz`, `--rocm-version` or
+`--torch-index-url`). The build date, commit and untested suites are `null`
+when Quartz has no `status.json` for the version. Result files copy them to
+`environment.rocm_build_version`, `environment.rocm_build_date`,
+`environment.therock_commit` and `environment.rocm_build_untested` (see
+[results-schema.md](results-schema.md#environment)).
+
+CI (`setup.yml` gpu-test and `check-deserialize.yml`) uses the selected
+nightly. `check-deserialize.yml` builds for `gfx942`, because Quartz reports
+failed `gfx90a` ROCm tests on most nightlies. To use a known build instead,
+set the `ROCM_VERSION` repository variable. Each job prints the ROCm build
+and its untested suites in its log and in the job summary.
 
 ## rocm-libraries source
 
@@ -335,18 +413,20 @@ python3 setup_env.py --clean -y
 ### Reusing a venv
 
 Without `--clean`, setup keeps the venv and its PyTorch and builds
-incrementally. When setup installs PyTorch it records the index URL and GPU
-architecture in `<workspace>/.venv/dnn-bench-torch.json`. On a later run, an
-explicit `--gpu-arch` or `--torch-index-url` that differs from the record
+incrementally. It does not read Quartz again. When setup installs PyTorch it
+records the index URL and GPU architecture in
+`<workspace>/.venv/dnn-bench-torch.json`, and the ROCm build in
+`dnn-bench-rocm-build.json`. On a later run, an explicit `--gpu-arch`,
+`--torch-index-url` or `--rocm-version` that differs from the record
 stops setup with an error that asks for `--clean`. Without them, a
 `--torch-mode rocm` run builds for the recorded GPU architecture and installs
-a missing rocm-sdk-devel from the recorded index. If no detected GPU has the
-recorded architecture, setup stops with an error that names the detected and
-the recorded architectures. Then pass `--clean` to set up the venv again (add
-`--gpu-arch` on a host with several architectures), or
-`--gpu-arch <recorded arch>` to keep the recorded build. When one of the
-detected GPUs has the recorded architecture, or setup detects no GPU, setup
-uses the recorded architecture. A venv without the record
+a missing rocm-sdk-devel of the recorded ROCm version from the recorded index.
+If no detected GPU has the recorded architecture, setup stops with an error
+that names the detected and the recorded architectures. Then pass `--clean`
+to set up the venv again (add `--gpu-arch` on a host with several
+architectures), or `--gpu-arch <recorded arch>` to keep the recorded build.
+When one of the detected GPUs has the recorded architecture, or setup detects
+no GPU, setup uses the recorded architecture. A venv without the record
 (PyTorch installed another way) cannot be checked; setup shows a warning
 instead. A different `--torch-mode` than the one in the venv also asks for
 `--clean`, including `--torch-mode none` on a venv that has PyTorch.
@@ -389,12 +469,30 @@ from the local checkout:
 | `--container-command CMD` | `docker` | Container command. |
 | `--device-target TARGET` | `gfx942` | ROCm PyTorch architecture: `gfx90a`, `gfx942`, `gfx950`, `gfx1151` or `gfx1152`. |
 | `--tag TAG` | `dnn-benchmark-performance:<device-target>` | Image tag. |
+| `--rocm-version VERSION` | newest usable Quartz nightly | ROCm wheel version to install. |
 | `-- ARGS...` | none | More arguments for the container build command. |
 
 The script passes the pinned `rocm-libraries` commit to the build, because
-the build context has no `.git`. The image runs `setup_env.py --torch-mode
-rocm --no-editable -y` with the venv in `/opt/dnn-benchmark/.venv`. The
-entry point is `dnn-benchmark`, so arguments go straight to the tool:
+the build context has no `.git`. The script also selects the ROCm nightly for
+`--device-target` on the host, as in
+[ROCm nightly selection](#rocm-nightly-selection), unless `--rocm-version`
+names one. The host thus needs `python3`. When no nightly qualifies for the
+device target, for example while Quartz reports failed `gfx90a` tests, the
+script stops; then pass `--rocm-version`. The script passes the version as
+the `ROCM_VERSION` build argument and the wheels URL as
+`ROCM_TORCH_INDEX_URL`. A new nightly thus rebuilds the setup layer. The
+image carries the ROCm version in the label
+`com.amd.dnn-benchmark.rocm-version`:
+
+```bash
+docker inspect --format \
+  '{{ index .Config.Labels "com.amd.dnn-benchmark.rocm-version" }}' \
+  dnn-benchmark-performance:gfx942
+```
+
+The image runs `setup_env.py --torch-mode rocm --rocm-version <version>
+--no-editable -y` with the venv in `/opt/dnn-benchmark/.venv`. The entry
+point is `dnn-benchmark`, so arguments go straight to the tool:
 
 ```bash
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
