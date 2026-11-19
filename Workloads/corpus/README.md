@@ -93,8 +93,11 @@ model (for example `microbench/aiter`, `microbench/hipkittens`, and
 
 Tag meanings:
 
-- `mode` is `training` for every gradient graph. A forward normalization
-  graph that saves its statistics is also a `training` graph.
+- `mode` is `training` for every gradient graph, except a backward-data
+  graph from a transposed convolution (`from_transpose` `true`). PyTorch runs
+  the forward pass of a transposed convolution as backward-data, so that
+  graph gets the `mode` of its source. A forward normalization graph that
+  saves its statistics is also a `training` graph.
 - `attention_type` is `mla` when the source names multi-head latent attention,
   when the model uses it (DeepSeek-V4), or when the query-key and value head
   dimensions differ. Otherwise the head counts set it: equal counts give
