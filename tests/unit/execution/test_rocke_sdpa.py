@@ -164,12 +164,15 @@ _ARGS = ("q_ptr", "k_ptr", "v_ptr", "o_ptr", "scale", "batch", "seqlen_q", "seql
 
 
 def _metadata(dtype="FP16", d=128, hq=32, hkv=8, causal=1, bm=256, bn=64):
-    """Variant metadata as the packer installs it: upper-case dtype, 0/1 flags."""
+    """Variant metadata as the packer installs it: upper-case dtype, 0/1 flags.
+
+    ``hq=None`` leaves out both head counts, as rocm-libraries #14901 does.
+    """
+    heads = {} if hq is None else {"num_query_heads": hq, "num_kv_heads": hkv}
     return {
         "dtype": dtype,
         "head_size": d,
-        "num_query_heads": hq,
-        "num_kv_heads": hkv,
+        **heads,
         "causal": causal,
         "ragged": 0,
         "sliding_window": 0,
@@ -289,17 +292,22 @@ def test_catalog_matches_problem_and_tile_divisibility(tmp_path) -> None:
     assert [k.name for k in catalog_kernels(catalog, kv4)] == ["rocke:kv4"]
 
 
+@pytest.mark.parametrize("recorded_heads", [True, False])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("b, hq, hkv", [(1, 32, 8), (4, 16, 16), (2, 40, 8)])
-def test_matched_variants_launch_on_hipdnns_grid(tmp_path, causal, b, hq, hkv) -> None:
+def test_matched_variants_launch_on_hipdnns_grid(
+    tmp_path, causal, b, hq, hkv, recorded_heads
+) -> None:
     """hipDNN launches every variant query-block-major; rocKE's auto block
-    order would put the batch on x for causal problems."""
+    order would put the batch on x for causal problems. A descriptor without
+    head counts (rocm-libraries #14901) serves every head configuration."""
     dense = pytest.importorskip("kernels.gfx950.attention_dense")
+    heads = dict(hq=hq, hkv=hkv) if recorded_heads else dict(hq=None)
     catalog = _catalog(
         tmp_path,
         {
-            "bm256": _metadata(hq=hq, hkv=hkv, causal=int(causal), bm=256),
-            "bm128": _metadata(hq=hq, hkv=hkv, causal=int(causal), bm=128, bn=32),
+            "bm256": _metadata(**heads, causal=int(causal), bm=256),
+            "bm128": _metadata(**heads, causal=int(causal), bm=128, bn=32),
         },
     )
     problem = _problem(sdpa_graph(b=b, hq=hq, hkv=hkv, s=2048, causal_mask=causal))
@@ -309,6 +317,7 @@ def test_matched_variants_launch_on_hipdnns_grid(tmp_path, causal, b, hq, hkv) -
     assert len(found) == 2
     for kernel in found:
         spec = dense.Gfx950AttentionDenseSpec(**kernel.spec)
+        assert (spec.num_query_heads, spec.num_kv_heads) == (hq, hkv)
         assert tuple(dense.attention_dense_grid(spec)) == hipdnn_grid(
             problem, kernel.spec["block_m"]
         )
