@@ -101,6 +101,10 @@ The CLI collects these values one time, at suite start.
 | `cuda_version` | string | The `cuda` value of `torch/version.py` for a CUDA PyTorch. `null` for a ROCm PyTorch. |
 | `cudnn_version` | string | cuDNN version. Set only for a CUDA PyTorch that the process has already imported. |
 | `hipdnn_version` | string | `hipdnn_frontend.__version__`. |
+| `rocm_build_version` | string | The ROCm wheel version that `setup_env.py` installed in `--torch-mode rocm`, for example `10.3.0a20261117`. The tool reads it from `dnn-bench-rocm-build.json` in the venv of the running Python (`sys.prefix`). `null` when the venv has no such record: ROCm came from somewhere else, or setup did not install ROCm PyTorch. Files written before this key was added do not have it; `schema_version` stays 2. See [setup.md](setup.md#rocm-nightly-selection). |
+| `rocm_build_date` | string | `YYYYMMDD` build date of that ROCm build, from its Quartz `status.json`. `null` without a record, or when Quartz has no `status.json` for the version. Files written before this key was added do not have it. |
+| `therock_commit` | string | The full TheRock commit of that ROCm build, from its Quartz `status.json`. `null` in the same cases as `rocm_build_date`. Files written before this key was added do not have it. |
+| `rocm_build_untested` | array of strings | The Quartz test suites (`rocm`, `pytorch`) that report no result for the GPU architecture of that ROCm build. Setup accepts such a build but records that the suite did not test the architecture. `[]` when both suites tested it. `null` in the same cases as `rocm_build_date`. Files written before this key was added do not have it. See [setup.md](setup.md#rocm-nightly-selection). |
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
 | `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |

@@ -1,0 +1,290 @@
+{
+  "schema_version": "2.2",
+  "release_type": "nightly",
+  "rocm_version": "10.3.0a20261114",
+  "build_date": "20261114",
+  "build_variant": "release",
+  "therock_commit": "2c9d452433c5f8644300a22d83c0a75a486f8f19",
+  "trigger_workflow_run_id": 43531276507,
+  "trigger_run_attempt": 2,
+  "created_at": "2026-11-14T00:01:09Z",
+  "completed_at": "2026-11-14T13:54:00Z",
+  "orchestrator_conclusion": "success",
+  "pytorch_enabled": true,
+  "jax_enabled": true,
+  "status_json_created": "2026-11-14T00:02:10Z",
+  "status_json_last_updated": "2026-11-15T18:01:59Z",
+  "summary": {
+    "overall_status": "failure",
+    "linux": {
+      "status": "failure",
+      "architectures": [
+        "gfx94X-dcgpu",
+        "gfx110X-all",
+        "gfx1151",
+        "gfx120X-all",
+        "gfx125X-dcgpu",
+        "gfx90a",
+        "gfx950-dcgpu",
+        "gfx900",
+        "gfx90c",
+        "gfx906",
+        "gfx908",
+        "gfx101X-dgpu",
+        "gfx103X-all",
+        "gfx1150",
+        "gfx1152",
+        "gfx1153",
+        "gfx117X-all"
+      ],
+      "urls": {
+        "tarballs": "https://nightly.repo.amd.com/rocm/core/tarball/",
+        "wheels": "https://nightly.repo.amd.com/rocm/whl-next/",
+        "artifacts": "https://therock-nightly-artifacts.s3.amazonaws.com/43531276507-linux/index.html",
+        "rpm": "https://nightly.repo.amd.com/rocm/core/packages/<os-profile>/20261114-43531276507/",
+        "deb": "https://nightly.repo.amd.com/rocm/core/packages/<os-profile>/20261114-43531276507/"
+      },
+      "rocm": {
+        "build": {
+          "status": "success"
+        },
+        "test": {
+          "success": 0,
+          "failure": 7,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        }
+      },
+      "pytorch": {
+        "build": {
+          "status": "failure",
+          "success": 0,
+          "failure": 20,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "test": {
+          "success": 0,
+          "failure": 0,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        }
+      },
+      "jax": {
+        "build": {
+          "status": "failure",
+          "success": 19,
+          "failure": 3,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "test": {
+          "success": 16,
+          "failure": 0,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        }
+      },
+      "native_packages": {
+        "rpm": {
+          "status": "success"
+        },
+        "deb": {
+          "status": "success"
+        }
+      }
+    },
+    "windows": {
+      "status": "failure",
+      "architectures": [
+        "gfx110X-all",
+        "gfx1151",
+        "gfx120X-all",
+        "gfx90a",
+        "gfx900",
+        "gfx90c",
+        "gfx906",
+        "gfx908",
+        "gfx101X-dgpu",
+        "gfx103X-all",
+        "gfx1150",
+        "gfx1152",
+        "gfx1153",
+        "gfx117X-all"
+      ],
+      "urls": {
+        "tarballs": "https://nightly.repo.amd.com/rocm/core/tarball/",
+        "wheels": "https://nightly.repo.amd.com/rocm/whl-next/",
+        "artifacts": "https://therock-nightly-artifacts.s3.amazonaws.com/43531276507-windows/index.html"
+      },
+      "rocm": {
+        "build": {
+          "status": "success"
+        },
+        "test": {
+          "success": 0,
+          "failure": 4,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        }
+      },
+      "pytorch": {
+        "build": {
+          "status": "success",
+          "success": 20,
+          "failure": 0,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "test": {
+          "success": 18,
+          "failure": 38,
+          "in_progress": 0,
+          "cancelled": 0,
+          "skipped": 0
+        }
+      }
+    }
+  },
+  "pipelines": {
+    "rocm": {
+      "test": {
+        "linux": {
+          "gfx94X-dcgpu": {
+            "status": "failure",
+            "run_id": 43551314442,
+            "run_attempt": 2,
+            "started_at": "2026-11-14T11:31:03Z",
+            "completed_at": "2026-11-14T13:12:09Z"
+          },
+          "gfx90a": {
+            "status": "failure",
+            "run_id": 43551315546,
+            "run_attempt": 2,
+            "started_at": "2026-11-14T11:47:26Z",
+            "completed_at": "2026-11-14T12:10:21Z"
+          },
+          "gfx1151": {
+            "status": "failure",
+            "run_id": 43551315273,
+            "run_attempt": 3,
+            "started_at": "2026-11-14T13:06:04Z",
+            "completed_at": "2026-11-14T13:51:45Z"
+          }
+        },
+        "windows": {
+          "gfx1151": {
+            "status": "failure",
+            "run_id": 43597407853,
+            "run_attempt": 1,
+            "started_at": "2026-11-14T12:58:34Z",
+            "completed_at": "2026-11-14T14:59:16Z"
+          }
+        }
+      }
+    },
+    "pytorch": {
+      "test": {
+        "windows": {
+          "gfx1151": {
+            "status": "failure",
+            "run_id": 43602000802,
+            "run_attempt": 2,
+            "started_at": "2026-11-14T17:45:08Z",
+            "completed_at": "2026-11-15T10:02:10Z",
+            "variants": [
+              {
+                "py": "3.11",
+                "torch": "release/2.15",
+                "status": "failure",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T09:23:45Z",
+                "completed_at": "2026-11-15T09:58:16Z"
+              },
+              {
+                "py": "3.11",
+                "torch": "release/2.14",
+                "status": "success",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-14T17:45:08Z",
+                "completed_at": "2026-11-14T18:14:05Z"
+              },
+              {
+                "py": "3.11",
+                "torch": "release/2.13",
+                "status": "failure",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T09:27:18Z",
+                "completed_at": "2026-11-15T10:00:56Z"
+              },
+              {
+                "py": "3.11",
+                "torch": "nightly",
+                "status": "failure",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T09:22:47Z",
+                "completed_at": "2026-11-15T09:55:15Z"
+              }
+            ]
+          },
+          "gfx90a": {
+            "status": "failure",
+            "run_id": 43602000802,
+            "run_attempt": 2,
+            "started_at": "2026-11-15T08:46:16Z",
+            "completed_at": "2026-11-15T09:58:28Z",
+            "variants": [
+              {
+                "py": "3.11",
+                "torch": "release/2.15",
+                "status": "failure",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T08:46:16Z",
+                "completed_at": "2026-11-15T09:55:26Z"
+              },
+              {
+                "py": "3.11",
+                "torch": "release/2.14",
+                "status": "success",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T08:46:16Z",
+                "completed_at": "2026-11-15T08:46:20Z"
+              },
+              {
+                "py": "3.11",
+                "torch": "release/2.13",
+                "status": "failure",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T08:46:16Z",
+                "completed_at": "2026-11-15T09:58:28Z"
+              },
+              {
+                "py": "3.11",
+                "torch": "nightly",
+                "status": "failure",
+                "run_id": 43602000802,
+                "run_attempt": 2,
+                "started_at": "2026-11-15T08:46:16Z",
+                "completed_at": "2026-11-15T09:27:19Z"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
