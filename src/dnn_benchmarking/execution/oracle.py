@@ -35,7 +35,12 @@ from ..reporting.statistics import BenchmarkStats, TimingInfo
 from ..reporting.suite_results import OracleResult, ProviderEngineResult
 from ..validation import ReferenceOutput
 from .correctness import check_correctness
-from .timing import Measurement, StallFallbackError
+from .timing import (
+    STALL_RERUN_REASON,
+    Measurement,
+    StallFallbackError,
+    release_flush_buffers,
+)
 
 #: hipDNN knob that makes a provider sample its candidate kernels on the first
 #: execute() and keep the fastest (kernel ingestor, MIOpen).
@@ -232,12 +237,16 @@ def _run_hipdnn_tuned_child(
 ) -> Dict[str, Any]:
     """Run ``cli/hipdnn_tuned_child.py``; return its ``result.json``.
 
+    Frees this process's cold-cache flush buffer first, so the child gets the
+    device memory the OOTB row had; the next cold iteration reallocates it.
+
     Raises:
         StallFallbackError: The child reports a failed stall gate.
         RuntimeError: The child failed, timed out (``--oracle-timeout``)
             or wrote no result.
     """
     timeout_s = config.oracle_timeout_s or None
+    release_flush_buffers()
     argv = _hipdnn_tuned_argv(
         graph_path, engine_id, plugin_path, config, out_dir, save_outputs
     )
@@ -267,7 +276,8 @@ def _pytorch_tuned_argv(
     """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle.
 
     The child's untimed first launch runs the tuning search, so it gets the
-    same warmup and sampling settings as the OOTB row.
+    same warmup and sampling settings as the OOTB row, and the same stall-gate
+    state: after a stall-gate fallback both plans time unstalled.
     """
     argv = [
         sys.executable,
@@ -300,6 +310,8 @@ def _pytorch_tuned_argv(
     ]
     if config.pytorch_rocm_fa_library is not None:
         argv += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
+    if not config.timing_policy.stall_gate:
+        argv.append("--no-stall-gate")
     return argv
 
 
@@ -308,7 +320,8 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
 
     The child owns the conv algorithm cache and the TunableOp results, in a
     temporary directory that is deleted afterwards. It runs on the tuned
-    selection state of the work dir; no OOTB run uses it.
+    selection state of the work dir; no OOTB run uses it. This process's
+    cold-cache flush buffer is freed first, as for the hipDNN child.
 
     Raises:
         RuntimeError: If the child fails, times out (``--oracle-timeout``)
@@ -316,6 +329,7 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
     """
     from ..common.pytorch_tuning import tuned_subprocess_env
 
+    release_flush_buffers()
     with tempfile.TemporaryDirectory(prefix="dnn-bench-pytorch-tuned-") as state_dir:
         output = Path(state_dir) / "result.json"
         timeout_s = config.oracle_timeout_s or None
@@ -373,9 +387,20 @@ def run_pytorch_tuned(
     not stack on top of them. Tuned outputs are not validated: they never
     enter this process. ``tuning_available`` is true only when the graph has
     a conv or matmul node, the ops the child searches.
+
+    Raises:
+        StallFallbackError: The child remeasured its graph unstalled after a
+            stall-gate failure while this run still times staged; the suite
+            runner remeasures the whole graph unstalled. Other failures set
+            ``row.oracle_error``.
     """
     try:
         plan = _run_pytorch_tuned_child(graph_path, config)["ootb"]
+        if (
+            config.timing_policy.stall_gate
+            and plan["timing"]["fallback_reason"] == STALL_RERUN_REASON
+        ):
+            raise StallFallbackError("stall gate failed in the tuned PyTorch child")
         oracle = OracleResult(
             tuning_available=any(
                 node.get("type") in _PYTORCH_TUNABLE_OPS
@@ -387,5 +412,7 @@ def run_pytorch_tuned(
         )
         _set_throughputs(oracle, row)
         row.oracle = oracle
+    except StallFallbackError:
+        raise  # The suite runner remeasures the whole graph unstalled.
     except Exception as e:
         _record_error(row, f"PyTorch on {graph_name}", e)
