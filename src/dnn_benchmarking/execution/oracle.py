@@ -35,6 +35,7 @@ from ..reporting.statistics import BenchmarkStats, TimingInfo
 from ..reporting.suite_results import OracleResult, ProviderEngineResult
 from ..validation import ReferenceOutput
 from .correctness import check_correctness
+from .pytorch_dispatch import DISPATCH_NOT_RECORDED
 from .timing import (
     STALL_RERUN_REASON,
     Measurement,
@@ -386,7 +387,9 @@ def run_pytorch_tuned(
     Call after the OOTB buffers are released, so the child's allocations do
     not stack on top of them. Tuned outputs are not validated: they never
     enter this process. ``tuning_available`` is true only when the graph has
-    a conv or matmul node, the ops the child searches.
+    a conv or matmul node, the ops the child searches. ``dispatch`` is what
+    the child's launch ran with the tuned state; the child's warnings about
+    it are copied to the row.
 
     Raises:
         StallFallbackError: The child remeasured its graph unstalled after a
@@ -395,7 +398,8 @@ def run_pytorch_tuned(
             ``row.oracle_error``.
     """
     try:
-        plan = _run_pytorch_tuned_child(graph_path, config)["ootb"]
+        child = _run_pytorch_tuned_child(graph_path, config)
+        plan = child["ootb"]
         if (
             config.timing_policy.stall_gate
             and plan["timing"]["fallback_reason"] == STALL_RERUN_REASON
@@ -409,9 +413,15 @@ def run_pytorch_tuned(
             timing=(timing := TimingInfo(**plan["timing"])),
             gpu_kernel_stats=_stats(plan["kernel"], timing.samples),
             host_stats=_stats(plan["host"], timing.samples),
+            dispatch=plan["dispatch"],
         )
         _set_throughputs(oracle, row)
         row.oracle = oracle
+        row.warnings = (row.warnings or []) + [
+            f"tuned run: {w}"
+            for w in child["warnings"]
+            if w.startswith(DISPATCH_NOT_RECORDED)
+        ]
     except StallFallbackError:
         raise  # The suite runner remeasures the whole graph unstalled.
     except Exception as e:

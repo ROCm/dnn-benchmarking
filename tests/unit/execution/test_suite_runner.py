@@ -98,6 +98,12 @@ class Fake:
         self.buffer_infos = []  # TensorInfo lists the buffer managers received
         self.tuned = []  # keyword arguments of each run_hipdnn_tuned call
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
+        # What the PyTorch executor's capture_dispatch returns, or raises.
+        self.torch_dispatch = {
+            "sdpa_backend": None,
+            "fa_library": None,
+            "kernels": ["k"],
+        }
 
 
 @pytest.fixture
@@ -235,6 +241,11 @@ def fake_torch(fake, monkeypatch):
         def benchmark(self, tensors):
             fake.torch_outputs_written = True
             return _stall_aware(fake, "pytorch", self.policy)
+
+        def capture_dispatch(self):
+            if isinstance(fake.torch_dispatch, Exception):
+                raise fake.torch_dispatch
+            return dict(fake.torch_dispatch)
 
         def execute_once(self, tensors):
             if fake.torch_execute_error:
@@ -893,7 +904,8 @@ def test_a_failed_reference_pass_keeps_its_timings_and_names_the_right_step(
 def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
     fake_torch, monkeypatch
 ):
-    """Timing measures default dispatch; the graded outputs use MATH."""
+    """Timing and the dispatch record follow default dispatch; the graded
+    outputs use MATH."""
     import torch
 
     from dnn_benchmarking.execution import pytorch_executor, pytorch_ops
@@ -920,10 +932,15 @@ def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
     calls = {}
     executor_cls = pytorch_executor.PyTorchCudaExecutor
     timed_loop, output_pass = executor_cls.benchmark, executor_cls.execute_once
+    capture = executor_cls.capture_dispatch
 
     def benchmark(self, tensors):
         calls["benchmark"] = math_only_at_sdpa()
         return timed_loop(self, tensors)
+
+    def capture_dispatch(self):
+        calls["capture_dispatch"] = math_only_at_sdpa()
+        return capture(self)
 
     def execute_once(self, tensors):
         calls["execute_once"] = math_only_at_sdpa()
@@ -931,10 +948,15 @@ def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
 
     monkeypatch.setattr(executor_cls, "benchmark", benchmark)
     monkeypatch.setattr(executor_cls, "execute_once", execute_once)
+    monkeypatch.setattr(executor_cls, "capture_dispatch", capture_dispatch)
 
     _validate()
 
-    assert calls == {"benchmark": False, "execute_once": True}
+    assert calls == {
+        "benchmark": False,
+        "capture_dispatch": False,
+        "execute_once": True,
+    }
 
 
 def test_cpu_reference_failure_fails_validation_and_keeps_engine_rows(
@@ -1688,6 +1710,35 @@ class TestPytorchRuntime:
 
         assert row.status == status
         assert "NotARealOp" in (row.error_message or row.skip_reason)
+
+    @pytest.mark.parametrize(
+        "outcome, expected, warning",
+        [
+            (
+                RuntimeError("Kineto not available"),
+                None,
+                "dispatch not recorded: RuntimeError: Kineto not available",
+            ),
+            (
+                {"sdpa_backend": "math", "fa_library": None, "kernels": []},
+                {"sdpa_backend": "math", "fa_library": None, "kernels": None},
+                "dispatch not recorded: the profiler saw no GPU kernel",
+            ),
+        ],
+    )
+    def test_a_failed_capture_is_a_warning_and_never_fails_the_row(
+        self, fake_torch, outcome, expected, warning
+    ):
+        """An empty trace is a failed capture, not a graph without kernels:
+        a null list says "unknown", an empty one would say "none ran"."""
+        fake_torch.torch_dispatch = outcome
+
+        (row,) = self._run().results
+
+        assert row.status == "success"
+        assert row.ootb.gpu_kernel_stats is not None
+        assert row.ootb.dispatch == expected
+        assert warning in row.warnings
 
 
 def _run_with(other, **config):

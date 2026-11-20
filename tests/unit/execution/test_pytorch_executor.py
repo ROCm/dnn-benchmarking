@@ -345,6 +345,41 @@ def test_sdpa_options_reach_the_replay(rocm_module, monkeypatch, fake_cuda) -> N
     assert seen == [(PyTorchSdpaBackendName.FLASH, "aotriton")]
 
 
+def test_dispatch_profiles_one_replay_of_the_timed_inputs(
+    rocm_module, monkeypatch, fake_cuda
+) -> None:
+    """The traced launch reuses the timed loop's primed inputs, so handler
+    setup (fused-kernel probes, layout copies) is not in the kernel list. The
+    device is drained before the trace starts, so no input fill, warmup or
+    flush kernel is in it either, and the launch drains its own stream so
+    its kernels are."""
+    executor, compiled = _prepared(rocm_module, monkeypatch, fake_cuda)
+    with pytest.raises(ExecutionError):
+        executor.capture_dispatch()
+    executor.benchmark({1: "x"})
+    fake_cuda.log.clear()
+
+    def profile_launch(launch):
+        fake_cuda.log.append("trace_start")
+        launch()
+        return [
+            {"cat": "cpu_op", "name": "aten::_scaled_dot_product_attention_math"},
+            {"cat": "kernel", "name": "bmm_kernel", "ts": 1.0},
+        ]
+
+    monkeypatch.setattr(rocm_module.pytorch_dispatch, "profile_launch", profile_launch)
+
+    dispatch = executor.capture_dispatch()
+
+    assert compiled.seen[-1] is compiled.seen[0]
+    assert fake_cuda.log == ["torch_device_sync", "trace_start", "stream_sync"]
+    assert dispatch == {
+        "sdpa_backend": "math",
+        "fa_library": None,  # a ROCm Flash library applies to Flash only
+        "kernels": ["bmm_kernel"],
+    }
+
+
 def test_benchmark_before_prepare_raises(rocm_module) -> None:
     executor = rocm_module.PyTorchCudaExecutor(
         {"nodes": []}, TimingPolicy(), pytorch_sdpa_backend="default"
