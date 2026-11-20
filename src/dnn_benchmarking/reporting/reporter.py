@@ -377,10 +377,12 @@ class Reporter:
         gr = graph_result
         title = gr.graph_name
         stem = Path(gr.graph_path).stem
-        if stem != gr.graph_name:
+        if stem not in (gr.graph_name, gr.graph_id):
             # The progress line announced the file stem; show both to link them.
+            # A file named by its graph_id needs no stem: the id follows.
             title = f"{stem} ({gr.graph_name})"
-        self._print(title + (f"  [{gr.graph_id}]" if gr.graph_id else ""))
+        # The console shows a 12-character prefix; the result file has the full id.
+        self._print(title + (f"  [{gr.graph_id[:12]}]" if gr.graph_id else ""))
         if gr.error:
             self._print(_clip(f"  graph error: {_one_line(gr.error)}", _width()))
         elif gr.status == "no_engines":

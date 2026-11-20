@@ -49,11 +49,11 @@ def _run_conv(hipdnn, **config):
     return result, successes
 
 
-def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
-    """Default metrics on: timing, derived metrics, and a strict-JSON v2 row."""
+def test_rows_carry_timing_metrics_and_v3_schema(hipdnn) -> None:
+    """Default metrics on: timing, derived metrics, and a strict-JSON v3 row."""
     result, successes = _run_conv(hipdnn)
     assert result.status == "ok"
-    assert re.fullmatch(r"[0-9a-f]{12}", result.graph_id)
+    assert re.fullmatch(r"[0-9a-f]{64}", result.graph_id)
 
     for r in successes:
         assert r.runtime == "hipdnn"
