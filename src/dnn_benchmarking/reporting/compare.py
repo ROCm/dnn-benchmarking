@@ -178,18 +178,27 @@ def _pair(
     return pair
 
 
+def _join_key(a: Dict[str, Any], b: Dict[str, Any]) -> str:
+    """``graph_id`` when both files use one schema; else ``graph_name``.
+
+    Schema 2 hashes the whole graph JSON and schema 3 only its geometry, so
+    their ids never match."""
+    return "graph_id" if a["schema_version"] == b["schema_version"] else "graph_name"
+
+
 def _match_graphs(
-    a: Dict[str, Any], b: Dict[str, Any]
+    a: Dict[str, Any], b: Dict[str, Any], key: str
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[str], List[str]]:
-    """Join on graph_id (null only for graphs that failed to load: no rows).
-    Duplicate ids pair in order of appearance, like ``_keyed`` rows."""
-    by_id: Dict[str, List[Dict[str, Any]]] = {}
+    """Join on ``key``. A graph with a null graph_id failed to load and has no
+    rows, so it never joins. Duplicate keys pair in order of appearance, like
+    ``_keyed`` rows."""
+    by_key: Dict[str, List[Dict[str, Any]]] = {}
     for g in b["graphs"]:
         if g["graph_id"]:
-            by_id.setdefault(g["graph_id"], []).append(g)
+            by_key.setdefault(g[key], []).append(g)
     matched, only_a = [], []
     for ga in a["graphs"]:
-        queue = by_id.get(ga["graph_id"]) if ga["graph_id"] else None
+        queue = by_key.get(ga[key]) if ga["graph_id"] else None
         if not queue:
             only_a.append(ga["graph_name"])
             continue
@@ -207,8 +216,8 @@ def compare(
     metric: str = "kernel",
     threshold: float = 5.0,
 ) -> Dict[str, Any]:
-    """Compare two loaded v2 documents; returns the JSON-shaped report."""
-    matched, only_a, only_b = _match_graphs(a, b)
+    """Compare two loaded v2 or v3 documents; returns the JSON-shaped report."""
+    matched, only_a, only_b = _match_graphs(a, b, _join_key(a, b))
     pairs: List[Pair] = []
     for ga, gb in matched:
         name = ga["graph_name"]
@@ -380,6 +389,11 @@ def main(argv: List[str]) -> int:
         return 2
     for w in _config_warnings(a, b):
         print(f"warning: {w}", file=sys.stderr)
+    if _join_key(a, b) == "graph_name":
+        print(
+            "warning: schema 2 and 3 ids differ; joined by graph name",
+            file=sys.stderr,
+        )
     ca, cb = a["run"]["config"], b["run"]["config"]
     gated = [k for k in _GATED if ca.get(k) != cb.get(k)]
     if gated and not args.allow_mismatch:

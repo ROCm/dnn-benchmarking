@@ -1,4 +1,4 @@
-# Result file schema (version 2)
+# Result file schema (version 3)
 
 `dnn-benchmark -o PATH` writes one result file. The file is JSON, or CSV when
 `PATH` ends in `.csv`. This page describes both formats.
@@ -23,14 +23,15 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 - The writer replaces the file atomically. A reader never sees a
   half-written file. The file mode follows the umask, as for a file that
   `open()` creates.
-- `SuiteResult.load(path)` reads a file. It rejects any `schema_version`
-  other than 2. It prints a warning on stderr when `run.complete` is `false`.
+- `SuiteResult.load(path)` reads a file. It accepts `schema_version` 2 and
+  3, and rejects all other values. It prints a warning on stderr when
+  `run.complete` is `false`.
 
 ## Top level
 
 | Key | Type | Meaning |
 |---|---|---|
-| `schema_version` | int | Always `2`. |
+| `schema_version` | int | Always `3`. See [Version history](#version-history). |
 | `tool` | object | `name` (`"dnn-benchmarking"`) and `version` (package version). |
 | `run` | object | How and when the suite ran. See [run](#run). |
 | `environment` | object | Machine and software snapshot. See [environment](#environment). |
@@ -137,15 +138,38 @@ The writer recalculates the summary from `graphs`. The row counts include
 
 ### graph_id
 
-`graph_id` is the first 12 hex characters of the SHA-256 of the canonical
-graph JSON:
+`graph_id` is the geometry hash of the graph: the SHA-256 of the canonical
+graph JSON without the top-level `name` and `metadata` keys, as 64 lowercase
+hex characters:
 
 ```python
-json.dumps(graph, sort_keys=True, separators=(",", ":"))
+geometry = {k: v for k, v in graph.items() if k not in ("name", "metadata")}
+canonical = json.dumps(
+    geometry,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+    allow_nan=False,
+)
+graph_id = hashlib.sha256(canonical.encode()).hexdigest()
 ```
 
-The graph content decides the ID. The file name and the file path do not. Use
-`graph_id` to join the same graph across result files.
+The graph geometry decides the ID. The file name, the file path, the graph
+`name` and the tags in `metadata` do not. Only the top-level `name` and
+`metadata` are removed; a node `name` is part of the geometry. Use
+`graph_id` to join the same graph across result files. A graph that holds
+NaN or infinity has no `graph_id`, and its `status` is `error`.
+
+### Version history
+
+|Version|Change|
+|---|---|
+|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it.|
+|2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
+
+All other keys are the same in versions 2 and 3. `dnn-benchmark compare`
+joins a version 2 file and a version 3 file on `graph_name`. See
+[usage.md](usage.md#compare).
 
 ## row
 

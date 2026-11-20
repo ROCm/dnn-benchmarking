@@ -170,13 +170,23 @@ class TestOracleSpeedup:
         assert oracle_speedup(_tuned_row(ootb=ootb, tuned=tuned)) is None
 
 
-def test_graph_id_is_order_independent_and_content_sensitive() -> None:
-    a = graph_id_for({"nodes": [1, 2], "name": "g"})
-    assert a == graph_id_for({"name": "g", "nodes": [1, 2]})
-    assert a != graph_id_for({"name": "g", "nodes": [2, 1]})
-    # Golden value: sha256 of the compact sorted JSON '{"name":"g","nodes":[1,2]}'.
-    # It must not change, or old and new result files stop joining in compare.
-    assert a == "b01a1b729a95"
+def test_graph_id_is_the_geometry_hash() -> None:
+    graph = {"name": "g", "metadata": {"model": ["a"]}, "nodes": [1, 2]}
+    a = graph_id_for(graph)
+    # A rename, a retag or a key order change keeps the id.
+    assert a == graph_id_for({**graph, "name": "renamed"})
+    assert a == graph_id_for({**graph, "metadata": {"model": ["b"], "notes": "x"}})
+    assert a == graph_id_for({"nodes": [1, 2]})
+    assert a != graph_id_for({**graph, "nodes": [2, 1]})
+    # Golden value: sha256 of the compact sorted JSON '{"nodes":[1,2]}'. A
+    # graph store names each object by this value, and compare joins on it.
+    assert a == "9c60629ac4eaf78152204036b7fceceb3321e6541678640b98fad42d5893c77e"
+
+
+def test_graph_id_keeps_nested_name_and_metadata() -> None:
+    # Only the top-level keys are labels; a node's name is geometry.
+    graph = {"nodes": [{"name": "conv"}]}
+    assert graph_id_for(graph) != graph_id_for({"nodes": [{"name": "conv2"}]})
 
 
 def _sample_suite(complete=True) -> SuiteResult:
@@ -264,13 +274,21 @@ class TestWriteLoad:
         assert [p.name for p in tmp_path.iterdir()] == ["r.json"]
 
     @pytest.mark.parametrize(
-        "version", [{}, {"schema_version": 1}, {"schema_version": 3}]
+        "version", [{}, {"schema_version": 1}, {"schema_version": 4}]
     )
     def test_load_refuses_other_schema_versions(self, tmp_path, version) -> None:
         path = tmp_path / "other.json"
         path.write_text(json.dumps({**version, "metadata": {}, "graphs": []}))
         with pytest.raises(ValueError, match="schema_version"):
             SuiteResult.load(path)
+
+    @pytest.mark.parametrize("version", [2, 3])
+    def test_load_reads_schema_2_and_3(self, tmp_path, version) -> None:
+        doc = json.loads(_sample_suite().to_json())
+        doc["schema_version"] = version
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps(doc))
+        assert SuiteResult.load(path) == doc
 
     def test_load_warns_on_partial_results(self, tmp_path, capsys) -> None:
         path = tmp_path / "partial.json"
@@ -286,7 +304,7 @@ class TestWriteLoad:
         suite.write(compact, compact=True)
         text = compact.read_text()
         assert "\n" not in text and ", " not in text and ": " not in text
-        assert indented.read_text().startswith('{\n "schema_version": 2,')
+        assert indented.read_text().startswith('{\n "schema_version": 3,')
         assert SuiteResult.load(compact) == SuiteResult.load(indented)
         row = SuiteResult.load(compact)["graphs"][0]["results"][0]
         assert row["ootb"]["tflops"] == 0.333333
