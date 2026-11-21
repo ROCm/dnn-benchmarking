@@ -60,7 +60,9 @@ the same output format.
 When `--plugin-path` is not given, the tool uses
 `$ROCM_PATH/lib/hipdnn_plugins/engines`. When `ROCM_PATH` is not set, it uses
 the plugin directory of the pip ROCm SDK. The `setup_env.py` activation script
-sets `ROCM_PATH`.
+sets `ROCM_PATH`. The engines that a setup build installs, and the SDPA
+backward engines of each architecture, are in
+[setup.md](setup.md#extra-cmake-defines).
 
 ### Validation
 
@@ -91,7 +93,8 @@ that rounds one ULP the other way still passes. fp8 e8m0 holds only powers of
 two, so it compares log2 values (the code distance) with (0, 1): at most one
 code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
 log2 values of e8m0 outputs. fp16 outputs of an SDPA backward node use
-(4e-3, 1e-3); see [SDPA backward inputs](methodology.md#sdpa-backward-inputs).
+(4e-3, 1e-3) and bf16 outputs (3e-2, 2e-3); see
+[SDPA backward inputs](methodology.md#sdpa-backward-inputs).
 The sources are `OP_TOLERANCES` and `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
