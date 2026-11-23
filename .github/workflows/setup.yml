@@ -123,6 +123,8 @@ jobs:
           pip install -q -e .
           cat > /tmp/discover.py <<'EOF'
           import json, os, sys
+          if sys.argv[1] == "TORCH_FIRST":
+              import torch
           import hipdnn_frontend as h
           from dnn_benchmarking.common.rocm_runtime import default_hipdnn_plugin_paths
           from dnn_benchmarking.config.benchmark_config import SuiteConfig
@@ -136,12 +138,12 @@ jobs:
           except Exception as e:
               print(sys.argv[1], paths, "ERROR:", e)
           EOF
-          for var in NONE XDG_CACHE_HOME MIOPEN_CUSTOM_CACHE_DIR AMD_COMGR_CACHE_DIR HIPDNN_CACHE_DIR MIOPEN_USER_DB_PATH; do
-            d=$(mktemp -d)
-            if [ "$var" = NONE ]; then python /tmp/discover.py NONE
-            else env "$var=$d" python /tmp/discover.py "$var=$d"; fi
+          python /tmp/discover.py NONE
+          python /tmp/discover.py TORCH_FIRST
+          HIPDNN_LOG_LEVEL=info python /tmp/discover.py LOG_INFO 2>&1 | grep -v "^$" | tail -80
+          for so in .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipdnn_plugins/engines/*.so; do
+            echo "== $so"; ldd "$so" | grep -i "not found\|miopen" || true
           done
-          dnn-benchmark -g graphs/sample_conv_fwd.json -w 1 -i 3 -v || true
 
       # activate (not $VENV/python) for the ROCM_PATH/LD_LIBRARY_PATH that
       # conftest.py's plugin discovery needs. No -m filter: gpu tests run here.
