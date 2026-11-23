@@ -98,6 +98,10 @@ dnn-benchmark -g graphs/sample_conv_fwd.json -i 200 --min-time-ms 100 --cache-mo
 # rocKE block timing: each of 100 samples times 50 back-to-back launches
 dnn-benchmark -g 'graphs/*.json' --iters 100 --timing-block 50
 
+# Run every headline convolution of the public graph store (see docs/graph-store.md)
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag workload=headline --tag operation=convolution -o conv.json
+
 # Run every graph in a tarball (fetch it first, see Workload files)
 dnn-benchmark -g Workloads/headline/conv.tar.gz -o conv.json
 
@@ -121,6 +125,7 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 |---|---|
 | [docs/setup.md](docs/setup.md) | `setup_env.py`: torch modes, CMake defines, rocm-libraries source, CUDA hosts, Docker. |
 | [docs/usage.md](docs/usage.md) | All CLI options, engine selection, config files, console output, exit codes, `compare`, profiling. |
+| [docs/graph-store.md](docs/graph-store.md) | The graph store: object keys, the tag vocabulary, `--tag` queries, the upload procedure. |
 | [docs/methodology.md](docs/methodology.md) | What `kernel_med` measures, warmup, cache modes, stop rule, statistics, parity with rocKE and PyTorch, known limits. |
 | [docs/results-schema.md](docs/results-schema.md) | Result file schema version 2 (JSON and CSV). |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | ROCm library paths, profiler requirements, profiling artefacts. |

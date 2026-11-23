@@ -51,6 +51,10 @@ operation: ``pointwise``, ``quantize`` and ``reduction`` count only when the
 graph has no other operation, so a MoE grouped matmul with a pointwise
 activation is ``moe``. Two primary operations stop the migration.
 
+The key rule, the tag vocabulary and the anonymous S3 reads come from
+``dnn_benchmarking.graph.store`` (``docs/graph-store.md``), so install the
+package first (``pip install -e .``).
+
 Usage:
   python tools/workloads_to_store.py --ref <commit> --out /tmp/store \\
       --cache /tmp/dvc-cache \\
@@ -72,20 +76,25 @@ import sys
 import tarfile
 import tempfile
 import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+from dnn_benchmarking.graph import store
+from dnn_benchmarking.graph.store import (
+    CLOSED_TAGS,
+    DTYPES,
+    KEY,
+    OPEN_TAGS,
+    PARALLEL,
+    TOKEN,
+    geometry_key,
+)
 
 #: Anonymous HTTPS base of the DVC remote ``s3://therock-dvc/dnn-benchmarking``.
 DVC_REMOTE_URL = "https://therock-dvc.s3.amazonaws.com/dnn-benchmarking"
 
 #: Name priority of the top-level set directories (lowest number wins).
 NAME_PRIORITY = {"headline": 0, "corpus": 1, "microbench": 2, "models": 3}
-
-PARALLEL = 16
-TOKEN = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
-KEY = re.compile(r"^[0-9a-f]{64}\.json$")
 
 
 def _query(**tags: str) -> dict[str, tuple[str, ...]]:
@@ -185,67 +194,6 @@ SETS: dict[str, SetMapping] = {
     ),
 }
 
-#: Tag keys with a closed list of values.
-CLOSED_TAGS: dict[str, frozenset[str]] = {
-    "workload": frozenset({"headline", "microbench", "corpus", "model", "integration"}),
-    "source": frozenset(
-        {
-            "bench_cases",
-            "synthetic",
-            "hipblaslt",
-            "cudnn_frontend",
-            "aiter",
-            "aotriton",
-            "conv_sweep",
-            "cudnn_attention_inference",
-            "cudnn_attention_training",
-            "cudnn_bench_moe",
-            "cudnn_gemm",
-            "hipkittens",
-            "pytorch",
-            "rocke",
-            "hf_config",
-            "mad",
-            "brad_corpus",
-            "sdpa_fwd_to_bwd",
-            "integration_tests",
-        }
-    ),
-    "tier": frozenset({"quick", "standard", "full", "comprehensive"}),
-    "operation": frozenset(
-        {
-            "convolution",
-            "sdpa",
-            "matmul",
-            "moe",
-            "norm",
-            "batchnorm",
-            "pointwise",
-            "reduction",
-            "resample",
-            "quantize",
-        }
-    ),
-    "direction": frozenset({"fwd", "bwd", "dgrad", "wgrad"}),
-    "dtype": frozenset({"float32", "float16", "bfloat16", "fp8_e4m3"}),
-    "layout": frozenset({"nchw", "nhwc", "ncdhw", "ndhwc", "bshd", "bhsd"}),
-    "mode": frozenset({"training", "inference"}),
-    "phase": frozenset({"prefill", "chunked_prefill", "decode"}),
-}
-
-#: Tag keys with free lowercase tokens.
-OPEN_TAGS = frozenset(
-    {
-        "model_family",
-        "model",
-        "use_case",
-        "capability",
-        "variant",
-        "priority",
-        "purpose",
-        "suite",
-    }
-)
 
 #: Node type -> (operation, direction). A direction of None means that the
 #: node type does not decide it.
@@ -275,13 +223,6 @@ NODE_TYPES: dict[str, tuple[str, str | None]] = {
 #: Operations that count only when a graph has no other operation.
 AUXILIARY_OPERATIONS = frozenset({"pointwise", "quantize", "reduction"})
 
-#: Graph ``io_data_type`` -> ``dtype`` tag.
-DTYPES = {
-    "float": "float32",
-    "half": "float16",
-    "bfloat16": "bfloat16",
-    "fp8_e4m3": "fp8_e4m3",
-}
 
 #: Other spellings of tag values, per key.
 VALUE_ALIASES: dict[str, dict[str, str]] = {
@@ -388,15 +329,6 @@ class MigrationError(Exception):
 
 # ---------------------------------------------------------------------------
 # Keys and tags
-
-
-def geometry_key(graph: dict[str, Any]) -> str:
-    """Return the store key: sha256 of the graph without ``name``/``metadata``."""
-    body = {k: v for k, v in graph.items() if k not in ("name", "metadata")}
-    canonical = json.dumps(
-        body, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest() + ".json"
 
 
 def model_token(value: str) -> str:
@@ -592,8 +524,7 @@ def validate(key: str, obj: dict[str, Any]) -> list[str]:
 
 def matches(obj: dict[str, Any], query: dict[str, tuple[str, ...]]) -> bool:
     """AND across keys, OR within a key."""
-    metadata = obj["metadata"]
-    return all(set(metadata.get(k, ())) & set(v) for k, v in query.items())
+    return store.matches(obj["metadata"], {k: frozenset(v) for k, v in query.items()})
 
 
 def check_queries(
@@ -659,21 +590,13 @@ def parse_archive_option(text: str) -> Archive:
     return Archive(match.group(1), match.group(3), None, Path(match.group(2)))
 
 
-def _https_get(url: str, timeout: float) -> bytes:
-    """Return the body of an HTTPS GET. Reject every other URL scheme."""
-    if urllib.parse.urlparse(url).scheme != "https":
-        raise MigrationError(f"only https URLs are allowed, got {url!r}")
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return response.read()
-
-
 def fetch(archive: Archive, cache: Path) -> Path:
     """Return a local copy of an archive whose md5 and size are checked."""
     path = archive.path or cache / archive.md5
     if archive.path is None and not path.exists():
         url = f"{DVC_REMOTE_URL}/files/md5/{archive.md5[:2]}/{archive.md5[2:]}"
         partial = path.with_suffix(".part")
-        partial.write_bytes(_https_get(url, timeout=120))
+        partial.write_bytes(store.https_get(url, timeout=120))
         partial.replace(path)
     data = path.read_bytes()
     # md5 is DVC's integrity checksum here, not a security control.
@@ -757,40 +680,15 @@ def upload(objects: dict[str, dict[str, Any]], url: str) -> None:
         raise MigrationError(f"{len(failures)} uploads failed, first: {failures[0]}")
 
 
-def _https(bucket: str) -> str:
-    return f"https://{bucket}.s3.amazonaws.com"
-
-
-def list_prefix(url: str) -> list[str]:
-    """List the keys under an S3 prefix anonymously (ListObjectsV2)."""
-    bucket, prefix = _split_s3(url)
-    namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-    keys, token = [], None
-    while True:
-        params = {"list-type": "2", "prefix": prefix}
-        if token:
-            params["continuation-token"] = token
-        query = urllib.parse.urlencode(params)
-        body = _https_get(f"{_https(bucket)}/?{query}", timeout=60)
-        root = ElementTree.fromstring(body)
-        keys += [
-            e.text.removeprefix(prefix)
-            for e in root.findall("s3:Contents/s3:Key", namespace)
-        ]
-        token = root.findtext("s3:NextContinuationToken", namespaces=namespace)
-        if not token:
-            return keys
-
-
 def verify_upload(objects: dict[str, Any], url: str, fraction: float) -> int:
     """Check the key count and re-hash a sample of the uploaded objects (step 7)."""
     bucket, prefix = _split_s3(url)
-    keys = set(list_prefix(url))
+    keys = set(store.list_objects(bucket, prefix))
     if keys != set(objects):
         raise MigrationError(f"{url} has {len(keys)} keys, expected {len(objects)}")
     checked = sample(list(keys), fraction)
     for key in checked:
-        body = _https_get(f"{_https(bucket)}/{prefix}{key}", timeout=60)
+        body = store.https_get(f"{store.bucket_url(bucket)}/{prefix}{key}")
         if geometry_key(json.loads(body)) != key:
             raise MigrationError(f"{url}{key}: key is not the geometry hash")
     return len(checked)

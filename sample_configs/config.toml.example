@@ -10,10 +10,14 @@
 version = 1
 
 # --- Input -------------------------------------------------------------------
-# Graph JSON files, directories, globs or tarballs (--graph/-g replaces this).
+# Graph JSON files, directories, globs, tarballs or graph store prefixes
+# (s3://BUCKET/PREFIX/, kept as written). --graph/-g replaces this.
 graphs = [
   "../graphs/sample_conv_fwd.json",
 ]
+# Run only graphs with these metadata tags: AND across keys, OR within a key
+# (--tag replaces this). See docs/graph-store.md.
+# tags = ["workload=headline", "operation=convolution"]
 
 # --- Run ---------------------------------------------------------------------
 warmup = 10          # untimed warmup launches per engine

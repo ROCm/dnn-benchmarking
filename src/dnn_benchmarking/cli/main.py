@@ -15,6 +15,7 @@ from ..common.work_dir import (
     FRESH_STATE_PREFIX,
     SelectionState,
     benchmarks_kernels,
+    graph_store_cache,
     ootb_state,
     tuned_state,
     work_dir,
@@ -109,23 +110,74 @@ def _configure_work_dir(
     )
 
 
+def _sync_stores(urls: List[str], cache_root: Path, reporter) -> List[str]:
+    """Copy each graph store URL into the cache; return the cached files.
+
+    Raises:
+        GraphLoadError: A listing or a download fails.
+    """
+    from ..graph import store
+
+    files: List[str] = []
+    for url in urls:
+        synced = store.sync(url, cache_root)
+        reporter.info(
+            f"Graph store {url}: {len(synced.paths)} object(s), "
+            f"{synced.downloaded} downloaded, {synced.removed} removed "
+            f"(cache {store.store_cache_dir(cache_root, url)})"
+        )
+        if synced.rejected:
+            reporter.warning(
+                f"Graph store {url}: skipped {len(synced.rejected)} object(s) "
+                f"whose content does not hash to their key, first {synced.rejected[0]}"
+            )
+        if synced.ignored:
+            reporter.warning(
+                f"Graph store {url}: ignored {len(synced.ignored)} name(s) that "
+                f"are not object keys, first {synced.ignored[0]}"
+            )
+        files.extend(str(p) for p in synced.paths)
+    return files
+
+
 def _resolve_graphs(args, reporter) -> tuple[list, Optional[List[str]], Optional[str]]:
-    """Resolve --graph args. Returns (tmpdirs, files or None, tarball_source)."""
+    """Resolve --graph args, then keep the graphs that match --tag.
+
+    Returns (tmpdirs, files or None, tarball_source). Store URLs
+    (``s3://BUCKET/PREFIX/``) are copied into ``<work>/graph-store`` first.
+    """
+    from ..graph import store
     from ..graph.resolver import is_tarball, resolve_graph_files_multi
 
     graphs = " ".join(args.graph)
+    urls = [g for g in args.graph if store.is_store_url(g)]
+    local_args = [g for g in args.graph if not store.is_store_url(g)]
     if len(args.graph) == 1 and is_tarball(args.graph[0]):
         reporter.info(f"Extracting {graphs} ...")
     try:
-        tmpdirs, files, tarball_source = resolve_graph_files_multi(args.graph)
+        store_files = _sync_stores(
+            urls, graph_store_cache(Path(args.benchmark_work_dir)), reporter
+        )
+        tmpdirs, files, tarball_source = (
+            resolve_graph_files_multi(local_args) if local_args else ([], [], None)
+        )
     except GraphLoadError as e:
         reporter.error(str(e))
         return [], None, None
     if tmpdirs:
         reporter.info(f"Extracted {len(files)} graph file(s) from {graphs}")
+    files = list(dict.fromkeys([*files, *store_files]))
     if not files:
         reporter.error(f"No graph files found in: {graphs}")
         return tmpdirs, None, None
+    if args.tag:
+        found = len(files)
+        files = store.select_by_tags(files, store.tag_query(args.tag))
+        terms = " ".join(f"--tag {t}" for t in args.tag)
+        if not files:
+            reporter.error(f"No graph in {graphs} matches {terms}")
+            return tmpdirs, None, None
+        reporter.info(f"{len(files)} of {found} graph file(s) match {terms}")
     return tmpdirs, files, tarball_source
 
 
@@ -172,9 +224,12 @@ def main(argv: Optional[Sequence[str]] = None, *, tuned_child: bool = False) -> 
     # Report option errors as usage errors (exit 2) before a missing graph
     # can give exit 1. run_suite_cli builds the config again from args.
     from ..config.benchmark_config import SuiteConfig
+    from ..graph.store import is_store_url, split_store_url
 
     try:
         SuiteConfig.from_namespace(args)
+        for url in filter(is_store_url, args.graph):
+            split_store_url(url)
     except ValueError as e:
         parser.error(str(e))
 
