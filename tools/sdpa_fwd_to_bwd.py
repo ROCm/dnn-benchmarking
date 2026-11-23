@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
-"""Build the SDPA backward corpus from the workload tarballs.
+"""Build the SDPA backward corpus as graph-store objects.
 
-The corpus has three origins, recorded in ``metadata.origin``:
+The input is a set of graphs: JSON files, directories, globs or tarballs,
+usually a local copy of the graph store (``docs/graph-store.md``). The
+output is one store object for each backward graph, ``<key>.json`` in the
+``--out`` folder, ready for the upload procedure of the store.
+
+The corpus has three origins, recorded in ``metadata.notes.origin``:
 
 - ``converted_fwd``: every dense ``SdpaAttributes`` graph becomes one
   ``SdpaBackwardAttributes`` graph with the same Q, K, V, mask, scale, bounds
@@ -14,37 +19,44 @@ The corpus has three origins, recorded in ``metadata.origin``:
   Forward graphs with no backward equivalent in hipDNN are skipped: paged
   K/V caches, attention sinks, block masks, fp8 descale/scale tensors and
   dropout.
-- ``captured_bwd``: ``SdpaBackwardAttributes`` graphs already in the
-  tarballs, unchanged, except that a ``metadata.dropout`` probability the
-  capture did not write into the graph is added (probability, seed and
-  offset).
+- ``captured_bwd``: ``SdpaBackwardAttributes`` input graphs, unchanged,
+  except that a dropout probability the capture did not write into the graph
+  (``_CAPTURED_DROPOUT``) is added (probability, seed and offset).
 - ``model_spec``: training graphs with features no captured workload has
   (``_MODEL_SPECS``): attention dropout, additive bias with and without
   dBias, and ALiBi, at the published shapes of the named models.
 
-``metadata.shape`` is ``decode`` (Sq = 1), ``sq_lt_skv``, ``sq_eq_skv`` or
-``sq_gt_skv``. Duplicates (canonical JSON without ``name`` and
-``metadata``) are kept once, with the sources of every copy in
-``metadata.source``.
+An input graph whose only ``source`` tag is ``sdpa_fwd_to_bwd`` is an output
+of an earlier run: the tool skips it and makes it again.
+
+Each object has the tags ``workload=corpus``, ``source=sdpa_fwd_to_bwd``,
+``operation=sdpa``, ``direction=bwd`` and ``mode=training``. The backward
+graph gives ``dtype``, ``layout`` and ``phase``. ``model`` and
+``model_family`` are the union over the input graphs. ``metadata.notes``
+holds ``origin``, ``attention_type`` (``mla`` when an input graph says so),
+``mask`` and ``sink``. Duplicates (same object key) are kept once.
 
 Usage:
-  python tools/sdpa_fwd_to_bwd.py -o Workloads/corpus/SDPABackward/files.tar.gz \\
-      'Workloads/**/*.tar.gz'
+  python tools/sdpa_fwd_to_bwd.py --out /tmp/sdpa-bwd \\
+      <work>/graph-store/therock-dvc/dnn-benchmarking-graphs
 """
 
 import argparse
 import collections
 import copy
-import glob
-import hashlib
-import gzip
-import io
 import json
 import re
 import sys
-import tarfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from dnn_benchmarking.common.exceptions import GraphLoadError
+from dnn_benchmarking.graph import store
+from dnn_benchmarking.graph.resolver import resolve_graph_files_multi
+
+#: The ``source`` tag of the objects that this tool writes.
+SOURCE = "sdpa_fwd_to_bwd"
+
 
 #: Forward inputs that have no backward equivalent, with the skip reason.
 _FORWARD_ONLY_INPUTS = {
@@ -174,6 +186,16 @@ class Skip(Exception):
     """The graph has no backward equivalent."""
 
 
+#: Tags that every object of the corpus has.
+_CORPUS_TAGS = {
+    "workload": ["corpus"],
+    "source": [SOURCE],
+    "operation": ["sdpa"],
+    "direction": ["bwd"],
+    "mode": ["training"],
+}
+
+
 def _param(node: Dict[str, Any], key: str) -> Any:
     for section in ("inputs", "outputs", "attributes", "parameters"):
         value = (node.get(section) or {}).get(key)
@@ -217,14 +239,26 @@ def _add_dropout(graph: Dict[str, Any], probability: float) -> None:
     node["parameters"]["dropout_probability"] = probability
 
 
+#: Attention dropout of captured backward graphs whose capture did not write
+#: it into the graph, by graph name. The source is the ``dropout`` field of
+#: the ``bench_cases_attn_bwd.json`` capture of the headline attention graphs.
+_CAPTURED_DROPOUT = {
+    "llama-3-8b-sft__bf16_bwd_causal_gqa_dropout_bf16_idx18_b4_hq32_kv8"
+    "_sq4096_skv4096_d128v128_causal_bwd": 0.1,
+    "llama-3-8b-sft__bf16_bwd_causal_gqa_dropout_sweep_bf16_idx35_b2_hq32_kv8"
+    "_sq8192_skv8192_d128v128_causal_bwd": 0.1,
+    "vit-l-14__fp16_bwd_vision_noncausal_dropout_fp16_idx21_b8_hq16_kv16"
+    "_sq257_skv257_d64v64_full_bwd": 0.1,
+}
+
+
 def adopt(bwd: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a captured backward graph, with its ``metadata.dropout`` applied."""
+    """Return a captured backward graph, with its ``_CAPTURED_DROPOUT`` applied."""
     nodes = bwd.get("nodes", [])
     if len(nodes) != 1 or nodes[0].get("type") != "SdpaBackwardAttributes":
         raise Skip("not_single_sdpa_bwd")
     graph = {k: copy.deepcopy(v) for k, v in bwd.items() if k != "metadata"}
-    metadata = bwd.get("metadata")
-    dropout = float(metadata.get("dropout") or 0.0) if isinstance(metadata, dict) else 0
+    dropout = _CAPTURED_DROPOUT.get(bwd.get("name"), 0.0)
     node = graph["nodes"][0]
     if dropout and not float(_param(node, "dropout_probability") or 0.0):
         _add_dropout(graph, dropout)
@@ -295,16 +329,80 @@ def spec_graph(spec: Dict[str, Any]) -> Dict[str, Any]:
     return graph
 
 
-def _shape_tag(graph: Dict[str, Any]) -> str:
+def _graph_tags(graph: Dict[str, Any]) -> Tuple[Dict[str, List[str]], Dict[str, Any]]:
+    """``(tags, notes)`` that the backward graph itself gives."""
     node = graph["nodes"][0]
-    dims = {int(t["uid"]): t["dims"] for t in graph["tensors"]}
-    seq_q = int(dims[int(_param(node, "q_tensor_uid"))][2])
-    seq_kv = int(dims[int(_param(node, "k_tensor_uid"))][2])
+    tensors = {int(t["uid"]): t for t in graph["tensors"]}
+    q, k, v = (tensors[int(_param(node, f"{n}_tensor_uid"))] for n in ("q", "k", "v"))
+    heads_q, seq_q, dim = (int(d) for d in q["dims"][1:])
+    heads_kv, seq_kv = int(k["dims"][1]), int(k["dims"][2])
+    if int(v["dims"][3]) != dim:
+        attention = "mla"
+    elif heads_kv == heads_q:
+        attention = "mha"
+    else:
+        attention = "mqa" if heads_kv == 1 else "gqa"
+    if (
+        _param(node, "left_bound") is not None
+        or _param(node, "right_bound") is not None
+    ):
+        mask = "sliding_window"
+    elif _param(node, "causal_mask") or _param(node, "causal_mask_bottom_right"):
+        mask = "causal"
+    else:
+        mask = "none"
     if seq_q == 1:
-        return "decode"
-    return {-1: "sq_lt_skv", 0: "sq_eq_skv", 1: "sq_gt_skv"}[
-        (seq_q > seq_kv) - (seq_q < seq_kv)
-    ]
+        phase = "decode"
+    else:
+        phase = "chunked_prefill" if seq_q < seq_kv else "prefill"
+    tags = {
+        **_CORPUS_TAGS,
+        "dtype": [store.DTYPES[graph["io_data_type"]]],
+        "phase": [phase],
+    }
+    layout = _layout(q, k)
+    if layout:
+        tags["layout"] = [layout]
+    notes = {"attention_type": [attention], "mask": [mask], "sink": ["false"]}
+    return tags, notes
+
+
+def _layout(q: Dict[str, Any], k: Dict[str, Any]) -> Optional[str]:
+    """``bshd`` or ``bhsd`` from the Q (or K) strides; None when they cannot tell."""
+    for tensor in (q, k):
+        dims, strides = tensor["dims"], tensor["strides"]
+        if dims[1] != 1 and dims[2] != 1:
+            return "bshd" if strides[1] < strides[2] else "bhsd"
+    # One query row and one KV head: the size-1 sequence stride still shows
+    # the layout of the generator (H*D for bshd, D for bhsd).
+    heads, dim = q["dims"][1], q["dims"][3]
+    if heads > 1 and q["strides"][1] == dim:
+        return {heads * dim: "bshd", dim: "bhsd"}.get(q["strides"][2])
+    return None
+
+
+def metadata(
+    graph: Dict[str, Any], origins: List[str], sources: List[Any]
+) -> Dict[str, Any]:
+    """Store metadata of one backward graph: its tags and ``notes``.
+
+    ``sources`` holds the metadata of every source graph: the tags of an
+    input graph, or the ``_MODEL_SPECS`` entry of a ``model_spec`` graph.
+    """
+    tags, notes = _graph_tags(graph)
+    union: Dict[str, set] = {"model": set(), "model_family": set()}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        union["model"].update(_model_tags(source))
+        union["model_family"].update(store.tag_values(source, "model_family"))
+        if "mla" in store.tag_values(source, "attention_type") | store.tag_values(
+            source.get("notes"), "attention_type"
+        ):
+            notes["attention_type"] = ["mla"]
+    tags.update({key: sorted(values) for key, values in union.items() if values})
+    notes["origin"] = sorted(set(origins))
+    return {**tags, "notes": notes}
 
 
 def convert(fwd: Dict[str, Any]) -> Dict[str, Any]:
@@ -394,49 +492,39 @@ def convert(fwd: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def identity(graph: Dict[str, Any]) -> str:
-    """SHA-256 of the canonical executable JSON (no name or metadata)."""
-    body = {k: v for k, v in graph.items() if k not in ("name", "metadata")}
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
 def _model_tags(metadata: Any) -> List[str]:
     model = metadata.get("model") if isinstance(metadata, dict) else None
     names = model if isinstance(model, list) else [model] if model else []
     return [re.sub(r"[^a-z0-9]+", "_", str(n).lower()).strip("_") for n in names]
 
 
-def iter_graphs(
-    patterns: List[str], root: Path, exclude: Optional[Path] = None
-) -> Iterator[Tuple[str, Dict[str, Any]]]:
-    """Yield ``(source, graph)`` for each JSON member of the matched tarballs.
+def iter_graphs(paths: List[str]) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Yield ``(label, graph)`` for each input graph file, in path order.
 
-    ``exclude`` (the output archive) is never read, so a rebuild does not
-    adopt the previous corpus.
+    Skips the outputs of an earlier run: graphs whose only ``source`` tag is
+    ``sdpa_fwd_to_bwd``.
+
+    Raises:
+        GraphLoadError: A tarball cannot be read.
     """
-    paths = sorted(
-        {Path(p) for pat in patterns for p in glob.glob(pat, recursive=True)}
-    )
-    for path in paths:
-        if exclude is not None and path.resolve() == exclude.resolve():
-            continue
-        try:
-            label = path.resolve().relative_to(root.resolve()).as_posix()
-        except ValueError:
-            label = path.as_posix()
-        with tarfile.open(path) as archive:
-            for member in sorted(archive.getmembers(), key=lambda m: m.name):
-                if member.isfile() and member.name.endswith(".json"):
-                    graph = json.load(archive.extractfile(member))
-                    yield f"{label}:{member.name}", graph
+    tmpdirs, files, _ = resolve_graph_files_multi(paths)
+    try:
+        for path in files:
+            with open(path, encoding="utf-8") as f:
+                graph = json.load(f)
+            if store.tag_values(graph.get("metadata"), "source") == {SOURCE}:
+                continue
+            yield path, graph
+    finally:
+        for tmpdir in tmpdirs:
+            tmpdir.cleanup()
 
 
 def _graph_origins(
-    patterns: List[str], root: Path, exclude: Optional[Path], skipped: Dict[str, int]
+    paths: List[str], skipped: Dict[str, int]
 ) -> Iterator[Tuple[str, str, Dict[str, Any], Any]]:
-    """Yield ``(origin, source, backward graph, source metadata)``."""
-    for source, graph in iter_graphs(patterns, root, exclude):
+    """Yield ``(origin, label, backward graph, source metadata)``."""
+    for label, graph in iter_graphs(paths):
         types = {n.get("type") for n in graph.get("nodes", [])}
         if "SdpaAttributes" in types:
             origin, make = "converted_fwd", convert
@@ -445,93 +533,82 @@ def _graph_origins(
         else:
             continue
         try:
-            yield origin, source, make(graph), graph.get("metadata")
+            yield origin, label, make(graph), graph.get("metadata")
         except Skip as reason:
             skipped[str(reason)] += 1
     for spec in _MODEL_SPECS:
         yield "model_spec", f"model_spec:{spec['source']}", spec_graph(spec), spec
 
 
-def build(
-    patterns: List[str], root: Path, exclude: Optional[Path] = None
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
-    """Collect and de-duplicate; return graphs by identity and skip counts."""
-    kept: Dict[str, Dict[str, Any]] = {}
+def build(paths: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """Collect and de-duplicate.
+
+    Returns ``{key: store object}`` and the skip counts. The first input in
+    path order names a duplicate.
+    """
+    found: Dict[str, Dict[str, Any]] = {}
     skipped: Dict[str, int] = collections.Counter()
-    for origin, source, bwd, metadata in _graph_origins(
-        patterns, root, exclude, skipped
-    ):
-        entry = kept.setdefault(
-            identity(bwd),
-            {
-                **bwd,
-                "metadata": {
-                    "operation": ["sdpa"],
-                    "direction": ["bwd"],
-                    "dtype": [bwd["io_data_type"]],
-                    "shape": [_shape_tag(bwd)],
-                    "origin": [],
-                    "model": [],
-                    "source": [],
-                },
-            },
+    for origin, _, bwd, source in _graph_origins(paths, skipped):
+        entry = found.setdefault(
+            store.geometry_key(bwd), {"graph": bwd, "origins": [], "sources": []}
         )
-        tags = entry["metadata"]
-        tags["origin"] = sorted(set(tags["origin"]) | {origin})
-        tags["source"].append(source)
-        tags["model"] = sorted(set(tags["model"]) | set(_model_tags(metadata)))
-    for entry in kept.values():
-        if not entry["metadata"]["model"]:
-            del entry["metadata"]["model"]
-    return kept, dict(skipped)
+        entry["origins"].append(origin)
+        entry["sources"].append(source)
+    objects = {
+        key: {
+            **e["graph"],
+            "metadata": metadata(e["graph"], e["origins"], e["sources"]),
+        }
+        for key, e in found.items()
+    }
+    return objects, dict(skipped)
 
 
-def _unique_names(graphs: List[Dict[str, Any]]) -> None:
-    seen: Dict[str, int] = collections.Counter()
-    for graph in graphs:
-        base = re.sub(r"[^A-Za-z0-9_.-]+", "_", graph["name"])
-        seen[base] += 1
-        graph["name"] = base if seen[base] == 1 else f"{base}_{seen[base]}"
-
-
-def write_archive(graphs: List[Dict[str, Any]], output: Path, prefix: str) -> None:
-    """Write the graphs as a byte-reproducible ``.tar.gz`` (fixed mtimes)."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with (
-        open(output, "wb") as raw,
-        gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed,
-        tarfile.open(fileobj=compressed, mode="w") as archive,
-    ):
-        for graph in graphs:
-            data = (json.dumps(graph, indent=1) + "\n").encode()
-            info = tarfile.TarInfo(f"{prefix}/{graph['name']}.json")
-            info.size, info.mode, info.mtime = len(data), 0o644, 0
-            archive.addfile(info, io.BytesIO(data))
+def write_objects(objects: Dict[str, Dict[str, Any]], out: Path) -> None:
+    """Write each object as ``<out>/<key>``. ``out`` must be empty or new."""
+    out.mkdir(parents=True, exist_ok=True)
+    if any(out.iterdir()):
+        raise ValueError(f"{out} is not empty")
+    for key, obj in objects.items():
+        (out / key).write_bytes(store.object_bytes(obj))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("tarballs", nargs="+", help="workload tarball paths or globs")
-    parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument(
-        "--prefix", default="sdpa_bwd", help="directory inside the archive"
+        "graphs", nargs="+", help="input graph files, directories, globs or tarballs"
     )
     parser.add_argument(
-        "--root", type=Path, default=Path("."), help="base of source labels"
+        "--out", type=Path, required=True, help="empty folder for the store objects"
     )
     args = parser.parse_args(argv)
 
-    kept, skipped = build(args.tarballs, args.root, args.output)
-    graphs = sorted(kept.values(), key=lambda g: g["metadata"]["source"][0])
-    _unique_names(graphs)
-    write_archive(graphs, args.output, args.prefix)
+    try:
+        objects, skipped = build(args.graphs)
+    except (GraphLoadError, OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    problems = [
+        f"{key}: {problem}"
+        for key in sorted(objects)
+        for problem in store.validate_object(key, objects[key])
+    ]
+    if problems:
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        return 1
+    try:
+        write_objects(objects, args.out)
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     origins = collections.Counter(
-        origin for g in graphs for origin in g["metadata"]["origin"]
+        origin
+        for obj in objects.values()
+        for origin in obj["metadata"]["notes"]["origin"]
     )
-    sources = sum(len(g["metadata"]["source"]) for g in graphs)
     print(
-        f"{sources} source graphs, {sources - len(graphs)} duplicates, "
-        f"{len(graphs)} unique backward graphs written to {args.output}: "
+        f"{len(objects)} backward graphs written to {args.out}: "
         + ", ".join(f"{n} {o}" for o, n in sorted(origins.items())),
         file=sys.stderr,
     )

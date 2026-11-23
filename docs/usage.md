@@ -20,7 +20,8 @@ override a config file.
 
 | Option | Default | Description |
 |---|---|---|
-| `-g`, `--graph PATH [PATH ...]` | required | Graph JSON files, directories, globs or tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`). Quote globs so the shell does not expand them. |
+| `-g`, `--graph PATH [PATH ...]` | required | Graph JSON files, directories, globs, tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`) or graph store prefixes (`s3://BUCKET/PREFIX/`). Quote globs so the shell does not expand them. See [Graph store](#graph-store). |
+| `--tag KEY=VALUE` | none | Run only the graphs whose `metadata` has this tag. Repeat the option for more terms: the terms of different keys must all match (AND), and one term of a key is sufficient (OR). Applies to every `--graph` source. |
 | `--config PATH` | none | TOML recipe. Explicit CLI flags override its values. See [Config files](#config-files). |
 
 Graphs run in command-line order. The files that one argument expands to
@@ -29,6 +30,47 @@ two times runs one time, at its first position. The tool extracts a tarball
 to a temporary directory and deletes the directory at the end of the run.
 All graphs share one execution path: one graph, a glob and a tarball give
 the same output format.
+
+`--tag` reads `metadata.<KEY>` of each graph file. A value can be an array
+of tokens or one scalar; the comparison ignores case. A file that is not
+valid JSON stays in the list, so that the run reports it as a graph error.
+When no graph matches, the run stops with exit code 1.
+
+```bash
+# Every headline MoE or matmul graph of the bench_cases source
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag workload=headline --tag source=bench_cases \
+  --tag operation=moe --tag operation=matmul
+```
+
+### Graph store
+
+`-g s3://BUCKET/PREFIX/` reads a graph store: one JSON object for each
+graph, with the tags in its `metadata`. [graph-store.md](graph-store.md)
+gives the store rules and the tag vocabulary. The public store is
+`s3://therock-dvc/dnn-benchmarking-graphs/`.
+
+1. The tool lists the prefix with anonymous HTTPS requests. It needs no
+   credentials and no AWS tools, and it never writes to the store.
+2. It downloads only the objects that are new, or whose ETag changed since
+   the last run, into `<work>/graph-store/<bucket>/<prefix>/` (see
+   [Work directory](#work-directory---benchmark-work-dir)). The first run
+   downloads every object, 16 in parallel on kept-alive connections. A later
+   run reads only the listing.
+3. It retries a request that fails with a connection error, a timeout, 429
+   or 5xx, up to 6 attempts with an increasing wait. It does not retry other
+   errors, for example 403 or 404.
+4. It skips, with a warning, each object whose content does not hash to its
+   key, and each name under the prefix that is not an object key.
+5. It removes the cached objects that the store no longer lists.
+6. `--tag` then selects from the objects.
+
+A listing or download error that remains after the retries stops the run
+with exit code 1. The objects that arrived stay in the cache with their
+ETags, so the next run downloads only the rest. A directory of
+store objects (for example the cache folder, or the `--out` folder of
+`tools/sdpa_fwd_to_bwd.py`) is a usual `-g` directory: `--tag` applies to it
+in the same way.
 
 ### Run
 
@@ -254,7 +296,8 @@ The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 its rows to the same graph, in one process and one result file:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag source=rocke --tag operation=sdpa --runtime hipdnn,rocke \
   --validate pytorch --timing-block 50 -o results.json
 ```
 
@@ -457,7 +500,8 @@ Requirements and limits:
 To compare rocKE with hipDNN, run both runtimes in one run:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag source=rocke --tag operation=sdpa --runtime hipdnn,rocke \
   -e hipkernel:Gfx950AttentionDense --timing-block 50 -o both.json
 ```
 
@@ -559,7 +603,8 @@ Requirements and limits:
 To compare AITER with hipDNN, run both runtimes in one run:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/aiter.tar.gz --runtime hipdnn,aiter \
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag workload=microbench --tag source=aiter --runtime hipdnn,aiter \
   --validate pytorch -o both.json
 ```
 
@@ -576,6 +621,8 @@ The work directory holds the caches and the kernel-selection state:
   tuned/                 tuned selection state, kept across commands
     hipdnn-cache/
     miopen-user-db/
+  graph-store/           local copy of each graph store prefix, kept
+    <bucket>/<prefix>/   (see Graph store)
 ```
 
 - `--autotune` runs, runs with `HIPDNN_FORCE_BENCHMARKING` set to a true
@@ -795,7 +842,8 @@ differences:
 | Config key | CLI option |
 |---|---|
 | `version` | none. Must be `1` when present. |
-| `graphs` (list of paths) | `--graph` |
+| `graphs` (list of paths) | `--graph`. A `s3://` entry stays as written. |
+| `tags` (list of `"KEY=VALUE"` strings) | `--tag` |
 | `[[engines]]` tables with `id` and optional `plugin_path` | `--engine` and `--plugin-path` |
 
 `sample_configs/config.toml.example` lists every key. An unknown key, a wrong
@@ -889,8 +937,8 @@ with code 143 without it. The file then holds the last periodic write.
 | Code | Meaning |
 |---|---|
 | 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
-| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, a tarball that cannot be read, or a runtime that is not available at startup (hipDNN, PyTorch, rocKE or the reference provider). |
-| 2 | Usage error: a bad flag, a bad config file, an option that the runtime does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
+| 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, no graph that matches `--tag`, a tarball that cannot be read, a graph store that cannot be listed or read, or a runtime that is not available at startup (hipDNN, PyTorch, rocKE or the reference provider). |
+| 2 | Usage error: a bad flag (a `--tag` without `KEY=VALUE`, a store URL without a bucket), a bad config file, an option that the runtime does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
 | 143 | Interrupted by SIGTERM. On Linux the run ends within 30 seconds, also when it is blocked in GPU code. |

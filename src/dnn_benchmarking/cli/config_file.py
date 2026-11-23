@@ -17,6 +17,7 @@ from .parser import (
     ConfigKind,
     parse_engine_id,
 )
+from ..graph.store import is_store_url
 
 _ALLOWED_TOP_LEVEL_KEYS: Set[str] = {
     str(option.config_key) for option in CONFIG_OPTIONS
@@ -118,7 +119,10 @@ def _convert(value: Any, option: CliOption, base_dir: Path) -> Any:
                 raise ValueError(
                     f"Config field '{key}' must be a non-empty list of string paths"
                 )
-            return [str(_path_from_config(base_dir, item)) for item in value]
+            return [
+                item if is_store_url(item) else str(_path_from_config(base_dir, item))
+                for item in value
+            ]
         case ConfigKind.PATH_OR_PATH_LIST:
             if isinstance(value, str) and value:
                 value = [value]
@@ -127,6 +131,15 @@ def _convert(value: Any, option: CliOption, base_dir: Path) -> Any:
                     f"Config field '{key}' must be a string or non-empty list of strings"
                 )
             return [_path_from_config(base_dir, item) for item in value]
+        case ConfigKind.STRING_LIST:
+            if not _is_path_list(value):
+                raise ValueError(
+                    f"Config field '{key}' must be a non-empty list of strings"
+                )
+            try:
+                return [option.parser_type(item) for item in value]
+            except argparse.ArgumentTypeError as e:
+                raise ValueError(f"Config field '{key}' {e}") from e
     raise AssertionError(f"unhandled config kind {option.config_kind}")
 
 

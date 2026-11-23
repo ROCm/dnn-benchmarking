@@ -35,6 +35,7 @@ class ConfigKind(str, Enum):
     PATH = "path"
     PATH_LIST = "path_list"
     PATH_OR_PATH_LIST = "path_or_path_list"
+    STRING_LIST = "string_list"
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,17 @@ def _parse_runtime_list(s: str) -> str:
     return s
 
 
+def _parse_tag(s: str) -> str:
+    """Validate one ``--tag KEY=VALUE`` term; return it as lowercase ``key=value``."""
+    from ..graph.store import parse_tag
+
+    try:
+        key, value = parse_tag(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return f"{key}={value}"
+
+
 def _bool_option(
     flags: tuple[str, ...], dest: str, group: str, cls: type, field: str, help: str
 ) -> CliOption:
@@ -221,10 +233,23 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         group="Input",
         nargs="+",
         metavar="PATH",
-        help="graph JSON files, directories, globs, or tarballs "
-        "(.tar, .tar.gz, .tgz, .tar.bz2, .tar.xz)",
+        help="graph JSON files, directories, globs, tarballs "
+        "(.tar, .tar.gz, .tgz, .tar.bz2, .tar.xz) or graph store prefixes "
+        "(s3://BUCKET/PREFIX/, copied to a local cache)",
         config_key="graphs",
         config_kind=ConfigKind.PATH_LIST,
+    ),
+    CliOption(
+        flags=("--tag",),
+        dest="tag",
+        group="Input",
+        parser_type=_parse_tag,
+        action="append",
+        metavar="KEY=VALUE",
+        help="run only graphs whose metadata has this tag; repeatable: "
+        "AND across keys, OR within a key",
+        config_key="tags",
+        config_kind=ConfigKind.STRING_LIST,
     ),
     CliOption(
         flags=("--config",),
@@ -615,7 +640,8 @@ examples:
       --plugin-path /path/to/build_a/engines,/path/to/build_b/engines
   dnn-benchmark -g 'graphs/*.json' --validate pytorch -o results.json
   dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-sdpa-backend flash
-  dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke --timing-block 50
+  dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ --tag source=rocke \\
+      --tag operation=sdpa --runtime hipdnn,rocke --timing-block 50
   dnn-benchmark -g graphs/sample_sdpa.json --runtime hipdnn,aiter --validate pytorch
   dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
 
