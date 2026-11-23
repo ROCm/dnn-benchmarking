@@ -1,7 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Golden key-set tests for result JSON schema v2.
+"""Golden key-set tests for result JSON schema v3.
 
 Consumers rely on every key being present regardless of row status, so the
 full and the minimal document must have identical key sets at every level.
@@ -220,7 +220,7 @@ def test_full_document_has_exact_key_sets() -> None:
         assert set(plan["timing"]) == TIMING_KEYS
         assert set(plan["correctness"]) == CORRECTNESS_KEYS
         assert set(plan["dispatch"]) == DISPATCH_KEYS
-    assert doc["schema_version"] == 2
+    assert doc["schema_version"] == 3
     assert doc["environment"] == full_suite().environment  # values unchanged
 
 

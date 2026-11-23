@@ -45,7 +45,7 @@ def _row(name, median, *, cv=0.0, match=True, status="success", role="engine",
     )
 
 
-def _write(tmp_path, fname, graphs, **config):
+def _write(tmp_path, fname, graphs, schema_version=None, **config):
     suite = SuiteResult(
         run=RunInfo(
             "t", [], {"cache_mode": "warm", "iters": 100, **config}, complete=True
@@ -58,6 +58,9 @@ def _write(tmp_path, fname, graphs, **config):
     )
     path = tmp_path / fname
     suite.write(path)
+    if schema_version is not None:
+        doc = json.loads(path.read_text())
+        path.write_text(json.dumps({**doc, "schema_version": schema_version}))
     return str(path)
 
 
@@ -285,6 +288,71 @@ def test_duplicate_graph_ids_pair_in_order_of_appearance(tmp_path, capsys):
         ("a2", 1.0),
     ]
     assert (report["only_in_a"], report["only_in_b"]) == ([], ["b3"])
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_same_schema_joins_on_graph_id_without_warning(tmp_path, capsys, version):
+    a = _write(tmp_path, "a.json", [("x", "same", [_row("E", 1.0)])],
+               schema_version=version)  # fmt: skip
+    b = _write(tmp_path, "b.json", [("y", "same", [_row("E", 1.0)])],
+               schema_version=version)  # fmt: skip
+    main([a, b, "--json"])
+    captured = capsys.readouterr()
+    assert [p["graph"] for p in json.loads(captured.out)["pairs"]] == ["x"]
+    assert "graph name" not in captured.err
+
+
+@pytest.mark.parametrize("order", ["v2_v3", "v3_v2"])
+def test_schema_2_and_3_join_on_graph_name_with_one_warning(tmp_path, capsys, order):
+    v2 = _write(tmp_path, "v2.json", [("g", "0123456789ab", [_row("E", 2.0)]),
+                                      ("old", "aaaaaaaaaaaa", [_row("E", 1.0)]),
+                                      ("broken", None, [])],
+                schema_version=2)  # fmt: skip
+    v3 = _write(tmp_path, "v3.json", [("g", "f" * 64, [_row("E", 1.0)]),
+                                      ("new", "aaaaaaaaaaaa", [_row("E", 1.0)]),
+                                      ("broken", None, [])])  # fmt: skip
+    a, b = (v2, v3) if order == "v2_v3" else (v3, v2)
+    code, report = _json(capsys, [a, b])
+    # The ids differ, so only the shared name joins; the shared id does not.
+    # A graph that did not load (null id) never joins, as in an id join.
+    assert [p["graph"] for p in report["pairs"]] == ["g"]
+    only_v2, only_v3 = (["old", "broken"], ["new", "broken"])
+    expected = (only_v2, only_v3) if order == "v2_v3" else (only_v3, only_v2)
+    assert (report["only_in_a"], report["only_in_b"]) == expected
+    assert code == (0 if order == "v2_v3" else 1)  # B 2x slower in v3_v2
+    main([a, b])
+    assert capsys.readouterr().err.count("joined by graph name") == 1
+
+
+def test_mixed_schema_leaves_duplicate_names_unmatched(tmp_path, capsys):
+    # Two different graphs share a name. Timings do not change, but the
+    # schema 3 file lists them in reverse order.
+    v2 = _write(tmp_path, "v2.json", [("dup", "a" * 12, [_row("E", 1.0)]),
+                                      ("dup", "b" * 12, [_row("E", 2.0)])],
+                schema_version=2)  # fmt: skip
+    v3 = _write(tmp_path, "v3.json", [("dup", "b" * 64, [_row("E", 2.0)]),
+                                      ("dup", "a" * 64, [_row("E", 1.0)])])  # fmt: skip
+    code, report = _json(capsys, [v2, v3])
+    assert code == 0
+    assert report["pairs"] == [] and report["regressions"] == 0
+    assert (report["only_in_a"], report["only_in_b"]) == ([], [])
+    assert report["ambiguous"] == [{"graph_name": "dup", "count_a": 2, "count_b": 2}]
+    assert main([v2, v3]) == 0
+    assert capsys.readouterr().err.count("more than once") == 1
+
+
+def test_mixed_schema_name_duplicated_on_one_side_is_unmatched(tmp_path, capsys):
+    v2 = _write(tmp_path, "v2.json", [("dup", "a" * 12, [_row("E", 1.0)]),
+                                      ("u", "c" * 12, [_row("E", 1.0)])],
+                schema_version=2)  # fmt: skip
+    v3 = _write(tmp_path, "v3.json", [("dup", "b" * 64, [_row("E", 9.0)]),
+                                      ("dup", "a" * 64, [_row("E", 1.0)]),
+                                      ("u", "c" * 64, [_row("E", 1.0)])])  # fmt: skip
+    code, report = _json(capsys, [v2, v3])
+    assert code == 0  # the 9x slower "dup" is not paired
+    assert [p["graph"] for p in report["pairs"]] == ["u"]
+    assert (report["only_in_a"], report["only_in_b"]) == ([], [])
+    assert report["ambiguous"] == [{"graph_name": "dup", "count_a": 1, "count_b": 2}]
 
 
 def test_config_mismatch_warns(tmp_path, capsys):

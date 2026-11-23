@@ -195,6 +195,14 @@ class TestTableLayout:
         )
         assert out.getvalue().splitlines()[0] == "sample_add (pointwise_add_1x2)  [abc]"
 
+    def test_title_of_a_file_named_by_its_graph_id(self) -> None:
+        gid = "0123456789ab" + "f" * 52
+        out = io.StringIO()
+        Reporter(out, io.StringIO()).print_graph_table(
+            GraphResult("conv_k3", f"/store/{gid}.json", [], graph_id=gid)
+        )
+        assert out.getvalue().splitlines()[0] == "conv_k3  [0123456789ab]"
+
     def test_no_engine_graph_shows_why(self) -> None:
         out = io.StringIO()
         Reporter(out, io.StringIO()).print_graph_table(

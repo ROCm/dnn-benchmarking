@@ -1,11 +1,11 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Suite result data model and result JSON schema v2.
+"""Suite result data model and result JSON schema v3.
 
 Top-level structure is graph-first: SuiteResult holds run info, the
 environment and a list of GraphResult, each holding ProviderEngineResult
-rows. Python attribute names are stable; the v2 JSON key names are applied
+rows. Python attribute names are stable; the v3 JSON key names are applied
 only in ``to_dict``. Every key is always present (null when not
 applicable) so consumers never probe for key presence.
 """
@@ -26,7 +26,11 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from .. import __version__
 from .statistics import BenchmarkStats, TimingInfo
 
-SUITE_RESULT_SCHEMA_VERSION = 2
+SUITE_RESULT_SCHEMA_VERSION = 3
+
+#: Versions that ``SuiteResult.load`` reads. Version 2 differs only in
+#: ``graph_id``: 12 hex characters of the hash of the whole graph JSON.
+LOADABLE_SCHEMA_VERSIONS = (2, 3)
 
 # Keys of run.config / environment that are always emitted (null when the
 # producer did not supply them). Extra producer keys are kept as-is.
@@ -123,9 +127,23 @@ def engine_id_hex(engine_id: Optional[int]) -> Optional[str]:
 
 
 def graph_id_for(graph_json: Dict[str, Any]) -> str:
-    """Stable join key for a graph: sha256 of its canonical JSON, 12 hex chars."""
-    canonical = json.dumps(graph_json, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+    """Geometry hash of a graph: the stable join key, 64 hex characters.
+
+    The SHA-256 of the canonical JSON of the graph without the top-level
+    ``name`` and ``metadata``. A rename or a retag keeps the id.
+
+    Raises:
+        ValueError: The graph holds NaN or infinity.
+    """
+    geometry = {k: v for k, v in graph_json.items() if k not in ("name", "metadata")}
+    canonical = json.dumps(
+        geometry,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _with_keys(d: Optional[Dict[str, Any]], keys: tuple) -> Dict[str, Any]:
@@ -209,7 +227,7 @@ class CorrectnessResult:
         return self.tolerance_match is False
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 ``correctness`` object."""
+        """Convert to the v3 ``correctness`` object."""
         return {
             "match": self.tolerance_match,
             "rtol": self.rtol,
@@ -257,7 +275,7 @@ class PlanResult:
     dispatch: Optional[Dict[str, Any]] = None
 
     def plan_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 plan object (``ootb`` and ``oracle``)."""
+        """Convert to the v3 plan object (``ootb`` and ``oracle``)."""
         return {
             "build_ms": self.cpu_build_time_ms,
             "timing": self.timing.to_dict() if self.timing is not None else None,
@@ -296,7 +314,7 @@ class OracleResult(PlanResult):
     tuning_available: bool
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 ``oracle`` object: the plan object plus tuning."""
+        """Convert to the v3 ``oracle`` object: the plan object plus tuning."""
         return {**self.plan_dict(), "tuning_available": self.tuning_available}
 
 
@@ -442,7 +460,7 @@ class ProviderEngineResult:
         return "unchecked"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 row object (every key always present).
+        """Convert to the v3 row object (every key always present).
 
         ``ootb`` and ``oracle`` are the same plan object; ``ootb`` is null
         when the row did not run (``error`` or ``skipped`` rows carry only
@@ -543,7 +561,7 @@ class GraphResult:
         return "ok"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 graph object."""
+        """Convert to the v3 graph object."""
         return {
             "graph_id": self.graph_id,
             "graph_name": self.graph_name,
@@ -574,7 +592,7 @@ class RunInfo:
     complete: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 ``run`` object."""
+        """Convert to the v3 ``run`` object."""
         config = _with_keys(self.config, RUN_CONFIG_KEYS)
         config["profiling"] = _with_keys(config["profiling"], PROFILING_KEYS)
         return {
@@ -588,7 +606,7 @@ class RunInfo:
 
 @dataclass
 class SuiteResult:
-    """Top-level suite result (result JSON schema v2).
+    """Top-level suite result (result JSON schema v3).
 
     Attributes:
         run: Run info and effective config.
@@ -624,7 +642,7 @@ class SuiteResult:
         }
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to the v2 document (not yet NaN-sanitized; see to_json)."""
+        """Convert to the v3 document (not yet NaN-sanitized; see to_json)."""
         env = _with_keys(self.environment, ENVIRONMENT_KEYS)
         return {
             "schema_version": SUITE_RESULT_SCHEMA_VERSION,
@@ -735,11 +753,11 @@ class SuiteResult:
 
     @staticmethod
     def load(path: Union[str, Path]) -> Dict[str, Any]:
-        """Read a v2 result document.
+        """Read a v2 or v3 result document.
 
         Raises:
             OSError: Unreadable file.
-            ValueError: Not a schema v2 JSON result file.
+            ValueError: Not a schema v2 or v3 JSON result file.
         """
         with open(path) as f:
             try:
@@ -750,11 +768,11 @@ class SuiteResult:
                     "-o *.json output"
                 ) from None
         version = doc.get("schema_version") if isinstance(doc, dict) else None
-        if version != SUITE_RESULT_SCHEMA_VERSION:
+        if version not in LOADABLE_SCHEMA_VERSIONS:
             raise ValueError(
                 f"{path}: unsupported result schema_version {version!r} "
-                f"(expected {SUITE_RESULT_SCHEMA_VERSION}); regenerate it with this "
-                "version of dnn-benchmark"
+                f"(expected one of {', '.join(map(str, LOADABLE_SCHEMA_VERSIONS))}); "
+                "regenerate it with this version of dnn-benchmark"
             )
         if not doc["run"]["complete"]:
             print(

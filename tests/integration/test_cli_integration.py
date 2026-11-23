@@ -23,7 +23,7 @@ def test_cli_smoke(
     """One good graph with --validate plus one broken graph.
 
     Pins the user-facing contract: results on stdout, progress on stderr,
-    per-graph isolation, exit code 1 for a graph error, and a v2 JSON file.
+    per-graph isolation, exit code 1 for a graph error, and a v3 JSON file.
     """
     conv = GRAPHS_DIR / "sample_conv_fwd.json"
     broken = tmp_path / "broken.json"
@@ -63,7 +63,7 @@ def test_cli_smoke(
     assert re.search(r"^Summary: 2 graph\(s\)", proc.stdout, re.MULTILINE)
 
     data = json.loads(output.read_text())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["run"]["complete"] is True
     config = data["run"]["config"]
     assert (config["validate"], config["iters"], config["seed"]) == ("pytorch", 3, 0)

@@ -41,7 +41,7 @@ User documentation:
 - `docs/setup.md`: `setup_env.py`.
 - `docs/usage.md`: CLI reference, console output, exit codes, `compare`.
 - `docs/methodology.md`: timing method and known limits.
-- `docs/results-schema.md`: result file schema version 2.
+- `docs/results-schema.md`: result file schema version 3.
 - `docs/troubleshooting.md`: ROCm paths and profiling.
 
 Update the matching document in the same change when you change a CLI
@@ -126,7 +126,7 @@ src/dnn_benchmarking/
 │   └── _diagnostic.py        # warn_once
 ├── reporting/
 │   ├── statistics.py         # BenchmarkStats, noise_warnings, TimingInfo
-│   ├── suite_results.py      # result data model, schema v2, JSON/CSV write, load
+│   ├── suite_results.py      # result data model, schema v3, JSON/CSV write, load
 │   ├── reporter.py           # console: results on stdout, progress on stderr
 │   └── compare.py            # `dnn-benchmark compare`
 └── validation/               # reference providers and tolerance comparison
