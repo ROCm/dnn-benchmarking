@@ -124,7 +124,15 @@ def _first_pe_extra(data: dict) -> dict:
         for pe in graph.get("results", []):
             if pe.get("status") == "success":
                 return pe.get("extra_metrics") or {}
-    pytest.fail("no successful provider/engine result in output JSON")
+    seen = [
+        (
+            g.get("status"),
+            g.get("message"),
+            [(r.get("status"), r.get("message")) for r in g.get("results", [])],
+        )
+        for g in data.get("graphs", [])
+    ]
+    pytest.fail(f"no successful provider/engine result in output JSON: {seen}")
 
 
 @pytest.mark.rocprofv3

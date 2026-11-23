@@ -9,7 +9,6 @@ on:
       - '**.md'
       - 'docs/**'
       - 'graphs/**'
-      - 'Workloads/**'
       - 'sample_configs/**'
   push:
     branches: [main]
@@ -17,7 +16,6 @@ on:
       - '**.md'
       - 'docs/**'
       - 'graphs/**'
-      - 'Workloads/**'
       - 'sample_configs/**'
 
 permissions:

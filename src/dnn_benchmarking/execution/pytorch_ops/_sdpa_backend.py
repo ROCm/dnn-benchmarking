@@ -200,6 +200,31 @@ def _prefer_rocm_fa_library(
         preference(previous)
 
 
+def rocm_fa_library(state: PyTorchSdpaBackendState) -> Optional[str]:
+    """The ROCm Flash library that a Flash call under ``state`` prefers.
+
+    ``ck`` or ``aotriton``: PyTorch serves its ``Default`` preference with
+    AOTriton. A strict Flash selection applies ``--pytorch-rocm-fa-library``
+    only around each call, so it is applied here too; PyTorch keeps the
+    previous preference when it refuses a library. None on a CUDA build or
+    when torch does not expose the preference.
+    """
+    if not torch_support.is_rocm_build():
+        return None
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    preference = getattr(cuda_backends, "preferred_rocm_fa_library", None)
+    if not callable(preference):
+        return None
+    with _SDPA_SELECTION_LOCK:
+        if state.selection is PyTorchSdpaBackendName.FLASH:
+            with _prefer_rocm_fa_library(state.selection, state.rocm_fa_library):
+                value = preference()
+        else:
+            value = preference()
+    name = str(getattr(value, "name", value)).rsplit(".", 1)[-1].lower()
+    return "ck" if name == "ck" else "aotriton"
+
+
 def _is_backend_unavailable_error(error: RuntimeError) -> bool:
     """Recognize PyTorch's forced-dispatch no-backend diagnostics."""
     message = str(error).lower()

@@ -26,6 +26,7 @@ from ._sdpa_backend import (
     PyTorchSdpaBackendUnavailableError,
     execute_selected_sdpa,
     reference_sdpa_pass,
+    rocm_fa_library,
     use_pytorch_sdpa_backend,
 )
 from ._warnings import get_reference_warnings
@@ -51,6 +52,7 @@ __all__ = [
     "PyTorchSdpaBackendState",
     "use_pytorch_sdpa_backend",
     "reference_sdpa_pass",
+    "rocm_fa_library",
     "execute_selected_sdpa",
     "register_handler",
     "get_handler",

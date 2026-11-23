@@ -6,7 +6,6 @@ name: check-deserialize
 on:
   pull_request:
     paths:
-      - 'Workloads/**'
       - 'graphs/**'
       - 'src/dnn_benchmarking/graph/**'
       - 'tools/check_deserialize.py'
@@ -14,7 +13,6 @@ on:
   push:
     branches: [main]
     paths:
-      - 'Workloads/**'
       - 'graphs/**'
       - 'src/dnn_benchmarking/graph/**'
       - 'tools/check_deserialize.py'
@@ -35,54 +33,32 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install DVC
-        run: pip install "dvc[s3]"
-
-      # .dvc/config sets allow_anonymous_login for the S3 remote, so this
-      # needs no credentials. Total tracked workload size is ~1 MB.
-      - name: Pull DVC-tracked workloads
-        run: dvc pull
-
-      # Different tarballs may contain graphs with the same relative path.
-      - name: Extract workload tarballs
-        run: |
-          set -o pipefail
-          first_archive="$(find Workloads -iname '*.tar.gz' -print -quit)"
-          if [[ -z "$first_archive" ]]; then
-            echo 'DVC pull materialized no workload tarballs' >&2
-            exit 1
-          fi
-          find Workloads -iname '*.tar.gz' -print0 |
-            while IFS= read -r -d '' archive; do
-              dest="/tmp/workloads-extracted/${archive#Workloads/}"
-              dest="${dest%.tar.gz}"
-              mkdir -p "$dest"
-              tar xzf "$archive" -C "$dest"
-            done
-
+      # The checked-in sample graphs only. The graph store is outside this
+      # repository and this workflow does not check it (docs/graph-store.md).
+      #
       # --level json only exercises dnn_benchmarking's pure-Python
       # GraphLoader, which doesn't know hipDNN's real node contract (tensor
       # rank, dtype, connected-components, per-node field constraints). It's
       # a fast fail-fast gate for gross JSON/schema errors, not the safety
       # net -- that's the opgraph-level check below, which calls real
-      # hipdnn_frontend and is the only level that has ever caught a graph
-      # bug in this repo (see the moe.tar.gz fix history).
+      # hipdnn_frontend.
       - name: Fast pre-check (JSON schema only)
         run: |
           pip install -e .
-          python tools/check_deserialize.py --level json --src src \
-            /tmp/workloads-extracted graphs
+          python tools/check_deserialize.py --level json --src src graphs
 
       # No GPU required: from_json + validate + build_operation_graph only
       # assemble and finalize the backend operation-graph descriptor, no
-      # plan build or kernel execution.
+      # plan build or kernel execution. The check imports only
+      # hipdnn_frontend, so --no-aiter skips the AITER build, which needs a
+      # ROCm version file that this runner does not have.
       - name: Build hipDNN (no GPU)
         env:
           PIP_NO_CACHE_DIR: "1"
         run: |
-          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y
+          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y --no-aiter
 
       - name: Check opgraph-level graph deserialization
         run: |
           .ci-workspace/.venv/bin/python tools/check_deserialize.py \
-            --level opgraph /tmp/workloads-extracted graphs
+            --level opgraph graphs
