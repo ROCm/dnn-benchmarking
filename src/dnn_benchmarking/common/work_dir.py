@@ -14,6 +14,8 @@ Layout of ``--benchmark-work-dir`` (default :func:`work_dir`)::
       tuned/                 selection state of tuned runs, kept across commands
         hipdnn-cache/        (tuned rankings, ingestor winners)
         miopen-user-db/
+      graph-store/           local copy of each graph store prefix (-g s3://...),
+        <bucket>/<prefix>/   kept: a sync downloads only new or changed objects
 
 OOTB state serves every run that does not tune, ``--fast`` included, and the
 OOTB plans of ``--oracle``. Only such runs write it, so a stored find result
@@ -128,3 +130,11 @@ def ootb_state(work: Path) -> SelectionState:
 def tuned_state(work: Path) -> SelectionState:
     """The tuned selection state, kept across commands."""
     return SelectionState.under(work / "tuned")
+
+
+def graph_store_cache(work: Path) -> Path:
+    """The root of the local graph store copies, kept across commands.
+
+    ``--fresh-state`` does not change it: the copies hold graphs, not state.
+    """
+    return work / "graph-store"
