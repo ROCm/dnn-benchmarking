@@ -168,8 +168,9 @@ NaN or infinity has no `graph_id`, and its `status` is `error`.
 |2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
 
 All other keys are the same in versions 2 and 3. `dnn-benchmark compare`
-joins a version 2 file and a version 3 file on `graph_name`. See
-[usage.md](usage.md#compare).
+joins a version 2 file and a version 3 file on `graph_name`. It does not
+pair a `graph_name` that occurs more than once in either file, and reports
+that name as ambiguous. See [usage.md](usage.md#compare).
 
 ## row
 

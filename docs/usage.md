@@ -913,9 +913,18 @@ Rules:
   the same graph. Compare then joins graphs on `graph_name` and prints the
   warning `schema 2 and 3 ids differ; joined by graph name` on stderr. A
   renamed graph shows as `graph only in A` and `graph only in B`.
-- When a file has more than one graph with the same join key, the graphs
+- In a schema 2 and schema 3 comparison, a `graph_name` that occurs more
+  than once in either file can name different graphs. Compare does not pair
+  these graphs. It lists each name in the `ambiguous` key of the `--json`
+  output, with the count in each file (`count_a`, `count_b`). The table
+  shows `ambiguous graph name: NAME (A: n, B: m)`. Stderr gets the warning
+  `N graph names appear more than once; mixed-schema results cannot be
+  paired by name, so they are not compared`. These graphs are not in
+  `only_in_a` or `only_in_b` and cannot change the exit code.
+- When a file has more than one graph with the same `graph_id`, the graphs
   pair in order of appearance. A graph with no partner shows as
-  `graph only in A` or `graph only in B`.
+  `graph only in A` or `graph only in B`. In a same-schema comparison,
+  `ambiguous` is always empty.
 - In `--by engine` mode, only engine rows are compared; compare reference
   rows with `--by ref`. Rows join on runtime, engine ID and engine name.
   When a file has more than one row with the same key, the rows pair in

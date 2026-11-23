@@ -324,6 +324,37 @@ def test_schema_2_and_3_join_on_graph_name_with_one_warning(tmp_path, capsys, or
     assert capsys.readouterr().err.count("joined by graph name") == 1
 
 
+def test_mixed_schema_leaves_duplicate_names_unmatched(tmp_path, capsys):
+    # Two different graphs share a name. Timings do not change, but the
+    # schema 3 file lists them in reverse order.
+    v2 = _write(tmp_path, "v2.json", [("dup", "a" * 12, [_row("E", 1.0)]),
+                                      ("dup", "b" * 12, [_row("E", 2.0)])],
+                schema_version=2)  # fmt: skip
+    v3 = _write(tmp_path, "v3.json", [("dup", "b" * 64, [_row("E", 2.0)]),
+                                      ("dup", "a" * 64, [_row("E", 1.0)])])  # fmt: skip
+    code, report = _json(capsys, [v2, v3])
+    assert code == 0
+    assert report["pairs"] == [] and report["regressions"] == 0
+    assert (report["only_in_a"], report["only_in_b"]) == ([], [])
+    assert report["ambiguous"] == [{"graph_name": "dup", "count_a": 2, "count_b": 2}]
+    assert main([v2, v3]) == 0
+    assert capsys.readouterr().err.count("more than once") == 1
+
+
+def test_mixed_schema_name_duplicated_on_one_side_is_unmatched(tmp_path, capsys):
+    v2 = _write(tmp_path, "v2.json", [("dup", "a" * 12, [_row("E", 1.0)]),
+                                      ("u", "c" * 12, [_row("E", 1.0)])],
+                schema_version=2)  # fmt: skip
+    v3 = _write(tmp_path, "v3.json", [("dup", "b" * 64, [_row("E", 9.0)]),
+                                      ("dup", "a" * 64, [_row("E", 1.0)]),
+                                      ("u", "c" * 64, [_row("E", 1.0)])])  # fmt: skip
+    code, report = _json(capsys, [v2, v3])
+    assert code == 0  # the 9x slower "dup" is not paired
+    assert [p["graph"] for p in report["pairs"]] == ["u"]
+    assert (report["only_in_a"], report["only_in_b"]) == ([], [])
+    assert report["ambiguous"] == [{"graph_name": "dup", "count_a": 1, "count_b": 2}]
+
+
 def test_config_mismatch_warns(tmp_path, capsys):
     a = _write(tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])])
     b = _write(tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])], iters=50)
