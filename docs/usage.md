@@ -820,21 +820,23 @@ Table columns:
 Example (MI210, `-g graphs/sample_conv_fwd.json graphs/sample_layernorm.json`):
 
 ```text
-sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [e50543fd1d83]
+sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [c6ab89a41cb4]
   engine                       verdict    kernel_med  iqr%    submit  tflops  gbps  vs_best
   MIOPEN_ENGINE                unchecked   25.44 µs    1.9  11.55 µs    0.74  21.0    1.00x
   MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.60 µs    1.3  11.47 µs    0.74  20.8    0.99x
   kernel_med = median device time per launch (staged stall-gate; cache warm); submit = host enqueue time; vs_best = best
   median / row median; * = noisy
 
-sample_layernorm (sample_layernorm_2x3x4)  [ad562fbb5a14]
+sample_layernorm (sample_layernorm_2x3x4)  [a48a45922921]
   no engines applicable: Failed to get ranked engine ids: No engine configurations available for the graph.
 
 Summary: 2 graph(s), 2 row(s): 0 passed, 2 unchecked, 0 failed, 0 skipped, 0 error(s); 1 graph(s) without engines
 ```
 
 The graph title is the file stem, then the `name` of the graph JSON in
-parentheses when it is different. The value in brackets is the `graph_id`.
+parentheses when it is different. When the file stem is the `graph_id`, the
+title is only the `name`. The value in brackets is the first 12 characters
+of the `graph_id`.
 A graph with no applicable engine shows the reason from hipDNN.
 `unchecked` means that the row ran without validation. It is not a pass.
 
@@ -845,7 +847,7 @@ profiling results, and all warnings.
 
 ### Result files
 
-`-o results.json` writes the full result (schema version 2). `-o results.csv`
+`-o results.json` writes the full result (schema version 3). `-o results.csv`
 writes one line per row with the main columns. See
 [results-schema.md](results-schema.md).
 
@@ -904,11 +906,25 @@ reads JSON only, not CSV.
 Rules:
 
 - `speedup = A_median / B_median`. A value more than 1 means B is faster.
-- Graphs join on `graph_id` only. A graph that did not load has no
-  `graph_id`, so it shows as `graph only in A` or `graph only in B`.
+- Graphs join on `graph_id` when both files have the same `schema_version`.
+  A graph that did not load has no `graph_id`, so it shows as
+  `graph only in A` or `graph only in B`.
+- A schema 2 file and a schema 3 file have different `graph_id` values for
+  the same graph. Compare then joins graphs on `graph_name` and prints the
+  warning `schema 2 and 3 ids differ; joined by graph name` on stderr. A
+  renamed graph shows as `graph only in A` and `graph only in B`.
+- In a schema 2 and schema 3 comparison, a `graph_name` that occurs more
+  than once in either file can name different graphs. Compare does not pair
+  these graphs. It lists each name in the `ambiguous` key of the `--json`
+  output, with the count in each file (`count_a`, `count_b`). The table
+  shows `ambiguous graph name: NAME (A: n, B: m)`. Stderr gets the warning
+  `N graph names appear more than once; mixed-schema results cannot be
+  paired by name, so they are not compared`. These graphs are not in
+  `only_in_a` or `only_in_b` and cannot change the exit code.
 - When a file has more than one graph with the same `graph_id`, the graphs
   pair in order of appearance. A graph with no partner shows as
-  `graph only in A` or `graph only in B`.
+  `graph only in A` or `graph only in B`. In a same-schema comparison,
+  `ambiguous` is always empty.
 - In `--by engine` mode, only engine rows are compared; compare reference
   rows with `--by ref`. Rows join on runtime, engine ID and engine name.
   When a file has more than one row with the same key, the rows pair in

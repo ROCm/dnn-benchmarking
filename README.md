@@ -60,7 +60,7 @@ before using `--validate pytorch` with that setup.
    ```
 
    ```text
-   sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [e50543fd1d83]
+   sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [c6ab89a41cb4]
      engine                       verdict    kernel_med  iqr%    submit  tflops  gbps  vs_best
      MIOPEN_ENGINE                unchecked   25.44 µs    1.9  11.55 µs    0.74  21.0    1.00x
      MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.60 µs    1.3  11.47 µs    0.74  20.8    0.99x
@@ -122,7 +122,7 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 | [docs/setup.md](docs/setup.md) | `setup_env.py`: torch modes, CMake defines, rocm-libraries source, CUDA hosts, Docker. |
 | [docs/usage.md](docs/usage.md) | All CLI options, engine selection, config files, console output, exit codes, `compare`, profiling. |
 | [docs/methodology.md](docs/methodology.md) | What `kernel_med` measures, warmup, cache modes, stop rule, statistics, parity with rocKE and PyTorch, known limits. |
-| [docs/results-schema.md](docs/results-schema.md) | Result file schema version 2 (JSON and CSV). |
+| [docs/results-schema.md](docs/results-schema.md) | Result file schema version 3 (JSON and CSV). |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | ROCm library paths, profiler requirements, profiling artefacts. |
 | [AGENTS.md](AGENTS.md) | Architecture and development rules. |
 
