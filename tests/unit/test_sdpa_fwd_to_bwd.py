@@ -8,11 +8,12 @@ form, which flags the backward node needs, and which graphs are duplicates.
 """
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
 
-from dnn_benchmarking.graph import GraphLoader
+from dnn_benchmarking.graph import GraphLoader, store
 
 _TOOL = Path(__file__).resolve().parents[2] / "tools" / "sdpa_fwd_to_bwd.py"
 
@@ -122,11 +123,11 @@ def test_forward_only_features_are_skipped(tool, inputs, reason) -> None:
     assert str(skipped.value) == reason
 
 
-def test_captured_dropout_metadata_adds_philox_dropout_once(tool) -> None:
+def test_captured_dropout_adds_philox_dropout_once(tool, monkeypatch) -> None:
     bwd = tool.convert(_forward())
-    captured = {**bwd, "metadata": {"dropout": 0.1}}
+    monkeypatch.setitem(tool._CAPTURED_DROPOUT, bwd["name"], 0.1)
 
-    adopted = tool.adopt(captured)
+    adopted = tool.adopt(bwd)
     node = adopted["nodes"][0]
     assert node["parameters"]["dropout_probability"] == 0.1
     uids = {t["uid"] for t in adopted["tensors"]}
@@ -134,16 +135,79 @@ def test_captured_dropout_metadata_adds_philox_dropout_once(tool) -> None:
         uids
     )
     # A graph that already has dropout keeps its own probability and inputs.
-    again = tool.adopt({**adopted, "metadata": {"dropout": 0.3}})
+    monkeypatch.setitem(tool._CAPTURED_DROPOUT, bwd["name"], 0.3)
+    again = tool.adopt(adopted)
     assert again["nodes"][0] == node
     assert len(again["tensors"]) == len(adopted["tensors"])
 
 
-def test_identity_ignores_name_and_metadata_only(tool) -> None:
+def test_metadata_follows_the_store_vocabulary_and_unions_the_sources(tool) -> None:
+    """Duplicates keep every source model; one ``mla`` source marks the graph
+    ``mla`` even though its head dims are equal (absorbed MLA)."""
     bwd = tool.convert(_forward())
-    renamed = {**bwd, "name": "other", "metadata": {"model": ["x"]}}
-    changed = tool.convert(_forward())
-    changed["nodes"][0]["parameters"]["attn_scale_value"] = 0.5
+    sources = [
+        {
+            "model": ["kimi_k3"],
+            "model_family": ["llm"],
+            "notes": {"attention_type": ["mla"]},
+        },
+        {"model": ["synthetic"], "model_family": ["synthetic"]},
+    ]
 
-    assert tool.identity(renamed) == tool.identity(bwd)
-    assert tool.identity(changed) != tool.identity(bwd)
+    metadata = tool.metadata(bwd, ["converted_fwd", "converted_fwd"], sources)
+
+    assert metadata == {
+        "workload": ["corpus"],
+        "source": ["sdpa_fwd_to_bwd"],
+        "operation": ["sdpa"],
+        "direction": ["bwd"],
+        "dtype": ["float16"],
+        "layout": ["bhsd"],
+        "mode": ["training"],
+        "phase": ["chunked_prefill"],
+        "model_family": ["llm", "synthetic"],
+        "model": ["kimi_k3", "synthetic"],
+        "notes": {
+            "attention_type": ["mla"],
+            "mask": ["causal"],
+            "sink": ["false"],
+            "origin": ["converted_fwd"],
+        },
+    }
+    key = store.geometry_key(bwd)
+    assert store.validate_object(key, {**bwd, "metadata": metadata}) == []
+
+
+def _write_graph(folder: Path, graph: dict) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / store.geometry_key(graph)).write_text(json.dumps(graph))
+
+
+def test_writes_store_objects_and_remakes_its_own_earlier_outputs(
+    tool, tmp_path: Path
+) -> None:
+    """The input is a store copy: an object whose only source is this tool
+    is remade, not adopted as a captured graph; a captured graph that also
+    has another source is adopted."""
+    fwd = {**_forward(), "metadata": {"source": ["rocke"], "model": ["llama3_1"]}}
+    stale = tool.convert(_forward(seq_lens=True))
+    stale["metadata"] = {"source": ["sdpa_fwd_to_bwd"]}
+    captured = tool.convert(_forward())
+    captured["nodes"][0]["parameters"]["attn_scale_value"] = 0.5
+    captured["metadata"] = {"source": ["bench_cases", "sdpa_fwd_to_bwd"]}
+    for graph in (fwd, stale, captured):
+        _write_graph(tmp_path / "store", graph)
+
+    assert tool.main(["--out", str(tmp_path / "out"), str(tmp_path / "store")]) == 0
+
+    objects = {p.name: json.loads(p.read_text()) for p in (tmp_path / "out").iterdir()}
+    origins = {key: obj["metadata"]["notes"]["origin"] for key, obj in objects.items()}
+    assert origins[store.geometry_key(tool.convert(fwd))] == ["converted_fwd"]
+    assert origins[store.geometry_key(captured)] == ["captured_bwd"]
+    assert store.geometry_key(stale) not in objects
+    assert sum(o == ["model_spec"] for o in origins.values()) == len(tool._MODEL_SPECS)
+    for key, obj in objects.items():
+        assert store.validate_object(key, obj) == []
+    assert objects[store.geometry_key(tool.convert(fwd))]["metadata"]["model"] == [
+        "llama3_1"
+    ]

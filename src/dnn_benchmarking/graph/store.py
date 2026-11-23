@@ -134,6 +134,49 @@ def geometry_key(graph: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest() + ".json"
 
 
+def object_bytes(obj: Mapping[str, Any]) -> bytes:
+    """The file content of a store object: indented JSON, sorted keys."""
+    return (json.dumps(obj, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
+
+
+def validate_object(key: str, obj: Mapping[str, Any]) -> List[str]:
+    """Return the problems of one store object against the store rules.
+
+    Checks the key, a non-empty name, the nodes, and that every tag is a
+    sorted array of unique tokens in the vocabulary, with one ``operation``.
+    """
+    problems = []
+    if not KEY.match(key) or geometry_key(obj) != key:
+        problems.append("key is not the geometry hash")
+    if not isinstance(obj.get("name"), str) or not obj["name"].strip():
+        problems.append("empty name")
+    if not obj.get("nodes"):
+        problems.append("no nodes")
+    metadata = obj.get("metadata")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("notes"), dict):
+        return problems + ["metadata or metadata.notes is not an object"]
+    for tag, values in metadata.items():
+        if tag == "notes":
+            continue
+        if tag not in CLOSED_TAGS and tag not in OPEN_TAGS:
+            problems.append(f"tag {tag!r} is not in the vocabulary")
+            continue
+        if (
+            not isinstance(values, list)
+            or not values
+            or values != sorted(set(values))
+            or not all(isinstance(v, str) and TOKEN.match(v) for v in values)
+        ):
+            problems.append(f"tag {tag!r} is not a sorted unique token array")
+            continue
+        unknown = set(values) - CLOSED_TAGS.get(tag, set(values))
+        if unknown:
+            problems.append(f"tag {tag!r} has values outside the vocabulary {unknown}")
+    if len(metadata.get("operation", [])) != 1:
+        problems.append("operation does not have exactly one value")
+    return problems
+
+
 def parse_tag(text: str) -> Tuple[str, str]:
     """Parse one ``KEY=VALUE`` tag term into lowercase ``(key, value)``.
 

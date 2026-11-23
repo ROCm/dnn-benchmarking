@@ -83,11 +83,10 @@ from dnn_benchmarking.graph import store
 from dnn_benchmarking.graph.store import (
     CLOSED_TAGS,
     DTYPES,
-    KEY,
     OPEN_TAGS,
     PARALLEL,
-    TOKEN,
     geometry_key,
+    object_bytes,
 )
 
 #: Anonymous HTTPS base of the DVC remote ``s3://therock-dvc/dnn-benchmarking``.
@@ -487,38 +486,14 @@ def merge(copies: list[Copy]) -> dict[str, dict[str, Any]]:
 
 
 def validate(key: str, obj: dict[str, Any]) -> list[str]:
-    """Return the problems of one store object (design step 4)."""
-    problems = []
-    if not KEY.match(key) or geometry_key(obj) != key:
-        problems.append("key is not the geometry hash")
-    if not isinstance(obj.get("name"), str) or not obj["name"].strip():
-        problems.append("empty name")
-    if not obj.get("nodes"):
-        problems.append("no nodes")
+    """Return the problems of one store object (design step 4).
+
+    The store rules, plus a ``source`` tag: every set maps to a source.
+    """
+    problems = store.validate_object(key, obj)
     metadata = obj.get("metadata")
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("notes"), dict):
-        return problems + ["metadata or metadata.notes is not an object"]
-    for tag, values in metadata.items():
-        if tag == "notes":
-            continue
-        if tag not in CLOSED_TAGS and tag not in OPEN_TAGS:
-            problems.append(f"tag {tag!r} is not in the vocabulary")
-            continue
-        if (
-            not isinstance(values, list)
-            or not values
-            or values != sorted(set(values))
-            or not all(isinstance(v, str) and TOKEN.match(v) for v in values)
-        ):
-            problems.append(f"tag {tag!r} is not a sorted unique token array")
-            continue
-        unknown = set(values) - CLOSED_TAGS.get(tag, set(values))
-        if unknown:
-            problems.append(f"tag {tag!r} has values outside the vocabulary {unknown}")
-    if not metadata.get("source"):
+    if isinstance(metadata, dict) and not metadata.get("source"):
         problems.append("no source tag")
-    if len(metadata.get("operation", [])) != 1:
-        problems.append("operation does not have exactly one value")
     return problems
 
 
@@ -617,10 +592,6 @@ def read_archive(path: Path) -> Iterator[tuple[str, Any]]:
 
 # ---------------------------------------------------------------------------
 # Output and upload
-
-
-def object_bytes(obj: dict[str, Any]) -> bytes:
-    return (json.dumps(obj, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
 
 
 def sample(keys: list[str], fraction: float) -> list[str]:

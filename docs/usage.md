@@ -289,7 +289,8 @@ The tables show the engine name. `-v` shows `NAME (0xHEX)`.
 its rows to the same graph, in one process and one result file:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag source=rocke --tag operation=sdpa --runtime hipdnn,rocke \
   --validate pytorch --timing-block 50 -o results.json
 ```
 
@@ -468,7 +469,8 @@ Requirements and limits:
 To compare rocKE with hipDNN, run both runtimes in one run:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag source=rocke --tag operation=sdpa --runtime hipdnn,rocke \
   -e hipkernel:Gfx950AttentionDense --timing-block 50 -o both.json
 ```
 
@@ -570,7 +572,8 @@ Requirements and limits:
 To compare AITER with hipDNN, run both runtimes in one run:
 
 ```bash
-dnn-benchmark -g Workloads/microbench/aiter.tar.gz --runtime hipdnn,aiter \
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag workload=microbench --tag source=aiter --runtime hipdnn,aiter \
   --validate pytorch -o both.json
 ```
 

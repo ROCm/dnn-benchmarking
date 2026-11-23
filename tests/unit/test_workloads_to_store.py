@@ -8,6 +8,7 @@ geometry, and whether the result is valid enough to upload.
 """
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,15 +39,6 @@ def _graph(*node_types, name="g", io="half", metadata=None, dims=(1, 2)):
     if metadata is not None:
         graph["metadata"] = metadata
     return graph
-
-
-def test_key_ignores_name_and_metadata_only(tool):
-    base = tool.geometry_key(_graph("MatmulAttributes"))
-    assert base == tool.geometry_key(
-        _graph("MatmulAttributes", name="other", metadata={"model": ["x"]})
-    )
-    assert base != tool.geometry_key(_graph("MatmulAttributes", dims=(1, 3)))
-    assert len(base) == len("0" * 64 + ".json")
 
 
 @pytest.mark.parametrize(
@@ -182,3 +174,43 @@ def test_conversion_query_reports_extra_and_missing(tool):
 
     wrong = tool.check_queries(objects, {"headline/attn": {conv.key}})
     assert wrong == {"headline/attn": (1, 1, 1)}
+
+
+def test_pointers_are_read_at_the_ref_after_workloads_left_the_tree(tool, tmp_path):
+    """The migration reads the DVC pointers from a pinned git ref, so it still
+    works when the current tree has no ``Workloads/``."""
+
+    def git(*args):
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                *args,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    pointer = tmp_path / "Workloads" / "headline" / "conv.tar.gz.dvc"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        "outs:\n- md5: " + "a" * 32 + "\n  size: 123\n  path: conv.tar.gz\n"
+    )
+    git("add", "-A")
+    git("commit", "-q", "-m", "pointers")
+    pinned = git("rev-parse", "HEAD")
+    git("rm", "-q", "-r", "Workloads")
+    git("commit", "-q", "-m", "remove Workloads")
+
+    assert not (tmp_path / "Workloads").exists()
+    assert tool.read_pointers(tmp_path, pinned) == {
+        "headline/conv": tool.Archive("headline/conv", "a" * 32, 123)
+    }
+    assert tool.read_pointers(tmp_path, "HEAD") == {}

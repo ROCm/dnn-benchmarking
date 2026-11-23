@@ -19,14 +19,14 @@ mask hipDNN actually runs (dnn_benchmarking's sdpa_band): a deprecated causal
 flag acts as right_bound = 0 and keeps the stored diagonal_alignment, and
 setting both causal_mask and causal_mask_bottom_right is
 rejected. An effective top-left diagonal with Sq = 1 attends only to key 0,
-which no decode step means. 137 graphs in the shipped corpus are written that
+which no decode step means. 131 graphs of the graph store are written that
 way, so it is reported as DECODE and does not fail the run;
 --strict-decode-mask makes it a failure once those graphs are regenerated.
 Any other effective top-left causal graph with Sq != Skv is printed as a
 warning, since decode and chunked prefill almost always mean bottom-right.
 
 Usage:
-  python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+  python tools/check_deserialize.py --level opgraph graphs <store folder>
 """
 import argparse, glob, json, os, sys
 from pathlib import Path
