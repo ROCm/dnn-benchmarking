@@ -644,17 +644,24 @@ The tool thus builds the reference of each engine row from the dump of that
 row, and the graph has no `reference` row. It compares every output except
 the dump.
 
-Before it builds that reference, the tool checks the dump as the hipDNN
-integration tests do. In this check, `n` is the number of elements of the
-dump and `rate` is the fraction of ones. `keep` is `1 - p` in double
-precision, from the float32 `p`:
+Before it builds that reference, the tool checks the dump against the
+same statistical bound the hipDNN integration tests use, applied to the
+count of ones instead of their rate. In this check, `n` is the number of
+elements of the dump and `ones` is the count of ones. `keep` is `1 - p`
+in double precision, from the float32 `p`:
 
 1. Each value must be 0 or 1. -0.0 counts as 0, and NaN fails. The message
    names the first bad index.
-2. The keep rate must be in the bound
-   `|rate - keep| <= 6*sqrt(keep*(1-keep)/n) + 1/n`. The first term is 6
-   standard deviations of the rate. The second term allows one element of
-   rounding. An empty dump passes.
+2. The count of ones must be in the bound
+   `|ones - keep*n| <= 6*sqrt(keep*(1-keep)*n) + 1`. The first term is 6
+   standard deviations of the count. The second term allows one element
+   off the keep rate. An empty dump passes.
+
+The two forms are algebraically identical in real arithmetic: dividing
+this bound by `n` gives the hipDNN harness's rate form. They diverge at
+floating-point rounding, so hipDNN's rate form can still reject a dump
+that this count form accepts, for example one off-keep element in an
+all-kept dump at `dropout_probability = 0`.
 
 The tool fills the dump with NaN before the validation run. An engine that
 does not write the dump thus fails step 1, for all `n` and `p`. Without the
@@ -874,9 +881,12 @@ The tool does not do these things yet:
   explicit dropout mask (forward and backward) and Philox forward graphs
   with an `rng_dump` output (see
   [Dropout validation](#dropout-validation)). It declines Philox forward
-  graphs without `rng_dump`, Philox backward graphs, and dropout with paged
-  K and V or ragged sequence lengths. With `--validate`, the engine rows of
-  these graphs fail. Some get `unchecked` instead when a CPU reference does
+  graphs without `rng_dump`, Philox backward graphs, and dropout with
+  paged, ragged or variable-length K/V. The PyTorch reference does not
+  implement that last combination; it is a limit of this tool, not of
+  hipDNN, which densifies paged and ragged dropout in its own reference.
+  With `--validate`, the engine rows of these graphs fail. Some get
+  `unchecked` instead when a CPU reference does
   not fit in host memory (see [SDPA dropout](usage.md#sdpa-dropout)). Other
   masks also make the reference decline the graph.
 - Per-document masking inside one sequence (`varlen_docmask`).

@@ -193,10 +193,13 @@ For each engine row, after the timed loop:
 
 1. The tool fills the `rng_dump` buffer with NaN, zeroes the other
    outputs and runs the engine one more time.
-2. It checks the dump: each value must be 0 or 1, and the keep rate must
-   be within 6 standard deviations of `1 - dropout_probability`. A dump
-   that the engine did not write still holds NaN, so it fails. A dump that
-   fails the check fails the row.
+2. It checks the dump: each value must be 0 or 1, and the count of ones
+   must be within 6 standard deviations of `(1 - dropout_probability) * n`,
+   plus one element of rounding allowance (`n` is the dump size). A dump
+   that the engine did not write still holds NaN, so it fails. A dump
+   that fails the check fails the row. hipDNN's own integration harness
+   checks the rate form of this bound, which can reject a dump that this
+   count form accepts at that one-element edge.
 3. It builds a reference from the inputs and this dump, and compares the
    other outputs (for example `O`) with it. It does not compare the dump.
 
@@ -232,8 +235,9 @@ engine rows fail (exit code 3) and keep their timings:
 - A Philox forward graph whose `rng_dump` is not FLOAT. The message names
   `rng_dump`. The tool declines the graph before the NaN fill. The rows thus
   fail also when a CPU reference or the dump would not fit in host memory.
-- Dropout with paged K and V or with ragged sequence lengths. The message
-  names the feature.
+- Dropout with paged, ragged or variable-length K/V: the PyTorch
+  reference does not implement that combination (not a hipDNN rule). The
+  message names the feature.
 - A Philox backward graph: a backward node with `seed`, `offset` or a
   `dropout_probability` other than 0. hipDNN's backward graph has no
   `rng_dump`, so the reference has no mask.

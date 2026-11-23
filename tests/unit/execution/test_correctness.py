@@ -405,8 +405,9 @@ def test_rng_dump_keep_rate_bound(n, ones, passes):
 
 @pytest.mark.parametrize("n, passes", [(1, True), (2, False), (1000, False)])
 def test_rng_dump_all_zero_at_p_zero_fails(n, passes):
-    """At p = 0 the bound is 1/n, so one zero (rate 0, keep 1) still passes.
-    The harness has the same bound."""
+    """At p = 0 the count-form bound is exactly 1, so an all-zero dump
+    passes only at n = 1. hipDNN's own rate form allows the same single
+    element in real arithmetic, but rounds it away at larger n."""
     c = check_rng_dump(_dump(0, n), 0.0, _config())
 
     if passes:
