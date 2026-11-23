@@ -227,6 +227,7 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "fast": config.fast,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
+        "pytorch_dispatch": config.pytorch_dispatch if pytorch else None,
         "aiter_rows": (
             config.aiter_rows.value if RuntimeName.AITER in config.runtimes else None
         ),
@@ -383,6 +384,11 @@ def _warn_ignored_options(config: SuiteConfig, reporter: Reporter) -> None:
     if sdpa_set and not pytorch_selected:
         reporter.warning(
             "PyTorch SDPA options have no effect without --runtime pytorch or "
+            "--validate pytorch"
+        )
+    if config.pytorch_dispatch and not pytorch_selected:
+        reporter.warning(
+            "--pytorch-dispatch has no effect without --runtime pytorch or "
             "--validate pytorch"
         )
 

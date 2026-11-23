@@ -27,7 +27,8 @@ CONFIG_KEYS = {
     "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
     "reference_precision", "oracle", "autotune", "benchmark_work_dir", "fresh_state",
     "fast",
-    "pytorch_sdpa_backend", "pytorch_rocm_fa_library", "aiter_rows", "metrics",
+    "pytorch_sdpa_backend", "pytorch_rocm_fa_library", "pytorch_dispatch",
+    "aiter_rows", "metrics",
     "profiling",
 }  # fmt: skip
 PROFILING_KEYS = {"pmc", "trace", "perf", "roofline"}
@@ -61,8 +62,9 @@ ENGINE_KEYS = {"id", "name", "version"}
 METRICS_KEYS = {"flops", "io_bytes", "clocks_after"}
 PLAN_KEYS = {
     "build_ms", "timing", "kernel", "host", "workspace_bytes", "tflops", "gbps",
-    "correctness",
+    "correctness", "dispatch",
 }  # fmt: skip
+DISPATCH_KEYS = {"sdpa_backend", "fa_library", "kernels"}
 STATS_KEYS = {"p25_ms", "median_ms", "p75_ms"}
 TIMING_KEYS = {
     "mode", "timer", "warmup_iters", "samples", "first_call_ms", "capped", "fallback_reason",
@@ -92,6 +94,7 @@ def _oracle() -> OracleResult:
         derived_tflops_per_s=4.0,
         derived_gbytes_per_s=3000.0,
         workspace_bytes=2048,
+        dispatch={"sdpa_backend": None, "fa_library": None, "kernels": ["k_tuned"]},
     )
 
 
@@ -136,6 +139,8 @@ def full_suite() -> SuiteResult:
             derived_tflops_per_s=2.0,
             derived_gbytes_per_s=2000.0,
             timing=TimingInfo("staged", "hip", 10, 30, 12.5),
+            # A producer that omits a key still gets it, as null.
+            dispatch={"sdpa_backend": "flash", "kernels": ["attn_fwd"]},
         ),
     )
     # Distinct values, so a dropped or swapped value changes the output.
@@ -215,6 +220,7 @@ def test_full_document_has_exact_key_sets() -> None:
         assert set(plan["host"]) == STATS_KEYS
         assert set(plan["timing"]) == TIMING_KEYS
         assert set(plan["correctness"]) == CORRECTNESS_KEYS
+        assert set(plan["dispatch"]) == DISPATCH_KEYS
     assert doc["schema_version"] == 3
     assert doc["environment"] == full_suite().environment  # values unchanged
 
@@ -252,6 +258,11 @@ def test_full_row_values() -> None:
         "reference_precision": "float64",
         "message": "note",
     }
+    assert ootb["dispatch"] == {
+        "sdpa_backend": "flash",
+        "fa_library": None,
+        "kernels": ["attn_fwd"],
+    }
     stats_keys = {"kernel", "host"}
     assert {k: v for k, v in row["oracle"].items() if k not in stats_keys} == {
         "build_ms": 7.0,
@@ -280,6 +291,7 @@ def test_full_row_values() -> None:
             "reference_precision": "native",
             "message": "off",
         },
+        "dispatch": {"sdpa_backend": None, "fa_library": None, "kernels": ["k_tuned"]},
     }
     medians = {k: row["oracle"][k]["median_ms"] for k in stats_keys}
     assert medians == {"kernel": 1.0, "host": 3.0}

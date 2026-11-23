@@ -501,7 +501,7 @@ def test_run_config_records_effective_values_that_compare_checks(
             *("-o", str(cold), "--cache-mode", "cold", "--seed", "7"),
             *("--iters", "11", "--warmup", "3", "--min-time-ms", "5"),
             *("--validate", "pytorch", "--pytorch-sdpa-backend", "flash"),
-            *("--pytorch-rocm-fa-library", "aotriton"),
+            *("--pytorch-rocm-fa-library", "aotriton", "--pytorch-dispatch"),
         ),
         _graphs(tmp_path, 1),
     )
@@ -510,6 +510,7 @@ def test_run_config_records_effective_values_that_compare_checks(
     assert warm_config["timing_block"] == 4
     assert warm_config["pytorch_sdpa_backend"] is None  # PyTorch not used
     assert warm_config["pytorch_rocm_fa_library"] is None
+    assert warm_config["pytorch_dispatch"] is None
     config = SuiteResult.load(cold)["run"]["config"]
     del config["plugin_paths"]  # the default depends on the installed ROCm
     assert config == {
@@ -533,6 +534,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "fast": False,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
+        "pytorch_dispatch": True,
         "aiter_rows": None,  # AITER not selected
         "metrics": True,
         "profiling": {
