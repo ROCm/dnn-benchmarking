@@ -422,7 +422,7 @@ row's `engine.id`:
 
 | Row | Kernel |
 |---|---|
-| `rocke:<variant>` | One row for each variant that hipDNN ships for `hipkernel:Gfx950AttentionDense` and that runs the graph. `<variant>` is the hipDNN kernel descriptor name, for example `attention_dense.fp16_d128_hq32_kv8_c1_bm256_bn64.gfx950`. |
+| `rocke:<variant>` | One row for each variant that hipDNN ships for `hipkernel:Gfx950AttentionDense` and that runs the graph. `<variant>` is the hipDNN kernel descriptor name, for example `attention_dense.fp16_d128_c1_bm256_bn64.gfx950`. |
 | `rocke:auto:<kernel>` | The kernel that rocKE's production dispatcher (`dispatch_attention`) selects. At the pinned rocm-libraries commit this is unified 2D or 3D attention. |
 
 How the variant rows get the hipDNN kernel:
