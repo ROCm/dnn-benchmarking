@@ -51,10 +51,10 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch` or `rocke`. |
+| `runtime` | string | The first selected runtime: `hipdnn`, `pytorch`, `rocke` or `aiter`. |
 | `runtimes` | array of string or null | Every selected runtime in run order, for example `["hipdnn", "rocke"]` for `--runtime hipdnn,rocke`. `null` in files written before this key. |
 | `engine_filter` | array of string or null | `--engine` selections as hex engine IDs (same format as `engine.id`). `null` means all discovered engines. |
-| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
+| `plugin_paths` | array of string or null | Plugin directories. `null` for `--runtime pytorch`, `--runtime aiter` and `--runtime pytorch,aiter`. With `--runtime rocke`, the directories whose rocKE descriptors give the variant rows. |
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
@@ -72,6 +72,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `fast` | bool | `--fast`. Do not compare the numbers of a `--fast` run with a run without it; see [usage.md](usage.md#fast-mode---fast). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
+| `aiter_rows` | string or null | `all` for `--runtime aiter`, `auto` for `--runtime aiter:auto`. `null` unless AITER is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
 | `profiling` | object | Requested profiling passes: `pmc` (set name or null), `trace` (bool), `perf` (bool), `roofline` (bool). |
 
@@ -131,7 +132,7 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `graph_path` | string | Path of the graph file. |
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
 | `error` | string or null | Graph-level failure, as `ExceptionType: message`. A failure before any row runs has the prefix `Engine discovery failed: ` or `Input data generation failed: `. |
-| `message` | string or null | Why no engine applies, when `status` is `no_engines`: hipDNN's reason, or the unsupported tensor data type. The console shows `no engines applicable: <message>`. |
+| `message` | string or null | Why no engine applies, when `status` is `no_engines`: hipDNN's reason, the unsupported tensor data type, or why the tool cannot serve the layout of a variable-length or ragged SDPA graph (the message names the tensor). The console shows `no engines applicable: <message>`. |
 | `results` | array | One [row](#row) per engine or reference. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. An SDPA forward graph with Philox dropout has no `reference` row, so with `no_engines` its `results` is empty (see [SDPA dropout](usage.md#sdpa-dropout)). |
 
 ### graph_id
@@ -150,7 +151,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch` or `rocke`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. |
+| `runtime` | string | Runtime that produced the row: `hipdnn`, `pytorch`, `rocke` or `aiter`. A `rocke` row has `engine.id` and `engine.name` `rocke:<hipDNN variant>` or `rocke:auto:<kernel>`, and `engine.version` the `rocke` package version. An `aiter` row has `engine.id` and `engine.name` `aiter:<backend>` (`aiter:auto`, `aiter:ck`, ...), and `engine.version` the `amd-aiter` package version. |
 | `role` | string | `engine` for a benchmarked engine. `reference` for the timed reference row that `--validate pytorch` adds. |
 | `engine` | object | See [engine](#engine). |
 | `status` | string | `success`, `error` or `skipped`. |
@@ -169,7 +170,7 @@ The graph content decides the ID. The file name and the file path do not. Use
 
 | Key | Type | Meaning |
 |---|---|---|
-| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE rows: the row name, which is stable across runs. `null` for PyTorch rows. |
+| `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE and AITER rows: the row name, which is stable across runs. `null` for PyTorch rows. |
 | `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
 | `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
 
@@ -231,8 +232,8 @@ file does not store them.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `flops` | int or null | Analytical FLOPs for one launch of the graph. `null` when any node has no FLOP formula (or lacks the tensor data its formula needs), so a partial count is never reported. `tflops` is then `null` too. |
-| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. |
+| `flops` | int or null | Analytical FLOPs for one launch of the graph. For an SDPA node with variable lengths, it sums the counts over batches. Each count comes from the valid lengths of that batch. A paged graph uses the real KV lengths. `null` when any node has no FLOP formula, or lacks the tensor data its formula needs. A partial count is never reported. `tflops` is then `null` too. |
+| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. A tensor with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors, including a ragged Q/O over a paged K/V cache) counts only its valid elements. A non-ragged paged K, V, Q or O container counts its full size. |
 | `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. See [clocks](#clocks). |
 
 `--no-metrics` sets these values and the plan `workspace_bytes`, `tflops` and
@@ -241,7 +242,11 @@ file does not store them.
 #### clocks
 
 amdsmi supplies these values. The object is `null` without amdsmi. A value is
-`null` when the platform does not report it.
+`null` when the platform does not report it. The tool finds the amdsmi device
+of the run by its PCI address, from PyTorch or from the loaded HIP runtime. If
+that fails while `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`,
+`CUDA_VISIBLE_DEVICES` or `GPU_DEVICE_ORDINAL` is set, the object and the
+amdsmi values of `environment` are `null`, and a warning gives the reason.
 
 | Key | Unit |
 |---|---|
@@ -261,7 +266,7 @@ amdsmi supplies these values. The object is `null` without amdsmi. A value is
 | `max_abs_diff` | float or null | Largest absolute difference over all outputs. |
 | `max_rel_diff` | float or null | Largest `\|actual - expected\| / \|expected\|` over all outputs, taken only over elements with `\|expected\| > atol`. `0.0` when no element qualifies, so a mismatch against a near-zero reference can show `0.0` with `n_mismatch > 0`. Use `match` and `n_mismatch` for pass or fail. |
 | `n_mismatch` | int or null | Elements outside tolerance, summed over outputs. |
-| `n_total` | int or null | Elements compared, summed over outputs. |
+| `n_total` | int or null | Elements compared, summed over outputs. For a ragged output (SDPA with `ragged_offset_tensor_uid`), only the positions inside the length of each batch count. |
 | `worst_output_uid` | int or null | Tensor UID of the output with the largest difference. |
 | `reference_precision` | string or null | Arithmetic of the reference that the outputs were compared with: `float64` (a float64 computation from the same inputs, not rounded to the output dtype) or `native` (the graph data types). `native` for graphs outside the float64 scope, for `--reference-precision native`, and when the float64 reference failed. `null` when no comparison ran. See [Reference precision](usage.md#reference-precision). |
 | `message` | string or null | Why `match` is `false` or `null`. |
@@ -277,6 +282,7 @@ loop. Paths are relative to the row:
 | `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.timing.samples` is 10 or more. |
 | `outlier: max Nx median` | The slowest sample is more than 2 x `ootb.kernel.median_ms`. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
+| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | `ootb.timing.mode` is `block` or `events`, and `ootb.host.median_ms` is 0.9 x `ootb.kernel.median_ms` or more. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |

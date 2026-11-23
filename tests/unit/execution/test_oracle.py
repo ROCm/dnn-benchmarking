@@ -3,10 +3,12 @@
 
 """Tests for execution.oracle (tuned run next to the OOTB run)."""
 
+import dataclasses
 import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,8 +25,13 @@ from dnn_benchmarking.config.benchmark_config import (
     ValidationConfig,
 )
 from dnn_benchmarking.execution import oracle as oracle_mod
+from dnn_benchmarking.execution import timing
 from dnn_benchmarking.execution.correctness import check_correctness
-from dnn_benchmarking.execution.timing import Measurement, StallFallbackError
+from dnn_benchmarking.execution.timing import (
+    STALL_RERUN_REASON,
+    Measurement,
+    StallFallbackError,
+)
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.reporting.statistics import BenchmarkStats, TimingInfo
 from dnn_benchmarking.reporting.suite_results import (
@@ -367,6 +374,22 @@ def test_no_references_means_no_tuned_validation(fake, tmp_path):
     assert row.oracle.correctness is None
 
 
+def test_tuned_validation_matches_infinities_in_sdpa_stats(fake, tmp_path):
+    """Varlen graphs hold -inf in dead stats rows; the tuned check compares
+    them as equal, as the OOTB check does."""
+    dead = np.full(2, -np.inf, np.float32)
+    fake.output = dead.copy()
+    refs = {1: ReferenceOutput(data=dead.copy(), tensor_uid=1)}
+    out = replace(OUT, matching_infinities=True)
+
+    def validate(outputs):
+        return check_correctness(outputs, [out], refs, "pytorch", _config())
+
+    row = _run(tmp_path, validate=validate)
+
+    assert row.oracle.correctness.tolerance_match
+
+
 def test_failing_tuned_plan_keeps_the_row_verdict(fake, tmp_path):
     passed = CorrectnessResult(tolerance_match=True, rtol=1e-5, atol=1e-6)
     fake.output = np.ones(2, np.float32)
@@ -452,19 +475,26 @@ def test_tuned_child_timeout_is_an_oracle_error(monkeypatch, tmp_path):
 # --- run_pytorch_tuned ------------------------------------------------------
 
 
-def _child_row(status="success", message=None, kernel_ms=(0.25, 0.25, 0.3)):
-    timing = TimingInfo(
-        mode="staged",
+def _child_row(
+    status="success",
+    message=None,
+    kernel_ms=(0.25, 0.25, 0.3),
+    mode="staged",
+    fallback_reason=None,
+):
+    timing_info = TimingInfo(
+        mode=mode,
         timer="hip",
         warmup_iters=3,
         samples=len(kernel_ms),
         first_call_ms=40.0,
+        fallback_reason=fallback_reason,
     )
     return {
         "status": status,
         "message": message,
         "ootb": {
-            "timing": timing.to_dict(),
+            "timing": timing_info.to_dict(),
             "kernel": BenchmarkStats.from_timings(kernel_ms).to_dict(),
             "host": BenchmarkStats.from_timings([0.5, 0.5, 0.5]).to_dict(),
         },
@@ -483,6 +513,7 @@ def child(monkeypatch):
 
     def run_capped(argv, timeout_s, env=None):
         launch.argv, launch.env = argv, env
+        launch.flush_buffers = dict(timing._flush_buffers)
         if launch.result is not None:
             output = Path(argv[argv.index("--output") + 1])
             output.write_text(json.dumps(launch.result))
@@ -505,17 +536,23 @@ def _run_pytorch(tmp_path, config=None, node_type="ConvolutionFwdAttributes"):
     return row
 
 
+@pytest.mark.parametrize("stall_gate", [True, False])
 def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
-    child, tmp_path
+    child, tmp_path, stall_gate
 ):
     """The child must time with the parent's settings, or the tuned and OOTB
-    PyTorch numbers are not comparable."""
+    PyTorch numbers are not comparable. That includes the stall gate: after
+    a stall-gate fallback the suite runner clears it, and both plans then
+    time unstalled, so the speedup is not suppressed as mixed-timing."""
     config = _pytorch_config(
         warmup_iters=3,
         benchmark_iters=5,
         min_time_ms=2.0,
         timing_block=4,
         seed=11,
+    )
+    config.timing_policy = dataclasses.replace(
+        config.timing_policy, stall_gate=stall_gate
     )
 
     _run_pytorch(tmp_path, config)
@@ -529,6 +566,65 @@ def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
     assert child_config.oracle is False
     assert child_config.timing_policy == config.timing_policy
     assert child_config.seed == 11
+
+
+def test_pytorch_child_stall_propagates_for_a_whole_graph_remeasure(child, tmp_path):
+    """The child remeasured its graph unstalled while the run still times
+    staged: the suite runner must remeasure the whole graph unstalled, as
+    for a stall in the hipDNN child, so both plans share one timing mode."""
+    child.result = {
+        "graphs": [
+            {"results": [_child_row(mode="events", fallback_reason=STALL_RERUN_REASON)]}
+        ]
+    }
+
+    with pytest.raises(StallFallbackError):
+        _run_pytorch(tmp_path)
+
+
+def test_unstalled_run_keeps_the_unstalled_pytorch_child_row(child, tmp_path):
+    child.result = {
+        "graphs": [
+            {"results": [_child_row(mode="events", fallback_reason=STALL_RERUN_REASON)]}
+        ]
+    }
+    config = _pytorch_config()
+    config.timing_policy = dataclasses.replace(config.timing_policy, stall_gate=False)
+
+    row = _run_pytorch(tmp_path, config)
+
+    assert row.oracle_error is None
+    assert row.oracle.timing.mode == "events"
+
+
+def test_cold_flush_buffer_is_freed_before_the_pytorch_child_starts(
+    child, monkeypatch, tmp_path
+):
+    """The child must get the device memory the OOTB row had, not 512 MiB
+    less: the parent's cold-cache flush buffer is freed before launch."""
+    monkeypatch.setattr(timing, "_flush_buffers", {"hip": object()})
+
+    _run_pytorch(tmp_path, _pytorch_config(cache_mode="cold"))
+
+    assert child.flush_buffers == {}
+
+
+def test_cold_flush_buffer_is_freed_before_the_hipdnn_child_starts(
+    fake, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(timing, "_flush_buffers", {"hip": object()})
+    run_child = oracle_mod.run_capped
+    seen = []
+
+    def recording(argv, timeout_s, env=None):
+        seen.append(dict(timing._flush_buffers))
+        return run_child(argv, timeout_s, env=env)
+
+    monkeypatch.setattr(oracle_mod, "run_capped", recording)
+
+    _run(tmp_path, config=_config(cache_mode="cold"))
+
+    assert seen == [{}]
 
 
 def test_pytorch_child_tunes_on_the_shared_state_and_a_deleted_state_dir(

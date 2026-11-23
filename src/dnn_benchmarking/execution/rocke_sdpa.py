@@ -20,10 +20,11 @@ This module needs neither torch nor rocKE at import time.
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Tuple, Union
 
 from ..common.exceptions import UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
+from .sdpa_graph import dense_sdpa
 
 DENSE_ARCH = "gfx950"
 
@@ -42,35 +43,6 @@ _ROCKE_DTYPES = {"half": "fp16", "bfloat16": "bf16"}
 #: to the gfx950 builder (``kernels.common.attention_unified._tiled_2d_impl``),
 #: whose code object does not load there.
 _AUTO_ARCHES = ("gfx942", "gfx950", "gfx1250")
-
-_UNSUPPORTED_INPUTS = (
-    "attn_mask_tensor_uid",
-    "scale_tensor_uid",
-    "seq_len_q_tensor_uid",
-    "seq_len_kv_tensor_uid",
-    "seed_tensor_uid",
-    "offset_tensor_uid",
-    "dropout_mask_tensor_uid",
-    "dropout_scale_tensor_uid",
-    "page_table_k_tensor_uid",
-    "page_table_v_tensor_uid",
-    "block_mask_tensor_uid",
-    "sink_token_tensor_uid",
-    "descale_q_tensor_uid",
-    "descale_k_tensor_uid",
-    "descale_v_tensor_uid",
-    "descale_s_tensor_uid",
-    "scale_s_tensor_uid",
-    "scale_o_tensor_uid",
-)
-_UNSUPPORTED_OUTPUTS = (
-    "stats_tensor_uid",
-    "max_tensor_uid",
-    "sum_exp_tensor_uid",
-    "rng_dump_tensor_uid",
-    "amax_s_tensor_uid",
-    "amax_o_tensor_uid",
-)
 
 
 @dataclass(frozen=True)
@@ -135,16 +107,6 @@ RockeKernel = Union[CatalogKernel, AutoKernel]
 Catalog = Tuple[CatalogKernel, ...]
 
 
-def _is_packed_bshd(dims: Sequence[int], strides: Sequence[int]) -> bool:
-    """Whether ``[B, H, S, D]`` (graph order) is packed BSHD in memory.
-
-    The stride of a size-1 dimension never addresses memory, so it is free.
-    """
-    _, heads, seq, head_size = dims
-    packed = (seq * heads * head_size, head_size, heads * head_size, 1)
-    return all(n == 1 or s == p for n, s, p in zip(dims, strides, packed))
-
-
 def sdpa_problem(
     graph_json: Dict[str, Any], tensor_infos: List[TensorInfo]
 ) -> SdpaProblem:
@@ -154,103 +116,33 @@ def sdpa_problem(
         UnsupportedGraphError: The graph is not one dense SDPA forward node
             that rocKE kernels can run.
     """
-    from .pytorch_ops._common import _node_param, _optional_uid
-    from .pytorch_ops.handlers.sdpa import _sdpa_derive_mask
-
-    nodes = graph_json.get("nodes") or []
-    if len(nodes) != 1 or nodes[0].get("type") != "SdpaAttributes":
+    dense = dense_sdpa(graph_json, tensor_infos, "rocKE")
+    if dense.head_size_v != dense.head_size_qk:
         raise UnsupportedGraphError(
-            "rocKE runtime runs graphs with one SdpaAttributes node only"
+            "rocKE runtime needs one head size for Q, K and V "
+            f"(Q/K {dense.head_size_qk}, V {dense.head_size_v})"
         )
-    node = nodes[0]
-
-    present = [
-        key
-        for key in _UNSUPPORTED_INPUTS + _UNSUPPORTED_OUTPUTS
-        if _optional_uid(node, key) is not None
-    ]
-    for flag in ("alibi_mask", "padding_mask"):
-        if _node_param(node, flag, False):
-            present.append(flag)
-    if _node_param(node, "generate_stats", False):
-        present.append("generate_stats")
-    if float(_node_param(node, "dropout_probability", 0.0) or 0.0) != 0.0:
-        present.append("dropout_probability")
-    if present:
-        raise UnsupportedGraphError(
-            f"rocKE runtime does not support SDPA features: {', '.join(present)}"
-        )
-    # The mask resolves as hipDNN resolves it: the deprecated causal booleans
-    # win over the bounds and the alignment.
-    try:
-        causal, window, bottom_right = _sdpa_derive_mask(node)
-    except ValueError as e:
-        raise UnsupportedGraphError(str(e)) from e
-    if window is not None:
-        raise UnsupportedGraphError("rocKE runtime does not support sliding windows")
-    causal = causal or bottom_right
-
-    infos = {info.uid: info for info in tensor_infos}
-    uids = {}
-    for role, key in (
-        ("q", "q_tensor_uid"),
-        ("k", "k_tensor_uid"),
-        ("v", "v_tensor_uid"),
-        ("o", "o_tensor_uid"),
-    ):
-        uid = _optional_uid(node, key)
-        if uid is None or uid not in infos:
-            raise UnsupportedGraphError(f"SDPA node has no {role} tensor")
-        uids[role] = uid
-    q, k, v, o = (infos[uids[r]] for r in ("q", "k", "v", "o"))
-
-    dtypes = {t.data_type for t in (q, k, v, o)}
-    if len(dtypes) != 1 or next(iter(dtypes)) not in _ROCKE_DTYPES:
-        raise UnsupportedGraphError(
-            f"rocKE runtime needs one fp16 or bf16 dtype for Q/K/V/O, got {sorted(dtypes)}"
-        )
-    if any(len(t.dims) != 4 for t in (q, k, v, o)):
-        raise UnsupportedGraphError("rocKE runtime needs 4-D Q/K/V/O tensors")
-    batch, hq, sq, d = q.dims
-    _, hkv, skv, dk = k.dims
-    if list(o.dims) != list(q.dims) or list(v.dims) != list(k.dims) or dk != d:
-        raise UnsupportedGraphError(
-            "rocKE runtime needs O shaped like Q, V shaped like K, and one head size"
-        )
-    if k.dims[0] != batch or hkv <= 0 or hq % hkv != 0:
-        raise UnsupportedGraphError(
-            f"rocKE runtime needs matching batch and Hq divisible by Hkv "
-            f"(Hq={hq}, Hkv={hkv})"
-        )
-    for t in (q, k, v, o):
-        if not _is_packed_bshd(t.dims, t.strides):
-            raise UnsupportedGraphError(
-                f"rocKE runtime needs packed BSHD tensors; '{t.name}' has strides "
-                f"{list(t.strides)}"
-            )
-    if causal and sq != skv:
+    causal = dense.causal or dense.bottom_right
+    if causal and dense.seqlen_q != dense.seqlen_kv:
         # Catalog kernels align the diagonal top-left, the unified kernels
         # bottom-right; the two masks are the same only for square problems.
         raise UnsupportedGraphError(
             "rocKE runtime runs causal SDPA only with seqlen_q == seqlen_kv"
         )
-
-    scale = _node_param(node, "attn_scale_value", None)
     return SdpaProblem(
-        dtype=_ROCKE_DTYPES[q.data_type],
-        batch=batch,
-        num_query_heads=hq,
-        num_kv_heads=hkv,
-        seqlen_q=sq,
-        seqlen_kv=skv,
-        head_size=d,
+        dtype=_ROCKE_DTYPES[dense.data_type],
+        batch=dense.batch,
+        num_query_heads=dense.num_query_heads,
+        num_kv_heads=dense.num_kv_heads,
+        seqlen_q=dense.seqlen_q,
+        seqlen_kv=dense.seqlen_kv,
+        head_size=dense.head_size_qk,
         causal=causal,
-        # hipDNN reads an absent attn_scale as 1.0 (cuDNN semantics).
-        scale=1.0 if scale is None else float(scale),
-        q_uid=uids["q"],
-        k_uid=uids["k"],
-        v_uid=uids["v"],
-        o_uid=uids["o"],
+        scale=dense.scale,
+        q_uid=dense.q_uid,
+        k_uid=dense.k_uid,
+        v_uid=dense.v_uid,
+        o_uid=dense.o_uid,
     )
 
 

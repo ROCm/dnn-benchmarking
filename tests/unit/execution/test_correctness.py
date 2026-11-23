@@ -14,7 +14,9 @@ from dnn_benchmarking.execution.correctness import (
     check_rng_dump,
     tolerance_for,
 )
-from dnn_benchmarking.graph.tensor_info import TensorInfo
+from dnn_benchmarking.graph.loader import GraphLoader
+from dnn_benchmarking.graph.tensor_info import TensorInfo, VarlenLayout
+from dnn_benchmarking.graph.varlen import resolve_varlen_layouts
 from dnn_benchmarking.validation import ReferenceOutput
 
 
@@ -129,6 +131,47 @@ def test_fp8_zero_reference_accepts_only_the_smallest_subnormal(
     c = check_correctness(bm, [_out(1, data_type)], ref, "pytorch", _config())
 
     assert c.n_mismatch == 1
+
+
+def _graph_outputs(node_type):
+    """Output TensorInfo of a one-node fp16 graph, through the loader."""
+    graph = {
+        "tensors": [
+            {
+                "uid": 1,
+                "name": "y",
+                "dims": [4],
+                "strides": [1],
+                "data_type": "half",
+                "virtual": False,
+            }
+        ],
+        "nodes": [{"type": node_type, "inputs": {}, "outputs": {"y_tensor_uid": 1}}],
+    }
+    return GraphLoader().extract_tensor_info(graph)
+
+
+@pytest.mark.parametrize(
+    "node_type, actual, passes",
+    [
+        # fp16 ULP at 1024 is 1: SDPA backward gradients may land 2 ULP apart.
+        ("SdpaBackwardAttributes", [1026, 1024, 1022, 1024], True),
+        ("SdpaBackwardAttributes", [1040, 1024, 1024, 1024], False),
+        ("PointwiseAttributes", [1026, 1024, 1022, 1024], False),
+    ],
+)
+def test_fp16_sdpa_backward_tolerates_two_ulp(node_type, actual, passes):
+    ref = {1: _ref([1024, 1024, 1024, 1024])}
+    bm = _HostBM({1: np.array(actual, np.float32)})
+
+    c = check_correctness(bm, _graph_outputs(node_type), ref, "pytorch", _config())
+
+    assert c.tolerance_match is passes
+
+
+def test_explicit_tolerance_wins_over_the_sdpa_backward_default():
+    (out,) = _graph_outputs("SdpaBackwardAttributes")
+    assert tolerance_for(_config(1e-3, 1e-3), out) == (1e-3, 1e-3)
 
 
 def test_aggregates_over_outputs_and_names_the_failing_output():
@@ -404,3 +447,130 @@ def test_check_correctness_ignores_the_listed_uids(refs):
     assert ignored.passed
     assert ignored.n_total == 4
     assert compared.explicitly_failed
+
+
+def _varlen_out(uid, lengths, data_type="float", ragged=True):
+    """A ``[2, 1, 3, 2]`` output with per-batch ``lengths``; ragged batches
+    start at their offsets, padded ones at ``b * strides[0]``."""
+    starts = (0, lengths[0] * 2) if ragged else None
+    end = sum(lengths) * 2 if ragged else None
+    return TensorInfo(
+        uid=uid,
+        name=f"t{uid}",
+        dims=[2, 1, 3, 2],
+        strides=[6, 6, 2, 1],
+        data_type=data_type,
+        is_virtual=False,
+        is_output=True,
+        ragged_offset_tensor_uid=9 if ragged else None,
+        varlen=VarlenLayout(lengths=lengths, starts=starts, end=end),
+    )
+
+
+def test_ragged_output_ignores_padding_and_counts_valid_elements():
+    expected = np.ones((2, 1, 3, 2), np.float32)
+    actual = expected.copy()
+    actual[0, :, 2:, :] = np.nan  # past batch 0's length of 2
+    actual[1, :, 3:, :] = 99.0  # empty slice: batch 1 is full
+    ref = {1: _ref(expected)}
+
+    c = check_correctness(
+        _HostBM({1: actual}), [_varlen_out(1, (2, 3))], ref, "pytorch", _config()
+    )
+
+    assert c.tolerance_match is True
+    assert c.n_total == (2 + 3) * 2
+
+
+def test_padded_output_compares_its_padding():
+    # hipDNN defines the rows past a length (O = 0, zero gradients), so an
+    # engine that leaves garbage there fails.
+    expected = np.ones((2, 1, 3, 2), np.float32)
+    expected[0, :, 2:, :] = 0.0
+    actual = expected.copy()
+    actual[0, :, 2:, :] = 5.0  # past batch 0's length of 2
+    ref = {1: _ref(expected)}
+    out = _varlen_out(1, (2, 3), ragged=False)
+
+    c = check_correctness(_HostBM({1: actual}), [out], ref, "pytorch", _config())
+
+    assert c.tolerance_match is False
+    assert c.n_mismatch == 2
+    assert c.n_total == 2 * 3 * 2
+
+
+def test_varlen_output_fails_on_a_wrong_valid_value():
+    expected = np.ones((2, 1, 3, 2), np.float32)
+    actual = expected.copy()
+    actual[0, 0, 1, 0] = 2.0
+    ref = {1: _ref(expected)}
+
+    c = check_correctness(
+        _HostBM({1: actual}), [_varlen_out(1, (2, 3))], ref, "pytorch", _config()
+    )
+
+    assert c.tolerance_match is False
+    assert c.n_mismatch == 1
+
+
+def test_ragged_device_output_ignores_padding():
+    torch = pytest.importorskip("torch")
+    expected = torch.ones(2, 1, 3, 2)
+    actual = expected.clone()
+    actual[0, :, 2:, :] = float("nan")
+
+    class DeviceBM:
+        def get_output_tensor(self, uid):
+            return actual
+
+    ref = {
+        1: ReferenceOutput(
+            data=expected.numpy(), tensor_uid=1, device_data=expected.clone()
+        )
+    }
+
+    c = check_correctness(
+        DeviceBM(), [_varlen_out(1, (2, 3))], ref, "pytorch", _config()
+    )
+
+    assert c.tolerance_match is True
+
+
+_SDPA_GRAPH = {
+    "nodes": [
+        {
+            "type": "SdpaAttributes",
+            "inputs": {"q_tensor_uid": 10},
+            "outputs": {"o_tensor_uid": 2, "stats_tensor_uid": 1},
+        }
+    ]
+}
+
+
+def _sdpa_output(uid):
+    """Output ``uid`` of ``_SDPA_GRAPH`` with the fields the graph decides."""
+    (info,) = resolve_varlen_layouts([_out(uid)], _SDPA_GRAPH, {})
+    return info
+
+
+def test_sdpa_stats_output_matches_negative_infinity():
+    """A row with no live key has a log-sum-exp of -inf on both sides."""
+    values = np.array([0.5, -np.inf, 1.0, 2.0], np.float32)
+    ref = {1: _ref(values)}
+    bm = _HostBM({1: values.copy()})
+
+    resolved = check_correctness(bm, [_sdpa_output(1)], ref, "pytorch", _config())
+    unresolved = check_correctness(bm, [_out(1)], ref, "pytorch", _config())
+
+    assert resolved.tolerance_match is True
+    assert unresolved.tolerance_match is False
+
+
+def test_infinity_in_a_non_stats_output_still_fails():
+    values = np.array([0.5, -np.inf, 1.0, 2.0], np.float32)
+    ref = {2: _ref(values)}
+    bm = _HostBM({2: values.copy()})
+
+    c = check_correctness(bm, [_sdpa_output(2)], ref, "pytorch", _config())
+
+    assert c.tolerance_match is False

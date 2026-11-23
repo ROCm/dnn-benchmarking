@@ -1,11 +1,15 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Tests for BenchmarkStats and noise_warnings."""
+"""Tests for BenchmarkStats, noise_warnings and host_bound_warnings."""
 
 import pytest
 
-from dnn_benchmarking.reporting.statistics import BenchmarkStats, noise_warnings
+from dnn_benchmarking.reporting.statistics import (
+    BenchmarkStats,
+    host_bound_warnings,
+    noise_warnings,
+)
 
 
 class TestBenchmarkStats:
@@ -83,3 +87,24 @@ class TestNoiseWarnings:
     def test_outlier_max_is_flagged(self) -> None:
         stats = BenchmarkStats.from_timings([1.0] * 9 + [2.5])
         assert any(w.startswith("outlier:") for w in noise_warnings(stats))
+
+
+class TestHostBoundWarnings:
+    @pytest.mark.parametrize(
+        "kernel, host, mode, expected",
+        [
+            (0.0243, 0.0237, "block", True),  # MI210: a 12 us kernel read as 24 us
+            (1.0, 0.90, "block", True),  # exactly the threshold
+            (1.0, 0.89, "block", False),
+            (1.0, 0.95, "events", True),
+            (1.0, 0.99, "staged", False),  # the staged span excludes the host
+        ],
+    )
+    def test_threshold_and_modes(self, kernel, host, mode, expected) -> None:
+        warnings = host_bound_warnings(
+            BenchmarkStats.from_timings([kernel] * 10),
+            BenchmarkStats.from_timings([host] * 10),
+            mode,
+        )
+        assert bool(warnings) == expected
+        assert all(w.startswith("host-bound: ") and mode in w for w in warnings)

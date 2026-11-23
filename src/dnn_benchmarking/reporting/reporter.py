@@ -132,7 +132,7 @@ def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
         # One fixed configuration: the ratio is run-to-run noise.
         return "no-search"
     if timing_modes_differ(pe):
-        # Event-timed OOTB against stall-gated tuned: not one measurement.
+        # One plan fell back to events timing: not one measurement.
         return "mixed-timing"
     if oracle_speedup(pe) is not None:
         return None

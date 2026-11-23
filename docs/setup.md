@@ -2,7 +2,9 @@
 
 `setup_env.py` creates a virtual environment, installs PyTorch, builds hipDNN
 and the provider plugins, and installs dnn-benchmarking. It requires Python
-3.12 or newer. `python3 setup_env.py --help` lists every option.
+3.12 or newer. The source build also requires `cmake` 3.26 or newer and
+`ninja` on `PATH`; setup checks the `cmake` version before its first stage.
+`python3 setup_env.py --help` lists every option.
 
 ## Quick setup (ROCm)
 
@@ -40,9 +42,15 @@ stages are:
    package is absent.
 9. `rocKE Python packages`: Linux only. Install rocKE's Python packages for
    `--runtime rocke` (see [Extra CMake defines](#extra-cmake-defines)).
-10. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
-    and link the wheel rocprofiler libraries.
-11. `Verify installation`.
+10. `AITER`: Linux with ROCm torch only. Install AITER for `--runtime aiter`
+    and compile its attention kernels (see [AITER](#aiter)). Skipped with
+    `--no-aiter`.
+11. `amdsmi and rocprofiler libraries`: install the amdsmi Python bindings
+    and link the wheel rocprofiler libraries. A rocm-sdk-core wheel that ships
+    `share/amd_smi/amdsmi` without `setup.py` or `pyproject.toml` gets a
+    symlink `site-packages/amdsmi` to that package. Other sources are
+    installed with `pip install -e`.
+12. `Verify installation`.
 
 Then setup prints the `Profiling sources:` block. See
 [troubleshooting.md](troubleshooting.md#what-each-profiling-source-needs).
@@ -63,6 +71,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
+| `--no-aiter` | Skip the `AITER` stage. Only `--runtime aiter` needs it. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
 | `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
@@ -93,6 +102,7 @@ On Linux the venv activation script exports these variables:
 | `LD_LIBRARY_PATH` | `$ROCM_PATH/lib`, then the ROCm toolchain `lib` directory (rocm-sdk-devel in `rocm` torch mode), added at the start. |
 | `DNN_BENCH_WORKSPACE` | The workspace. The default `--benchmark-work-dir` is `<workspace>/work`: compile caches, and the kernel-selection state of the runs. |
 | `PYTHONPYCACHEPREFIX` | `<workspace>/pycache`. |
+| `AITER_JIT_DIR` | `<venv>/aiter-jit`, where the `AITER` stage compiles AITER's modules. A plain `import aiter` in the venv loads them. |
 
 dnn-benchmarking finds the engine plugins in
 `$ROCM_PATH/lib/hipdnn_plugins/engines/`. Give this directory to
@@ -275,6 +285,39 @@ the checkout can differ from the one they were built from. The rocKE rows
 then fail with an argument-list, grid or SHA-256 error rather than give wrong
 numbers.
 
+## AITER
+
+On Linux with ROCm torch, the `AITER` stage installs AITER for
+`--runtime aiter`:
+
+1. It fetches the `aiter` submodule at the commit that this repository pins,
+   with the release tags at that commit, and AITER's
+   `3rdparty/composable_kernel` submodule, each at depth 1. The tags give
+   the AITER package its release version, which the result files record.
+   An existing checkout (for example from `git submodule update --init
+   --recursive aiter`) is kept; a commit other than the pin gives a warning.
+   With `--reuse-artifacts`, it fetches nothing: without a checkout, it
+   skips the stage.
+2. It installs AITER's `requirements.txt` and its build requirements
+   (`[build-system] requires` in `aiter/pyproject.toml`), then AITER as an
+   editable package without build isolation and with
+   `AITER_USE_SYSTEM_TRITON=1`. Both are needed to keep torch's Triton: an
+   isolated build cannot see it, and AITER then runs its own Triton install
+   script.
+3. On a GPU that AITER supports (gfx90a, gfx942, gfx950), it runs every
+   AITER backend that `--runtime aiter` runs on that GPU once, for fp16 and
+   bf16 with and without a causal mask. This compiles AITER's host modules
+   (JIT) into the `aiter-jit` directory of the venv, so the first benchmark
+   does not compile and `--clean` removes them. The CK modules take minutes
+   each. Without a GPU, each backend compiles on its first use. A backend
+   that does not compile gives a warning; its rows then report the same
+   error.
+
+AITER compiles with the pip ROCm SDK of torch (see
+[AITER runtime](usage.md#aiter-runtime)). Other torch modes and Windows skip
+the stage. It adds about 6 minutes to the CI setup and 15 to 18 minutes on
+a 32-core node. Use `--no-aiter` when you do not run `--runtime aiter`.
+
 ## Rebuild from zero
 
 ```bash
@@ -291,7 +334,13 @@ architecture in `<workspace>/.venv/dnn-bench-torch.json`. On a later run, an
 explicit `--gpu-arch` or `--torch-index-url` that differs from the record
 stops setup with an error that asks for `--clean`. Without them, a
 `--torch-mode rocm` run builds for the recorded GPU architecture and installs
-a missing rocm-sdk-devel from the recorded index. A venv without the record
+a missing rocm-sdk-devel from the recorded index. If no detected GPU has the
+recorded architecture, setup stops with an error that names the detected and
+the recorded architectures. Then pass `--clean` to set up the venv again (add
+`--gpu-arch` on a host with several architectures), or
+`--gpu-arch <recorded arch>` to keep the recorded build. When one of the
+detected GPUs has the recorded architecture, or setup detects no GPU, setup
+uses the recorded architecture. A venv without the record
 (PyTorch installed another way) cannot be checked; setup shows a warning
 instead. A different `--torch-mode` than the one in the venv also asks for
 `--clean`, including `--torch-mode none` on a venv that has PyTorch.

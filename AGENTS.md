@@ -22,6 +22,11 @@ rocKE Python packages: each hipDNN-shipped `Gfx950AttentionDense` variant
 that applies, plus rocKE's auto-dispatched kernel. It shares the same timed
 loop and result schema, and compares with the hipDNN rows of the same graphs.
 
+`--runtime aiter` launches AITER SDPA forward kernels directly through the
+pinned `aiter` submodule: `aiter.flash_attn_func` (AITER's own selection)
+plus one row for each AITER backend that runs the graph. It shares the same
+timed loop and result schema.
+
 `--runtime` takes a comma list (default `hipdnn`). Each runtime is a planner
 (`suite_runner.GraphPlanner`) that turns a graph into a `RuntimePlan`: its
 engines, or why none applies. `suite_runner.run_graph` composes any planners:
@@ -96,17 +101,22 @@ src/dnn_benchmarking/
 │   ├── timing.py             # measure(): the one timed loop (staged / events)
 │   ├── executor.py           # hipDNN engine executor
 │   ├── pytorch_executor.py   # PyTorch executor
+│   ├── sdpa_graph.py         # rocKE and AITER runtimes: read one dense SDPA forward graph
 │   ├── rocke_sdpa.py         # rocKE runtime: SDPA problem, shipped-variant catalog, auto kernel
 │   ├── rocke_executor.py     # rocKE runtime: load and launch one rocKE kernel
 │   ├── kpack.py              # rocKE runtime: read hipDNN's code objects (librocm_kpack)
+│   ├── aiter_sdpa.py         # AITER runtime: SDPA problem, the backend rows of a problem
+│   ├── aiter_executor.py     # AITER runtime: launch one AITER backend; setup prebuild
 │   ├── buffer_manager.py     # hipDNN device buffers and input generation
+│   ├── sdpa_backward_inputs.py # forward-consistent O and stats for SDPA backward inputs
+│   ├── varlen_inputs.py      # seq_len, cu_seq_len and ragged offset-table inputs
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
 │   ├── sdpa_dropout.py       # SDPA dropout attributes and the rng_dump output; no torch import
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
 │   ├── oracle.py             # --oracle pass
 │   └── correctness.py        # output comparison for a row
-├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs)
+├── graph/                    # loader (load + validate), tensor_info, resolver (globs, tarballs), varlen (SDPA lengths, ragged layouts)
 ├── metrics/
 │   ├── analytical/           # FLOP and I/O byte formulas
 │   ├── gpu_smi.py            # amdsmi clocks, VRAM, static GPU info
@@ -127,7 +137,9 @@ Data flow (hipDNN): CLI -> `SuiteConfig` -> `runtimes.start_runtime` -> for
 each graph: `GraphLoader` -> `suite_runner.run_graph` with
 `hipdnn_planner` -> `Executor` + `BufferManager` -> `timing.measure` ->
 correctness, oracle, profiling -> `GraphResult` -> `Reporter` and
-`SuiteResult.write`.
+`SuiteResult.write`. `run_graph` generates the inputs once per graph. Then
+`resolve_varlen_layouts` sets the per-tensor varlen layouts and comparison
+fields that buffer managers, comparison and I/O metrics read.
 
 Data flow (PyTorch): the same, with `pytorch_plan`, `PyTorchCudaExecutor`
 and `PyTorchCudaBufferManager`. One `runtime = "pytorch"` row per graph. No
@@ -139,6 +151,11 @@ Data flow (rocKE): the same, with `rocke_planner`, `RockeExecutor` and
 (`rocke_session`); a variant row launches hipDNN's code object from the
 kpack archive.
 One `runtime = "rocke"` row per applicable kernel.
+
+Data flow (AITER): the same, with `aiter_planner`, `AiterExecutor` and
+`PyTorchCudaBufferManager`. `aiter_session` reads the device once per suite;
+`aiter_sdpa.backend_rows` repeats AITER's backend checks for each graph.
+One `runtime = "aiter"` row per applicable backend.
 
 With several runtimes, `run_graph` gets one planner per runtime, in
 `RuntimeName` order.

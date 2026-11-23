@@ -59,6 +59,28 @@ PROVIDER_DESCRIPTOR_ROOT = (
     / "kernel_ingestor_engine"
     / "descriptors"
 )
+
+AITER_DIR = SCRIPT_DIR / "aiter"
+# AITER submodules that its JIT compiles against: the CK headers and the CK
+# code generator of its CK forward kernels.
+AITER_SUBMODULES = ("3rdparty/composable_kernel",)
+
+
+def aiter_build_requires(aiter_dir: Path) -> list[str]:
+    """AITER's build requirements (``[build-system] requires``).
+
+    AITER is installed without build isolation: in an isolated build its
+    setup.py sees neither torch nor torch's Triton, ignores
+    ``AITER_USE_SYSTEM_TRITON`` and runs its install_triton.sh, which
+    uninstalls and reinstalls Triton with the first ``python3`` on ``PATH``.
+    So these requirements go into the venv first.
+    """
+    import tomllib
+
+    with open(aiter_dir / "pyproject.toml", "rb") as f:
+        return list(tomllib.load(f)["build-system"]["requires"])
+
+
 DEFAULT_ROCM_PREFIX = "/opt/rocm"
 
 
@@ -123,6 +145,13 @@ def run(cmd, *, env=None, check=True, **kwargs):
     return subprocess.run(list(cmd), env=env, check=check, **kwargs)
 
 
+#: Oldest CMake that builds everything setup builds. rocm-libraries needs
+#: 3.25.2 (CMakeLists.txt, CMakePresets.json "version": 6); the hipDNN Python
+#: bindings need 3.26 (projects/hipdnn/python/frontend_bindings/CMakeLists.txt).
+CMAKE_MIN_VERSION = (3, 26)
+_CMAKE_VERSION = re.compile(r"cmake version (\d+)\.(\d+)")
+
+
 def require_working_cmake() -> str:
     """Return the PATH-selected CMake executable after a startup check."""
     cmake = shutil.which("cmake")
@@ -131,7 +160,7 @@ def require_working_cmake() -> str:
     try:
         result = subprocess.run(
             [cmake, "--version"],
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
@@ -143,6 +172,19 @@ def require_working_cmake() -> str:
             f"cmake at {cmake} failed its startup check (exit {result.returncode}).",
             result.stderr.strip()
             or "Fix the selected cmake executable or PATH before retrying.",
+        )
+    floor = ".".join(map(str, CMAKE_MIN_VERSION))
+    found = _CMAKE_VERSION.search(result.stdout or "")
+    if found is None:
+        warn(f"cannot read the version of cmake at {cmake}; setup needs {floor}+.")
+    elif tuple(map(int, found.groups())) < CMAKE_MIN_VERSION:
+        # An old cmake fails later with only "Could not read presets ...:
+        # Unrecognized "version" field".
+        fail(
+            f"cmake at {cmake} is version {found.group(1)}.{found.group(2)}; "
+            f"setup needs cmake {floor} or later.",
+            f"Put a newer cmake first on PATH, for example from "
+            f"`python3 -m pip install 'cmake>={floor}'`.",
         )
     return cmake
 
@@ -285,18 +327,12 @@ for root in roots:
             if not lib_dir.is_dir() or not any(lib_dir.glob("libMIOpen.so*")):
                 continue
         elif kind == "core":
+            # Not gated on how amdsmi is packaged: since about rocm 10.1 the
+            # core wheel ships share/amd_smi/amdsmi without setup.py or
+            # pyproject.toml, and comgr and rocprofiler also use this prefix.
             if not child.name.startswith("_rocm_sdk_core"):
                 continue
-            amd_smi_dir = child.joinpath("share/amd_smi")
-            if not (
-                child.joinpath("lib").is_dir()
-                and any(child.joinpath("lib").glob("libamd_smi.so*"))
-                and amd_smi_dir.is_dir()
-                and (
-                    amd_smi_dir.joinpath("setup.py").is_file()
-                    or amd_smi_dir.joinpath("pyproject.toml").is_file()
-                )
-            ):
+            if not child.joinpath("lib").is_dir():
                 continue
         else:
             print(f"ERROR: unknown ROCm wheel prefix kind: {kind}", file=sys.stderr)
@@ -384,6 +420,24 @@ else:
     else:
         mode = "cpu"
 print("\n" + mode)
+"""
+
+# Compile the AITER backends that --runtime aiter runs on this GPU (see
+# aiter_executor.prebuild). Exit 1 when any of them fails.
+_AITER_PREBUILD = r"""
+import sys
+
+from dnn_benchmarking.execution import aiter_executor
+
+reason = aiter_executor.prebuild_skip_reason()
+if reason:
+    print(f"  Nothing to compile: {reason}.")
+    sys.exit(0)
+failed = 0
+for label, error in aiter_executor.prebuild():
+    failed += error is not None
+    print(f"  {label}: {error}" if error else f"  {label}", flush=True)
+sys.exit(1 if failed else 0)
 """
 
 
@@ -507,6 +561,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-aiter",
+        dest="aiter",
+        action="store_false",
+        help=(
+            "Skip the AITER stage (fetch, install and kernel compile for "
+            "--runtime aiter). Other runtimes do not need it."
+        ),
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help=(
@@ -572,6 +635,7 @@ class Setup:
     def __init__(self, args: argparse.Namespace) -> None:
         self.torch_mode = args.torch_mode
         self.reuse_artifacts = args.reuse_artifacts
+        self.with_aiter = args.aiter
         self.auto_yes = args.yes
         self.clean = args.clean
         self.rocm_prefix = args.rocm_prefix
@@ -646,24 +710,12 @@ class Setup:
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
         gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        ref = self.rocm_libraries_ref
-        if not ref:
-            try:
-                ref = git_output(
-                    ["-C", str(SCRIPT_DIR), "rev-parse", "HEAD:rocm-libraries"]
-                )
-            except subprocess.CalledProcessError:
-                ref = git_output(
-                    ["config", "-f", gitmodules, "submodule.rocm-libraries.branch"]
-                )
-                warn(
-                    "could not resolve the pinned rocm-libraries commit (no git "
-                    "metadata, e.g. a Docker build or source tarball); falling "
-                    f"back to the MOVING branch '{ref}'.",
-                    "The hipDNN/provider build is not reproducible. Pass "
-                    "--rocm-libraries-ref <sha> (`git rev-parse "
-                    "HEAD:rocm-libraries` in a checkout of this repository).",
-                )
+        ref = self.rocm_libraries_ref or self._pinned_submodule_commit(
+            "rocm-libraries",
+            "The hipDNN/provider build is not reproducible. Pass "
+            "--rocm-libraries-ref <sha> (`git rev-parse "
+            "HEAD:rocm-libraries` in a checkout of this repository).",
+        )
         # Only a full commit id can be compared with HEAD; a branch moves.
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
@@ -759,6 +811,135 @@ class Setup:
         except subprocess.CalledProcessError:
             return False
 
+    @staticmethod
+    def _pinned_submodule_commit(name: str, fallback_note: str) -> str:
+        """The commit this repository pins for submodule ``name``.
+
+        Without git metadata (a Docker build or a source tarball) there is no
+        pin to read, so warn and return the submodule's moving branch.
+        """
+        try:
+            return git_output(["-C", str(SCRIPT_DIR), "rev-parse", f"HEAD:{name}"])
+        except subprocess.CalledProcessError:
+            branch = git_output(
+                [
+                    "config",
+                    "-f",
+                    str(SCRIPT_DIR / ".gitmodules"),
+                    f"submodule.{name}.branch",
+                ]
+            )
+            warn(
+                f"could not resolve the pinned {name} commit (no git metadata, "
+                "e.g. a Docker build or source tarball); falling back to the "
+                f"MOVING branch '{branch}'.",
+                fallback_note,
+            )
+            return branch
+
+    # -- AITER ----------------------------------------------------------------
+
+    def ensure_aiter_checkout(self) -> None:
+        """Fetch AITER at its pinned submodule commit if absent.
+
+        `git submodule update --init --recursive aiter` also works. This path
+        fetches only the pinned commit and the AITER submodules that its JIT
+        compiles against (AITER_SUBMODULES), each at depth 1. An existing
+        checkout is reused as-is.
+        """
+        ref = self._pinned_submodule_commit(
+            "aiter", "The AITER rows are not reproducible."
+        )
+        pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
+        if (AITER_DIR / ".git").exists():
+            head = git_output(["-C", str(AITER_DIR), "rev-parse", "HEAD"])
+            if pinned and head != ref:
+                warn(
+                    f"aiter is at {head[:12]}, not the pinned {ref[:12]}. Check "
+                    "out that commit in aiter/ (e.g. `git submodule update "
+                    "--recursive aiter`) or delete the directory to fetch it."
+                )
+            self._init_aiter_submodules(AITER_DIR)
+            return
+
+        # An uninitialised submodule leaves an empty directory; anything else
+        # here is not ours to delete without asking.
+        if AITER_DIR.exists() and any(AITER_DIR.iterdir()):
+            self._confirm(
+                f"replace {AITER_DIR}, which is not a git checkout and is not empty"
+            )
+        url = git_output(
+            ["config", "-f", str(SCRIPT_DIR / ".gitmodules"), "submodule.aiter.url"]
+        )
+        print(f"Fetching aiter ({ref}) at depth 1...")
+        # Same staging as rocm-libraries: an interrupted fetch must not leave
+        # a .git directory that the next run would reuse.
+        staging = AITER_DIR.with_name(AITER_DIR.name + ".partial")
+        if staging.exists():
+            rmtree(staging)
+        git = ["-C", str(staging)]
+        try:
+            run_git(["init", "--quiet", str(staging)])
+            run_git([*git, "remote", "add", "origin", url])
+            run_git([*git, "fetch", "--quiet", "--depth", "1", "origin", ref])
+            run_git([*git, "checkout", "--quiet", "FETCH_HEAD"])
+            self._fetch_tags_at(staging, ref)
+            self._init_aiter_submodules(staging)
+        except BaseException:
+            if staging.exists():
+                rmtree(staging)
+            raise
+        if AITER_DIR.exists():
+            rmtree(AITER_DIR)
+        os.replace(staging, AITER_DIR)
+
+    @staticmethod
+    def _fetch_tags_at(checkout: Path, commit: str) -> None:
+        """Fetch the tags of ``origin`` that point at ``commit``.
+
+        AITER's package version comes from ``git describe`` (setuptools_scm).
+        A depth-1 fetch has no tags, so a release commit would install as
+        ``0.1.1.dev1+g<sha>`` and the result files would record that version.
+        """
+        listing = git_output(["-C", str(checkout), "ls-remote", "--tags", "origin"])
+        tags = set()
+        for line in listing.splitlines():
+            sha, _, name = line.partition("\t")
+            if sha == commit:
+                tags.add(name.removeprefix("refs/tags/").removesuffix("^{}"))
+        for tag in sorted(tags):
+            ref = f"refs/tags/{tag}"
+            run_git(
+                ["-C", str(checkout), "fetch", "--quiet", "--depth", "1", "origin"]
+                + [f"{ref}:{ref}"]
+            )
+
+    @staticmethod
+    def _init_aiter_submodules(checkout: Path) -> None:
+        """Fetch each AITER submodule that is not checked out, at depth 1.
+
+        A checked-out submodule is left alone, so local changes survive.
+        """
+        missing = [
+            path
+            for path in AITER_SUBMODULES
+            if not (checkout / path).is_dir() or not any((checkout / path).iterdir())
+        ]
+        if missing:
+            run_git(
+                [
+                    "-C",
+                    str(checkout),
+                    "submodule",
+                    "update",
+                    "--quiet",
+                    "--init",
+                    "--depth",
+                    "1",
+                    *missing,
+                ]
+            )
+
     # -- venv lifecycle -----------------------------------------------------
 
     def setup_venv(self) -> None:
@@ -788,6 +969,10 @@ class Setup:
         lines = [
             f"export PYTHONPYCACHEPREFIX={shlex.quote(str(self.workspace / 'pycache'))}",
             f"export DNN_BENCH_WORKSPACE={shlex.quote(str(self.workspace))}",
+            # Where the AITER stage compiled AITER's modules (see
+            # aiter_executor.prepare_aiter_environment): a plain `import
+            # aiter` in the venv then loads them instead of compiling again.
+            f"export AITER_JIT_DIR={shlex.quote(str(self.venv_dir / 'aiter-jit'))}",
         ]
         if rocm_prefix:
             lines.append(f"export ROCM_PATH={shlex.quote(rocm_prefix)}")
@@ -843,6 +1028,11 @@ class Setup:
         return arch
 
     @functools.cached_property
+    def cmake(self) -> str:
+        """The checked cmake executable; the check runs once per Setup."""
+        return require_working_cmake()
+
+    @functools.cached_property
     def hip_arch_args(self):
         """GPU_TARGETS/AMDGPU_TARGETS flags for the HIP device-code builds.
 
@@ -862,9 +1052,21 @@ class Setup:
     def _detect_gpu_arch() -> str:
         """The one GPU arch the ROCm tools report, "" when none.
 
-        gfx000 is the CPU agent. A host with several distinct archs has no
-        single right answer, so the user must choose.
+        A host with several distinct archs has no single right answer, so the
+        user must choose.
         """
+        tool, archs = Setup._detected_gpu_archs()
+        if len(archs) > 1:
+            fail(
+                f"{tool} reports several GPU architectures: {', '.join(archs)}.",
+                "Pass --gpu-arch to choose the one to install and build for.",
+            )
+        return archs[0] if archs else ""
+
+    @staticmethod
+    def _detected_gpu_archs() -> tuple:
+        """(tool, sorted GPU archs) from the first ROCm tool that reports any,
+        or ("", []). gfx000 is the CPU agent."""
         for tool in ("rocm_agent_enumerator", "rocminfo"):
             if not shutil.which(tool):
                 continue
@@ -880,14 +1082,9 @@ class Setup:
                 warn(f"{tool} did not finish within {DETECT_TIMEOUT_S}s; ignoring it.")
                 continue
             archs = sorted(set(_GFX_ARCH.findall(out)) - {"gfx000"})
-            if len(archs) > 1:
-                fail(
-                    f"{tool} reports several GPU architectures: {', '.join(archs)}.",
-                    "Pass --gpu-arch to choose the one to install and build for.",
-                )
             if archs:
-                return archs[0]
-        return ""
+                return tool, archs
+        return "", []
 
     # -- ROCm wheel prefix discovery ----------------------------------------
 
@@ -981,6 +1178,27 @@ class Setup:
             (path / "setup.py").is_file() or (path / "pyproject.toml").is_file()
         )
 
+    def _link_wheel_amdsmi(self, package: Path, link: Path) -> bool:
+        """Put the SDK wheel's ready-made amdsmi package on the venv path.
+
+        pip cannot install it: it has no setup.py or pyproject.toml. The
+        package loads libamd_smi relative to its resolved path, so a symlink
+        keeps that lookup and a copy would break it.
+        """
+        print(f"Linking amdsmi Python bindings from {package}...")
+        try:
+            if link.is_symlink():  # stale link from an earlier setup
+                link.unlink()
+            link.symlink_to(package, target_is_directory=True)
+        except OSError as error:
+            warn(f"cannot link {link} to {package}: {error}")
+            return False
+        if self.amdsmi_importable():
+            return True
+        link.unlink()
+        warn(f"amdsmi from {package} does not import; trying other sources.")
+        return False
+
     def maybe_install_amdsmi(self, *prefixes: str) -> None:
         if self.amdsmi_importable():
             return
@@ -988,7 +1206,14 @@ class Setup:
         candidates = []
         prefix, status = self.find_rocm_wheel_prefix("core")
         if status == 0:
-            candidates.append(Path(prefix) / "share" / "amd_smi")
+            source = Path(prefix) / "share" / "amd_smi"
+            package = source / "amdsmi"
+            if self._is_amdsmi_source(source):
+                candidates.append(source)
+            elif (package / "__init__.py").is_file() and self._link_wheel_amdsmi(
+                package, Path(prefix).parent / "amdsmi"
+            ):
+                return
         elif status != 1:
             warn("ROCm SDK core discovery failed; skipping SDK amdsmi candidate.")
         candidates += [
@@ -1161,8 +1386,9 @@ class Setup:
         Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
         the TORCH_RECORD written when setup installed torch. A venv without
         the record (torch installed some other way) cannot be checked. With
-        ``check_arch`` and no --gpu-arch, the build uses the recorded arch;
-        with no --torch-index-url, the toolchain uses the recorded index.
+        ``check_arch`` and no --gpu-arch, the build uses the recorded arch,
+        and fails when the detected GPU has another arch; with no
+        --torch-index-url, the toolchain uses the recorded index.
         """
         try:
             record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
@@ -1174,7 +1400,21 @@ class Setup:
             and record
             and record.get("gpu_arch")
         ):
-            self.gpu_arch = record["gpu_arch"]
+            recorded = record["gpu_arch"]
+            # Detection alone, not self.gpu_arch: its Windows default is no
+            # evidence of the GPU in this host. A multi-arch host may keep a
+            # venv recorded for any of its archs.
+            _, detected = self._detected_gpu_archs()
+            if detected and recorded not in detected:
+                found = ", ".join(detected)
+                fail(
+                    f"this host has {found} GPU(s), but {self.venv_dir} was "
+                    f"set up for {recorded}.",
+                    "Pass --clean to set up the venv again (with --gpu-arch "
+                    f"when the host has several archs), or --gpu-arch {recorded} "
+                    f"to keep the {recorded} build.",
+                )
+            self.gpu_arch = recorded
             print(f"GPU arch: {self.gpu_arch} (recorded in {self.venv_dir})")
         if check_arch and not self.torch_index_url and record:
             self.resolved_torch_index_url = record.get(
@@ -1368,7 +1608,7 @@ class Setup:
         record.write_text(json.dumps(wanted) + "\n")
 
     def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
-        cmake = require_working_cmake()
+        cmake = self.cmake
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
@@ -1416,7 +1656,7 @@ class Setup:
     def build_and_install_bindings(
         self, install_prefix: str, toolchain_prefix: str
     ) -> None:
-        cmake = require_working_cmake()
+        cmake = self.cmake
         python_dir = HIPDNN_ROOT / "python"
         bindings_source = python_dir / "frontend_bindings"
         if not bindings_source.is_dir():
@@ -1578,6 +1818,49 @@ class Setup:
         # The library resolves `rocke` from the platform install.
         self.pip("install", *platform_args)
         self.pip("install", "--no-deps", *library_args)
+
+    def install_aiter(self) -> None:
+        """Install the pinned AITER for ``--runtime aiter`` and compile its kernels.
+
+        AITER compiles its host modules (JIT) against the installed torch, so
+        it is installed from source (the ``aiter`` submodule) and only with
+        ROCm torch, without build isolation (see :func:`aiter_build_requires`).
+        On a GPU that AITER supports, the stage then runs every AITER backend
+        once on small problems (``aiter_executor.prebuild``); the compiled
+        modules stay in ``<venv>/aiter-jit``. --reuse-artifacts fetches no
+        AITER sources: it installs an existing ``aiter/`` checkout or skips.
+        """
+        if self.installed_torch_mode != "rocm":
+            print(
+                f"Skipping AITER: --runtime aiter needs ROCm torch, not "
+                f"'{self.installed_torch_mode}'."
+            )
+            return
+        if self.reuse_artifacts and not (AITER_DIR / ".git").exists():
+            print(
+                "Skipping AITER: --reuse-artifacts fetches no sources and aiter/ "
+                "is not checked out (`git submodule update --init --recursive "
+                "aiter`)."
+            )
+            return
+        self.ensure_aiter_checkout()
+        env = dict(self.env, AITER_USE_SYSTEM_TRITON="1")
+        # AITER's runtime imports (pyyaml, ...) are in requirements.txt only.
+        self.pip("install", "-r", str(AITER_DIR / "requirements.txt"), env=env)
+        self.pip("install", *aiter_build_requires(AITER_DIR), env=env)
+        # compat mode puts aiter/ on sys.path through a .pth file. The default
+        # finder loses to the aiter/ checkout itself, which imports as an empty
+        # namespace package from the repository root (python -c, python -m).
+        compat = ("--config-settings", "editable_mode=compat")
+        self.pip(
+            "install", "--no-build-isolation", *compat, "-e", str(AITER_DIR), env=env
+        )
+        prebuild = run([self.py, "-c", _AITER_PREBUILD], env=env, check=False)
+        if prebuild.returncode != 0:
+            warn(
+                "Some AITER backends did not compile or run (see above).",
+                "Their --runtime aiter rows report the same error.",
+            )
 
     def install_runtime_extras(self) -> None:
         self.maybe_install_amdsmi(
@@ -1791,6 +2074,10 @@ class Setup:
         if cuda:
             self.do_build = False
         self.confirm_build()
+        if self.do_build:
+            # Before any stage downloads wheels: an old cmake fails only at
+            # the hipDNN build, many minutes later.
+            self.cmake
 
         stages = [
             ("Virtual environment", self.setup_venv),
@@ -1816,6 +2103,9 @@ class Setup:
             if not IS_WINDOWS:
                 # The Windows ROCm build of rocKE is untested (see rocke_args).
                 stages.append(("rocKE Python packages", self.install_rocke_packages))
+            # AITER's source install needs FlyDSL, which ships Linux wheels only.
+            if not IS_WINDOWS and self.with_aiter:
+                stages.append(("AITER", self.install_aiter))
             stages.append(
                 ("amdsmi and rocprofiler libraries", self.install_runtime_extras)
             )

@@ -9,10 +9,10 @@ measures it. The code is `src/dnn_benchmarking/execution/timing.py`
 - The headline number is `kernel_med`: the median device time of one launch
   of the graph, in the table and in `ootb.kernel.median_ms`.
 - One loop implementation (`timing.measure`) times hipDNN engines, the
-  PyTorch runtime and the rocKE runtime. The runtimes get the same warmup,
-  stop rule, cache mode and statistics. rocKE rows launch with
-  `rocke.runtime.no_fence`, because a fenced rocKE launch synchronizes the
-  host after each call.
+  PyTorch runtime, the rocKE runtime and the AITER runtime. The runtimes get
+  the same warmup, stop rule, cache mode and statistics. rocKE rows launch
+  with `rocke.runtime.no_fence`, because a fenced rocKE launch synchronizes
+  the host after each call. AITER rows launch on the torch default stream.
 - Each plan records how it was measured in `timing`: mode, timer,
   cache mode, warmup count, first-call cost, cap and fallback reason.
 - TFLOP/s and GB/s use the median. The tool reports the spread (IQR, CV) and
@@ -54,13 +54,29 @@ The stall gate has a watchdog. If the gate cannot arm, cannot be created, or
 the watchdog releases it before the host finished the enqueue, that sample
 includes host gaps and is invalid. The tool then discards every row of the
 graph and measures the whole graph again in `events` mode. A warning on
-stderr gives the cause. The rows of one graph are compared with each other,
-so they always share one mode.
+stderr gives the cause.
+
+Rows of one graph share one mode only when no per-row fallback applies.
+These cases give a graph rows in different modes:
+
+- The `--validate pytorch` reference row can fall back to `events` mode
+  alone (for example, `host sync in enqueue: ...`). The hipDNN engine rows of
+  the same graph stay in `staged` mode.
+- With several runtimes (`--runtime hipdnn,pytorch` or `hipdnn,rocke`), a
+  PyTorch or rocKE engine row can fall back to `events` mode alone. The hipDNN
+  rows of the same graph stay in `staged` mode.
+- With `--oracle`, the tuned plan can use a different mode than the OOTB
+  plan. The oracle verdict is then `mixed-timing` (see `docs/usage.md`).
+- `--timing-block N` (N > 1) times every row of the run in `block` mode.
+
+Read `timing.mode` of each row before you compare two rows.
 
 In `events` mode each iteration records the start event, calls `enqueue()`,
-records the stop event and waits. The span then includes any host launch gap
-inside the graph. For a single short kernel the two modes agree. For a graph
-with many short kernels, `events` reads higher.
+records the stop event and waits. The device records the start event before
+the host finishes the enqueue. Thus the span includes the host submit time and
+any host launch gap inside the graph. The two modes agree only when the
+device time is much longer than the host submit time. For a short kernel or
+a graph with many short kernels, `events` reads higher.
 
 ## Submit time
 
@@ -97,9 +113,28 @@ first `enqueue()`, so `first_call_ms` includes it and `kernel_med` does not:
   `--pytorch-sdpa-backend math`, `efficient`, `cudnn` or `overrideable`. Those
   strict backends can reject `enable_gqa`, and a row that does not use it
   still runs.
-- Sliding-window and bottom-right masks, where a graph needs one, and the
-  dense per-sequence K and V of paged graphs are built once. A timed paged
-  iteration does one SDPA call per sequence and one `torch.cat`.
+- Sliding-window and bottom-right masks, where a graph needs one, are built
+  once. The dense per-sequence K and V of paged graphs are also built once. A
+  timed paged iteration does one SDPA call per sequence. A packed Q (one
+  batch row for all sequences) then gets one `torch.cat` along the query
+  axis. A Q with one batch row per sequence, padded or ragged, gets a scatter
+  of each sequence's rows into a zeroed per-batch output instead (RFC 0014
+  limitation 9 covers ragged Q/O over a non-ragged paged K/V cache).
+- A variable-length forward graph (`seq_len`, `cu_seq_len` or ragged
+  tensors, without a page table) does one SDPA call per batch. The call
+  reads the first `lq` query positions of the batch. It reads the first
+  `lkv` key positions of the batch. Every mask, including the bottom-right
+  causal alignment, uses these live lengths.
+- A row with no visible key (a dead row) keeps `O = 0`. Its `stats` is
+  `-inf`, or the sink logit when the graph has sink tokens.
+  Dead rows are the leading rows of a bottom-right mask when `lq > lkv`.
+  They are also the trailing rows of a top-left window when `lq >= lkv + w`,
+  where `w` is the window size. A row past `lq` keeps `stats = -inf`, also
+  with sink tokens.
+- The tool reads the lengths once, before the timed loop. The timed region
+  does the slices, the SDPA calls and the copy into the output. A
+  variable-length backward graph runs per batch too. `dQ`, `dK` and `dV` are
+  0 past each length and on dead rows.
 - The `stats` output (log-sum-exp) comes from the fused kernel, as in a
   PyTorch training step. Q, K and V go into the call with `requires_grad`, and
   the tool reads the log-sum-exp that the kernel saves for the backward pass.
@@ -131,6 +166,14 @@ causal with one query (decode) or with equal query and KV lengths. On MI210
 (gfx90a), fp32 GQA graphs are skipped too. Other architectures can differ,
 because the result depends on the torch build.
 
+Paged and variable-length graphs run one SDPA call per sequence. When such a
+GQA call would use the math backend, the tool tries the call with K and V
+expanded to the query head count. It builds the expansion once, before the
+timed loop. When a fused kernel accepts the expanded call, the row is timed
+with that call. The row is skipped only when the expanded call also needs
+the math backend. On MI308X (gfx942), memory-efficient attention accepts the
+expanded top-left causal call with unequal query and KV lengths.
+
 The setup is built once on the assumption that the inputs do not change
 between iterations. When a graph node computes an SDPA input, the tool skips
 the PyTorch row instead of timing the setup.
@@ -138,7 +181,10 @@ the PyTorch row instead of timing the setup.
 Some SDPA features have no native PyTorch form. For these rows the timing
 includes a workaround, and the row gets a reference warning:
 
-- Paged KV: one SDPA call per sequence and a `torch.cat`.
+- Paged KV: one SDPA call per sequence, then a `torch.cat` or a scatter into
+  a zeroed output.
+- Variable-length lengths (`seq_len`, `cu_seq_len` or ragged tensors): one
+  SDPA call per batch.
 - Sliding window or bottom-right causal with a query length above 1 that
   differs from the KV length: the kernel reads an additive mask tensor.
 - Attention sinks: separate fp32 ops instead of an SDPA kernel.
@@ -160,6 +206,84 @@ includes a workaround, and the row gets a reference warning:
 - Explicit `attn_mask` bias with a causal mask, a sliding window or
   bottom-right alignment: the tool adds the bias first and applies the band
   second. The kernel reads the sum as one additive mask tensor.
+
+### PyTorch SDPA backward
+
+A timed SDPA backward iteration calls the fused backward kernel that a
+PyTorch training step uses: `aten::_scaled_dot_product_flash_attention_backward`
+or `aten::_scaled_dot_product_efficient_attention_backward`. On ROCm these run
+AOTriton or CK. The call reads the graph's O and `stats` inputs, as the hipDNN
+kernel does. PyTorch autograd cannot do this, because it keeps its own saved
+output and log-sum-exp.
+
+The setup runs once, before the timed loop:
+
+1. Run the forward once with the current `--pytorch-sdpa-backend` selection,
+   with `requires_grad` inputs and the graph's mask, bounds and scale. GQA and
+   MQA graphs use `enable_gqa` on the real-size K and V, as a training step
+   does. If that forward does not run Flash, the tool expands K and V to the
+   query head count and runs the forward again.
+2. Read from the autograd node which fused kernel ran, and its saved scalars.
+3. Copy `stats` into the log-sum-exp layout of that kernel.
+4. Copy O into the memory layout of the forward's output. For an O in the
+   `[B, H, S, D]` memory order, the memory-efficient backward (AOTriton) of
+   PyTorch 2.9.1 and of the 2.14 nightly on gfx90a gives wrong dK and dV
+   (ALMIOPEN-3256). A training step also passes the forward's output in this
+   layout.
+
+The setup thus reads Q, K, V, O, `stats` and the mask once. If an earlier
+node of the graph computes one of these inputs, the row does not run: its
+setup cannot be outside the timed region.
+
+A timed iteration does one backward kernel call. With `enable_gqa`, the Flash
+backward writes dK and dV at the K/V head count, so the iteration does no
+other work. With expanded K and V, the iteration also sums dK and dV over
+each head group.
+
+- With the default selection, the backward kernel is the one the forward
+  dispatches to. If default dispatch chooses neither Flash nor
+  memory-efficient attention (math, or cuDNN on CUDA), the row runs a manual
+  fp32 backward formula and gets a warning.
+- `--pytorch-sdpa-backend flash` and `efficient` select that kernel. Flash
+  takes no mask tensor, so it fails sliding-window and `attn_mask` graphs, and
+  bottom-right causal graphs with `Sq > 1` and `Sq != Skv`. It also rejects
+  top-left causal graphs with `Sq != Skv`. `--pytorch-rocm-fa-library` applies
+  to the timed backward call too. The tool binds no backward for `math`,
+  `cudnn` and `overrideable`, so the row is an error.
+- The CPU reference (`--validate pytorch` on the host) uses the manual fp32
+  formula of hipDNN's CPU reference.
+- The timed backward gets the same mask as the forward call of step 1. A
+  sliding window, a bottom-right causal band with `Sq != Skv` and a bias
+  reach the kernel as one additive mask tensor, as in the forward (see
+  [PyTorch SDPA setup](#pytorch-sdpa-setup)). ALiBi graphs use the manual
+  fp32 formula. The backward has no static warning for the additive mask;
+  only the fallback to the manual fp32 formula is warned at run time.
+- A variable-length backward graph (`seq_len` or ragged tensors, without a
+  page table) uses the manual fp32 formula, one batch at a time, on the
+  first `lq` query rows and the first `lkv` keys of the batch. The fused
+  kernels take no lengths. With `flash` or `efficient` selected, the row is
+  an error. The reference does not support a variable-length backward with
+  a bottom-right causal band or a sliding window.
+
+A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
+dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
+the bias broadcasts. It has the dims and the data type of the bias. This is
+the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
+from rocm-libraries `4630e167ce1` (#14358), which the pinned `bfbd6d7`
+includes.
+
+- The timed row calls the memory-efficient backward kernel with its bias
+  gradient enabled, and then sums the score-shaped gradient to the bias
+  dims. A training step with a bias that requires a gradient does the same
+  two operations. Flash takes no bias, so it cannot compute dBias.
+- ALiBi graphs and rows that fall back to math run the manual fp32 formula,
+  which also gives dBias.
+- The reference accumulates dBias in fp32 and rounds it to the bias data
+  type once, as hipDNN's CPU reference does. The timed kernel rounds each
+  score-shaped element first. On MI210 the two differ by at most 0.002 on
+  the fp16 `swin-base` graph (values up to 6.1) and the bf16 `alphafold2`
+  graph (values up to 0.55) of the SDPA backward collection. The SDPA
+  backward tolerances apply to dBias unchanged.
 
 ### PyTorch convolution backward
 
@@ -215,10 +339,12 @@ Notes for `cold`:
   never flushed.
 - 512 MiB is two times or more the largest last-level cache that the tool
   targets (MI300X MALL, 256 MiB). MI210 L2 is 8 MiB.
-- The tool allocates the buffer one time per process, at the first cold
-  iteration. The hipDNN path uses `hipdnn_frontend.DeviceBuffer`. The CUDA
-  path uses a PyTorch tensor. If the allocation fails, the row fails with an
-  error that tells you to use `--cache-mode warm`.
+- The tool allocates the buffer at the first cold iteration and keeps it for
+  the process. It frees the buffer before an `--oracle` child starts, and the
+  next cold iteration allocates it again. The hipDNN path uses
+  `hipdnn_frontend.DeviceBuffer`. The CUDA path uses a PyTorch tensor. If
+  the allocation fails, the row fails with an error that tells you to use
+  `--cache-mode warm`.
 - The zero writes leave dirty lines in the cache. The first kernel in the
   span can pay the write-back of these lines. `triton.testing.do_bench` has
   the same effect.
@@ -283,6 +409,7 @@ The tool does not remove outliers. It adds warnings to the row:
 |---|---|
 | `noisy: IQR x% of median` | `iqr_ms / median_ms` more than 5 % and 10 or more samples. The table marks `kernel_med` with `*`. |
 | `outlier: max Nx median` | Maximum more than 2 x median. The table marks `kernel_med` with `*` and shows the warning in `note`. |
+| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | Block or events timing only. The median host submit time is 90 % or more of the median span. The span then measures the launch cost, not the device. Use the default staged timing for such kernels. |
 
 The noise flag uses IQR/median, not CV. A few slow samples raise the CV a
 lot but do not change the IQR. The `outlier` flag reports those samples.
@@ -290,6 +417,60 @@ lot but do not change the IQR. The `outlier` flag reports those samples.
 The median is the headline because one slow iteration moves the mean but not
 the median. In the MI210 runs below, one 37.6 us sample in a 29 us matmul run
 moved the mean and the standard deviation, but not the median.
+
+## Input data for variable-length SDPA
+
+An SDPA node is variable-length when it has a length source on a side:
+`seq_len_q_tensor_uid`, `seq_len_kv_tensor_uid`, `cu_seq_len_q_tensor_uid` or
+`cu_seq_len_kv_tensor_uid`. A tensor is ragged when it sets
+`ragged_offset_tensor_uid` (with the optional `ragged_offset_multiplier`,
+default 1). The tool draws the values of these integer tensors from the seed.
+They are not uniform floats:
+
+- Lengths are in `1..S_max`, where `S_max` is the sequence dim of the
+  operands. A group of lengths varies between batches. With two or more
+  batches, one batch is padded (shorter than `S_max`) and one batch is full.
+- For a paged graph, the KV lengths stay within the page allocation:
+  `page_table` width times page size, capped by `max_seq_len_kv` when the
+  graph sets it. The width is the product of the table dims after the
+  first: hipDNN's tables are `[B, 1, max_blocks_per_seq, 1]`.
+- An offset table has `B + 1` entries and starts with 0. Entry `b + 1` is
+  the start of batch `b + 1`. That is the start of batch `b` plus its length
+  and its gap, in the unit of the table. Only a group of tensors that has a
+  `seq_len` gets gaps. A gap is padding tokens after the live tokens of a
+  batch, and the length excludes them. With two or more batches, some batch
+  starts after a gap. The exception is a graph where no batch before the last
+  has room for one. Then every length is at the aligned sequence length, or
+  the token capacity holds just one aligned block for each batch. Each entry
+  is stored in the unit of the table. That is the token start times the
+  sequence stride divided by `ragged_offset_multiplier`.
+- A head-major ragged tensor (for example `[H, T, D]`) stores the token
+  range in the head stride. The capacity of that range limits the lengths
+  and the gaps. The tool reduces them to fit, and keeps one gap before a
+  batch other than the last when the capacity has room for it. A graph that
+  cannot fit one aligned block of tokens for each batch is not served.
+- `cu_seq_len` tensors hold the running totals of the lengths: `0`, `l0`,
+  `l0 + l1`, and so on, `B + 1` entries, in the dtype of the tensor. A side
+  uses `seq_len` or `cu_seq_len`, not both. The two sides can use different
+  sources. The key names follow rocm-libraries PR #14560 (forward
+  `SdpaAttributes` only; ALMIOPEN-2935). hipDNN has not decided whether an
+  engine reads `cu_seq_len` as the batch starts (as FlashAttention does) or
+  as lengths only. Thus a group whose only length source is `cu_seq_len` gets
+  no gaps: its batch starts, in tokens, equal `cu_seq_len`, and both readings
+  are correct.
+- Tensors that share one length or offset tensor get one set of values. For
+  example, self-attention can use one offset table for Q and K.
+- The lengths and the offsets come from a separate random stream that the
+  seed also sets. The float inputs of a graph do not change when the graph
+  has these tensors.
+
+Every tensor of the graph stays logical (shaped by its dims) in the
+reference. The graph layout (offsets, strides) applies only when the tool
+writes inputs to device storage and reads outputs from it. A ragged tensor
+stores each batch at its offset. Its padding (past each length and between
+batches) holds generated values, as the padding of a non-ragged tensor (for
+example the BSHD view of aiter graphs) and the golden data of hipDNN do. An
+engine must ignore these values.
 
 ## TFLOP/s and GB/s
 
@@ -300,8 +481,16 @@ moved the mean and the standard deviation, but not the median.
   are in its sibling modules (`conv.py`, `matmul.py`, `elementwise.py`,
   `normalization.py`, `reduction.py`, `sdpa.py`). When any node of the graph
   has no formula, `flops` and `tflops` are `null`, not a partial count.
+- For an SDPA node with variable lengths, `flops` sums the count of each
+  batch from its valid lengths. The lengths come from the generated input
+  data, not from the tensor dims. A paged graph counts the real KV lengths
+  of its batches, not the page size. Without input data, a paged graph
+  counts the page-table width times the page size, capped by
+  `max_seq_len_kv`, for each sequence.
 - `io_bytes` is the sum of the sizes of all non-virtual tensors. It is a
-  lower bound of the real memory traffic.
+  lower bound of the real memory traffic. A tensor with valid lengths counts
+  only its valid elements: `sum(lengths) * elements per position * element
+  size`. Paged K and V containers count their full size.
 - In `warm` mode, a small problem can stay in L2. GB/s can then be more than
   the HBM bandwidth. Use `--cache-mode cold` to measure from memory.
 
@@ -336,8 +525,12 @@ device once. It does not use the timed loop, for two reasons:
 Before each child starts, the parent frees the engine buffers. The child thus
 has the same free VRAM as the timed run. Counter values come from this child,
 not from the timed loop. The child also launches input-fill kernels, and a
-graph can launch more than one kernel. Use `pmc.per_kernel[...].dispatches`
-and the kernel name to find the engine kernel.
+graph can launch more than one kernel. For an SDPA backward graph, the input
+fill includes the PyTorch attention forward that computes O and `stats` (see
+[SDPA backward inputs](#sdpa-backward-inputs)). Its matmul, `exp` and
+`logsumexp` kernels run on the GPU before the graph executes, and the
+profiler records them. Use `pmc.per_kernel[...].dispatches` and the kernel
+name to find the engine kernel.
 
 ## Fast mode
 
@@ -415,6 +608,9 @@ dropout mask and `s` is the dropout scale.
   - `dV = (P * M * s)^T @ dO`.
   - `dQ` and `dK` come from `dS`, as without dropout. `inv` changes only
     `D`, so only `dQ` and `dK` show a wrong `inv`.
+  - With a bias gradient, dBias is the dropout-scaled
+    `dS = s * P * (M * dP - D * inv)`, summed over the bias's broadcast
+    dims, as hipDNN's CPU reference does.
 
 Dropout combines with causal masks, sliding windows, an additive bias, ALiBi
 and attention sinks, where the reference supports that mask. Like the hipDNN
@@ -565,28 +761,83 @@ hipDNN and `--runtime pytorch` on the same graphs, kernel median in ms:
 | relu | 0.155 | 0.156 |
 | rmsnorm | 0.010 | 0.032 |
 
-The tables above come from the review before this overhaul. The timed loop
-was already stall-gated then, but the warmup ran back to back, so the
-minimum-to-maximum ranges can include clock-ramp outliers.
+These runs used a back-to-back warmup, so the minimum-to-maximum ranges can
+include clock-ramp outliers.
 
-### Change against the previous loop (MI210, gfx90a)
+Bimodal kernels (CV 0.1 to 0.3), for example `conv_dgrad`, have a median
+that can move between the two modes from one measurement to the next. Their
+mean moves less. Compare the mean and the CV of such a row before you report
+a change.
 
-Every `graphs/*.json` ran on both runtimes with `--warmup 10 --iters 100`,
-once with the previous loop (`main` at 2af0454) and once with this loop,
-back to back, in two repeats (92 median pairs):
+## Paged SDPA inputs
 
-- 85 of 92 medians agree within 2 %. On kernels near 14 us, 1 % is one
-  0.16 us step of the event timer.
-- The other pairs are bimodal kernels (CV 0.1 to 0.3), where the median moves
-  between the two modes. `conv_dgrad` on the PyTorch runtime read 26 % and
-  36 % lower; its mean moved less (43.1 to 43.0 us, 44.3 to 39.7 us).
-  `conv_dgrad` on `MIOPEN_ENGINE_DETERMINISTIC` read 5.4 % lower in both
-  repeats. Two other rows moved in one repeat only.
-- CV fell where the previous warmup left clock-ramp samples in the loop, for
-  example `conv_wgrad` 0.16 to 0.01 and `rmsnorm` on PyTorch 0.14 to 0.02.
+A paged SDPA graph gives K and V as a block container `[num_blocks, H_kv,
+page_size, D]`, and the page tables as int32 `[B, 1, max_blocks_per_seq,
+1]`, as hipDNN and cuDNN require. The tool also reads rank-2 `[B,
+max_blocks_per_seq]` tables. It fills the page tables with block ids
+0, 1, 2, ... in sequence order, so no two sequences share a block when the
+container has at least `B * max_blocks_per_seq` blocks. A smaller container
+wraps the ids around its block count. The sequence lengths follow
+[Input data for variable-length SDPA](#input-data-for-variable-length-sdpa).
 
-A time series that crosses this change can show a step on bimodal rows.
-Measure again after a timing change.
+## SDPA backward inputs
+
+An SDPA backward node reads Q, K, V, the forward output O, the incoming
+gradient dO and the forward log-sum-exp `stats`. The tool draws Q, K, V and
+dO from U[0, 1) like other inputs, and then scales dO (see below). It
+computes O and `stats` as the
+exact float32 forward of Q, K and V with the graph's scale, mask, bounds,
+additive bias, ALiBi and GQA layout. The forward runs in PyTorch, on the GPU
+when one is visible;
+without PyTorch a NumPy fallback gives the same values. O is rounded to its
+graph type. Both runtimes and the reference read these values.
+
+Independent random O and `stats` do not describe a forward pass. On gfx942
+(ALMIOPEN-2976), random values gave gradients of 1e4 to 1e5 and fp16
+overflow, and the ASM SDPA engine failed validation on every graph. An upper
+bound for `stats` without a forward kept the gradients finite but between
+4e-6 and 0.13, so the tolerances could not detect an error. With the forward
+values, the gradients were 1 to 7 and the engine passed on every bf16 graph.
+The kernel times were the same within 1% for all three input forms.
+
+With many keys per query, as in decode shapes, dV and dK elements can all
+be below 1e-3 even with forward values (one query and 4,096 keys without
+GQA: dK up to 2e-4, dV up to 5e-4). The fixed `atol` of 1e-3 would then
+accept an engine that never writes dK or dV. Every gradient is linear in
+dO, so the tool scales dO like AMP loss scaling: when the largest element
+of `dV = P^T dO` is below 0.5, dO is multiplied by the power of two that
+puts it in [0.5, 1). The scale is at most 2^14, so fp16 dO stays finite.
+A power of two keeps dO exact at its graph type. The other gradients scale
+by the same factor. A square shape with Sq = Skv = 1,024 gets no scale,
+because dV is already near 1; its dQ stays below 1e-2.
+
+fp16 SDPA backward outputs use `rtol` 4e-3 (about 4 ULP) instead of the fp16
+default of 1e-3. dQ, dK and dV sum over every key or query row. The value
+was measured on gfx942 against the earlier AOTriton reference: the ASM SDPA
+engine and AOTriton differed by 2 ULP on 1 in 10,000 to 1 in 50,000
+elements (`max_rel_diff` 2^-9), so 1e-3 failed two correct kernels. It is
+not yet measured again against the fp32 reference. The source is
+`OP_TOLERANCES` in `src/dnn_benchmarking/execution/correctness.py`.
+
+With `--validate pytorch`, the SDPA backward reference is the manual fp32
+formula, on a GPU and on the host. It reads the graph's O and `stats`. The
+reference pass does not call the fused PyTorch backward kernel: only the
+timed PyTorch row does (see [PyTorch SDPA backward](#pytorch-sdpa-backward)).
+
+A graph with sequence lengths (`seq_len_q` and `seq_len_kv`, or ragged
+tensors) gets the forward of each batch on its first `lq` query rows over
+its first `lkv` keys, with the generated lengths (see
+[Input data for variable-length SDPA](#input-data-for-variable-length-sdpa)).
+The engines and the reference read these rows. A bottom-right band follows
+the live lengths. The rows past `lq` keep the forward of the full shape. The
+dO scale uses the largest dV element of the per-batch forwards.
+
+The forward has no dropout, so O of a dropout graph is the forward without
+dropout. The forward adds host time to input generation
+before the timed loop. It is proportional to the attention FLOPs of the
+graph. Forward-consistent SDPA backward inputs and the scaled dO start at
+tool version 0.4.0. Do not compare SDPA backward results with results from
+earlier versions.
 
 ## Not yet
 
@@ -602,19 +853,35 @@ The tool does not do these things yet:
   bottom-right causal bands, bounded left windows with `right_bound = 0`,
   attention-sink logits, and ALiBi with top-left causal masking or a
   top-left sliding window. An explicit `attn_mask` bias can combine with a
-  causal band or a sliding window. It follows hipDNN precedence: the
-  deprecated causal booleans override the modern bounds and diagonal
-  alignment. The reference declines these graphs as unsupported: ALiBi with
-  bottom-right alignment or with neither a causal mask nor a sliding window;
-  padding masks; paged or variable-length ALiBi graphs. For dropout, the
-  reference supports an explicit dropout mask (forward and backward) and
-  Philox forward graphs with an `rng_dump` output (see
+  causal band or a sliding window. It resolves the mask as hipDNN does: a
+  deprecated causal boolean acts as `right_bound = 0`, and the stored
+  `left_bound` and diagonal alignment still apply. As in cuDNN and in hipDNN
+  since rocm-libraries #14483, `left_bound = L` keeps `L` keys up to and
+  including the diagonal, so a window of `L` keys has `left_bound = L`. The
+  same rule sets the FLOP count and the SDPA backward inputs. Before 0.4.0,
+  `left_bound = L` kept `L + 1` keys, so a window graph without a causal
+  boolean has a band one key narrower at 0.4.0, with a different FLOP count,
+  reference and backward inputs. Do not compare window rows across 0.3.0
+  and 0.4.0. Tool versions before 0.4.0 also let the deprecated boolean
+  override the bounds and the alignment. For a graph that sets a causal
+  boolean with a bound or with `BOTTOM_RIGHT`, the FLOP count and the
+  PyTorch and rocKE masks thus changed at 0.4.0. The reference declines
+  these graphs as unsupported:
+  `left_bound = 0`, which hipDNN rejects; ALiBi with bottom-right alignment
+  or with neither a causal mask nor a sliding window; padding masks; paged
+  or variable-length ALiBi graphs. For dropout, the reference supports an
+  explicit dropout mask (forward and backward) and Philox forward graphs
+  with an `rng_dump` output (see
   [Dropout validation](#dropout-validation)). It declines Philox forward
   graphs without `rng_dump`, Philox backward graphs, and dropout with paged
   K and V or ragged sequence lengths. With `--validate`, the engine rows of
   these graphs fail. Some get `unchecked` instead when a CPU reference does
   not fit in host memory (see [SDPA dropout](usage.md#sdpa-dropout)). Other
   masks also make the reference decline the graph.
+- Per-document masking inside one sequence (`varlen_docmask`).
+  Variable-length SDPA with `seq_len`, `cu_seq_len` and ragged tensors is
+  supported; see
+  [Input data for variable-length SDPA](#input-data-for-variable-length-sdpa).
 - One buffer manager for both runtimes. The hipDNN path (`BufferManager`) and
   the PyTorch path (`PyTorchCudaBufferManager`) still allocate and fill
   buffers with separate code. Both use the same timed loop.
@@ -635,6 +902,12 @@ The tool does not do these things yet:
   tool version 0.3.0 (`tool.version` in the result file). Do not compare
   fp16 convolution correctness results with results from earlier versions.
   Signed data for other operations needs a role for each tensor first.
+- Validation of large fp16 SDPA backward gradients. On the six fp16
+  `aotriton_test_perf` graphs (B4, H48, D128, S 1024 to 4096), dK reaches
+  about 440. Against the earlier AOTriton reference, the ASM SDPA engine
+  differed by up to 1.0 on 18 to 194 elements of up to 3e8, where
+  cancellation leaves small values. AOTriton itself differs from an fp32
+  reference by up to 0.13. A norm-based tolerance would decide these rows.
 - `--validate` allocator difference. With a device reference, the timed
   hipDNN buffers come from the PyTorch caching allocator, not from
   `hipMalloc`. The same engine can thus give slightly different numbers with
@@ -642,3 +915,12 @@ The tool does not do these things yet:
   not compare runs with different values.
 - Repeats across processes (rocKE attempts). Each engine is timed in one loop
   in one process.
+- Validation of the page table. `graphs/sample_sdpa_paged.json` has one KV
+  page: K and V are `[1, 4, 64, 128]` and the page table is `[[0], [0]]`.
+  Every sequence reads page 0, so `--validate` cannot catch a kernel that
+  ignores the page table. hipDNN rejects a K or V batch size (the page count)
+  that differs from the Q batch size (`SdpaFwdNode::pre_validate_node`:
+  "batch size mismatch between Q and K"). The Q batch of the sample is 1, so
+  the sample can have only one page. In a real paged KV cache the page count
+  does not depend on the batch size (hipDNN issue ALMIOPEN-3110). Unit tests
+  check multi-page page tables in the input generator.

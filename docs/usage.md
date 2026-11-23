@@ -39,7 +39,7 @@ the same output format.
 | `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of `max(10000, --iters)` samples applies. |
 | `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each warmup and timed iteration. |
 | `--timing-block N` | 1 | Launches per timed sample. `1` times each launch on its own. `N > 1` uses rocKE block timing: before each sample, `--warmup` untimed launches and a drain; then `N` back-to-back launches in one event pair, recorded as `elapsed / N`. The first sample is discarded. Requires `--cache-mode warm`. |
-| `-s`, `--seed SEED` | 0 | Random seed for the input data. |
+| `-s`, `--seed SEED` | 0 | Random seed for the input data. The lengths (`seq_len`), the cumulative lengths (`cu_seq_len`) and the ragged offset tables of a graph are the same for the same seed. |
 
 [methodology.md](methodology.md) explains each value.
 
@@ -47,14 +47,14 @@ the same output format.
 
 | Option | Default | Description |
 |---|---|---|
-| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
+| `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). `aiter` launches AITER SDPA forward kernels directly: `aiter:auto` (AITER's own selection) and one row per backend; `aiter:auto` runs only the `aiter:auto` row. A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
 | `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner in the tuned state of the work directory. See [Kernel selection](#kernel-selection---autotune). |
 | `--benchmark-work-dir PATH` | `$DNN_BENCH_WORKSPACE/work`, else `$XDG_CACHE_HOME/dnn-benchmark/work`, else `<system temp dir>/dnn-benchmark-<user>/work` | Work directory for the caches and the kernel-selection state. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.benchmark_work_dir`. |
 | `--fresh-state`, `--no-fresh-state` | off | Runs the command on a new, empty selection state in the system temporary directory, removed when the command ends. Use it for cold first-run numbers. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.fresh_state`. |
 | `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
-| `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). |
+| `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). SDPA backward graphs run the backward kernel of the selected category (`default`, `flash` or `efficient`); see [PyTorch SDPA backward](methodology.md#pytorch-sdpa-backward). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 
 When `--plugin-path` is not given, the tool uses
@@ -90,7 +90,9 @@ The dtype-aware defaults (rtol, atol) follow the output dtype: bf16 (3e-2,
 that rounds one ULP the other way still passes. fp8 e8m0 holds only powers of
 two, so it compares log2 values (the code distance) with (0, 1): at most one
 code step either way (2x or 0.5x). `--rtol` and `--atol` also apply to the
-log2 values of e8m0 outputs. The source is `TOLERANCES` in
+log2 values of e8m0 outputs. fp16 outputs of an SDPA backward node use
+(4e-3, 1e-3); see [SDPA backward inputs](methodology.md#sdpa-backward-inputs).
+The sources are `OP_TOLERANCES` and `TOLERANCES` in
 `src/dnn_benchmarking/execution/correctness.py`.
 
 Except for a Philox forward graph, the reference comes from the timed PyTorch
@@ -213,6 +215,36 @@ Other runtimes and options:
 - The tool validates a Philox forward graph with `rng_dump` whatever
   `--pytorch-sdpa-backend` says. Its per-row reference makes no native SDPA
   call.
+
+Variable-length and ragged SDPA graphs (graphs with `seq_len`, `cu_seq_len` or
+ragged tensors) follow these rules:
+
+- A ragged output compares valid positions only. A position at or past the
+  length of its batch is not compared, so engines can write any value there.
+- A padded (non-ragged) output, including a non-ragged paged output,
+  compares every element. hipDNN defines the padding: rows at or past
+  `seq_len_q` hold O = 0 and `stats = -inf`, and gradients past a length are
+  0. A ragged Q/O over a paged K/V cache (RFC 0014 limitation 9) is ragged,
+  not paged, for this rule: it compares valid positions only.
+- `correctness.n_total` counts the compared elements. For a ragged output
+  this is not the tensor size.
+- If the tool cannot serve the layout of a graph, it refuses the graph. The
+  graph reports the status `no_engines` and the message names the tensor.
+  The exit code stays 0. Examples:
+  - an offset table that does not have `B + 1` entries;
+  - a ragged tensor that is not an operand of any SDPA node;
+  - a ragged K or V operand of a paged node: the page pool itself must stay
+    non-ragged, even when Q, O or `stats` is ragged over it;
+  - an offset or length tensor that a node computes.
+- `cu_seq_len_q_tensor_uid` / `cu_seq_len_kv_tensor_uid` need
+  `padding_mask = true` (hipDNN rocm-libraries#14560 Rule 6c); without it the
+  graph is refused the same way. A paged graph does not take `cu_seq_len` at
+  all: it is refused in the same way, naming the tensor.
+
+In the `stats` output of every SDPA forward node, an infinity in both tensors
+with the same sign is equal. This holds for dense graphs too, for example a
+bottom-right mask with `Sq > Skv`. A row with no visible key has
+`stats = -inf`, or the sink logit when the graph has sink tokens.
 
 #### Reference precision
 
@@ -337,9 +369,9 @@ dnn-benchmark -g Workloads/microbench/rocke.tar.gz --runtime hipdnn,rocke \
   --validate pytorch --timing-block 50 -o results.json
 ```
 
-- The runtimes run in the order `hipdnn`, `pytorch`, `rocke`, whatever the
-  typed order. hipDNN loads its HIP runtime before torch does, and its rows
-  exist before a later runtime can stop the process.
+- The runtimes run in the order `hipdnn`, `pytorch`, `rocke`, `aiter`,
+  whatever the typed order. hipDNN loads its HIP runtime before torch does,
+  and its rows exist before a later runtime can stop the process.
 - All runtimes use the same inputs. `--validate pytorch` gives one reference
   row per graph, and every engine row is checked against it. A Philox
   forward graph is different: see [SDPA dropout](#sdpa-dropout).
@@ -389,7 +421,9 @@ support an input.
 When PyTorch runs (`--runtime pytorch` or `--validate pytorch`), the CLI sets
 these PyTorch controls so the PyTorch baseline is not handicapped. The CLI
 overwrites any value already in the environment, so the command line is the
-only control. The tool prints the settings.
+only control. The tool prints the settings. When it replaces a different
+value from the environment, it shows a warning with the variable, the old
+value and the new value. `--quiet` does not hide this warning.
 
 | Setting | Why |
 |---|---|
@@ -484,8 +518,10 @@ Requirements and limits:
 - Graphs with one `SdpaAttributes` forward node, fp16 or bf16, packed BSHD
   Q/K/V/O, no mask tensor, dropout, statistics output, paging or sliding
   window. A causal mask (top-left or bottom-right) needs
-  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. The
-  deprecated `causal_mask` flag wins over `diagonal_alignment`, as in hipDNN.
+  `seqlen_q == seqlen_kv`, where the two alignments give the same mask. As in
+  hipDNN, the deprecated `causal_mask` flag acts as `right_bound = 0` and
+  keeps `left_bound` and `diagonal_alignment`. `left_bound = 0` is not
+  supported, as in hipDNN.
   An absent `attn_scale_value` is 1.0, as in hipDNN.
 - Variant rows need gfx950. The auto row needs gfx942, gfx950 or gfx1250 and
   a causal graph. The auto row is verified on gfx942 and gfx950. It is not
@@ -497,6 +533,11 @@ Requirements and limits:
   reports the time of the first load. For the auto row it also includes the
   compile and the first launch, because rocKE compiles the unified kernel
   inside its launch call.
+- Graphs with `seq_len`, `cu_seq_len` or ragged tensors do not apply. A
+  graph is a ragged graph when a tensor sets `ragged_offset_tensor_uid`.
+  `seq_len` means the `seq_len_q_tensor_uid` and `seq_len_kv_tensor_uid`
+  inputs; `cu_seq_len` means the `cu_seq_len_q_tensor_uid` and
+  `cu_seq_len_kv_tensor_uid` inputs.
 - `--plugin-path` selects the descriptor directory. With `--runtime rocke`
   alone, these options stop the run with exit code 2: `--engine`, `--oracle`,
   `--pmc`, `--trace`, `--perf`, `--roofline` and `--autotune`.
@@ -513,6 +554,102 @@ Each graph's table lists the hipDNN row and the rocKE rows, and `vs_best`
 compares them. Two result files, one for each runtime, also work:
 `compare --by best` pairs the fastest rocKE row with the hipDNN row.
 `--by engine` does not pair them, because the row key includes the runtime.
+
+## AITER runtime
+
+`--runtime aiter` launches AITER SDPA forward kernels directly, without
+hipDNN and without PyTorch's SDPA dispatch. Use it to compare AITER with
+hipDNN on the same graphs. The rows use the same inputs, timed loop, FLOP
+count and result schema as the hipDNN rows. AITER comes from the `aiter`
+submodule of this repository, at the commit that it pins.
+
+Each graph gets these `runtime = "aiter"` rows. The row name is also the
+row's `engine.id`:
+
+| Row | AITER entry point | Runs on |
+|---|---|---|
+| `aiter:auto` | `aiter.flash_attn_func`: AITER selects the backend | gfx90a, gfx942, gfx950; head sizes up to 256 after AITER pads them to a multiple of 8 |
+| `aiter:ck` | `aiter.mha_fwd` (CK tile) | head sizes divisible by 8, up to 256 |
+| `aiter:asm_v3` | `aiter.fmha_v3_fwd` (assembly) | gfx942 and gfx950, bf16, head sizes 128/128 or 192/128 |
+| `aiter:opus` | `aiter.fmha_fwd_bf16_opus_fwd` | gfx950, bf16, head sizes 128/128 or 192/128 |
+| `aiter:native_splitkv` | `aiter.mha_fwd_native_splitkv` | gfx942, bf16, head size 64, when AITER's split-KV heuristic splits the KV |
+| `aiter:triton` | `aiter.ops.triton.attention.mha.flash_attn_func` | gfx942 and gfx950 |
+| `aiter:gluon` | the same function with `backend="gluon"` | gfx950 with Triton 3.6 or later |
+
+AITER selects between its compiled backends with checks inside
+`_flash_attn_forward` that a caller cannot reach. The tool repeats those
+checks for the graphs that this runtime accepts
+(`execution/aiter_sdpa.py`). They follow the pinned AITER commit; a
+submodule bump must check them again. `aiter:auto` is AITER's own choice.
+On this graph form it takes the first of: native split-KV, OPUS (192/128
+only), the assembly kernel when `seqlen_q > 128`, and CK. It pads head
+sizes that are not a multiple of 8 inside the timed call. The `aiter:opus`
+row also runs the 128/128 OPUS kernel, which `aiter:auto` uses only with
+`AITER_ENABLE_FMHA_OPUS=1`.
+
+Read the rows as follows:
+
+- `aiter:auto` is what an AITER user gets from the public API.
+- In the default staged timing, the fastest backend row minus `aiter:auto`
+  is the loss from AITER's own backend selection. In block or events
+  timing, a short kernel's row measures the host launch cost of its entry
+  point instead, and the row gets a `host-bound` warning. Compare such rows
+  in staged timing.
+- `aiter:auto`, `aiter:triton` and `aiter:gluon` allocate their output inside
+  the timed call, as their entry points do. The Triton forward also
+  zero-fills both the output and the LSE buffer on every call, so
+  `aiter:triton` includes two fill kernels. The Gluon forward allocates the
+  output without a fill and skips the LSE buffer, so `aiter:gluon` includes
+  no fill. The other rows write the graph's output tensor.
+- Every row is reported on its own, in the table and as one JSON row with
+  `runtime = "aiter"` and `engine.name = "aiter:<backend>"`. The tool does
+  not pick a best AITER row; take the fastest one from the JSON, or compare
+  an AITER result file with `compare --by best`.
+
+`--runtime aiter:auto` runs only `aiter:auto`, AITER's own selection, for
+each graph; it combines with other runtimes like `aiter` does (for example
+`--runtime hipdnn,aiter:auto`). `run.config.aiter_rows` records `auto`, or
+`all` for `--runtime aiter`; the rows keep `runtime = "aiter"`.
+
+Requirements and limits:
+
+- A ROCm build of PyTorch and the `aiter` package. On Linux with ROCm
+  torch, `setup_env.py` fetches the pinned `aiter` submodule and installs it
+  (see [setup.md](setup.md)).
+- AITER compiles a backend's host module (JIT) the first time the backend
+  runs in an install. It takes its ROCm root from `ROCM_HOME`, else
+  `ROCM_PATH`, and its compiler from the first `hipcc` on `PATH`. The
+  `setup_env.py` environment sets `ROCM_PATH` to the hipDNN prefix, which
+  has no HIP runtime to link. So, with the pip ROCm SDK installed, the tool
+  sets `ROCM_HOME` to the SDK's devel package (unless `ROCM_HOME` is set)
+  and puts the venv's `bin` directory, which holds the SDK's `hipcc`, first
+  on `PATH`. The compiled modules stay in the `aiter-jit` directory of the
+  venv (`AITER_JIT_DIR`, unless it is set). So `--clean` removes them, and
+  each venv compiles against its own torch.
+  `build_ms` is the first launch of the row: the compile on a cold JIT
+  cache (minutes for a CK module), the module load otherwise. Triton
+  compiles each kernel once per process.
+- The same graph form as the rocKE runtime: one `SdpaAttributes` forward
+  node, fp16 or bf16, packed BSHD Q/K/V/O, no mask tensor, dropout,
+  statistics output, paging or sliding window. V and O can have a head size
+  other than Q and K (for example 192/128). AITER aligns a causal mask to
+  the bottom right, so a top-left causal mask needs `seqlen_q ==
+  seqlen_kv`; a bottom-right causal mask runs on any shape. The deprecated
+  causal flags follow the rocKE rule above. An absent `attn_scale_value` is
+  1.0, as in hipDNN.
+- Other arches report `no engines applicable`. With `--runtime aiter` alone,
+  these options stop the run with exit code 2: `--engine`, `--plugin-path`,
+  `--oracle`, `--pmc`, `--trace`, `--perf`, `--roofline`, `--autotune` and
+  `--fast`.
+- The gfx1250 assembly and FlyDSL forward kernels, FP8 and the varlen entry
+  points have no row.
+
+To compare AITER with hipDNN, run both runtimes in one run:
+
+```bash
+dnn-benchmark -g Workloads/microbench/aiter.tar.gz --runtime hipdnn,aiter \
+  --validate pytorch -o both.json
+```
 
 ## Work directory (`--benchmark-work-dir`)
 
@@ -678,13 +815,16 @@ operation graph build and the workspace allocation are not timed.
    against the same reference. For a Philox forward graph, it validates them
    against a reference built from the child's own `rng_dump` (see
    [SDPA dropout](#sdpa-dropout)). A failed child sets `oracle_error` and keeps
-   the row.
+   the row. With `--cache-mode cold`, the benchmark process frees its
+   512 MiB flush buffer before each child starts.
 4. `--oracle-timeout` (default 1800 s) bounds each child. A hung search thus
    costs the tuned result of one row. After Ctrl-C, the partial result file
    keeps every graph that finished, with its tuned results; the graph that
    was running is not in it.
-5. When a tuned run fails the stall gate, the tool measures every row of
-   that graph again without the stall gate, the tuned runs included.
+5. When a tuned run fails the stall gate, in the hipDNN or the PyTorch
+   child, the tool measures every row of that graph again without the stall
+   gate, the tuned runs included. Both children then time without the stall
+   gate, as the OOTB rows do.
 
 A tuned build prepares every candidate that the provider can sample, so it is
 usually slower than the OOTB build. Providers that support the knob (today the
@@ -701,7 +841,7 @@ no speedup applies:
 | Label | Meaning |
 |---|---|
 | `no-search` | The engine exposes no `global.benchmarking` knob, or the PyTorch graph has no conv or matmul node, so the tuned run re-measured the OOTB plan. |
-| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. This happens when a stall-gate fallback times the OOTB plan in `events` mode and the tuned PyTorch child times in `staged` mode. |
+| `mixed-timing` | The two plans were timed in different modes (`timing.mode`), so their medians do not compare. Both tuned children use the stall-gate state of the run, so a stall-gate fallback does not cause this label. |
 | `invalid` | The OOTB or the tuned plan failed validation. |
 | `failed` | The tuned run did not produce a result (`oracle_error`). |
 | `n/a` | No comparison is available. |
@@ -845,6 +985,22 @@ with code 143 without it. The file then holds the last periodic write.
 When more than one condition applies, 3 wins over 1, and 1 wins over 0.
 Only `engine` rows count: the `reference` row that `--validate pytorch` adds
 never changes the exit code.
+
+The tool checks flag values and their combinations before it looks for graph
+files. A bad option combination thus exits 2 also when no graph file exists.
+The output path, `--profiling-output-dir` and the profiler tools are checked
+after the graph files are found, so a missing graph file exits 1 first.
+
+These flags were renamed or removed. The usage error names the
+replacement:
+
+| Old flag | Use |
+|---|---|
+| `--backend`, `-b` | `--runtime`, `-r` |
+| `--emit-trace` | `--trace` |
+| `--metrics-tier` | `--metrics` or `--no-metrics` |
+| `--cache-dir`, `--hipdnn-cache-dir` | `--benchmark-work-dir` |
+| `--oracle-mode` | `--oracle`. The `plan` and `exhaustive` modes are removed. |
 
 ## compare
 

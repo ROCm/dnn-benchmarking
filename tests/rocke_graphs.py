@@ -41,11 +41,16 @@ _ATTRIBUTES = {
 }
 
 
-def sdpa_graph(b=1, hq=32, hkv=8, s=2048, d=128, dtype="half", **attributes):
+def sdpa_graph(
+    b=1, hq=32, hkv=8, s=2048, d=128, dtype="half", s_kv=None, d_v=None, **attributes
+):
     """An SDPA forward graph in the form of the rocKE perf-oracle workloads.
 
     hipDNN can deserialize it, so it also runs through hipDNN engines.
+    ``s_kv`` and ``d_v`` default to ``s`` and ``d``.
     """
+    s_kv = s if s_kv is None else s_kv
+    d_v = d if d_v is None else d_v
     return {
         "name": "sdpa",
         "compute_data_type": "float",
@@ -53,9 +58,9 @@ def sdpa_graph(b=1, hq=32, hkv=8, s=2048, d=128, dtype="half", **attributes):
         "intermediate_data_type": dtype,
         "tensors": [
             bshd_tensor(1, "query", b, hq, s, d, dtype),
-            bshd_tensor(2, "key", b, hkv, s, d, dtype),
-            bshd_tensor(3, "value", b, hkv, s, d, dtype),
-            bshd_tensor(4, "output", b, hq, s, d, dtype),
+            bshd_tensor(2, "key", b, hkv, s_kv, d, dtype),
+            bshd_tensor(3, "value", b, hkv, s_kv, d_v, dtype),
+            bshd_tensor(4, "output", b, hq, s, d_v, dtype),
         ],
         "nodes": [
             {

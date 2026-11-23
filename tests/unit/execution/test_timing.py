@@ -86,6 +86,9 @@ def _install_fake_hip(
         def zeros(self) -> None:
             log.append("flush")
 
+        def __del__(self) -> None:
+            log.append("free")
+
     fake = types.SimpleNamespace(
         HipEvent=FakeEvent,
         HipStallGate=FakeGate,
@@ -255,14 +258,21 @@ def _install_fake_torch_cuda(monkeypatch, log: List[str]) -> None:
         def zero_(self) -> None:
             log.append("flush")
 
+        def __del__(self) -> None:
+            log.append("free")
+
     cuda = types.SimpleNamespace(
         Event=Event,
         current_stream=lambda: "torch-stream",
         synchronize=lambda: log.append("device_sync"),
+        empty_cache=lambda: log.append("empty_cache"),
     )
-    torch = types.SimpleNamespace(
-        cuda=cuda, uint8="uint8", empty=lambda *a, **kw: Buffer()
-    )
+
+    def empty(*args, **kwargs) -> Buffer:
+        log.append("alloc")
+        return Buffer()
+
+    torch = types.SimpleNamespace(cuda=cuda, uint8="uint8", empty=empty)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
 
@@ -290,19 +300,34 @@ def test_cold_flushes_before_every_events_mode_iteration(monkeypatch, backend) -
     assert len(m.kernel_ms) == 2
 
 
-def test_first_call_ms_covers_first_enqueue_and_its_sync(monkeypatch) -> None:
+@pytest.mark.parametrize("backend", ["hip", "torch"])
+def test_first_call_ms_covers_first_enqueue_and_its_sync(monkeypatch, backend) -> None:
+    """The first-call cost includes the device sync: the enqueue only submits,
+    the compile and the first kernel finish during the sync."""
     log: List[str] = []
     clock = FakeClock()
-    _install_fake_hip(monkeypatch, log, clock=clock)
+    fake = _install_fake_hip(monkeypatch, log, clock=clock)
     calls = []
 
     def enqueue() -> None:
         calls.append(1)
         clock.advance_ms(30.0 if len(calls) == 1 else 1.0)  # first call compiles
 
-    m = measure(enqueue, stream=7, policy=TimingPolicy(warmup_iters=2, iters=1))
+    def device_sync() -> None:
+        log.append("device_sync")
+        clock.advance_ms(20.0)  # the device drains the first call
 
-    assert m.first_call_ms == pytest.approx(30.0)
+    if backend == "torch":
+        _install_fake_torch_cuda(monkeypatch, log)
+        monkeypatch.setattr(sys.modules["torch"].cuda, "synchronize", device_sync)
+    else:
+        monkeypatch.setattr(fake, "hip_device_synchronize", device_sync)
+
+    m = measure(
+        enqueue, stream=7, policy=TimingPolicy(warmup_iters=2, iters=1), timer=backend
+    )
+
+    assert m.first_call_ms == pytest.approx(50.0)
     assert m.warmup_iters == 2
 
 
@@ -316,6 +341,48 @@ def test_cold_flush_allocation_failure_names_warm_mode(monkeypatch) -> None:
             stream=7,
             policy=TimingPolicy(warmup_iters=1, iters=1, cache_mode="cold"),
         )
+
+
+@pytest.mark.parametrize("backend", ["hip", "torch"])
+def test_released_flush_buffer_is_freed_and_reallocated(monkeypatch, backend) -> None:
+    """A tuned child must not run with the parent's 512 MiB flush buffer
+    still held; the next cold loop allocates a new one."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log, staged=backend == "torch")
+    if backend == "torch":
+        _install_fake_torch_cuda(monkeypatch, log)
+    policy = TimingPolicy(warmup_iters=0, iters=1, cache_mode="cold")
+
+    measure(_enqueue(log), stream=7, policy=policy, timer=backend)
+    assert "free" not in log
+
+    timing_module.release_flush_buffers()
+
+    # torch keeps freed blocks in its cache until empty_cache().
+    released = ["free", "empty_cache"] if backend == "torch" else ["free"]
+    assert log[-len(released) :] == released
+    measure(_enqueue(log), stream=7, policy=policy, timer=backend)
+    assert sum(e.startswith("alloc") for e in log) == 2
+
+
+def test_flush_buffers_get_one_exit_handler_across_releases(monkeypatch) -> None:
+    """Each row with --oracle releases and reallocates the buffer; the exit
+    handler must not pile up, and it must free the buffer held at exit."""
+    log: List[str] = []
+    _install_fake_hip(monkeypatch, log)
+    handlers = []
+    monkeypatch.setattr(timing_module.atexit, "register", handlers.append)
+    monkeypatch.setattr(timing_module, "_flush_exit_registered", False)
+    policy = TimingPolicy(warmup_iters=0, iters=1, cache_mode="cold")
+
+    for _ in range(3):
+        measure(_enqueue(log), stream=7, policy=policy)
+        timing_module.release_flush_buffers()
+    measure(_enqueue(log), stream=7, policy=policy)
+
+    assert len(handlers) == 1
+    handlers[0]()
+    assert log[-1] == "free"
 
 
 def _install_fake_torch_sync_debug(monkeypatch, modes: List[str]):

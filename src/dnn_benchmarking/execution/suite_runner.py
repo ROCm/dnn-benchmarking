@@ -32,6 +32,7 @@ from typing import (
 from ..common import torch_support
 from ..common.exceptions import UnsupportedGraphError
 from ..config.benchmark_config import (
+    AiterRows,
     PyTorchSdpaBackendName,
     ReferencePrecision,
     SuiteConfig,
@@ -41,10 +42,16 @@ from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
 from ..execution.timing import Measurement, StallFallbackError, Timer
 from ..graph.tensor_info import TensorInfo
+from ..graph.varlen import resolve_varlen_layouts
 from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
-from ..reporting.statistics import BenchmarkStats, TimingInfo, noise_warnings
+from ..reporting.statistics import (
+    BenchmarkStats,
+    TimingInfo,
+    host_bound_warnings,
+    noise_warnings,
+)
 from ..reporting.suite_results import (
     CorrectnessResult,
     GraphResult,
@@ -53,6 +60,7 @@ from ..reporting.suite_results import (
     graph_id_for,
 )
 from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRegistry
+from .aiter_sdpa import AiterBackend, AiterDevice, aiter_problem, backend_rows
 from .correctness import check_correctness, check_rng_dump, mismatch, unchecked
 from .oracle import run_hipdnn_tuned, run_pytorch_tuned
 from .rocke_sdpa import (
@@ -64,6 +72,7 @@ from .rocke_sdpa import (
     sdpa_problem,
 )
 from .sdpa_dropout import RngDump, find_rng_dump, philox_without_dump
+from .sdpa_graph import DenseSdpa
 
 
 @dataclass
@@ -187,10 +196,15 @@ def _measure_row(
         row.clocks_after = probe.clocks()
 
     kernel = BenchmarkStats.from_timings(m.kernel_ms)
+    host = BenchmarkStats.from_timings(m.host_ms)
     row.ootb.gpu_kernel_stats = kernel
-    row.ootb.host_stats = BenchmarkStats.from_timings(m.host_ms)
+    row.ootb.host_stats = host
     row.ootb.timing = TimingInfo.from_measurement(m)
-    warnings = list(row.warnings or []) + noise_warnings(kernel)
+    warnings = (
+        list(row.warnings or [])
+        + noise_warnings(kernel)
+        + host_bound_warnings(kernel, host, m.mode)
+    )
     if m.capped:
         warnings.append("capped at max_iters")
     if m.fallback_reason:
@@ -300,6 +314,9 @@ def _graph_context(
 ) -> _GraphContext:
     """Generate inputs and per-graph analytical FLOPs/IO (shape-only, once)."""
     graph_name = graph_json.get("name", graph_path.stem)
+    input_data = generate_input_data(tensor_infos, config.seed, graph_json)
+    # Rebind: every consumer, and the analytical IO, sees the resolved layouts.
+    tensor_infos = resolve_varlen_layouts(tensor_infos, graph_json, input_data)
     ctx = _GraphContext(
         graph_path=graph_path,
         graph_json=graph_json,
@@ -307,12 +324,12 @@ def _graph_context(
         tensor_infos=tensor_infos,
         config=config,
         reporter=reporter,
-        input_data=generate_input_data(tensor_infos, config.seed, graph_json),
+        input_data=input_data,
         philox=find_rng_dump(graph_json),
     )
     if config.metrics.basic:
         try:
-            ctx.flops = compute_flops(graph_json)
+            ctx.flops = compute_flops(graph_json, ctx.input_data)
         except Exception as e:
             warn_once("analytical", f"compute_flops failed for {graph_name}: {e}")
         try:
@@ -1186,6 +1203,10 @@ def _run_graph(
     if any(p.needs_inputs for p in plans):
         try:
             ctx = _graph_context(graph_path, graph_json, tensor_infos, config, reporter)
+        except UnsupportedGraphError as e:
+            graph.engine_ids = []
+            graph.message = str(e)
+            return graph
         except Exception as e:
             errors.append(f"Input data generation failed: {type(e).__name__}: {e}")
             graph.error = "; ".join(errors)
@@ -1368,7 +1389,7 @@ def rocke_session(config: SuiteConfig, reporter: Reporter) -> RockeSession:
     """
     import torch
 
-    from .rocke_executor import device_arch, device_num_cus
+    from ..common.torch_support import device_arch, device_num_cus
     from .rocke_sdpa import load_catalog
 
     device = torch.device("cuda")
@@ -1445,22 +1466,41 @@ def _run_rocke_row(
     session: RockeSession,
 ) -> ProviderEngineResult:
     """Load, time and validate one rocKE kernel."""
-    config = ctx.config
+
+    def executor() -> Any:
+        from .rocke_executor import RockeExecutor
+
+        return RockeExecutor(
+            kernel, problem, ctx.config.timing_policy, loaded=session.loaded
+        )
+
+    return _run_executor_row(ctx, "rocke", kernel.name, session.version, executor)
+
+
+def _run_executor_row(
+    ctx: _GraphContext,
+    runtime: str,
+    name: str,
+    version: str,
+    make_executor: Callable[[], Any],
+) -> ProviderEngineResult:
+    """Prepare, time and validate one row of a runtime that launches on torch tensors.
+
+    The executor (rocKE or AITER) provides ``device``, ``prepare``,
+    ``build_time_ms``, ``benchmark`` and ``execute_once``.
+    """
     row = ProviderEngineResult(
-        runtime="rocke",
+        runtime=runtime,
         # The row name is stable across runs, so it is the engine ID.
-        engine_id=kernel.name,
-        engine_name=kernel.name,
+        engine_id=name,
+        engine_name=name,
         status="success",
-        engine_version=session.version,
+        engine_version=version,
     )
     try:
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
-        from .rocke_executor import RockeExecutor
 
-        executor = RockeExecutor(
-            kernel, problem, config.timing_policy, loaded=session.loaded
-        )
+        executor = make_executor()
         with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
             bm.allocate_all()
             bm.load_input_data(ctx.input_data)
@@ -1478,3 +1518,94 @@ def _run_rocke_row(
             ProviderEngineResult.error_row, row, f"{type(e).__name__}: {e}"
         )
     return row
+
+
+@dataclass(frozen=True)
+class AiterSession:
+    """Per-suite AITER state.
+
+    Attributes:
+        device: The device facts that AITER's backend checks read.
+        version: Installed ``amd-aiter`` package version.
+    """
+
+    device: AiterDevice
+    version: str
+
+
+def aiter_session() -> AiterSession:
+    """Read the device once per suite.
+
+    Raises:
+        Exception: AITER's Triton MHA module does not import.
+    """
+    import torch
+
+    from .aiter_executor import aiter_device
+
+    return AiterSession(
+        device=aiter_device(torch.device("cuda")),
+        version=_package_version("amd-aiter"),
+    )
+
+
+def aiter_planner(session: AiterSession) -> GraphPlanner:
+    """Plan ``aiter:auto`` and every AITER backend that runs an SDPA graph.
+
+    With ``--runtime aiter:auto`` only ``aiter:auto`` runs. A graph that AITER
+    cannot run gets no rows and no inputs; alone, its status is
+    ``no_engines``.
+    """
+
+    def plan(
+        graph_path: Path,
+        graph_json: Dict[str, Any],
+        tensor_infos: list,
+        config: SuiteConfig,
+        reporter: Reporter,
+    ) -> RuntimePlan:
+        try:
+            problem = aiter_problem(graph_json, tensor_infos)
+            backends = backend_rows(
+                problem, session.device, auto_only=config.aiter_rows is AiterRows.AUTO
+            )
+        except UnsupportedGraphError as e:
+            return RuntimePlan("aiter", message=str(e))
+        except Exception as e:
+            return RuntimePlan(
+                "aiter",
+                error=f"AITER backend selection failed: {type(e).__name__}: {e}",
+            )
+
+        def rows(ctx: Optional[_GraphContext]) -> List[ProviderEngineResult]:
+            return [
+                _report_row(
+                    reporter,
+                    backend.row_name,
+                    lambda b=backend: _run_aiter_row(ctx, b, problem, session),
+                )
+                for backend in backends
+            ]
+
+        # No hipDNN engine IDs: one 0 sentinel per row, as for PyTorch.
+        return RuntimePlan(
+            "aiter", engine_ids=[0] * len(backends), rows=rows, needs_inputs=True
+        )
+
+    return plan
+
+
+def _run_aiter_row(
+    ctx: _GraphContext,
+    backend: AiterBackend,
+    problem: DenseSdpa,
+    session: AiterSession,
+) -> ProviderEngineResult:
+    """Compile or load, time and validate one AITER backend."""
+
+    def executor() -> Any:
+        from .aiter_executor import AiterExecutor
+
+        return AiterExecutor(backend, problem, ctx.config.timing_policy)
+
+    return _run_executor_row(ctx, "aiter", backend.row_name, session.version, executor)

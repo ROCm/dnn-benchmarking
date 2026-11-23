@@ -227,6 +227,9 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "fast": config.fast,
         "pytorch_sdpa_backend": config.pytorch_sdpa_backend.value if pytorch else None,
         "pytorch_rocm_fa_library": config.pytorch_rocm_fa_library if pytorch else None,
+        "aiter_rows": (
+            config.aiter_rows.value if RuntimeName.AITER in config.runtimes else None
+        ),
         "metrics": metrics.basic,
         "profiling": {
             "pmc": metrics.pmc_set,
@@ -408,14 +411,20 @@ def _warn_oracle(reporter: Reporter) -> None:
 def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
     """Set PyTorch's kernel-selection controls when PyTorch is timed or used.
 
-    Must run before the first PyTorch conv or SDPA call.
+    Must run before the first PyTorch conv or SDPA call. A replaced shell
+    value is a warning, so ``--quiet`` still shows it.
     """
     if not (
         RuntimeName.PYTORCH in config.runtimes
         or config.validation.provider is ReferenceProviderName.PYTORCH
     ):
         return
-    effective = apply_pytorch_environment()
+    effective, replaced = apply_pytorch_environment()
+    for name, old in replaced.items():
+        reporter.warning(
+            f"PyTorch kernel selection: {name}={old!r} from the environment is "
+            f"replaced with {name}={effective[name]!r}"
+        )
     settings = ", ".join(f"{k}={v}" for k, v in effective.items())
     tuned = "; tuned runs use an isolated subprocess" if config.oracle else ""
     reporter.info(f"PyTorch kernel selection: {settings}{tuned}")

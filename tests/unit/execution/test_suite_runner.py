@@ -151,11 +151,14 @@ class Fake:
         self.events = []
         self.torch_options = []
         self.torch_buffer_devices = []
+        self.buffer_devices = []  # device of each hipDNN BufferManager
+        self.torch_outputs_on_gpu = False
         self.torch_outputs_written = False
         self.policies = []
         # (call, handle, HIPDNN_DISABLE_CACHE) per plan build/run, in order;
         # ("tuned", engine_id, None) per tuned-child start.
         self.calls = []
+        self.buffer_infos = []  # TensorInfo lists the buffer managers received
         self.tuned = []  # keyword arguments of each run_hipdnn_tuned call
         self.stall = set()  # engine ids (or 'pytorch') whose stall gate fails
 
@@ -218,6 +221,8 @@ def fake(monkeypatch):
     class BufferManager:
         def __init__(self, tensor_infos, device=None):
             self.nan_uids = set()
+            f.buffer_devices.append(device)
+            f.buffer_infos.append(tensor_infos)
 
         def __enter__(self):
             return self
@@ -337,6 +342,13 @@ def fake_torch(fake, monkeypatch):
             fake.torch_outputs_written = False
 
         def get_tensors(self):
+            if fake.torch_outputs_on_gpu:
+                import torch
+
+                return {
+                    t.uid: SimpleNamespace(is_cuda=True, detach=lambda: torch.zeros(4))
+                    for t in self._outputs
+                }
             return {t.uid: SimpleNamespace(is_cuda=False) for t in self._outputs}
 
         def get_output_tensors(self):
@@ -573,7 +585,9 @@ def test_engine_failure_is_isolated_to_its_row(fake, stage, error, status, messa
 
 
 def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch):
-    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
+    monkeypatch.setattr(
+        suite_runner, "compute_flops", lambda g, data=None: 2_000_000_000
+    )
     fake.discovered = [1]
     # Median 1 ms, mean 1.4 ms: throughput must come from the median.
     # Every timing field off its default, so a row cannot claim a cache mode,
@@ -654,7 +668,9 @@ def test_tuned_child_starts_after_the_ootb_row_is_timed_and_validated(fake, refe
 
 
 def test_no_metrics_skips_probes_and_throughput(fake, monkeypatch):
-    monkeypatch.setattr(suite_runner, "compute_flops", lambda g: 2_000_000_000)
+    monkeypatch.setattr(
+        suite_runner, "compute_flops", lambda g, data=None: 2_000_000_000
+    )
     fake.discovered = [1]
     fake.clocks = [{"sclk_mhz": 1700}]
 
@@ -706,6 +722,138 @@ def test_unsupported_graph_still_gets_the_pytorch_reference_row(fake_torch):
         ("pytorch", "reference", None, "reference")
     ]
     assert graph.results[0].ootb.gpu_kernel_stats is not None
+
+
+def _varlen_graph(sources=("q", "kv")):
+    batches, heads, seq, head_dim = 3, 1, 8, 4
+
+    def tensor(uid, name, dims, dtype="float"):
+        return {
+            "uid": uid,
+            "name": name,
+            "dims": dims,
+            "strides": [int(np.prod(dims[i + 1 :])) for i in range(len(dims))],
+            "data_type": dtype,
+            "virtual": False,
+        }
+
+    dims = [batches, heads, seq, head_dim]
+    inputs = {"q_tensor_uid": 1, "k_tensor_uid": 2, "v_tensor_uid": 3}
+    inputs.update(
+        {
+            f"seq_len_{s}_tensor_uid": uid
+            for s, uid in (("q", 7), ("kv", 8))
+            if s in sources
+        }
+    )
+    return {
+        "name": "varlen",
+        "tensors": [
+            tensor(1, "q", dims),
+            tensor(2, "k", dims),
+            tensor(3, "v", dims),
+            tensor(4, "o", dims),
+            tensor(5, "stats", [batches, heads, seq, 1]),
+            tensor(7, "seq_len_q", [batches], "int32"),
+            tensor(8, "seq_len_kv", [batches], "int32"),
+        ],
+        "nodes": [
+            {
+                "name": "sdpa",
+                "type": "SdpaAttributes",
+                "inputs": inputs,
+                "outputs": {"o_tensor_uid": 4, "stats_tensor_uid": 5},
+                "attributes": {"attn_scale_value": 0.5},
+            }
+        ],
+    }
+
+
+def _run_varlen(graph_json, **config):
+    from dnn_benchmarking.graph.loader import GraphLoader
+
+    out = io.StringIO()
+    graph = suite_runner.run_graph(
+        PATH,
+        graph_json,
+        GraphLoader().extract_tensor_info(graph_json),
+        SuiteConfig(**config),
+        Reporter(out),
+        [suite_runner.hipdnn_planner(_Handle())],
+    )
+    return graph, out.getvalue()
+
+
+def test_varlen_graph_gives_the_buffer_manager_resolved_layouts(fake):
+    fake.discovered = [1]
+
+    _run_varlen(_varlen_graph())
+
+    (infos,) = fake.buffer_infos
+    operands = {i.name: i for i in infos}
+    for name in ("q", "k", "v", "o", "stats"):
+        assert operands[name].varlen is not None, name
+        assert len(operands[name].varlen.lengths) == 3
+
+
+def test_varlen_graph_reports_the_per_batch_flops_not_the_dense_count(fake):
+    from dnn_benchmarking.execution.buffer_manager import generate_input_data
+    from dnn_benchmarking.graph.loader import GraphLoader
+    from dnn_benchmarking.metrics import compute_flops
+
+    fake.discovered = [1]
+    graph_json = _varlen_graph()
+    config = SuiteConfig()
+    infos = GraphLoader().extract_tensor_info(graph_json)
+    data = generate_input_data(infos, config.seed, graph_json)
+    expected = compute_flops(graph_json, data)
+    dense = compute_flops(graph_json)
+    assert expected != dense
+
+    (row,) = _run_varlen(graph_json)[0].results
+
+    assert row.analytical_flops == expected
+
+
+def test_varlen_sdpa_stats_with_matching_infinities_pass_validation(fake, monkeypatch):
+    """Dead rows hold -inf in the engine and the reference; the resolved tensor
+    infos must reach the check so the stats output compares with matching
+    infinities."""
+    fake.discovered = [1]
+    shape = (3, 1, 8)
+    stats = np.full((*shape, 1), -np.inf, np.float32)
+    out = np.zeros((*shape, 4), np.float32)
+    outputs = {4: out, 5: stats}
+
+    def prepare(ctx):
+        ctx.reference_outputs = {
+            uid: suite_runner.ReferenceOutput(data=data.copy(), tensor_uid=uid)
+            for uid, data in outputs.items()
+        }
+
+    monkeypatch.setattr(suite_runner, "_prepare_references", prepare)
+    monkeypatch.setattr(
+        suite_runner.BufferManager,
+        "get_output_data",
+        lambda self, uid: outputs[uid].copy(),
+    )
+
+    graph, _ = _run_varlen(
+        _varlen_graph(), validation=ValidationConfig(provider="pytorch")
+    )
+
+    (infos,) = fake.buffer_infos
+    assert sum(next(i for i in infos if i.name == "stats").varlen.lengths) > 0
+    (row,) = graph.results
+    assert row.verdict == "passed"
+
+
+def test_graph_the_varlen_resolver_refuses_has_no_engines_and_names_the_tensor(fake):
+    graph, _ = _run_varlen(_varlen_graph(sources=("q",)))
+
+    assert graph.status == "no_engines"
+    assert graph.results == [] and graph.error is None
+    assert "seq_len" in graph.message and "'q'" in graph.message
 
 
 @pytest.mark.parametrize(
@@ -795,6 +943,7 @@ def test_failed_timed_reference(
 
     reference, engine = _validate(pytorch_sdpa_backend=sdpa_backend)[0].results
 
+    assert reference.role == "reference"
     assert reference.status == reference_status
     assert (reference.error_message or reference.skip_reason).startswith(
         reference_reason
@@ -1323,6 +1472,23 @@ def test_reference_warnings_go_on_the_reference_row_only(fake_torch, monkeypatch
 
     assert "manual op" in reference.warnings
     assert "manual op" not in (engine.warnings or [])
+
+
+@pytest.mark.parametrize("profiling, device", [(False, "cuda"), (True, None)])
+def test_profiled_run_keeps_host_only_references(
+    fake_torch, monkeypatch, profiling, device
+):
+    """A profiling child allocates its own VRAM, so a profiled run must not
+    keep the PyTorch reference (and hipDNN buffers) on the device."""
+    from dnn_benchmarking.metrics import profiling_orchestrator
+
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
+    fake_torch.discovered = [1]
+    fake_torch.torch_outputs_on_gpu = True
+
+    _validate(metrics=MetricsConfig(perf=profiling))
+
+    assert fake_torch.buffer_devices == [device]
 
 
 def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):
@@ -2261,3 +2427,92 @@ def test_philox_row_passes_under_a_strict_sdpa_backend(real_reference):
 
     (row,) = graph.results
     assert row.verdict == "passed", row.ootb.correctness
+
+
+@pytest.fixture
+def fake_aiter(fake_torch, monkeypatch):
+    """A bf16 d128 SDPA problem and a fake AITER executor; rows validate
+    against the reference of ``fake_torch``. A row in ``wrong`` writes no
+    output."""
+    from dnn_benchmarking.execution import aiter_executor
+    from dnn_benchmarking.execution.aiter_sdpa import aiter_problem
+    from dnn_benchmarking.graph.loader import GraphLoader
+    from tests.rocke_graphs import sdpa_graph
+
+    fake = fake_torch
+    fake.wrong = set()
+    graph = sdpa_graph(dtype="bfloat16", d=128)
+    problem = aiter_problem(graph, GraphLoader().extract_tensor_info(graph))
+
+    class AiterExecutor:
+        def __init__(self, backend, problem, policy):
+            self.name, self.policy = backend.row_name, policy
+            self.device = "cuda:0"
+            self.build_time_ms = 2.5
+
+        def prepare(self, tensors):
+            pass
+
+        def benchmark(self):
+            return _stall_aware(fake, self.name, self.policy)
+
+        def execute_once(self):
+            fake.torch_outputs_written = self.name not in fake.wrong
+
+    monkeypatch.setattr(suite_runner, "aiter_problem", lambda graph, infos: problem)
+    monkeypatch.setattr(aiter_executor, "AiterExecutor", AiterExecutor)
+    return fake
+
+
+def _run_aiter(**config):
+    from dnn_benchmarking.execution.aiter_sdpa import AiterDevice
+
+    session = suite_runner.AiterSession(
+        device=AiterDevice(arch="gfx942", num_cus=304, gluon=False), version="0.1"
+    )
+    return suite_runner.run_graph(
+        PATH,
+        GRAPH,
+        TENSORS,
+        SuiteConfig(validation=ValidationConfig(provider="pytorch"), **config),
+        Reporter(io.StringIO()),
+        [suite_runner.aiter_planner(session)],
+    )
+
+
+def test_aiter_rows_are_auto_then_each_backend(fake_aiter):
+    fake_aiter.wrong = {"aiter:asm_v3"}
+
+    graph = _run_aiter()
+
+    assert [(r.runtime, r.engine_name, r.verdict) for r in graph.results] == [
+        ("pytorch", "pytorch", "reference"),
+        ("aiter", "aiter:auto", "passed"),
+        ("aiter", "aiter:ck", "passed"),
+        ("aiter", "aiter:asm_v3", "failed"),
+        ("aiter", "aiter:triton", "passed"),
+    ]
+    assert graph.results[2].engine_id == "aiter:ck"
+    assert graph.results[2].engine_version == "0.1"
+    assert graph.results[2].ootb.cpu_build_time_ms == 2.5
+
+
+def test_aiter_rows_auto_runs_only_aiters_own_selection(fake_aiter):
+    graph = _run_aiter(runtime="aiter:auto")
+
+    assert [(r.engine_name, r.verdict) for r in graph.results] == [
+        ("pytorch", "reference"),
+        ("aiter:auto", "passed"),
+    ]
+
+
+def test_aiter_without_a_problem_adds_no_rows(fake_aiter, monkeypatch):
+    def unsupported(graph, infos):
+        raise UnsupportedGraphError("AITER runtime needs 4-D Q/K/V/O tensors")
+
+    monkeypatch.setattr(suite_runner, "aiter_problem", unsupported)
+
+    graph = _run_aiter()
+
+    assert (graph.status, graph.results) == ("no_engines", [])
+    assert graph.message == "AITER runtime needs 4-D Q/K/V/O tensors"

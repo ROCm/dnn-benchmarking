@@ -438,6 +438,44 @@ def test_main_without_matching_graphs_exits_1(tmp_path, monkeypatch, capsys) -> 
     assert "No graph files found" in capsys.readouterr().err
 
 
+def test_bad_option_combination_with_missing_graph_exits_2(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Usage errors win over graph resolution, which would exit 1."""
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        cli_main(["--graph", str(tmp_path / "none.json"), "-r", "pytorch", "-e", "1"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--runtime pytorch" in err
+    assert "No graph files found" not in err
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        (["--backend", "pytorch"], "--runtime"),
+        (["-b", "pytorch"], "--runtime"),
+        (["--emit-trace", "pftrace"], "--trace"),
+        (["--metrics-tier=off"], "--no-metrics"),
+        (["--cache-dir", "d"], "--benchmark-work-dir"),
+        (["--hipdnn-cache-dir", "d"], "--benchmark-work-dir"),
+        (["--oracle-mode", "plan"], "--oracle"),
+    ],
+)
+def test_renamed_flag_usage_error_names_the_new_flag(
+    tmp_path, monkeypatch, capsys, old, new
+) -> None:
+    monkeypatch.setenv("DNN_BENCH_WORKSPACE", str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        cli_main(["--graph", "g.json", *old])
+    assert exc.value.code == 2
+    # The lines after the "unrecognized arguments" line name the new flag.
+    err = capsys.readouterr().err
+    hint = err.split("unrecognized arguments:", 1)[1].split("\n", 1)[1]
+    assert old[0].split("=")[0] in hint and new in hint
+
+
 def test_main_records_its_argv_and_wires_verbose(
     tmp_path, runtime, monkeypatch, capsys
 ) -> None:
@@ -495,6 +533,7 @@ def test_run_config_records_effective_values_that_compare_checks(
         "fast": False,
         "pytorch_sdpa_backend": "flash",
         "pytorch_rocm_fa_library": "aotriton",
+        "aiter_rows": None,  # AITER not selected
         "metrics": True,
         "profiling": {
             "pmc": None,
@@ -1059,7 +1098,9 @@ def test_unsupported_tensor_dtype_is_no_engines_not_an_error(tmp_path, runtime) 
 
 
 def test_internal_flags_are_hidden_from_help() -> None:
-    assert "--internal-profiling-run" not in create_parser().format_help()
+    help_text = create_parser().format_help()
+    assert "--internal-profiling-run" not in help_text
+    assert "--no-stall-gate" not in help_text
 
 
 _PYTORCH_ENV = dict.fromkeys(pytorch_tuning.ENV_NAMES, "1")
@@ -1080,6 +1121,32 @@ def test_shell_value_cannot_override_pytorch_flag(tmp_path, runtime, monkeypatch
     runtime(lambda path: _graph(path, [_passed()]))
     _run(_args("-r", "pytorch"), _graphs(tmp_path, 1))
     assert os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] == "1"
+
+
+@pytest.mark.parametrize(("shell", "warned"), [("0", True), ("1", False)])
+def test_replaced_shell_pytorch_flag_is_a_warning_under_quiet(
+    tmp_path, runtime, monkeypatch, shell, warned
+):
+    """A shell value the run replaces must stay visible with -q: the user
+    otherwise believes PyTorch rows ran with it."""
+    monkeypatch.setenv("PYTORCH_MIOPEN_SUGGEST_NHWC", shell)
+    runtime(lambda path: _graph(path, [_passed()]))
+    out = io.StringIO()
+
+    suite_runner_cli.run_suite_cli(
+        _args("-r", "pytorch"), _graphs(tmp_path, 1), Reporter(output=out, quiet=True)
+    )
+
+    lines = [
+        line
+        for line in _warnings(out.getvalue()).splitlines()
+        if "PYTORCH_MIOPEN_SUGGEST_NHWC" in line
+    ]
+    if warned:
+        assert len(lines) == 1
+        assert "'0'" in lines[0] and "'1'" in lines[0]
+    else:
+        assert lines == []
 
 
 def test_hipdnn_only_run_leaves_pytorch_flags_unset(tmp_path, runtime) -> None:
