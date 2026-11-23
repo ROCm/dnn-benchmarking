@@ -2442,15 +2442,27 @@ class TestPyTorchProviderNewOps:
             )
         assert "rng_dump" not in str(declined.value)
 
-    def test_sdpa_backward_dropout_never_takes_fused_path(self) -> None:
-        """``fused()`` (:2496) must decline whenever dropout is active, even
-        past the GPU branch (``q.is_cuda``): PyTorch's fused backward kernels
-        take no dropout mask, so taking that path would silently drop it.
-        Fused() is tried only once ``q.is_cuda``; a CPU tensor tagged
-        ``is_cuda`` reaches that branch without a GPU (``_GpuTensor``, as
-        ``test_pytorch_ops.py`` does for MIOpen ops). A correct dropout-aware
-        gradient here proves the manual path ran instead of the
-        (dropout-blind) fused one."""
+    def test_sdpa_backward_dropout_never_takes_fused_path(self, monkeypatch) -> None:
+        """``fused()`` (:2496) must decline whenever dropout is active, before
+        ever asking whether a fused kernel is available. On CPU torch the
+        probe (``_backward_probe``) never classifies as Flash or Efficient
+        attention (it reports the CPU flash kernel's own
+        ``...ForCpuBackward0``, or a plain math graph), so
+        ``_prepare_fused_backward`` would return ``None`` on its own even
+        with the dropout check removed -- the mutant this guards
+        (``or dropout is not None`` at :2496) would still pass a test that
+        only drove ``q.is_cuda``. To make the dropout check itself the thing
+        under test, ``_prepare_fused_backward`` is monkeypatched to behave as
+        it would on a real GPU where a fused kernel *is* available: it
+        returns a kernel computing the plain (no-dropout) attention gradient,
+        exactly what a fused backward would give back since it takes no
+        dropout mask. The real check must still short-circuit before this
+        monkeypatch is ever consulted, so the result must be the
+        dropout-aware gradient, not the plain one the fake kernel returns.
+        ``q.is_cuda`` is driven without a GPU by ``_GpuTensor`` (CPU tensor
+        reporting ``is_cuda``), as ``test_pytorch_ops.py`` does for MIOpen
+        ops."""
+        import dnn_benchmarking.execution.pytorch_ops.handlers.sdpa as sdpa_mod
         from dnn_benchmarking.execution import pytorch_ops
 
         class _GpuTensor(torch.Tensor):
@@ -2470,6 +2482,35 @@ class TestPyTorchProviderNewOps:
             inputs[_DROP_MASK],
             _KEEP_SCALE,
             1 / _KEEP_SCALE,
+        )
+        # What a fused kernel would actually return: the plain attention
+        # gradient (mask of all ones, no dropout scale or inverse), since a
+        # fused backward takes no dropout mask at all. Reachable here only if
+        # the dropout check being tested fails to short-circuit first.
+        _, _, wrong_dq, wrong_dk, wrong_dv = self._dropout_backward_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            inputs[self._DO],
+            np.ones_like(inputs[_DROP_MASK]),
+            1.0,
+            1.0,
+        )
+
+        def fake_prepare_fused_backward(
+            q, k, v, o, stats, attn_mask, is_causal, scale, rep_k, rep_v, dbias
+        ):
+            def call(do):
+                return (
+                    torch.from_numpy(wrong_dq.astype(np.float32)),
+                    torch.from_numpy(wrong_dk.astype(np.float32)),
+                    torch.from_numpy(wrong_dv.astype(np.float32)),
+                )
+
+            return sdpa_mod._FusedBackward(call, 1, 1)
+
+        monkeypatch.setattr(
+            sdpa_mod, "_prepare_fused_backward", fake_prepare_fused_backward
         )
         tensors = {
             _Q: torch.from_numpy(inputs[_Q]).as_subclass(_GpuTensor),
