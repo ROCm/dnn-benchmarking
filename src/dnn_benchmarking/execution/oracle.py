@@ -311,6 +311,8 @@ def _pytorch_tuned_argv(
     ]
     if config.pytorch_rocm_fa_library is not None:
         argv += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
+    if config.pytorch_dispatch:
+        argv.append("--pytorch-dispatch")
     if not config.timing_policy.stall_gate:
         argv.append("--no-stall-gate")
     return argv

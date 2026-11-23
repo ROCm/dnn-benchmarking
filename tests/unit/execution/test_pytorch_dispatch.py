@@ -5,6 +5,7 @@
 library and GPU kernels, read from a Chrome trace of one launch."""
 
 import enum
+import threading
 
 import pytest
 
@@ -161,6 +162,34 @@ def test_an_active_profiler_session_is_left_running():
             pytorch_dispatch.profile_launch(lambda: torch.ones(2).relu())
         torch.ones(2).neg()
 
+    assert "aten::neg" in {event.name for event in outer.events()}
+
+
+def test_a_session_of_another_thread_is_left_running():
+    """A capture in a worker thread must not cancel a torch.profiler session
+    that the main thread runs: Kineto cancels the first session, and the
+    later export can crash the process."""
+    torch = pytest.importorskip("torch")
+    from torch.autograd import profiler as autograd_profiler
+    from torch.profiler import ProfilerActivity, profile
+
+    if not hasattr(autograd_profiler, "_is_profiler_enabled"):
+        pytest.skip("this torch has no process-wide profiler flag")
+    errors = []
+
+    def worker():
+        try:
+            pytorch_dispatch.profile_launch(lambda: torch.ones(2).relu())
+        except RuntimeError as e:
+            errors.append(str(e))
+
+    with profile(activities=[ProfilerActivity.CPU]) as outer:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        torch.ones(2).neg()
+
+    assert errors == ["a torch.profiler session is already active"]
     assert "aten::neg" in {event.name for event in outer.events()}
 
 

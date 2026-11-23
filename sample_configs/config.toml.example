@@ -48,6 +48,10 @@ fast = false
 
 pytorch_sdpa_backend = "default"  # default, flash, math, efficient, cudnn, overrideable
 # pytorch_rocm_fa_library = "aotriton"  # requires pytorch_sdpa_backend = "flash"
+# Record the SDPA backend and GPU kernels of each PyTorch row (one untimed
+# torch.profiler launch). Off: it would cancel a torch.profiler session that
+# another thread of the process runs.
+pytorch_dispatch = false
 
 # --- Validation --------------------------------------------------------------
 validate = "none"    # "none" or "pytorch"

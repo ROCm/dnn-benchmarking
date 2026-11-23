@@ -518,6 +518,18 @@ def test_pytorch_child_runs_one_untuned_oracle_off_row_with_the_run_timing(
     assert child_config.seed == 11
 
 
+@pytest.mark.parametrize("pytorch_dispatch", [True, False])
+def test_pytorch_child_captures_dispatch_only_when_the_run_does(
+    child, tmp_path, pytorch_dispatch
+):
+    """The tuned child starts a torch.profiler session only when the parent
+    run opted in with --pytorch-dispatch."""
+    _run_pytorch(tmp_path, _pytorch_config(pytorch_dispatch=pytorch_dispatch))
+
+    args = create_parser().parse_args(child.argv[3:])
+    assert SuiteConfig.from_namespace(args).pytorch_dispatch is pytorch_dispatch
+
+
 def test_pytorch_child_stall_propagates_for_a_whole_graph_remeasure(child, tmp_path):
     """The child remeasured its graph unstalled while the run still times
     staged: the suite runner must remeasure the whole graph unstalled, as

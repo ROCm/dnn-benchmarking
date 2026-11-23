@@ -74,6 +74,7 @@ the keys below.
 | `fast` | bool | `--fast`. Do not compare the numbers of a `--fast` run with a run without it; see [usage.md](usage.md#fast-mode---fast). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
+| `pytorch_dispatch` | bool or null | `--pytorch-dispatch`: PyTorch plans record [dispatch](#dispatch). `null` unless PyTorch is selected. Files written before this key do not have it; read it as `null`. |
 | `aiter_rows` | string or null | `all` for `--runtime aiter`, `auto` for `--runtime aiter:auto`. `null` unless AITER is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
 | `profiling` | object | Requested profiling passes: `pmc` (set name or null), `trace` (bool), `perf` (bool), `roofline` (bool). |
@@ -169,11 +170,11 @@ NaN or infinity has no `graph_id`, and its `status` is `error`.
 |2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
 
 All other keys are the same in versions 2 and 3. One exception: files
-written before the plan key `dispatch` was added do not have it. Read it as
-`null`. `dnn-benchmark compare` joins a version 2 file and a version 3 file
-on `graph_name`. It does not pair a `graph_name` that occurs more than once
-in either file, and reports that name as ambiguous. See
-[usage.md](usage.md#compare).
+written before `run.config.pytorch_dispatch` and the plan key `dispatch` were
+added do not have them. Read them as `null`. `dnn-benchmark compare` joins a
+version 2 file and a version 3 file on `graph_name`. It does not pair a
+`graph_name` that occurs more than once in either file, and reports that name
+as ambiguous. See [usage.md](usage.md#compare).
 
 ## row
 
@@ -222,7 +223,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | `tflops` | float or null | `metrics.flops / kernel.median_ms`, in 10^12 FLOP/s. |
 | `gbps` | float or null | `metrics.io_bytes / kernel.median_ms`, in 10^9 bytes/s. |
 | `correctness` | object or null | See [correctness](#correctness). `null` when validation did not run. |
-| `dispatch` | object or null | PyTorch rows: the SDPA backend and the GPU kernels that the plan ran. See [dispatch](#dispatch). `null` on hipDNN, rocKE and AITER rows, and when the capture failed (the row then has a warning). Files written before this key do not have it; read it as `null`. |
+| `dispatch` | object or null | PyTorch rows with `--pytorch-dispatch`: the SDPA backend and the GPU kernels that the plan ran. See [dispatch](#dispatch). `null` without `--pytorch-dispatch`, on hipDNN, rocKE and AITER rows, and when the capture failed (the row then has a warning). Files written before this key do not have it; read it as `null`. |
 
 ### timing
 
@@ -287,8 +288,8 @@ amdsmi values of `environment` are `null`, and a warning gives the reason.
 
 ### dispatch
 
-A PyTorch plan records what one untimed launch of its timed path ran. The
-launch runs after the timed loop and outside it. See
+With `--pytorch-dispatch`, a PyTorch plan records what one untimed launch of
+its timed path ran. The launch runs after the timed loop and outside it. See
 [methodology.md](methodology.md#pytorch-dispatch-record). In `oracle`, the
 tuned child process recorded the object with the tuned state, so tuning
 (MIOpen find, TunableOp) can show other kernels there.

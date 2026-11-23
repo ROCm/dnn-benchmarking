@@ -500,7 +500,8 @@ def _time_pytorch_row(
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             row.warnings = (row.warnings or []) + executor.notes
-            _record_dispatch(row, ctx, executor)
+            if config.pytorch_dispatch:
+                _record_dispatch(row, ctx, executor)
             if role == "reference":
                 stage = "reference"
                 bm.zero_outputs()

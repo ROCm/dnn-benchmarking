@@ -102,15 +102,24 @@ def profile_launch(launch: Callable[[], None]) -> List[Dict[str, Any]]:
     ``launch`` must synchronize its stream, so every kernel it starts ends
     inside the profiled span.
 
+    Kineto runs one session per process, and a second one cancels the first.
+    The check below sees a session of this thread, and a Python
+    ``torch.profiler`` session of any thread on the PyTorch versions that keep
+    the private ``torch.autograd.profiler._is_profiler_enabled`` flag. PyTorch
+    has no public process-wide check, so ``--pytorch-dispatch`` is opt-in.
+
     Raises:
         RuntimeError: A profiler session is already active in this process.
             Kineto runs one session at a time, so a second one would stop the
             caller's session.
     """
     import torch
+    from torch.autograd import profiler as autograd_profiler
     from torch.profiler import ProfilerActivity, profile
 
-    if torch._C._autograd._profiler_enabled():
+    if torch._C._autograd._profiler_enabled() or getattr(
+        autograd_profiler, "_is_profiler_enabled", False
+    ):
         raise RuntimeError("a torch.profiler session is already active")
 
     os.environ.setdefault("KINETO_LOG_LEVEL", _KINETO_SILENT)

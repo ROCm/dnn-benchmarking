@@ -500,11 +500,11 @@ when `throttle_status` is not 0. The tool does not set or lock clocks.
 
 ## PyTorch dispatch record
 
-A PyTorch row records which SDPA backend and which GPU kernels its timed path
-ran, in the plan's `dispatch` object (see
-[results-schema.md](results-schema.md#dispatch)). After the timed loop, the
-tool runs the graph one more time under `torch.profiler`, with CPU and GPU
-activities:
+With `--pytorch-dispatch`, a PyTorch row records which SDPA backend and which
+GPU kernels its timed path ran, in the plan's `dispatch` object (see
+[results-schema.md](results-schema.md#dispatch)). The option is off by
+default, and `dispatch` is then `null`. After the timed loop, the tool runs
+the graph one more time under `torch.profiler`, with CPU and GPU activities:
 
 1. The tool synchronizes the device. No input-fill, warmup or cache-flush
    kernel is then in the trace.
@@ -529,7 +529,11 @@ it. The first profiler start in a process can take about one second.
 - When a `torch.profiler` session is already active in the process (for
   example, a caller that profiles the run), the tool does not start a second
   one. Kineto runs one session at a time, and a second one stops the first.
-  The row then has no `dispatch` and gets a warning.
+  The row then has no `dispatch` and gets a warning. The check finds a
+  session of the same thread. It finds a Python `torch.profiler` session of
+  another thread only through a private PyTorch flag
+  (`torch.autograd.profiler._is_profiler_enabled`). PyTorch has no public
+  check for this case, so the capture is opt-in.
 
 ## Profiling child process
 

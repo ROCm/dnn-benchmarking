@@ -408,6 +408,16 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_kind=ConfigKind.SCALAR,
         config_type=str,
     ),
+    _bool_option(
+        ("--pytorch-dispatch",),
+        "pytorch_dispatch",
+        "Runtime/Selection",
+        SuiteConfig,
+        "pytorch_dispatch",
+        "record the SDPA backend and GPU kernels of each PyTorch row: one "
+        "untimed torch.profiler launch after the timed loop; do not use while "
+        "another torch.profiler session runs in the process",
+    ),
     # Validation
     _choice_option(
         ("--validate",),

@@ -418,6 +418,11 @@ class SuiteConfig:
             PyTorch timing or reference execution.
         pytorch_rocm_fa_library: Optional ROCm Flash Attention implementation
             preference forwarded to PyTorch with the Flash category.
+        pytorch_dispatch: Record each PyTorch plan's ``dispatch`` object
+            (SDPA backend and GPU kernels) with one untimed torch.profiler
+            launch. Off by default: torch.profiler runs one session per
+            process, and PyTorch has no public check that sees a session
+            that another thread started.
     """
 
     warmup_iters: int = 10
@@ -434,6 +439,7 @@ class SuiteConfig:
     runtime: RuntimeName = RuntimeName.HIPDNN
     pytorch_sdpa_backend: PyTorchSdpaBackendName = PyTorchSdpaBackendName.DEFAULT
     pytorch_rocm_fa_library: Optional[str] = None
+    pytorch_dispatch: bool = False
     #: Sample every knob-filtered candidate on first execute and cache the
     #: winner (HIPDNN_FORCE_BENCHMARKING=1). Off, an engine serves its cold
     #: heuristic's rank-0 pick, so the table measures the heuristic rather than
@@ -524,6 +530,7 @@ class SuiteConfig:
             runtime=args.runtime,
             pytorch_sdpa_backend=args.pytorch_sdpa_backend,
             pytorch_rocm_fa_library=args.pytorch_rocm_fa_library,
+            pytorch_dispatch=args.pytorch_dispatch,
             autotune=args.autotune,
             benchmark_work_dir=(
                 str(args.benchmark_work_dir) if args.benchmark_work_dir else None

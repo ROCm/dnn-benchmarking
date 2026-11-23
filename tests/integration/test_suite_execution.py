@@ -198,6 +198,7 @@ def test_pytorch_sdpa_row_records_its_backend_and_kernels(
         benchmark_iters=2,
         runtime=RuntimeName.PYTORCH,
         pytorch_sdpa_backend=selection,
+        pytorch_dispatch=True,
     )
     result = run_graph(
         path,

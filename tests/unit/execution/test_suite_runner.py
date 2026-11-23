@@ -950,7 +950,7 @@ def test_reference_outputs_come_from_math_sdpa_and_timing_does_not(
     monkeypatch.setattr(executor_cls, "execute_once", execute_once)
     monkeypatch.setattr(executor_cls, "capture_dispatch", capture_dispatch)
 
-    _validate()
+    _validate(pytorch_dispatch=True)
 
     assert calls == {
         "benchmark": False,
@@ -1733,12 +1733,31 @@ class TestPytorchRuntime:
         a null list says "unknown", an empty one would say "none ran"."""
         fake_torch.torch_dispatch = outcome
 
-        (row,) = self._run().results
+        (row,) = self._run(pytorch_dispatch=True).results
 
         assert row.status == "success"
         assert row.ootb.gpu_kernel_stats is not None
         assert row.ootb.dispatch == expected
         assert warning in row.warnings
+
+    def test_no_capture_without_the_option(self, fake_torch, monkeypatch):
+        """Capture starts a torch.profiler session, which can cancel a session
+        that the caller runs in another thread. Off by default, it must never
+        start, and the row records no dispatch and no warning about it."""
+        from dnn_benchmarking.execution import pytorch_executor
+
+        def capture_dispatch(self):
+            raise AssertionError("capture_dispatch ran without --pytorch-dispatch")
+
+        monkeypatch.setattr(
+            pytorch_executor.PyTorchCudaExecutor, "capture_dispatch", capture_dispatch
+        )
+
+        (row,) = self._run().results
+
+        assert row.status == "success"
+        assert row.ootb.dispatch is None
+        assert not any("dispatch" in w for w in row.warnings or [])
 
 
 def _run_with(other, **config):
