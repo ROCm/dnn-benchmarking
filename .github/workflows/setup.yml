@@ -138,12 +138,13 @@ jobs:
           except Exception as e:
               print(sys.argv[1], paths, "ERROR:", e)
           EOF
-          python /tmp/discover.py NONE
-          python /tmp/discover.py TORCH_FIRST
-          HIPDNN_LOG_LEVEL=info python /tmp/discover.py LOG_INFO 2>&1 | grep -v "^$" | tail -80
-          for so in .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipdnn_plugins/engines/*.so; do
-            echo "== $so"; ldd "$so" | grep -i "not found\|miopen" || true
-          done
+          E=.ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipdnn_plugins/engines
+          python -c "import ctypes, sys; ctypes.CDLL(sys.argv[1]); print('miopen plugin dlopen OK')" "$E/libmiopen_plugin.so" 2>&1 || true
+          python -c "import torch, ctypes, sys; ctypes.CDLL(sys.argv[1]); print('miopen plugin dlopen OK after torch')" "$E/libmiopen_plugin.so" 2>&1 || true
+          ldd -r "$E/libmiopen_plugin.so" 2>&1 | grep -iE "undefined|not found" | head -20 || true
+          ldd "$E/libmiopen_plugin.so" | head -40
+          python -c "import torch, os; print([l for l in open('/proc/self/maps').read().split() if 'MIOpen' in l][:5])" || true
+          ls -la .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/ | grep -i miopen || true
 
       # activate (not $VENV/python) for the ROCM_PATH/LD_LIBRARY_PATH that
       # conftest.py's plugin discovery needs. No -m filter: gpu tests run here.
