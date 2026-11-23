@@ -5,6 +5,7 @@ container_command="docker"
 device_target="gfx942"
 tag=""
 rocm_version=""
+rocm_libraries_ref=""
 build_args=()
 
 usage() {
@@ -21,6 +22,10 @@ Options:
                            10.3.0a20261117. Default: the newest nightly that
                            Quartz reports as built for the device target,
                            selected on this host.
+  --rocm-libraries-ref SHA Full 40-character rocm-libraries commit to build.
+                           Default: the rocm-libraries commit pinned by the
+                           selected ROCm nightly's TheRock commit (falling back
+                           to the local submodule pin if Quartz has none).
   -h, --help               Show this help.
 
 Examples:
@@ -53,6 +58,11 @@ while [[ $# -gt 0 ]]; do
             rocm_version="$2"
             shift 2
             ;;
+        --rocm-libraries-ref)
+            [[ $# -ge 2 ]] || { echo "--rocm-libraries-ref requires a value" >&2; exit 2; }
+            rocm_libraries_ref="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -82,32 +92,40 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-# The image build context excludes .git, so resolve the pinned rocm-libraries
-# commit here; setup_env.py otherwise falls back to a moving branch.
-rocm_libraries_ref="$(git -C "${repo_root}" rev-parse HEAD:rocm-libraries 2>/dev/null || true)"
-if [[ -z "${rocm_libraries_ref}" ]]; then
-    echo "WARNING: could not resolve the rocm-libraries submodule commit; the image will build its moving branch." >&2
-fi
-
-# Select the ROCm nightly here, with the same rule as setup_env.py. The image
-# then installs and labels that ROCm build even when a newer nightly appears.
-resolved="$(python3 - "${repo_root}/setup_env.py" "${device_target}" "${rocm_version}" <<'PY'
+# Select the ROCm nightly here, with the same rule as setup_env.py, and resolve
+# the matching rocm-libraries commit from its TheRock commit unless the caller
+# passed --rocm-libraries-ref. The image then installs and labels that matched
+# build even when a newer nightly appears.
+resolved="$(python3 - "${repo_root}/setup_env.py" "${device_target}" "${rocm_version}" "${rocm_libraries_ref}" <<'PY'
 import importlib.util
 import sys
 
 spec = importlib.util.spec_from_file_location("setup_env", sys.argv[1])
 setup_env = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup_env)
-device_target, rocm_version = sys.argv[2:]
+device_target, rocm_version, rocm_libraries_ref = sys.argv[2:]
 if rocm_version:
     build = setup_env.describe_rocm_version(rocm_version, "", "linux", device_target)
 else:
     build = setup_env.select_quartz_nightly("linux", device_target)
-print(build.rocm_version, build.index_url)
+if not rocm_libraries_ref and build.therock_commit:
+    rocm_libraries_ref = setup_env.resolve_therock_rocm_libraries_commit(
+        build.therock_commit
+    )
+print(build.rocm_version, build.index_url, rocm_libraries_ref)
 PY
 )"
-read -r rocm_version rocm_index_url <<<"${resolved}"
-echo "ROCm ${rocm_version} from ${rocm_index_url}"
+read -r rocm_version rocm_index_url rocm_libraries_ref <<<"${resolved}"
+
+# Fall back to the local submodule pin when Quartz had no TheRock commit (for
+# example a custom --rocm-version unknown to Quartz).
+if [[ -z "${rocm_libraries_ref}" ]]; then
+    rocm_libraries_ref="$(git -C "${repo_root}" rev-parse HEAD:rocm-libraries 2>/dev/null || true)"
+fi
+if [[ -z "${rocm_libraries_ref}" ]]; then
+    echo "WARNING: could not resolve a rocm-libraries commit; the image will build its moving branch." >&2
+fi
+echo "ROCm ${rocm_version} from ${rocm_index_url} (rocm-libraries ${rocm_libraries_ref:-moving})"
 
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" "${container_command}" build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance-linux" \

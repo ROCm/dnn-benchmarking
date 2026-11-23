@@ -34,6 +34,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -112,6 +113,10 @@ QUARTZ_TEST_SUITES = ("rocm", "pytorch")
 # The ROCm wheel version of a nightly, for example 10.3.0a20261117. The group
 # is the build date.
 _NIGHTLY_VERSION = re.compile(r"\d+\.\d+\.\d+a(\d{8})")
+# TheRock repository whose rocm-libraries submodule gitlink supplies the
+# rocm-libraries commit that a Quartz-selected ROCm nightly was built from.
+THEROCK_REPO_URL = "https://github.com/ROCm/TheRock.git"
+THEROCK_ROCM_LIBRARIES_PATH = "rocm-libraries"
 
 # Windows has no rocm_agent_enumerator/rocminfo to detect the local arch with,
 # so fall back to a default target known to have published wheels.
@@ -489,6 +494,65 @@ def describe_rocm_version(
     return _rocm_build_from_quartz(
         document, url, platform_name, gpu_arch, "--rocm-version", index_url
     )
+
+
+def resolve_therock_rocm_libraries_commit(
+    therock_commit: str, repo_url: str = THEROCK_REPO_URL
+) -> str:
+    """The rocm-libraries submodule commit pinned by ``therock_commit`` in TheRock.
+
+    Uses a bare, tree-filtered git fetch of the single commit (~10 KB, no
+    GitHub REST API rate limit) and reads the ``rocm-libraries`` gitlink via
+    ``git ls-tree``. Exits with an actionable error when the commit cannot be
+    fetched or carries no ``rocm-libraries`` submodule entry.
+    """
+    commit = therock_commit.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        fail(
+            f"expected a 40-character TheRock commit SHA, got {therock_commit!r}.",
+            "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+        )
+    with tempfile.TemporaryDirectory(prefix="therock-ref-") as tmp:
+        git = ["-C", tmp]
+        try:
+            run_git(["init", "--bare", "--quiet", tmp])
+            run_git(
+                [
+                    *git,
+                    "fetch",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    "--filter=tree:0",
+                    repo_url,
+                    commit,
+                ]
+            )
+            entry = git_output(
+                [*git, "ls-tree", "FETCH_HEAD", "--", THEROCK_ROCM_LIBRARIES_PATH]
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            fail(
+                f"cannot resolve {THEROCK_ROCM_LIBRARIES_PATH} commit for "
+                f"TheRock {commit} from {repo_url}.",
+                *(line for line in (detail,) if line),
+                "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+            )
+    parts = entry.split()
+    if (
+        len(parts) != 4
+        or parts[0] != "160000"
+        or parts[1] != "commit"
+        or not re.fullmatch(r"[0-9a-f]{40}", parts[2])
+        or parts[3] != THEROCK_ROCM_LIBRARIES_PATH
+    ):
+        fail(
+            f"TheRock commit {commit} has no '{THEROCK_ROCM_LIBRARIES_PATH}' "
+            f"submodule entry in {repo_url} (got {entry!r}).",
+            "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+        )
+    return parts[2]
 
 
 def default_workspace() -> Path:
@@ -912,10 +976,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Full 40-character rocm-libraries commit to fetch when "
             "rocm-libraries/ is absent. "
-            "Default: the submodule commit pinned in this repository (`git "
-            "rev-parse HEAD:rocm-libraries`). Needed where no git metadata "
-            "exists (Docker builds, source tarballs); without it setup falls "
-            "back to the moving .gitmodules branch and warns."
+            "Default: in rocm mode with a Quartz-known ROCm nightly, the "
+            "rocm-libraries commit pinned by that nightly's TheRock commit "
+            "(so miopen-provider matches the wheel's MIOpen); otherwise the "
+            "submodule commit pinned in this repository (`git rev-parse "
+            "HEAD:rocm-libraries`). Without git metadata or Quartz metadata "
+            "(for example a custom --torch-index-url in a Docker build), "
+            "setup falls back to the moving .gitmodules branch and warns."
         ),
     )
     parser.add_argument(
@@ -1021,25 +1088,70 @@ class Setup:
 
     # -- rocm-libraries checkout --------------------------------------------
 
+    def _resolve_rocm_libraries_ref(self) -> Tuple[str, str, Optional[str]]:
+        """Return ``(ref, source, therock_commit)`` for the rocm-libraries checkout.
+
+        Precedence:
+        1. Explicit ``--rocm-libraries-ref``.
+        2. When ROCm PyTorch was installed from a Quartz-known TheRock nightly
+           (recorded in ``ROCM_BUILD_RECORD``), the ``rocm-libraries`` commit
+           pinned by that ``therock_commit`` so ``miopen-provider`` and hipDNN
+           stay in lockstep with the wheel's MIOpen.
+        3. The pinned ``rocm-libraries`` git submodule commit of this repo.
+        """
+        if self.rocm_libraries_ref:
+            return self.rocm_libraries_ref, "--rocm-libraries-ref", None
+        if self.installed_torch_mode == "rocm":
+            record = self._read_venv_record(ROCM_BUILD_RECORD)
+            if record:
+                therock_commit = record.get("therock_commit")
+                if not isinstance(therock_commit, str) or not therock_commit:
+                    therock_commit = None
+                recorded_ref = record.get("rocm_libraries_commit")
+                if isinstance(recorded_ref, str) and re.fullmatch(
+                    r"[0-9a-f]{40}", recorded_ref
+                ):
+                    return recorded_ref, "quartz", therock_commit
+                if therock_commit:
+                    print(
+                        "Resolving rocm-libraries commit for TheRock "
+                        f"{therock_commit[:12]}..."
+                    )
+                    ref = resolve_therock_rocm_libraries_commit(therock_commit)
+                    record["rocm_libraries_commit"] = ref
+                    try:
+                        (self.venv_dir / ROCM_BUILD_RECORD).write_text(
+                            json.dumps(record) + "\n"
+                        )
+                    except OSError:
+                        pass
+                    return ref, "quartz", therock_commit
+        return (
+            self._pinned_submodule_commit(
+                "rocm-libraries",
+                "The hipDNN/provider build is not reproducible. Pass "
+                "--rocm-libraries-ref <sha> (`git rev-parse "
+                "HEAD:rocm-libraries` in a checkout of this repository).",
+            ),
+            "submodule",
+            None,
+        )
+
     def ensure_rocm_libraries_checkout(self) -> None:
         """Fetch rocm-libraries if absent.
 
         It is a git submodule (see .gitmodules), so `git submodule update
         --init` also works. This is the fast path used only when the directory
-        isn't already a checkout: a sparse, blobless clone of the pinned
-        submodule commit (or --rocm-libraries-ref), limited to the hipDNN/
-        provider sources and root CMake tooling this script builds.
-        To build against a different ref, check it out directly, e.g.
-        `git -C rocm-libraries fetch --depth 1 origin <ref> &&
+        isn't already a checkout: a sparse, blobless clone of the resolved
+        commit (--rocm-libraries-ref, else the Quartz-selected TheRock build's
+        rocm-libraries commit in rocm mode, else the pinned submodule commit),
+        limited to the hipDNN/provider sources and root CMake tooling this
+        script builds. To build against a different ref, check it out directly,
+        e.g. `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
         gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        ref = self.rocm_libraries_ref or self._pinned_submodule_commit(
-            "rocm-libraries",
-            "The hipDNN/provider build is not reproducible. Pass "
-            "--rocm-libraries-ref <sha> (`git rev-parse "
-            "HEAD:rocm-libraries` in a checkout of this repository).",
-        )
+        ref, source, therock_commit = self._resolve_rocm_libraries_ref()
         # Only a full commit id can be compared with HEAD; a branch moves.
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
@@ -1058,11 +1170,25 @@ class Setup:
             # sparse clone would otherwise go unnoticed.
             head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
             if pinned and head != ref:
-                warn(
-                    f"rocm-libraries is at {head[:12]}, not the pinned {ref[:12]}. "
-                    "Check out that commit in rocm-libraries/ (e.g. `git submodule "
-                    "update rocm-libraries`) or delete the directory to fetch it."
-                )
+                if source == "quartz":
+                    therock_note = (
+                        f" (matched to TheRock {therock_commit[:12]})"
+                        if therock_commit
+                        else " (matched to the Quartz ROCm nightly)"
+                    )
+                    warn(
+                        f"rocm-libraries is at {head[:12]}, not {ref[:12]}"
+                        f"{therock_note}. Check out that commit in "
+                        "rocm-libraries/ or delete the directory to fetch it "
+                        "(or pass --rocm-libraries-ref to override)."
+                    )
+                else:
+                    warn(
+                        f"rocm-libraries is at {head[:12]}, not the pinned "
+                        f"{ref[:12]}. Check out that commit in rocm-libraries/ "
+                        "(e.g. `git submodule update rocm-libraries`) or delete "
+                        "the directory to fetch it."
+                    )
             if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
                 warn(
                     "rocm-libraries/CMakePresets.json is missing (a non-cone "

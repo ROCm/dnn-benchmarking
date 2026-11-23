@@ -273,11 +273,12 @@ Quartz.
 
 After the install, setup writes `<workspace>/.venv/dnn-bench-rocm-build.json`:
 the ROCm wheel version, the TheRock build date and commit from Quartz, the
-untested suites (`untested`, for example `["rocm"]`), the `status.json` URL,
-the index URL, and what selected the build (`quartz`, `--rocm-version` or
-`--torch-index-url`). The build date, commit and untested suites are `null`
-when Quartz has no `status.json` for the version. Result files copy them to
-`environment.rocm_build_version`, `environment.rocm_build_date`,
+matched `rocm-libraries` commit (added when `rocm-libraries` is resolved from
+Quartz), the untested suites (`untested`, for example `["rocm"]`), the
+`status.json` URL, the index URL, and what selected the build (`quartz`,
+`--rocm-version` or `--torch-index-url`). The build date, commit and untested
+suites are `null` when Quartz has no `status.json` for the version. Result
+files copy them to `environment.rocm_build_version`, `environment.rocm_build_date`,
 `environment.therock_commit` and `environment.rocm_build_untested` (see
 [results-schema.md](results-schema.md#environment)).
 
@@ -292,18 +293,29 @@ and its untested suites in its log and in the job summary.
 `rocm-libraries/` is a git submodule. It holds the hipDNN and provider
 sources.
 
-- When `rocm-libraries/` is absent, setup does a sparse, blobless clone of
-  the pinned submodule commit (`git rev-parse HEAD:rocm-libraries`). The clone
-  contains only `cmake`, `shared/ctest`, `projects/hipdnn` and
-  `dnn-providers`, not the full monorepo. `shared/ctest` carries the CMake
+- When `rocm-libraries/` is absent, setup does a sparse, blobless clone. It
+  selects the commit in this order:
+  1. `--rocm-libraries-ref SHA`, when passed.
+  2. In `--torch-mode rocm` (or `--torch-mode existing` with a ROCm venv that
+     has `dnn-bench-rocm-build.json`), when Quartz supplies a `therock_commit`
+     for the installed ROCm nightly, the `rocm-libraries` submodule commit
+     pinned by that `therock_commit` in `ROCm/TheRock`. This keeps
+     `miopen-provider` and hipDNN in lockstep with the MIOpen libraries in the
+     ROCm wheel.
+  3. Otherwise (`--torch-mode cpu`, `--torch-mode none`, a custom
+     `--torch-index-url` without Quartz, or a `--rocm-version` unknown to
+     Quartz), the pinned submodule commit (`git rev-parse HEAD:rocm-libraries`).
+  The clone contains only `.dvc`, `cmake`, `shared/ctest`, `projects/hipdnn`
+  and `dnn-providers`, not the full monorepo. `shared/ctest` carries the CMake
   file that declares hipDNN's test categories; the rest of `shared/` (Tensile
   and friends) stays out.
-- Where no git metadata exists (Docker builds, source tarballs), give
-  `--rocm-libraries-ref SHA`. Without it, setup uses the moving
-  `.gitmodules` branch and shows a warning.
+- Where no git metadata and no Quartz `therock_commit` exist (for example a
+  source tarball with `--torch-mode cpu`), give `--rocm-libraries-ref SHA`.
+  Without it, setup uses the moving `.gitmodules` branch and shows a warning.
 - Setup uses an existing checkout as it is. A checkout from
   `git submodule update --init` also works. Setup shows a warning when the
-  checkout is not at the pinned commit. When that checkout is sparse and was
+  checkout is not at the expected commit (the Quartz-matched commit in `rocm`
+  mode, or the pinned commit otherwise). When that checkout is sparse and was
   made by an older setup, the root directories added since are added to its
   sparse set; a full checkout is left alone.
 

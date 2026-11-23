@@ -90,7 +90,7 @@ jobs:
 
       - name: Log the ROCm build
         run: |
-          python -c 'import json, sys; r = json.load(open(sys.argv[1])); print("ROCm", r["rocm_version"], "built", r["build_date"], "from TheRock", r["therock_commit"], "(" + r["source"] + "), untested:", r["untested"])' \
+          python -c 'import json, sys; r = json.load(open(sys.argv[1])); print("ROCm", r["rocm_version"], "built", r["build_date"], "from TheRock", r["therock_commit"], "rocm-libraries", r.get("rocm_libraries_commit"), "(" + r["source"] + "), untested:", r["untested"])' \
             .ci-workspace/.venv/dnn-bench-rocm-build.json |
             tee -a "$GITHUB_STEP_SUMMARY"
 
