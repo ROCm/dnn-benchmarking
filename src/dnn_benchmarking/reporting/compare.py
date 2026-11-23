@@ -178,25 +178,59 @@ def _pair(
     return pair
 
 
-def _match_graphs(
-    a: Dict[str, Any], b: Dict[str, Any]
-) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[str], List[str]]:
-    """Join on graph_id (null only for graphs that failed to load: no rows).
-    Duplicate ids pair in order of appearance, like ``_keyed`` rows."""
-    by_id: Dict[str, List[Dict[str, Any]]] = {}
+def _join_key(a: Dict[str, Any], b: Dict[str, Any]) -> str:
+    """``graph_id`` when both files use one schema; else ``graph_name``.
+
+    Schema 2 hashes the whole graph JSON and schema 3 only its geometry, so
+    their ids never match."""
+    return "graph_id" if a["schema_version"] == b["schema_version"] else "graph_name"
+
+
+def _match_graphs(a: Dict[str, Any], b: Dict[str, Any], key: str) -> Tuple[
+    List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    List[str],
+    List[str],
+    List[Dict[str, Any]],
+]:
+    """Join on ``key``. A graph with a null graph_id failed to load and has no
+    rows, so it never joins. Duplicate graph_ids pair in order of appearance,
+    like ``_keyed`` rows: they have the same geometry. A graph_name that occurs
+    more than once in either file can name different graphs, so a name join
+    leaves it unmatched and returns it in the ambiguous list."""
+    counts: Dict[str, List[int]] = {}
+    for side, doc in enumerate((a, b)):
+        for g in doc["graphs"]:
+            if g["graph_id"]:
+                counts.setdefault(g[key], [0, 0])[side] += 1
+    skip = set()
+    ambiguous = []
+    if key == "graph_name":
+        skip = {k for k, (na, nb) in counts.items() if na > 1 or nb > 1}
+        ambiguous = [
+            {"graph_name": k, "count_a": na, "count_b": nb}
+            for k, (na, nb) in counts.items()
+            if k in skip
+        ]
+    by_key: Dict[str, List[Dict[str, Any]]] = {}
     for g in b["graphs"]:
-        if g["graph_id"]:
-            by_id.setdefault(g["graph_id"], []).append(g)
+        if g["graph_id"] and g[key] not in skip:
+            by_key.setdefault(g[key], []).append(g)
     matched, only_a = [], []
     for ga in a["graphs"]:
-        queue = by_id.get(ga["graph_id"]) if ga["graph_id"] else None
+        if ga["graph_id"] and ga[key] in skip:
+            continue
+        queue = by_key.get(ga[key]) if ga["graph_id"] else None
         if not queue:
             only_a.append(ga["graph_name"])
             continue
         matched.append((ga, queue.pop(0)))
     used = {id(gb) for _, gb in matched}
-    only_b = [g["graph_name"] for g in b["graphs"] if id(g) not in used]
-    return matched, only_a, only_b
+    only_b = [
+        g["graph_name"]
+        for g in b["graphs"]
+        if id(g) not in used and not (g["graph_id"] and g[key] in skip)
+    ]
+    return matched, only_a, only_b, ambiguous
 
 
 def compare(
@@ -207,8 +241,8 @@ def compare(
     metric: str = "kernel",
     threshold: float = 5.0,
 ) -> Dict[str, Any]:
-    """Compare two loaded v2 documents; returns the JSON-shaped report."""
-    matched, only_a, only_b = _match_graphs(a, b)
+    """Compare two loaded v2 or v3 documents; returns the JSON-shaped report."""
+    matched, only_a, only_b, ambiguous = _match_graphs(a, b, _join_key(a, b))
     pairs: List[Pair] = []
     for ga, gb in matched:
         name = ga["graph_name"]
@@ -232,6 +266,7 @@ def compare(
         "pairs": [asdict(p) for p in pairs],
         "only_in_a": only_a,
         "only_in_b": only_b,
+        "ambiguous": ambiguous,
         "geomean_speedup": geometric_mean(ratios) if ratios else None,
         "regressions": sum(p.label == "REGRESSION" for p in pairs),
     }
@@ -301,6 +336,12 @@ def _print_table(
     for side, names in (("A", report["only_in_a"]), ("B", report["only_in_b"])):
         for name in names:
             print(_clip(f"graph only in {side}: {name}", width), file=out)
+    for amb in report["ambiguous"]:
+        line = (
+            f"ambiguous graph name: {amb['graph_name']} "
+            f"(A: {amb['count_a']}, B: {amb['count_b']})"
+        )
+        print(_clip(line, width), file=out)
     geo = report["geomean_speedup"]
     n = sum(p["in_geomean"] for p in pairs)
     footer = (
@@ -380,6 +421,11 @@ def main(argv: List[str]) -> int:
         return 2
     for w in _config_warnings(a, b):
         print(f"warning: {w}", file=sys.stderr)
+    if _join_key(a, b) == "graph_name":
+        print(
+            "warning: schema 2 and 3 ids differ; joined by graph name",
+            file=sys.stderr,
+        )
     ca, cb = a["run"]["config"], b["run"]["config"]
     gated = [k for k in _GATED if ca.get(k) != cb.get(k)]
     if gated and not args.allow_mismatch:
@@ -393,6 +439,13 @@ def main(argv: List[str]) -> int:
         report = compare(a, b, by=args.by, metric=args.metric, threshold=args.threshold)
         if all(p["speedup"] is None for p in report["pairs"]):
             print("warning: no timings were compared", file=sys.stderr)
+        if report["ambiguous"]:
+            print(
+                f"warning: {len(report['ambiguous'])} graph names appear more than "
+                "once; mixed-schema results cannot be paired by name, so they are "
+                "not compared",
+                file=sys.stderr,
+            )
         if args.json:
             json.dump(report, sys.stdout, indent=2, allow_nan=False)
             print()

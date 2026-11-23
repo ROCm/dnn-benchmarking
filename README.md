@@ -60,7 +60,7 @@ before using `--validate pytorch` with that setup.
    ```
 
    ```text
-   sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [e50543fd1d83]
+   sample_conv_fwd (sample_conv_fwd_16x16x16x16_k16_3x3)  [c6ab89a41cb4]
      engine                       verdict    kernel_med  iqr%    submit  tflops  gbps  vs_best
      MIOPEN_ENGINE                unchecked   25.44 µs    1.9  11.55 µs    0.74  21.0    1.00x
      MIOPEN_ENGINE_DETERMINISTIC  unchecked   25.60 µs    1.3  11.47 µs    0.74  20.8    0.99x
@@ -98,8 +98,9 @@ dnn-benchmark -g graphs/sample_conv_fwd.json -i 200 --min-time-ms 100 --cache-mo
 # rocKE block timing: each of 100 samples times 50 back-to-back launches
 dnn-benchmark -g 'graphs/*.json' --iters 100 --timing-block 50
 
-# Run every graph in a tarball (fetch it first, see Workload files)
-dnn-benchmark -g Workloads/headline/conv.tar.gz -o conv.json
+# Run every headline convolution of the public graph store (see docs/graph-store.md)
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ \
+  --tag workload=headline --tag operation=convolution -o conv.json
 
 # Repeatable recipe; CLI flags override the file
 dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_fwd.json
@@ -121,47 +122,40 @@ dnn-benchmark --config sample_configs/basic.toml.example -g graphs/sample_conv_f
 |---|---|
 | [docs/setup.md](docs/setup.md) | `setup_env.py`: torch modes, CMake defines, rocm-libraries source, CUDA hosts, Docker. |
 | [docs/usage.md](docs/usage.md) | All CLI options, engine selection, config files, console output, exit codes, `compare`, profiling. |
+| [docs/graph-store.md](docs/graph-store.md) | The graph store: object keys, the tag vocabulary, `--tag` queries, the upload procedure. |
 | [docs/methodology.md](docs/methodology.md) | What `kernel_med` measures, warmup, cache modes, stop rule, statistics, parity with rocKE and PyTorch, known limits. |
-| [docs/results-schema.md](docs/results-schema.md) | Result file schema version 2 (JSON and CSV). |
+| [docs/results-schema.md](docs/results-schema.md) | Result file schema version 3 (JSON and CSV). |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | ROCm library paths, profiler requirements, profiling artefacts. |
 | [AGENTS.md](AGENTS.md) | Architecture and development rules. |
 
 `dnn-benchmark --help` is the authoritative option list.
 
-## Workload files
+## Graph store
 
-The `Workloads/` directory holds benchmark workload tarballs tracked with
-[DVC](https://dvc.org/). The public DVC remote in `.dvc/config` allows
-anonymous reads.
-
-- `Workloads/headline/`: the small, curated set for regression monitoring
-  (`conv`, `bnorm`, `attn`, `hipblaslt`, `moe`, `norm`). No ROCm engine
-  implements RMSNorm or LayerNorm yet, so `norm.tar.gz` has no applicable
-  engines today.
-- `Workloads/microbench/`: larger shape sweeps and per-source collections.
-- `Workloads/models/`: workloads for each model.
-- `Workloads/corpus/`: reference collections across models with minimal graph
-  overlap inside each collection. The current collection covers convolution.
+The benchmark graphs are in a public graph store, one JSON object for each
+graph. The tags in each graph select it. Anyone can read the store without
+credentials:
 
 ```bash
-python -m pip install "dvc[s3]"
-dvc pull                                      # every workload
-dvc pull Workloads/headline/conv.tar.gz.dvc   # one headline workload
-dvc pull Workloads/corpus/Convolution/files.tar.gz.dvc  # corpus
+# Every headline graph; the first run copies the store into the work directory
+dnn-benchmark -g s3://therock-dvc/dnn-benchmarking-graphs/ --tag workload=headline
 ```
 
-Keep credentials in `.dvc/config.local`, which git ignores.
+The `workload` tag groups the graphs:
 
-DVC keeps per-repository state in a shared site cache, `/var/tmp/dvc` on Linux.
-Where `/var/tmp` is read-only (some containers, including the hipDNN
-Slurm images), `dvc pull` fails with
-`[Errno 30] Read-only file system: '/var/tmp/dvc'`. Point the site cache at any
-writable directory:
+- `workload=headline`: the small, curated set for regression monitoring.
+  `operation` splits it into `convolution`, `batchnorm`, `sdpa`, `matmul`,
+  `moe` and `norm`. No ROCm engine implements RMSNorm or LayerNorm yet, so
+  the `operation=norm` graphs have no applicable engines today.
+- `workload=microbench`: larger shape sweeps and per-source collections
+  (`source=aiter`, `source=rocke`, ...).
+- `workload=model`: workloads for each model (`model=...`).
+- `workload=corpus`: reference collections across models with minimal graph
+  overlap inside each collection: convolution, SDPA forward and SDPA
+  backward.
 
-```bash
-export DVC_SITE_CACHE_DIR=/tmp/dvc-site    # or: dvc config --local core.site_cache_dir /tmp/dvc-site
-dvc pull
-```
+[docs/graph-store.md](docs/graph-store.md) gives the tag vocabulary, the
+query for each old `Workloads/` set, and the upload procedure.
 
 ## Tests
 
@@ -179,13 +173,17 @@ without building a plan or running a kernel. It has two validation levels:
 
 ```bash
 # Pure-Python loader only (no hipDNN build required)
-python tools/check_deserialize.py --level json --src src 'Workloads/**/*.json'
+python tools/check_deserialize.py --level json --src src graphs
 
 # Full deserialize + build/finalize the backend operation graph (needs a built hipDNN)
-python tools/check_deserialize.py --level opgraph 'Workloads/**/*.json'
+python tools/check_deserialize.py --level opgraph graphs
+
+# The local copy of the graph store (after one dnn-benchmark -g s3://... run)
+python tools/check_deserialize.py --level json --src src \
+  <work>/graph-store/therock-dvc/dnn-benchmarking-graphs
 ```
 
-Run this after adding new workload graphs to confirm hipDNN can load them. Paths may
+Run this before you upload new graphs to the store, to confirm hipDNN can load them. Paths may
 be globs, directories, or tarball-extracted trees; the script exits non-zero on any
 failure and prints the first failures with their error messages.
 
@@ -196,8 +194,8 @@ scale its source used, usually `1/sqrt(head_dim)`. Such nodes print as
 `NOSCALE` and still exit 0; pass `--strict-scale` to make them failures.
 A causal SDPA node with Sq = 1 whose effective diagonal is top-left attends
 only to key 0, which no decode step means (a decode step is unmasked or
-bottom-right). 137 graphs in the shipped corpus are written that way (57 of
-them in `corpus/SDPABackward`), so the
+bottom-right). 131 graphs of the graph store are written that way (57 of
+them `workload=corpus direction=bwd`), so the
 check prints them as `DECODE` and still exits 0; pass `--strict-decode-mask`
 to make them failures once those graphs are regenerated. Other effective
 top-left causal nodes with Sq != Skv print a warning, because decode and

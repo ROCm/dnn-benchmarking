@@ -49,11 +49,11 @@ def _run_conv(hipdnn, **config):
     return result, successes
 
 
-def test_rows_carry_timing_metrics_and_v2_schema(hipdnn) -> None:
-    """Default metrics on: timing, derived metrics, and a strict-JSON v2 row."""
+def test_rows_carry_timing_metrics_and_v3_schema(hipdnn) -> None:
+    """Default metrics on: timing, derived metrics, and a strict-JSON v3 row."""
     result, successes = _run_conv(hipdnn)
     assert result.status == "ok"
-    assert re.fullmatch(r"[0-9a-f]{12}", result.graph_id)
+    assert re.fullmatch(r"[0-9a-f]{64}", result.graph_id)
 
     for r in successes:
         assert r.runtime == "hipdnn"
@@ -132,9 +132,14 @@ def test_oracle_times_a_knob_built_plan(hipdnn, plugin_path_cli_args, tmp_path) 
         600,
     )
     assert out.is_file(), proc.stderr
-    rows = [r for g in json.loads(out.read_text())["graphs"] for r in g["results"]]
+    graphs = json.loads(out.read_text())["graphs"]
+    rows = [r for g in graphs for r in g["results"]]
     miopen = [r for r in rows if r["engine"]["name"] == "MIOPEN_ENGINE"]
-    assert miopen, [(r["engine"]["name"], r["status"], r["message"]) for r in rows]
+    assert miopen, (
+        [(g["status"], g["message"]) for g in graphs],
+        [(r["engine"]["name"], r["status"], r["message"]) for r in rows],
+        proc.stderr[-4000:],
+    )
     row = miopen[0]
     assert row["status"] == "success" and row["oracle_error"] is None, row
 
