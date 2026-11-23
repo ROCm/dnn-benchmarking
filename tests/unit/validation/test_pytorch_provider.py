@@ -3332,7 +3332,12 @@ class TestSdpaPhiloxDropout:
                 id="fp8_scaling",
             ),
             pytest.param(
-                {"extra_inputs": {"seq_len_kv_tensor_uid": (15, [2])}},
+                {
+                    "extra_inputs": {
+                        "seq_len_q_tensor_uid": (17, [2]),
+                        "seq_len_kv_tensor_uid": (15, [2]),
+                    }
+                },
                 _DUMP_DIMS,
                 "seq_len_kv",
                 id="ragged_kv",

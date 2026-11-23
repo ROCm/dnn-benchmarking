@@ -39,9 +39,12 @@ _FORWARD = "SdpaAttributes"
 
 # The lookup order of pytorch_ops/_common.py (_node_param, _optional_uid). That
 # module imports torch, so the order is repeated here. A null value counts as
-# absent, and the search goes on to the next place.
+# absent, and the search goes on to the next place. _optional_uid's own
+# sections are ("inputs", "outputs"); its fallback (_node_uid) always also
+# checks "attributes" then "parameters", so every optional uid lookup -- not
+# just this one -- sees all four sections in this order.
 _PARAM_SECTIONS = ("parameters", "attributes", "inputs", "outputs")
-_UID_SECTIONS = ("inputs", "outputs", "attributes")
+_UID_SECTIONS = ("inputs", "outputs", "attributes", "parameters")
 
 
 def _first_non_null(node: Dict[str, Any], key: str, sections: Tuple[str, ...]) -> Any:
