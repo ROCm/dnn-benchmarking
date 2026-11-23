@@ -49,12 +49,14 @@ jobs:
 
       # No GPU required: from_json + validate + build_operation_graph only
       # assemble and finalize the backend operation-graph descriptor, no
-      # plan build or kernel execution.
+      # plan build or kernel execution. The check imports only
+      # hipdnn_frontend, so --no-aiter skips the AITER build, which needs a
+      # ROCm version file that this runner does not have.
       - name: Build hipDNN (no GPU)
         env:
           PIP_NO_CACHE_DIR: "1"
         run: |
-          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y
+          python setup_env.py --gpu-arch gfx90a --workspace .ci-workspace -y --no-aiter
 
       - name: Check opgraph-level graph deserialization
         run: |
