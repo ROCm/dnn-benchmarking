@@ -114,38 +114,6 @@ jobs:
             --workspace .ci-gpu-workspace \
             -y
 
-      # TEMPORARY diagnostic: which variable that cli.main sets makes hipDNN
-      # find no engine for sample_conv_fwd. Removed before merge.
-      - name: Debug engine discovery per variable
-        continue-on-error: true
-        run: |
-          source .ci-gpu-workspace/.venv/bin/activate
-          pip install -q -e .
-          cat > /tmp/discover.py <<'EOF'
-          import json, os, sys
-          if sys.argv[1] == "TORCH_FIRST":
-              import torch
-          import hipdnn_frontend as h
-          from dnn_benchmarking.common.rocm_runtime import default_hipdnn_plugin_paths
-          from dnn_benchmarking.config.benchmark_config import SuiteConfig
-          from dnn_benchmarking.execution import Executor
-          paths = [str(p) for p in default_hipdnn_plugin_paths()]
-          h.set_engine_plugin_paths(paths, h.PluginLoadingMode.ABSOLUTE)
-          graph = json.load(open("graphs/sample_conv_fwd.json"))
-          try:
-              ids = Executor(json.dumps(graph), SuiteConfig().timing_policy).discover_engines(h.Handle())
-              print(sys.argv[1], paths, "engines:", ids)
-          except Exception as e:
-              print(sys.argv[1], paths, "ERROR:", e)
-          EOF
-          E=.ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipdnn_plugins/engines
-          python -c "import ctypes, sys; ctypes.CDLL(sys.argv[1]); print('miopen plugin dlopen OK')" "$E/libmiopen_plugin.so" 2>&1 || true
-          python -c "import torch, ctypes, sys; ctypes.CDLL(sys.argv[1]); print('miopen plugin dlopen OK after torch')" "$E/libmiopen_plugin.so" 2>&1 || true
-          ldd -r "$E/libmiopen_plugin.so" 2>&1 | grep -iE "undefined|not found" | head -20 || true
-          ldd "$E/libmiopen_plugin.so" | head -40
-          python -c "import torch, os; print([l for l in open('/proc/self/maps').read().split() if 'MIOpen' in l][:5])" || true
-          ls -la .ci-gpu-workspace/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/ | grep -i miopen || true
-
       # activate (not $VENV/python) for the ROCM_PATH/LD_LIBRARY_PATH that
       # conftest.py's plugin discovery needs. No -m filter: gpu tests run here.
       - name: Install test extras and run full suite on hardware
