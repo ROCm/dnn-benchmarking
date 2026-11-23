@@ -337,8 +337,8 @@ def _dump(ones, n, seed=0):
 def _keep_rate_edges(p, n):
     """The fewest and the most ones that the harness bound accepts."""
     keep = 1.0 - float(np.float32(p))
-    bound = 6.0 * math.sqrt(keep * (1.0 - keep) / n) + 1.0 / n
-    inside = [k for k in range(n + 1) if abs(k / n - keep) <= bound]
+    bound = 6.0 * math.sqrt(keep * (1.0 - keep) * n) + 1.0
+    inside = [k for k in range(n + 1) if abs(k - keep * n) <= bound]
     assert 0 < inside[0] and inside[-1] < n  # Both edges have a neighbour outside.
     return inside[0], inside[-1]
 
@@ -413,6 +413,21 @@ def test_rng_dump_all_zero_at_p_zero_fails(n, passes):
         assert c is None
     else:
         assert c is not None and c.explicitly_failed
+
+
+@pytest.mark.parametrize("n", [3, 7, 42, 81, 100])
+def test_rng_dump_one_zero_at_p_zero_passes(n):
+    """At p = 0 the count bound is exact (``abs(ones - n) <= 1``), so one
+    zero in an all-ones dump passes. A rate comparison instead rounds one
+    ULP past the bound and rejects it for most n, including these five."""
+    c = check_rng_dump(_dump(n - 1, n), 0.0, _config())
+    assert c is None
+
+
+@pytest.mark.parametrize("n", [3, 7, 42, 81, 100])
+def test_rng_dump_two_zeros_at_p_zero_fails(n):
+    c = check_rng_dump(_dump(n - 2, n), 0.0, _config())
+    assert c is not None and c.explicitly_failed
 
 
 @pytest.mark.parametrize("p", [1.5, -0.1, 1.0, np.nan])

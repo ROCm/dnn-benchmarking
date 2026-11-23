@@ -113,10 +113,12 @@ def check_rng_dump(
 
     Returns None when the dump is acceptable, else a mismatch. First, ``p``
     must be in [0, 1), the range the reference accepts. Then every value
-    must be 0.0 or 1.0 (-0.0 is 0; NaN fails). Then the keep rate must be
-    within ``6 * sqrt(keep * (1 - keep) / n) + 1 / n`` of ``keep = 1 - p``,
-    with ``p`` rounded to float32 and the bound in double. An empty dump
-    passes.
+    must be 0.0 or 1.0 (-0.0 is 0; NaN fails). Then the count of ones must
+    be within ``6 * sqrt(keep * (1 - keep) * n) + 1`` of ``keep * n``, with
+    ``keep = 1 - p`` (``p`` rounded to float32) and the bound in double.
+    Comparing counts rather than rates keeps the bound exact at p = 0: a
+    rate comparison can round a dump with exactly one off-keep element one
+    ULP past the bound. An empty dump passes.
     """
     if not 0.0 <= p < 1.0:  # NaN fails too.
         return mismatch(
@@ -143,13 +145,16 @@ def check_rng_dump(
 
     keep = 1.0 - float(np.float32(p))
     rate = ones / n
-    bound = 6.0 * math.sqrt(keep * (1.0 - keep) / n) + 1.0 / n
-    if abs(rate - keep) > bound:
+    # Compare counts, not rates: dividing the bound by n to compare rates
+    # can round a dump with exactly one off-keep element one ULP past the
+    # bound (e.g. p = 0, one zero in an all-ones dump).
+    bound = 6.0 * math.sqrt(keep * (1.0 - keep) * n) + 1.0
+    if abs(ones - keep * n) > bound:
         return mismatch(
             config,
             f"rng_dump keep rate check failed: {ones} of {n} elements are 1 "
-            f"(rate {rate:.6g}). The rate must be within {bound:.6g} of the "
-            f"keep rate {keep:.6g} (dropout_probability {p}).",
+            f"(rate {rate:.6g}). The rate must be within {bound / n:.6g} of "
+            f"the keep rate {keep:.6g} (dropout_probability {p}).",
         )
     return None
 
