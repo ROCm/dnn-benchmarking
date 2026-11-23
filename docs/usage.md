@@ -63,8 +63,8 @@ gives the store rules and the tag vocabulary. The public store is
 
 A listing or download error stops the run with exit code 1. A directory of
 store objects (for example the cache folder, or the `--out` folder of
-`tools/workloads_to_store.py`) is a usual `-g` directory: `--tag` applies to
-it in the same way.
+`tools/sdpa_fwd_to_bwd.py`) is a usual `-g` directory: `--tag` applies to it
+in the same way.
 
 ### Run
 

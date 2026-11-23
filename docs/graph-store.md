@@ -99,15 +99,15 @@ writes, so that two uploads of one key cannot overwrite each other.
    object to change its tags.
 
 Before an upload, check each object against rules 1 to 3.
-`tools/workloads_to_store.py` (the one-time conversion of the `Workloads/`
-tarballs) and `tools/sdpa_fwd_to_bwd.py` (the SDPA backward corpus) write
-objects that obey these rules into a local folder. Run a folder with
+`tools/sdpa_fwd_to_bwd.py` (the SDPA backward corpus) writes objects that
+obey these rules into a local folder. Run a folder with
 `dnn-benchmark -g <folder>` before you upload it.
 
 ## Old `Workloads/` sets
 
-The `Workloads/` DVC tarballs became store objects. Each old set is the
-result of one tag query:
+The `Workloads/` DVC tarballs became store objects in a one-time migration,
+done outside this repository. Duplicate geometries became one object with
+the union of their tags. Each old set is the result of one tag query:
 
 | Old set (`Workloads/...`) | Tag query |
 |---|---|
@@ -119,11 +119,26 @@ result of one tag query:
 | `headline/norm` | `workload=headline operation=norm` |
 | `microbench/<source>` | `workload=microbench source=<source>` |
 | `microbench/rocke` | `workload=microbench source=rocke operation=convolution` |
-| `models/<set>` | `workload=model source=<source> model=<model>` |
+| `models/<set>` | `workload=model source=<source> model=<model>` (table below) |
 | `corpus/Convolution` | `workload=corpus operation=convolution` |
 | `corpus/SDPA` | `workload=corpus operation=sdpa direction=fwd` |
 | `corpus/SDPABackward` | `workload=corpus operation=sdpa direction=bwd` |
 
 `a|b` is two terms of one key: `--tag operation=moe --tag operation=matmul`.
-The `SETS` table in `tools/workloads_to_store.py` gives the `source` and the
-`model` of each `models/` set.
+
+| Old set (`Workloads/models/...`) | `source` | `model` |
+|---|---|---|
+| `auto_regressive_dit` | `cudnn_attention_training` | `auto_regressive_dit` |
+| `dsv3` | `cudnn_attention_training` | `deepseek_v3` |
+| `gpt_oss` | `cudnn_attention_training` | `gpt_oss` |
+| `kimiK26` | `cudnn_attention_training` | `kimi_k2_6` |
+| `llama3.1` | `cudnn_attention_training` | `llama3_1` |
+| `ltx2` | `cudnn_attention_training` | `ltx2` |
+| `qwen35` | `cudnn_attention_training` | `qwen3_5` |
+| `wan22_a14b` | `cudnn_attention_training` | `wan2_2_a14b` |
+| `glm_5_2_moe` | `hf_config` | `glm5_2` |
+| `qwen3_235b_a22b_moe` | `hf_config` | `qwen3_235b_a22b` |
+| `qwen3_30b_a3b_moe` | `hf_config` | `qwen3_30b_a3b` |
+| `qwen3_32b` | `hf_config` | `qwen3_32b` |
+| `qwen3_8b` | `hf_config` | `qwen3_8b` |
+| `mad_llama3_1_8b_train` | `mad` | `llama3_1_8b` |
