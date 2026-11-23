@@ -75,7 +75,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
 | `--no-aiter` | Skip the `AITER` stage. Only `--runtime aiter` needs it. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
-| `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
+| `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Default: the commit pinned by the Quartz nightly's `therock_commit` in `rocm` mode, else the repo's submodule pin. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
 | `-y`, `--yes` | Answer yes to every prompt. Required when stdin is not a terminal and a prompt would show. |
 
@@ -476,19 +476,23 @@ from the local checkout:
 | `--device-target TARGET` | `gfx942` | ROCm PyTorch architecture: `gfx90a`, `gfx942`, `gfx950`, `gfx1151` or `gfx1152`. |
 | `--tag TAG` | `dnn-benchmark-performance:<device-target>` | Image tag. |
 | `--rocm-version VERSION` | newest usable Quartz nightly | ROCm wheel version to install. |
+| `--rocm-libraries-ref SHA` | matched to the nightly's `therock_commit` | Full 40-character `rocm-libraries` commit to build. |
 | `-- ARGS...` | none | More arguments for the container build command. |
 
-The script passes the pinned `rocm-libraries` commit to the build, because
-the build context has no `.git`. The script also selects the ROCm nightly for
-`--device-target` on the host, as in
+The script selects the ROCm nightly for `--device-target` on the host, as in
 [ROCm nightly selection](#rocm-nightly-selection), unless `--rocm-version`
-names one. The host thus needs `python3`. When no nightly qualifies for the
-device target, for example while Quartz reports failed `gfx90a` tests, the
-script stops; then pass `--rocm-version`. The script passes the version as
-the `ROCM_VERSION` build argument and the wheels URL as
-`ROCM_TORCH_INDEX_URL`. A new nightly thus rebuilds the setup layer. The
-image carries the ROCm version in the label
-`com.amd.dnn-benchmark.rocm-version`:
+names one. Unless `--rocm-libraries-ref` is given, it then resolves the
+matching `rocm-libraries` commit from `ROCm/TheRock` at that nightly's
+`therock_commit` (falling back to the local submodule pin when Quartz has no
+`therock_commit`, because the build context has no `.git`). The host thus
+needs `python3`, `git` and HTTPS access to `github.com`. When no nightly
+qualifies for the device target, for example while Quartz reports failed
+`gfx90a` tests, the script stops; then pass `--rocm-version`. The script
+passes the selected build as the `ROCM_VERSION`, `ROCM_LIBRARIES_REF` and
+`ROCM_TORCH_INDEX_URL` build arguments. Both `ROCM_VERSION` and
+`ROCM_LIBRARIES_REF` are declared after the `apt-get` stage, so a new nightly
+reuses the apt layer and rebuilds only the setup layer. The image carries the
+ROCm version in the label `com.amd.dnn-benchmark.rocm-version`:
 
 ```bash
 docker inspect --format \

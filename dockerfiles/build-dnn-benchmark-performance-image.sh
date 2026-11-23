@@ -97,6 +97,7 @@ repo_root="$(cd -- "${script_dir}/.." && pwd)"
 # passed --rocm-libraries-ref. The image then installs and labels that matched
 # build even when a newer nightly appears.
 resolved="$(python3 - "${repo_root}/setup_env.py" "${device_target}" "${rocm_version}" "${rocm_libraries_ref}" <<'PY'
+import argparse
 import importlib.util
 import sys
 
@@ -104,6 +105,12 @@ spec = importlib.util.spec_from_file_location("setup_env", sys.argv[1])
 setup_env = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup_env)
 device_target, rocm_version, rocm_libraries_ref = sys.argv[2:]
+if rocm_libraries_ref:
+    try:
+        rocm_libraries_ref = setup_env._commit_sha(rocm_libraries_ref)
+    except argparse.ArgumentTypeError as exc:
+        print(f"ERROR: --rocm-libraries-ref: {exc}", file=sys.stderr)
+        sys.exit(2)
 if rocm_version:
     build = setup_env.describe_rocm_version(rocm_version, "", "linux", device_target)
 else:

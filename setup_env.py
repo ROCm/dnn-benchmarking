@@ -496,27 +496,24 @@ def describe_rocm_version(
     )
 
 
-def resolve_therock_rocm_libraries_commit(
+def _fetch_therock_rocm_libraries_commit(
     therock_commit: str, repo_url: str = THEROCK_REPO_URL
 ) -> str:
-    """The rocm-libraries submodule commit pinned by ``therock_commit`` in TheRock.
+    """Resolve the rocm-libraries gitlink at ``therock_commit`` in TheRock.
 
-    Uses a bare, tree-filtered git fetch of the single commit (~10 KB, no
-    GitHub REST API rate limit) and reads the ``rocm-libraries`` gitlink via
-    ``git ls-tree``. Exits with an actionable error when the commit cannot be
-    fetched or carries no ``rocm-libraries`` submodule entry.
+    Raises ``RuntimeError`` on invalid input, missing git, fetch failure, or a
+    missing submodule entry so callers can choose fatal vs advisory handling.
     """
     commit = therock_commit.strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        fail(
-            f"expected a 40-character TheRock commit SHA, got {therock_commit!r}.",
-            "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+        raise RuntimeError(
+            f"expected a 40-character TheRock commit SHA, got {therock_commit!r}."
         )
     with tempfile.TemporaryDirectory(prefix="therock-ref-") as tmp:
         git = ["-C", tmp]
         try:
-            run_git(["init", "--bare", "--quiet", tmp])
-            run_git(
+            git_output(["init", "--bare", "--quiet", tmp])
+            git_output(
                 [
                     *git,
                     "fetch",
@@ -531,14 +528,20 @@ def resolve_therock_rocm_libraries_commit(
             entry = git_output(
                 [*git, "ls-tree", "FETCH_HEAD", "--", THEROCK_ROCM_LIBRARIES_PATH]
             )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"git not found on PATH; cannot resolve {THEROCK_ROCM_LIBRARIES_PATH} "
+                f"commit for TheRock {commit}."
+            ) from exc
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or "").strip()
-            fail(
+            msg = (
                 f"cannot resolve {THEROCK_ROCM_LIBRARIES_PATH} commit for "
-                f"TheRock {commit} from {repo_url}.",
-                *(line for line in (detail,) if line),
-                "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+                f"TheRock {commit} from {repo_url}."
             )
+            if detail:
+                msg = f"{msg}\n{detail}"
+            raise RuntimeError(msg) from exc
     parts = entry.split()
     if (
         len(parts) != 4
@@ -547,12 +550,38 @@ def resolve_therock_rocm_libraries_commit(
         or not re.fullmatch(r"[0-9a-f]{40}", parts[2])
         or parts[3] != THEROCK_ROCM_LIBRARIES_PATH
     ):
-        fail(
+        raise RuntimeError(
             f"TheRock commit {commit} has no '{THEROCK_ROCM_LIBRARIES_PATH}' "
-            f"submodule entry in {repo_url} (got {entry!r}).",
-            "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+            f"submodule entry in {repo_url} (got {entry!r})."
         )
     return parts[2]
+
+
+def resolve_therock_rocm_libraries_commit(
+    therock_commit: str,
+    repo_url: str = THEROCK_REPO_URL,
+    *,
+    required: bool = True,
+) -> Optional[str]:
+    """The rocm-libraries submodule commit pinned by ``therock_commit`` in TheRock.
+
+    Uses a bare, tree-filtered git fetch of the single commit (~10 KB, no
+    GitHub REST API rate limit) and reads the ``rocm-libraries`` gitlink via
+    ``git ls-tree``. When ``required`` is True, exits with an actionable error
+    on failure; when False (advisory check for an existing checkout), warns and
+    returns None.
+    """
+    try:
+        return _fetch_therock_rocm_libraries_commit(therock_commit, repo_url)
+    except RuntimeError as exc:
+        lines = str(exc).splitlines()
+        if required:
+            fail(
+                *lines,
+                "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+            )
+        warn(*lines, "Keeping the existing rocm-libraries/ checkout.")
+        return None
 
 
 def default_workspace() -> Path:
@@ -1088,7 +1117,9 @@ class Setup:
 
     # -- rocm-libraries checkout --------------------------------------------
 
-    def _resolve_rocm_libraries_ref(self) -> Tuple[str, str, Optional[str]]:
+    def _resolve_rocm_libraries_ref(
+        self, *, required: bool = True
+    ) -> Tuple[str, str, Optional[str]]:
         """Return ``(ref, source, therock_commit)`` for the rocm-libraries checkout.
 
         Precedence:
@@ -1096,7 +1127,9 @@ class Setup:
         2. When ROCm PyTorch was installed from a Quartz-known TheRock nightly
            (recorded in ``ROCM_BUILD_RECORD``), the ``rocm-libraries`` commit
            pinned by that ``therock_commit`` so ``miopen-provider`` and hipDNN
-           stay in lockstep with the wheel's MIOpen.
+           stay in lockstep with the wheel's MIOpen. When ``required`` is False
+           (reusing an existing checkout), a failed lookup warns and returns an
+           empty ref instead of aborting setup.
         3. The pinned ``rocm-libraries`` git submodule commit of this repo.
         """
         if self.rocm_libraries_ref:
@@ -1117,7 +1150,11 @@ class Setup:
                         "Resolving rocm-libraries commit for TheRock "
                         f"{therock_commit[:12]}..."
                     )
-                    ref = resolve_therock_rocm_libraries_commit(therock_commit)
+                    ref = resolve_therock_rocm_libraries_commit(
+                        therock_commit, required=required
+                    )
+                    if ref is None:
+                        return "", "quartz", therock_commit
                     record["rocm_libraries_commit"] = ref
                     try:
                         (self.venv_dir / ROCM_BUILD_RECORD).write_text(
@@ -1151,12 +1188,14 @@ class Setup:
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
         gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        ref, source, therock_commit = self._resolve_rocm_libraries_ref()
+        has_checkout = (ROCM_LIBRARIES_DIR / ".git").exists()
+        ref, source, therock_commit = self._resolve_rocm_libraries_ref(
+            required=not has_checkout
+        )
         # Only a full commit id can be compared with HEAD; a branch moves.
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
-        if (ROCM_LIBRARIES_DIR / ".git").exists():
-            # A sparse clone made by an older setup lacks root dirs added since.
+        if has_checkout:
             missing = [
                 path
                 for path in ROCM_LIBRARIES_ROOT_DIRS

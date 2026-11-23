@@ -42,7 +42,9 @@ def _no_quartz_network(setup_env, monkeypatch):
     def refuse_url(url):
         raise AssertionError(f"unit test fetched {url}")
 
-    def refuse_therock(therock_commit, repo_url=setup_env.THEROCK_REPO_URL):
+    def refuse_therock(
+        therock_commit, repo_url=setup_env.THEROCK_REPO_URL, *, required=True
+    ):
         raise AssertionError(
             f"unit test resolved TheRock {therock_commit} from {repo_url}"
         )
@@ -1614,7 +1616,7 @@ def test_rocm_mode_checks_out_quartz_matched_rocm_libraries_and_caches_it(
     monkeypatch.setattr(
         setup_env,
         "resolve_therock_rocm_libraries_commit",
-        lambda sha, repo_url=setup_env.THEROCK_REPO_URL: (
+        lambda sha, repo_url=setup_env.THEROCK_REPO_URL, *, required=True: (
             calls.append(sha),
             quartz_sha,
         )[1],
@@ -1658,7 +1660,7 @@ def test_rocm_mode_warns_when_existing_checkout_differs_from_quartz_match(
     monkeypatch.setattr(
         setup_env,
         "resolve_therock_rocm_libraries_commit",
-        lambda sha, repo_url=setup_env.THEROCK_REPO_URL: quartz_sha,
+        lambda sha, repo_url=setup_env.THEROCK_REPO_URL, *, required=True: quartz_sha,
     )
     setup = _setup(setup_env, tmp_path)
     setup.venv_dir.mkdir(parents=True)
@@ -1674,6 +1676,57 @@ def test_rocm_mode_warns_when_existing_checkout_differs_from_quartz_match(
     assert _head(rocm_libraries) == older_sha
     err = capsys.readouterr().err
     assert f"not {quartz_sha[:12]} (matched to TheRock {therock_sha[:12]})" in err
+
+
+def test_rocm_mode_reuses_existing_checkout_when_therock_lookup_fails(
+    setup_env, tmp_path, monkeypatch, capsys, rocm_libraries
+) -> None:
+    older_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", older_sha
+    ).ensure_rocm_libraries_checkout()
+    assert _head(rocm_libraries) == older_sha
+
+    # Exercise the real resolver against an unreachable repo URL: because
+    # rocm-libraries/ already exists, the lookup is advisory and must warn
+    # instead of aborting setup.
+    monkeypatch.undo()
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
+    monkeypatch.setattr(
+        setup_env, "THEROCK_REPO_URL", (tmp_path / "no-such-therock.git").as_uri()
+    )
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(
+        json.dumps({"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "e" * 40})
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == older_sha
+    err = capsys.readouterr().err
+    assert "WARNING:" in err
+    assert "Keeping the existing rocm-libraries/ checkout." in err
+
+
+def test_resolve_therock_rocm_libraries_commit_handles_missing_git(
+    setup_env, monkeypatch, capsys
+) -> None:
+    monkeypatch.undo()
+
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(setup_env, "git_output", no_git)
+
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit("f" * 40)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "git not found on PATH" in err
+    assert "--rocm-libraries-ref" in err
 
 
 def test_explicit_rocm_libraries_ref_overrides_quartz_therock_commit(
