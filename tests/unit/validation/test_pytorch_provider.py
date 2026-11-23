@@ -2056,6 +2056,7 @@ class TestPyTorchProviderNewOps:
         dbias=False,
         attributes=None,
         types=None,
+        extra_inputs=None,
     ):
         """An SDPA backward graph (B 2, Hq 4, Hkv 2, Sq 5, Skv 7, D 8) with an
         explicit dropout mask, its scale and ``dropout_scale_inv`` by default.
@@ -2095,6 +2096,9 @@ class TestPyTorchProviderNewOps:
             if dims is not None:
                 inputs[key] = uid
                 tensors[uid] = list(dims)
+        for key, (uid, dims) in (extra_inputs or {}).items():
+            inputs[key] = uid
+            tensors[uid] = list(dims)
         outputs = {
             "dq_tensor_uid": cls._DQ,
             "dk_tensor_uid": cls._DK,
@@ -2410,12 +2414,25 @@ class TestPyTorchProviderNewOps:
                 id="probability_zero_with_offset",
             ),
             pytest.param({"probability": 0.0}, None, id="probability_zero_with_mask"),
+            pytest.param(
+                {
+                    "extra_inputs": {
+                        "seq_len_q_tensor_uid": (19, [2]),
+                        "seq_len_kv_tensor_uid": (20, [2]),
+                    },
+                    "types": {19: "int64", 20: "int64"},
+                },
+                "ragged or variable-length",
+                id="explicit_mask_with_varlen_length_source",
+            ),
         ],
     )
     def test_sdpa_backward_dropout_declines(self, graph_kwargs, match) -> None:
-        """One case per backward R7 rule that hipDNN declines (rows 10-11).
-        Each graph differs from a computable one in that rule only. A backward
-        node has no ``rng_dump``, so no message may name it."""
+        """One case per backward R7 rule that hipDNN declines (rows 10-11),
+        plus the backward's ragged/variable-length dropout decline (:2428):
+        explicit-mask dropout with a length source on both sides. Each graph
+        differs from a computable one in that rule only. A backward node has
+        no ``rng_dump``, so no message may name it."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph = self._backward_dropout_graph(**graph_kwargs)
 
@@ -2424,6 +2441,52 @@ class TestPyTorchProviderNewOps:
                 graph, self._backward_dropout_inputs(graph, seed=25)
             )
         assert "rng_dump" not in str(declined.value)
+
+    def test_sdpa_backward_dropout_never_takes_fused_path(self) -> None:
+        """``fused()`` (:2496) must decline whenever dropout is active, even
+        past the GPU branch (``q.is_cuda``): PyTorch's fused backward kernels
+        take no dropout mask, so taking that path would silently drop it.
+        Fused() is tried only once ``q.is_cuda``; a CPU tensor tagged
+        ``is_cuda`` reaches that branch without a GPU (``_GpuTensor``, as
+        ``test_pytorch_ops.py`` does for MIOpen ops). A correct dropout-aware
+        gradient here proves the manual path ran instead of the
+        (dropout-blind) fused one."""
+        from dnn_benchmarking.execution import pytorch_ops
+
+        class _GpuTensor(torch.Tensor):
+            """CPU tensor reporting ``is_cuda`` so CPU torch reaches the GPU branch."""
+
+            @property
+            def is_cuda(self) -> bool:
+                return True
+
+        graph = self._backward_dropout_graph()
+        inputs = self._backward_dropout_inputs(graph, seed=29)
+        o, lse, dq, dk, dv = self._dropout_backward_reference(
+            inputs[_Q],
+            inputs[_K],
+            inputs[_V],
+            inputs[self._DO],
+            inputs[_DROP_MASK],
+            _KEEP_SCALE,
+            1 / _KEEP_SCALE,
+        )
+        tensors = {
+            _Q: torch.from_numpy(inputs[_Q]).as_subclass(_GpuTensor),
+            _K: torch.from_numpy(inputs[_K]),
+            _V: torch.from_numpy(inputs[_V]),
+            _O: torch.from_numpy(o.astype(np.float32)),
+            self._DO: torch.from_numpy(inputs[self._DO]),
+            _STATS: torch.from_numpy(lse.astype(np.float32)),
+            _DROP_MASK: torch.from_numpy(inputs[_DROP_MASK]),
+            _DROP_SCALE: torch.from_numpy(inputs[_DROP_SCALE]),
+            self._SCALE_INV: torch.from_numpy(inputs[self._SCALE_INV]),
+        }
+
+        pytorch_ops.execute_graph(graph, tensors)
+
+        for uid, grad in ((self._DQ, dq), (self._DK, dk), (self._DV, dv)):
+            np.testing.assert_allclose(tensors[uid].numpy(), grad, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.parametrize("dtype", ["float", "bfloat16"])
     def test_sdpa_alibi_forward_correct_across_block_boundaries(
@@ -2870,10 +2933,38 @@ class TestSdpaExplicitDropout:
                 "page_table",
                 None,
             ),
-            ({"seq_len_q_tensor_uid": (15, [2])}, "seq_len_q", None),
-            ({"seq_len_kv_tensor_uid": (15, [2])}, "seq_len_kv", None),
-            ({"cu_seq_len_q_tensor_uid": (15, [3])}, "cu_seq_len_q", None),
-            ({"cu_seq_len_kv_tensor_uid": (15, [3])}, "cu_seq_len_kv", None),
+            (
+                {
+                    "seq_len_q_tensor_uid": (15, [2]),
+                    "seq_len_kv_tensor_uid": (16, [2]),
+                },
+                "seq_len_q",
+                None,
+            ),
+            (
+                {
+                    "seq_len_q_tensor_uid": (15, [2]),
+                    "seq_len_kv_tensor_uid": (16, [2]),
+                },
+                "seq_len_kv",
+                None,
+            ),
+            (
+                {
+                    "cu_seq_len_q_tensor_uid": (15, [3]),
+                    "cu_seq_len_kv_tensor_uid": (16, [3]),
+                },
+                "cu_seq_len_q",
+                lambda g: g["nodes"][0]["attributes"].update(padding_mask=True),
+            ),
+            (
+                {
+                    "cu_seq_len_q_tensor_uid": (15, [3]),
+                    "cu_seq_len_kv_tensor_uid": (16, [3]),
+                },
+                "cu_seq_len_kv",
+                lambda g: g["nodes"][0]["attributes"].update(padding_mask=True),
+            ),
             (
                 {},
                 "ragged",

@@ -1544,36 +1544,12 @@ def compile_sdpa(
     o_uid = _required_output_uid(node, "o_tensor_uid")
     plan = _plan_sdpa_common(node, allow_paged=True, allow_sink=True)
     is_causal = plan.is_causal
-    # Dropout is handled entirely by the manual paths below (explicit mask,
-    # Philox); nonzero p never reaches a native SDPA call.
-    dropout_p = 0.0
     operands = sdpa_operands(node)
     stats_uid = operands.stats
     tensors_json = tensors_by_uid(graph_json)
 
     is_paged = operands.is_paged
-    if is_paged and plan.alibi:
-        raise UnsupportedGraphError("SDPA ALiBi is not supported with paged attention")
-    if is_paged:
-        if (
-            operands.page_table_k_tensor_uid is None
-            or operands.page_table_v_tensor_uid is None
-        ):
-            raise ValueError("Paged SDPA needs both K and V page tables")
-        if operands.seq_len_kv_tensor_uid is None:
-            raise ValueError("Paged SDPA needs seq_len_kv to bound each sequence")
-        if stats_uid is not None:
-            raise ValueError("Paged SDPA stats output is not supported")
-        if any(
-            ragged_fields(tensors_json.get(uid, {}))[0] is not None
-            for uid in operands.kv_side
-        ):
-            raise ValueError("Paged SDPA K/V cache must stay non-ragged")
     is_varlen = not is_paged and has_varlen_source(node, tensors_json)
-    if is_varlen and plan.alibi:
-        raise UnsupportedGraphError(
-            "SDPA ALiBi is not supported with variable-length attention"
-        )
     if plan.dropout_form is not None and (is_paged or is_varlen):
         layout = [
             key
@@ -1593,6 +1569,33 @@ def compile_sdpa(
             "SDPA dropout is not supported with paged or ragged K/V "
             f"({', '.join(layout)})"
         )
+    if is_paged and plan.alibi:
+        raise UnsupportedGraphError("SDPA ALiBi is not supported with paged attention")
+    if is_paged:
+        if (
+            operands.page_table_k_tensor_uid is None
+            or operands.page_table_v_tensor_uid is None
+        ):
+            raise ValueError("Paged SDPA needs both K and V page tables")
+        if operands.seq_len_kv_tensor_uid is None:
+            raise ValueError("Paged SDPA needs seq_len_kv to bound each sequence")
+        if stats_uid is not None:
+            raise ValueError("Paged SDPA stats output is not supported")
+        if any(
+            ragged_fields(tensors_json.get(uid, {}))[0] is not None
+            for uid in operands.kv_side
+        ):
+            raise ValueError("Paged SDPA K/V cache must stay non-ragged")
+    if is_varlen and plan.alibi:
+        raise UnsupportedGraphError(
+            "SDPA ALiBi is not supported with variable-length attention"
+        )
+    if plan.dropout_form == _EXPLICIT_DROPOUT:
+        _check_explicit_dropout(node, graph_json, plan.dropout)
+    philox_dump = None
+    if plan.dropout_form == _PHILOX_DROPOUT:
+        philox_dump = _philox_dump(node, graph_json, plan.dropout)
+        philox_scale = _philox_scale(plan.dropout.probability)
 
     # Setup is cached on the assumption that its inputs repeat unchanged every
     # replay. A tensor written by an earlier node breaks that assumption,
@@ -1847,7 +1850,7 @@ def compile_sdpa(
                         batch.k,
                         batch.v,
                         attn_mask=batch.mask,
-                        dropout_p=dropout_p,
+                        dropout_p=0.0,
                         is_causal=batch.is_causal,
                         scale=s.scale,
                         enable_gqa=batch.enable_gqa,
