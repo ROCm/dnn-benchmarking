@@ -848,6 +848,45 @@ def test_varlen_sdpa_stats_with_matching_infinities_pass_validation(fake, monkey
     assert row.verdict == "passed"
 
 
+def test_tuned_validator_matches_infinities_in_sdpa_stats(fake, monkeypatch):
+    """suite_runner._tuned_validator must grade the tuned child's saved
+    outputs with the graph's resolved tensor infos (ctx.tensor_infos), not a
+    bare comparison built without them: the varlen stats output carries
+    matching_infinities, so the tuned verdict accepts dead -inf rows there
+    and still catches a real mismatch."""
+    fake.discovered = [1]
+    shape = (3, 1, 8)
+    o = np.zeros((*shape, 4), np.float32)
+    dead_stats = np.full((*shape, 1), -np.inf, np.float32)
+
+    def prepare(ctx):
+        ctx.reference_outputs = {
+            4: suite_runner.ReferenceOutput(data=o.copy(), tensor_uid=4),
+            5: suite_runner.ReferenceOutput(data=dead_stats.copy(), tensor_uid=5),
+        }
+
+    monkeypatch.setattr(suite_runner, "_prepare_references", prepare)
+
+    _run_varlen(
+        _varlen_graph(), validation=ValidationConfig(provider="pytorch"), oracle=True
+    )
+
+    (kw,) = fake.tuned
+    validate = kw["validate"]
+    assert validate is not None
+
+    def saved(stats):
+        return SimpleNamespace(
+            get_output_tensor=lambda uid: None,
+            get_output_data={4: o.copy(), 5: stats}.get,
+        )
+
+    assert validate(saved(dead_stats.copy())).tolerance_match
+
+    live_stats = np.full(shape + (1,), np.inf, np.float32)  # opposite sign
+    assert not validate(saved(live_stats)).tolerance_match
+
+
 def test_graph_the_varlen_resolver_refuses_has_no_engines_and_names_the_tensor(fake):
     graph, _ = _run_varlen(_varlen_graph(sources=("q",)))
 
