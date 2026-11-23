@@ -659,17 +659,25 @@ def parse_archive_option(text: str) -> Archive:
     return Archive(match.group(1), match.group(3), None, Path(match.group(2)))
 
 
+def _https_get(url: str, timeout: float) -> bytes:
+    """Return the body of an HTTPS GET. Reject every other URL scheme."""
+    if urllib.parse.urlparse(url).scheme != "https":
+        raise MigrationError(f"only https URLs are allowed, got {url!r}")
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.read()
+
+
 def fetch(archive: Archive, cache: Path) -> Path:
     """Return a local copy of an archive whose md5 and size are checked."""
     path = archive.path or cache / archive.md5
     if archive.path is None and not path.exists():
         url = f"{DVC_REMOTE_URL}/files/md5/{archive.md5[:2]}/{archive.md5[2:]}"
         partial = path.with_suffix(".part")
-        with urllib.request.urlopen(url, timeout=120) as response:
-            partial.write_bytes(response.read())
+        partial.write_bytes(_https_get(url, timeout=120))
         partial.replace(path)
     data = path.read_bytes()
-    if hashlib.md5(data).hexdigest() != archive.md5:
+    # md5 is DVC's integrity checksum here, not a security control.
+    if hashlib.md5(data, usedforsecurity=False).hexdigest() != archive.md5:
         raise MigrationError(f"{archive.set_name}: md5 mismatch for {path}")
     if archive.size is not None and len(data) != archive.size:
         raise MigrationError(f"{archive.set_name}: size mismatch for {path}")
@@ -763,8 +771,8 @@ def list_prefix(url: str) -> list[str]:
         if token:
             params["continuation-token"] = token
         query = urllib.parse.urlencode(params)
-        with urllib.request.urlopen(f"{_https(bucket)}/?{query}", timeout=60) as r:
-            root = ElementTree.fromstring(r.read())
+        body = _https_get(f"{_https(bucket)}/?{query}", timeout=60)
+        root = ElementTree.fromstring(body)
         keys += [
             e.text.removeprefix(prefix)
             for e in root.findall("s3:Contents/s3:Key", namespace)
@@ -782,9 +790,9 @@ def verify_upload(objects: dict[str, Any], url: str, fraction: float) -> int:
         raise MigrationError(f"{url} has {len(keys)} keys, expected {len(objects)}")
     checked = sample(list(keys), fraction)
     for key in checked:
-        with urllib.request.urlopen(f"{_https(bucket)}/{prefix}{key}", timeout=60) as r:
-            if geometry_key(json.loads(r.read())) != key:
-                raise MigrationError(f"{url}{key}: key is not the geometry hash")
+        body = _https_get(f"{_https(bucket)}/{prefix}{key}", timeout=60)
+        if geometry_key(json.loads(body)) != key:
+            raise MigrationError(f"{url}{key}: key is not the geometry hash")
     return len(checked)
 
 
