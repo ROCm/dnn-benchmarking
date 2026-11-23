@@ -20,10 +20,11 @@ stages are:
 
 1. `Virtual environment`: create `<workspace>/.venv`, or reuse it. See
    [Reusing a venv](#reusing-a-venv).
-2. `PyTorch (--torch-mode rocm)`: detect the GPU architecture, select the
-   ROCm nightly (see [ROCm nightly selection](#rocm-nightly-selection)) and
-   install its ROCm PyTorch (`torch[device-<arch>]`). Its ROCm SDK
-   libraries and toolchain are used for the build.
+2. `PyTorch (--torch-mode rocm)`: detect the GPU architecture, resolve the
+   ROCm nightly (from `rocm-pin.json` by default; see
+   [ROCm nightly selection](#rocm-nightly-selection)) and install its ROCm
+   PyTorch (`torch[device-<arch>]`). Its ROCm SDK libraries and toolchain are
+   used for the build.
 3. `dnn-benchmarking package`: install dnn-benchmarking (editable unless
    `--no-editable`).
 4. `rocm-libraries sources`: fetch `rocm-libraries` if it is absent (see
@@ -68,14 +69,14 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--torch-mode {rocm,cuda,cpu,existing,none}` | How to provide PyTorch. Default `rocm`. See [Torch modes](#torch-modes). |
 | `--workspace WORKSPACE` | Root for the venv, the Python bytecode cache and the runtime caches. See [Workspace](#workspace). |
 | `--no-editable` | Install dnn-benchmarking and the rocKE packages into the venv. The default links to the source tree. |
-| `--torch-index-url URL` | pip index URL for PyTorch. In `rocm` mode without `--rocm-version`, setup does not read Quartz and installs the newest build on this index. |
-| `--rocm-version VERSION` | ROCm wheel version for `--torch-mode rocm`, for example `10.3.0a20261117`. Default: the newest nightly that Quartz reports as built, with no failed tests for the GPU architecture. See [ROCm nightly selection](#rocm-nightly-selection). |
+| `--torch-index-url URL` | pip index URL for PyTorch. In `rocm` mode without `--rocm-version`, setup installs the newest build on this index instead of `rocm-pin.json`. |
+| `--rocm-version VERSION` | ROCm wheel version for `--torch-mode rocm`: `latest` (newest usable Quartz nightly) or a specific version such as `10.3.0a20261123`. Default: the version pinned in `rocm-pin.json`. See [ROCm nightly selection](#rocm-nightly-selection). |
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
 | `--no-aiter` | Skip the `AITER` stage. Only `--runtime aiter` needs it. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
-| `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Abbreviated SHAs and branch names are rejected. |
+| `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Default: matched to `--rocm-version` (`latest` or explicit), else `rocm_libraries_commit` from `rocm-pin.json`. Abbreviated SHAs and branch names are rejected. |
 | `--cmake-arg NAME=VALUE` | Extra CMake define for the hipDNN and provider configure. Repeatable. See [Extra CMake defines](#extra-cmake-defines). |
 | `-y`, `--yes` | Answer yes to every prompt. Required when stdin is not a terminal and a prompt would show. |
 
@@ -114,7 +115,7 @@ dnn-benchmarking finds the engine plugins in
 
 | Mode | PyTorch | hipDNN and providers | Use |
 |---|---|---|---|
-| `rocm` (default) | ROCm nightly for the detected architecture, selected with Quartz | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
+| `rocm` (default) | ROCm nightly pinned in `rocm-pin.json` (or `--rocm-version latest` via Quartz) | Built against the ROCm SDK from the PyTorch wheels | Benchmarks on AMD GPUs. |
 | `cuda` | CUDA PyTorch from PyPI, or `--torch-index-url` | Not built. No bindings, no amdsmi, no `ROCM_PATH` | `--runtime pytorch` on NVIDIA GPUs. |
 | `cpu` | CPU-only PyTorch | Built from source, or reused from the installed prefix with a prepared CPU venv and `--reuse-artifacts`. | CI and `--validate pytorch` with a system ROCm. |
 | `existing` | Keep the PyTorch in the venv | ROCm PyTorch: its SDK libraries. CUDA PyTorch: the `cuda` path. CPU PyTorch: the installed ROCm. | Reuse a venv. |
@@ -214,9 +215,20 @@ On Windows the default is `gfx1151`.
 
 ## ROCm nightly selection
 
-[Quartz](https://github.com/ROCm/Quartz) publishes a `status.json` for each
-TheRock nightly. In `--torch-mode rocm`, setup reads these files to select
-the ROCm nightly that it installs:
+By default, `--torch-mode rocm` installs the ROCm nightly and matching
+`rocm-libraries` commit checked into `rocm-pin.json`. This keeps the ROCm
+PyTorch wheels, MIOpen and `miopen-provider` in lockstep without reading
+Quartz on every setup run, and isolates upstream regressions to scheduled bump
+PRs (`.github/workflows/bump-rocm-pin.yml`).
+
+To pull the newest passing nightly directly from
+[Quartz](https://github.com/ROCm/Quartz), pass `--rocm-version latest`:
+
+```bash
+python3 setup_env.py --rocm-version latest
+```
+
+With `--rocm-version latest`, setup reads Quartz's `status.json` files:
 
 1. Setup reads `nightly/latest.json` from
    `https://raw.githubusercontent.com/ROCm/quartz/main/`. This gives the build
@@ -240,7 +252,8 @@ the ROCm nightly that it installs:
 3. Setup installs `rocm[libraries,devel,device-<arch>]==<rocm_version>` and
    `torch[device-<arch>]` from that wheels URL. The torch wheel requires the
    `rocm` version that it was built with, so pip installs the torch of the
-   same nightly.
+   same nightly. Setup also resolves the `rocm-libraries` commit pinned by
+   that nightly's `therock_commit` in `ROCm/TheRock`.
 4. When no nightly in the 14 days qualifies, setup stops with an error that
    lists each nightly and each reason it was rejected, for example
    `linux rocm tests of gfx94X-dcgpu are failure`. Setup does not install an
@@ -249,7 +262,7 @@ the ROCm nightly that it installs:
 A test entry that is `failure`, `in_progress`, `cancelled` or any value
 other than `success` rejects the nightly. A missing test entry does not:
 Quartz does not run every suite on every architecture. For example, the
-nightlies 20261113 to 20261119 have no ROCm test entry for `gfx950-dcgpu`.
+nightlies 20261113 to 20261123 have no ROCm test entry for `gfx950-dcgpu`.
 Setup then accepts the nightly, prints the suites without a result, and
 records them as untested.
 
@@ -258,7 +271,7 @@ Setup does not read the test counters, `pipelines.pytorch.test_full` or
 that often fail, so almost no nightly has an overall `success`. Setup also
 stops when a `status.json` has a schema major other than 2.
 
-To install a known build, for example to repeat an older run, give its
+To install a specific build, for example to repeat an older run, give its
 version:
 
 ```bash
@@ -269,41 +282,52 @@ Setup installs that version even when Quartz reports it as failed, and shows
 a warning that names each failed build or test of the GPU architecture.
 `--torch-index-url` gives another index. `--torch-index-url` without
 `--rocm-version` installs the newest build on that index and does not read
-Quartz.
+`rocm-pin.json` or Quartz.
 
 After the install, setup writes `<workspace>/.venv/dnn-bench-rocm-build.json`:
-the ROCm wheel version, the TheRock build date and commit from Quartz, the
-untested suites (`untested`, for example `["rocm"]`), the `status.json` URL,
-the index URL, and what selected the build (`quartz`, `--rocm-version` or
-`--torch-index-url`). The build date, commit and untested suites are `null`
-when Quartz has no `status.json` for the version. Result files copy them to
-`environment.rocm_build_version`, `environment.rocm_build_date`,
-`environment.therock_commit` and `environment.rocm_build_untested` (see
+the ROCm wheel version, the TheRock build date and commit, the matched
+`rocm-libraries` commit, the untested suites (`untested`, for example
+`["rocm"]` when selected via Quartz, or `null` when selected from
+`rocm-pin.json`), the `status.json` URL, the index URL, and what selected the
+build (`rocm-pin.json`, `quartz`, `--rocm-version` or `--torch-index-url`).
+Result files copy the build fields to `environment.rocm_build_version`,
+`environment.rocm_build_date`, `environment.therock_commit` and
+`environment.rocm_build_untested` (see
 [results-schema.md](results-schema.md#environment)).
 
-CI (`setup.yml` gpu-test and `check-deserialize.yml`) uses the selected
-nightly. `check-deserialize.yml` builds for `gfx942`, because Quartz reports
-failed `gfx90a` ROCm tests on most nightlies. To use a known build instead,
-set the `ROCM_VERSION` repository variable. Each job prints the ROCm build
-and its untested suites in its log and in the job summary.
+CI (`setup.yml` gpu-test and `check-deserialize.yml`) uses `rocm-pin.json`.
+To test another build in CI, set the `ROCM_VERSION` repository variable (for
+example `latest` or a specific version). Each job prints the ROCm build and
+`rocm-libraries` commit in its log and in the job summary. The scheduled
+`.github/workflows/bump-rocm-pin.yml` workflow opens PRs to advance
+`rocm-pin.json` to the newest Quartz nightly passing Linux `gfx942` and
+`gfx950` tests and Windows `gfx1151` builds. When the `ROCM_PIN_BUMP_TOKEN`
+repository secret is configured, GitHub runs `gpu-tests` and
+`check-deserialize` on each bump PR automatically.
 
 ## rocm-libraries source
 
-`rocm-libraries/` is a git submodule. It holds the hipDNN and provider
-sources.
+`rocm-libraries/` is cloned on demand by `setup_env.py` (it is gitignored,
+not a git submodule). It holds the hipDNN and provider sources.
 
-- When `rocm-libraries/` is absent, setup does a sparse, blobless clone of
-  the pinned submodule commit (`git rev-parse HEAD:rocm-libraries`). The clone
-  contains only `cmake`, `shared/ctest`, `projects/hipdnn` and
-  `dnn-providers`, not the full monorepo. `shared/ctest` carries the CMake
+- When `rocm-libraries/` is absent, setup does a sparse, blobless clone from
+  `https://github.com/ROCm/rocm-libraries.git`. It selects the commit in this
+  order:
+  1. `--rocm-libraries-ref SHA`, when passed.
+  2. In `--torch-mode rocm` (or `--torch-mode existing` with a ROCm venv that
+     has `dnn-bench-rocm-build.json`), the `rocm_libraries_commit` recorded
+     for the installed ROCm build (from `rocm-pin.json` by default, or
+     resolved from `ROCm/TheRock` at the Quartz nightly's `therock_commit`
+     when `--rocm-version latest` or an explicit `--rocm-version` was used).
+  3. Otherwise (`--torch-mode cpu`, `--torch-mode none`, a custom
+     `--torch-index-url` without `--rocm-version`, or a `--rocm-version`
+     unknown to Quartz), `rocm_libraries_commit` from `rocm-pin.json`.
+  The clone contains only `.dvc`, `cmake`, `shared/ctest`, `projects/hipdnn`
+  and `dnn-providers`, not the full monorepo. `shared/ctest` carries the CMake
   file that declares hipDNN's test categories; the rest of `shared/` (Tensile
   and friends) stays out.
-- Where no git metadata exists (Docker builds, source tarballs), give
-  `--rocm-libraries-ref SHA`. Without it, setup uses the moving
-  `.gitmodules` branch and shows a warning.
-- Setup uses an existing checkout as it is. A checkout from
-  `git submodule update --init` also works. Setup shows a warning when the
-  checkout is not at the pinned commit. When that checkout is sparse and was
+- Setup uses an existing checkout as it is. Setup shows a warning when the
+  checkout is not at the expected commit. When that checkout is sparse and was
   made by an older setup, the root directories added since are added to its
   sparse set; a full checkout is left alone.
 
@@ -469,18 +493,20 @@ from the local checkout:
 | `--container-command CMD` | `docker` | Container command. |
 | `--device-target TARGET` | `gfx942` | ROCm PyTorch architecture: `gfx90a`, `gfx942`, `gfx950`, `gfx1151` or `gfx1152`. |
 | `--tag TAG` | `dnn-benchmark-performance:<device-target>` | Image tag. |
-| `--rocm-version VERSION` | newest usable Quartz nightly | ROCm wheel version to install. |
+| `--rocm-version VERSION` | `rocm-pin.json` | ROCm wheel version to install (`latest` for Quartz, or a specific version). |
+| `--rocm-libraries-ref SHA` | matched to `--rocm-version` | Full 40-character `rocm-libraries` commit to build. |
 | `-- ARGS...` | none | More arguments for the container build command. |
 
-The script passes the pinned `rocm-libraries` commit to the build, because
-the build context has no `.git`. The script also selects the ROCm nightly for
-`--device-target` on the host, as in
-[ROCm nightly selection](#rocm-nightly-selection), unless `--rocm-version`
-names one. The host thus needs `python3`. When no nightly qualifies for the
-device target, for example while Quartz reports failed `gfx90a` tests, the
-script stops; then pass `--rocm-version`. The script passes the version as
-the `ROCM_VERSION` build argument and the wheels URL as
-`ROCM_TORCH_INDEX_URL`. A new nightly thus rebuilds the setup layer. The
+By default, the script reads `rocm-pin.json` on the host (requiring only
+`python3`, with no network or host `git` call) and passes `ROCM_VERSION`,
+`ROCM_LIBRARIES_REF` and `ROCM_TORCH_INDEX_URL` to the build. When
+`--rocm-version latest` or another version is passed, it queries Quartz and
+resolves the matching `rocm-libraries` commit from `ROCm/TheRock` on the host
+(requiring `git` and HTTPS access to `github.com`), unless
+`--rocm-libraries-ref` overrides it. Both `ROCM_VERSION` and
+`ROCM_LIBRARIES_REF` are declared after the `apt-get` stage, so a new pin
+reuses the apt layer and rebuilds only the setup layer. A direct `docker build`
+without build arguments reads `rocm-pin.json` from the build context. The
 image carries the ROCm version in the label
 `com.amd.dnn-benchmark.rocm-version`:
 

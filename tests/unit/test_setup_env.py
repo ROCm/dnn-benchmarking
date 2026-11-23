@@ -39,10 +39,20 @@ def setup_env():
 
 @pytest.fixture(autouse=True)
 def _no_quartz_network(setup_env, monkeypatch):
-    def refuse(url):
+    def refuse_url(url):
         raise AssertionError(f"unit test fetched {url}")
 
-    monkeypatch.setattr(setup_env, "fetch_quartz_text", refuse)
+    def refuse_therock(
+        therock_commit, repo_url=setup_env.THEROCK_REPO_URL, *, required=True
+    ):
+        raise AssertionError(
+            f"unit test resolved TheRock {therock_commit} from {repo_url}"
+        )
+
+    monkeypatch.setattr(setup_env, "fetch_quartz_text", refuse_url)
+    monkeypatch.setattr(
+        setup_env, "resolve_therock_rocm_libraries_commit", refuse_therock
+    )
 
 
 def _quartz_document(build_date: str) -> dict:
@@ -617,14 +627,23 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".gitmodules").write_text(
-        '[submodule "rocm-libraries"]\n'
-        "\tpath = rocm-libraries\n"
-        f"\turl = {origin.as_uri()}\n"
-        "\tbranch = main\n"
+    pin_file = repo / "rocm-pin.json"
+    pin_file.write_text(
+        json.dumps(
+            {
+                "rocm_version": _RECORDED_ROCM_VERSION,
+                "build_date": "20261115",
+                "therock_commit": "62d1ac21a0eda4df3871c6c8d4570cb0ee9a4637",
+                "rocm_libraries_commit": _head(src),
+                "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+            }
+        )
+        + "\n"
     )
     monkeypatch.setattr(setup_env, "SCRIPT_DIR", repo)
+    monkeypatch.setattr(setup_env, "ROCM_PIN_FILE", pin_file)
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", repo / "rocm-libraries")
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_REPO_URL", origin.as_uri())
     return repo / "rocm-libraries"
 
 
@@ -1422,14 +1441,15 @@ def _recorded_environment(setup, monkeypatch) -> dict:
         ),
     ],
 )
-def test_rocm_install_pins_the_selected_nightly_and_records_it(
+def test_rocm_install_latest_pins_the_selected_nightly_and_records_it(
     setup_env, tmp_path, monkeypatch, quartz, capsys, arch, latest, environment
 ) -> None:
     quartz.latest = latest
-    setup, pip_calls = _fresh_rocm_setup(setup_env, tmp_path, monkeypatch, arch=arch)
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, "--rocm-version", "latest", arch=arch
+    )
 
     setup.install_torch()
-
     assert pip_calls == [
         (
             "install",
@@ -1557,6 +1577,345 @@ def test_missing_toolchain_is_installed_at_the_recorded_rocm_version(
             "https://index.invalid/",
         )
     ]
+
+
+# --- Checked-in rocm-pin.json & Quartz -> TheRock -> rocm-libraries ---------
+
+
+def test_rocm_install_defaults_to_rocm_pin_without_network(
+    setup_env, tmp_path, monkeypatch, rocm_libraries
+) -> None:
+    # The autouse guard fails on any Quartz or TheRock network call.
+    pin = setup_env.read_rocm_pin()
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, arch="gfx950"
+    )
+
+    setup.install_torch()
+    setup.ensure_rocm_libraries_checkout()
+
+    assert pip_calls == [
+        (
+            "install",
+            "--pre",
+            "torch[device-gfx950]",
+            f"rocm[libraries,devel,device-gfx950]=={pin.rocm_version}",
+            "--index-url",
+            pin.index_url,
+        )
+    ]
+    assert _recorded_environment(setup, monkeypatch) == {
+        "rocm_build_version": pin.rocm_version,
+        "rocm_build_date": pin.build_date,
+        "therock_commit": pin.therock_commit,
+        "rocm_build_untested": None,
+    }
+    saved = json.loads((setup.venv_dir / setup_env.ROCM_BUILD_RECORD).read_text())
+    assert saved["source"] == "rocm-pin.json"
+    assert saved["rocm_libraries_commit"] == pin.rocm_libraries_commit
+    assert _head(rocm_libraries) == pin.rocm_libraries_commit
+
+
+def test_read_rocm_pin_rejects_missing_or_invalid_fields(
+    setup_env, tmp_path, capsys
+) -> None:
+    missing = tmp_path / "missing.json"
+    with pytest.raises(SystemExit) as exc:
+        setup_env.read_rocm_pin(missing)
+    assert exc.value.code == 1
+    assert "cannot read ROCm pin file" in capsys.readouterr().err
+
+    bad = tmp_path / "bad.json"
+    bad.write_text(
+        json.dumps(
+            {"rocm_version": "10.3.0a20261123", "rocm_libraries_commit": "short"}
+        )
+    )
+    with pytest.raises(SystemExit) as exc:
+        setup_env.read_rocm_pin(bad)
+    assert exc.value.code == 1
+    assert "invalid rocm_libraries_commit" in capsys.readouterr().err
+
+
+def test_reused_venv_refuses_rocm_version_latest(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    setup, _ = _reused_venv(
+        setup_env, tmp_path, monkeypatch, "rocm", "--rocm-version", "latest"
+    )
+    with pytest.raises(SystemExit) as exc:
+        setup.install_torch()
+    assert exc.value.code == 1
+    assert "--rocm-version latest" in capsys.readouterr().err
+
+
+def test_select_quartz_nightly_for_archs_requires_every_arch(setup_env, quartz) -> None:
+    # On 20261116, rocm build is in_progress; on 20261115, gfx950 passes but
+    # gfx942 fails rocm tests; on 20261119 both gfx942 and gfx950 pass.
+    quartz.latest = "20261119"
+    build = setup_env.select_quartz_nightly_for_archs("linux", ("gfx942", "gfx950"))
+    assert build.build_date == "20261119"
+
+    # Make 20261119 fail gfx950 pytorch tests -> must walk back to 20261118.
+    doc = _quartz_document("20261119")
+    doc["pipelines"]["pytorch"]["test"]["linux"]["gfx950-dcgpu"]["status"] = "failure"
+    quartz.documents["20261119"] = doc
+    build = setup_env.select_quartz_nightly_for_archs("linux", ("gfx942", "gfx950"))
+    assert build.build_date == "20261118"
+
+    # require_platform_builds checks that the extra platform's builds and wheels
+    # succeeded (without rejecting on test failures): on 20261119 Windows
+    # pytorch build is in_progress, so requiring Windows gfx1151 builds walks
+    # back to a nightly where Windows finished building.
+    quartz.documents.clear()
+    build = setup_env.select_quartz_nightly_for_archs(
+        "linux",
+        ("gfx942", "gfx950"),
+        require_platform_builds=(("windows", setup_env.WINDOWS_DEFAULT_GPU_ARCH),),
+    )
+    assert build.build_date == "20261118"
+
+
+def _make_fake_therock_repo(
+    tmp_path: Path, rocm_libraries_commit: str | None
+) -> tuple[Path, str]:
+    """Create a local bare TheRock repo whose tip optionally pins rocm-libraries."""
+    src = tmp_path / "therock-src"
+    src.mkdir()
+    _git("init", "-q", "-b", "main", cwd=src)
+    if rocm_libraries_commit is not None:
+        _git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{rocm_libraries_commit},rocm-libraries",
+            cwd=src,
+        )
+    else:
+        (src / "README.md").write_text("no submodule\n")
+        _git("add", "README.md", cwd=src)
+    _git("commit", "-q", "-m", "therock pin", cwd=src)
+    commit = _head(src)
+    bare = tmp_path / "therock.git"
+    _git("clone", "-q", "--bare", str(src), str(bare))
+    _git("config", "uploadpack.allowfilter", "true", cwd=bare)
+    return bare, commit
+
+
+def test_resolve_therock_rocm_libraries_commit_reads_submodule_gitlink(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    monkeypatch.undo()
+    expected_sha = "1234567890abcdef" * 2 + "12345678"
+    bare, therock_commit = _make_fake_therock_repo(tmp_path, expected_sha)
+
+    resolved = setup_env.resolve_therock_rocm_libraries_commit(
+        therock_commit, repo_url=bare.as_uri()
+    )
+
+    assert resolved == expected_sha
+
+
+def test_resolve_therock_rocm_libraries_commit_fails_when_submodule_missing(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    monkeypatch.undo()
+    bare, therock_commit = _make_fake_therock_repo(tmp_path, None)
+
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit(
+            therock_commit, repo_url=bare.as_uri()
+        )
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "no 'rocm-libraries' submodule entry" in err
+    assert "--rocm-libraries-ref" in err
+
+
+def test_resolve_therock_rocm_libraries_commit_rejects_bad_sha(
+    setup_env, monkeypatch, capsys
+) -> None:
+    monkeypatch.undo()
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit("not-a-sha")
+
+    assert exc.value.code == 1
+    assert "40-character TheRock commit SHA" in capsys.readouterr().err
+
+
+def test_resolve_therock_rocm_libraries_commit_handles_missing_git(
+    setup_env, monkeypatch, capsys
+) -> None:
+    monkeypatch.undo()
+
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(setup_env, "git_output", no_git)
+
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit("f" * 40)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "git not found on PATH" in err
+    assert "--rocm-libraries-ref" in err
+
+
+def _two_commit_rocm_libraries(tmp_path: Path) -> tuple[str, str]:
+    """Advance the local rocm_libraries origin by one commit; return (first, second)."""
+    src = tmp_path / "src"
+    first = _head(src)
+    (src / "projects/hipdnn/matched.txt").write_text("matched\n")
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", "matched commit", cwd=src)
+    _git("fetch", "-q", str(src), "main:main", cwd=tmp_path / "origin.git")
+    return first, _head(src)
+
+
+def test_rocm_mode_checks_out_quartz_matched_rocm_libraries_and_caches_it(
+    setup_env, tmp_path, monkeypatch, rocm_libraries
+) -> None:
+    _, quartz_sha = _two_commit_rocm_libraries(tmp_path)
+    therock_sha = "a" * 40
+    calls = []
+    monkeypatch.setattr(
+        setup_env,
+        "resolve_therock_rocm_libraries_commit",
+        lambda sha, repo_url=setup_env.THEROCK_REPO_URL, *, required=True: (
+            calls.append(sha),
+            quartz_sha,
+        )[1],
+    )
+
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    record_path = setup.venv_dir / setup_env.ROCM_BUILD_RECORD
+    record_path.write_text(
+        json.dumps(
+            {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": therock_sha}
+        )
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert calls == [therock_sha]
+    assert _head(rocm_libraries) == quartz_sha
+    saved = json.loads(record_path.read_text())
+    assert saved["rocm_libraries_commit"] == quartz_sha
+
+    # A second run against the same venv reuses the cached rocm_libraries_commit
+    # without querying TheRock again.
+    setup.ensure_rocm_libraries_checkout()
+    assert calls == [therock_sha]
+
+
+def test_rocm_mode_warns_when_existing_checkout_differs_from_quartz_match(
+    setup_env, tmp_path, monkeypatch, capsys, rocm_libraries
+) -> None:
+    older_sha, quartz_sha = _two_commit_rocm_libraries(tmp_path)
+    therock_sha = "b" * 40
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", older_sha
+    ).ensure_rocm_libraries_checkout()
+    assert _head(rocm_libraries) == older_sha
+
+    monkeypatch.setattr(
+        setup_env,
+        "resolve_therock_rocm_libraries_commit",
+        lambda sha, repo_url=setup_env.THEROCK_REPO_URL, *, required=True: quartz_sha,
+    )
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(
+        json.dumps(
+            {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": therock_sha}
+        )
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == older_sha
+    err = capsys.readouterr().err
+    assert f"not {quartz_sha[:12]} (matched to TheRock {therock_sha[:12]})" in err
+
+
+def test_rocm_mode_reuses_existing_checkout_when_therock_lookup_fails(
+    setup_env, tmp_path, monkeypatch, capsys, rocm_libraries
+) -> None:
+    older_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", older_sha
+    ).ensure_rocm_libraries_checkout()
+    assert _head(rocm_libraries) == older_sha
+
+    missing_repo = (tmp_path / "no-such-therock.git").as_uri()
+    monkeypatch.undo()
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
+    monkeypatch.setattr(setup_env, "THEROCK_REPO_URL", missing_repo)
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(
+        json.dumps({"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "e" * 40})
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == older_sha
+    err = capsys.readouterr().err
+    assert "WARNING:" in err
+    assert missing_repo in err
+    assert "Keeping the existing rocm-libraries/ checkout." in err
+
+
+def test_explicit_rocm_libraries_ref_overrides_quartz_therock_commit(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
+    explicit_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    setup = _setup(setup_env, tmp_path, "--rocm-libraries-ref", explicit_sha)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    record_path = setup.venv_dir / setup_env.ROCM_BUILD_RECORD
+    record_path.write_text(
+        json.dumps({"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "c" * 40})
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == explicit_sha
+    assert "rocm_libraries_commit" not in json.loads(record_path.read_text())
+
+
+@pytest.mark.parametrize(
+    "torch_mode, record",
+    [
+        ("cpu", {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "d" * 40}),
+        ("rocm", {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": None}),
+        ("rocm", None),
+    ],
+    ids=["cpu-mode", "rocm-without-therock-commit", "rocm-without-record"],
+)
+def test_rocm_libraries_falls_back_to_rocm_pin_without_quartz_therock_commit(
+    setup_env, tmp_path, rocm_libraries, torch_mode, record
+) -> None:
+    pin_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    setup = _setup(setup_env, tmp_path, "--torch-mode", torch_mode)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = torch_mode
+    if record is not None:
+        (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(json.dumps(record))
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == pin_sha
 
 
 def _host_gpu_archs(setup_env, monkeypatch, archs):

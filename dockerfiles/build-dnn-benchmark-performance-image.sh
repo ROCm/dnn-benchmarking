@@ -5,6 +5,7 @@ container_command="docker"
 device_target="gfx942"
 tag=""
 rocm_version=""
+rocm_libraries_ref=""
 build_args=()
 
 usage() {
@@ -17,10 +18,13 @@ Options:
   --container-command CMD  Container command. Default: docker
   --device-target TARGET   ROCm PyTorch GPU architecture. Default: gfx942
   --tag TAG                Image tag. Default: dnn-benchmark-performance:<device-target>
-  --rocm-version VERSION   ROCm wheel version to install, for example
-                           10.3.0a20261117. Default: the newest nightly that
-                           Quartz reports as built for the device target,
-                           selected on this host.
+  --rocm-version VERSION   ROCm wheel version to install ('latest' for the
+                           newest usable Quartz nightly, or a specific version
+                           such as 10.3.0a20261123). Default: rocm-pin.json.
+  --rocm-libraries-ref SHA Full 40-character rocm-libraries commit to build.
+                           Default: matched to --rocm-version (from
+                           rocm-pin.json by default, or from TheRock for
+                           'latest' / explicit versions).
   -h, --help               Show this help.
 
 Examples:
@@ -53,6 +57,11 @@ while [[ $# -gt 0 ]]; do
             rocm_version="$2"
             shift 2
             ;;
+        --rocm-libraries-ref)
+            [[ $# -ge 2 ]] || { echo "--rocm-libraries-ref requires a value" >&2; exit 2; }
+            rocm_libraries_ref="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -82,32 +91,52 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-# The image build context excludes .git, so resolve the pinned rocm-libraries
-# commit here; setup_env.py otherwise falls back to a moving branch.
-rocm_libraries_ref="$(git -C "${repo_root}" rev-parse HEAD:rocm-libraries 2>/dev/null || true)"
-if [[ -z "${rocm_libraries_ref}" ]]; then
-    echo "WARNING: could not resolve the rocm-libraries submodule commit; the image will build its moving branch." >&2
-fi
-
-# Select the ROCm nightly here, with the same rule as setup_env.py. The image
-# then installs and labels that ROCm build even when a newer nightly appears.
-resolved="$(python3 - "${repo_root}/setup_env.py" "${device_target}" "${rocm_version}" <<'PY'
+# Resolve the ROCm build and matching rocm-libraries commit here, using the
+# same rule as setup_env.py: rocm-pin.json by default (no network or host git
+# required), or Quartz + TheRock when --rocm-version is 'latest' or another
+# version.
+resolved="$(python3 - "${repo_root}/setup_env.py" "${device_target}" "${rocm_version}" "${rocm_libraries_ref}" <<'PY'
+import argparse
 import importlib.util
 import sys
 
 spec = importlib.util.spec_from_file_location("setup_env", sys.argv[1])
 setup_env = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup_env)
-device_target, rocm_version = sys.argv[2:]
+device_target, rocm_version, rocm_libraries_ref = sys.argv[2:]
+if rocm_libraries_ref:
+    try:
+        rocm_libraries_ref = setup_env._commit_sha(rocm_libraries_ref)
+    except argparse.ArgumentTypeError as exc:
+        print(f"ERROR: --rocm-libraries-ref: {exc}", file=sys.stderr)
+        sys.exit(2)
 if rocm_version:
-    build = setup_env.describe_rocm_version(rocm_version, "", "linux", device_target)
-else:
+    try:
+        rocm_version = setup_env._rocm_version(rocm_version)
+    except argparse.ArgumentTypeError as exc:
+        print(f"ERROR: --rocm-version: {exc}", file=sys.stderr)
+        sys.exit(2)
+pin = setup_env.read_rocm_pin()
+if not rocm_version or rocm_version == pin.rocm_version:
+    build = pin
+elif rocm_version == "latest":
     build = setup_env.select_quartz_nightly("linux", device_target)
-print(build.rocm_version, build.index_url)
+else:
+    build = setup_env.describe_rocm_version(rocm_version, "", "linux", device_target)
+if not rocm_libraries_ref:
+    if build.rocm_libraries_commit:
+        rocm_libraries_ref = build.rocm_libraries_commit
+    elif build.therock_commit:
+        rocm_libraries_ref = setup_env.resolve_therock_rocm_libraries_commit(
+            build.therock_commit
+        )
+    else:
+        rocm_libraries_ref = pin.rocm_libraries_commit or ""
+print(build.rocm_version, build.index_url, rocm_libraries_ref)
 PY
 )"
-read -r rocm_version rocm_index_url <<<"${resolved}"
-echo "ROCm ${rocm_version} from ${rocm_index_url}"
+read -r rocm_version rocm_index_url rocm_libraries_ref <<<"${resolved}"
+echo "ROCm ${rocm_version} from ${rocm_index_url} (rocm-libraries ${rocm_libraries_ref})"
 
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" "${container_command}" build \
     -f "${script_dir}/Dockerfile.dnn-benchmark-performance-linux" \

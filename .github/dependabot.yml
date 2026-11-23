@@ -11,9 +11,8 @@ updates:
         patterns:
           - "*"
 
-  # rocm-libraries and aiter. Dependabot takes one entry per ecosystem and
-  # directory, so both submodules share this entry and its title form:
-  # "chore(deps): bump <submodule> from <old> to <new>".
+  # aiter submodule. rocm-libraries is pinned alongside ROCm in rocm-pin.json
+  # and updated by .github/workflows/bump-rocm-pin.yml.
   - package-ecosystem: "gitsubmodule"
     directory: "/"
     cooldown:

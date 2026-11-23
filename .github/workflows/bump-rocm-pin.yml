@@ -1,0 +1,172 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: bump-rocm-pin
+
+on:
+  schedule:
+    # Mondays and Wednesdays at 16:00 UTC (~12:00 America/New_York), matching
+    # the submodule cadence in dependabot.yml.
+    - cron: '0 16 * * 1,3'
+  workflow_dispatch:
+    inputs:
+      rocm_version:
+        description: 'Optional ROCm nightly version (e.g. 10.3.0a20261123); blank selects newest Quartz nightly passing linux gfx942 + gfx950.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-rocm-pin
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Resolve candidate ROCm pin from Quartz
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.rocm_version }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location("setup_env", "setup_env.py")
+          setup_env = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(setup_env)
+
+          pin_path = Path("rocm-pin.json")
+          current = setup_env.read_rocm_pin(pin_path)
+          requested = os.environ.get("REQUESTED_VERSION", "").strip()
+          if requested:
+              requested = setup_env._rocm_version(requested)
+          if not requested or requested == "latest":
+              build = setup_env.select_quartz_nightly_for_archs(
+                  "linux",
+                  ("gfx942", "gfx950"),
+                  require_platform_builds=(
+                      ("windows", setup_env.WINDOWS_DEFAULT_GPU_ARCH),
+                  ),
+              )
+          else:
+              build = setup_env.describe_rocm_version(
+                  requested, "", "linux", "gfx942"
+              )
+          if not build.therock_commit:
+              setup_env.fail(
+                  f"Quartz has no therock_commit for ROCm {build.rocm_version}."
+              )
+          rocm_libraries_commit = setup_env.resolve_therock_rocm_libraries_commit(
+              build.therock_commit
+          )
+          new_pin = {
+              "rocm_version": build.rocm_version,
+              "build_date": build.build_date,
+              "therock_commit": build.therock_commit,
+              "rocm_libraries_commit": rocm_libraries_commit,
+              "index_url": build.index_url,
+          }
+          is_manual = bool(requested and requested != "latest")
+          current_date = current.build_date or ""
+          new_date = build.build_date or ""
+          # Scheduled bumps only move forward; manual dispatch may pin any version.
+          if not is_manual and current_date and new_date and new_date < current_date:
+              changed = False
+          else:
+              changed = (
+                  build.rocm_version != current.rocm_version
+                  or rocm_libraries_commit != current.rocm_libraries_commit
+                  or build.therock_commit != current.therock_commit
+              )
+          if changed:
+              pin_path.write_text(
+                  json.dumps(new_pin, indent=2) + "\n", encoding="utf-8"
+              )
+
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          with out.open("a", encoding="utf-8") as f:
+              f.write(f"changed={'true' if changed else 'false'}\n")
+              f.write(f"old_version={current.rocm_version}\n")
+              f.write(f"new_version={build.rocm_version}\n")
+              f.write(f"therock_commit={build.therock_commit}\n")
+              f.write(f"old_rocm_libraries={current.rocm_libraries_commit}\n")
+              f.write(f"new_rocm_libraries={rocm_libraries_commit}\n")
+          print(
+              f"Current: {current.rocm_version} ({current.rocm_libraries_commit[:12]}) -> "
+              f"Candidate: {build.rocm_version} ({rocm_libraries_commit[:12]}), "
+              f"changed={changed}"
+          )
+          PY
+
+      - name: Open or update bump PR
+        if: steps.resolve.outputs.changed == 'true'
+        env:
+          # Setting repository secret ROCM_PIN_BUMP_TOKEN (a PAT or GitHub App
+          # token) lets the pushed branch trigger pull_request CI checks
+          # automatically; otherwise GITHUB_TOKEN opens/updates the PR.
+          GH_TOKEN: ${{ secrets.ROCM_PIN_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          OLD_VERSION: ${{ steps.resolve.outputs.old_version }}
+          NEW_VERSION: ${{ steps.resolve.outputs.new_version }}
+          THEROCK_COMMIT: ${{ steps.resolve.outputs.therock_commit }}
+          OLD_ROCM_LIBRARIES: ${{ steps.resolve.outputs.old_rocm_libraries }}
+          NEW_ROCM_LIBRARIES: ${{ steps.resolve.outputs.new_rocm_libraries }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch="chore/bump-rocm-pin"
+          title="chore(deps): bump ROCm pin to ${NEW_VERSION}"
+          body=$(cat <<EOF
+          Bump \`rocm-pin.json\` to the newest ROCm nightly that Quartz reports usable for Linux \`gfx942\` and \`gfx950\` (with Windows \`gfx1151\` wheels built):
+
+          - **ROCm / PyTorch wheel:** \`${OLD_VERSION}\` -> \`${NEW_VERSION}\`
+          - **TheRock commit:** \`${THEROCK_COMMIT}\`
+          - **rocm-libraries commit:** \`${OLD_ROCM_LIBRARIES}\` -> \`${NEW_ROCM_LIBRARIES}\`
+          EOF
+          )
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          # Skip pushing when the open bump branch already carries this exact
+          # pin, so scheduled runs do not trigger redundant GPU CI or overwrite
+          # manual fix-up commits on the bump PR.
+          if git fetch --quiet "${remote}" "refs/heads/${branch}" 2>/dev/null; then
+            if git show FETCH_HEAD:rocm-pin.json 2>/dev/null | cmp -s - rocm-pin.json; then
+              echo "Branch ${branch} already has this exact rocm-pin.json; skipping push."
+              exit 0
+            fi
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${branch}"
+          git add rocm-pin.json
+          git commit -m "${title}"
+          git push --force "${remote}" "HEAD:refs/heads/${branch}"
+          existing=$(gh pr list --repo "${REPO}" --head "${branch}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+            gh api -X PATCH "repos/${REPO}/pulls/${existing}" \
+              -f title="${title}" \
+              -f body="${body}" >/dev/null
+            echo "Updated PR #${existing}"
+          else
+            gh pr create --repo "${REPO}" --base main --head "${branch}" \
+              --title "${title}" \
+              --body "${body}"
+          fi
