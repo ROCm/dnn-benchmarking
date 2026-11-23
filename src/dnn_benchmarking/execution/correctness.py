@@ -109,16 +109,20 @@ _RNG_DUMP_CHUNK = 1 << 22
 def check_rng_dump(
     values: np.ndarray, p: float, config: SuiteConfig
 ) -> Optional[CorrectnessResult]:
-    """Check an engine's ``rng_dump`` as the hipDNN integration harness does.
+    """Check an engine's ``rng_dump``.
 
     Returns None when the dump is acceptable, else a mismatch. First, ``p``
     must be in [0, 1), the range the reference accepts. Then every value
     must be 0.0 or 1.0 (-0.0 is 0; NaN fails). Then the count of ones must
     be within ``6 * sqrt(keep * (1 - keep) * n) + 1`` of ``keep * n``, with
     ``keep = 1 - p`` (``p`` rounded to float32) and the bound in double.
-    Comparing counts rather than rates keeps the bound exact at p = 0: a
-    rate comparison can round a dump with exactly one off-keep element one
-    ULP past the bound. An empty dump passes.
+    In exact arithmetic this count form is the hipDNN integration harness's
+    rate form (``|rate - keep| <= 6 * sqrt(keep * (1 - keep) / n) + 1 / n``)
+    multiplied through by ``n``; the two diverge only at floating-point
+    rounding edges. The harness's rate form can reject a dump with exactly
+    one off-keep element that this count form accepts (e.g. ``p = 0``, one
+    zero in an all-ones dump): dividing the bound by ``n`` to compare rates
+    can round it one ULP past the bound. An empty dump passes.
     """
     if not 0.0 <= p < 1.0:  # NaN fails too.
         return mismatch(

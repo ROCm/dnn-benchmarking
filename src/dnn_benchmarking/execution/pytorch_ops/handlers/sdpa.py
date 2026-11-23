@@ -1526,8 +1526,9 @@ def compile_sdpa(
     mask and scale to the softmax; the stats are the log-sum-exp before
     dropout. An explicit mask builds its operands once. Philox dropout uses
     the engine's ``rng_dump`` as its mask (``_philox_dump``) with the scale
-    ``1 / (1 - p)``, one query block at a time on every device. Dropout with
-    paged or ragged K/V is declined.
+    ``1 / (1 - p)``, one query block at a time on every device. Dropout
+    with paged, ragged or variable-length K/V is not implemented, so it is
+    declined.
     """
     _sdpa_unsupported_if_present(
         node,
@@ -1566,8 +1567,8 @@ def compile_sdpa(
         if not layout:
             layout = ["a ragged Q/K/V offset table"]
         raise ValueError(
-            "SDPA dropout is not supported with paged or ragged K/V "
-            f"({', '.join(layout)})"
+            "SDPA: the PyTorch reference does not implement dropout with "
+            f"paged, ragged or variable-length K/V ({', '.join(layout)})"
         )
     if is_paged and plan.alibi:
         raise UnsupportedGraphError("SDPA ALiBi is not supported with paged attention")
@@ -2064,8 +2065,9 @@ def _decline_backward_philox(dropout: SdpaDropout) -> None:
     if p is not None and p != 0.0:
         raise ValueError(
             f"SDPA Philox backward dropout (dropout_probability={p}) is not "
-            "supported: the hipDNN backward graph has no dropout mask output, "
-            "so the reference has no mask to apply (see rocm-libraries #15643)"
+            "supported: the hipDNN backward graph API has no rng_dump "
+            "output, so the reference cannot replay the Philox mask (see "
+            "rocm-libraries #14358)"
         )
     if dropout.seed_uid is not None or dropout.offset_uid is not None:
         raise ValueError(
@@ -2399,8 +2401,8 @@ def compile_sdpa_backward(
     ``dropout_scale_inv`` ``inv`` (1 when absent), ``P`` stays the softmax
     before dropout and ``D = rowsum(dO * O) * inv``, ``dP = (dO V^T) * M``,
     ``dS = s * P * (dP - D)``, ``dV = (P * M * s)^T dO`` (CpuFpReferenceSdpa.hpp,
-    rocm-libraries #14358). Philox backward dropout is declined
-    (rocm-libraries #15643).
+    rocm-libraries #14358). Philox backward dropout is declined: the
+    backward graph API has no rng_dump output (rocm-libraries #14358).
 
     dBias (``dbias_tensor_uid``) is the gradient of the ``attn_mask`` bias:
     the unscaled ``dS`` above (before the attention scale), summed over every
@@ -2430,7 +2432,8 @@ def compile_sdpa_backward(
     is_varlen = not operands.is_paged and has_varlen_source(node, tensors_json)
     if dropout is not None and is_varlen:
         raise ValueError(
-            "SDPA dropout is not supported with ragged or variable-length K/V"
+            "SDPA: the PyTorch reference does not implement dropout with "
+            "ragged or variable-length K/V"
         )
     if is_varlen and (plan.window is not None or plan.bottom_right):
         raise ValueError(

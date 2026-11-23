@@ -2429,10 +2429,10 @@ class TestPyTorchProviderNewOps:
     )
     def test_sdpa_backward_dropout_declines(self, graph_kwargs, match) -> None:
         """One case per backward R7 rule that hipDNN declines (rows 10-11),
-        plus the backward's ragged/variable-length dropout decline (:2428):
+        plus the backward's ragged/variable-length dropout decline (:2436):
         explicit-mask dropout with a length source on both sides. Each graph
-        differs from a computable one in that rule only. A backward node has
-        no ``rng_dump``, so no message may name it."""
+        differs from a computable one in that rule only. Only the Philox
+        backward subject may name ``rng_dump``; no other message may."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph = self._backward_dropout_graph(**graph_kwargs)
 
@@ -2440,7 +2440,8 @@ class TestPyTorchProviderNewOps:
             provider.compute_reference(
                 graph, self._backward_dropout_inputs(graph, seed=25)
             )
-        assert "rng_dump" not in str(declined.value)
+        if match != "Philox backward":
+            assert "rng_dump" not in str(declined.value)
 
     def test_sdpa_backward_dropout_never_takes_fused_path(self, monkeypatch) -> None:
         """``fused()`` (:2496) must decline whenever dropout is active, before
@@ -3027,10 +3028,11 @@ class TestSdpaExplicitDropout:
         self, extra_inputs, feature, mutate
     ) -> None:
         """hipDNN's dense-rewrite paged and ragged/variable-length SDPA (#118)
-        accepts dropout-free graphs; the PyTorch reference still declines
-        every one of them combined with dropout (R15), by UID presence (page
-        table, seq_len, cu_seq_len) or by a ragged offset table on a Q/K/V
-        tensor itself, whichever the graph carries."""
+        accepts dropout-free graphs; the PyTorch reference does not
+        implement dropout with paged, ragged or variable-length K/V (R15),
+        and declines by UID presence (page table, seq_len, cu_seq_len) or by
+        a ragged offset table on a Q/K/V tensor itself, whichever the graph
+        carries."""
         provider = ReferenceProviderRegistry.get_provider("pytorch")
         graph = _dropout_graph(extra_inputs=extra_inputs)
         if mutate is not None:

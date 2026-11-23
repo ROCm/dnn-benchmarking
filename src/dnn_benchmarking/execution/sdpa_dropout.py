@@ -10,6 +10,8 @@ through the same functions.
 
 from typing import Any, Dict, Iterator, NamedTuple, Optional, Tuple
 
+from ..graph.varlen import node_value
+
 
 class SdpaDropout(NamedTuple):
     """The dropout attributes of one SDPA node.
@@ -37,32 +39,24 @@ class RngDump(NamedTuple):
 
 _FORWARD = "SdpaAttributes"
 
-# The lookup order of pytorch_ops/_common.py (_node_param, _optional_uid). That
-# module imports torch, so the order is repeated here. A null value counts as
-# absent, and the search goes on to the next place. _optional_uid's own
-# sections are ("inputs", "outputs"); its fallback (_node_uid) always also
-# checks "attributes" then "parameters", so every optional uid lookup -- not
-# just this one -- sees all four sections in this order.
+# The lookup order of pytorch_ops/_common.py (_node_param, _optional_uid). A
+# null value counts as absent, and the search goes on to the next place.
+# _optional_uid's own sections are ("inputs", "outputs"); its fallback
+# (_node_uid) always also checks "attributes" then "parameters", so every
+# optional uid lookup -- not just this one -- sees all four sections in this
+# order.
 _PARAM_SECTIONS = ("parameters", "attributes", "inputs", "outputs")
 _UID_SECTIONS = ("inputs", "outputs", "attributes", "parameters")
 
 
-def _first_non_null(node: Dict[str, Any], key: str, sections: Tuple[str, ...]) -> Any:
-    for name in sections:
-        section = node.get(name)
-        if isinstance(section, dict) and section.get(key) is not None:
-            return section[key]
-    return node.get(key)
-
-
 def _uid(node: Dict[str, Any], key: str) -> Optional[int]:
-    value = _first_non_null(node, key, _UID_SECTIONS)
+    value = node_value(node, key, _UID_SECTIONS)
     return None if value is None else int(value)
 
 
 def read_dropout(node: Dict[str, Any]) -> SdpaDropout:
     """Read the dropout attributes of one SDPA node."""
-    probability = _first_non_null(node, "dropout_probability", _PARAM_SECTIONS)
+    probability = node_value(node, "dropout_probability", _PARAM_SECTIONS)
     return SdpaDropout(
         probability=None if probability is None else float(probability),
         seed_uid=_uid(node, "seed_tensor_uid"),
@@ -86,8 +80,8 @@ def find_rng_dump(graph_json: Dict[str, Any]) -> Optional[RngDump]:
     """The first forward SDPA node with an ``rng_dump`` and a probability.
 
     hipDNN writes the dump only when the probability is not null
-    (RngDumpHandoff.hpp, rocm-libraries #14358; the submodule pin predates
-    it). Backward nodes have no dump.
+    (RngDumpHandoff.hpp, rocm-libraries #14358, which the pinned submodule
+    includes). Backward nodes have no dump.
     """
     for _, dropout in _forward_dropouts(graph_json):
         if dropout.rng_dump_uid is not None and dropout.probability is not None:
