@@ -607,9 +607,10 @@ dropout mask and `s` is the dropout scale.
   - `dS = s * P * (dP - D)`.
   - `dV = (P * M * s)^T @ dO`.
   - `dQ` and `dK` come from `dS`, as without dropout. `inv` changes only
-    `D`, so only `dQ` and `dK` show a wrong `inv`.
-  - With a bias gradient, dBias is the dropout-scaled
-    `dS = s * P * (M * dP - D * inv)`, summed over the bias's broadcast
+    `D`, so only `dQ`, `dK` and dBias show a wrong `inv`.
+  - With a bias gradient, dBias is the `dS` above: `s * P * (dP - D)`.
+    `dP` and `D` already carry `M` and `inv`. The tool takes dBias
+    before the attention scale. It sums dBias over the bias's broadcast
     dims, as hipDNN's CPU reference does.
 
 Dropout combines with causal masks, sliding windows, an additive bias, ALiBi
