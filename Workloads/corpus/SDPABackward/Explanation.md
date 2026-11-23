@@ -59,7 +59,7 @@ Dropout uses cuDNN's Philox form: `dropout_probability` with int64 `seed`
 and `offset` tensors of dims `[1, 1, 1, 1]`. The `model_spec` shapes and
 their sources are in `_MODEL_SPECS` in `tools/sdpa_fwd_to_bwd.py`.
 
-At rocm-libraries `bfbd6d7`, the hipDNN ASM SDPA backward engine declines
+At rocm-libraries `4577381`, the hipDNN ASM SDPA backward engine declines
 dropout, bias, dBias and ALiBi. The PyTorch reference skips dropout graphs,
 which include the `t5-large` dBias graph. It computes dBias for the
 `swin-base` and `alphafold2` graphs, and runs the ALiBi graphs with its fp32
@@ -83,7 +83,7 @@ For each forward graph, the converter:
    When the graph has both `seq_len_q` and `seq_len_kv`, it sets
    `padding_mask = true`, because cuDNN requires the flag with sequence
    lengths (SEM-008 in hipDNN's `SdpaSemanticsRegister.md`, rocm-libraries
-   `bfbd6d7d535` and later). At the pinned `bfbd6d7`, `SdpaBwdNode` Rule 9
+   `bfbd6d7d535` and later). At the pinned `4577381`, `SdpaBwdNode` Rule 9
    still checks the `seq_len` shapes only when `padding_mask` is set.
 7. Drops the forward-only attributes (`max_seq_len_kv`, `implementation`,
    `mma_core_mode`, `generate_stats`) and the top-level `_comment`.
