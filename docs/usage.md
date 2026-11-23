@@ -55,13 +55,19 @@ gives the store rules and the tag vocabulary. The public store is
 2. It downloads only the objects that are new, or whose ETag changed since
    the last run, into `<work>/graph-store/<bucket>/<prefix>/` (see
    [Work directory](#work-directory---benchmark-work-dir)). The first run
-   downloads every object. A later run reads only the listing.
-3. It skips, with a warning, each object whose content does not hash to its
+   downloads every object, 16 in parallel on kept-alive connections. A later
+   run reads only the listing.
+3. It retries a request that fails with a connection error, a timeout, 429
+   or 5xx, up to 6 attempts with an increasing wait. It does not retry other
+   errors, for example 403 or 404.
+4. It skips, with a warning, each object whose content does not hash to its
    key, and each name under the prefix that is not an object key.
-4. It removes the cached objects that the store no longer lists.
-5. `--tag` then selects from the objects.
+5. It removes the cached objects that the store no longer lists.
+6. `--tag` then selects from the objects.
 
-A listing or download error stops the run with exit code 1. A directory of
+A listing or download error that remains after the retries stops the run
+with exit code 1. The objects that arrived stay in the cache with their
+ETags, so the next run downloads only the rest. A directory of
 store objects (for example the cache folder, or the `--out` folder of
 `tools/sdpa_fwd_to_bwd.py`) is a usual `-g` directory: `--tag` applies to it
 in the same way.

@@ -21,6 +21,7 @@ from tests.fake_store import URL, FakeBucket, graph as _graph
 def bucket(monkeypatch) -> FakeBucket:
     fake = FakeBucket()
     monkeypatch.setattr(store, "https_get", fake)
+    monkeypatch.setattr(store, "_sleep", lambda seconds: None)
     return fake
 
 
@@ -180,27 +181,78 @@ def test_names_that_are_not_keys_are_ignored(
     assert [p.name for p in result.paths] == [key]
 
 
-def test_a_failed_listing_or_download_is_a_graph_load_error(
-    bucket: FakeBucket, tmp_path: Path, monkeypatch
+def test_transient_errors_are_retried_until_the_object_arrives(
+    bucket: FakeBucket, tmp_path: Path
+) -> None:
+    flaky = bucket.put(_graph(1))
+    bucket.put(_graph(2))
+    bucket.faults[flaky] = [
+        ConnectionResetError(104, "Connection reset by peer"),
+        TimeoutError("timed out"),
+        store.HTTPStatusError("https://x", 503),
+        store.HTTPStatusError("https://x", 429),
+    ]
+
+    result = store.sync(URL, tmp_path)
+
+    assert result.downloaded == 2
+    assert bucket.gets.count(flaky) == 5
+
+
+def test_a_transient_error_that_persists_stops_the_sync_after_the_retries(
+    bucket: FakeBucket, tmp_path: Path
 ) -> None:
     key = bucket.put(_graph(1))
-    real = bucket.objects.pop(f"graphs/{key}")
+    bucket.faults[key] = [ConnectionResetError(104, "reset")] * store.ATTEMPTS
 
-    def listing_then_404(url: str, timeout: float = 0) -> bytes:
-        if urllib.parse.urlparse(url).path == "/":
-            bucket.objects[f"graphs/{key}"] = real
-            page = bucket(url)
-            del bucket.objects[f"graphs/{key}"]
-            return page
-        return bucket(url)
-
-    monkeypatch.setattr(store, "https_get", listing_then_404)
     with pytest.raises(GraphLoadError, match="Cannot download"):
         store.sync(URL, tmp_path)
+    assert bucket.gets.count(key) == store.ATTEMPTS
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_a_permanent_error_is_not_retried(
+    bucket: FakeBucket, tmp_path: Path, status: int
+) -> None:
+    key = bucket.put(_graph(1))
+    bucket.faults[key] = [store.HTTPStatusError("https://x", status)]
+
+    with pytest.raises(GraphLoadError, match=f"HTTP {status}"):
+        store.sync(URL, tmp_path)
+    assert bucket.gets.count(key) == 1
+
+
+def test_a_failed_sync_keeps_its_progress_and_the_next_one_resumes(
+    bucket: FakeBucket, tmp_path: Path
+) -> None:
+    keys = [bucket.put(_graph(n)) for n in range(8)]
+    broken = keys[3]
+    bucket.faults[broken] = [store.HTTPStatusError("https://x", 403)]
+    with pytest.raises(GraphLoadError):
+        store.sync(URL, tmp_path)
+    first = set(bucket.gets)
+    bucket.gets.clear()
+
+    result = store.sync(URL, tmp_path)
+
+    # Only the broken object and the ones the failed sync did not reach.
+    assert broken in bucket.gets
+    assert set(bucket.gets) == {broken} | (set(keys) - first)
+    assert result.downloaded == len(bucket.gets)
+    assert [p.name for p in result.paths] == sorted(keys)
+
+
+def test_an_unreachable_store_is_a_graph_load_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = []
 
     def offline(url: str, timeout: float = 0) -> bytes:
+        calls.append(url)
         raise OSError("network is unreachable")
 
     monkeypatch.setattr(store, "https_get", offline)
+    monkeypatch.setattr(store, "_sleep", lambda seconds: None)
     with pytest.raises(GraphLoadError, match="Cannot list"):
         store.sync(URL, tmp_path)
+    assert len(calls) == store.ATTEMPTS

@@ -24,12 +24,17 @@ def graph(n: int, **tags: str) -> dict:
 
 
 class FakeBucket:
-    """Serves ListObjectsV2 pages and object GETs for ``URL``."""
+    """Serves ListObjectsV2 pages and object GETs for ``URL``.
+
+    ``faults[key]`` lists exceptions that the next GETs of ``key`` raise, in
+    order, before the object is served.
+    """
 
     def __init__(self, page_size: int = 2) -> None:
         self.objects: dict[str, bytes] = {}
         self.page_size = page_size
         self.gets: list[str] = []
+        self.faults: dict[str, list[Exception]] = {}
 
     def put(self, graph: dict, key: Optional[str] = None) -> str:
         key = key or store.geometry_key(graph)
@@ -43,9 +48,12 @@ class FakeBucket:
         if parsed.path == "/":
             return self._page(urllib.parse.parse_qs(parsed.query))
         name = urllib.parse.unquote(parsed.path[1:])
-        self.gets.append(name.rsplit("/", 1)[-1])
+        key = name.rsplit("/", 1)[-1]
+        self.gets.append(key)
+        if self.faults.get(key):
+            raise self.faults[key].pop(0)
         if name not in self.objects:
-            raise OSError(f"404 {name}")
+            raise store.HTTPStatusError(url, 404)
         return self.objects[name]
 
     def _page(self, query: dict) -> bytes:

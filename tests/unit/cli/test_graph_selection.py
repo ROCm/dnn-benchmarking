@@ -36,6 +36,7 @@ def ran(monkeypatch) -> list:
 def bucket(monkeypatch) -> FakeBucket:
     fake = FakeBucket()
     monkeypatch.setattr(store, "https_get", fake)
+    monkeypatch.setattr(store, "_sleep", lambda seconds: None)
     return fake
 
 
@@ -116,6 +117,7 @@ def test_an_unreachable_store_is_exit_1(tmp_path: Path, ran: list, monkeypatch) 
         raise OSError("network is unreachable")
 
     monkeypatch.setattr(store, "https_get", offline)
+    monkeypatch.setattr(store, "_sleep", lambda seconds: None)
 
     assert main_module.main(["-g", URL]) == 1
     assert ran == []
