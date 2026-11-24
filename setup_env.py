@@ -66,6 +66,28 @@ PROVIDER_DESCRIPTOR_ROOT = (
     / "kernel_ingestor_engine"
     / "descriptors"
 )
+SUPERBUILD_ALL_COMPONENTS = (
+    "hipdnn",
+    "miopen-provider",
+    "hipblaslt-provider",
+    "hip-kernel-provider",
+)
+SUPERBUILD_HYBRID_COMPONENTS = ("hip-kernel-provider",)
+# Subtrees whose prebuilt wheel binaries are reused in hybrid mode; local
+# edits under any of these trigger a full source build instead.
+_PREBUILT_ROCM_LIBRARIES_SUBDIRS = (
+    "projects/hipdnn",
+    "dnn-providers/miopen-provider",
+    "dnn-providers/hipblaslt-provider",
+)
+
+_PREBUILT_HIPDNN_CMAKE_CONFIGS = (
+    "lib/cmake/hipdnn_frontend/hipdnn_frontendConfig.cmake",
+    "lib/cmake/hipdnn_backend/hipdnn_backendConfig.cmake",
+    "lib/cmake/hipdnn_data_sdk/hipdnn_data_sdkConfig.cmake",
+    "lib/cmake/hipdnn_flatbuffers_sdk/hipdnn_flatbuffers_sdkConfig.cmake",
+    "lib/cmake/hipdnn_plugin_sdk/hipdnn_plugin_sdkConfig.cmake",
+)
 
 AITER_DIR = SCRIPT_DIR / "aiter"
 # AITER submodules that its JIT compiles against: the CK headers and the CK
@@ -1130,6 +1152,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--build-from-source",
+        action="store_true",
+        help=(
+            "Build hipDNN and all provider plugins (MIOpen, hipBLASLt and "
+            "hip-kernel) from source instead of reusing prebuilt hipDNN, "
+            "MIOpen and hipBLASLt binaries from the ROCm SDK prefix. "
+            "Implied by --rocm-libraries-ref."
+        ),
+    )
+    parser.add_argument(
         "--no-aiter",
         dest="aiter",
         action="store_false",
@@ -1205,6 +1237,7 @@ class Setup:
     def __init__(self, args: argparse.Namespace) -> None:
         self.torch_mode = args.torch_mode
         self.reuse_artifacts = args.reuse_artifacts
+        self.build_from_source = args.build_from_source
         self.with_aiter = args.aiter
         self.auto_yes = args.yes
         self.clean = args.clean
@@ -1222,6 +1255,7 @@ class Setup:
         self.current_stage = "preflight"
         self.n_stages = 0
         self._stage_index = 0
+        self._rocm_libraries_matches_pin = True
 
         self.do_build = not self.reuse_artifacts and self.torch_mode != "cuda"
 
@@ -1350,6 +1384,7 @@ class Setup:
             # sparse clone would otherwise go unnoticed.
             head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
             if pinned and head != ref:
+                self._rocm_libraries_matches_pin = False
                 if source == "quartz":
                     therock_note = (
                         f" (matched to TheRock {therock_commit[:12]})"
@@ -1368,6 +1403,8 @@ class Setup:
                         f"{ref[:12]}. Check out that commit in rocm-libraries/ "
                         "or delete the directory to fetch it."
                     )
+            if self._rocm_libraries_has_prebuilt_edits():
+                self._rocm_libraries_matches_pin = False
             if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
                 warn(
                     "rocm-libraries/CMakePresets.json is missing (a non-cone "
@@ -1438,6 +1475,24 @@ class Setup:
             )
         except subprocess.CalledProcessError:
             return False
+
+    @staticmethod
+    def _rocm_libraries_has_prebuilt_edits() -> bool:
+        """True when rocm-libraries/ has local changes under any prebuilt tree."""
+        try:
+            out = git_output(
+                [
+                    "-C",
+                    str(ROCM_LIBRARIES_DIR),
+                    "status",
+                    "--porcelain",
+                    "--",
+                    *_PREBUILT_ROCM_LIBRARIES_SUBDIRS,
+                ]
+            )
+        except subprocess.CalledProcessError:
+            return False
+        return bool(out.strip())
 
     @staticmethod
     def _pinned_submodule_commit(name: str, fallback_note: str) -> str:
@@ -1887,6 +1942,92 @@ class Setup:
             and self.hipdnn_backend_config_path(prefix).is_file()
         )
 
+    def prefixes_have_hipdnn(self, *prefixes: str) -> bool:
+        return any(self.prefix_has_hipdnn(p) for p in prefixes if p)
+
+    @staticmethod
+    def _prefixes_have_prebuilt_hipdnn_sdk(
+        install_prefix: str, toolchain_prefix: str
+    ) -> bool:
+        """True when all hipDNN SDK CMake configs exist in either prefix."""
+        roots = tuple(Path(p) for p in (install_prefix, toolchain_prefix) if p)
+        return all(
+            any((root / rel).is_file() for root in roots)
+            for rel in _PREBUILT_HIPDNN_CMAKE_CONFIGS
+        )
+
+    @staticmethod
+    def _prefix_has_prebuilt_plugins(
+        install_prefix: str, *, include_hip_kernel: bool = False
+    ) -> bool:
+        """True when install_prefix already holds prebuilt hipDNN + plugins."""
+        root = Path(install_prefix)
+        if IS_WINDOWS:
+            required = [
+                root / "bin" / "hipdnn_backend.dll",
+                root / "bin" / "hipdnn_plugins" / "engines" / "miopen_plugin.dll",
+                root / "bin" / "hipdnn_plugins" / "engines" / "hipblaslt_plugin.dll",
+            ]
+            if include_hip_kernel:
+                required.append(
+                    root
+                    / "bin"
+                    / "hipdnn_plugins"
+                    / "engines"
+                    / "hip_kernel_provider.dll"
+                )
+        else:
+            required = [
+                root / "lib" / "libhipdnn_backend.so",
+                root / "lib" / "hipdnn_plugins" / "engines" / "libmiopen_plugin.so",
+                root / "lib" / "hipdnn_plugins" / "engines" / "libhipblaslt_plugin.so",
+            ]
+            if include_hip_kernel:
+                required.append(
+                    root
+                    / "lib"
+                    / "hipdnn_plugins"
+                    / "engines"
+                    / "libhip_kernel_provider.so"
+                )
+        return all(path.exists() for path in required)
+
+    def select_superbuild_components(
+        self, install_prefix: str, toolchain_prefix: str
+    ) -> Tuple[str, ...]:
+        """Components to build in rocm-libraries (empty = skip superbuild).
+
+        Defaults to hybrid mode when the ROCm prefix/toolchain already ships
+        hipDNN, MIOpen and hipBLASLt plugins matching the pinned commit: Linux
+        rebuilds only hip-kernel-provider (for rocKE + kernel ingestor), and
+        Windows skips the superbuild when hip_kernel_provider.dll is present
+        and no --cmake-arg was passed. Falls back to the full superbuild on
+        --build-from-source, --rocm-libraries-ref, local edits/mismatched HEAD
+        in rocm-libraries/, or a prefix without prebuilt hipDNN/plugins.
+        """
+        if self.build_from_source or self.rocm_libraries_ref:
+            return SUPERBUILD_ALL_COMPONENTS
+        if not self._rocm_libraries_matches_pin:
+            print(
+                "rocm-libraries/ differs from the pinned wheel commit or has "
+                "local edits; building hipDNN and all providers from source."
+            )
+            return SUPERBUILD_ALL_COMPONENTS
+        if not (
+            self._prefixes_have_prebuilt_hipdnn_sdk(install_prefix, toolchain_prefix)
+            and self._prefix_has_prebuilt_plugins(install_prefix)
+        ):
+            return SUPERBUILD_ALL_COMPONENTS
+        if (
+            IS_WINDOWS
+            and not self.extra_cmake_args
+            and self._prefix_has_prebuilt_plugins(
+                install_prefix, include_hip_kernel=True
+            )
+        ):
+            return ()
+        return SUPERBUILD_HYBRID_COMPONENTS
+
     def resolve_installed_rocm_prefix(self) -> str:
         if self.rocm_prefix:
             return self.rocm_prefix
@@ -2294,6 +2435,7 @@ class Setup:
             "-DHIPKERNELPROVIDER_ENABLE_ROCKE=ON",
             "-DHIPDNN_ENABLE_KERNEL_INGESTOR=ON",
             "-DHIPKERNELPROVIDER_KPACK_ALLOW_FETCH=ON",
+            "-DROCKE_INSTALL_TEST_GPU_REFERENCES=OFF",
             f"-DPython3_EXECUTABLE={self.py}",
             # The ingestor headers' std::stable_sort trips libstdc++ 12's
             # deprecated get_temporary_buffer under the wheel clang's -Werror
@@ -2339,38 +2481,88 @@ class Setup:
         build_dir.mkdir(parents=True, exist_ok=True)
         record.write_text(json.dumps(wanted) + "\n")
 
-    def build_superbuild(self, install_prefix: str, toolchain_prefix: str) -> None:
+    def build_superbuild(
+        self,
+        install_prefix: str,
+        toolchain_prefix: str,
+        components: Optional[Tuple[str, ...]] = None,
+    ) -> None:
+        if components is None:
+            components = self.select_superbuild_components(
+                install_prefix, toolchain_prefix
+            )
+        if not components:
+            print(
+                f"Using prebuilt hipDNN and provider plugins from {install_prefix}; "
+                "skipping C++ superbuild."
+            )
+            return
+
         cmake = self.cmake
         if not shutil.which("ninja"):
             fail("ninja not found on PATH.")
 
         build_dir = ROCM_LIBRARIES_DIR / "build"
         prefix_path, program_path = self._cmake_paths(install_prefix, toolchain_prefix)
-        configure_args = [
-            "--preset",
-            "hipdnn-providers-all",
-            "-GNinja",
-            f"-DROCM_PATH={toolchain_prefix}",
-            f"-DCMAKE_PREFIX_PATH={prefix_path}",
-            f"-DCMAKE_PROGRAM_PATH={program_path}",
-            f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
-            "-DROCM_LIBS_ENABLE_COMPONENTS=hipdnn;miopen-provider;"
-            "hipblaslt-provider;hip-kernel-provider",
-            *self.hip_arch_args,
-            "-DHIPDNN_SKIP_TESTS=ON",
-            "-DHIPDNN_ENABLE_SDPA=ON",
-            "-DMIOPENPROVIDER_SKIP_TESTS=ON",
-            "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
-            "-DENABLE_ASM_SDPA_ENGINE=ON",
-            *self.rocke_args(toolchain_prefix),
-            "-DENABLE_CLANG_FORMAT=OFF",
-            "-DENABLE_CLANG_TIDY=OFF",
-            # LAST, so a caller's -D overrides a default above rather than
-            # being silently overridden by it.
-            *self.extra_cmake_args,
-        ]
+        if components == SUPERBUILD_HYBRID_COMPONENTS:
+            # Configure hip-kernel-provider standalone against the prebuilt
+            # hipDNN SDK rather than through the rocm-libraries root superbuild:
+            # the root CMakeLists prepends cmake/modules/ ahead of
+            # dnn-providers/cmake/, shadowing CheckToolVersion.cmake when
+            # hipdnn is omitted.
+            configure_args = [
+                "-S",
+                str(ROCM_LIBRARIES_DIR / "dnn-providers" / "hip-kernel-provider"),
+                "-B",
+                str(build_dir),
+                "-GNinja",
+                "-DCMAKE_BUILD_TYPE=Release",
+                f"-DCMAKE_TOOLCHAIN_FILE={ROCM_LIBRARIES_DIR / 'cmake/toolchains/rocm-clang.cmake'}",
+                f"-DROCM_PATH={toolchain_prefix}",
+                f"-DCMAKE_PREFIX_PATH={prefix_path}",
+                f"-DCMAKE_PROGRAM_PATH={program_path}",
+                f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+                *self.hip_arch_args,
+                "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
+                "-DENABLE_ASM_SDPA_ENGINE=ON",
+                *self.rocke_args(toolchain_prefix),
+                "-DENABLE_CLANG_FORMAT=OFF",
+                "-DENABLE_CLANG_TIDY=OFF",
+                # LAST, so a caller's -D overrides a default above rather than
+                # being silently overridden by it.
+                *self.extra_cmake_args,
+            ]
+        else:
+            configure_args = [
+                "--preset",
+                "hipdnn-providers-all",
+                "-GNinja",
+                f"-DROCM_PATH={toolchain_prefix}",
+                f"-DCMAKE_PREFIX_PATH={prefix_path}",
+                f"-DCMAKE_PROGRAM_PATH={program_path}",
+                f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+                f"-DROCM_LIBS_ENABLE_COMPONENTS={';'.join(components)}",
+                *self.hip_arch_args,
+                "-DHIPDNN_SKIP_TESTS=ON",
+                "-DHIPDNN_ENABLE_SDPA=ON",
+                "-DMIOPENPROVIDER_SKIP_TESTS=ON",
+                "-DHIPKERNELPROVIDER_ENABLE_TESTS=OFF",
+                "-DENABLE_ASM_SDPA_ENGINE=ON",
+                *self.rocke_args(toolchain_prefix),
+                "-DENABLE_CLANG_FORMAT=OFF",
+                "-DENABLE_CLANG_TIDY=OFF",
+                # LAST, so a caller's -D overrides a default above rather than
+                # being silently overridden by it.
+                *self.extra_cmake_args,
+            ]
         self._reset_build_dir(build_dir, configure_args)
-        print(f"Building hipDNN and providers to {install_prefix}...")
+        if components == SUPERBUILD_ALL_COMPONENTS:
+            print(f"Building hipDNN and providers to {install_prefix}...")
+        else:
+            print(
+                f"Using prebuilt hipDNN, MIOpen and hipBLASLt plugins from "
+                f"{install_prefix}; building {', '.join(components)}..."
+            )
         run(
             [cmake, *configure_args],
             cwd=ROCM_LIBRARIES_DIR,
@@ -2460,7 +2652,7 @@ class Setup:
         toolchain_prefix = self.toolchain_prefix
         if self.do_build:
             self.build_superbuild(install_prefix, toolchain_prefix)
-        elif not self.prefix_has_hipdnn(install_prefix):
+        elif not self.prefixes_have_hipdnn(install_prefix, toolchain_prefix):
             fail(
                 "--reuse-artifacts was passed, but hipDNN CMake configs "
                 f"were not found under {install_prefix}.",
@@ -2482,8 +2674,8 @@ class Setup:
 
         self.env["ROCM_PATH"] = install_prefix
         if not IS_WINDOWS:
-            # Install prefix first: the ROCm devel wheel ships its own, older
-            # libhipdnn_backend.so, which must not shadow the one just built.
+            # Install prefix first so freshly built or wheel runtime libraries
+            # in install_prefix/lib take precedence over toolchain_prefix/lib.
             lib_dirs = tuple(
                 str(Path(prefix) / "lib")
                 for prefix in (install_prefix, toolchain_prefix)
@@ -2910,6 +3102,8 @@ def main(argv=None) -> int:
         )
     if args.rocm_version and args.torch_mode != "rocm":
         parser.error("--rocm-version needs --torch-mode rocm")
+    if args.build_from_source and args.reuse_artifacts:
+        parser.error("--build-from-source cannot be combined with --reuse-artifacts")
     setup = Setup(args)
     try:
         return setup.run()
