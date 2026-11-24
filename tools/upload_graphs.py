@@ -6,10 +6,13 @@
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
-from tempfile import TemporaryDirectory
+
+import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 from dnn_benchmarking.graph import store
 
@@ -33,8 +36,8 @@ def merge_tags(current: dict, incoming: dict) -> dict:
     return {**current, "metadata": metadata}
 
 
-def read_graph(path: Path) -> dict:
-    graph = json.loads(path.read_text(encoding="utf-8"))
+def parse_graph(data: bytes) -> dict:
+    graph = json.loads(data)
     if not isinstance(graph, dict):
         raise ValueError("expected a graph JSON object")
     return graph
@@ -48,7 +51,7 @@ def load_inputs(paths: list[Path]) -> dict[str, dict]:
             raise ValueError(f"{path}: no graph JSON files")
         for file in files:
             try:
-                graph = read_graph(file)
+                graph = parse_graph(file.read_bytes())
                 key = store.geometry_key(graph)
                 validate(key, graph)
                 if key in graphs:
@@ -61,66 +64,48 @@ def load_inputs(paths: list[Path]) -> dict[str, dict]:
 
 
 def upload_graph(
-    common: list[str],
-    object_args: list[str],
-    key: str,
-    incoming: dict,
-    body: Path,
-    apply: bool,
+    s3, bucket: str, prefix: str, key: str, incoming: dict, apply: bool
 ) -> str:
-    get = subprocess.run(
-        [*common, "get-object", *object_args, str(body)],
-        capture_output=True,
-        text=True,
-    )
-    if get.returncode == 0:
-        current = read_graph(body)
+    object_args = {"Bucket": bucket, "Key": prefix + key}
+    try:
+        response = s3.get_object(**object_args)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchKey":
+            raise
+        graph = incoming
+        condition = {"IfNoneMatch": "*"}
+        action = "create"
+    else:
+        with response["Body"] as body:
+            current = parse_graph(body.read())
         validate(key, current)
         graph = merge_tags(current, incoming)
         if graph == current:
             return "skip"
-        etag = json.loads(get.stdout).get("ETag")
+        etag = response.get("ETag")
         if not etag:
             raise ValueError("S3 did not return an ETag for the existing graph")
-        condition = ["--if-match", etag]
+        condition = {"IfMatch": etag}
         action = "merge"
-    elif "(NoSuchKey)" in get.stderr:
-        graph = incoming
-        condition = ["--if-none-match", "*"]
-        action = "create"
-    else:
-        raise RuntimeError(
-            get.stderr.strip() or f"aws get-object exited {get.returncode}"
-        )
     validate(key, graph)
     payload = store.object_bytes(graph)
     if apply:
-        body.write_bytes(payload)
-        put = subprocess.run(
-            [
-                *common,
-                "put-object",
-                *object_args,
-                "--body",
-                str(body),
-                "--content-type",
-                "application/json",
-                *condition,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if put.returncode:
-            if any(
-                f"({code})" in put.stderr
-                for code in ("PreconditionFailed", "ConditionalRequestConflict")
-            ):
+        try:
+            s3.put_object(
+                **object_args,
+                Body=payload,
+                ContentType="application/json",
+                **condition,
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in {
+                "PreconditionFailed",
+                "ConditionalRequestConflict",
+            }:
                 raise RuntimeError(
                     "S3 object changed; rerun the preview before retrying"
-                )
-            raise RuntimeError(
-                put.stderr.strip() or f"aws put-object exited {put.returncode}"
-            )
+                ) from exc
+            raise
     return action
 
 
@@ -130,32 +115,40 @@ def main(argv: list[str] | None = None) -> int:
         "graphs", nargs="+", type=Path, help="JSON files or directories"
     )
     parser.add_argument("--store", default=DEFAULT_STORE, help="destination S3 URL")
-    parser.add_argument("--profile", help="AWS CLI profile (required with --apply)")
+    parser.add_argument("--profile", help="override the AWS credential profile")
     parser.add_argument(
         "--apply", action="store_true", help="write instead of previewing"
     )
     args = parser.parse_args(argv)
-    if args.apply and not args.profile:
-        parser.error("--apply requires --profile")
     try:
         bucket, prefix = store.split_store_url(args.store)
         graphs = load_inputs(args.graphs)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
-    aws = ["aws", "--no-cli-pager", "--output", "json"]
-    aws.extend(["--profile", args.profile] if args.profile else ["--no-sign-request"])
-    aws.append("s3api")
-    with TemporaryDirectory(prefix="dnn-upload-") as directory:
-        body = Path(directory) / "graph.json"
-        for key, graph in graphs.items():
-            args_for_key = ["--bucket", bucket, "--key", prefix + key]
-            try:
-                action = upload_graph(aws, args_for_key, key, graph, body, args.apply)
-            except (OSError, TypeError, ValueError, RuntimeError) as exc:
-                print(f"{key}: {exc}", file=sys.stderr)
-                return 1
-            print(f"{action if args.apply else 'would ' + action} {key}")
+    try:
+        session = boto3.Session(profile_name=args.profile)
+        config = (
+            None if args.apply or args.profile else Config(signature_version=UNSIGNED)
+        )
+        s3 = session.client("s3", config=config)
+    except (BotoCoreError, ClientError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    for key, graph in graphs.items():
+        try:
+            action = upload_graph(s3, bucket, prefix, key, graph, args.apply)
+        except (
+            BotoCoreError,
+            ClientError,
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            print(f"{key}: {exc}", file=sys.stderr)
+            return 1
+        print(f"{action if args.apply else 'would ' + action} {key}")
     return 0
 
 

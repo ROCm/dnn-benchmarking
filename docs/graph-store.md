@@ -76,23 +76,26 @@ are different. A change to a name or a tag does not change the key.
 ### 4. Upload
 
 Use [`tools/upload_graphs.py`](../tools/upload_graphs.py) from an environment
-with `dnn-benchmarking` installed and a recent AWS CLI v2 on `PATH`. Pass
-tagged graph JSON files or directories containing `*.json` files.
+with `dnn-benchmarking` installed. Install the uploader's AWS SDK dependency,
+then pass tagged graph JSON files or directories containing `*.json` files.
 
 ```bash
+python -m pip install -r tools/requirements.txt
+
 # Preview against the public store without AWS credentials.
 python tools/upload_graphs.py /path/to/graphs
 
-# Write with a named AWS profile that has graph-store write access.
-python tools/upload_graphs.py /path/to/graphs --profile graph-writer --apply
+# Write using the standard AWS credential chain.
+python tools/upload_graphs.py /path/to/graphs --apply
 ```
 
 The script computes the object key from each graph, not its filename. It
 validates the input and reports `create`, `merge`, or `skip` for each key.
-Use `--store s3://BUCKET/PREFIX/` to select another store. A private store
-also needs `--profile` for the preview.
-The reader needs permission to get objects and list the destination prefix
-so S3 can distinguish a missing key from denied access.
+Use `--profile graph-writer` to select a named AWS credential profile. A
+preview without `--profile` uses anonymous reads. Use `--store
+s3://BUCKET/PREFIX/` to select another store. The reader needs permission to
+get objects and list the destination prefix so S3 can distinguish a missing
+key from denied access.
 
 The script creates new objects with `If-None-Match: *`. For existing objects,
 it keeps the stored name and notes, adds only missing tags, and writes with
