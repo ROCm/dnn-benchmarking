@@ -25,7 +25,7 @@ RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
     "runtime", "runtimes", "engine_filter", "plugin_paths", "warmup_iters", "iters",
     "min_time_ms", "cache_mode", "rotate_buffers", "timing_block", "seed",
-    "input_recipe", "input_recipe_version", "validate",
+    "input_recipe", "input_recipe_version", "knobs", "sweep_knobs", "validate",
     "rtol", "atol", "reference_precision", "oracle", "autotune",
     "benchmark_work_dir", "fresh_state", "fast",
     "pytorch_sdpa_backend", "pytorch_rocm_fa_library", "pytorch_dispatch",
@@ -61,7 +61,7 @@ ROW_KEYS = {
     "elapsed_s", "metrics", "ootb", "oracle", "oracle_error", "warnings",
     "extra_metrics",
 }  # fmt: skip
-ENGINE_KEYS = {"id", "name", "version"}
+ENGINE_KEYS = {"id", "name", "version", "plan_name", "knobs"}
 METRICS_KEYS = {"flops", "flops_formula_version", "io_bytes", "clocks_after"}
 PLAN_KEYS = {
     "build_ms", "timing", "kernel", "host", "workspace_bytes", "tflops", "gbps",
@@ -236,6 +236,8 @@ def test_full_row_values() -> None:
         "id": "0x15B46865C717A122",
         "name": "MIOPEN_ENGINE",
         "version": "1.0",
+        "plan_name": None,
+        "knobs": None,
     }
     assert row["metrics"] == {
         "flops": 10**9,

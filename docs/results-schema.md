@@ -66,6 +66,8 @@ the keys below.
 | `seed` | int | Input data seed. |
 | `input_recipe` | string | `--input-recipe` (`centered`, `llm`, `heavy_tail`, `legacy`, or `zeros`). |
 | `input_recipe_version` | int | Version of the input-generation recipe implementation. |
+| `knobs` | object or null | Explicit `--knob` settings applied to hipDNN engines, or `null`. |
+| `sweep_knobs` | bool | `--sweep-knobs`. |
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
@@ -174,7 +176,7 @@ NaN or infinity has no `graph_id`, and its `status` is `error`.
 
 |Version|Change|
 |---|---|
-|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it. Also adds `run.config` (`rotate_buffers`, `input_recipe`, `input_recipe_version`), `graph.input_fingerprint`, `metrics.flops_formula_version`, `timing` (`launch_mode`, `requested_warmup_iters`, `flush_method`, `flush_bytes`, `rotated_buffers`, `timed_work_notes`), and in-run `metrics.clocks_after` telemetry (`in_run_samples`, `throttle_any`, `power_max_w`, `sclk_min_mhz`, `sclk_max_mhz`).|
+|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it. Also adds `run.config` (`rotate_buffers`, `input_recipe`, `input_recipe_version`, `knobs`, `sweep_knobs`), `graph.input_fingerprint`, `engine` (`plan_name`, `knobs`), `timing` (`launch_mode`, `requested_warmup_iters`, `flush_method`, `flush_bytes`, `rotated_buffers`, `timed_work_notes`), and in-run `metrics.clocks_after` telemetry (`in_run_samples`, `throttle_any`, `power_max_w`, `sclk_min_mhz`, `sclk_max_mhz`).|
 |2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
 
 All other keys are the same in versions 2 and 3. One exception: files
@@ -211,6 +213,8 @@ See [usage.md](usage.md#compare).
 | `id` | string or null | hipDNN rows: engine ID as `0x` plus 16 upper-case hex digits. rocKE and AITER rows: the row name, which is stable across runs. `null` for PyTorch rows. |
 | `name` | string or null | Engine name, for example `MIOPEN_ENGINE`. `pytorch` on PyTorch rows. |
 | `version` | string | Plugin version, or `"unavailable"`. On PyTorch rows, the torch version. |
+| `plan_name` | string or null | Resolved hipDNN plan or descriptor name when exposed by the provider, else `null`. |
+| `knobs` | object or null | Explicit knob tuple applied to this row, or `null` for unpinned runs. |
 
 hipDNN engine IDs are signed 64-bit integers. JSON readers that use
 floating-point numbers lose precision above 2^53. For this reason the file

@@ -45,6 +45,9 @@ RUNTIME_OPTIONS: Dict[RuntimeName, frozenset] = {
     RuntimeName.HIPDNN: frozenset(
         {
             "--engine",
+            "--knob",
+            "--sweep-knobs",
+            "--knob-candidates",
             "--pmc",
             "--trace",
             "--perf",
@@ -482,6 +485,16 @@ class SuiteConfig:
     timing_block: int = 1
     #: Named input-value generation recipe (see INPUT_RECIPE_CHOICES).
     input_recipe: str = "centered"
+    #: Explicit hipDNN knob pins (``knob_id -> int|float|str``).
+    knobs: Optional[Dict[str, Any]] = None
+    #: Sweep exact candidate knob tuples for explicit hipDNN engines.
+    sweep_knobs: bool = False
+    #: Optional JSON file supplying exact candidate knob tuples for ``--sweep-knobs``.
+    knob_candidates: Optional[Path] = None
+    #: Preloaded candidates from ``knob_candidates``, populated at CLI startup.
+    parsed_knob_candidates: Optional[Tuple[Any, ...]] = field(
+        default=None, init=False, repr=False
+    )
     #: Suppress progress output; tables and the summary still print.
     quiet: bool = False
     #: Write the JSON result without whitespace (default: one-space indent).
@@ -524,6 +537,9 @@ class SuiteConfig:
             seed=args.seed,
             input_recipe=getattr(args, "input_recipe", "centered"),
             engine_filter=args.engine,
+            knobs=getattr(args, "knob", None),
+            sweep_knobs=bool(getattr(args, "sweep_knobs", False)),
+            knob_candidates=getattr(args, "knob_candidates", None),
             verbose=args.verbose,
             quiet=args.quiet,
             compact_json=args.compact_json,
@@ -565,6 +581,8 @@ class SuiteConfig:
             raise ValueError(
                 "--input-recipe must be one of: " + ", ".join(INPUT_RECIPE_CHOICES)
             )
+        if isinstance(self.knob_candidates, str):
+            self.knob_candidates = Path(self.knob_candidates)
         self.timing_policy = TimingPolicy(
             warmup_iters=self.warmup_iters,
             iters=self.benchmark_iters,
@@ -615,8 +633,24 @@ class SuiteConfig:
             self.pytorch_sdpa_backend,
             self.pytorch_rocm_fa_library,
         )
+        if self.knobs and self.engine_filter is None:
+            raise ValueError("--knob requires --engine")
+        if self.knobs and self.sweep_knobs:
+            raise ValueError("--knob cannot be combined with --sweep-knobs")
+        if self.sweep_knobs:
+            if self.engine_filter is None:
+                raise ValueError("--sweep-knobs requires --engine")
+            if self.autotune or self.oracle:
+                raise ValueError(
+                    "--sweep-knobs cannot be combined with --autotune or --oracle"
+                )
+        if self.knob_candidates is not None and not self.sweep_knobs:
+            raise ValueError("--knob-candidates requires --sweep-knobs")
         runtime_options = [
             ("--engine", self.engine_filter is not None),
+            ("--knob", bool(self.knobs)),
+            ("--sweep-knobs", self.sweep_knobs),
+            ("--knob-candidates", self.knob_candidates is not None),
             ("--pmc", self.metrics.pmc_set is not None),
             ("--trace", self.metrics.trace),
             ("--perf", self.metrics.perf),
@@ -654,6 +688,7 @@ class SuiteConfig:
         rejected = [
             ("--validate", self.validation.enabled),
             ("--oracle", self.oracle),
+            ("--sweep-knobs", self.sweep_knobs),
             ("--pmc", self.metrics.pmc_set is not None),
             ("--trace", self.metrics.trace),
             ("--perf", self.metrics.perf),

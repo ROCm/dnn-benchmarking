@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
 from ..reporting.suite_results import engine_id_hex
+from .knob_sweep import validate_knobs_strict
 from .timing import Measurement, StallFallbackError, Timer, device_sync, measure
 
 
@@ -38,6 +39,8 @@ class Executor:
         self._workspace_ptr: int = 0
         self._workspace_size: int = 0
         self._build_time_ms: float = 0.0
+        self._plan_name: Optional[str] = None
+        self._validated_knobs: Optional[Dict[str, Any]] = None
 
     def _build_through_operation_graph(self, handle: Any) -> Any:
         """Create the hipdnn graph and run it up to ``build_operation_graph``.
@@ -151,11 +154,36 @@ class Executor:
         self._build_plan(hipdnn, engine_id, None)
         self._graph = None
 
+    def _get_exposed_knobs(self, engine_id: int) -> Any:
+        """Query knobs for ``engine_id``, mapping inapplicable engines to ``UnsupportedGraphError``."""
+        try:
+            return self._graph.get_knobs_for_engine(engine_id)
+        except RuntimeError as e:
+            raise UnsupportedGraphError(
+                f"Forced engine {engine_id_hex(engine_id)} not applicable "
+                f"to this graph: {e}"
+            ) from e
+
+    def validate_knobs(
+        self, handle: Any, engine_id: int, knobs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Validate ``knobs`` against ``engine_id`` without priming or building a plan."""
+        if not knobs:
+            return {}
+        self._build_through_operation_graph(handle)
+        try:
+            exposed = self._get_exposed_knobs(engine_id)
+            return validate_knobs_strict(exposed, knobs)
+        finally:
+            self._graph = None
+
     def _build_plan(
         self,
         hipdnn: Any,
         engine_id: Optional[int],
         knobs: Optional[Dict[str, Any]],
+        *,
+        strict_knobs: bool = False,
     ) -> None:
         """Create, support-check, and compile the execution plan."""
         if engine_id is not None:
@@ -163,9 +191,14 @@ class Executor:
             # create_execution_plan_ext reports a bad result if the engine is
             # not valid/applicable, so it can never silently fall back to a
             # different engine the way the soft preferred-engine path could.
+            effective_knobs = knobs or {}
+            if strict_knobs and effective_knobs:
+                exposed = self._get_exposed_knobs(engine_id)
+                effective_knobs = validate_knobs_strict(exposed, effective_knobs)
+            self._validated_knobs = dict(effective_knobs) if effective_knobs else None
             settings = [
                 hipdnn.KnobSetting(knob_id, value)
-                for knob_id, value in (knobs or {}).items()
+                for knob_id, value in effective_knobs.items()
             ]
             result = self._graph.create_execution_plan_ext(engine_id, settings)
             if result.is_bad():
@@ -174,6 +207,7 @@ class Executor:
                     f"to this graph: {result.get_message()}"
                 )
         else:
+            self._validated_knobs = None
             result = self._graph.create_execution_plans()
             if result.is_bad():
                 raise ExecutionError(
@@ -195,6 +229,8 @@ class Executor:
         handle: Any,
         engine_id: Optional[int] = None,
         knobs: Optional[Dict[str, Any]] = None,
+        *,
+        strict_knobs: bool = False,
     ) -> None:
         """Build the operation graph and one execution plan.
 
@@ -206,11 +242,14 @@ class Executor:
             engine_id: Build the plan for exactly this engine. When None, the
                 backend heuristic picks the engine.
             knobs: Knob settings for the ``engine_id`` plan, keyed by knob id.
+                With ``strict_knobs=True``, unknown or out-of-domain knobs
+                raise ``UnsupportedGraphError`` instead of being dropped.
+            strict_knobs: Enforce strict knob validation before plan creation.
 
         Raises:
             ValueError: If ``knobs`` is given without ``engine_id``.
             ExecutionError: If graph building fails.
-            UnsupportedGraphError: If support check fails.
+            UnsupportedGraphError: If strict knob validation or support fails.
         """
         if knobs and engine_id is None:
             raise ValueError("knobs require an explicit engine_id")
@@ -218,10 +257,18 @@ class Executor:
         hipdnn = self._build_through_operation_graph(handle)
 
         with Timer() as build_timer:
-            self._build_plan(hipdnn, engine_id, knobs)
+            self._build_plan(hipdnn, engine_id, knobs, strict_knobs=strict_knobs)
         self._build_time_ms = build_timer.elapsed_ms
 
         self._check_selected_engine(engine_id)
+        get_plan_name = getattr(self._graph, "get_plan_name", None)
+        if callable(get_plan_name):
+            try:
+                name = get_plan_name()
+                self._plan_name = str(name) if name else None
+            except Exception:
+                self._plan_name = None
+
         workspace_size = self._graph.get_workspace_size()
         self._workspace_size = int(workspace_size)
         if workspace_size > 0:
@@ -329,6 +376,16 @@ class Executor:
             raise
         except RuntimeError as e:
             raise ExecutionError(str(e)) from e
+
+    @property
+    def plan_name(self) -> Optional[str]:
+        """Resolved plan/descriptor name reported by hipDNN, if available."""
+        return self._plan_name
+
+    @property
+    def validated_knobs(self) -> Optional[Dict[str, Any]]:
+        """Validated, type-coerced knobs applied during ``prepare()``."""
+        return self._validated_knobs
 
     @property
     def build_time_ms(self) -> float:

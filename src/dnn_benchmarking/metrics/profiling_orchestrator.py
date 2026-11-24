@@ -21,6 +21,7 @@ warning naming the graph and engine goes to stderr.
 """
 
 import hashlib
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -119,12 +120,13 @@ def build_inner_argv(
     *,
     input_recipe: str = "centered",
     rotate_buffers: int = 1,
+    knobs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Argv for the ``--internal-profiling-run`` child (frozen contract).
 
     ``-m dnn_benchmarking --internal-profiling-run --graph G --engine E
     --warmup W --iters I --seed S [--plugin-path P] [--input-recipe R]
-    [--cache-mode rotate --rotate-buffers N]``.
+    [--cache-mode rotate --rotate-buffers N] [--knobs-json JSON]``.
     No profiling flag is ever forwarded, so the child cannot recurse.
     """
     argv = [
@@ -149,6 +151,8 @@ def build_inner_argv(
         argv += ["--input-recipe", input_recipe]
     if rotate_buffers > 1:
         argv += ["--cache-mode", "rotate", "--rotate-buffers", str(rotate_buffers)]
+    if knobs:
+        argv += ["--knobs-json", json.dumps(knobs, sort_keys=True)]
     return argv
 
 
@@ -223,6 +227,7 @@ def run_profiling_passes(
     *,
     input_recipe: str = "centered",
     rotate_buffers: int = 1,
+    knobs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run every requested profiling source. Returns a merged dict.
 
@@ -258,6 +263,7 @@ def run_profiling_passes(
         plugin_path,
         input_recipe=input_recipe,
         rotate_buffers=rotate_buffers,
+        knobs=knobs,
     )
     context = f"{graph_path.stem}/{engine_name}"
     sources = (

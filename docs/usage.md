@@ -93,6 +93,9 @@ in the same way.
 |---|---|---|
 | `-r`, `--runtime RUNTIMES` | hipdnn | `hipdnn` runs the engine plugins. `pytorch` runs the graph through PyTorch (ROCm or CUDA). `rocke` launches rocKE kernels directly (SDPA forward today). `aiter` launches AITER SDPA forward kernels directly: `aiter:auto` (AITER's own selection) and one row per backend; `aiter:auto` runs only the `aiter:auto` row. A comma list, for example `hipdnn,rocke`, adds the rows of each runtime to each graph. See [Several runtimes](#several-runtimes). |
 | `-e`, `--engine ENGINES` | all discovered | Comma list of engines, run in the given order. See [Engine selection](#engine-selection). |
+| `--knob KEY=VAL[,...]` | none | Comma list of explicit hipDNN knob settings (requires `--engine`). Validated strictly against the engine's exposed knobs. |
+| `--sweep-knobs`, `--no-sweep-knobs` | off | Run the unpinned baseline plus every exact candidate knob tuple for each `--engine` (uses candidate enumeration or `--knob-candidates`). |
+| `--knob-candidates PATH` | none | JSON file listing exact candidate knob-tuple objects for `--sweep-knobs`. |
 | `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner in the tuned state of the work directory. See [Kernel selection](#kernel-selection---autotune). |
 | `--benchmark-work-dir PATH` | `$DNN_BENCH_WORKSPACE/work`, else `$XDG_CACHE_HOME/dnn-benchmark/work`, else `<system temp dir>/dnn-benchmark-<user>/work` | Work directory for the caches and the kernel-selection state. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.benchmark_work_dir`. |
@@ -874,8 +877,8 @@ The tool builds the OOTB plan through one timed path:
 
 | Plan | Knobs | Build time in JSON |
 |---|---|---|
-| OOTB | none | `ootb.build_ms` |
-| Tuned | `global.benchmarking=1` | `oracle.build_ms` |
+| OOTB | none (or user `--knob` settings when given) | `ootb.build_ms` |
+| Tuned | `global.benchmarking=1` (merged over user `--knob` settings when given) | `oracle.build_ms` |
 
 The build time covers only those three calls. Graph deserialization, the
 operation graph build and the workspace allocation are not timed.
@@ -1063,7 +1066,7 @@ with code 143 without it. The file then holds the last periodic write.
 |---|---|
 | 0 | All engine rows ran. No engine row failed validation. A run where every row is skipped also exits 0. |
 | 1 | An engine row error, a graph error, a failed final result write (a failed periodic write alone does not count), no graph files found, no graph that matches `--tag`, a tarball that cannot be read, a graph store that cannot be listed or read, or a runtime that is not available at startup (hipDNN, PyTorch, rocKE or the reference provider). |
-| 2 | Usage error: a bad flag (a `--tag` without `KEY=VALUE`, a store URL without a bucket), a bad config file, an option that the runtime does not support, an unknown `--engine`, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. |
+| 2 | Usage error: a bad flag (a `--tag` without `KEY=VALUE`, a store URL without a bucket), a bad config file, an option that the runtime does not support, an unknown `--engine`, an unknown `--knob` ID or wrong `--knob` value type, an unreadable or malformed `--knob-candidates` file, an output path or a `--profiling-output-dir` that cannot be written, or a missing profiler tool. If `-o` is set and a fatal `--knob` fails mid-run, the written file holds the graphs finished so far with `run.complete = false`. Per-graph `--knob` domain or range mismatches skip that row instead. |
 | 3 | At least one engine row failed validation. |
 | 130 | Interrupted by SIGINT (Ctrl-C). |
 | 143 | Interrupted by SIGTERM. On Linux the run ends within 30 seconds, also when it is blocked in GPU code. |
@@ -1178,7 +1181,7 @@ Each requested pass runs this child process under its profiler:
 
 ```text
 python -m dnn_benchmarking --internal-profiling-run --graph G --engine E \
-    --warmup W --iters 5 --seed S [--plugin-path P] [--input-recipe R] [--cache-mode rotate --rotate-buffers N]
+    --warmup W --iters 5 --seed S [--plugin-path P] [--input-recipe R] [--cache-mode rotate --rotate-buffers N] [--knobs-json JSON]
 ```
 
 The child does not recurse and does not print on success.

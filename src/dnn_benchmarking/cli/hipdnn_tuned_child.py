@@ -75,6 +75,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--plugin-path", type=Path)
     parser.add_argument("--save-outputs", action="store_true")
     parser.add_argument("--rotate-count", type=int, default=1)
+    parser.add_argument(
+        "--knobs",
+        type=lambda text: json.loads(text),
+        default=None,
+        help="Optional base knobs as a JSON object merged under global.benchmarking=1",
+    )
     return parser.parse_args(argv)
 
 
@@ -124,7 +130,8 @@ def _run(args: argparse.Namespace) -> None:
     # the OOTB row does.
     Executor(graph_json_str, policy).prime(handle, args.engine)
     executor = Executor(graph_json_str, policy)
-    executor.prepare(handle, engine_id=args.engine, knobs={BENCHMARKING_KNOB: 1})
+    knobs = {**(args.knobs or {}), BENCHMARKING_KNOB: 1}
+    executor.prepare(handle, engine_id=args.engine, knobs=knobs)
     # hipDNN ignores a knob the engine does not expose; such a tuned run
     # re-measures the OOTB configuration.
     tuning_available = BENCHMARKING_KNOB in executor.engine_knob_ids(args.engine)

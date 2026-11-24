@@ -26,3 +26,15 @@ class UnsupportedGraphError(ExecutionError):
     """
 
     pass
+
+
+class InvalidKnobError(ExecutionError):
+    """Raised when a requested hipDNN knob ID or value type is invalid for an engine."""
+
+    pass
+
+
+class KnobConstraintError(InvalidKnobError):
+    """Raised when a hipDNN knob value violates a per-graph domain or range constraint."""
+
+    pass

@@ -12,10 +12,10 @@ is how kernel-trace / PMC counters scope what they record.
 Argv (built by ``profiling_orchestrator.build_inner_argv``):
 ``--internal-profiling-run --graph G --engine E --warmup W --iters I
 --seed S [--plugin-path P] [--input-recipe R]
-[--cache-mode rotate --rotate-buffers N]``. The child builds the one
-engine, fills the inputs exactly as the timed pass did, and dispatches
-``W + I`` plain executions (cycling ``N`` independent buffer sets when
-``--cache-mode rotate`` is set so L2/MALL counters match rotated timings
+[--cache-mode rotate --rotate-buffers N] [--knobs-json JSON]``. The child
+builds the one engine, fills the inputs exactly as the timed pass did, and
+dispatches ``W + I`` plain executions (cycling ``N`` independent buffer sets
+when ``--cache-mode rotate`` is set so L2/MALL counters match rotated timings
 without adding extra flush kernels). It prints nothing on success so
 profiler log capture stays clean.
 """
@@ -79,7 +79,12 @@ def run_internal_profiling(args: argparse.Namespace) -> int:
         tensor_infos = loader.extract_tensor_info(graph_json)
 
         executor = Executor(json.dumps(graph_json), policy)
-        executor.prepare(handle, engine_id=engine_id)
+        knobs_json = getattr(args, "knobs_json", None)
+        if knobs_json:
+            knobs = json.loads(knobs_json)
+        else:
+            knobs = getattr(args, "knob", None)
+        executor.prepare(handle, engine_id=engine_id, knobs=knobs)
         # sequence lengths need valid integers, not uniform noise.
         recipe = getattr(args, "input_recipe", "centered")
         if recipe == "centered":

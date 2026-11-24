@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from ..common.exceptions import UnsupportedGraphError
+from ..common.exceptions import ExecutionError, InvalidKnobError, UnsupportedGraphError
 from ..common.pytorch_tuning import apply_pytorch_environment
 from ..common.work_dir import env_switch_on, ootb_state, tuned_state, work_dir
 from ..config.benchmark_config import (
@@ -139,6 +139,17 @@ def run_suite_cli(
         reporter.error(message)
     if missing:
         return 2
+    if config.knob_candidates is not None:
+        from ..execution.knob_sweep import load_knob_candidates
+
+        try:
+            config.parsed_knob_candidates = tuple(
+                load_knob_candidates(config.knob_candidates)
+            )
+        except ExecutionError as e:
+            reporter.error(str(e))
+            return 2
+
     # The runtime's handles are destroyed when ``resources`` closes, on every
     # exit path, while the selection state that ``cli.main`` owns still
     # exists.
@@ -222,6 +233,8 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "seed": config.seed,
         "input_recipe": config.input_recipe,
         "input_recipe_version": INPUT_RECIPE_VERSION,
+        "knobs": dict(config.knobs) if config.knobs else None,
+        "sweep_knobs": config.sweep_knobs,
         "validate": (
             config.validation.provider.value if config.validation.enabled else None
         ),
@@ -264,6 +277,8 @@ def _run_one_graph(graph_path: Path, run_graph: GraphRunner) -> GraphResult:
         loader.validate(graph_json)
         tensor_infos = loader.extract_tensor_info(graph_json)
         return run_graph(graph_path, graph_json, tensor_infos)
+    except InvalidKnobError:
+        raise
     except UnsupportedGraphError as e:
         return GraphResult(
             graph_name=graph_path.stem,
@@ -314,6 +329,7 @@ def _run_suite(
             return False
 
     interrupted: Optional[int] = None
+    invalid_knob: Optional[str] = None
     previous_sigterm = (
         signal.signal(signal.SIGTERM, _raise_terminated)
         if signal.getsignal(signal.SIGTERM) is not None
@@ -332,6 +348,8 @@ def _run_suite(
                 last_write = time.monotonic()
         suite.run.finished_at = _now()
         suite.run.complete = True
+    except InvalidKnobError as e:
+        invalid_knob = str(e)
     except KeyboardInterrupt:
         interrupted = 130
     except _Terminated:
@@ -356,6 +374,9 @@ def _run_suite(
             if previous_sigterm is not None:
                 signal.signal(signal.SIGTERM, previous_sigterm)
 
+    if invalid_knob is not None:
+        reporter.error(invalid_knob)
+        return 2
     if interrupted is not None:
         where = (
             f"partial results in {output_path}"

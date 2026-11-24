@@ -587,7 +587,7 @@ backend or overwrite timed samples. After all OOTB rows of the graph complete
 each pass under the profiler:
 ```text
 python -m dnn_benchmarking --internal-profiling-run --graph G --engine E \
-    --warmup W --iters 5 --seed S [--plugin-path P] [--input-recipe R] [--cache-mode rotate --rotate-buffers N]
+    --warmup W --iters 5 --seed S [--plugin-path P] [--input-recipe R] [--cache-mode rotate --rotate-buffers N] [--knobs-json JSON]
 ```
 
 The child builds one engine, fills the inputs with the same seed and recipe as

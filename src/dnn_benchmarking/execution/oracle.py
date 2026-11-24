@@ -130,6 +130,7 @@ def _hipdnn_tuned_argv(
     save_outputs: bool,
     *,
     rotate_count: int = 1,
+    knobs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Argv of ``cli/hipdnn_tuned_child.py``, with the full timing policy."""
     argv = [
@@ -155,6 +156,8 @@ def _hipdnn_tuned_argv(
         argv.append("--save-outputs")
     if rotate_count > 1:
         argv += ["--rotate-count", str(rotate_count)]
+    if knobs:
+        argv += ["--knobs", json.dumps(knobs)]
     return argv
 
 
@@ -208,6 +211,8 @@ def run_hipdnn_tuned(
             child_extra: Dict[str, Any] = {}
             if rotate_count > 1:
                 child_extra["rotate_count"] = rotate_count
+            if row.knobs:
+                child_extra["knobs"] = row.knobs
             result = _run_hipdnn_tuned_child(
                 graph_path,
                 engine_id,
@@ -254,6 +259,7 @@ def _run_hipdnn_tuned_child(
     save_outputs: bool,
     *,
     rotate_count: int = 1,
+    knobs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run ``cli/hipdnn_tuned_child.py``; return its ``result.json``.
 
@@ -275,6 +281,7 @@ def _run_hipdnn_tuned_child(
         out_dir,
         save_outputs,
         rotate_count=rotate_count,
+        knobs=knobs,
     )
     try:
         proc = run_capped(argv, timeout_s, env=_hipdnn_tuned_env(config, out_dir))

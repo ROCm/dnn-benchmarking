@@ -31,7 +31,12 @@ from typing import (
 )
 
 from ..common import torch_support
-from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..common.exceptions import (
+    ExecutionError,
+    InvalidKnobError,
+    KnobConstraintError,
+    UnsupportedGraphError,
+)
 from ..config.benchmark_config import (
     AiterRows,
     PyTorchSdpaBackendName,
@@ -46,6 +51,7 @@ from ..execution.buffer_manager import (
     input_fingerprint,
 )
 from ..execution.executor import Executor
+from ..execution.knob_sweep import enumerate_candidates
 from ..execution.timing import (
     MIXED_MODE_RERUN_REASON,
     STALL_RERUN_REASON,
@@ -733,6 +739,10 @@ def run_single_provider_engine(
     engine_name: str,
     engine_version: str,
     plugin_path: Optional[Path],
+    *,
+    knobs: Optional[Dict[str, Any]] = None,
+    strict_knobs: bool = False,
+    knob_errors_fatal: bool = False,
 ) -> ProviderEngineResult:
     """Build, time and validate one hipDNN engine; then its tuned run in a child."""
     config = ctx.config
@@ -744,14 +754,34 @@ def run_single_provider_engine(
         status="success",
         engine_version=engine_version,
         plugin_path=plugin,
+        knobs=dict(knobs) if knobs else None,
     )
     memory_at_start = _gpu_memory_at_row_start()
     try:
+        effective_knobs = dict(knobs) if knobs else None
+        if effective_knobs and strict_knobs and knob_errors_fatal:
+            validator = Executor(ctx.graph_json_str, config.timing_policy)
+            effective_knobs = validator.validate_knobs(
+                handle, engine_id, effective_knobs
+            )
+            row.knobs = dict(effective_knobs)
         # Absorb the engine's one-time build costs (provider setup, cold
         # plugin and kernel file reads) before the timed build.
         primer.prime(handle, ctx.graph_json_str, config.timing_policy, engine_id)
         executor = Executor(ctx.graph_json_str, config.timing_policy)
-        executor.prepare(handle, engine_id=engine_id)
+        if effective_knobs:
+            executor.prepare(
+                handle,
+                engine_id=engine_id,
+                knobs=effective_knobs,
+                strict_knobs=strict_knobs,
+            )
+            validated = getattr(executor, "validated_knobs", None)
+            if validated:
+                row.knobs = dict(validated)
+        else:
+            executor.prepare(handle, engine_id=engine_id)
+        row.plan_name = getattr(executor, "plan_name", None)
         row.ootb.cpu_build_time_ms = executor.build_time_ms
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
@@ -796,6 +826,12 @@ def run_single_provider_engine(
         del executor
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
+    except KnobConstraintError as e:
+        return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
+    except InvalidKnobError as e:
+        if knob_errors_fatal:
+            raise
+        return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except UnsupportedGraphError as e:
         return _failed_row(ProviderEngineResult.skipped_row, row, str(e))
     except Exception as e:
@@ -1050,6 +1086,8 @@ def _run_profiling(
                 and row.ootb.timing.rotated_buffers > 1
             ):
                 prof_extra["rotate_buffers"] = row.ootb.timing.rotated_buffers
+            if row.knobs:
+                prof_extra["knobs"] = row.knobs
             extra = run_profiling_passes(
                 graph_path=ctx.graph_path,
                 engine_id=engine_id,
@@ -1507,8 +1545,11 @@ def hipdnn_planner(handle: Any, prime_once: bool = False) -> GraphPlanner:
             "hipdnn",
             engine_ids=engine_ids,
             rows=lambda ctx: [
-                _run_engine_selection(ctx, handle, primer, s.engine_id, s.plugin_path)
+                row
                 for s in selections
+                for row in _run_engine_selection(
+                    ctx, handle, primer, s.engine_id, s.plugin_path
+                )
             ],
             message=message,
             needs_inputs=True,
@@ -1523,8 +1564,8 @@ def _run_engine_selection(
     primer: EnginePrimer,
     engine_id: int,
     plugin_path: Optional[Path],
-) -> ProviderEngineResult:
-    """One engine row, creating a plugin-scoped handle when none is shared."""
+) -> List[ProviderEngineResult]:
+    """Run one engine selection (plus candidate-tuple sweep rows when requested)."""
     if handle is None:
         try:
             import hipdnn_frontend as hipdnn
@@ -1533,25 +1574,97 @@ def _run_engine_selection(
             handle = hipdnn.Handle()
         except Exception as e:
             label = engine_id_hex(engine_id) or ""
-            return _report_row(
+            return [
+                _report_row(
+                    ctx.reporter,
+                    label,
+                    lambda: ProviderEngineResult.error_row(
+                        "hipdnn",
+                        engine_id,
+                        f"{type(e).__name__}: {e}",
+                        engine_name=label,
+                        plugin_path=str(plugin_path) if plugin_path else None,
+                    ),
+                )
+            ]
+    name, version = _engine_identity(handle, engine_id)
+    if not ctx.config.sweep_knobs:
+        knobs = ctx.config.knobs
+        return [
+            _report_row(
                 ctx.reporter,
-                label,
+                name,
+                lambda: run_single_provider_engine(
+                    ctx,
+                    handle,
+                    primer,
+                    engine_id,
+                    name,
+                    version,
+                    plugin_path,
+                    knobs=knobs,
+                    strict_knobs=bool(knobs),
+                    knob_errors_fatal=bool(knobs),
+                ),
+            )
+        ]
+
+    # --sweep-knobs: measure the unpinned baseline first, then each exact
+    # candidate tuple discovered for this engine on this graph.
+    rows: List[ProviderEngineResult] = [
+        _report_row(
+            ctx.reporter,
+            name,
+            lambda: run_single_provider_engine(
+                ctx, handle, primer, engine_id, name, version, plugin_path
+            ),
+        )
+    ]
+    try:
+        candidates = enumerate_candidates(
+            graph_path=ctx.graph_path,
+            engine_name=name,
+            plugin_path=plugin_path,
+            engine_id=engine_id,
+            candidates_file=ctx.config.knob_candidates,
+            preloaded_candidates=ctx.config.parsed_knob_candidates,
+        )
+    except Exception as e:
+        rows.append(
+            _report_row(
+                ctx.reporter,
+                f"{name}[sweep]",
                 lambda: ProviderEngineResult.error_row(
                     "hipdnn",
                     engine_id,
                     f"{type(e).__name__}: {e}",
-                    engine_name=label,
+                    engine_name=f"{name}[sweep]",
                     plugin_path=str(plugin_path) if plugin_path else None,
                 ),
             )
-    name, version = _engine_identity(handle, engine_id)
-    return _report_row(
-        ctx.reporter,
-        name,
-        lambda: run_single_provider_engine(
-            ctx, handle, primer, engine_id, name, version, plugin_path
-        ),
-    )
+        )
+        return rows
+
+    for cand in candidates:
+        label = f"{name}[{cand.candidate_id}]"
+        rows.append(
+            _report_row(
+                ctx.reporter,
+                label,
+                lambda c=cand, lbl=label: run_single_provider_engine(
+                    ctx,
+                    handle,
+                    primer,
+                    engine_id,
+                    lbl,
+                    version,
+                    plugin_path,
+                    knobs=c.knobs,
+                    strict_knobs=True,
+                ),
+            )
+        )
+    return rows
 
 
 def pytorch_plan(

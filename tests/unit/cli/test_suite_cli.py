@@ -526,6 +526,8 @@ def test_run_config_records_effective_values_that_compare_checks(
         "seed": 7,
         "input_recipe": "centered",
         "input_recipe_version": 1,
+        "knobs": None,
+        "sweep_knobs": False,
         "validate": "pytorch",
         "rtol": None,
         "atol": None,

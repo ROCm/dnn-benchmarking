@@ -37,6 +37,8 @@ runtime = "hipdnn"   # "hipdnn" or "pytorch"
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
 autotune = false     # benchmark candidate kernels and cache the winner
+sweep_knobs = false  # sweep exact candidate knob tuples for explicit engines
+# knob_candidates = "/tmp/candidates.json"  # exact candidate tuples for sweep_knobs
 # runs that do not tune, fast included, kept) and tuned/ (the same for
 # autotune and oracle tuned runs, kept). Default: $DNN_BENCH_WORKSPACE/work,
 # else $XDG_CACHE_HOME/dnn-benchmark/work, else a directory in the system

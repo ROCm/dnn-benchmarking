@@ -185,6 +185,37 @@ def _parse_tag(s: str) -> str:
     return f"{key}={value}"
 
 
+def _parse_knob_value(raw: str) -> Any:
+    """Parse a knob value string as int, float, or str."""
+    text = raw.strip()
+    if re.fullmatch(r"[+-]?\d+", text):
+        return int(text)
+    try:
+        value = float(text)
+        if math.isfinite(value):
+            return value
+    except ValueError:
+        pass
+    return text
+
+
+def parse_knob_list(s: str) -> Dict[str, Any]:
+    """Parse ``--knob`` as a comma list of ``KEY=VALUE`` pairs."""
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("requires at least one KEY=VALUE pair")
+    knobs: Dict[str, Any] = {}
+    for part in parts:
+        if "=" not in part:
+            raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {part!r}")
+        key, raw = part.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise argparse.ArgumentTypeError(f"empty knob name in {part!r}")
+        knobs[key] = _parse_knob_value(raw)
+    return knobs
+
+
 def _bool_option(
     flags: tuple[str, ...], dest: str, group: str, cls: type, field: str, help: str
 ) -> CliOption:
@@ -383,6 +414,36 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         metavar="ENGINES",
         help="comma list of engine names, decimal IDs or 0x hex IDs, run in order "
         "(default: all discovered)",
+    ),
+    CliOption(
+        flags=("--knob",),
+        dest="knob",
+        group="Runtime/Selection",
+        parser_type=parse_knob_list,
+        default=None,
+        metavar="KEY=VAL[,...]",
+        help="comma list of explicit hipDNN knob settings (requires --engine); "
+        "validated strictly against the engine's exposed knobs",
+    ),
+    _bool_option(
+        ("--sweep-knobs",),
+        "sweep_knobs",
+        "Runtime/Selection",
+        SuiteConfig,
+        "sweep_knobs",
+        "benchmark the unpinned baseline plus every exact candidate knob tuple "
+        "for each --engine (requires --engine; uses candidate enumeration or "
+        "--knob-candidates)",
+    ),
+    CliOption(
+        flags=("--knob-candidates",),
+        dest="knob_candidates",
+        group="Runtime/Selection",
+        parser_type=Path,
+        metavar="PATH",
+        help="JSON file listing exact candidate knob-tuple objects for --sweep-knobs",
+        config_key="knob_candidates",
+        config_kind=ConfigKind.PATH,
     ),
     CliOption(
         flags=("--plugin-path",),
@@ -771,7 +832,14 @@ def create_parser(*, suppress_defaults: bool = False) -> argparse.ArgumentParser
         default=False,
         help=argparse.SUPPRESS,
     )
-    # Hidden: the --oracle tuned-PyTorch child of a graph that the parent
+    # Hidden: typed knob dict passed as JSON to --internal-profiling-run so
+    # string/bool/int/float types never mutate through K=V text re-parsing.
+    parser.add_argument(
+        "--knobs-json",
+        dest="knobs_json",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     # remeasured after a stall-gate failure times unstalled too.
     parser.add_argument(
         "--no-stall-gate",

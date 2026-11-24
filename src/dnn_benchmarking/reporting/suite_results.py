@@ -48,6 +48,8 @@ RUN_CONFIG_KEYS = (
     "seed",
     "input_recipe",
     "input_recipe_version",
+    "knobs",
+    "sweep_knobs",
     "validate",
     "rtol",
     "atol",
@@ -390,6 +392,8 @@ class ProviderEngineResult:
     oracle_error: Optional[str] = None
     clocks_after: Optional[Dict[str, Any]] = None
     engine_name: Optional[str] = None
+    plan_name: Optional[str] = None
+    knobs: Optional[Dict[str, Any]] = None
     flops_formula_version: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -486,6 +490,8 @@ class ProviderEngineResult:
                 ),
                 "name": self.engine_name,
                 "version": self.engine_version,
+                "plan_name": self.plan_name,
+                "knobs": self.knobs,
             },
             "status": self.status,
             "verdict": self.verdict,

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from dnn_benchmarking.cli import hipdnn_tuned_child, suite_runner_cli
+from dnn_benchmarking.cli.parser import parse_knob_list
 from dnn_benchmarking.config.benchmark_config import (
     INPUT_RECIPE_CHOICES,
     SuiteConfig,
@@ -27,6 +28,10 @@ from dnn_benchmarking.execution.buffer_manager import (
     input_fingerprint,
 )
 from dnn_benchmarking.execution.correctness import check_correctness
+from dnn_benchmarking.execution.knob_sweep import (
+    load_knob_candidates,
+    validate_knobs_strict,
+)
 from dnn_benchmarking.execution.sdpa_graph import DenseSdpa
 from dnn_benchmarking.graph.tensor_info import TensorInfo
 from dnn_benchmarking.metrics import gpu_smi
@@ -116,7 +121,7 @@ def _write_suite(tmp_path: Path, fname: str, graphs, **cfg) -> str:
     return str(out)
 
 
-# --- P0: Compare compatibility, validation loopholes, and exact thresholds ---
+# --- Compare compatibility, validation completeness, and exact thresholds ---
 
 
 def test_compare_excludes_mixed_timing_modes_by_default(tmp_path, capsys) -> None:
@@ -285,7 +290,7 @@ def test_reporter_refuses_vs_best_across_mixed_modes() -> None:
     assert "1.00x" not in text
 
 
-# --- P1: AITER guards, AMD SMI handle/in-run telemetry, signal restore, fresh oracle ---
+# --- AITER guards, AMD SMI handle/in-run telemetry, signal restore, fresh oracle ---
 
 
 def _sdpa(**kw) -> DenseSdpa:
@@ -570,7 +575,7 @@ def test_signal_restore_skips_native_none_handlers(tmp_path, monkeypatch) -> Non
     assert calls == []
 
 
-# --- Analytical FLOPs and timer resolution warnings ---
+# --- Cache modes, input recipes, and strict knob validation ---
 
 
 def test_flush_bytes_for_arch_and_rotate_policy() -> None:
@@ -621,6 +626,43 @@ def test_all_input_recipes_finite_deterministic_and_fingerprinted(recipe) -> Non
     mutated = {k: v.copy() for k, v in d1.items()}
     mutated[1].reshape(-1)[0] = np.float16(float(mutated[1].reshape(-1)[0]) + 1.0)
     assert input_fingerprint(mutated, recipe, 42) != fp1
+
+
+def test_knob_parsing_strict_validation_and_candidate_file(tmp_path) -> None:
+    from dnn_benchmarking.common.exceptions import InvalidKnobError, KnobConstraintError
+
+    assert parse_knob_list("block_m=256,scale=1.5,mode=fast") == {
+        "block_m": 256,
+        "scale": 1.5,
+        "mode": "fast",
+    }
+
+    knob = types.SimpleNamespace(
+        knob_id="block_m",
+        value_type="INT64",
+        constraint=types.SimpleNamespace(valid_values=[64, 128, 256]),
+    )
+    assert validate_knobs_strict([knob], {"block_m": 128}) == {"block_m": 128}
+    # Unknown knob ID and wrong type raise base InvalidKnobError (fatal), not KnobConstraintError.
+    with pytest.raises(InvalidKnobError, match="not exposed") as exc_unknown:
+        validate_knobs_strict([knob], {"unknown_knob": 1})
+    assert not isinstance(exc_unknown.value, KnobConstraintError)
+    with pytest.raises(InvalidKnobError, match="integer") as exc_type:
+        validate_knobs_strict([knob], {"block_m": "not_an_int"})
+    assert not isinstance(exc_type.value, KnobConstraintError)
+    # Per-graph constraint failure raises KnobConstraintError (non-fatal skip).
+    with pytest.raises(KnobConstraintError, match="allowed values"):
+        validate_knobs_strict([knob], {"block_m": 32})
+
+    cfile = tmp_path / "cands.json"
+    cfile.write_text(
+        json.dumps([{"id": "t1", "knobs": {"block_m": 128}}, {"block_m": 256}])
+    )
+    cands = load_knob_candidates(cfile)
+    assert [(c.candidate_id, c.knobs) for c in cands] == [
+        ("t1", {"block_m": 128}),
+        ("block_m=256", {"block_m": 256}),
+    ]
 
 
 # --- Analytical FLOPs and timer resolution warnings ---
@@ -865,17 +907,19 @@ def test_hipdnn_tuned_child_rotates_buffers_and_forwards_recipe(
         out_dir,
         False,
         rotate_count=3,
+        knobs={"block_m": 128},
     )
     assert "--rotate-count" in argv and argv[argv.index("--rotate-count") + 1] == "3"
+    assert "--knobs" in argv
 
     rc = hipdnn_tuned_child.main(argv[3:])
     assert rc == 0
-    assert seen["knobs"] == {oracle.BENCHMARKING_KNOB: 1}
+    assert seen["knobs"] == {"block_m": 128, oracle.BENCHMARKING_KNOB: 1}
     assert len(seen["variant_packs"]) == 3
     assert seen["rotated_bytes"] == 3 * 32  # 2 tensors * 4 floats * 4 bytes each
 
 
-def test_profiling_orchestrator_forwards_input_recipe_and_rotate_buffers(
+def test_profiling_orchestrator_forwards_recipe_rotate_and_typed_knobs(
     tmp_path, monkeypatch
 ) -> None:
     import sys
@@ -885,11 +929,20 @@ def test_profiling_orchestrator_forwards_input_recipe_and_rotate_buffers(
 
     default_argv = build_inner_argv(Path("/g.json"), 1, 0, 2, 5, None)
     assert (
-        "--input-recipe" not in default_argv and "--rotate-buffers" not in default_argv
+        "--input-recipe" not in default_argv
+        and "--rotate-buffers" not in default_argv
+        and "--knobs-json" not in default_argv
     )
 
     gpath = tmp_path / "g.json"
     gpath.write_text(json.dumps(_MINIMAL_GRAPH))
+    typed_knobs = {
+        "block_m": 128,
+        "str_num": "128",
+        "csv_opt": "a,b",
+        "flag": True,
+        "ratio": 1.5,
+    }
     argv = build_inner_argv(
         gpath,
         1,
@@ -899,15 +952,18 @@ def test_profiling_orchestrator_forwards_input_recipe_and_rotate_buffers(
         None,
         input_recipe="llm",
         rotate_buffers=4,
+        knobs=typed_knobs,
     )
     parsed = create_parser().parse_args(argv[3:])
     assert parsed.input_recipe == "llm"
     assert parsed.cache_mode == "rotate"
     assert parsed.rotate_buffers == 4
+    assert json.loads(parsed.knobs_json) == typed_knobs
 
-    # Verify run_internal_profiling allocates 4 BufferManagers and cycles all 4
-    # variant packs across warmup + iters enqueues without extra flush kernels.
+    # Verify run_internal_profiling allocates 4 BufferManagers, applies typed
+    # knobs, and cycles all 4 variant packs across warmup + iters enqueues.
     enqueued: List[Any] = []
+    seen_knobs: Dict[str, Any] = {}
     bm_count = {"n": 0}
 
     class FakeExec:
@@ -915,7 +971,7 @@ def test_profiling_orchestrator_forwards_input_recipe_and_rotate_buffers(
             pass
 
         def prepare(self, handle, *, engine_id=None, knobs=None):
-            pass
+            seen_knobs["knobs"] = knobs
 
         def enqueue(self, handle, vp):
             enqueued.append(vp["pack"])
@@ -954,6 +1010,7 @@ def test_profiling_orchestrator_forwards_input_recipe_and_rotate_buffers(
 
     rc = internal_profiling.run_internal_profiling(parsed)
     assert rc == 0
+    assert seen_knobs["knobs"] == typed_knobs
     assert bm_count["n"] == 4
     assert enqueued == [1, 2, 3, 4, 1]
 
@@ -1030,6 +1087,205 @@ def test_compare_treats_missing_input_recipe_as_legacy_across_schemas(
 
     assert compare.main([str(a_path), b_centered]) == 2
     assert "input_recipe" in capsys.readouterr().err
+
+
+def test_invalid_knob_and_bad_candidates_exit_2_through_real_runner(
+    tmp_path, monkeypatch
+) -> None:
+    """Unknown user --knob exits 2 through run_single_provider_engine -> _run_suite; unreadable candidates exits 2 at startup."""
+    from dnn_benchmarking.cli.parser import create_parser
+    from dnn_benchmarking.common.exceptions import InvalidKnobError
+    from dnn_benchmarking.execution import executor as exec_mod
+
+    gpath = tmp_path / "g.json"
+    gpath.write_text(json.dumps(_MINIMAL_GRAPH))
+
+    # Unreadable --knob-candidates exits 2 at run_suite_cli startup before running graphs.
+    bad_cands = tmp_path / "missing.json"
+    args = create_parser().parse_args(
+        [
+            "-g",
+            str(gpath),
+            "-e",
+            "1",
+            "--sweep-knobs",
+            "--knob-candidates",
+            str(bad_cands),
+        ]
+    )
+    rc = suite_runner_cli.run_suite_cli(args, [gpath], Reporter(quiet=True))
+    assert rc == 2
+
+    # Real call path: _run_suite -> run_graph -> _run_engine_selection -> run_single_provider_engine -> Executor.validate_knobs.
+    monkeypatch.setattr(
+        suite_runner_cli, "_arm_sigterm_watchdog", lambda: (lambda: None)
+    )
+    monkeypatch.setattr(
+        suite_runner_cli, "collect_environment_info", lambda: {"gpu_arch": "gfx90a"}
+    )
+    monkeypatch.setattr(suite_runner, "_engine_identity", lambda h, eid: ("ENG", "1.0"))
+
+    class RejectingExecutor:
+        def __init__(self, *a, **kw):
+            pass
+
+        def validate_knobs(self, handle, engine_id, knobs):
+            raise InvalidKnobError("Knob 'bogus' is not exposed by this engine")
+
+    monkeypatch.setattr(suite_runner, "Executor", RejectingExecutor)
+    monkeypatch.setattr(exec_mod, "Executor", RejectingExecutor)
+
+    cfg = SuiteConfig(
+        engine_filter=[1],
+        knobs={"bogus": 1},
+        warmup_iters=1,
+        benchmark_iters=1,
+    )
+    planner = lambda gp, gj, ti, c, rep: suite_runner.RuntimePlan(
+        "hipdnn",
+        engine_ids=[1],
+        rows=lambda ctx: suite_runner._run_engine_selection(
+            ctx, object(), suite_runner.EnginePrimer(), 1, None
+        ),
+        needs_inputs=True,
+    )
+    rc2 = suite_runner_cli._run_suite(
+        [gpath],
+        cfg,
+        lambda p, gj, ti: suite_runner.run_graph(
+            p, gj, ti, cfg, Reporter(quiet=True), [planner]
+        ),
+        None,
+        Reporter(quiet=True),
+        ["dnn-benchmark"],
+    )
+    assert rc2 == 2
+
+
+def test_per_graph_knob_constraint_skips_only_affected_graph(
+    tmp_path, monkeypatch
+) -> None:
+    """Out-of-range --knob skips only the constrained graph and keeps running subsequent graphs (exit 0)."""
+    from dnn_benchmarking.common.exceptions import KnobConstraintError
+
+    g1 = tmp_path / "g1.json"
+    g2 = tmp_path / "g2.json"
+    g3 = tmp_path / "g3.json"
+    for name, p in [("g1", g1), ("g2", g2), ("g3", g3)]:
+        p.write_text(json.dumps({**_MINIMAL_GRAPH, "name": name}))
+
+    monkeypatch.setattr(
+        suite_runner_cli, "_arm_sigterm_watchdog", lambda: (lambda: None)
+    )
+    monkeypatch.setattr(
+        suite_runner_cli, "collect_environment_info", lambda: {"gpu_arch": "gfx90a"}
+    )
+    monkeypatch.setattr(suite_runner, "_engine_identity", lambda h, eid: ("ENG", "1.0"))
+
+    class PerGraphLimitExecutor:
+        build_time_ms = 1.0
+        workspace_size = 0
+        plan_name = "p0"
+        validated_knobs = {"global.workspace_size_limit": 100000}
+
+        def __init__(self, graph_json_str, *a, **kw):
+            self._name = json.loads(graph_json_str)["name"]
+
+        def validate_knobs(self, handle, engine_id, knobs):
+            if self._name == "g2":
+                raise KnobConstraintError(
+                    "Knob 'global.workspace_size_limit'=100000 exceeds maximum 1800"
+                )
+            return dict(knobs)
+
+        def prime(self, *a, **kw):
+            pass
+
+        def prepare(self, *a, **kw):
+            pass
+
+        def benchmark(self, *a, **kw):
+            return timing.Measurement([0.5], [0.1], "staged", "hip", "warm", 1, 0.5)
+
+        def execute_once(self, *a, **kw):
+            pass
+
+    class FakeBM:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def allocate_all(self):
+            pass
+
+        def load_input_data(self, data):
+            pass
+
+        def zero_outputs(self):
+            pass
+
+        def create_variant_pack(self):
+            return {}
+
+    monkeypatch.setattr(suite_runner, "Executor", PerGraphLimitExecutor)
+    monkeypatch.setattr(suite_runner, "BufferManager", FakeBM)
+
+    cfg = SuiteConfig(
+        engine_filter=[1],
+        knobs={"global.workspace_size_limit": 100000},
+        warmup_iters=1,
+        benchmark_iters=1,
+    )
+    planner = lambda gp, gj, ti, c, rep: suite_runner.RuntimePlan(
+        "hipdnn",
+        engine_ids=[1],
+        rows=lambda ctx: suite_runner._run_engine_selection(
+            ctx, object(), suite_runner.EnginePrimer(), 1, None
+        ),
+        needs_inputs=True,
+    )
+    out_file = tmp_path / "out.json"
+    rc = suite_runner_cli._run_suite(
+        [g1, g2, g3],
+        cfg,
+        lambda p, gj, ti: suite_runner.run_graph(
+            p, gj, ti, cfg, Reporter(quiet=True), [planner]
+        ),
+        out_file,
+        Reporter(quiet=True),
+        ["dnn-benchmark"],
+    )
+    assert rc == 0
+    doc = json.loads(out_file.read_text())
+    assert doc["run"]["complete"] is True
+    statuses = [g["results"][0]["status"] for g in doc["graphs"]]
+    assert statuses == ["success", "skipped", "success"]
+
+
+def test_unsupported_graph_with_knob_is_skipped_not_error(monkeypatch) -> None:
+    """When get_knobs_for_engine raises RuntimeError for an inapplicable engine, the row is skipped."""
+    from dnn_benchmarking.common.exceptions import UnsupportedGraphError
+    from dnn_benchmarking.execution.executor import Executor
+
+    ex = Executor.__new__(Executor)
+    ex._graph = types.SimpleNamespace(
+        get_knobs_for_engine=lambda eid: (_ for _ in ()).throw(
+            RuntimeError("Failed to get knobs for engine: Failed to finalize")
+        )
+    )
+    ex._build_through_operation_graph = lambda h: None
+    with pytest.raises(UnsupportedGraphError, match="not applicable"):
+        ex.validate_knobs(object(), 1, {"global.benchmarking": 1})
+
+
+def test_suite_config_rejects_combining_knob_and_sweep_knobs() -> None:
+    with pytest.raises(ValueError, match="--knob"):
+        SuiteConfig(engine_filter=[1], knobs={"a": 1}, sweep_knobs=True)
 
 
 def test_setup_env_sets_dvc_global_config_dir(tmp_path, monkeypatch) -> None:
@@ -1284,6 +1540,60 @@ def test_cold_flush_truthfully_labels_zero_fill_fallback(monkeypatch) -> None:
     method, nbytes = timing._flush_cache("hip", 0)
     timing.release_flush_buffers()
     assert method == "zero_fill" and nbytes == 4096 and zero_calls["n"] == 1
+
+
+def test_executor_strict_knobs_rejects_before_create_plan() -> None:
+    """Executor._build_plan rejects invalid knobs strictly before calling create_execution_plan_ext."""
+    from dnn_benchmarking.common.exceptions import InvalidKnobError
+    from dnn_benchmarking.execution.executor import Executor
+
+    called = {"create": False}
+    knob = types.SimpleNamespace(
+        knob_id="valid_knob", value_type="INT64", constraint=None
+    )
+    ex = Executor.__new__(Executor)
+    ex._graph = types.SimpleNamespace(
+        get_knobs_for_engine=lambda eid: [knob],
+        create_execution_plan_ext=lambda eid, s: called.update(create=True),
+    )
+    fake_hipdnn = types.SimpleNamespace(KnobSetting=lambda k, v: (k, v))
+    with pytest.raises(InvalidKnobError, match="not exposed"):
+        ex._build_plan(fake_hipdnn, 1, {"bogus": 7}, strict_knobs=True)
+    assert called["create"] is False
+
+
+def test_sweep_knobs_emits_baseline_and_candidate_rows(monkeypatch) -> None:
+    """_run_engine_selection runs unpinned baseline then each exact candidate tuple."""
+    from dnn_benchmarking.execution.knob_sweep import KnobCandidate
+
+    cfg = SuiteConfig(sweep_knobs=True, engine_filter=[1])
+    cfg.parsed_knob_candidates = (
+        KnobCandidate("c0", {"block_m": 64}),
+        KnobCandidate("c1", {"block_m": 128}),
+    )
+    ctx = suite_runner._GraphContext(
+        graph_path=Path("g.json"),
+        graph_json=_MINIMAL_GRAPH,
+        graph_name="g",
+        tensor_infos=[],
+        config=cfg,
+        reporter=Reporter(quiet=True),
+        input_data={},
+    )
+    monkeypatch.setattr(suite_runner, "_engine_identity", lambda h, eid: ("ENG", "1.0"))
+
+    def fake_single(ctx, handle, primer, eid, name, ver, ppath, *, knobs=None, **kw):
+        r = _row(name, 0.1)
+        r.knobs = dict(knobs) if knobs else None
+        return r
+
+    monkeypatch.setattr(suite_runner, "run_single_provider_engine", fake_single)
+    rows = suite_runner._run_engine_selection(ctx, object(), object(), 1, None)
+    assert [(r.engine_name, r.knobs) for r in rows] == [
+        ("ENG", None),
+        ("ENG[c0]", {"block_m": 64}),
+        ("ENG[c1]", {"block_m": 128}),
+    ]
 
 
 def test_rocke_passes_after_iteration_scratch_release(monkeypatch) -> None:
