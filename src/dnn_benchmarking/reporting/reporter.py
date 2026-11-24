@@ -141,6 +141,23 @@ def _oracle_state(pe: ProviderEngineResult) -> Optional[str]:
     return "n/a"
 
 
+def _dispatch_lines(dispatch: Optional[Dict[str, Any]]) -> List[str]:
+    """The SDPA backend and the GPU kernels that a PyTorch plan ran."""
+    if dispatch is None:
+        return []
+    lines = []
+    backend = dispatch["sdpa_backend"]
+    if backend is not None:
+        library = dispatch["fa_library"]
+        lines.append(f"sdpa {backend}" + (f" ({library})" if library else ""))
+    kernels = dispatch["kernels"]
+    if kernels is None:
+        lines.append("kernels not recorded")
+    else:
+        lines.extend(f"kernel {name}" for name in kernels)
+    return lines
+
+
 class Reporter:
     """Formats benchmark progress and results for the console."""
 
@@ -595,6 +612,8 @@ class Reporter:
             add("metrics", metrics)
         if pe.ootb.correctness is not None and pe.role == "engine":
             add("correctness", self._correctness_text(pe))
+        for line in _dispatch_lines(pe.ootb.dispatch):
+            add("dispatch", line)
         for line in self._oracle_lines(pe):
             add("oracle", line)
         for line in self._profiling_lines(pe.extra_metrics or {}):
@@ -702,6 +721,7 @@ class Reporter:
             )
         if o.derived_tflops_per_s is not None:
             lines.append(f"throughput {o.derived_tflops_per_s:.3f} TFLOP/s tuned")
+        lines.extend(f"dispatch: {line}" for line in _dispatch_lines(o.dispatch))
         return lines
 
     @staticmethod

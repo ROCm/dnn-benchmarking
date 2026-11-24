@@ -63,6 +63,7 @@ from ..validation import ReferenceOutput, ReferenceProvider, ReferenceProviderRe
 from .aiter_sdpa import AiterBackend, AiterDevice, aiter_problem, backend_rows
 from .correctness import check_correctness, check_rng_dump, mismatch, unchecked
 from .oracle import run_hipdnn_tuned, run_pytorch_tuned
+from .pytorch_dispatch import DISPATCH_NOT_RECORDED
 from .rocke_sdpa import (
     Catalog,
     RockeKernel,
@@ -506,6 +507,8 @@ def _time_pytorch_row(
             tensors = bm.get_tensors()
             _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             row.warnings = (row.warnings or []) + executor.notes
+            if config.pytorch_dispatch:
+                _record_dispatch(row, ctx, executor)
             if role == "reference":
                 stage = "reference"
                 bm.zero_outputs()
@@ -542,6 +545,29 @@ def _time_pytorch_row(
         message = _failure_message(e, memory_at_start)
         return _failed_pytorch_row(row, fatal, message, role, stage), None
     return row, outputs
+
+
+def _record_dispatch(
+    row: ProviderEngineResult, ctx: _GraphContext, executor: Any
+) -> None:
+    """Set ``row.ootb.dispatch`` from one profiled launch; never fails the row.
+
+    A failed capture leaves ``dispatch`` null; a trace without GPU kernels
+    leaves ``dispatch.kernels`` null. Each adds a row warning.
+    """
+    try:
+        dispatch = executor.capture_dispatch()
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+    else:
+        row.ootb.dispatch = dispatch
+        if dispatch["kernels"]:
+            return
+        dispatch["kernels"] = None
+        reason = "the profiler saw no GPU kernel"
+    warning = f"{DISPATCH_NOT_RECORDED}: {reason}"
+    warn_once("dispatch", f"{ctx.graph_name}: {warning}")
+    row.warnings = (row.warnings or []) + [warning]
 
 
 class EnginePrimer:

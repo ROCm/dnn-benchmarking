@@ -5,7 +5,8 @@
 
 The source of truth is `src/dnn_benchmarking/reporting/suite_results.py`. The
 key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
-`ENVIRONMENT_KEYS`, `END_OF_RUN_KEYS`, `ROW_COLUMNS`) list the keys below.
+`DISPATCH_KEYS`, `ENVIRONMENT_KEYS`, `END_OF_RUN_KEYS`, `ROW_COLUMNS`) list
+the keys below.
 
 ## General rules
 
@@ -73,6 +74,7 @@ key tuples in that module (`RUN_CONFIG_KEYS`, `PROFILING_KEYS`,
 | `fast` | bool | `--fast`. Do not compare the numbers of a `--fast` run with a run without it; see [usage.md](usage.md#fast-mode---fast). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
+| `pytorch_dispatch` | bool or null | `--pytorch-dispatch`: PyTorch plans record [dispatch](#dispatch). `null` unless PyTorch is selected. Files written before this key do not have it; read it as `null`. |
 | `aiter_rows` | string or null | `all` for `--runtime aiter`, `auto` for `--runtime aiter:auto`. `null` unless AITER is selected. |
 | `metrics` | bool | `--metrics`: the always-on probes ran. |
 | `profiling` | object | Requested profiling passes: `pmc` (set name or null), `trace` (bool), `perf` (bool), `roofline` (bool). |
@@ -167,10 +169,12 @@ NaN or infinity has no `graph_id`, and its `status` is `error`.
 |3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it.|
 |2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
 
-All other keys are the same in versions 2 and 3. `dnn-benchmark compare`
-joins a version 2 file and a version 3 file on `graph_name`. It does not
-pair a `graph_name` that occurs more than once in either file, and reports
-that name as ambiguous. See [usage.md](usage.md#compare).
+All other keys are the same in versions 2 and 3. One exception: files
+written before `run.config.pytorch_dispatch` and the plan key `dispatch` were
+added do not have them. Read them as `null`. `dnn-benchmark compare` joins a
+version 2 file and a version 3 file on `graph_name`. It does not pair a
+`graph_name` that occurs more than once in either file, and reports that name
+as ambiguous. See [usage.md](usage.md#compare).
 
 ## row
 
@@ -219,6 +223,7 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | `tflops` | float or null | `metrics.flops / kernel.median_ms`, in 10^12 FLOP/s. |
 | `gbps` | float or null | `metrics.io_bytes / kernel.median_ms`, in 10^9 bytes/s. |
 | `correctness` | object or null | See [correctness](#correctness). `null` when validation did not run. |
+| `dispatch` | object or null | PyTorch rows with `--pytorch-dispatch`: the SDPA backend and the GPU kernels that the plan ran. See [dispatch](#dispatch). `null` without `--pytorch-dispatch`, on hipDNN, rocKE and AITER rows, and when the capture failed (the row then has a warning). Files written before this key do not have it; read it as `null`. |
 
 ### timing
 
@@ -281,6 +286,20 @@ amdsmi values of `environment` are `null`, and a warning gives the reason.
 | `temp_hotspot_c` | Hotspot temperature, degrees C. |
 | `throttle_status` | Throttle status bit field. `0` means no throttle. |
 
+### dispatch
+
+With `--pytorch-dispatch`, a PyTorch plan records what one untimed launch of
+its timed path ran. The launch runs after the timed loop and outside it. See
+[methodology.md](methodology.md#pytorch-dispatch-record). In `oracle`, the
+tuned child process recorded the object with the tuned state, so tuning
+(MIOpen find, TunableOp) can show other kernels there.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `sdpa_backend` | string or null | The PyTorch SDPA backend that the launch called: `flash`, `efficient`, `math`, `cudnn` or `overrideable`. With `--pytorch-sdpa-backend default`, this is the choice of the PyTorch dispatcher. `null` when the launch called no PyTorch SDPA op: the graph has no SDPA node, or the tool computes the attention with its own formula (for example the backward formula of an ALiBi graph). When SDPA calls used different backends, the names are joined with `,` in the order of the first call. |
+| `fa_library` | string or null | The preferred ROCm Flash Attention library, `aotriton` or `ck`, when `sdpa_backend` includes `flash` on a ROCm build. `--pytorch-rocm-fa-library` sets it; else `torch.backends.cuda.preferred_rocm_fa_library()` gives it, and its `default` value is `aotriton`. PyTorch can use another library for an operation that the preferred library does not implement: `kernels` shows what ran. `null` otherwise. |
+| `kernels` | array of string or null | The distinct GPU kernel names of the launch, in the order of the first launch of each. Input fills, warmup launches, cache flushes, copies and the setup of the first call are not included. `null` when the profiler recorded no kernel (the row then has a warning). |
+
 ### correctness
 
 | Key | Type | Meaning |
@@ -311,6 +330,8 @@ loop. Paths are relative to the row:
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
 | `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
+| `dispatch not recorded: <reason>` | PyTorch rows only. The [dispatch](#dispatch) capture failed (`ootb.dispatch` is `null`), or the profiler recorded no GPU kernel (`ootb.dispatch.kernels` is `null`). stderr also shows it one time per process. The timed values stay in the row. |
+| `tuned run: dispatch not recorded: <reason>` | PyTorch rows with `--oracle` only. The same failure in the tuned child process, for `oracle.dispatch`. |
 | `float64 reference not used (<reason>); using the graph data types` | `reference` row only. The float64 reference failed or did not fit in memory, so the engine rows of the graph met the native reference. |
 
 The tool never removes samples because of a warning.
@@ -332,6 +353,7 @@ the reason and `oracle` is `null`.
   the candidates, so `oracle.timing.first_call_ms` holds the search cost.
 - PyTorch rows: the tuned run comes from a child process (MIOpen exhaustive
   conv search and TunableOp). `build_ms` and `correctness` are `null`.
+  `dispatch` is the record of the child process.
 
 The file does not store a speedup. Use `ootb.kernel.median_ms /
 oracle.kernel.median_ms`. Do not report a speedup when either `correctness`

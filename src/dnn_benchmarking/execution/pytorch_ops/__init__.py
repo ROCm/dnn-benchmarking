@@ -27,6 +27,7 @@ from ._sdpa_backend import (
     current_philox_dumps,
     execute_selected_sdpa,
     reference_sdpa_pass,
+    rocm_fa_library,
     use_philox_dumps,
     use_pytorch_sdpa_backend,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "PyTorchSdpaBackendState",
     "use_pytorch_sdpa_backend",
     "reference_sdpa_pass",
+    "rocm_fa_library",
     "execute_selected_sdpa",
     "use_philox_dumps",
     "current_philox_dumps",

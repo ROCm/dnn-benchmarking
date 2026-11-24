@@ -98,6 +98,7 @@ in the same way.
 | `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). SDPA backward graphs run the backward kernel of the selected category (`default`, `flash` or `efficient`); see [PyTorch SDPA backward](methodology.md#pytorch-sdpa-backward). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
+| `--pytorch-dispatch`, `--no-pytorch-dispatch` | off | Records the SDPA backend and the GPU kernels of each PyTorch row in the plan's `dispatch` object. The tool runs one untimed `torch.profiler` launch after the timed loop. See [PyTorch dispatch record](#pytorch-dispatch-record). Recorded as `run.config.pytorch_dispatch`. |
 
 When `--plugin-path` is not given, the tool uses
 `$ROCM_PATH/lib/hipdnn_plugins/engines`. When `ROCM_PATH` is not set, it uses
@@ -463,6 +464,30 @@ dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch \
 can use a different Flash implementation when the preferred one does not
 support an input.
 
+### PyTorch dispatch record
+
+`--pytorch-dispatch` records what each PyTorch row ran: the SDPA backend, the
+ROCm Flash Attention library and the GPU kernel names. The tool runs one more
+launch of the graph under `torch.profiler`, after the timed loop. The launch
+gives no sample. See
+[PyTorch dispatch record](methodology.md#pytorch-dispatch-record).
+
+```bash
+dnn-benchmark -g graphs/sample_sdpa.json --runtime pytorch --pytorch-dispatch -v
+```
+
+The option is off by default. `torch.profiler` runs one session for each
+process, and a second session cancels the first. The tool does not start a
+capture when it finds an active session. PyTorch has no public check that
+finds a session of another thread. Thus, do not use `--pytorch-dispatch` when
+the process runs its own `torch.profiler` session, for example when you call
+the tool from Python under a profiler. Without the option, `dispatch` is
+`null` on all rows.
+
+The option has an effect only with `--runtime pytorch` or
+`--validate pytorch`. Otherwise the tool shows a warning. With `--oracle`,
+the tuned child process records `oracle.dispatch` too.
+
 ### PyTorch kernel selection
 
 When PyTorch runs (`--runtime pytorch` or `--validate pytorch`), the CLI sets
@@ -514,7 +539,7 @@ row's `engine.id`:
 
 | Row | Kernel |
 |---|---|
-| `rocke:<variant>` | One row for each variant that hipDNN ships for `hipkernel:Gfx950AttentionDense` and that runs the graph. `<variant>` is the hipDNN kernel descriptor name, for example `attention_dense.fp16_d128_hq32_kv8_c1_bm256_bn64.gfx950`. |
+| `rocke:<variant>` | One row for each variant that hipDNN ships for `hipkernel:Gfx950AttentionDense` and that runs the graph. `<variant>` is the hipDNN kernel descriptor name, for example `attention_dense.fp16_d128_c1_bm256_bn64.gfx950`. |
 | `rocke:auto:<kernel>` | The kernel that rocKE's production dispatcher (`dispatch_attention`) selects. At the pinned rocm-libraries commit this is unified 2D or 3D attention. |
 
 How the variant rows get the hipDNN kernel:
@@ -1009,8 +1034,9 @@ A graph with no applicable engine shows the reason from hipDNN.
 
 `-v` adds a block for each row with the plugin path, costs (build, first
 call, row total), timing mode, a statistics table for kernel and submit time,
-clocks before and after the loop, FLOPs, I/O and VRAM, correctness, oracle and
-profiling results, and all warnings.
+clocks before and after the loop, FLOPs, I/O and VRAM, correctness, the
+PyTorch SDPA backend and GPU kernels (`dispatch` lines, with
+`--pytorch-dispatch`), oracle and profiling results, and all warnings.
 
 ### Result files
 
