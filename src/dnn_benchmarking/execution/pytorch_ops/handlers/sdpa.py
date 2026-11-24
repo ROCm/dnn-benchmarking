@@ -1839,6 +1839,8 @@ def compile_sdpa(
         v: torch.Tensor,
     ) -> None:
         s = setup(tensors, "varlen", lambda: prepare_varlen(tensors, q, k, v))
+        if isinstance(tensors, ReplayTensors):
+            tensors.timed_work_note("varlen_per_batch_copy")
         for batch in s.batches:
             if s.sink is not None:
                 o, stats = _sink_attention(

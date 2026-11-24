@@ -188,6 +188,15 @@ def _attention_terms(
             _nonmasked_pairs(lq, lkv, *band) for lq, lkv in zip(lengths[0], lengths[1])
         )
         return num_q_heads * pairs, int(q_dims[-1]), int(v_dims[-1])
+    # Packed paged Q across multiple sequences with a diagonal mask has no
+    # unique pair count without per-sequence lengths (F-4).
+    if (
+        len(table_dims) >= 2
+        and int(table_dims[0]) > 1
+        and int(q_dims[0]) == 1
+        and (band[0] is not None or band[1] is not None)
+    ):
+        return None
     pairs = _nonmasked_pairs(q_seqlen, kv_seqlen, *band)
     return rows * pairs, int(q_dims[-1]), int(v_dims[-1])
 

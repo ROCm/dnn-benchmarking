@@ -3,6 +3,7 @@
 
 """Benchmark statistics calculation."""
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -95,17 +96,31 @@ HOST_BOUND = 0.9
 
 
 def noise_warnings(stats: BenchmarkStats) -> List[str]:
-    """Flag dispersion a reader should know about; samples are never trimmed.
+    """Flag dispersion and resolution hazards; samples are never trimmed.
 
     Noise uses the robust spread IQR/median, so a few slow samples (reported
     by the outlier flag) do not mark an otherwise tight distribution noisy.
     """
     warnings: List[str] = []
-    if stats.n >= 10 and stats.median_ms > 0:
+    if not math.isfinite(stats.median_ms):
+        warnings.append("non-finite median timing")
+        return warnings
+    if math.isfinite(stats.min_ms) and stats.min_ms <= 0:
+        warnings.append("timer resolution: zero or nonpositive sample(s)")
+    if (
+        stats.n >= 10
+        and stats.median_ms > 0
+        and math.isfinite(stats.p25_ms)
+        and math.isfinite(stats.p75_ms)
+    ):
         spread = stats.iqr_ms / stats.median_ms
         if spread > NOISY_IQR:
             warnings.append(f"noisy: IQR {spread:.1%} of median")
-    if stats.median_ms > 0 and stats.max_ms > OUTLIER_RATIO * stats.median_ms:
+    if (
+        stats.median_ms > 0
+        and math.isfinite(stats.max_ms)
+        and stats.max_ms > OUTLIER_RATIO * stats.median_ms
+    ):
         warnings.append(f"outlier: max {stats.max_ms / stats.median_ms:.1f}x median")
     return warnings
 
@@ -113,19 +128,24 @@ def noise_warnings(stats: BenchmarkStats) -> List[str]:
 def host_bound_warnings(
     kernel: BenchmarkStats, host: BenchmarkStats, mode: str
 ) -> List[str]:
-    """Flag a kernel time that the host submit time sets.
+    """Flag a kernel event span that the host submit time sets.
 
     Block and events spans include the host's launch gaps. The staged span
     starts after the host has enqueued the work, so it is never host-bound.
     """
-    if mode == "staged" or kernel.median_ms <= 0:
+    if (
+        mode == "staged"
+        or not math.isfinite(kernel.median_ms)
+        or not math.isfinite(host.median_ms)
+        or kernel.median_ms <= 0
+    ):
         return []
     ratio = host.median_ms / kernel.median_ms
     if ratio < HOST_BOUND:
         return []
     return [
         f"host-bound: submit is {ratio:.0%} of kernel_med in {mode} timing; "
-        "the time is launch cost, not device time"
+        "the span likely reflects host launch overhead rather than pure device time"
     ]
 
 
@@ -146,10 +166,14 @@ class TimingInfo:
     first_call_ms: float
     capped: bool = False
     fallback_reason: Optional[str] = None
+    launch_mode: str = "raw"
+    requested_warmup_iters: Optional[int] = None
+    timed_work_notes: Optional[List[str]] = None
 
     @classmethod
     def from_measurement(cls, m: Any) -> "TimingInfo":
         """Copy the provenance fields of an ``execution.timing.Measurement``."""
+        notes = getattr(m, "timed_work_notes", None)
         return cls(
             mode=m.mode,
             timer=m.timer,
@@ -158,6 +182,9 @@ class TimingInfo:
             first_call_ms=m.first_call_ms,
             capped=m.capped,
             fallback_reason=m.fallback_reason,
+            launch_mode=getattr(m, "launch_mode", "raw"),
+            requested_warmup_iters=getattr(m, "requested_warmup_iters", None),
+            timed_work_notes=list(notes) if notes else None,
         )
 
     def to_dict(self) -> Dict[str, Any]:

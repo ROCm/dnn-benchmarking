@@ -10,11 +10,11 @@ through :mod:`dnn_benchmarking.metrics.analytical` for the public API.
 from typing import Any, Dict, Optional
 
 
-def tensor_dim_product(tensor: Dict[str, Any]) -> int:
-    """Return the product of a tensor's dims, or 0 when dims are missing."""
-    dims = tensor.get("dims") or []
-    if not dims:
-        return 0
+def tensor_dim_product(tensor: Dict[str, Any]) -> Optional[int]:
+    """Return the product of a tensor's dims, 1 for a scalar ``[]``, or None when dims are absent."""
+    dims = tensor.get("dims")
+    if dims is None:
+        return None
     n = 1
     for d in dims:
         n *= int(d)

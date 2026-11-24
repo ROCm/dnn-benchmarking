@@ -116,13 +116,17 @@ class PyTorchCudaExecutor:
         # One stream context around the whole loop: entering it per iteration
         # would put its host cost inside the submit bracket.
         with torch.cuda.device(self._device), torch.cuda.stream(stream):
-            return measure(
+            measurement = measure(
                 lambda: self._execute_graph(replay),
                 stream=int(stream.cuda_stream),
                 policy=self._policy,
                 timer=self._timer,
                 torch_stream=stream,
             )
+            work_notes = getattr(replay, "timed_work_notes", None)
+            if work_notes:
+                measurement.timed_work_notes = list(work_notes)
+            return measurement
 
     def capture_dispatch(self) -> Dict[str, Any]:
         """Profile one untimed launch of the timed path; return what it ran.

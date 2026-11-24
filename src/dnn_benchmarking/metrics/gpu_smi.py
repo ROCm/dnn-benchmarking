@@ -25,8 +25,9 @@ import ctypes
 import functools
 import os
 import sys
-from typing import Any, Callable, Dict, Optional, Tuple
-
+import threading
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from ..common import torch_support
 from ._diagnostic import warn_once
 
@@ -73,8 +74,14 @@ def _amdsmi() -> Optional[Any]:
 
 
 def is_amdsmi_available() -> bool:
-    """True when amdsmi imports and initialises."""
-    return _amdsmi() is not None
+    """True when amdsmi imports, initialises and exposes at least one handle."""
+    amdsmi = _amdsmi()
+    if amdsmi is None:
+        return False
+    try:
+        return bool(amdsmi.amdsmi_get_processor_handles())
+    except Exception:
+        return False
 
 
 def _hip_device_bdf(device_index: Optional[int]) -> Optional[str]:
@@ -135,8 +142,8 @@ def _hip_runtime_bdf(device_index: Optional[int]) -> Optional[str]:
 
 
 @functools.lru_cache(maxsize=None)
-def _handle_for(device_index: Optional[int]) -> Optional[Any]:
-    """amdsmi processor handle for a HIP device index (None = current)."""
+def _handle_for_bdf(device_index: Optional[int], bdf: Optional[str]) -> Optional[Any]:
+    """Cached amdsmi handle lookup keyed by ``(device_index, hip_bdf)``."""
     amdsmi = _amdsmi()
     if amdsmi is None:
         return None
@@ -146,7 +153,6 @@ def _handle_for(device_index: Optional[int]) -> Optional[Any]:
         return None
     if not handles:
         return None
-    bdf = _hip_device_bdf(device_index)
     if bdf is not None:
         for handle in handles:
             # amdsmi reports "dddd:bb:dd.f"; torch exposes no function number.
@@ -164,6 +170,25 @@ def _handle_for(device_index: Optional[int]) -> Optional[Any]:
         return None
     index = device_index or 0
     return handles[index] if index < len(handles) else None
+
+
+def _handle_for(device_index: Optional[int]) -> Optional[Any]:
+    """amdsmi processor handle for a HIP device index (None = current).
+
+    Resolves the HIP PCI address dynamically so an early pre-HIP lookup
+    cannot pin a stale fallback once HIP or torch initialises.
+    """
+    if _amdsmi() is None:
+        return None
+    bdf = _hip_device_bdf(device_index)
+    handle = _handle_for_bdf(device_index, bdf)
+    if handle is None and bdf is None:
+        # Do not cache an unresolved pre-init None permanently.
+        _handle_for_bdf.cache_clear()
+    return handle
+
+
+_handle_for.cache_clear = _handle_for_bdf.cache_clear  # type: ignore[attr-defined]
 
 
 class GpuSmiProbe:
@@ -208,6 +233,58 @@ class GpuSmiProbe:
                 lambda: smi.amdsmi_get_gpu_metrics_info(h)["throttle_status"], int
             ),
         }
+
+    @contextmanager
+    def sample_during(self, interval_s: float = 0.1) -> Iterator[Dict[str, Any]]:
+        """Sample clocks, power and throttle status during a timed loop.
+
+        Yields a mutable dict populated on exit with the post-loop reading
+        (same keys as :meth:`clocks`) plus in-run aggregates:
+        ``in_run_samples``, ``throttle_any``, ``power_max_w``,
+        ``sclk_min_mhz``, and ``sclk_max_mhz``. When amdsmi or the device is
+        unavailable the yielded dict stays empty.
+        """
+        result: Dict[str, Any] = {}
+        if self._handle is None:
+            yield result
+            return
+        samples: List[Dict[str, Any]] = []
+        stop = threading.Event()
+
+        def poll() -> None:
+            while not stop.wait(interval_s):
+                reading = self.clocks()
+                if reading is not None:
+                    samples.append(reading)
+
+        thread = threading.Thread(target=poll, daemon=True)
+        thread.start()
+        try:
+            yield result
+        finally:
+            stop.set()
+            thread.join(timeout=1.0)
+            after = self.clocks()
+            if after is not None:
+                samples.append(after)
+                result.update(after)
+            if samples:
+                powers = [s["power_w"] for s in samples if s.get("power_w") is not None]
+                sclks = [
+                    s["sclk_mhz"] for s in samples if s.get("sclk_mhz") is not None
+                ]
+                throttles = [
+                    s["throttle_status"]
+                    for s in samples
+                    if s.get("throttle_status") is not None
+                ]
+                result["in_run_samples"] = len(samples)
+                result["throttle_any"] = (
+                    any(bool(t) for t in throttles) if throttles else None
+                )
+                result["power_max_w"] = max(powers) if powers else None
+                result["sclk_min_mhz"] = min(sclks) if sclks else None
+                result["sclk_max_mhz"] = max(sclks) if sclks else None
 
     def identity(self) -> Tuple[Optional[str], Optional[str]]:
         """``(target_graphics_version, market_name)``; None where unreported.

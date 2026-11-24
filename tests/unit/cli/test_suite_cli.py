@@ -1105,7 +1105,7 @@ def test_internal_flags_are_hidden_from_help() -> None:
     assert "--no-stall-gate" not in help_text
 
 
-_PYTORCH_ENV = dict.fromkeys(pytorch_tuning.ENV_NAMES, "1")
+_PYTORCH_ENV = dict(pytorch_tuning._DEFAULT_ENV)
 
 
 @pytest.mark.parametrize(

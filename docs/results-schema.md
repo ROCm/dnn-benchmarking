@@ -69,8 +69,8 @@ the keys below.
 | `reference_precision` | string or null | `--reference-precision` (`float64` or `native`). `null` when validation is off. Each row's `correctness.reference_precision` gives the reference that the row met. |
 | `oracle` | bool | `--oracle`. |
 | `autotune` | bool | `--autotune`. |
-| `benchmark_work_dir` | string | The work directory: `--benchmark-work-dir`, else the default. Without `--fresh-state`, runs use its kept selection state (`ootb/`, or `tuned/` for `--autotune` and for a true `HIPDNN_FORCE_BENCHMARKING` in the environment), so they can be warm. `--oracle` tuned runs always use `tuned/`. See [usage.md](usage.md#work-directory---benchmark-work-dir). |
-| `fresh_state` | bool | `--fresh-state`: the command ran on a new, empty selection state, removed at exit. `--oracle` tuned runs still used the kept tuned state. |
+| `benchmark_work_dir` | string | The work directory: `--benchmark-work-dir`, else the default. Without `--fresh-state`, runs use its kept selection state (`ootb/`, or `tuned/` for `--autotune` and for a true `HIPDNN_FORCE_BENCHMARKING` in the environment), so they can be warm. `--oracle` tuned runs use `tuned/`, or a fresh temporary state when `--fresh-state` is set. See [usage.md](usage.md#work-directory---benchmark-work-dir). |
+| `fresh_state` | bool | `--fresh-state`: the command and its `--oracle` tuned children ran on new, empty selection state, removed at exit. |
 | `fast` | bool | `--fast`. Do not compare the numbers of a `--fast` run with a run without it; see [usage.md](usage.md#fast-mode---fast). |
 | `pytorch_sdpa_backend` | string or null | `--pytorch-sdpa-backend`. `null` unless `--runtime pytorch` or `--validate pytorch`. |
 | `pytorch_rocm_fa_library` | string or null | `--pytorch-rocm-fa-library`. `null` unless PyTorch is selected. |
@@ -110,8 +110,8 @@ The CLI collects these values one time, at suite start.
 | `rocm_build_untested` | array of strings | The Quartz test suites (`rocm`, `pytorch`) that report no result for the GPU architecture of that ROCm build. `[]` when both suites tested it. `null` when setup read no Quartz `status.json` (for example `rocm-pin.json` or an unknown `--rocm-version`). See [setup.md](setup.md#rocm-nightly-selection). |
 | `python_version` | string | Python version. |
 | `torch_version` | string | `__version__` of `torch/version.py`. |
-| `amdsmi_available` | bool | `true` when amdsmi loads. Without amdsmi, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
-| `selection_env` | object or null | Kernel-selection environment variables at start: `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `HIPDNN_CACHE_DIR`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_FORCE_BENCHMARKING`, `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR`. `null` unless `--oracle` or `--autotune` is set. |
+| `amdsmi_available` | bool | `true` when amdsmi loads, initializes and exposes at least one processor handle. Without amdsmi or a mapped handle, `gpu_hbm_gb`, `gpu_pcie_link`, `amdgpu_driver_version`, `gpu_power_cap_w`, `gpu_max_sclk_mhz`, `gpu_compute_partition` and all clock values are `null`. |
+| `selection_env` | object or null | Effective kernel-selection environment variables (`HIPDNN_CACHE_DIR`, `MIOPEN_USER_DB_PATH`, `HIPDNN_FORCE_BENCHMARKING`, `HIPDNN_DISABLE_CACHE`, `HIPDNN_DISABLE_EXACT_ENGINE_CACHE`, `MIOPEN_CUSTOM_CACHE_DIR`), each string or `null`. `null` unless `--oracle` or `--autotune`. |
 
 ## summary
 
@@ -170,7 +170,7 @@ NaN or infinity has no `graph_id`, and its `status` is `error`.
 
 |Version|Change|
 |---|---|
-|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it.|
+|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it. Also adds `metrics.flops_formula_version`, `timing` (`launch_mode`, `requested_warmup_iters`, `timed_work_notes`), and in-run `metrics.clocks_after` telemetry (`in_run_samples`, `throttle_any`, `power_max_w`, `sclk_min_mhz`, `sclk_max_mhz`).|
 |2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
 
 All other keys are the same in versions 2 and 3. One exception: files
@@ -219,13 +219,13 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 
 | Key | Type | Meaning |
 |---|---|---|
-| `build_ms` | float or null | CPU time of the plan build only: `create_execution_plan_ext`, `check_support` and `build_plans`. Every run first builds the OOTB plan once, untimed, so `build_ms` excludes one-time provider setup and cold file reads. `null` for PyTorch, which has no plan build. |
-| `timing` | object | How the samples were measured. See [timing](#timing). |
-| `kernel` | object or null | Device time per launch. See [stats](#stats). |
-| `host` | object or null | Host submit time per launch (enqueue call only). See [stats](#stats). |
+| `build_ms` | float or null | CPU time of the runtime's prepare/build phase: for hipDNN, `create_execution_plan_ext`, `check_support` and `build_plans` after priming; for rocKE variants, code-object load; for rocKE auto and AITER, initial prepare launch; `null` for PyTorch. Because phases differ across runtimes, do not compare `build_ms` across runtimes as one phase. |
+| `timing` | object or null | How the samples were measured (`null` only on an untimed plan object). See [timing](#timing). |
+| `kernel` | object or null | Device event span per launch (milliseconds). See [stats](#stats). |
+| `host` | object or null | Host submit time per launch (Python callback wall time around enqueue, milliseconds). See [stats](#stats). |
 | `workspace_bytes` | int or null | Workspace that hipDNN reserved for the plan. `null` for PyTorch. |
-| `tflops` | float or null | `metrics.flops / kernel.median_ms`, in 10^12 FLOP/s. |
-| `gbps` | float or null | `metrics.io_bytes / kernel.median_ms`, in 10^9 bytes/s. |
+| `tflops` | float or null | Graph-normalized rate `metrics.flops / (kernel.median_ms * 1e9)`, in decimal 10^12 FLOP/s. `null` when `metrics.flops` is `null` or `kernel.median_ms` is missing, non-finite, or `<= 0`; `0.0` when `metrics.flops == 0`. |
+| `gbps` | float or null | Graph-footprint rate `metrics.io_bytes / (kernel.median_ms * 1e6)`, in decimal 10^9 bytes/s. `null` when `metrics.io_bytes` is `null` or `kernel.median_ms` is missing, non-finite, or `<= 0`; `0.0` when `metrics.io_bytes == 0`. |
 | `correctness` | object or null | See [correctness](#correctness). `null` when validation did not run. |
 | `dispatch` | object or null | PyTorch rows with `--pytorch-dispatch`: the SDPA backend and the GPU kernels that the plan ran. See [dispatch](#dispatch). `null` without `--pytorch-dispatch`, on hipDNN, rocKE and AITER rows, and when the capture failed (the row then has a warning). Files written before this key do not have it; read it as `null`. |
 
@@ -233,18 +233,20 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 
 | Key | Type | Meaning |
 |---|---|---|
-| `mode` | string | `staged` (stall-gated device span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
+| `mode` | string | `staged` (stall-gated device event span), `events` (event pair around each launch), or `block` (event pair around `timing_block` back-to-back launches; samples are `elapsed / timing_block`). |
 | `timer` | string | Event timer: `hip` (HIP events) or `torch` (`torch.cuda.Event`). |
-| `warmup_iters` | int | Untimed launches that actually ran: priming (and, for PyTorch, the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
+| `warmup_iters` | int | Untimed launches that actually ran inside `measure()`: priming (and, for torch-driven runtimes — PyTorch, rocKE and AITER — the host-sync probe and its rerun) plus the discarded warmups. Always 1 or more. In `block` mode, also the `--warmup` launches before every sample, the discarded first sample included. See [methodology.md](methodology.md#warmup). |
+| `requested_warmup_iters` | int or null | The requested `--warmup` value before adding priming/probe launches. |
 | `samples` | int | Number of timed samples behind `kernel` and `host` (`n` below). Equal to `--iters` unless `--min-time-ms` extends the loop. |
-| `first_call_ms` | float | Wall time of the first launch plus a device sync. It includes one-time costs such as kernel compile and MIOpen find. |
+| `first_call_ms` | float | Wall time of the first launch inside `measure()` plus a device sync. Includes one-time costs not already paid in `prepare()`. |
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
-| `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the PyTorch `enqueue()` syncs with the host. |
+| `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the enqueue syncs with the host. |
+| `launch_mode` | string | `raw` (direct kernel launches) or `graph_replay` (internal HIP graph replay). |
+| `timed_work_notes` | array of string or null | Non-core work included in the timed callback when known (for example `output_allocated`, `head_padding`, `triton_buffer_fills`, `split_kv_scratch`, `varlen_per_batch_copy`). |
 
 The cache mode and the launches per sample apply to the whole run, so they
-are only in `run.config` (`cache_mode`, `timing_block`). See
+are in `run.config` (`cache_mode`, `timing_block`). See
 [methodology.md](methodology.md) for the meaning of each mode.
-
 ### stats
 
 `kernel` and `host` use the same object. All values are milliseconds. The
@@ -266,29 +268,36 @@ file does not store them.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `flops` | int or null | Analytical FLOPs for one launch of the graph. For an SDPA node with variable lengths, it sums the counts over batches. Each count comes from the valid lengths of that batch. A paged graph uses the real KV lengths. `null` when any node has no FLOP formula, or lacks the tensor data its formula needs. A partial count is never reported. `tflops` is then `null` too. |
-| `io_bytes` | int or null | Sum of the sizes of all non-virtual tensors, bytes. A tensor with valid lengths (SDPA with `seq_len`, `cu_seq_len` or ragged tensors, including a ragged Q/O over a paged K/V cache) counts only its valid elements. A non-ragged paged K, V, Q or O container counts its full size. |
-| `clocks_after` | object or null | GPU clocks right after the default plan's timed loop. See [clocks](#clocks). |
+| `flops` | int or null | Analytical graph FLOPs for one launch. For an SDPA node with variable lengths, it sums the counts over batches from valid lengths. A paged graph uses the real KV lengths; a packed paged graph with a diagonal mask and no length data returns `null`. `null` when any node has no FLOP formula or lacks tensor dims. A partial count is never reported. |
+| `flops_formula_version` | int or null | Version of the analytical FLOP/IO formula set (`2`), or `null` when `flops` is `null`. |
+| `io_bytes` | int or null | Graph-footprint bytes across all non-virtual tensors (not a hardware traffic lower bound). A tensor with valid lengths counts only its valid elements. Non-ragged paged K, V, Q and O containers count their full size. |
+| `clocks_after` | object or null | GPU telemetry sampled during and right after the default plan's timed loop. See [clocks](#clocks). |
 
 `--no-metrics` sets these values and the plan `workspace_bytes`, `tflops` and
 `gbps` to `null`.
 
 #### clocks
 
-amdsmi supplies these values. The object is `null` without amdsmi. A value is
-`null` when the platform does not report it. The tool finds the amdsmi device
-of the run by its PCI address, from PyTorch or from the loaded HIP runtime. If
-that fails while `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`,
-`CUDA_VISIBLE_DEVICES` or `GPU_DEVICE_ORDINAL` is set, the object and the
-amdsmi values of `environment` are `null`, and a warning gives the reason.
+amdsmi supplies these values. The object is `null` without amdsmi or a mapped
+device handle. A value is `null` when the platform does not report it. The
+tool finds the amdsmi device of the run by its PCI address, from PyTorch or
+from the loaded HIP runtime. If that fails while `HIP_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES` or `GPU_DEVICE_ORDINAL` is set,
+the object and the amdsmi values of `environment` are `null`, and a warning
+gives the reason.
 
 | Key | Unit |
 |---|---|
-| `sclk_mhz` | Shader clock, MHz. |
-| `mclk_mhz` | Memory clock, MHz. |
-| `power_w` | Socket power, W. |
-| `temp_hotspot_c` | Hotspot temperature, degrees C. |
-| `throttle_status` | Throttle status bit field. `0` means no throttle. |
+| `sclk_mhz` | Post-loop shader clock, MHz. |
+| `mclk_mhz` | Post-loop memory clock, MHz. |
+| `power_w` | Post-loop socket power, W. |
+| `temp_hotspot_c` | Post-loop hotspot temperature, degrees C. |
+| `throttle_status` | Post-loop throttle status bit field. `0` means no throttle. |
+| `in_run_samples` | Total telemetry samples collected during and after the timed loop. |
+| `throttle_any` | `true` if any in-run or post-loop sample reported nonzero throttle status. |
+| `power_max_w` | Peak socket power observed across in-run and post-loop samples, W. |
+| `sclk_min_mhz` | Minimum shader clock observed across in-run and post-loop samples, MHz. |
+| `sclk_max_mhz` | Maximum shader clock observed across in-run and post-loop samples, MHz. |
 
 ### dispatch
 
@@ -303,7 +312,6 @@ tuned child process recorded the object with the tuned state, so tuning
 | `sdpa_backend` | string or null | The PyTorch SDPA backend that the launch called: `flash`, `efficient`, `math`, `cudnn` or `overrideable`. With `--pytorch-sdpa-backend default`, this is the choice of the PyTorch dispatcher. `null` when the launch called no PyTorch SDPA op: the graph has no SDPA node, or the tool computes the attention with its own formula (for example the backward formula of an ALiBi graph). When SDPA calls used different backends, the names are joined with `,` in the order of the first call. |
 | `fa_library` | string or null | The preferred ROCm Flash Attention library, `aotriton` or `ck`, when `sdpa_backend` includes `flash` on a ROCm build. `--pytorch-rocm-fa-library` sets it; else `torch.backends.cuda.preferred_rocm_fa_library()` gives it, and its `default` value is `aotriton`. PyTorch can use another library for an operation that the preferred library does not implement: `kernels` shows what ran. `null` otherwise. |
 | `kernels` | array of string or null | The distinct GPU kernel names of the launch, in the order of the first launch of each. Input fills, warmup launches, cache flushes, copies and the setup of the first call are not included. `null` when the profiler recorded no kernel (the row then has a warning). |
-
 ### correctness
 
 | Key | Type | Meaning |
@@ -320,19 +328,20 @@ tuned child process recorded the object with the tuned state, so tuning
 | `message` | string or null | Why `match` is `false` or `null`. |
 
 ### Row warnings
-
-`warnings` holds short notes. The console table shows the first note in the
-`note` column. The runner adds these notes after the default plan's timed
-loop. Paths are relative to the row:
+`warnings` holds short notes. The console table shows the first non-noise note
+in the `note` column (`noisy:` warnings are indicated by `*` on `kernel_med`
+and printed in full under `-v`). The runner adds these notes after the default
+plan's timed loop. Paths are relative to the row:
 
 | Note | Condition |
 |---|---|
 | `noisy: IQR x% of median` | `(ootb.kernel.p75_ms - ootb.kernel.p25_ms) / ootb.kernel.median_ms` is more than 0.05 and `ootb.timing.samples` is 10 or more. |
 | `outlier: max Nx median` | The slowest sample is more than 2 x `ootb.kernel.median_ms`. |
+| `timer resolution: zero or nonpositive sample(s)` | One or more timed samples were `<= 0` ms. |
 | `capped at max_iters` | `ootb.timing.capped` is `true`. |
 | `host-bound: submit is x% of kernel_med in <mode> timing; ...` | `ootb.timing.mode` is `block` or `events`, and `ootb.host.median_ms` is 0.9 x `ootb.kernel.median_ms` or more. |
 | `<mode> timing: <reason>` | `ootb.timing.fallback_reason` is set. `<mode>` is `events` or `block` (`ootb.timing.mode`). stderr also shows the same text one time per process. |
-| `throttled` | `metrics.clocks_after.throttle_status` is not 0. |
+| `throttled` | `metrics.clocks_after.throttle_status` is nonzero or `metrics.clocks_after.throttle_any` is `true`. |
 | `profiling failed: <error>` | A profiling pass raised an exception. The timed values stay in the row. |
 | `dispatch not recorded: <reason>` | PyTorch rows only. The [dispatch](#dispatch) capture failed (`ootb.dispatch` is `null`), or the profiler recorded no GPU kernel (`ootb.dispatch.kernels` is `null`). stderr also shows it one time per process. The timed values stay in the row. |
 | `tuned run: dispatch not recorded: <reason>` | PyTorch rows with `--oracle` only. The same failure in the tuned child process, for `oracle.dispatch`. |

@@ -2273,6 +2273,17 @@ class Setup:
         ca_bundle = env.get("PIP_CERT") or env.get("SSL_CERT_FILE")
         if ca_bundle:
             env.setdefault("AWS_CA_BUNDLE", ca_bundle)
+        # Keep the DVC cache inside the writable workspace when no global DVC
+        # config dir is set, avoiding EROFS failures on read-only repo mounts.
+        if not env.get("DVC_GLOBAL_CONFIG_DIR"):
+            dvc_cfg_dir = self.workspace / "dvc-config"
+            dvc_cache = self.workspace / "dvc-cache"
+            dvc_cfg_dir.mkdir(parents=True, exist_ok=True)
+            dvc_cache.mkdir(parents=True, exist_ok=True)
+            (dvc_cfg_dir / "config").write_text(
+                f"[cache]\n    dir = {dvc_cache}\n", encoding="utf-8"
+            )
+            env["DVC_GLOBAL_CONFIG_DIR"] = str(dvc_cfg_dir)
         print(f"Pulling {len(targets)} provider descriptor artifact(s)...")
         run(
             [self.py, "-m", "dvc", "pull", *targets],

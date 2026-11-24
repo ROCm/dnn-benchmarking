@@ -24,6 +24,7 @@ from ..config.benchmark_config import (
     SuiteConfig,
 )
 from ..graph.loader import GraphLoader
+from ..metrics.gpu_smi import is_amdsmi_available
 from ..metrics.machine_info import collect_environment_info
 from ..metrics.profiling_orchestrator import check_requested_tools
 from ..reporting.reporter import Reporter
@@ -105,6 +106,8 @@ def run_suite_cli(
     reporter: Reporter,
     tarball_source: Optional[str] = None,
     argv: Optional[List[str]] = None,
+    *,
+    tuned_child: bool = False,
 ) -> int:
     """Build the config, run startup checks, run the suite; return the exit code.
 
@@ -135,7 +138,6 @@ def run_suite_cli(
         reporter.error(message)
     if missing:
         return 2
-
     # The runtime's handles are destroyed when ``resources`` closes, on every
     # exit path, while the selection state that ``cli.main`` owns still
     # exists.
@@ -144,12 +146,16 @@ def run_suite_cli(
         if config.fast:
             reporter.info("--fast: one process, one handle for every graph")
         _warn_ignored_options(config, reporter)
-        _apply_pytorch_environment(config, reporter)
+        _apply_pytorch_environment(config, reporter, tuned=tuned_child)
         if RuntimeName.HIPDNN in config.runtimes:
             _apply_tuning_environment(config, reporter)
             if config.oracle:
                 _warn_oracle(reporter)
 
+        # Initialise amdsmi before start_runtime() imports torch: on ROCm,
+        # importing torch first can load a bundled libamd_smi that makes
+        # amdsmi_get_processor_handles() return empty.
+        is_amdsmi_available()
         try:
             run_graph = start_runtime(config, reporter, resources)
         except RuntimeStartupError as e:
@@ -304,7 +310,11 @@ def _run_suite(
             return False
 
     interrupted: Optional[int] = None
-    previous_sigterm = signal.signal(signal.SIGTERM, _raise_terminated)
+    previous_sigterm = (
+        signal.signal(signal.SIGTERM, _raise_terminated)
+        if signal.getsignal(signal.SIGTERM) is not None
+        else None
+    )
     disarm_watchdog = _arm_sigterm_watchdog()
     try:
         last_write = time.monotonic()
@@ -324,14 +334,23 @@ def _run_suite(
         interrupted = 143
     finally:
         # A second Ctrl-C or SIGTERM must not lose the results on disk.
-        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # Preserve non-Python native signal handlers (e.g. rocprofv3), for
+        # which getsignal() returns None and signal.signal(sig, None) raises.
+        previous_sigint = (
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if signal.getsignal(signal.SIGINT) is not None
+            else None
+        )
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
             write_ok = write()
         finally:
             disarm_watchdog()
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            if previous_sigint is not None:
+                signal.signal(signal.SIGINT, previous_sigint)
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
     if interrupted is not None:
         where = (
@@ -414,7 +433,9 @@ def _warn_oracle(reporter: Reporter) -> None:
         )
 
 
-def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
+def _apply_pytorch_environment(
+    config: SuiteConfig, reporter: Reporter, *, tuned: bool = False
+) -> None:
     """Set PyTorch's kernel-selection controls when PyTorch is timed or used.
 
     Must run before the first PyTorch conv or SDPA call. A replaced shell
@@ -425,15 +446,15 @@ def _apply_pytorch_environment(config: SuiteConfig, reporter: Reporter) -> None:
         or config.validation.provider is ReferenceProviderName.PYTORCH
     ):
         return
-    effective, replaced = apply_pytorch_environment()
+    effective, replaced = apply_pytorch_environment(tuned=tuned)
     for name, old in replaced.items():
         reporter.warning(
             f"PyTorch kernel selection: {name}={old!r} from the environment is "
             f"replaced with {name}={effective[name]!r}"
         )
     settings = ", ".join(f"{k}={v}" for k, v in effective.items())
-    tuned = "; tuned runs use an isolated subprocess" if config.oracle else ""
-    reporter.info(f"PyTorch kernel selection: {settings}{tuned}")
+    tuned_note = "; tuned runs use an isolated subprocess" if config.oracle else ""
+    reporter.info(f"PyTorch kernel selection: {settings}{tuned_note}")
 
 
 def _report_selection_state(config: SuiteConfig, reporter: Reporter) -> None:

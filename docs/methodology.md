@@ -49,6 +49,7 @@ uses `events` mode and records the reason in `timing.fallback_reason`:
 | `device does not support hipStreamWaitValue32` | The device or driver has no stream wait-value support. |
 | `host sync in enqueue: ...` | The PyTorch graph reads a device value on the host. A stalled stream would then never complete. |
 | `stall gate failed in this graph; every row remeasured unstalled` | See below. |
+| `another row in this graph fell back to events; every row remeasured in events mode` | One row on the graph fell back to `events` mode, so every row on that graph was remeasured in `events` mode. |
 
 The stall gate has a watchdog. If the gate cannot arm, cannot be created, or
 the watchdog releases it before the host finished the enqueue, that sample
@@ -56,20 +57,21 @@ includes host gaps and is invalid. The tool then discards every row of the
 graph and measures the whole graph again in `events` mode. A warning on
 stderr gives the cause.
 
-Rows of one graph share one mode only when no per-row fallback applies.
-These cases give a graph rows in different modes:
+The same graph-wide rerun applies when a per-row fallback (for example,
+`host sync in enqueue: ...` on a PyTorch reference row or a PyTorch/rocKE
+engine row) leaves a graph with both `staged` and `events` rows: the tool
+discards the partial graph and remeasures every row in `events` mode so all
+rows share one timing mode. Rows that did not fail their own probe record
+`another row in this graph fell back to events; every row remeasured in events mode`.
 
-- The `--validate pytorch` reference row can fall back to `events` mode
-  alone (for example, `host sync in enqueue: ...`). The hipDNN engine rows of
-  the same graph stay in `staged` mode.
-- With several runtimes (`--runtime hipdnn,pytorch` or `hipdnn,rocke`), a
-  PyTorch or rocKE engine row can fall back to `events` mode alone. The hipDNN
-  rows of the same graph stay in `staged` mode.
-- With `--oracle`, the tuned plan can use a different mode than the OOTB
+These cases can still produce different modes:
+
+- With `--oracle`, the tuned child can use a different mode than the OOTB
   plan. The oracle verdict is then `mixed-timing` (see `docs/usage.md`).
 - `--timing-block N` (N > 1) times every row of the run in `block` mode.
 
-Read `timing.mode` of each row before you compare two rows.
+Read `timing.mode` and `timing.launch_mode` of each row before you compare
+two rows.
 
 In `events` mode each iteration records the start event, calls `enqueue()`,
 records the stop event and waits. The device records the start event before
@@ -318,42 +320,44 @@ kernel CV of 9.7 % and a maximum of 50.6 us (2 x median). Warmup through the
 timed path gave a CV of 0.95 % and a maximum of 26.2 us. The median did not
 change (25.4 to 25.6 us).
 
-`timing.warmup_iters` is the number of untimed launches that actually ran.
-Outside block mode it is `max(priming launches, --warmup)`: priming is 1
-launch for hipDNN, 2 for the PyTorch runtime (the host-sync probe), and 3
-when the probe finds a host sync and runs the launch again. So it is 1 or
-more, also when `--warmup 0` is given. In block mode it is the priming
-launches plus `--warmup` for every sample, the discarded first sample
-included.
+`timing.warmup_iters` is the number of untimed launches that actually ran
+inside `measure()`. Outside block mode it is `max(priming launches, --warmup)`:
+priming is 1 launch for hipDNN, 2 for torch-driven runtimes (PyTorch, rocKE
+and AITER: first call plus host-sync probe), and 3 when the probe finds a host
+sync and runs the launch again. `timing.requested_warmup_iters` records the
+requested `--warmup` separately. In block mode `warmup_iters` is the priming
+launches plus `--warmup` for every sample, the discarded first sample included.
+
+## Event-span overhead
+
+`kernel_med` is a **device event span** (stop event minus start event), not a
+profiler dispatch sum. On ROCm, even an empty or busy-wait staged span includes
+a fixed event/dispatch boundary floor (measured at ~7.8 µs on MI210, ~3.1–3.7 µs
+on MI325X, and ~3.6–4.1 µs on MI355X). For short kernels (<50 µs), this common
+offset compresses cross-runtime latency ratios toward 1.0x. Do not subtract a
+universal constant across workloads; use dispatch sums from a profiler trace
+when isolating sub-20 µs device busy time.
 
 ## Cache modes
 
 | Mode | Behavior |
 |---|---|
-| `warm` (default) | No flush. Inputs, outputs and workspace stay in L2 and MALL between iterations if they fit. This is the steady state of a layer that runs many times. |
-| `cold` | Before each warmup and timed iteration: write zeros to a 512 MiB device buffer, then do a full device sync. Then the iteration starts. |
+| `warm` (default) | No flush. Inputs, outputs and workspace stay in L2 and MALL between iterations if they fit. |
+| `cold` | Before each warmup and timed iteration: zero a 512 MiB buffer on the device, then drain the device. |
 
 Notes for `cold`:
 
-- The flush and the sync are outside the timed span. Priming launches are
-  never flushed.
-- 512 MiB is two times or more the largest last-level cache that the tool
-  targets (MI300X MALL, 256 MiB). MI210 L2 is 8 MiB.
-- The tool allocates the buffer at the first cold iteration and keeps it for
-  the process. It frees the buffer before an `--oracle` child starts, and the
-  next cold iteration allocates it again. The hipDNN path uses
-  `hipdnn_frontend.DeviceBuffer`. The CUDA path uses a PyTorch tensor. If
-  the allocation fails, the row fails with an error that tells you to use
-  `--cache-mode warm`.
-- The zero writes leave dirty lines in the cache. The first kernel in the
-  span can pay the write-back of these lines. `triton.testing.do_bench` has
-  the same effect.
-- The flush does not change the instruction cache or TLB state.
-- Each cold iteration costs more wall time than a warm iteration. The kernel
-  time budget (`--min-time-ms`) does not count the flush.
+- The flush and drain run outside the timed span. Priming launches are not
+  flushed.
+- 512 MiB is at least 2 x the largest last-level cache targeted (256 MiB MALL
+  on MI300X). The buffer is allocated once per process and freed before
+  `--oracle` child processes start.
+- This does not reset the instruction cache or guarantee an empty hardware
+  cache.
+- `--cache-mode cold` requires `--timing-block 1`.
 
-`dnn-benchmark compare` refuses to compare files with different
-`cache_mode` or `timing_block` values unless you give `--allow-mismatch`.
+`dnn-benchmark compare` refuses to compare files with different `cache_mode`
+or `timing_block` values unless you give `--allow-mismatch`.
 
 ## Stop rule
 
@@ -409,11 +413,12 @@ The tool does not remove outliers. It adds warnings to the row:
 |---|---|
 | `noisy: IQR x% of median` | `iqr_ms / median_ms` more than 5 % and 10 or more samples. The table marks `kernel_med` with `*`. |
 | `outlier: max Nx median` | Maximum more than 2 x median. The table marks `kernel_med` with `*` and shows the warning in `note`. |
-| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | Block or events timing only. The median host submit time is 90 % or more of the median span. The span then measures the launch cost, not the device. Use the default staged timing for such kernels. |
+| `timer resolution: zero or nonpositive sample(s)` | One or more timed samples are `<= 0` ms. |
+| `host-bound: submit is x% of kernel_med in <mode> timing; ...` | Block or events timing only. The median host submit time is 90 % or more of the median span. The span likely measures host launch overhead rather than pure device time. |
 
-The noise flag uses IQR/median, not CV. A few slow samples raise the CV a
-lot but do not change the IQR. The `outlier` flag reports those samples.
-
+The noise flag uses IQR/median, not CV (the console verbose block reports
+mean, standard deviation, min, p95 and max; CV is derivable as `std / mean`
+but is not printed directly). The `outlier` flag reports slow spikes.
 The median is the headline because one slow iteration moves the mean but not
 the median. In the MI210 runs below, one 37.6 us sample in a 29 us matmul run
 moved the mean and the standard deviation, but not the median.
@@ -474,32 +479,40 @@ engine must ignore these values.
 
 ## TFLOP/s and GB/s
 
-`tflops = flops / median` and `gbps = io_bytes / median`:
+`tflops` and `gbps` are **graph-normalized rates**, not physical hardware
+compute utilization or measured HBM bandwidth:
 
-- `flops` is an analytical count from the graph JSON (FMA = 2 FLOPs). The
-  dispatch table is in `metrics/analytical/__init__.py`; the per-op formulas
-  are in its sibling modules (`conv.py`, `matmul.py`, `elementwise.py`,
-  `normalization.py`, `reduction.py`, `sdpa.py`). When any node of the graph
-  has no formula, `flops` and `tflops` are `null`, not a partial count.
-- For an SDPA node with variable lengths, `flops` sums the count of each
-  batch from its valid lengths. The lengths come from the generated input
-  data, not from the tensor dims. A paged graph counts the real KV lengths
-  of its batches, not the page size. Without input data, a paged graph
-  counts the page-table width times the page size, capped by
-  `max_seq_len_kv`, for each sequence.
-- `io_bytes` is the sum of the sizes of all non-virtual tensors. It is a
-  lower bound of the real memory traffic. A tensor with valid lengths counts
-  only its valid elements: `sum(lengths) * elements per position * element
-  size`. Paged K and V containers count their full size.
-- In `warm` mode, a small problem can stay in L2. GB/s can then be more than
-  the HBM bandwidth. Use `--cache-mode cold` to measure from memory.
+- `tflops = flops / (kernel.median_ms * 1e9)` (decimal 10^12 FLOP/s).
+- `gbps = io_bytes / (kernel.median_ms * 1e6)` (decimal 10^9 bytes/s).
+- `flops` is an analytical count from the graph JSON (`FMA = 2 FLOPs`; version
+  recorded in `metrics.flops_formula_version`). Convolution counts use the
+  standard dense-equivalent convention (every tap at every output position,
+  including padded boundary positions). Normalization, reduction, pointwise,
+  and pooling ops use fixed per-element proxy multipliers rather than
+  instruction counts. SDPA counts only the QK and PV contractions (excluding
+  softmax). When any node has no formula or lacks required dims — including
+  packed paged SDPA with a diagonal mask and no sequence lengths — `flops` and
+  `tflops` are `null`.
+- Every runtime row on a graph shares the same graph numerator, even if one
+  runtime executes extra padding, fill, or copy kernels inside its timed call
+  (noted in `timing.timed_work_notes` where known).
+- `io_bytes` is the **graph tensor footprint** across non-virtual tensors, not
+  a lower bound on HBM traffic: strided spans include unreferenced holes,
+  non-ragged paged K, V, Q, and O containers count their full storage size, and
+  non-ragged padded outputs may still be written to memory. Variable-length
+  tensors with valid lengths count only their valid elements.
+- In `warm` mode, working sets that fit in L2/MALL can report `gbps` above HBM
+  bandwidth. Use `--cache-mode cold` or `--cache-mode rotate` to evict
+  benchmark data from caches.
 
-## Clocks after the timed loop
+## GPU telemetry during and after the timed loop
 
-With `--metrics` (default) and amdsmi available, the runner reads the GPU
-clocks right after the timed loop: `sclk_mhz`, `mclk_mhz`, `power_w`,
-`temp_hotspot_c` and `throttle_status`. The row gets the warning `throttled`
-when `throttle_status` is not 0. The tool does not set or lock clocks.
+With `--metrics` (default) and amdsmi available on the mapped HIP PCI device,
+the runner samples GPU clocks, power, hotspot temperature and throttle status
+during the timed loop and once immediately after it (`metrics.clocks_after`).
+The row gets the warning `throttled` when either the post-loop
+`throttle_status` is nonzero or `throttle_any` is `true`. The tool does not
+set or lock clocks.
 
 ## PyTorch dispatch record
 
@@ -537,13 +550,12 @@ it. The first profiler start in a process can take about one second.
   another thread only through a private PyTorch flag
   (`torch.autograd.profiler._is_profiler_enabled`). PyTorch has no public
   check for this case, so the capture is opt-in.
-
 ## Profiling child process
 
-`--pmc`, `--trace`, `--perf` and `--roofline` do not change the timed
-numbers. After the timed row completes, the tool starts one child process for
+`--pmc`, `--trace`, `--perf` and `--roofline` do not alter the parent's buffer
+backend or overwrite timed samples. After all OOTB rows of the graph complete
+(and GPU reference tensors are released), the tool starts one child process for
 each pass under the profiler:
-
 ```text
 python -m dnn_benchmarking --internal-profiling-run --graph G --engine E \
     --warmup W --iters 5 --seed S [--plugin-path P]
@@ -748,14 +760,13 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 | Host submit time | Yes (`host`) | No | Timer: wall time only |
 | Cache flush | `--cache-mode cold`, 512 MiB | Documented only | do_bench: 256 MB zero before each launch |
 | Rotating buffers | No | Documented only | No |
-| Graph replay | No | Yes | `do_bench_cudagraph` |
+| Graph replay | Raw launches (`launch_mode = raw` recorded) | Yes | `do_bench_cudagraph` |
 | Outliers | Flagged (IQR/median noise flag, max/median outlier flag), never removed; block mode discards the first sample | Discard first run | Timer: IQR warnings |
-| Statistics | n, mean, std, CV, min, p25, median, p75, p95, max, IQR | median, min, max, mean, stdev, spread | do_bench: mean or quantiles. Timer: median, IQR. |
+| Statistics | n, mean, std, min, p25, median, p75, p95, max, IQR | median, min, max, mean, stdev, spread | do_bench: mean or quantiles. Timer: median, IQR. |
 | Headline | Median | Median over attempts | do_bench: mean (default). Timer: median. |
 | TFLOP/s basis | Median | Median | User calculates |
 | Cross-process repeats | No | Yes (attempts, new process) | No |
-| Clock capture | Before warmup and after the loop | Advice: lock clocks | None |
-
+| Clock capture | Sampled during and after the timed loop | Advice: lock clocks | None |
 ### Measured numbers (MI210, gfx90a)
 
 These runs used the default warmup (10) and `--iters 100`. Values are kernel
@@ -942,21 +953,6 @@ The tool does not do these things yet:
   buffers with separate code. Both use the same timed loop.
 - Graph-replay timing (HIP or CUDA graph capture). Back-to-back timing is
   available with `--timing-block`.
-- Rotating input buffers. `--cache-mode cold` controls the cache state, but
-  the rocKE runbook also advises rotating buffers for bandwidth work.
-- Signed input distribution for all operations. The operands (data, filter
-  and incoming gradient) of a convolution with an fp16 output are uniform in
-  [-1, 1). With U[0, 1) data, a backward-weights sum over more than about
-  262,000 terms passes the fp16 maximum (65504). Signed data lets the terms
-  cancel. All other floating-point inputs are uniform in [0, 1), because
-  BatchNorm variance inputs must not be negative. A tensor that also feeds a
-  non-convolution node stays in [0, 1). Convolutions with an fp32 or bf16
-  output keep [0, 1): they do not overflow, and signed data puts fp32 outputs
-  near zero, where the fixed fp32 atol (1e-6) is smaller than the rounding
-  difference of two correct kernels. Signed convolution operands start at
-  tool version 0.3.0 (`tool.version` in the result file). Do not compare
-  fp16 convolution correctness results with results from earlier versions.
-  Signed data for other operations needs a role for each tensor first.
 - Validation of large fp16 SDPA backward gradients. On the six fp16
   `aotriton_test_perf` graphs (B4, H48, D128, S 1024 to 4096), dK reaches
   about 440. Against the earlier AOTriton reference, the ASM SDPA engine

@@ -73,6 +73,7 @@ class ReplayTensors(dict):
         self._int_cache: Dict[int, List[int]] = {}
         self._derived_cache: Dict[Hashable, Any] = {}
         self.notes: List[str] = []
+        self.timed_work_notes: List[str] = []
 
     def host_ints(self, uid: int) -> List[int]:
         """Return tensor ``uid`` flattened to host ints, resolved once."""
@@ -97,6 +98,11 @@ class ReplayTensors(dict):
         finding that static graph metadata cannot show). Repeats are dropped."""
         if text not in self.notes:
             self.notes.append(text)
+
+    def timed_work_note(self, text: str) -> None:
+        """Record extra runtime work that runs inside each timed iteration."""
+        if text not in self.timed_work_notes:
+            self.timed_work_notes.append(text)
 
 
 def _as_tuple(

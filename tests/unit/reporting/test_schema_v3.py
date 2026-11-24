@@ -60,7 +60,7 @@ ROW_KEYS = {
     "extra_metrics",
 }  # fmt: skip
 ENGINE_KEYS = {"id", "name", "version"}
-METRICS_KEYS = {"flops", "io_bytes", "clocks_after"}
+METRICS_KEYS = {"flops", "flops_formula_version", "io_bytes", "clocks_after"}
 PLAN_KEYS = {
     "build_ms", "timing", "kernel", "host", "workspace_bytes", "tflops", "gbps",
     "correctness", "dispatch",
@@ -68,7 +68,8 @@ PLAN_KEYS = {
 DISPATCH_KEYS = {"sdpa_backend", "fa_library", "kernels"}
 STATS_KEYS = {"p25_ms", "median_ms", "p75_ms"}
 TIMING_KEYS = {
-    "mode", "timer", "warmup_iters", "samples", "first_call_ms", "capped", "fallback_reason",
+    "mode", "timer", "warmup_iters", "samples", "first_call_ms", "capped",
+    "fallback_reason", "launch_mode", "requested_warmup_iters", "timed_work_notes",
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
@@ -235,6 +236,7 @@ def test_full_row_values() -> None:
     }
     assert row["metrics"] == {
         "flops": 10**9,
+        "flops_formula_version": None,
         "io_bytes": 10**6,
         "clocks_after": {"sclk_mhz": 1650},
     }
@@ -275,6 +277,9 @@ def test_full_row_values() -> None:
             "first_call_ms": 13.5,
             "capped": False,
             "fallback_reason": None,
+            "launch_mode": "raw",
+            "requested_warmup_iters": None,
+            "timed_work_notes": None,
         },
         "workspace_bytes": 2048,
         "tflops": 4.0,
