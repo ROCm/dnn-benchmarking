@@ -205,6 +205,8 @@ class RockeExecutor:
         self._stream = torch.cuda.default_stream(self._device)
         self._launch: Optional[Callable[[], None]] = None
         self._launch_mode: str = "raw"
+        self._catalog_state: Optional[Tuple[LoadedVariant, Any]] = None
+        self._auto_state: Optional[Tuple[Any, int, str, int, Dict[str, Any]]] = None
         self.build_time_ms: Optional[float] = None
 
     def _bshd_views(
@@ -252,6 +254,7 @@ class RockeExecutor:
             grid=variant.grid,
             block=variant.block,
         )
+        self._catalog_state = (variant, config)
         self._launch = lambda: variant.launcher(values, config=config)
 
     def _prepare_auto(self, q, k, v, o) -> None:
@@ -309,11 +312,47 @@ class RockeExecutor:
                 **extra_kwargs,
             )
 
+        self._auto_state = (problem, bs, backend, stream, extra_kwargs)
         with Timer() as t, torch.cuda.device(self._device):
             launch()
             self._release()
         self.build_time_ms = t.elapsed_ms
         self._launch = launch
+
+    def _bind_tensors(self, tensors: Dict[int, torch.Tensor]) -> Callable[[], None]:
+        """Bind an already-prepared kernel to another buffer set without rebuilding."""
+        q, k, v, o = self._bshd_views(tensors)
+        p = self._problem
+        if self._catalog_state is not None:
+            variant, config = self._catalog_state
+            assert isinstance(self._kernel, CatalogKernel)
+            values = variant_args(self._kernel.arg_names, p, q, k, v, o)
+            return lambda: variant.launcher(values, config=config)
+        if self._auto_state is not None:
+            from kernels import run_unified_attention_torch
+
+            problem, bs, backend, stream, extra_kwargs = self._auto_state
+            views = paged_views(p, bs, q, k, v, o)
+
+            def launch() -> None:
+                run_unified_attention_torch(
+                    problem=problem,
+                    q=views.q_tokens,
+                    k=views.k_cache,
+                    v=views.v_cache,
+                    out=views.o_tokens,
+                    cu_seqlens_q=views.cu_seqlens_q,
+                    seqused_k=views.seqused_k,
+                    softmax_scale=p.scale,
+                    block_table=views.block_table,
+                    softcap=0.0,
+                    backend=backend,
+                    stream=stream,
+                    **extra_kwargs,
+                )
+
+            return launch
+        raise ExecutionError("Executor not prepared. Call prepare() first.")
 
     def execute_once(self) -> None:
         """Launch the kernel once and wait for it."""
@@ -322,11 +361,31 @@ class RockeExecutor:
             launch()
             self._release()
 
-    def benchmark(self) -> Measurement:
+    def benchmark(
+        self,
+        *,
+        tensors_ring: Optional[Sequence[Dict[int, torch.Tensor]]] = None,
+        rotated_bytes: Optional[int] = None,
+    ) -> Measurement:
         """Time the kernel per the executor's policy."""
         from rocke.runtime import no_fence
 
         launch = self._require_prepared()
+        if tensors_ring and len(tensors_ring) > 1:
+            launches = tuple(self._bind_tensors(t) for t in tensors_ring)
+            idx = 0
+
+            def rotating_launch() -> None:
+                nonlocal idx
+                fn = launches[idx]
+                idx = (idx + 1) % len(launches)
+                fn()
+
+            run_fn: Callable[[], None] = rotating_launch
+            n_rot = len(launches)
+        else:
+            run_fn = launch
+            n_rot = 1
         try:
             with (
                 torch.cuda.device(self._device),
@@ -334,13 +393,15 @@ class RockeExecutor:
                 no_fence(),
             ):
                 return measure(
-                    launch,
+                    run_fn,
                     stream=int(self._stream.cuda_stream),
                     policy=self._policy,
                     timer=self._timer,
                     torch_stream=self._stream,
                     after_iteration=self._release_retained,
                     launch_mode=self._launch_mode,
+                    rotated_buffers=n_rot,
+                    rotated_bytes=rotated_bytes if n_rot > 1 else None,
                 )
         finally:
             self._release()

@@ -24,10 +24,12 @@ Timers
 """
 
 import atexit
+import ctypes
 import sys
 import time
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
@@ -69,6 +71,9 @@ class Measurement:
     timing_block: int = 1
     launch_mode: str = "raw"
     requested_warmup_iters: Optional[int] = None
+    flush_method: Optional[str] = None
+    flush_bytes: Optional[int] = None
+    rotated_buffers: int = 1
     timed_work_notes: Optional[List[str]] = None
 
 
@@ -94,14 +99,21 @@ MIXED_MODE_RERUN_REASON = (
 _HIP_API = ("HipEvent", "hip_get_device_count", "hip_device_synchronize")
 _STAGED_HIP_API = ("HipStallGate", "hip_can_use_stream_wait_value")
 
-# ponytail: fixed 512 MiB >= 2x the largest last-level cache we target (MI300X
-# MALL, 256 MiB); derive from device properties if a bigger cache appears.
+# Default fallback flush size (512 MiB) when the GPU arch is unknown; calibrated
+# per-architecture sizes match measured L2/MALL capacity sweeps (ALMIOPEN-3437).
 _FLUSH_BYTES = 512 * 1024 * 1024
+_FLUSH_BYTES_BY_ARCH: Dict[str, int] = {
+    "gfx90a": 24 * 1024 * 1024,  # 8 MiB L2 (no MALL); 3x L2 sweep
+    "gfx942": 640 * 1024 * 1024,  # 256 MiB MALL; 2.5x MALL sweep
+    "gfx950": 640 * 1024 * 1024,  # 256 MiB MALL; 2.5x MALL sweep
+}
 # One cold-cache flush buffer per timer, allocated on first cold iteration.
 _flush_buffers: Dict[str, Any] = {}
+# Cached compiled HIP read-only sweep kernel (module + function + sink), if hiprtc works.
+_hip_sweep_kernel: Optional[Any] = None
+_hip_sweep_probed: bool = False
 # Set when the exit handler that frees the flush buffers is registered.
 _flush_exit_registered = False
-
 # Lazily imported hipdnn_frontend module. Resolved on first HIP use so the tool
 # stays importable on hosts without hipDNN (e.g. CUDA machines running the
 # PyTorch runtime). Tests may inject a fake module here.
@@ -273,21 +285,261 @@ def device_sync(timer: str) -> None:
         torch.cuda.synchronize()
 
 
-def _flush_cache(timer: str) -> None:
-    """Evict L2/MALL by zeroing the flush buffer, then drain the device."""
+def _is_fake_hipdnn() -> bool:
+    """True when unit tests injected a fake module in place of hipdnn_frontend."""
+    return hipdnn is not None and not getattr(hipdnn, "__file__", None)
+
+
+def query_free_vram_bytes(timer: str = "hip") -> Optional[int]:
+    """Return currently free GPU VRAM in bytes, or None if unavailable.
+
+    Never imports ``torch`` on a HIP-only run and never loads a second HIP
+    runtime library.
+    """
+    if _is_fake_hipdnn():
+        return None
+    if timer == "torch" or "torch" in sys.modules:
+        torch = sys.modules.get("torch")
+        try:
+            if (
+                torch is not None
+                and getattr(torch, "__file__", None)
+                and torch.cuda.is_available()
+            ):
+                free, _total = torch.cuda.mem_get_info()
+                return int(free)
+        except Exception:
+            pass
+    try:
+        from ..metrics.gpu_smi import _loaded_hip_runtime
+
+        hip = _loaded_hip_runtime()
+        if hip is not None:
+            free = ctypes.c_size_t(0)
+            total = ctypes.c_size_t(0)
+            if hip.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total)) == 0:
+                return int(free.value)
+    except Exception:
+        pass
+    return None
+
+
+def flush_bytes_for_arch(arch: Optional[str]) -> int:
+    """Calibrated cold-cache sweep size in bytes for ``arch``.
+
+    Uses calibrated L2/MALL sizes for known architectures and falls back to
+    ``_FLUSH_BYTES`` (512 MiB) when the architecture is unlisted or unknown
+    (``hipDeviceAttributeL2CacheSize`` omits MALL on multi-XCD GPUs, so it is
+    not used as a fallback).
+    """
+    if arch:
+        base = str(arch).strip().lower().split(":")[0]
+        if base in _FLUSH_BYTES_BY_ARCH:
+            return _FLUSH_BYTES_BY_ARCH[base]
+    return _FLUSH_BYTES
+
+
+def _detect_flush_bytes(timer: str) -> int:
+    """Determine the calibrated sweep size for the active GPU, else ``_FLUSH_BYTES``."""
+    if _is_fake_hipdnn():
+        return _FLUSH_BYTES
+    if timer == "torch" or "torch" in sys.modules:
+        torch = sys.modules.get("torch")
+        try:
+            if (
+                torch is not None
+                and getattr(torch, "__file__", None)
+                and torch.cuda.is_available()
+            ):
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                arch = getattr(props, "gcnArchName", None) or None
+                if arch:
+                    return flush_bytes_for_arch(arch)
+        except Exception:
+            pass
+    try:
+        from ..metrics.gpu_smi import GpuSmiProbe
+
+        arch, _ = GpuSmiProbe().identity()
+        if arch:
+            return flush_bytes_for_arch(arch)
+    except Exception:
+        pass
+    try:
+        from ..metrics import arch as arch_mod
+
+        detected = arch_mod.detect_arch()
+        if detected and detected != "unknown":
+            return flush_bytes_for_arch(detected)
+    except Exception:
+        pass
+    return _FLUSH_BYTES
+
+
+_READ_SWEEP_HIP_SRC = b"""
+extern "C" __global__ void dnn_bench_read_sweep_u4(
+    const unsigned int* __restrict__ src,
+    unsigned long long count_u4,
+    unsigned int* __restrict__ sink) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    unsigned int acc = 0u;
+    for (unsigned long long i = idx; i < count_u4; i += stride) {
+        unsigned long long base = i * 4ULL;
+        acc ^= src[base] ^ src[base + 1] ^ src[base + 2] ^ src[base + 3];
+    }
+    if (idx == 0ULL) {
+        sink[0] = acc;
+    }
+}
+"""
+
+
+class _HipReadSweep:
+    """Coalesced read-only VRAM sweep compiled once via hiprtc on the loaded HIP runtime."""
+
+    def __init__(
+        self, hip_lib: Any, module: ctypes.c_void_p, fn: ctypes.c_void_p
+    ) -> None:
+        self._hip = hip_lib
+        self._module = module
+        self._fn = fn
+
+    @classmethod
+    def try_build(cls) -> Optional["_HipReadSweep"]:
+        if sys.platform == "win32":
+            return None
+        if hipdnn is None or not getattr(hipdnn, "__file__", None):
+            return None
+        hip_path = None
+        try:
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    parts = line.split(maxsplit=5)
+                    if len(parts) == 6 and "/libamdhip64.so" in parts[5]:
+                        hip_path = Path(parts[5].strip())
+                        break
+        except OSError:
+            return None
+        if hip_path is None:
+            return None
+        rtc_candidates = sorted(hip_path.parent.glob("libhiprtc.so*"))
+        if not rtc_candidates:
+            return None
+        try:
+            hip = ctypes.CDLL(str(hip_path))
+            rtc = ctypes.CDLL(str(rtc_candidates[0]))
+            prog = ctypes.c_void_p()
+            if (
+                rtc.hiprtcCreateProgram(
+                    ctypes.byref(prog),
+                    _READ_SWEEP_HIP_SRC,
+                    b"read_sweep.hip",
+                    0,
+                    None,
+                    None,
+                )
+                != 0
+            ):
+                return None
+            try:
+                if rtc.hiprtcCompileProgram(prog, 0, None) != 0:
+                    return None
+                code_size = ctypes.c_size_t()
+                if rtc.hiprtcGetCodeSize(prog, ctypes.byref(code_size)) != 0:
+                    return None
+                code = ctypes.create_string_buffer(code_size.value)
+                if rtc.hiprtcGetCode(prog, code) != 0:
+                    return None
+            finally:
+                rtc.hiprtcDestroyProgram(ctypes.byref(prog))
+            module = ctypes.c_void_p()
+            if hip.hipModuleLoadData(ctypes.byref(module), code) != 0:
+                return None
+            fn = ctypes.c_void_p()
+            if (
+                hip.hipModuleGetFunction(
+                    ctypes.byref(fn), module, b"dnn_bench_read_sweep_u4"
+                )
+                != 0
+            ):
+                return None
+            return cls(hip, module, fn)
+        except Exception:
+            return None
+
+    def launch(self, buf_ptr: int, nbytes: int, sink_ptr: int, stream: int) -> bool:
+        count_u4 = nbytes // 16
+        if count_u4 <= 0:
+            return False
+        a_src = ctypes.c_uint64(buf_ptr)
+        a_cnt = ctypes.c_uint64(count_u4)
+        a_snk = ctypes.c_uint64(sink_ptr)
+        params = (ctypes.c_void_p * 3)(
+            ctypes.addressof(a_src),
+            ctypes.addressof(a_cnt),
+            ctypes.addressof(a_snk),
+        )
+        threads = 256
+        blocks = min(4096, max(1, (count_u4 + threads - 1) // threads))
+        rc = self._hip.hipModuleLaunchKernel(
+            self._fn,
+            ctypes.c_uint(blocks),
+            ctypes.c_uint(1),
+            ctypes.c_uint(1),
+            ctypes.c_uint(threads),
+            ctypes.c_uint(1),
+            ctypes.c_uint(1),
+            ctypes.c_uint(0),
+            ctypes.c_void_p(stream),
+            params,
+            None,
+        )
+        return rc == 0
+
+
+def _get_hip_sweep_kernel() -> Optional[_HipReadSweep]:
+    global _hip_sweep_kernel, _hip_sweep_probed
+    if not _hip_sweep_probed:
+        _hip_sweep_probed = True
+        _hip_sweep_kernel = _HipReadSweep.try_build()
+    return _hip_sweep_kernel
+
+
+def _flush_cache(timer: str, stream: int = 0) -> Tuple[str, int]:
+    """Evict L2/MALL via a read-only capacity sweep (fallback: zero-fill), then drain.
+
+    Returns ``(method, flush_bytes)`` where ``method`` is ``"read_sweep"`` or
+    ``"zero_fill"``. Never mislabels a zero-fill fallback as ``"read_sweep"``.
+    """
     global _flush_exit_registered
-    buf = _flush_buffers.get(timer)
-    if buf is None:
+    entry = _flush_buffers.get(timer)
+    if entry is None:
+        nbytes = _detect_flush_bytes(timer)
         try:
             if timer == "hip":
-                buf = _require_hip_runtime().DeviceBuffer(_FLUSH_BYTES)
+                mod = _require_hip_runtime()
+                buf = mod.DeviceBuffer(nbytes)
+                sink = None
+                sweep = _get_hip_sweep_kernel()
+                if sweep is not None and hasattr(buf, "ptr"):
+                    buf.zeros()  # pre-touch once at allocation
+                    sink = mod.DeviceBuffer(16)
+                entry = (buf, nbytes, sink)
             else:
                 import torch
 
-                buf = torch.empty(_FLUSH_BYTES, dtype=torch.uint8, device="cuda")
+                buf = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+                if (
+                    hasattr(buf, "zero_")
+                    and hasattr(buf, "view")
+                    and hasattr(torch, "int64")
+                ):
+                    buf.zero_()  # pre-touch once at allocation
+                entry = (buf, nbytes, None)
         except Exception as e:
             raise ExecutionError(
-                f"Cannot allocate the {_FLUSH_BYTES >> 20} MiB cold-cache flush "
+                f"Cannot allocate the {nbytes >> 20} MiB cold-cache flush "
                 f"buffer ({e}); rerun with --cache-mode warm"
             ) from e
         if not _flush_exit_registered:
@@ -296,20 +548,48 @@ def _flush_cache(timer: str) -> None:
             # Once per process: release_flush_buffers() empties the dict.
             atexit.register(_flush_buffers.clear)
             _flush_exit_registered = True
-        _flush_buffers[timer] = buf
+        _flush_buffers[timer] = entry
+
+    buf, nbytes, sink = entry
+    method = "zero_fill"
     if timer == "hip":
-        buf.zeros()
+        sweep = _get_hip_sweep_kernel()
+        if (
+            sweep is not None
+            and sink is not None
+            and hasattr(buf, "ptr")
+            and hasattr(sink, "ptr")
+            and sweep.launch(int(buf.ptr()), nbytes, int(sink.ptr()), stream)
+        ):
+            method = "read_sweep"
+        else:
+            buf.zeros()
     else:
-        buf.zero_()
+        import torch
+
+        if (
+            hasattr(buf, "view")
+            and hasattr(torch, "int64")
+            and hasattr(torch, "sum")
+            and nbytes >= 8
+        ):
+            # Coalesced read-only reduction over pre-touched VRAM; writes only
+            # an 8-byte scalar sink on the current stream.
+            _ = torch.sum(buf[: (nbytes // 8) * 8].view(torch.int64))
+            method = "read_sweep"
+        else:
+            buf.zero_()
     device_sync(timer)
+    return method, nbytes
 
 
 def release_flush_buffers() -> None:
     """Free the cold-cache flush buffers; the next cold iteration reallocates.
 
     Call before a child process allocates its own device memory (the
-    ``--oracle`` tuned runs), so the child does not run with 512 MiB less.
-    The torch allocator keeps freed blocks, so also return them to the device.
+    ``--oracle`` tuned runs), so the child does not run with the flush buffer
+    still held. The torch allocator keeps freed blocks, so also return them to
+    the device.
     """
     had_torch = _flush_buffers.pop("torch", None) is not None
     _flush_buffers.clear()
@@ -360,7 +640,10 @@ def measure(
     timer: str = "hip",
     torch_stream: Any = None,
     after_iteration: Optional[Callable[[], None]] = None,
+    post_first_call: Optional[Callable[[], None]] = None,
     launch_mode: str = "raw",
+    rotated_buffers: int = 1,
+    rotated_bytes: Optional[int] = None,
     timed_work_notes: Optional[Sequence[str]] = None,
 ) -> Measurement:
     """Prime, warm up, then time ``enqueue`` per ``policy`` (a ``TimingPolicy``).
@@ -390,10 +673,13 @@ def measure(
             iteration outside the timed bracket (e.g. releasing rocKE's
             retained eager scratch).
         launch_mode: ``"raw"`` or ``"graph_replay"`` launch provenance.
+        rotated_buffers: Number of rotated I/O buffer sets (1 = none).
+        rotated_bytes: Total bytes across rotated I/O sets when rotating.
         timed_work_notes: Extra non-core work inside the timed closure.
 
     Raises:
         ExecutionError: If the cold-cache flush buffer cannot be allocated.
+        StallFallbackError: If stall-gated timing failed (see
             ``StalledRegionTimer``); the caller remeasures without stalling.
         RuntimeError: If the timer is unavailable.
     """
@@ -406,6 +692,8 @@ def measure(
     first_call_ms = (time.perf_counter() - t0) * 1000.0
     if after_iteration is not None:
         after_iteration()
+    if post_first_call is not None:
+        post_first_call()
     primed = 1
     reason: Optional[str] = None
     if torch_stream is not None:
@@ -427,8 +715,11 @@ def measure(
             reason,
             after_iteration=after_iteration,
             launch_mode=launch_mode,
+            rotated_buffers=rotated_buffers,
+            rotated_bytes=rotated_bytes,
             timed_work_notes=notes,
         )
+
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
         if timer != "hip":
@@ -444,11 +735,14 @@ def measure(
             raise StallFallbackError(f"stall gate unavailable: {e}") from e
 
     cold = policy.cache_mode == "cold"
+    flush_method: Optional[str] = "rotate" if rotated_buffers > 1 else None
+    flush_bytes: Optional[int] = rotated_bytes if rotated_buffers > 1 else None
 
     def iteration() -> Tuple[float, float]:
         """One ``(host_ms, kernel_ms)`` sample on the timed path."""
+        nonlocal flush_method, flush_bytes
         if cold:
-            _flush_cache(timer)
+            flush_method, flush_bytes = _flush_cache(timer, stream)
         if staged is not None:
             sample = staged.measure(enqueue)
         else:
@@ -490,6 +784,9 @@ def measure(
         fallback_reason=reason,
         launch_mode=launch_mode,
         requested_warmup_iters=policy.warmup_iters,
+        flush_method=flush_method,
+        flush_bytes=flush_bytes,
+        rotated_buffers=rotated_buffers,
         timed_work_notes=notes,
     )
 
@@ -505,6 +802,8 @@ def _measure_blocks(
     *,
     after_iteration: Optional[Callable[[], None]] = None,
     launch_mode: str = "raw",
+    rotated_buffers: int = 1,
+    rotated_bytes: Optional[int] = None,
     timed_work_notes: Optional[List[str]] = None,
 ) -> Measurement:
     """rocKE block timing (``time_launches`` / Solera ``measure()``).
@@ -565,6 +864,9 @@ def _measure_blocks(
         timing_block=block,
         launch_mode=launch_mode,
         requested_warmup_iters=policy.warmup_iters,
+        flush_method="rotate" if rotated_buffers > 1 else None,
+        flush_bytes=rotated_bytes if rotated_buffers > 1 else None,
+        rotated_buffers=rotated_buffers,
         timed_work_notes=timed_work_notes,
     )
 

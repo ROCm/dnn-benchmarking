@@ -152,8 +152,10 @@ def _normalize_pytorch_sdpa_settings(
     return selection, rocm_fa_library
 
 
-CACHE_MODE_CHOICES = ("warm", "cold")
+CACHE_MODE_CHOICES = ("warm", "cold", "rotate")
 
+INPUT_RECIPE_CHOICES = ("centered", "llm", "heavy_tail", "legacy", "zeros")
+INPUT_RECIPE_VERSION = 1
 
 PMC_SET_CHOICES = ("basic", "memory", "flops", "all")
 
@@ -190,6 +192,7 @@ class TimingPolicy:
     timing_block: int = 1
     stall_gate: bool = True
     stall_fallback_reason: Optional[str] = None
+    rotate_buffers: int = 0
 
     def __post_init__(self) -> None:
         """Validate loop bounds and the cache mode; messages name CLI flags."""
@@ -208,8 +211,16 @@ class TimingPolicy:
         if self.timing_block <= 0:
             raise ValueError("--timing-block must be >= 1")
         if self.timing_block > 1 and self.cache_mode == "cold":
-            # A flush before a block of N leaves only the first execution cold.
-            raise ValueError("--cache-mode cold requires --timing-block 1")
+            # A flush before a block of N leaves only the first execution cold;
+            # use --cache-mode rotate for cold block timing.
+            raise ValueError(
+                "--cache-mode cold requires --timing-block 1 "
+                "(use --cache-mode rotate for cold block timing)"
+            )
+        if self.rotate_buffers < 0 or self.rotate_buffers == 1:
+            raise ValueError("--rotate-buffers must be 0 (auto) or >= 2")
+        if self.rotate_buffers > 0 and self.cache_mode != "rotate":
+            raise ValueError("--rotate-buffers requires --cache-mode rotate")
 
 
 @dataclass
@@ -463,10 +474,14 @@ class SuiteConfig:
     fast: bool = False
     #: Summed device-time budget per timed loop (0 = fixed iteration count).
     min_time_ms: float = 0.0
-    #: ``warm`` or ``cold`` (flush L2/MALL before each timed iteration).
+    #: ``warm``, ``cold`` (read-only capacity sweep), or ``rotate`` (I/O ring).
     cache_mode: str = "warm"
+    #: Rotating buffer ring size when ``cache_mode == "rotate"`` (0 = auto).
+    rotate_buffers: int = 0
     #: Executions per timed sample (rocKE block timing when > 1).
     timing_block: int = 1
+    #: Named input-value generation recipe (see INPUT_RECIPE_CHOICES).
+    input_recipe: str = "centered"
     #: Suppress progress output; tables and the summary still print.
     quiet: bool = False
     #: Write the JSON result without whitespace (default: one-space indent).
@@ -504,8 +519,10 @@ class SuiteConfig:
             benchmark_iters=args.iters,
             min_time_ms=args.min_time_ms,
             cache_mode=args.cache_mode,
+            rotate_buffers=getattr(args, "rotate_buffers", 0),
             timing_block=args.timing_block,
             seed=args.seed,
+            input_recipe=getattr(args, "input_recipe", "centered"),
             engine_filter=args.engine,
             verbose=args.verbose,
             quiet=args.quiet,
@@ -544,6 +561,10 @@ class SuiteConfig:
 
     def __post_init__(self) -> None:
         """Validate values and cross-field constraints; messages name CLI flags."""
+        if self.input_recipe not in INPUT_RECIPE_CHOICES:
+            raise ValueError(
+                "--input-recipe must be one of: " + ", ".join(INPUT_RECIPE_CHOICES)
+            )
         self.timing_policy = TimingPolicy(
             warmup_iters=self.warmup_iters,
             iters=self.benchmark_iters,
@@ -552,6 +573,7 @@ class SuiteConfig:
             cache_mode=self.cache_mode,
             timing_block=self.timing_block,
             stall_gate=self.stall_gate,
+            rotate_buffers=self.rotate_buffers,
         )
         if self.engine_filter is not None and len(self.engine_filter) == 0:
             raise ValueError("--engine must list at least one engine")

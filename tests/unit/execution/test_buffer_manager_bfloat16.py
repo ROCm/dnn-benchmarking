@@ -261,16 +261,21 @@ class TestGenerateInputData:
     @pytest.mark.parametrize(
         "data_type", ["float", "half", "bfloat16", "double", "fp8_e4m3", "fp8_e5m2"]
     )
-    def test_float_inputs_are_unit_interval_in_logical_dtype(self, data_type) -> None:
+    def test_float_inputs_centered_default_and_legacy_unit_interval(
+        self, data_type
+    ) -> None:
         tensor = _tensor(1, data_type, dims=(64, 64))
 
-        data = generate_input_data([tensor], seed=0)[tensor.uid]
+        centered = generate_input_data([tensor], seed=0)[tensor.uid]
+        assert centered.dtype == tensor.dtype.numpy
+        assert centered.shape == (64, 64)
+        assert centered.min() < 0.0 and centered.max() > 0.0
+        assert np.all(np.isfinite(centered))
 
-        assert data.dtype == tensor.dtype.numpy
-        assert data.shape == (64, 64)
-        # Non-negative (batch-norm variances stay valid), rounded values <= 1.
-        assert data.min() >= 0.0 and data.max() <= 1.0
-        assert len(np.unique(data)) > 1
+        legacy = generate_input_data([tensor], seed=0, recipe="legacy")[tensor.uid]
+        assert legacy.dtype == tensor.dtype.numpy
+        assert legacy.min() >= 0.0 and legacy.max() <= 1.0
+        assert len(np.unique(legacy)) > 1
 
     @pytest.mark.parametrize(
         "data_type", ["int8", "uint8", "int32", "int64", "boolean"]

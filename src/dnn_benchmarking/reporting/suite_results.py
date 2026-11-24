@@ -43,8 +43,11 @@ RUN_CONFIG_KEYS = (
     "iters",
     "min_time_ms",
     "cache_mode",
+    "rotate_buffers",
     "timing_block",
     "seed",
+    "input_recipe",
+    "input_recipe_version",
     "validate",
     "rtol",
     "atol",
@@ -565,6 +568,7 @@ class GraphResult:
     graph_id: Optional[str] = None
     error: Optional[str] = None
     message: Optional[str] = None
+    input_fingerprint: Optional[str] = None
 
     @property
     def status(self) -> Literal["ok", "no_engines", "error"]:
@@ -584,6 +588,7 @@ class GraphResult:
             "status": self.status,
             "error": self.error,
             "message": self.message,
+            "input_fingerprint": self.input_fingerprint,
             "results": [r.to_dict() for r in self.results],
         }
 

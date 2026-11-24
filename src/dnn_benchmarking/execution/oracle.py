@@ -128,6 +128,8 @@ def _hipdnn_tuned_argv(
     config: SuiteConfig,
     out_dir: Path,
     save_outputs: bool,
+    *,
+    rotate_count: int = 1,
 ) -> List[str]:
     """Argv of ``cli/hipdnn_tuned_child.py``, with the full timing policy."""
     argv = [
@@ -140,6 +142,8 @@ def _hipdnn_tuned_argv(
         str(engine_id),
         "--seed",
         str(config.seed),
+        "--input-recipe",
+        config.input_recipe,
         "--timing-policy",
         json.dumps(asdict(config.timing_policy)),
         "--out-dir",
@@ -149,6 +153,8 @@ def _hipdnn_tuned_argv(
         argv += ["--plugin-path", str(plugin_path)]
     if save_outputs:
         argv.append("--save-outputs")
+    if rotate_count > 1:
+        argv += ["--rotate-count", str(rotate_count)]
     return argv
 
 
@@ -179,6 +185,7 @@ def run_hipdnn_tuned(
     plugin_path: Optional[Path],
     config: SuiteConfig,
     validate: Optional[Callable[[Any], CorrectnessResult]],
+    rotate_count: int = 1,
 ) -> None:
     """Time the engine's tuned plan in a child; attach it as ``row.oracle``.
 
@@ -198,6 +205,9 @@ def run_hipdnn_tuned(
     with tempfile.TemporaryDirectory(prefix="dnn-bench-hipdnn-tuned-") as state:
         out_dir = Path(state)
         try:
+            child_extra: Dict[str, Any] = {}
+            if rotate_count > 1:
+                child_extra["rotate_count"] = rotate_count
             result = _run_hipdnn_tuned_child(
                 graph_path,
                 engine_id,
@@ -205,6 +215,7 @@ def run_hipdnn_tuned(
                 config,
                 out_dir,
                 save_outputs=validate is not None,
+                **child_extra,
             )
             m = Measurement(**result["measurement"])
             oracle = OracleResult(
@@ -241,6 +252,8 @@ def _run_hipdnn_tuned_child(
     config: SuiteConfig,
     out_dir: Path,
     save_outputs: bool,
+    *,
+    rotate_count: int = 1,
 ) -> Dict[str, Any]:
     """Run ``cli/hipdnn_tuned_child.py``; return its ``result.json``.
 
@@ -261,6 +274,7 @@ def _run_hipdnn_tuned_child(
         config,
         out_dir,
         save_outputs,
+        rotate_count=rotate_count,
     )
     try:
         proc = run_capped(argv, timeout_s, env=_hipdnn_tuned_env(config, out_dir))
@@ -283,7 +297,11 @@ def _run_hipdnn_tuned_child(
 
 
 def _pytorch_tuned_argv(
-    graph_path: Path, config: SuiteConfig, output: Path
+    graph_path: Path,
+    config: SuiteConfig,
+    output: Path,
+    *,
+    rotate_count: Optional[int] = None,
 ) -> List[str]:
     """CLI argv for the tuned-PyTorch child: one timed PyTorch row, no oracle.
 
@@ -309,10 +327,18 @@ def _pytorch_tuned_argv(
         str(config.min_time_ms),
         "--cache-mode",
         config.cache_mode,
+        "--rotate-buffers",
+        str(
+            rotate_count
+            if rotate_count is not None and rotate_count > 1
+            else config.rotate_buffers
+        ),
         "--timing-block",
         str(config.timing_block),
         "--seed",
         str(config.seed),
+        "--input-recipe",
+        config.input_recipe,
         "--pytorch-sdpa-backend",
         config.pytorch_sdpa_backend.value,
         "--output",
@@ -331,7 +357,12 @@ def _pytorch_tuned_argv(
     return argv
 
 
-def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str, Any]:
+def _run_pytorch_tuned_child(
+    graph_path: Path,
+    config: SuiteConfig,
+    *,
+    rotate_count: Optional[int] = None,
+) -> Dict[str, Any]:
     """Time tuned PyTorch in a fresh process and return its result row.
 
     The child owns the conv algorithm cache and the TunableOp results, in a
@@ -351,7 +382,9 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
         timeout_s = config.oracle_timeout_s or None
         try:
             proc = run_capped(
-                _pytorch_tuned_argv(graph_path, config, output),
+                _pytorch_tuned_argv(
+                    graph_path, config, output, rotate_count=rotate_count
+                ),
                 timeout_s,
                 env=tuned_subprocess_env(
                     state_dir, _tuned_state(config, Path(state_dir))
@@ -398,6 +431,7 @@ def run_pytorch_tuned(
     graph_json: Dict[str, Any],
     graph_name: str,
     config: SuiteConfig,
+    rotate_count: Optional[int] = None,
 ) -> None:
     """Attach a tuned PyTorch run as ``row.oracle``; never fails the row.
 
@@ -415,7 +449,7 @@ def run_pytorch_tuned(
             ``row.oracle_error``.
     """
     try:
-        child = _run_pytorch_tuned_child(graph_path, config)
+        child = _run_pytorch_tuned_child(graph_path, config, rotate_count=rotate_count)
         plan = child["ootb"]
         if (
             config.timing_policy.stall_gate

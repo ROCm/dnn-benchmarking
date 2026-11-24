@@ -292,14 +292,36 @@ class AiterExecutor:
             notes.append("split_kv_scratch")
         return notes
 
-    def benchmark(self) -> Measurement:
+    def benchmark(
+        self,
+        *,
+        tensors_ring: Optional[Sequence[Dict[int, torch.Tensor]]] = None,
+        rotated_bytes: Optional[int] = None,
+    ) -> Measurement:
         """Time the backend per the executor's policy.
 
         A backend that allocates its output keeps the allocation in the timed
         call, as a caller of that AITER entry point does; the copy to the
-        graph's O tensor is not timed.
+        graph's O tensor is not timed. When ``tensors_ring`` holds multiple
+        independent buffer sets (``--cache-mode rotate``), each launch binds
+        directly to the next buffer set without re-running ``prepare()``.
         """
         launch = self._require_prepared()
+        if tensors_ring and len(tensors_ring) > 1:
+            launches = tuple(self._bind_tensors(t)[0] for t in tensors_ring)
+            idx = 0
+
+            def rotating_launch() -> Any:
+                nonlocal idx
+                fn = launches[idx]
+                idx = (idx + 1) % len(launches)
+                return fn()
+
+            run_fn: Launch = rotating_launch
+            n_rot = len(launches)
+        else:
+            run_fn = launch
+            n_rot = 1
         try:
             with (
                 torch.no_grad(),
@@ -307,11 +329,13 @@ class AiterExecutor:
                 torch.cuda.stream(self._stream),
             ):
                 return measure(
-                    launch,
+                    run_fn,
                     stream=int(self._stream.cuda_stream),
                     policy=self._policy,
                     timer=self._timer,
                     torch_stream=self._stream,
+                    rotated_buffers=n_rot,
+                    rotated_bytes=rotated_bytes if n_rot > 1 else None,
                     timed_work_notes=self._timed_work_notes() or None,
                 )
         finally:

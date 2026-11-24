@@ -60,9 +60,12 @@ the keys below.
 | `warmup_iters` | int | `--warmup`. |
 | `iters` | int | `--iters` (minimum timed iterations). |
 | `min_time_ms` | float | `--min-time-ms`. `0` means exactly `iters` samples. |
-| `cache_mode` | string | `warm` or `cold`. |
+| `cache_mode` | string | `warm`, `cold` (read-only capacity sweep), or `rotate` (rotating I/O buffer sets). |
+| `rotate_buffers` | int | `--rotate-buffers`. `0` = auto-sized when `cache_mode` is `rotate`, else `>= 2`. |
 | `timing_block` | int | `--timing-block`. `1` = one launch per sample; `N > 1` = rocKE block timing. |
 | `seed` | int | Input data seed. |
+| `input_recipe` | string | `--input-recipe` (`centered`, `llm`, `heavy_tail`, `legacy`, or `zeros`). |
+| `input_recipe_version` | int | Version of the input-generation recipe implementation. |
 | `validate` | string or null | Reference runtime (`pytorch`), or `null` when validation is off. |
 | `rtol` | float or null | `--rtol` as given. When both `rtol` and `atol` are `null`, validation uses dtype-aware defaults. When only one is given, it also sets the other, which stays `null` here; each row's `correctness.rtol` and `correctness.atol` hold the values a comparison applied (see [correctness](#correctness) for rows where none ran). |
 | `atol` | float or null | `--atol` as given. `null` follows the same rule as `rtol`. |
@@ -140,6 +143,7 @@ The writer recalculates the summary from `graphs`. The row counts include
 | `status` | string | `ok`, `no_engines` (no engine applies to the graph) or `error` (graph-level failure). |
 | `error` | string or null | Graph-level failure, as `ExceptionType: message`. A failure before any row runs has the prefix `Engine discovery failed: ` or `Input data generation failed: `. |
 | `message` | string or null | Why no engine applies, when `status` is `no_engines`: hipDNN's reason, the unsupported tensor data type, or why the tool cannot serve the layout of a variable-length or ragged SDPA graph (the message names the tensor). The console shows `no engines applicable: <message>`. |
+| `input_fingerprint` | string or null | First 12 hex characters of the SHA-256 over the input recipe, version, seed, and generated input tensors (hashes full tensors up to 64 KiB and samples head, strided, and tail slices for larger tensors). `null` when no inputs were generated. |
 | `results` | array | One [row](#row) per engine or reference. Empty when `status` is `error`. When `status` is `no_engines` it has no engine rows, but it holds the `reference` row when `--validate pytorch` ran and PyTorch supports the graph. An SDPA forward graph with Philox dropout has no `reference` row, so with `no_engines` its `results` is empty (see [SDPA dropout](usage.md#sdpa-dropout)). |
 
 ### graph_id
@@ -170,15 +174,16 @@ NaN or infinity has no `graph_id`, and its `status` is `error`.
 
 |Version|Change|
 |---|---|
-|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it. Also adds `metrics.flops_formula_version`, `timing` (`launch_mode`, `requested_warmup_iters`, `timed_work_notes`), and in-run `metrics.clocks_after` telemetry (`in_run_samples`, `throttle_any`, `power_max_w`, `sclk_min_mhz`, `sclk_max_mhz`).|
+|3|`graph_id` is the 64-character geometry hash. A rename or a `metadata` change keeps it. Also adds `run.config` (`rotate_buffers`, `input_recipe`, `input_recipe_version`), `graph.input_fingerprint`, `metrics.flops_formula_version`, `timing` (`launch_mode`, `requested_warmup_iters`, `flush_method`, `flush_bytes`, `rotated_buffers`, `timed_work_notes`), and in-run `metrics.clocks_after` telemetry (`in_run_samples`, `throttle_any`, `power_max_w`, `sclk_min_mhz`, `sclk_max_mhz`).|
 |2|`graph_id` is the first 12 hex characters of the SHA-256 of the whole canonical graph JSON, `name` and `metadata` included.|
 
 All other keys are the same in versions 2 and 3. One exception: files
 written before `run.config.pytorch_dispatch` and the plan key `dispatch` were
 added do not have them. Read them as `null`. `dnn-benchmark compare` joins a
-version 2 file and a version 3 file on `graph_name`. It does not pair a
-`graph_name` that occurs more than once in either file, and reports that name
-as ambiguous. See [usage.md](usage.md#compare).
+version 2 file and a version 3 file on `graph_name`. It treats a missing
+`input_recipe` in older files as `"legacy"`. It does not pair a `graph_name`
+that occurs more than once in either file, and reports that name as ambiguous.
+See [usage.md](usage.md#compare).
 
 ## row
 
@@ -242,10 +247,13 @@ plan compare key by key. `oracle` adds the keys in [oracle](#oracle).
 | `capped` | bool | `true` when the `max_iters` cap (`max(10000, --iters)`) stopped the loop before `--min-time-ms` was reached. |
 | `fallback_reason` | string or null | Why `staged` mode was not used. In `block` mode, set when the enqueue syncs with the host. |
 | `launch_mode` | string | `raw` (direct kernel launches) or `graph_replay` (internal HIP graph replay). |
+| `flush_method` | string or null | Cache de-warming method applied: `read_sweep`, `zero_fill` (fallback), `rotate`, or `null` in `warm` mode. |
+| `flush_bytes` | int or null | Bytes swept per iteration (`cold`) or total bytes across the rotated buffer ring (`rotate`); `null` in `warm` mode. |
+| `rotated_buffers` | int | Number of independent I/O buffer sets rotated during timing (`1` when not rotating). |
 | `timed_work_notes` | array of string or null | Non-core work included in the timed callback when known (for example `output_allocated`, `head_padding`, `triton_buffer_fills`, `split_kv_scratch`, `varlen_per_batch_copy`). |
 
 The cache mode and the launches per sample apply to the whole run, so they
-are in `run.config` (`cache_mode`, `timing_block`). See
+are in `run.config` (`cache_mode`, `rotate_buffers`, `timing_block`). See
 [methodology.md](methodology.md) for the meaning of each mode.
 ### stats
 

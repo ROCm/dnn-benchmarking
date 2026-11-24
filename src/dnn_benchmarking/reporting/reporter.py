@@ -650,6 +650,15 @@ class Reporter:
                 text += f" (requested {t.requested_warmup_iters})"
             if t.launch_mode != "raw":
                 text += f", launch {t.launch_mode}"
+            if t.flush_method:
+                size = (
+                    f" {_fmt_mib(t.flush_bytes / 2**20)}"
+                    if t.flush_bytes is not None
+                    else ""
+                )
+                text += f", flush {t.flush_method}{size}"
+            if t.rotated_buffers > 1:
+                text += f", rotated {t.rotated_buffers}x"
             if t.capped:
                 text += ", capped at max iters"
             if t.fallback_reason:

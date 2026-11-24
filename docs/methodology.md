@@ -343,21 +343,50 @@ when isolating sub-20 µs device busy time.
 | Mode | Behavior |
 |---|---|
 | `warm` (default) | No flush. Inputs, outputs and workspace stay in L2 and MALL between iterations if they fit. |
-| `cold` | Before each warmup and timed iteration: zero a 512 MiB buffer on the device, then drain the device. |
+| `cold` | Before each warmup and timed iteration: run a coalesced, read-only capacity sweep over unrelated device memory on the benchmark stream, then drain the device. Calibrated defaults: 24 MiB on `gfx90a`, 640 MiB on `gfx942`/`gfx950`, and 512 MiB fallback on unlisted or unknown architectures. |
+| `rotate` | Allocate `N` independent copies of the graph I/O buffers (`--rotate-buffers`, default auto-sized from the active GPU's cache eviction target and capped at 60% of free VRAM) and advance to the next copy on every launch with zero extra dispatches between launches. Works across all four runtimes and with both per-launch and `--timing-block N` timing. |
 
-Notes for `cold`:
+Notes for `cold` and `rotate`:
 
-- The flush and drain run outside the timed span. Priming launches are not
-  flushed.
-- 512 MiB is at least 2 x the largest last-level cache targeted (256 MiB MALL
-  on MI300X). The buffer is allocated once per process and freed before
-  `--oracle` child processes start.
-- This does not reset the instruction cache or guarantee an empty hardware
-  cache.
-- `--cache-mode cold` requires `--timing-block 1`.
+- The `cold` sweep and drain run outside the timed span. Priming launches are
+  never flushed. `timing.flush_method` records `read_sweep` (or `zero_fill` if
+  a runtime fallback is used; never relabeled) and `timing.flush_bytes` records
+  the exact byte size.
+- Unlike the legacy zero-fill flush, the read-only sweep leaves no dirty lines
+  in L2/MALL for the timed kernel to write back.
+- The flush buffer is allocated once per process and freed before `--oracle`
+  child processes start.
+- Neither `cold` nor `rotate` resets the instruction cache or guarantees an
+  empty hardware cache; they empirically evict benchmark data.
+- `--cache-mode cold` requires `--timing-block 1`; use `--cache-mode rotate`
+  for cold block timing.
 
-`dnn-benchmark compare` refuses to compare files with different `cache_mode`
-or `timing_block` values unless you give `--allow-mismatch`.
+`dnn-benchmark compare` refuses to compare files with different `cache_mode`,
+`timing_block`, or `input_recipe` values unless you give `--allow-mismatch`.
+
+## Input-value recipes
+
+Input distributions affect power draw, clock frequency, and throughput even
+when the dispatched kernel is unchanged. `--input-recipe` selects a named,
+seeded, versioned recipe (`run.config.input_recipe` and
+`graph.input_fingerprint`):
+
+- `centered` (default): seeded `N(0, 1)` for unconstrained floating-point
+  operands (GEMM, activations), `N(0, d^-0.25)` for SDPA Q/K (keeping `Q @ K^T`
+  unit-variance even when `attn_scale_value` is omitted and hipDNN defaults to
+  `scale = 1.0`), `U[0, 1)` for SDPA V (keeping `O = softmax(QK^T)V` centered
+  near 0.5 instead of cancelling near zero under bf16 tolerance), signed
+  `U[-1, 1)` for fp16-output convolutions, `U[0, 1)` for fp32/fp64-output
+  convolutions (avoiding near-zero cancellation against the float64 reference's
+  fixed `atol`), and strictly positive `U[0.5, 1.5)` for normalization
+  variances, inverse variances, inverse RMS, scales, and epsilons.
+- `llm`: role-aware heavy-tailed distributions fitted to measured LLM
+  checkpoints (Student-t weights `std ~ 0.03`, heavy-tailed activations and
+  Q/K, Laplace V, positive norm gains centered near `1.0`).
+- `heavy_tail`: 99% `N(0, 0.8^2)` + 1% `N(0, 6^2)` clipped to `±16`.
+- `legacy`: historical `U[0, 1)` generator (with `U[-1, 1)` for fp16 conv).
+- `zeros`: diagnostic all-zero float fill (positive norm variances/scales kept
+  at `1.0`).
 
 ## Stop rule
 
@@ -558,12 +587,15 @@ backend or overwrite timed samples. After all OOTB rows of the graph complete
 each pass under the profiler:
 ```text
 python -m dnn_benchmarking --internal-profiling-run --graph G --engine E \
-    --warmup W --iters 5 --seed S [--plugin-path P]
+    --warmup W --iters 5 --seed S [--plugin-path P] [--input-recipe R] [--cache-mode rotate --rotate-buffers N]
 ```
 
-The child builds one engine, fills the inputs with the same seed as the timed
-run, and runs `W + 5` plain graph executes: the same submissions as the timed
-loop, with no workspace reset and no sync between them. Then it drains the
+The child builds one engine, fills the inputs with the same seed and recipe as
+the timed run, and runs `W + 5` plain graph executes (rotating the same `N`
+buffer sets when the timed run used `--cache-mode rotate`, so L2/MALL counters
+match rotated timings without adding extra flush kernels): the same submissions
+as the timed loop, with no workspace reset and no sync between them. Then it
+drains the
 device once. It does not use the timed loop, for two reasons:
 
 - `rocprofv3 --pmc` serializes dispatches. A stalled stream then never
@@ -758,8 +790,8 @@ with PyTorch (`torch.utils.benchmark.Timer.blocked_autorange`,
 | Sync | After each launch; block mode: after each block | One at the end | do_bench: one at the end. Timer: one per block. |
 | Host launch gaps removed | Yes (stall gate) | Amortized over N launches | Amortized (do_bench) |
 | Host submit time | Yes (`host`) | No | Timer: wall time only |
-| Cache flush | `--cache-mode cold`, 512 MiB | Documented only | do_bench: 256 MB zero before each launch |
-| Rotating buffers | No | Documented only | No |
+| Cache flush | `--cache-mode cold` (per-arch read-only sweep) | Documented only | do_bench: 256 MB zero before each launch |
+| Rotating buffers | `--cache-mode rotate` (`--rotate-buffers`) | Documented only | No |
 | Graph replay | Raw launches (`launch_mode = raw` recorded) | Yes | `do_bench_cudagraph` |
 | Outliers | Flagged (IQR/median noise flag, max/median outlier flag), never removed; block mode discards the first sample | Discard first run | Timer: IQR warnings |
 | Statistics | n, mean, std, min, p25, median, p75, p95, max, IQR | median, min, max, mean, stdev, spread | do_bench: mean or quantiles. Timer: median, IQR. |

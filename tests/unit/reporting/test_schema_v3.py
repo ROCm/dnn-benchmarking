@@ -24,9 +24,10 @@ TOP_KEYS = {"schema_version", "tool", "run", "environment", "summary", "graphs"}
 RUN_KEYS = {"started_at", "finished_at", "complete", "argv", "config"}
 CONFIG_KEYS = {
     "runtime", "runtimes", "engine_filter", "plugin_paths", "warmup_iters", "iters",
-    "min_time_ms", "cache_mode", "timing_block", "seed", "validate", "rtol", "atol",
-    "reference_precision", "oracle", "autotune", "benchmark_work_dir", "fresh_state",
-    "fast",
+    "min_time_ms", "cache_mode", "rotate_buffers", "timing_block", "seed",
+    "input_recipe", "input_recipe_version", "validate",
+    "rtol", "atol", "reference_precision", "oracle", "autotune",
+    "benchmark_work_dir", "fresh_state", "fast",
     "pytorch_sdpa_backend", "pytorch_rocm_fa_library", "pytorch_dispatch",
     "aiter_rows", "metrics",
     "profiling",
@@ -52,6 +53,7 @@ GRAPH_KEYS = {
     "status",
     "error",
     "message",
+    "input_fingerprint",
     "results",
 }
 ROW_KEYS = {
@@ -69,7 +71,8 @@ DISPATCH_KEYS = {"sdpa_backend", "fa_library", "kernels"}
 STATS_KEYS = {"p25_ms", "median_ms", "p75_ms"}
 TIMING_KEYS = {
     "mode", "timer", "warmup_iters", "samples", "first_call_ms", "capped",
-    "fallback_reason", "launch_mode", "requested_warmup_iters", "timed_work_notes",
+    "fallback_reason", "launch_mode", "requested_warmup_iters", "flush_method",
+    "flush_bytes", "rotated_buffers", "timed_work_notes",
 }  # fmt: skip
 CORRECTNESS_KEYS = {
     "match", "rtol", "atol", "max_abs_diff", "max_rel_diff", "n_mismatch",
@@ -279,6 +282,9 @@ def test_full_row_values() -> None:
             "fallback_reason": None,
             "launch_mode": "raw",
             "requested_warmup_iters": None,
+            "flush_method": None,
+            "flush_bytes": None,
+            "rotated_buffers": 1,
             "timed_work_notes": None,
         },
         "workspace_bytes": 2048,

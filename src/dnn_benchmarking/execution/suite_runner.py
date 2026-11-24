@@ -9,6 +9,7 @@ the ``--validate`` reference once, and appends each runtime's rows in run
 order. Every row is timed by ``timing.measure`` (through the executors).
 """
 
+from contextlib import ExitStack
 import copy
 import gc
 import json
@@ -30,7 +31,7 @@ from typing import (
 )
 
 from ..common import torch_support
-from ..common.exceptions import UnsupportedGraphError
+from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import (
     AiterRows,
     PyTorchSdpaBackendName,
@@ -38,7 +39,12 @@ from ..config.benchmark_config import (
     SuiteConfig,
     TimingPolicy,
 )
-from ..execution.buffer_manager import BufferManager, generate_input_data
+from ..execution.buffer_manager import (
+    BufferManager,
+    buffer_set_bytes,
+    generate_input_data,
+    input_fingerprint,
+)
 from ..execution.executor import Executor
 from ..execution.timing import (
     MIXED_MODE_RERUN_REASON,
@@ -47,6 +53,9 @@ from ..execution.timing import (
     MixedModeFallbackError,
     StallFallbackError,
     Timer,
+    _detect_flush_bytes,
+    measure,
+    query_free_vram_bytes,
 )
 from ..graph.tensor_info import TensorInfo
 from ..graph.varlen import resolve_varlen_layouts
@@ -95,6 +104,7 @@ class _GraphContext:
     config: SuiteConfig
     reporter: Reporter
     input_data: Dict[int, Any]
+    input_fingerprint: Optional[str] = None
     flops: Optional[int] = None
     io_bytes: Optional[int] = None
     reference_outputs: Optional[Dict[int, ReferenceOutput]] = None
@@ -105,6 +115,78 @@ class _GraphContext:
     # against a reference built from its own dump.
     philox: Optional[RngDump] = None
     graph_json_str: str = ""  # hipDNN runs only
+
+
+#: Fraction of currently free GPU VRAM the rotating buffer ring may occupy.
+#: Leaves headroom for workspaces, allocator fragmentation and kernel scratch.
+_ROTATE_VRAM_FRACTION = 0.6
+_ROTATE_MAX_SETS = 256
+
+
+def _rotate_count(
+    ctx: _GraphContext,
+    timer: str = "hip",
+    *,
+    reserve_bytes: int = 0,
+    warnings: Optional[List[str]] = None,
+) -> int:
+    """Number of independent I/O buffer sets for ``--cache-mode rotate``.
+
+    Auto-sized rings target the active GPU's calibrated cache-eviction size
+    (``_detect_flush_bytes``) and clamp to stay within ``_ROTATE_VRAM_FRACTION``
+    of currently free VRAM. Raises :class:`ExecutionError` when the requested
+    or minimum 2-set ring would exceed the safe VRAM budget.
+    """
+    if ctx.config.cache_mode != "rotate":
+        return 1
+    per_set = buffer_set_bytes(ctx.tensor_infos)
+    free_vram = query_free_vram_bytes(timer)
+    budget: Optional[int] = None
+    if free_vram is not None:
+        budget = max(
+            0, int((free_vram - max(0, reserve_bytes)) * _ROTATE_VRAM_FRACTION)
+        )
+    mib = float(1 << 20)
+
+    if ctx.config.rotate_buffers >= 2:
+        requested = ctx.config.rotate_buffers
+        if budget is not None and per_set > 0:
+            max_fit = budget // per_set
+            if requested > max_fit:
+                hint = (
+                    f"use --rotate-buffers {max_fit} or --cache-mode cold"
+                    if max_fit >= 2
+                    else "rerun with --cache-mode cold or --cache-mode warm"
+                )
+                raise ExecutionError(
+                    f"--rotate-buffers {requested} needs {(requested * per_set) / mib:.1f} MiB, "
+                    f"exceeding the safe VRAM budget ({budget / mib:.1f} MiB of "
+                    f"{free_vram / mib:.1f} MiB free); {hint}"
+                )
+        return requested
+
+    target = _detect_flush_bytes(timer)
+    desired = (
+        2 if per_set <= 0 else max(2, min(_ROTATE_MAX_SETS, (target // per_set) + 1))
+    )
+    if budget is not None and per_set > 0:
+        max_fit = budget // per_set
+        if max_fit < 2:
+            raise ExecutionError(
+                f"--cache-mode rotate needs at least 2 buffer sets ({(2 * per_set) / mib:.1f} MiB), "
+                f"exceeding the safe VRAM budget ({budget / mib:.1f} MiB of "
+                f"{free_vram / mib:.1f} MiB free); rerun with --cache-mode cold or --cache-mode warm"
+            )
+        if desired > max_fit:
+            if warnings is not None:
+                warnings.append(
+                    f"rotate buffer count clamped from {desired} to {max_fit} to stay within "
+                    f"safe VRAM budget ({budget / mib:.1f} MiB of {free_vram / mib:.1f} MiB free); "
+                    f"ring size ({(max_fit * per_set) / mib:.1f} MiB) is below cache eviction "
+                    f"target ({target / mib:.1f} MiB)"
+                )
+            desired = max_fit
+    return desired
 
 
 def set_plugin_path(hipdnn: Any, plugin_path: Optional[Path]) -> None:
@@ -209,6 +291,7 @@ def _measure_row(
         m = benchmark()
         if probe is not None:
             row.clocks_after = probe.clocks()
+
     kernel = BenchmarkStats.from_timings(m.kernel_ms)
     host = BenchmarkStats.from_timings(m.host_ms)
     row.ootb.gpu_kernel_stats = kernel
@@ -331,7 +414,13 @@ def _graph_context(
 ) -> _GraphContext:
     """Generate inputs and per-graph analytical FLOPs/IO (shape-only, once)."""
     graph_name = graph_json.get("name", graph_path.stem)
-    input_data = generate_input_data(tensor_infos, config.seed, graph_json)
+    if config.input_recipe == "centered":
+        input_data = generate_input_data(tensor_infos, config.seed, graph_json)
+    else:
+        input_data = generate_input_data(
+            tensor_infos, config.seed, graph_json, recipe=config.input_recipe
+        )
+    fp = input_fingerprint(input_data, config.input_recipe, config.seed)
     # Rebind: every consumer, and the analytical IO, sees the resolved layouts.
     tensor_infos = resolve_varlen_layouts(tensor_infos, graph_json, input_data)
     ctx = _GraphContext(
@@ -343,6 +432,7 @@ def _graph_context(
         reporter=reporter,
         input_data=input_data,
         philox=find_rng_dump(graph_json),
+        input_fingerprint=fp,
     )
     if config.metrics.basic:
         try:
@@ -516,12 +606,35 @@ def _time_pytorch_row(
         )
         executor.prepare()
         # The executor's device, not the buffer manager's cuda:0 default.
-        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
-            bm.allocate_all()
-            bm.load_input_data(ctx.input_data)
-            bm.zero_outputs()
+        rot_warnings: List[str] = []
+        n_rot = _rotate_count(ctx, timer="torch", warnings=rot_warnings)
+        if rot_warnings:
+            row.warnings = (row.warnings or []) + rot_warnings
+        with ExitStack() as stack:
+            bms = [
+                stack.enter_context(
+                    PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device)
+                )
+                for _ in range(n_rot)
+            ]
+            for bm in bms:
+                bm.allocate_all()
+                bm.load_input_data(ctx.input_data)
+                bm.zero_outputs()
+            bm = bms[0]
             tensors = bm.get_tensors()
-            _measure_row(row, ctx, lambda: executor.benchmark(tensors))
+            if n_rot > 1:
+                ring = [m.get_tensors() for m in bms]
+                rot_bytes = n_rot * buffer_set_bytes(ctx.tensor_infos)
+                _measure_row(
+                    row,
+                    ctx,
+                    lambda: executor.benchmark(
+                        tensors, tensors_ring=ring, rotated_bytes=rot_bytes
+                    ),
+                )
+            else:
+                _measure_row(row, ctx, lambda: executor.benchmark(tensors))
             row.warnings = (row.warnings or []) + executor.notes
             if config.pytorch_dispatch:
                 _record_dispatch(row, ctx, executor)
@@ -544,12 +657,16 @@ def _time_pytorch_row(
         # After the OOTB buffers are released, so the child's allocations do
         # not stack on top of them.
         if config.oracle:
+            pt_oracle_kwargs: Dict[str, Any] = {}
+            if n_rot > 1:
+                pt_oracle_kwargs["rotate_count"] = n_rot
             run_pytorch_tuned(
                 row=row,
                 graph_path=ctx.graph_path,
                 graph_json=ctx.graph_json,
                 graph_name=ctx.graph_name,
                 config=config,
+                **pt_oracle_kwargs,
             )
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.
@@ -617,8 +734,7 @@ def run_single_provider_engine(
     engine_version: str,
     plugin_path: Optional[Path],
 ) -> ProviderEngineResult:
-    """Build, time and validate one hipDNN engine; then its tuned run and
-    profiling passes, each in a child process."""
+    """Build, time and validate one hipDNN engine; then its tuned run in a child."""
     config = ctx.config
     plugin = str(plugin_path) if plugin_path is not None else None
     row = ProviderEngineResult(
@@ -640,14 +756,37 @@ def run_single_provider_engine(
         if config.metrics.basic:
             row.ootb.workspace_bytes = executor.workspace_size
 
-        with BufferManager(
-            ctx.tensor_infos, device=_hipdnn_buffer_device(ctx.reference_outputs)
-        ) as bm:
-            bm.allocate_all()
-            bm.load_input_data(ctx.input_data)
-            bm.zero_outputs()
+        buf_dev = _hipdnn_buffer_device(ctx.reference_outputs)
+        rot_warnings: List[str] = []
+        n_rot = _rotate_count(ctx, timer="hip", warnings=rot_warnings)
+        if rot_warnings:
+            row.warnings = (row.warnings or []) + rot_warnings
+        with ExitStack() as stack:
+            bms = [
+                stack.enter_context(BufferManager(ctx.tensor_infos, device=buf_dev))
+                for _ in range(n_rot)
+            ]
+            for bm in bms:
+                bm.allocate_all()
+                bm.load_input_data(ctx.input_data)
+                bm.zero_outputs()
+            bm = bms[0]
             variant_pack = bm.create_variant_pack()
-            _measure_row(row, ctx, lambda: executor.benchmark(handle, variant_pack))
+            if n_rot > 1:
+                vps = [m.create_variant_pack() for m in bms]
+                rot_bytes = n_rot * buffer_set_bytes(ctx.tensor_infos)
+                _measure_row(
+                    row,
+                    ctx,
+                    lambda: executor.benchmark(
+                        handle,
+                        variant_pack,
+                        variant_packs=vps,
+                        rotated_bytes=rot_bytes,
+                    ),
+                )
+            else:
+                _measure_row(row, ctx, lambda: executor.benchmark(handle, variant_pack))
 
             _validate_row(
                 row, ctx, bm, lambda: executor.execute_once(handle, variant_pack)
@@ -671,6 +810,9 @@ def run_single_provider_engine(
     # process uses the OOTB one, and profiler overhead cannot pollute
     # the headline numbers.
     if config.oracle:
+        oracle_kwargs: Dict[str, Any] = {}
+        if n_rot > 1:
+            oracle_kwargs["rotate_count"] = n_rot
         run_hipdnn_tuned(
             row=row,
             graph_path=ctx.graph_path,
@@ -679,6 +821,7 @@ def run_single_provider_engine(
             plugin_path=plugin_path,
             config=config,
             validate=_tuned_validator(ctx),
+            **oracle_kwargs,
         )
     return row
 
@@ -898,6 +1041,15 @@ def _run_profiling(
     ctx.reporter.profiling_start(engine_name)
     with Timer() as t:
         try:
+            prof_extra: Dict[str, Any] = {}
+            if ctx.config.input_recipe != "centered":
+                prof_extra["input_recipe"] = ctx.config.input_recipe
+            if (
+                row.ootb is not None
+                and row.ootb.timing is not None
+                and row.ootb.timing.rotated_buffers > 1
+            ):
+                prof_extra["rotate_buffers"] = row.ootb.timing.rotated_buffers
             extra = run_profiling_passes(
                 graph_path=ctx.graph_path,
                 engine_id=engine_id,
@@ -906,6 +1058,7 @@ def _run_profiling(
                 warmup_iters=ctx.config.warmup_iters,
                 metrics_config=ctx.config.metrics,
                 plugin_path=plugin_path,
+                **prof_extra,
             )
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
@@ -1270,11 +1423,11 @@ def _run_graph(
             graph.error = "; ".join(errors)
             return graph
         ctx.graph_json_str = json.dumps(graph_json)
+        graph.input_fingerprint = ctx.input_fingerprint
         if config.validation.enabled:
             reference_row = _prepare_references(ctx)
             if reference_row is not None:
                 graph.results.append(reference_row)
-
     for plan in plans:
         graph.results.extend(plan.rows(ctx))
     if config.timing_policy.stall_gate and config.timing_policy.timing_block == 1:
@@ -1583,14 +1736,37 @@ def _run_executor_row(
     try:
         from .pytorch_buffer_manager import PyTorchCudaBufferManager
 
+        rot_warnings: List[str] = []
+        n_rot = _rotate_count(ctx, timer="torch", warnings=rot_warnings)
+        if rot_warnings:
+            row.warnings = (row.warnings or []) + rot_warnings
         executor = make_executor()
-        with PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device) as bm:
-            bm.allocate_all()
-            bm.load_input_data(ctx.input_data)
-            bm.zero_outputs()
+        with ExitStack() as stack:
+            bms = [
+                stack.enter_context(
+                    PyTorchCudaBufferManager(ctx.tensor_infos, device=executor.device)
+                )
+                for _ in range(n_rot)
+            ]
+            for bm in bms:
+                bm.allocate_all()
+                bm.load_input_data(ctx.input_data)
+                bm.zero_outputs()
+            bm = bms[0]
             executor.prepare(bm.get_tensors())
             row.ootb.cpu_build_time_ms = executor.build_time_ms
-            _measure_row(row, ctx, executor.benchmark)
+            if n_rot > 1:
+                ring = [m.get_tensors() for m in bms]
+                rot_bytes = n_rot * buffer_set_bytes(ctx.tensor_infos)
+                _measure_row(
+                    row,
+                    ctx,
+                    lambda: executor.benchmark(
+                        tensors_ring=ring, rotated_bytes=rot_bytes
+                    ),
+                )
+            else:
+                _measure_row(row, ctx, executor.benchmark)
             _validate_row(row, ctx, bm, executor.execute_once)
     except StallFallbackError:
         raise  # run_graph remeasures the whole graph unstalled.

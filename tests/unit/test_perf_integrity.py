@@ -1,7 +1,7 @@
 # Copyright © Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier:  MIT
 
-"""Regression tests for timing integrity, compare gates, runtime guards, and telemetry."""
+"""Regression tests for timing integrity, cache modes, input recipes, and telemetry."""
 
 from __future__ import annotations
 
@@ -16,11 +16,16 @@ import pytest
 
 from dnn_benchmarking.cli import hipdnn_tuned_child, suite_runner_cli
 from dnn_benchmarking.config.benchmark_config import (
+    INPUT_RECIPE_CHOICES,
     SuiteConfig,
     TimingPolicy,
     ValidationConfig,
 )
 from dnn_benchmarking.execution import aiter_sdpa, oracle, suite_runner, timing
+from dnn_benchmarking.execution.buffer_manager import (
+    generate_input_data,
+    input_fingerprint,
+)
 from dnn_benchmarking.execution.correctness import check_correctness
 from dnn_benchmarking.execution.sdpa_graph import DenseSdpa
 from dnn_benchmarking.graph.tensor_info import TensorInfo
@@ -228,6 +233,18 @@ def test_compare_missing_quartile_is_unknown_spread_not_zero(tmp_path, capsys) -
     assert report["unknown_spread"] == 1
     assert report["pairs"][0]["label"] == "unknown spread"
     assert report["pairs"][0]["in_geomean"] is False
+
+
+def test_compare_gates_input_recipe_mismatch(tmp_path, capsys) -> None:
+    a = _write_suite(
+        tmp_path, "a.json", [("g", "id", [_row("E", 1.0)])], input_recipe="centered"
+    )
+    b = _write_suite(
+        tmp_path, "b.json", [("g", "id", [_row("E", 1.0)])], input_recipe="legacy"
+    )
+    assert compare.main([a, b]) == 2
+    assert "input_recipe" in capsys.readouterr().err
+    assert compare.main([a, b, "--allow-mismatch"]) == 0
 
 
 def test_partial_missing_actual_output_fails_validation() -> None:
@@ -556,6 +573,59 @@ def test_signal_restore_skips_native_none_handlers(tmp_path, monkeypatch) -> Non
 # --- Analytical FLOPs and timer resolution warnings ---
 
 
+def test_flush_bytes_for_arch_and_rotate_policy() -> None:
+    assert timing.flush_bytes_for_arch("gfx90a:sramecc+:xnack-") == 24 * 1024 * 1024
+    assert timing.flush_bytes_for_arch("gfx942") == 640 * 1024 * 1024
+    assert timing.flush_bytes_for_arch("gfx950") == 640 * 1024 * 1024
+    assert timing.flush_bytes_for_arch("unknown") == 512 * 1024 * 1024
+
+    # Cold block is rejected; rotate block is accepted.
+    with pytest.raises(ValueError, match="rotate"):
+        TimingPolicy(cache_mode="cold", timing_block=10)
+    p = TimingPolicy(cache_mode="rotate", timing_block=10, rotate_buffers=8)
+    assert (p.cache_mode, p.timing_block, p.rotate_buffers) == ("rotate", 10, 8)
+    with pytest.raises(ValueError, match="--rotate-buffers"):
+        TimingPolicy(cache_mode="warm", rotate_buffers=4)
+    with pytest.raises(ValueError, match="--rotate-buffers"):
+        TimingPolicy(cache_mode="rotate", rotate_buffers=1)
+
+
+@pytest.mark.parametrize("recipe", INPUT_RECIPE_CHOICES)
+def test_all_input_recipes_finite_deterministic_and_fingerprinted(recipe) -> None:
+    t_x = TensorInfo(1, "x", [64, 64], [64, 1], "half", is_virtual=False)
+    t_v = TensorInfo(2, "var", [64], [1], "float", is_virtual=False)
+    graph = {
+        "tensors": [{"uid": 3, "data_type": "half"}],
+        "nodes": [
+            {
+                "type": "BatchnormInferenceAttributes",
+                "inputs": {"x_tensor_uid": 1, "inv_variance_tensor_uid": 2},
+                "outputs": {"y_tensor_uid": 3},
+            }
+        ],
+    }
+    d1 = generate_input_data([t_x, t_v], seed=42, graph_json=graph, recipe=recipe)
+    d2 = generate_input_data([t_x, t_v], seed=42, graph_json=graph, recipe=recipe)
+    assert np.array_equal(d1[1], d2[1])
+    assert np.all(np.isfinite(d1[1])) and np.all(np.isfinite(d1[2]))
+    assert d1[2].min() >= 0.0
+    if recipe != "legacy":
+        assert d1[2].min() > 0.0
+    fp1 = input_fingerprint(d1, recipe, 42)
+    fp2 = input_fingerprint(d2, recipe, 42)
+    assert fp1 == fp2 and len(fp1) == 12
+    # Fingerprint must change with seed, recipe, or element content.
+    assert input_fingerprint(d1, recipe, 43) != fp1
+    other_recipe = "legacy" if recipe != "legacy" else "centered"
+    assert input_fingerprint(d1, other_recipe, 42) != fp1
+    mutated = {k: v.copy() for k, v in d1.items()}
+    mutated[1].reshape(-1)[0] = np.float16(float(mutated[1].reshape(-1)[0]) + 1.0)
+    assert input_fingerprint(mutated, recipe, 42) != fp1
+
+
+# --- Analytical FLOPs and timer resolution warnings ---
+
+
 def test_packed_paged_sdpa_without_lengths_returns_none() -> None:
     graph = {
         "tensors": [
@@ -621,6 +691,273 @@ def test_zero_sample_emits_timer_resolution_warning() -> None:
 # --- Reporter, DVC setup, AITER env flags, and runtime invariants ---
 
 
+def test_pytorch_rotate_primes_ring_after_first_call_without_hiding_setup(
+    monkeypatch,
+) -> None:
+    """First call runs cold on set 0 before sets 1..N-1 are primed for probe/timed loops."""
+    import contextlib
+    from dnn_benchmarking.execution import pytorch_executor
+
+    events: List[Any] = []
+    syncs = {"n": 0}
+
+    class FakeStream:
+        cuda_stream = 1234
+
+        def synchronize(self):
+            syncs["n"] += 1
+
+    class FakeReplay:
+        def __init__(self, tensors):
+            self.tensors = tensors
+            self.notes = []
+            self.cached = False
+
+    def fake_measure(enqueue_fn, **kw):
+        post_first_call = kw.get("post_first_call")
+        events.append("first_call")
+        enqueue_fn()  # set 0 cold first call
+        if post_first_call is not None:
+            events.append("post_first_call")
+            post_first_call()
+        events.append("probe_and_loop")
+        for _ in range(3):
+            enqueue_fn()
+        return timing.Measurement([1.0], [0.1], "staged", "torch", "rotate", 1, 1.0)
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            device=lambda _d: contextlib.nullcontext(),
+            stream=lambda _s: contextlib.nullcontext(),
+        )
+    )
+    monkeypatch.setattr(pytorch_executor, "torch", fake_torch)
+    monkeypatch.setattr(pytorch_executor.pytorch_ops, "ReplayTensors", FakeReplay)
+    monkeypatch.setattr(pytorch_executor, "measure", fake_measure)
+
+    ex = pytorch_executor.PyTorchCudaExecutor.__new__(
+        pytorch_executor.PyTorchCudaExecutor
+    )
+    ex._device = "cuda:0"
+    ex._stream = FakeStream()
+    ex._policy = TimingPolicy(cache_mode="rotate", rotate_buffers=3)
+    ex._timer = "torch"
+
+    def fake_exec(replay):
+        sid = replay.tensors["id"]
+        if events and events[-1] == "probe_and_loop":
+            assert replay.cached is True, f"set {sid} was not primed before probe/loop"
+        events.append(sid)
+        replay.cached = True
+
+    ex._execute_graph = fake_exec
+    ring = [{"id": 0}, {"id": 1}, {"id": 2}]
+    ex.benchmark(ring[0], tensors_ring=ring, rotated_bytes=96)
+
+    # Set 0 runs first (cold), then post_first_call primes sets 1..2, then loop runs 1, 2, 0.
+    assert events == [
+        "first_call",
+        0,
+        "post_first_call",
+        1,
+        2,
+        "probe_and_loop",
+        1,
+        2,
+        0,
+    ]
+    assert syncs["n"] == 1
+
+
+def test_hipdnn_tuned_child_rotates_buffers_and_forwards_recipe(
+    tmp_path, monkeypatch
+) -> None:
+    """hipdnn_tuned_child rotates N BufferManagers and forwards input recipe."""
+    import sys
+
+    graph_path = tmp_path / "g.json"
+    graph_path.write_text(json.dumps(_MINIMAL_GRAPH))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    cache_dir = tmp_path / "cache"
+    db_dir = tmp_path / "db"
+    cache_dir.mkdir()
+    db_dir.mkdir()
+    monkeypatch.setenv("HIPDNN_FORCE_BENCHMARKING", "1")
+    monkeypatch.setenv("HIPDNN_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("MIOPEN_USER_DB_PATH", str(db_dir))
+    monkeypatch.setattr(hipdnn_tuned_child, "initialize_pip_rocm_runtime", lambda: None)
+    monkeypatch.setattr(hipdnn_tuned_child, "set_plugin_path", lambda h, p: None)
+
+    seen: Dict[str, Any] = {}
+
+    class FakeExec:
+        build_time_ms = 1.0
+        workspace_size = 0
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def prime(self, *a, **kw):
+            pass
+
+        def prepare(self, handle, *, engine_id=None, knobs=None):
+            seen["knobs"] = knobs
+
+        def engine_knob_ids(self, eid):
+            return [oracle.BENCHMARKING_KNOB]
+
+        def benchmark(self, handle, vp, *, variant_packs=None, rotated_bytes=None):
+            seen["variant_packs"] = variant_packs
+            seen["rotated_bytes"] = rotated_bytes
+            return timing.Measurement(
+                [1.0],
+                [0.1],
+                "block",
+                "hip",
+                "rotate",
+                1,
+                1.0,
+                rotated_buffers=len(variant_packs or [vp]),
+                flush_method="rotate",
+                flush_bytes=rotated_bytes,
+            )
+
+    bm_count = {"n": 0}
+
+    class FakeBM:
+        def __init__(self, infos):
+            bm_count["n"] += 1
+            self.idx = bm_count["n"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def allocate_all(self):
+            pass
+
+        def load_input_data(self, data):
+            pass
+
+        def zero_outputs(self):
+            pass
+
+        def create_variant_pack(self):
+            return {"pack": self.idx}
+
+    monkeypatch.setitem(
+        sys.modules, "hipdnn_frontend", types.SimpleNamespace(Handle=lambda: object())
+    )
+    monkeypatch.setattr(hipdnn_tuned_child, "Executor", FakeExec)
+    monkeypatch.setattr(hipdnn_tuned_child, "BufferManager", FakeBM)
+
+    cfg = SuiteConfig(
+        cache_mode="rotate", rotate_buffers=3, timing_block=4, input_recipe="llm"
+    )
+    argv = oracle._hipdnn_tuned_argv(
+        graph_path,
+        1,
+        None,
+        cfg,
+        out_dir,
+        False,
+        rotate_count=3,
+    )
+    assert "--rotate-count" in argv and argv[argv.index("--rotate-count") + 1] == "3"
+
+    rc = hipdnn_tuned_child.main(argv[3:])
+    assert rc == 0
+    assert seen["knobs"] == {oracle.BENCHMARKING_KNOB: 1}
+    assert len(seen["variant_packs"]) == 3
+    assert seen["rotated_bytes"] == 3 * 32  # 2 tensors * 4 floats * 4 bytes each
+
+
+def test_profiling_orchestrator_forwards_input_recipe_and_rotate_buffers(
+    tmp_path, monkeypatch
+) -> None:
+    import sys
+    from dnn_benchmarking.cli import internal_profiling
+    from dnn_benchmarking.cli.parser import create_parser
+    from dnn_benchmarking.metrics.profiling_orchestrator import build_inner_argv
+
+    default_argv = build_inner_argv(Path("/g.json"), 1, 0, 2, 5, None)
+    assert (
+        "--input-recipe" not in default_argv and "--rotate-buffers" not in default_argv
+    )
+
+    gpath = tmp_path / "g.json"
+    gpath.write_text(json.dumps(_MINIMAL_GRAPH))
+    argv = build_inner_argv(
+        gpath,
+        1,
+        0,
+        2,
+        3,
+        None,
+        input_recipe="llm",
+        rotate_buffers=4,
+    )
+    parsed = create_parser().parse_args(argv[3:])
+    assert parsed.input_recipe == "llm"
+    assert parsed.cache_mode == "rotate"
+    assert parsed.rotate_buffers == 4
+
+    # Verify run_internal_profiling allocates 4 BufferManagers and cycles all 4
+    # variant packs across warmup + iters enqueues without extra flush kernels.
+    enqueued: List[Any] = []
+    bm_count = {"n": 0}
+
+    class FakeExec:
+        def __init__(self, *a, **kw):
+            pass
+
+        def prepare(self, handle, *, engine_id=None, knobs=None):
+            pass
+
+        def enqueue(self, handle, vp):
+            enqueued.append(vp["pack"])
+
+    class FakeBM:
+        def __init__(self, infos):
+            bm_count["n"] += 1
+            self.idx = bm_count["n"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def allocate_all(self):
+            pass
+
+        def load_input_data(self, data):
+            pass
+
+        def zero_outputs(self):
+            pass
+
+        def create_variant_pack(self):
+            return {"pack": self.idx}
+
+    monkeypatch.setattr(internal_profiling, "initialize_pip_rocm_runtime", lambda: None)
+    monkeypatch.setattr(internal_profiling, "set_plugin_path", lambda h, p: None)
+    monkeypatch.setattr(internal_profiling, "device_sync", lambda _t: None)
+    monkeypatch.setattr(internal_profiling, "Executor", FakeExec)
+    monkeypatch.setattr(internal_profiling, "BufferManager", FakeBM)
+    monkeypatch.setitem(
+        sys.modules, "hipdnn_frontend", types.SimpleNamespace(Handle=lambda: object())
+    )
+
+    rc = internal_profiling.run_internal_profiling(parsed)
+    assert rc == 0
+    assert bm_count["n"] == 4
+    assert enqueued == [1, 2, 3, 4, 1]
+
+
 def test_reporter_nonfinite_iqr_and_launch_mode_legend() -> None:
     import io
 
@@ -660,6 +997,39 @@ def test_reporter_nonfinite_iqr_and_launch_mode_legend() -> None:
     rendered = out.getvalue()
     assert "staged/raw" in rendered and "staged/graph_replay" in rendered
     assert "1.00x" not in rendered
+
+
+def test_compare_treats_missing_input_recipe_as_legacy_across_schemas(
+    tmp_path, capsys
+) -> None:
+    a_path = Path(
+        _write_suite(tmp_path, "v2_old.json", [("g", "old_id", [_row("E", 1.0)])])
+    )
+    raw = json.loads(a_path.read_text())
+    raw["schema_version"] = 2
+    raw["run"]["config"].pop("input_recipe", None)
+    raw["run"]["config"].pop("input_recipe_version", None)
+    a_path.write_text(json.dumps(raw))
+
+    b_legacy = _write_suite(
+        tmp_path,
+        "v3_legacy.json",
+        [("g", "new_geom_hash", [_row("E", 1.0)])],
+        input_recipe="legacy",
+    )
+    b_centered = _write_suite(
+        tmp_path,
+        "v3_centered.json",
+        [("g", "new_geom_hash", [_row("E", 1.0)])],
+        input_recipe="centered",
+    )
+
+    assert compare.main([str(a_path), b_legacy, "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["pairs"][0]["in_geomean"] is True
+
+    assert compare.main([str(a_path), b_centered]) == 2
+    assert "input_recipe" in capsys.readouterr().err
 
 
 def test_setup_env_sets_dvc_global_config_dir(tmp_path, monkeypatch) -> None:
@@ -836,6 +1206,86 @@ def test_suite_runner_cli_tuned_child_preserves_tunableop_env(
     assert seen_env == {"enabled": "1", "tuning": "1"}
 
 
+def test_rotate_count_and_executor_rotates_variant_packs(monkeypatch) -> None:
+    """_rotate_count computes ring size without --metrics and Executor rotates variant packs."""
+    from dnn_benchmarking.execution import executor as exec_mod
+
+    infos = [
+        TensorInfo(1, "x", [1024], [1], "float", is_virtual=False),
+        TensorInfo(2, "y", [1024], [1], "float", is_virtual=False, is_output=True),
+    ]
+    ctx = suite_runner._GraphContext(
+        graph_path=Path("g.json"),
+        graph_json=_MINIMAL_GRAPH,
+        graph_name="g",
+        tensor_infos=infos,
+        config=SuiteConfig(cache_mode="rotate"),
+        reporter=Reporter(quiet=True),
+        input_data={},
+        io_bytes=None,
+    )
+    monkeypatch.setattr(suite_runner, "_detect_flush_bytes", lambda _t: 24 * 1024)
+    assert suite_runner._rotate_count(ctx, "hip") == 4  # 24KiB // 8KiB + 1
+
+    seen_vps = []
+
+    def fake_measure(enqueue_fn, **kw):
+        for _ in range(5):
+            enqueue_fn()
+        return timing.Measurement(
+            [1.0],
+            [0.1],
+            "block",
+            "hip",
+            "rotate",
+            1,
+            1.0,
+            rotated_buffers=kw["rotated_buffers"],
+            flush_method="rotate",
+            flush_bytes=kw["rotated_bytes"],
+        )
+
+    monkeypatch.setattr(exec_mod, "measure", fake_measure)
+    ex = exec_mod.Executor.__new__(exec_mod.Executor)
+    ex._policy = TimingPolicy(cache_mode="rotate", rotate_buffers=3, timing_block=4)
+    ok = types.SimpleNamespace(is_bad=lambda: False)
+    ex._graph = types.SimpleNamespace(
+        execute=lambda handle, vp, ws: (seen_vps.append(vp), ok)[1]
+    )
+    ex._workspace_ptr = None
+    ex._execution_stream = 0
+    vps = [{"id": 0}, {"id": 1}, {"id": 2}]
+    m = ex.benchmark(object(), vps[0], variant_packs=vps, rotated_bytes=24576)
+    assert seen_vps == [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 0}, {"id": 1}]
+    assert m.rotated_buffers == 3 and m.flush_bytes == 24576
+
+
+def test_cold_flush_truthfully_labels_zero_fill_fallback(monkeypatch) -> None:
+    """HIP cold flush reports zero_fill when the read-sweep kernel is unavailable."""
+    monkeypatch.setattr(timing, "_get_hip_sweep_kernel", lambda: None)
+    monkeypatch.setattr(timing, "_detect_flush_bytes", lambda _t: 4096)
+    timing.release_flush_buffers()
+    zero_calls = {"n": 0}
+
+    class FakeBuf:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+        def ptr(self):
+            return 0x1000
+
+        def zeros(self):
+            zero_calls["n"] += 1
+
+    fake_hip = types.SimpleNamespace(
+        DeviceBuffer=FakeBuf, hip_device_synchronize=lambda: None
+    )
+    monkeypatch.setattr(timing, "_require_hip_runtime", lambda: fake_hip)
+    method, nbytes = timing._flush_cache("hip", 0)
+    timing.release_flush_buffers()
+    assert method == "zero_fill" and nbytes == 4096 and zero_calls["n"] == 1
+
+
 def test_rocke_passes_after_iteration_scratch_release(monkeypatch) -> None:
     """RockeExecutor passes after_iteration scratch cleanup into measure()."""
     import contextlib
@@ -878,6 +1328,183 @@ def test_rocke_passes_after_iteration_scratch_release(monkeypatch) -> None:
     assert callable(captured_hook["fn"])
     captured_hook["fn"]()
     assert released == [99]
+
+
+def test_detect_flush_bytes_uses_detect_arch_and_conservative_fallback(
+    monkeypatch,
+) -> None:
+    """When amdsmi returns (None, None) under HIP_VISIBLE_DEVICES, arch detection still selects 640 MiB for gfx942; unknown arch uses 512 MiB."""
+    import sys
+    from dnn_benchmarking.metrics import arch as arch_mod
+    from dnn_benchmarking.metrics import gpu_smi
+
+    monkeypatch.setattr(timing, "hipdnn", None)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+
+    # Known arch via GpuSmiProbe even before timing.hipdnn is initialized.
+    monkeypatch.setattr(
+        gpu_smi.GpuSmiProbe, "identity", lambda self: ("gfx90a", "MI210")
+    )
+    assert timing._detect_flush_bytes("hip") == 24 * 1024 * 1024
+
+    # Under HIP_VISIBLE_DEVICES without torch, amdsmi may return (None, None):
+    # fall back to metrics.arch.detect_arch() (rocminfo) and preserve 640 MiB on gfx942.
+    monkeypatch.setattr(gpu_smi.GpuSmiProbe, "identity", lambda self: (None, None))
+    monkeypatch.setattr(arch_mod, "detect_arch", lambda: "gfx942")
+    assert timing._detect_flush_bytes("hip") == 640 * 1024 * 1024
+
+    # Unlisted or unknown arch uses conservative 512 MiB fallback (never 3x L2).
+    monkeypatch.setattr(arch_mod, "detect_arch", lambda: "unknown")
+    assert timing._detect_flush_bytes("hip") == 512 * 1024 * 1024
+    assert timing.flush_bytes_for_arch("gfx950") == 640 * 1024 * 1024
+    assert timing.flush_bytes_for_arch("unknown_gpu") == 512 * 1024 * 1024
+
+
+def test_pytorch_oracle_forwards_resolved_rotate_count(tmp_path) -> None:
+    """PyTorch tuned child receives the parent's resolved rotate ring size instead of raw 0."""
+    cfg = SuiteConfig(
+        benchmark_work_dir=str(tmp_path / "work"),
+        cache_mode="rotate",
+        rotate_buffers=0,
+        oracle=True,
+    )
+    argv = oracle._pytorch_tuned_argv(
+        tmp_path / "g.json", cfg, tmp_path / "out.json", rotate_count=12
+    )
+    idx = argv.index("--rotate-buffers")
+    assert argv[idx + 1] == "12"
+
+
+def test_rotate_count_clamps_and_rejects_against_free_vram(monkeypatch) -> None:
+    """_rotate_count stays within 60% of free VRAM, warns on clamp, errors when <2 fit."""
+    from dnn_benchmarking.common.exceptions import ExecutionError
+    from dnn_benchmarking.execution import suite_runner
+    from dnn_benchmarking.graph.tensor_info import TensorInfo
+
+    # 10 MiB per buffer set (float32, 2.5M elements)
+    ten_mib = 10 * 1024 * 1024
+    t_info = TensorInfo(
+        uid=1,
+        name="x",
+        data_type="float",
+        dims=[ten_mib // 4],
+        strides=[1],
+        is_virtual=False,
+    )
+
+    def make_ctx(rotate_buffers: int):
+        cfg = SuiteConfig(
+            cache_mode="rotate",
+            rotate_buffers=rotate_buffers,
+        )
+        return types.SimpleNamespace(config=cfg, tensor_infos=[t_info])
+
+    # Target 640 MiB => desires 65 sets, but 100 MiB free => 60 MiB budget => clamps to 6 sets
+    monkeypatch.setattr(
+        suite_runner, "_detect_flush_bytes", lambda _t: 640 * 1024 * 1024
+    )
+    monkeypatch.setattr(
+        suite_runner, "query_free_vram_bytes", lambda _t: 100 * 1024 * 1024
+    )
+    warnings: List[str] = []
+    n = suite_runner._rotate_count(make_ctx(0), timer="hip", warnings=warnings)
+    assert n == 6
+    assert warnings and "clamped from 65 to 6" in warnings[0]
+
+    # Explicit --rotate-buffers 8 exceeds 6-set budget => fails fast with ExecutionError
+    with pytest.raises(ExecutionError, match="--rotate-buffers 8"):
+        suite_runner._rotate_count(make_ctx(8), timer="hip")
+
+    # Explicit --rotate-buffers 4 fits within 6-set budget => allowed
+    assert suite_runner._rotate_count(make_ctx(4), timer="hip") == 4
+
+    # Free VRAM only 25 MiB => 15 MiB budget => < 2 sets (20 MiB) fit => ExecutionError
+    monkeypatch.setattr(
+        suite_runner, "query_free_vram_bytes", lambda _t: 25 * 1024 * 1024
+    )
+    with pytest.raises(ExecutionError, match="at least 2 buffer sets"):
+        suite_runner._rotate_count(make_ctx(0), timer="hip")
+
+
+def test_aiter_and_rocke_executors_rotate_ring_without_repreparing(monkeypatch) -> None:
+    """AiterExecutor and RockeExecutor bind ring sets directly without re-running prepare()."""
+    import contextlib
+    import sys
+    from dnn_benchmarking.execution import aiter_executor, rocke_executor
+
+    fake_torch = types.SimpleNamespace(
+        no_grad=contextlib.nullcontext,
+        cuda=types.SimpleNamespace(
+            device=lambda _d: contextlib.nullcontext(),
+            stream=lambda _s: contextlib.nullcontext(),
+        ),
+    )
+
+    # --- AITER ring rotation ---
+    seen_aiter: List[str] = []
+    aiter_meta: Dict[str, Any] = {}
+
+    def fake_aiter_measure(run_fn, **kw):
+        aiter_meta.update(kw)
+        for _ in range(5):
+            run_fn()
+        return timing.Measurement([1.0], [0.1], "staged", "torch", "rotate", 1, 1.0)
+
+    monkeypatch.setattr(aiter_executor, "torch", fake_torch)
+    monkeypatch.setattr(aiter_executor, "measure", fake_aiter_measure)
+    aex = aiter_executor.AiterExecutor.__new__(aiter_executor.AiterExecutor)
+    aex._backend = types.SimpleNamespace(name="ck")
+    aex._problem = types.SimpleNamespace(head_size_qk=128, head_size_v=128)
+    aex._device = "cuda:0"
+    aex._stream = types.SimpleNamespace(cuda_stream=7, synchronize=lambda: None)
+    aex._policy = TimingPolicy(cache_mode="rotate")
+    aex._timer = "torch"
+    aex._launch = lambda: seen_aiter.append("single")
+    aex._bind_tensors = lambda t: (lambda tag=t["tag"]: seen_aiter.append(tag), None)
+
+    aex.benchmark(
+        tensors_ring=[{"tag": "a0"}, {"tag": "a1"}, {"tag": "a2"}],
+        rotated_bytes=3072,
+    )
+    assert seen_aiter == ["a0", "a1", "a2", "a0", "a1"]
+    assert aiter_meta["rotated_buffers"] == 3
+    assert aiter_meta["rotated_bytes"] == 3072
+
+    # --- rocKE ring rotation ---
+    seen_rocke: List[str] = []
+    rocke_meta: Dict[str, Any] = {}
+    fake_rt = types.SimpleNamespace(
+        release_retained_for_stream=lambda _s: None,
+        wait_stream_and_release=lambda _s: None,
+        no_fence=contextlib.nullcontext,
+    )
+    monkeypatch.setitem(sys.modules, "rocke", types.SimpleNamespace(runtime=fake_rt))
+    monkeypatch.setitem(sys.modules, "rocke.runtime", fake_rt)
+
+    def fake_rocke_measure(run_fn, **kw):
+        rocke_meta.update(kw)
+        for _ in range(4):
+            run_fn()
+        return timing.Measurement([1.0], [0.1], "staged", "torch", "rotate", 1, 1.0)
+
+    monkeypatch.setattr(rocke_executor, "torch", fake_torch)
+    monkeypatch.setattr(rocke_executor, "measure", fake_rocke_measure)
+    rex = rocke_executor.RockeExecutor.__new__(rocke_executor.RockeExecutor)
+    rex._device = "cuda:0"
+    rex._stream = types.SimpleNamespace(cuda_stream=11)
+    rex._policy = TimingPolicy(cache_mode="rotate")
+    rex._launch_mode = "raw"
+    rex._timer = "torch"
+    rex._launch = lambda: seen_rocke.append("single")
+    rex._bind_tensors = lambda t: (lambda tag=t["tag"]: seen_rocke.append(tag))
+
+    rex.benchmark(
+        tensors_ring=[{"tag": "r0"}, {"tag": "r1"}],
+        rotated_bytes=2048,
+    )
+    assert seen_rocke == ["r0", "r1", "r0", "r1"]
+    assert rocke_meta["rotated_buffers"] == 2
+    assert rocke_meta["rotated_bytes"] == 2048
 
 
 def test_pytorch_executor_surfaces_timed_work_notes_on_measurement(monkeypatch) -> None:

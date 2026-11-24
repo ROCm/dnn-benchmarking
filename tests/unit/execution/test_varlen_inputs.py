@@ -227,18 +227,43 @@ class TestInputDataIntegration:
             for uid, name in ((1, "Q"), (2, "K"), (3, "V"))
         ]
         tensor_infos = floats + infos
+        dense_sdpa = {
+            "tensors": graph["tensors"],
+            "nodes": [
+                {
+                    **graph["nodes"][0],
+                    "inputs": {
+                        k: v
+                        for k, v in graph["nodes"][0]["inputs"].items()
+                        if k not in ("seq_len_q_tensor_uid", "seq_len_kv_tensor_uid")
+                    },
+                }
+            ],
+        }
         with_graph = generate_input_data(tensor_infos, seed=5, graph_json=graph)
-        without = generate_input_data(tensor_infos, seed=5)
+        without_varlen = generate_input_data(
+            tensor_infos, seed=5, graph_json=dense_sdpa
+        )
+        # Varlen length generation uses an independent RNG so Q, K, and V are unchanged.
         for uid in (1, 2, 3):
-            np.testing.assert_array_equal(with_graph[uid], without[uid])
+            np.testing.assert_array_equal(with_graph[uid], without_varlen[uid])
+        assert with_graph[3].min() >= 0.0 and with_graph[3].max() <= 1.0
+        legacy_with = generate_input_data(
+            tensor_infos, seed=5, graph_json=graph, recipe="legacy"
+        )
+        legacy_without = generate_input_data(tensor_infos, seed=5, recipe="legacy")
+        for uid in (1, 2, 3):
+            np.testing.assert_array_equal(legacy_with[uid], legacy_without[uid])
 
     def test_float_values_do_not_depend_on_the_graph_for_ragged(self) -> None:
         graph, infos = _ragged_graph()
         floats = [
             TensorInfo(1, "Q", [4, 2, 16, 8], [256, 128, 8, 1], "bfloat16", False)
         ]
-        with_graph = generate_input_data(floats + infos, seed=5, graph_json=graph)
-        without = generate_input_data(floats + infos, seed=5)
+        with_graph = generate_input_data(
+            floats + infos, seed=5, graph_json=graph, recipe="legacy"
+        )
+        without = generate_input_data(floats + infos, seed=5, recipe="legacy")
         np.testing.assert_array_equal(with_graph[1], without[1])
 
     def test_generate_input_data_uses_the_varlen_values(self) -> None:

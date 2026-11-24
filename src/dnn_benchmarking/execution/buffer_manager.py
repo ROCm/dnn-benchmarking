@@ -10,6 +10,7 @@ graph type, and are encoded to raw words only when written to device storage.
 """
 
 import functools
+import hashlib
 import math
 import struct
 import warnings
@@ -20,13 +21,13 @@ import numpy as np
 from ..common.blocks import iter_blocks
 from ..common.dtypes import DType
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
+from ..config.benchmark_config import INPUT_RECIPE_CHOICES, INPUT_RECIPE_VERSION
 from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
 from ..graph.varlen import sdpa_operands
 from .sdpa_backward_inputs import set_sdpa_backward_inputs
 from .sdpa_dropout import read_dropout
 from .varlen_inputs import generate_varlen_inputs
-
 
 # fp8 formats as (exponent bits, mantissa bits); E8M0 is a special case.
 _FP8_FORMATS = {
@@ -448,6 +449,41 @@ def _signed_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     return convolution - other
 
 
+def _fp32_conv_input_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
+    """Convolution operand UIDs whose output is fp32/fp64.
+
+    Under the default ``centered`` recipe these keep ``U[0, 1)`` so outputs
+    stay away from zero where the fixed fp32 validation ``atol=1e-6`` would
+    reject legitimate accumulation cancellation against the float64 reference.
+    """
+    if not graph_json:
+        return set()
+    tensors = {
+        int(tensor["uid"]): tensor
+        for tensor in graph_json.get("tensors", []) or []
+        if "uid" in tensor
+    }
+    uids: Set[int] = set()
+    for node in graph_json.get("nodes", []) or []:
+        if not str(node.get("type", "")).startswith("Convolution"):
+            continue
+        outputs = node.get("outputs") or {}
+        out_dtype = None
+        for key in _CONVOLUTION_OUTPUT_KEYS:
+            uid = outputs.get(key)
+            if uid is not None and int(uid) in tensors:
+                out_dtype = _output_data_type(tensors[int(uid)], graph_json)
+                break
+        if out_dtype in ("float", "double"):
+            inputs = node.get("inputs") or {}
+            uids.update(
+                int(inputs[key])
+                for key in _CONVOLUTION_OPERAND_KEYS
+                if inputs.get(key) is not None
+            )
+    return uids
+
+
 def _has_fp16_output(
     node: Dict[str, Any],
     tensors: Dict[int, Dict[str, Any]],
@@ -513,24 +549,230 @@ def _generate_paged_input(
     return ids.reshape(dims)
 
 
+# Node input keys that require strictly positive values (e.g. norm variance,
+# inverse variance, epsilon, momentum, quantization scales).
+_POSITIVE_VAR_KEYS = frozenset(
+    {
+        "in_running_var_tensor_uid",
+        "prev_running_variance_tensor_uid",
+        "variance_tensor_uid",
+        "inv_variance_tensor_uid",
+        "inv_rms_tensor_uid",
+        "epsilon_tensor_uid",
+        "momentum_tensor_uid",
+        "dropout_scale_tensor_uid",
+        "descale_q_tensor_uid",
+        "descale_k_tensor_uid",
+        "descale_v_tensor_uid",
+        "descale_s_tensor_uid",
+        "scale_s_tensor_uid",
+        "scale_o_tensor_uid",
+        "scale_tensor_uid",
+        "in_scale_tensor_uid",
+    }
+)
+_NORM_NODE_PREFIXES = ("Batchnorm", "Layernorm", "RMSNorm")
+_WEIGHT_KEYS = frozenset({"w_tensor_uid", "b_tensor_uid"})
+_SDPA_QK_KEYS = frozenset({"q_tensor_uid", "k_tensor_uid"})
+_SDPA_V_KEYS = frozenset({"v_tensor_uid"})
+
+
+def _tensor_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
+    """Classify input tensor UIDs by graph role for realistic recipes.
+
+    Positive-required roles (variance/epsilon/scales) take priority over every
+    other role so a shared tensor never receives negative values where positive
+    inputs are required.
+    """
+    if not graph_json:
+        return {}
+    roles: Dict[int, str] = {}
+    priority = {
+        "activation": 0,
+        "grad": 1,
+        "weight": 2,
+        "sdpa_qk": 3,
+        "sdpa_v": 3,
+        "norm_scale": 4,
+        "positive_var": 5,
+    }
+
+    def assign(uid: int, role: str) -> None:
+        if priority[role] >= priority.get(roles.get(uid, "activation"), -1):
+            roles[uid] = role
+
+    for node in graph_json.get("nodes", []) or []:
+        ntype = str(node.get("type", ""))
+        inputs = node.get("inputs") or {}
+        is_norm = ntype.startswith(_NORM_NODE_PREFIXES)
+        is_sdpa = ntype.startswith("Sdpa")
+        is_matmul_or_conv = ntype.startswith(
+            ("Convolution", "Matmul", "MoeGroupedMatmul")
+        )
+        for key, value in inputs.items():
+            if not key.endswith("_tensor_uid") or value is None:
+                continue
+            uids = value if isinstance(value, list) else [value]
+            for raw_uid in uids:
+                if raw_uid is None:
+                    continue
+                uid = int(raw_uid)
+                if is_norm and key == "scale_tensor_uid":
+                    assign(uid, "norm_scale")
+                elif key in _POSITIVE_VAR_KEYS:
+                    assign(uid, "positive_var")
+                elif is_sdpa and key in _SDPA_QK_KEYS:
+                    assign(uid, "sdpa_qk")
+                elif is_sdpa and key in _SDPA_V_KEYS:
+                    assign(uid, "sdpa_v")
+                elif key.startswith("d") and key != "descale_q_tensor_uid":
+                    assign(uid, "grad")
+                elif is_matmul_or_conv and key in _WEIGHT_KEYS:
+                    assign(uid, "weight")
+    return roles
+
+
+def _draw_float_block(
+    rng: np.random.Generator,
+    shape: Tuple[int, ...],
+    *,
+    recipe: str,
+    role: str,
+    is_signed_conv: bool,
+    is_fp32_conv: bool = False,
+    head_dim: int = 1,
+    dtype: DType,
+) -> np.ndarray:
+    """Draw one float32 block for ``(recipe, role)`` before dtype encoding."""
+    if dtype.name == "fp8_e8m0":
+        # E8M0 is an unsigned power-of-two scale format with no zero code.
+        if recipe == "zeros":
+            return np.ones(shape, dtype=np.float32)
+        if recipe == "legacy":
+            return rng.random(shape, dtype=np.float32)
+        return rng.uniform(0.5, 1.5, size=shape).astype(np.float32)
+
+    if recipe == "legacy":
+        block = rng.random(shape, dtype=np.float32)
+        if is_signed_conv:
+            block = block * np.float32(2) - np.float32(1)
+        return block
+
+    if role == "positive_var":
+        if recipe == "zeros":
+            return np.ones(shape, dtype=np.float32)
+        return rng.uniform(0.5, 1.5, size=shape).astype(np.float32)
+
+    if role == "norm_scale":
+        if recipe == "zeros":
+            return np.ones(shape, dtype=np.float32)
+        if recipe == "llm":
+            block = rng.normal(1.0, 0.25, size=shape).astype(np.float32)
+            return np.clip(block, np.float32(0.1), np.float32(4.0))
+        return rng.uniform(0.5, 1.5, size=shape).astype(np.float32)
+
+    if recipe == "zeros":
+        return np.zeros(shape, dtype=np.float32)
+
+    if recipe == "centered":
+        if is_signed_conv:
+            return rng.uniform(-1.0, 1.0, size=shape).astype(np.float32)
+        if is_fp32_conv:
+            return rng.random(shape, dtype=np.float32)
+        if role == "sdpa_qk":
+            # Scale Q and K by d^-0.25 so Q @ K^T has unit variance even when a
+            # graph omits attn_scale_value (hipDNN default scale = 1.0). Keeps
+            # Q/K zero-mean signed Gaussian while preventing unscaled logits of
+            # O(sqrt(d)) from amplifying bf16 pre-scaled q*log2(e) rounding in
+            # FlashAttention/AITER kernels.
+            scale = np.float32(max(1, head_dim) ** -0.25)
+            return rng.standard_normal(size=shape, dtype=np.float32) * scale
+        if role == "sdpa_v":
+            # Keep V in U[0, 1) under centered: softmax weights are
+            # non-negative and sum to 1, so O = P @ V stays centered near 0.5
+            # instead of cancelling near zero where bf16 tolerance (3e-2, 1e-3)
+            # rejects 1-2 ULP flash/AITER vs MATH differences.
+            return rng.random(shape, dtype=np.float32)
+        return rng.standard_normal(size=shape, dtype=np.float32)
+    if recipe == "heavy_tail":
+        base = rng.normal(0.0, 0.8, size=shape).astype(np.float32)
+        tail = rng.normal(0.0, 6.0, size=shape).astype(np.float32)
+        pick = rng.random(shape, dtype=np.float32) < np.float32(0.01)
+        return np.clip(np.where(pick, tail, base), np.float32(-16.0), np.float32(16.0))
+
+    if recipe == "llm":
+        # Fitted to measured DeepSeek-V2-Lite / Qwen2.5 / OLMo-2 distributions.
+        if role == "weight":
+            block = (rng.standard_t(10.0, size=shape) * 0.03).astype(np.float32)
+            return np.clip(block, np.float32(-1.5), np.float32(1.5))
+        if role == "sdpa_qk":
+            block = (rng.standard_t(3.0, size=shape) * 0.75).astype(np.float32)
+            return np.clip(block, np.float32(-25.0), np.float32(25.0))
+        if role == "sdpa_v":
+            block = rng.laplace(0.0, 0.35, size=shape).astype(np.float32)
+            return np.clip(block, np.float32(-16.0), np.float32(16.0))
+        if role == "grad":
+            block = (rng.standard_t(2.5, size=shape) * 1e-3).astype(np.float32)
+            return np.clip(block, np.float32(-1.0), np.float32(1.0))
+        block = (rng.standard_t(2.5, size=shape) * 0.35).astype(np.float32)
+        return np.clip(block, np.float32(-16.0), np.float32(16.0))
+
+    raise ValueError(
+        f"Unknown input recipe {recipe!r}; expected one of: {', '.join(INPUT_RECIPE_CHOICES)}"
+    )
+
+
+def input_fingerprint(input_data: Dict[int, np.ndarray], recipe: str, seed: int) -> str:
+    """Deterministic 12-hex SHA-256 fingerprint of generated graph inputs."""
+    h = hashlib.sha256()
+    h.update(f"v{INPUT_RECIPE_VERSION}:{recipe}:{seed}".encode("utf-8"))
+    for uid in sorted(input_data):
+        arr = np.asarray(input_data[uid])
+        h.update(f"|{uid}:{arr.shape}:{arr.dtype.str}:".encode("utf-8"))
+        flat = np.ascontiguousarray(arr).reshape(-1)
+        nbytes = flat.nbytes
+        if nbytes <= 65536:
+            h.update(flat.tobytes())
+        else:
+            raw = flat.view(np.uint8)
+            step = max(1, nbytes // 4096)
+            h.update(raw[:4096].tobytes())
+            h.update(raw[::step][:4096].tobytes())
+            h.update(raw[-4096:].tobytes())
+    return h.hexdigest()[:12]
+
+
+def buffer_set_bytes(tensor_infos: List[TensorInfo]) -> int:
+    """Total device storage bytes for one non-virtual tensor set.
+
+    Uses resolved ``storage_elements`` so varlen and ragged tensors count
+    their real device buffer footprint, independent of ``--no-metrics``.
+    """
+    return sum(
+        ti.storage_elements * ti.element_size
+        for ti in tensor_infos
+        if not ti.is_virtual and not ti.is_pass_by_value
+    )
+
+
 def generate_input_data(
     tensor_infos: List[TensorInfo],
     seed: int,
     graph_json: Optional[Dict[str, Any]] = None,
+    *,
+    recipe: str = "centered",
 ) -> Dict[int, np.ndarray]:
     """Generate one graph-scoped logical input map.
 
     Returned arrays are dense logical ndarrays keyed by tensor UID, consumed
-    by both hipDNN buffers and reference providers. Floating-point inputs are
-    U[0, 1) (non-negative, so batch-norm variances stay valid), drawn as
-    float32 and rounded to the graph type; bfloat16 and fp8 values are returned
-    as the exactly representable float32 values. The operands of a
-    convolution with an fp16 output are U[-1, 1) instead (see
-    :func:`_signed_input_uids`). Both come from the same
-    draw, so an unsigned tensor gets the same values with or without
-    ``graph_json``. Integer and boolean inputs are zeros, except the SDPA
-    sequence lengths, cumulative lengths and ragged offset tables, the
-    paged-SDPA page tables, and SDPA dropout roles.
+    by both hipDNN buffers and reference providers. The default ``centered``
+    recipe fills unconstrained floating-point operands from seeded ``N(0, 1)``
+    (signed ``U[-1, 1)`` for fp16-output convolutions, ``N(0, d^-0.25)`` for
+    SDPA Q/K, ``U[0, 1)`` for SDPA V and fp32/fp64 convolutions) and keeps
+    positive-only normalization variance/scale inputs strictly positive in
+    ``U[0.5, 1.5)``. Use ``recipe="legacy"`` for the historical ``U[0, 1)``
+    distribution, ``"llm"`` for heavy-tailed model-like fills, ``"heavy_tail"``
+    for an outlier stress mixture, or ``"zeros"`` for diagnostic zero inputs.
 
     ``graph_json`` selects the signed convolution operands and the SDPA
     tensors with invariants random data cannot satisfy. Lengths and offset
@@ -547,6 +789,10 @@ def generate_input_data(
     Raises:
         ValueError: A ``dropout_scale`` value gives a keep rate outside (0, 1].
     """
+    if recipe not in INPUT_RECIPE_CHOICES:
+        raise ValueError(
+            f"Unknown input recipe {recipe!r}; expected one of: {', '.join(INPUT_RECIPE_CHOICES)}"
+        )
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     page_tables = _page_table_uids(graph_json)
@@ -554,6 +800,8 @@ def generate_input_data(
     dropout_keep = _dropout_keep_rate(tensor_infos, dropout_roles)
     dropout_rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
     signed_uids = _signed_input_uids(graph_json)
+    fp32_conv_uids = _fp32_conv_input_uids(graph_json)
+    roles = _tensor_roles(graph_json)
     varlen_values = generate_varlen_inputs(graph_json, tensor_infos, seed)
     num_pages = _paged_metadata(graph_json) if page_tables else 0
 
@@ -585,11 +833,22 @@ def generate_input_data(
             # Draw and round one block at a time straight into the result, so
             # no full-size float32 draw or conversion temporary exists. The
             # blocks are drawn in C order, so the values match one full draw.
+            role = roles.get(tensor_info.uid, "activation")
+            is_signed = tensor_info.uid in signed_uids
+            is_fp32_conv = tensor_info.uid in fp32_conv_uids
+            head_dim = tensor_info.dims[-1] if tensor_info.dims else 1
             data = np.empty(tensor_info.dims, dtype=dtype.numpy)
             for index in iter_blocks(data.shape):
-                block = rng.random(data[index].shape, dtype=np.float32)
-                if tensor_info.uid in signed_uids:
-                    block = block * np.float32(2) - np.float32(1)
+                block = _draw_float_block(
+                    rng,
+                    data[index].shape,
+                    recipe=recipe,
+                    role=role,
+                    is_signed_conv=is_signed,
+                    is_fp32_conv=is_fp32_conv,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                )
                 data[index] = _decode(_encode(block, dtype), dtype)
             input_data[tensor_info.uid] = data
 

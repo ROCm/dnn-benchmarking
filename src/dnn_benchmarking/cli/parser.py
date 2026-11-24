@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, NoReturn, Optional
 
 from ..config.benchmark_config import (
     CACHE_MODE_CHOICES,
+    INPUT_RECIPE_CHOICES,
     RUNTIME_VARIANTS,
     RuntimeName,
     MetricsConfig,
@@ -302,7 +303,22 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         "Run",
         CACHE_MODE_CHOICES,
         _default(SuiteConfig, "cache_mode"),
-        "GPU L2/MALL: warm keeps them; cold flushes them before each timed iteration",
+        "GPU L2/MALL: warm keeps them; cold runs a read-only capacity sweep "
+        "before each timed iteration; rotate cycles independent I/O buffer sets "
+        "(works with --timing-block)",
+    ),
+    CliOption(
+        flags=("--rotate-buffers",),
+        dest="rotate_buffers",
+        group="Run",
+        parser_type=_at_least(int, 0),
+        default=_default(SuiteConfig, "rotate_buffers"),
+        metavar="N",
+        help="number of rotated I/O buffer sets for --cache-mode rotate "
+        "(0 = auto-size from LLC capacity, or >= 2)",
+        config_key="rotate_buffers",
+        config_kind=ConfigKind.SCALAR,
+        config_type=int,
     ),
     CliOption(
         flags=("--timing-block",),
@@ -327,6 +343,16 @@ CLI_OPTIONS: tuple[CliOption, ...] = (
         config_key="seed",
         config_kind=ConfigKind.SCALAR,
         config_type=int,
+    ),
+    _choice_option(
+        ("--input-recipe",),
+        "input_recipe",
+        "Run",
+        INPUT_RECIPE_CHOICES,
+        _default(SuiteConfig, "input_recipe"),
+        "input value distribution: centered (seeded N(0,1), signed conv, "
+        "positive norm scales/variances), llm (fitted heavy-tail model-like), "
+        "heavy_tail (outlier mixture), legacy (U[0,1)), zeros (diagnostic)",
     ),
     # Runtime/Selection
     CliOption(

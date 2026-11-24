@@ -630,6 +630,9 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "fallback_reason": "no stream wait",
         "launch_mode": "raw",
         "requested_warmup_iters": None,
+        "flush_method": None,
+        "flush_bytes": None,
+        "rotated_buffers": 1,
         "timed_work_notes": None,
     }
     assert row.ootb.workspace_bytes == 64

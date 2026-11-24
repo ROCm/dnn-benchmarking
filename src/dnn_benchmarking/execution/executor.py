@@ -4,7 +4,7 @@
 """hipDNN graph build and timed execution."""
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
@@ -152,7 +152,10 @@ class Executor:
         self._graph = None
 
     def _build_plan(
-        self, hipdnn: Any, engine_id: Optional[int], knobs: Optional[Dict[str, Any]]
+        self,
+        hipdnn: Any,
+        engine_id: Optional[int],
+        knobs: Optional[Dict[str, Any]],
     ) -> None:
         """Create, support-check, and compile the execution plan."""
         if engine_id is not None:
@@ -203,11 +206,11 @@ class Executor:
             engine_id: Build the plan for exactly this engine. When None, the
                 backend heuristic picks the engine.
             knobs: Knob settings for the ``engine_id`` plan, keyed by knob id.
-                hipDNN ignores knobs the engine does not expose.
 
         Raises:
             ValueError: If ``knobs`` is given without ``engine_id``.
             ExecutionError: If graph building fails.
+            UnsupportedGraphError: If support check fails.
         """
         if knobs and engine_id is None:
             raise ValueError("knobs require an explicit engine_id")
@@ -219,7 +222,6 @@ class Executor:
         self._build_time_ms = build_timer.elapsed_ms
 
         self._check_selected_engine(engine_id)
-
         workspace_size = self._graph.get_workspace_size()
         self._workspace_size = int(workspace_size)
         if workspace_size > 0:
@@ -282,26 +284,46 @@ class Executor:
         if result.is_bad():
             raise ExecutionError(f"Graph execution failed: {result.get_message()}")
 
-    def benchmark(self, handle: Any, variant_pack: Dict[int, int]) -> Measurement:
+    def benchmark(
+        self,
+        handle: Any,
+        variant_pack: Dict[int, int],
+        *,
+        variant_packs: Optional[Sequence[Dict[int, int]]] = None,
+        rotated_bytes: Optional[int] = None,
+    ) -> Measurement:
         """Prime and time the prepared graph per the executor's policy.
 
-        Args:
-            handle: hipdnn.Handle instance.
-            variant_pack: Mapping of tensor UIDs to device pointers.
-
-        Raises:
-            ExecutionError: If graph not prepared, execution fails, or HIP
-                timing is unavailable.
+        When ``variant_packs`` supplies multiple independent I/O buffer sets
+        (``--cache-mode rotate``), each launch advances to the next buffer set
+        with no extra dispatches between launches.
         """
         if self._graph is None:
             raise ExecutionError("Graph not prepared. Call prepare() first.")
         stream = self._get_execution_stream(handle)
+        if variant_packs and len(variant_packs) > 1:
+            packs = tuple(variant_packs)
+            idx = 0
+
+            def enqueue_rotating() -> None:
+                nonlocal idx
+                vp = packs[idx]
+                idx = (idx + 1) % len(packs)
+                self.enqueue(handle, vp)
+
+            enqueue_fn = enqueue_rotating
+            n_rot = len(packs)
+        else:
+            enqueue_fn = lambda: self.enqueue(handle, variant_pack)
+            n_rot = 1
         try:
             return measure(
-                lambda: self.enqueue(handle, variant_pack),
+                enqueue_fn,
                 stream=stream,
                 policy=self._policy,
                 timer="hip",
+                rotated_buffers=n_rot,
+                rotated_bytes=rotated_bytes if n_rot > 1 else None,
             )
         except StallFallbackError:
             raise

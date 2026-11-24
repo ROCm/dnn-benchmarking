@@ -83,7 +83,8 @@ package, run `PYTHONPATH=src python -m dnn_benchmarking ...`.
 
 `dnn-benchmark compare` uses 0 (no regression), 1 (regression, or coverage
 loss under `--strict-coverage`), and 2 (usage, unreadable input, or
-incompatible `cache_mode`/`timing_block` without `--allow-mismatch`).
+incompatible `cache_mode`/`timing_block`/`input_recipe` without
+`--allow-mismatch`).
 
 ## Architecture
 
