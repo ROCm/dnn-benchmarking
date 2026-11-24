@@ -166,8 +166,10 @@ reference (see [SDPA dropout](#sdpa-dropout)).
 
 A `dropout_probability` of `null` counts as absent. A `dropout_probability`
 of 0 without `rng_dump`, `dropout_mask` or `dropout_scale` is no dropout. A
-backward node must also have no `seed` or `offset`. The formulas of the
-reference are in [Dropout validation](methodology.md#dropout-validation).
+backward graph with `dropout_probability` 0 and no `dropout_mask`,
+`dropout_scale` or `dropout_scale_inv` is no dropout, with or without
+`seed` and `offset`, as in hipDNN's backward references. The formulas of
+the reference are in [Dropout validation](methodology.md#dropout-validation).
 
 The tool fills the dropout inputs as follows:
 
@@ -239,9 +241,11 @@ engine rows fail (exit code 3) and keep their timings:
 - Dropout with paged, ragged or variable-length K/V: the PyTorch
   reference does not implement that combination (not a hipDNN rule). The
   message names the feature.
-- A Philox backward graph: a backward node with `seed`, `offset` or a
-  `dropout_probability` other than 0. hipDNN's backward graph has no
-  `rng_dump`, so the reference has no mask.
+- A Philox backward graph: a backward node with a `dropout_probability`
+  above 0, with `seed` or `offset`. hipDNN's backward graph API has no
+  `rng_dump`, so no reference can replay the Philox mask (rocm-libraries
+  #14358). The FlyDSL backward engines (rocm-libraries #15643) serve this
+  graph, but no reference validates it.
 - The other dropout combinations that the hipDNN references also decline
   (see [Dropout validation](methodology.md#dropout-validation)).
 

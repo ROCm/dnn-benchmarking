@@ -269,7 +269,7 @@ A graph with a bias gradient (`dbias_tensor_uid`) needs an `attn_mask` bias.
 dBias is the unscaled `dS = P * (dP - D)`, summed over each dimension that
 the bias broadcasts. It has the dims and the data type of the bias. This is
 the definition of hipDNN's CPU reference (`CpuFpReferenceSdpa::backward`)
-from rocm-libraries `4630e167ce1` (#14358), which the pinned `4577381`
+from rocm-libraries `4630e167ce1` (#14358), which the pinned `28f91cf`
 includes.
 
 - The timed row calls the memory-efficient backward kernel with its bias
@@ -668,12 +668,17 @@ references, the reference declines these combinations:
   `[B, Hq, Sq, Skv]`;
 - dropout with fp8 scaling.
 
-The reference accepts one combination that the hipDNN develop backward
-reference declines. For a backward node, the tool takes a
-`dropout_probability` of 0 without `seed`, `offset` or a mask as no dropout.
-The hipDNN reference declines any non-null probability in the backward. A
-probability of 0 drops no element, so the gradients are those without
-dropout.
+For a backward node, the tool takes a `dropout_probability` of 0 without a
+dropout mask, `dropout_scale` or `dropout_scale_inv` as no dropout, with or
+without `seed` or `offset`, as hipDNN's backward references do
+(rocm-libraries #15643). A probability of 0 drops no element, so the
+gradients are those without dropout.
+
+The hipDNN backward references still decline a `dropout_probability` above
+0: the backward graph API has no `rng_dump`, so no reference can replay the
+Philox mask (rocm-libraries #14358). The FlyDSL backward engines
+(rocm-libraries #15643) serve Philox dropout in the backward, but no
+reference validates them.
 
 The engine makes a Philox mask, so the mask differs from row to row. A
 reference built from the dump of one row does not apply to another row.
@@ -915,11 +920,13 @@ The tool does not do these things yet:
   `left_bound = 0`, which hipDNN rejects; ALiBi with bottom-right alignment
   or with neither a causal mask nor a sliding window; padding masks; paged
   or variable-length ALiBi graphs. For dropout, the reference supports an
-  explicit dropout mask (forward and backward) and Philox forward graphs
-  with an `rng_dump` output (see
+  explicit dropout mask (forward and backward), a `dropout_probability` of
+  0 in the backward (no dropout, with or without `seed` or `offset`), and
+  Philox forward graphs with an `rng_dump` output (see
   [Dropout validation](#dropout-validation)). It declines Philox forward
-  graphs without `rng_dump`, Philox backward graphs, and dropout with
-  paged, ragged or variable-length K/V. The PyTorch reference does not
+  graphs without `rng_dump`, Philox backward graphs (`dropout_probability`
+  above 0, with `seed` or `offset`), and dropout with paged, ragged or
+  variable-length K/V. The PyTorch reference does not
   implement that last combination; it is a limit of this tool, not of
   hipDNN, which densifies paged and ragged dropout in its own reference.
   With `--validate`, the engine rows of these graphs fail. Some get
