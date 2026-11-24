@@ -11,10 +11,15 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'Optional ROCm nightly version (e.g. 10.3.0a20261123); blank selects newest Quartz nightly passing linux gfx942 + gfx950.'
+        description: 'Optional ROCm nightly version (e.g. 10.3.0a20261123); blank or latest bumps each arch independently from Quartz.'
         required: false
-        default: ''
         type: string
+        default: ''
+      archs:
+        description: 'Optional comma-separated archs to update (e.g. gfx942,gfx950); blank updates all archs in rocm-pin.json.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -34,16 +39,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
-      - name: Resolve candidate ROCm pin from Quartz
+      - name: Resolve per-arch ROCm pins from Quartz
         id: resolve
         env:
-          REQUESTED_VERSION: ${{ inputs.rocm_version }}
+          REQUESTED_VERSION: ${{ inputs.rocm_version || '' }}
+          REQUESTED_ARCHS: ${{ inputs.archs || '' }}
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
           import importlib.util
           import json
           import os
@@ -53,67 +60,175 @@ jobs:
           setup_env = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(setup_env)
 
+          # Memoize Quartz HTTP fetches across arch checks.
+          _real_fetch = setup_env.fetch_quartz_text
+          _fetch_cache: dict[str, str | None] = {}
+
+          def _cached_fetch(url: str) -> str | None:
+              if url not in _fetch_cache:
+                  _fetch_cache[url] = _real_fetch(url)
+              return _fetch_cache[url]
+
+          setup_env.fetch_quartz_text = _cached_fetch
+
+          # Per-arch Quartz gate: (primary_platform, extra_build_only_platforms).
+          # Linux datacenter archs gate on Linux build+tests; gfx1151 gates on
+          # Windows build+tests plus Linux wheel builds.
+          arch_gates: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
+              "gfx90a": ("linux", ()),
+              "gfx942": ("linux", ()),
+              "gfx950": ("linux", ()),
+              "gfx1151": ("windows", (("linux", "gfx1151"),)),
+          }
+
           pin_path = Path("rocm-pin.json")
-          current = setup_env.read_rocm_pin(pin_path)
+          default_arch, current_pins = setup_env.read_rocm_pins(pin_path)
+
           requested = os.environ.get("REQUESTED_VERSION", "").strip()
           if requested:
               requested = setup_env._rocm_version(requested)
-          if not requested or requested == "latest":
-              build = setup_env.select_quartz_nightly_for_archs(
-                  "linux",
-                  ("gfx942", "gfx950"),
-                  require_platform_builds=(
-                      ("windows", setup_env.WINDOWS_DEFAULT_GPU_ARCH),
-                  ),
-              )
-          else:
-              build = setup_env.describe_rocm_version(
-                  requested, "", "linux", "gfx942"
-              )
-          if not build.therock_commit:
-              setup_env.fail(
-                  f"Quartz has no therock_commit for ROCm {build.rocm_version}."
-              )
-          rocm_libraries_commit = setup_env.resolve_therock_rocm_libraries_commit(
-              build.therock_commit
-          )
-          new_pin = {
-              "rocm_version": build.rocm_version,
-              "build_date": build.build_date,
-              "therock_commit": build.therock_commit,
-              "rocm_libraries_commit": rocm_libraries_commit,
-              "index_url": build.index_url,
-          }
           is_manual = bool(requested and requested != "latest")
-          current_date = current.build_date or ""
-          new_date = build.build_date or ""
-          # Scheduled bumps only move forward; manual dispatch may pin any version.
-          if not is_manual and current_date and new_date and new_date < current_date:
-              changed = False
+
+          archs_raw = os.environ.get("REQUESTED_ARCHS", "").strip()
+          if archs_raw:
+              target_archs = [a.strip().lower() for a in archs_raw.split(",") if a.strip()]
+              unknown = [a for a in target_archs if a not in current_pins]
+              if unknown:
+                  setup_env.fail(
+                      f"Unknown arch(s) in inputs.archs: {', '.join(unknown)}.",
+                      f"Expected a subset of: {', '.join(current_pins)}.",
+                  )
           else:
-              changed = (
+              target_archs = list(current_pins)
+
+          therock_cache: dict[str, str] = {}
+
+          def resolve_rl(therock_commit: str) -> str:
+              if therock_commit not in therock_cache:
+                  therock_cache[therock_commit] = (
+                      setup_env.resolve_therock_rocm_libraries_commit(therock_commit)
+                  )
+              return therock_cache[therock_commit]
+
+          new_archs_data: dict[str, dict[str, str | None]] = {}
+          bumped_archs: list[str] = []
+          bumped_versions: set[str] = set()
+          rows: list[str] = []
+
+          for arch, current in current_pins.items():
+              current_entry = {
+                  "rocm_version": current.rocm_version,
+                  "build_date": current.build_date,
+                  "therock_commit": current.therock_commit,
+                  "rocm_libraries_commit": current.rocm_libraries_commit,
+                  "index_url": current.index_url,
+              }
+              if arch not in target_archs:
+                  new_archs_data[arch] = current_entry
+                  rows.append(
+                      f"| `{arch}` | skipped | `{current.rocm_version}` | "
+                      f"`{(current.rocm_libraries_commit or '')[:12]}` |"
+                  )
+                  continue
+
+              plat, extra_builds = arch_gates.get(arch, ("linux", ()))
+              if is_manual:
+                  build = setup_env.describe_rocm_version(requested, "", plat, arch)
+              else:
+                  build = setup_env.find_quartz_nightly(
+                      plat, arch, require_platform_builds=extra_builds
+                  )
+
+              if build is None:
+                  new_archs_data[arch] = current_entry
+                  rows.append(
+                      f"| `{arch}` | unchanged (no passing nightly in {setup_env.QUARTZ_LOOKBACK_DAYS}d) | "
+                      f"`{current.rocm_version}` | `{(current.rocm_libraries_commit or '')[:12]}` |"
+                  )
+                  continue
+
+              if not build.therock_commit:
+                  if is_manual:
+                      setup_env.fail(
+                          f"Quartz has no therock_commit for ROCm {build.rocm_version}."
+                      )
+                  new_archs_data[arch] = current_entry
+                  rows.append(
+                      f"| `{arch}` | unchanged (no therock_commit) | "
+                      f"`{current.rocm_version}` | `{(current.rocm_libraries_commit or '')[:12]}` |"
+                  )
+                  continue
+
+              current_date = current.build_date or ""
+              new_date = build.build_date or ""
+              # Scheduled bumps only move forward; manual dispatch may pin any version.
+              if not is_manual and current_date and new_date and new_date < current_date:
+                  new_archs_data[arch] = current_entry
+                  rows.append(
+                      f"| `{arch}` | unchanged (newest passing {new_date} < pinned {current_date}) | "
+                      f"`{current.rocm_version}` | `{(current.rocm_libraries_commit or '')[:12]}` |"
+                  )
+                  continue
+
+              rl_commit = resolve_rl(build.therock_commit)
+              entry_changed = (
                   build.rocm_version != current.rocm_version
-                  or rocm_libraries_commit != current.rocm_libraries_commit
+                  or rl_commit != current.rocm_libraries_commit
                   or build.therock_commit != current.therock_commit
               )
+              if entry_changed:
+                  new_archs_data[arch] = {
+                      "rocm_version": build.rocm_version,
+                      "build_date": build.build_date,
+                      "therock_commit": build.therock_commit,
+                      "rocm_libraries_commit": rl_commit,
+                      "index_url": build.index_url,
+                  }
+                  bumped_archs.append(arch)
+                  bumped_versions.add(build.rocm_version)
+                  rows.append(
+                      f"| `{arch}` | **bumped** | `{current.rocm_version}` -> `{build.rocm_version}` | "
+                      f"`{(current.rocm_libraries_commit or '')[:12]}` -> `{rl_commit[:12]}` |"
+                  )
+              else:
+                  new_archs_data[arch] = current_entry
+                  rows.append(
+                      f"| `{arch}` | unchanged | `{current.rocm_version}` | "
+                      f"`{(current.rocm_libraries_commit or '')[:12]}` |"
+                  )
+
+          changed = bool(bumped_archs)
           if changed:
               pin_path.write_text(
-                  json.dumps(new_pin, indent=2) + "\n", encoding="utf-8"
+                  json.dumps({"default": default_arch, "archs": new_archs_data}, indent=2)
+                  + "\n",
+                  encoding="utf-8",
               )
+              if len(bumped_versions) == 1:
+                  ver = next(iter(bumped_versions))
+                  title = f"chore(deps): bump ROCm pin ({', '.join(bumped_archs)} -> {ver})"
+              else:
+                  title = f"chore(deps): bump ROCm pin ({', '.join(bumped_archs)})"
+              body_lines = [
+                  "Bump per-arch entries in `rocm-pin.json` to the newest passing Quartz nightly (archs without a newer passing nightly stay untouched):",
+                  "",
+                  "| Arch | Status | ROCm / PyTorch | rocm-libraries |",
+                  "|---|---|---|---|",
+                  *rows,
+                  "",
+              ]
+              body_path = Path(os.environ["RUNNER_TEMP"]) / "bump-rocm-pin-body.md"
+              body_path.write_text("\n".join(body_lines), encoding="utf-8")
+          else:
+              title = ""
 
           out = Path(os.environ["GITHUB_OUTPUT"])
           with out.open("a", encoding="utf-8") as f:
               f.write(f"changed={'true' if changed else 'false'}\n")
-              f.write(f"old_version={current.rocm_version}\n")
-              f.write(f"new_version={build.rocm_version}\n")
-              f.write(f"therock_commit={build.therock_commit}\n")
-              f.write(f"old_rocm_libraries={current.rocm_libraries_commit}\n")
-              f.write(f"new_rocm_libraries={rocm_libraries_commit}\n")
-          print(
-              f"Current: {current.rocm_version} ({current.rocm_libraries_commit[:12]}) -> "
-              f"Candidate: {build.rocm_version} ({rocm_libraries_commit[:12]}), "
-              f"changed={changed}"
-          )
+              f.write(f"title={title}\n")
+
+          print("\n".join(rows))
+          print(f"changed={changed}")
           PY
 
       - name: Open or update bump PR
@@ -123,24 +238,12 @@ jobs:
           # token) lets the pushed branch trigger pull_request CI checks
           # automatically; otherwise GITHUB_TOKEN opens/updates the PR.
           GH_TOKEN: ${{ secrets.ROCM_PIN_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
-          OLD_VERSION: ${{ steps.resolve.outputs.old_version }}
-          NEW_VERSION: ${{ steps.resolve.outputs.new_version }}
-          THEROCK_COMMIT: ${{ steps.resolve.outputs.therock_commit }}
-          OLD_ROCM_LIBRARIES: ${{ steps.resolve.outputs.old_rocm_libraries }}
-          NEW_ROCM_LIBRARIES: ${{ steps.resolve.outputs.new_rocm_libraries }}
+          PR_TITLE: ${{ steps.resolve.outputs.title }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           branch="chore/bump-rocm-pin"
-          title="chore(deps): bump ROCm pin to ${NEW_VERSION}"
-          body=$(cat <<EOF
-          Bump \`rocm-pin.json\` to the newest ROCm nightly that Quartz reports usable for Linux \`gfx942\` and \`gfx950\` (with Windows \`gfx1151\` wheels built):
-
-          - **ROCm / PyTorch wheel:** \`${OLD_VERSION}\` -> \`${NEW_VERSION}\`
-          - **TheRock commit:** \`${THEROCK_COMMIT}\`
-          - **rocm-libraries commit:** \`${OLD_ROCM_LIBRARIES}\` -> \`${NEW_ROCM_LIBRARIES}\`
-          EOF
-          )
+          body_file="${RUNNER_TEMP}/bump-rocm-pin-body.md"
 
           remote="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           # Skip pushing when the open bump branch already carries this exact
@@ -157,16 +260,25 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "${branch}"
           git add rocm-pin.json
-          git commit -m "${title}"
+          git commit -m "${PR_TITLE}"
           git push --force "${remote}" "HEAD:refs/heads/${branch}"
-          existing=$(gh pr list --repo "${REPO}" --head "${branch}" --state open --json number --jq '.[0].number // empty')
-          if [ -n "${existing}" ]; then
-            gh api -X PATCH "repos/${REPO}/pulls/${existing}" \
-              -f title="${title}" \
-              -f body="${body}" >/dev/null
-            echo "Updated PR #${existing}"
+
+          pr_number=$(gh pr list --repo "${REPO}" --head "${branch}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "${pr_number}" ]; then
+            gh pr edit "${pr_number}" --repo "${REPO}" \
+              --title "${PR_TITLE}" \
+              --body-file "${body_file}"
+            echo "Updated PR #${pr_number}"
           else
-            gh pr create --repo "${REPO}" --base main --head "${branch}" \
-              --title "${title}" \
-              --body "${body}"
+            pr_url=$(gh pr create --repo "${REPO}" --base main --head "${branch}" \
+              --title "${PR_TITLE}" \
+              --body-file "${body_file}")
+            echo "Created ${pr_url}"
+            pr_number="${pr_url##*/}"
+          fi
+
+          # Enable squash auto-merge so the bump PR merges as soon as required
+          # checks and CODEOWNER approval pass (main ruleset blocks direct push).
+          if ! gh pr merge "${pr_number}" --repo "${REPO}" --auto --squash; then
+            echo "::warning::Could not enable auto-merge on PR #${pr_number}; merge manually after review."
           fi

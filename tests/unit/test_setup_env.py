@@ -628,14 +628,23 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     pin_file = repo / "rocm-pin.json"
+    entry = {
+        "rocm_version": _RECORDED_ROCM_VERSION,
+        "build_date": "20261115",
+        "therock_commit": "62d1ac21a0eda4df3871c6c8d4570cb0ee9a4637",
+        "rocm_libraries_commit": _head(src),
+        "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+    }
     pin_file.write_text(
         json.dumps(
             {
-                "rocm_version": _RECORDED_ROCM_VERSION,
-                "build_date": "20261115",
-                "therock_commit": "62d1ac21a0eda4df3871c6c8d4570cb0ee9a4637",
-                "rocm_libraries_commit": _head(src),
-                "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+                "default": "gfx950",
+                "archs": {
+                    "gfx90a": entry,
+                    "gfx942": entry,
+                    "gfx950": entry,
+                    "gfx1151": entry,
+                },
             }
         )
         + "\n"
@@ -1586,7 +1595,7 @@ def test_rocm_install_defaults_to_rocm_pin_without_network(
     setup_env, tmp_path, monkeypatch, rocm_libraries
 ) -> None:
     # The autouse guard fails on any Quartz or TheRock network call.
-    pin = setup_env.read_rocm_pin()
+    pin = setup_env.read_rocm_pin("gfx950")
     setup, pip_calls = _fresh_rocm_setup(
         setup_env, tmp_path, monkeypatch, arch="gfx950"
     )
@@ -1616,25 +1625,97 @@ def test_rocm_install_defaults_to_rocm_pin_without_network(
     assert _head(rocm_libraries) == pin.rocm_libraries_commit
 
 
+def test_read_rocm_pin_selects_per_arch_and_falls_back_to_default(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    pin_file = tmp_path / "rocm-pin.json"
+    pin_file.write_text(
+        json.dumps(
+            {
+                "default": "gfx950",
+                "archs": {
+                    "gfx90a": {
+                        "rocm_version": "10.3.0a20261120",
+                        "build_date": "20261120",
+                        "therock_commit": "a" * 40,
+                        "rocm_libraries_commit": "b" * 40,
+                        "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+                    },
+                    "gfx950": {
+                        "rocm_version": "10.3.0a20261123",
+                        "build_date": "20261123",
+                        "therock_commit": "c" * 40,
+                        "rocm_libraries_commit": "d" * 40,
+                        "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+                    },
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(setup_env, "ROCM_PIN_FILE", pin_file)
+
+    pin_90a = setup_env.read_rocm_pin("gfx90a")
+    assert pin_90a.rocm_version == "10.3.0a20261120"
+    assert pin_90a.rocm_libraries_commit == "b" * 40
+
+    pin_950 = setup_env.read_rocm_pin("gfx950")
+    assert pin_950.rocm_version == "10.3.0a20261123"
+    assert pin_950.rocm_libraries_commit == "d" * 40
+
+    # Unlisted arch falls back to default (gfx950) and prints a note.
+    setup, _ = _fresh_rocm_setup(setup_env, tmp_path, monkeypatch, arch="gfx1201")
+    fallback = setup.select_rocm_build("gfx1201")
+    assert fallback.rocm_version == "10.3.0a20261123"
+    assert fallback.rocm_libraries_commit == "d" * 40
+    assert "no entry for gfx1201; using default (gfx950)" in capsys.readouterr().out
+
+
 def test_read_rocm_pin_rejects_missing_or_invalid_fields(
     setup_env, tmp_path, capsys
 ) -> None:
     missing = tmp_path / "missing.json"
     with pytest.raises(SystemExit) as exc:
-        setup_env.read_rocm_pin(missing)
+        setup_env.read_rocm_pin(path=missing)
     assert exc.value.code == 1
     assert "cannot read ROCm pin file" in capsys.readouterr().err
 
-    bad = tmp_path / "bad.json"
-    bad.write_text(
+    bad_commit = tmp_path / "bad-commit.json"
+    bad_commit.write_text(
         json.dumps(
-            {"rocm_version": "10.3.0a20261123", "rocm_libraries_commit": "short"}
+            {
+                "default": "gfx950",
+                "archs": {
+                    "gfx950": {
+                        "rocm_version": "10.3.0a20261123",
+                        "rocm_libraries_commit": "short",
+                    }
+                },
+            }
         )
     )
     with pytest.raises(SystemExit) as exc:
-        setup_env.read_rocm_pin(bad)
+        setup_env.read_rocm_pin(path=bad_commit)
     assert exc.value.code == 1
     assert "invalid rocm_libraries_commit" in capsys.readouterr().err
+
+    bad_default = tmp_path / "bad-default.json"
+    bad_default.write_text(
+        json.dumps(
+            {
+                "default": "gfx942",
+                "archs": {
+                    "gfx950": {
+                        "rocm_version": "10.3.0a20261123",
+                        "rocm_libraries_commit": "a" * 40,
+                    }
+                },
+            }
+        )
+    )
+    with pytest.raises(SystemExit) as exc:
+        setup_env.read_rocm_pin(path=bad_default)
+    assert exc.value.code == 1
+    assert "invalid default arch" in capsys.readouterr().err
 
 
 def test_reused_venv_refuses_rocm_version_latest(
@@ -1649,30 +1730,26 @@ def test_reused_venv_refuses_rocm_version_latest(
     assert "--rocm-version latest" in capsys.readouterr().err
 
 
-def test_select_quartz_nightly_for_archs_requires_every_arch(setup_env, quartz) -> None:
-    # On 20261116, rocm build is in_progress; on 20261115, gfx950 passes but
-    # gfx942 fails rocm tests; on 20261119 both gfx942 and gfx950 pass.
+def test_find_quartz_nightly_per_arch_and_extra_platform_builds(
+    setup_env, quartz
+) -> None:
+    # On 20261116, rocm build is in_progress; on 20261115, gfx950 passes while
+    # gfx942 fails rocm tests -> per-arch lookup picks 20261115 for gfx950 and
+    # returns None for gfx942 (no passing nightly in recorded window).
+    quartz.latest = "20261116"
+    assert setup_env.find_quartz_nightly("linux", "gfx950").build_date == "20261115"
+    assert setup_env.find_quartz_nightly("linux", "gfx942") is None
+
+    # require_platform_builds checks extra platform builds/wheels without
+    # failing on flaky tests: on 20261119 Windows pytorch build is in_progress,
+    # so requiring Windows gfx1151 builds walks back to 20261118.
     quartz.latest = "20261119"
-    build = setup_env.select_quartz_nightly_for_archs("linux", ("gfx942", "gfx950"))
-    assert build.build_date == "20261119"
-
-    # Make 20261119 fail gfx950 pytorch tests -> must walk back to 20261118.
-    doc = _quartz_document("20261119")
-    doc["pipelines"]["pytorch"]["test"]["linux"]["gfx950-dcgpu"]["status"] = "failure"
-    quartz.documents["20261119"] = doc
-    build = setup_env.select_quartz_nightly_for_archs("linux", ("gfx942", "gfx950"))
-    assert build.build_date == "20261118"
-
-    # require_platform_builds checks that the extra platform's builds and wheels
-    # succeeded (without rejecting on test failures): on 20261119 Windows
-    # pytorch build is in_progress, so requiring Windows gfx1151 builds walks
-    # back to a nightly where Windows finished building.
-    quartz.documents.clear()
-    build = setup_env.select_quartz_nightly_for_archs(
+    build = setup_env.find_quartz_nightly(
         "linux",
-        ("gfx942", "gfx950"),
+        "gfx950",
         require_platform_builds=(("windows", setup_env.WINDOWS_DEFAULT_GPU_ARCH),),
     )
+    assert build is not None
     assert build.build_date == "20261118"
 
 

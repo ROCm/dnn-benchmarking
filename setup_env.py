@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, NoReturn, Optional, Tuple
+from typing import Dict, List, NoReturn, Optional, Tuple
 
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -442,22 +442,21 @@ def _newest_quartz_nightly() -> datetime.date:
         fail(f"{url} names no nightly build date: {body.strip()[:80]!r}")
 
 
-def select_quartz_nightly_for_archs(
+def _find_quartz_nightly(
     platform_name: str,
-    gpu_archs: Tuple[str, ...],
+    gpu_arch: str,
     index_url: str = "",
     *,
     require_platform_builds: Tuple[Tuple[str, str], ...] = (),
-) -> RocmBuild:
-    """The newest nightly that Quartz reports usable for every arch in ``gpu_archs``.
+) -> Tuple[Optional[RocmBuild], List[str], datetime.date]:
+    """Search back QUARTZ_LOOKBACK_DAYS for a usable nightly for ``gpu_arch``.
 
     ``require_platform_builds`` takes additional ``(platform, gpu_arch)`` pairs
-    whose ROCm and PyTorch builds and wheels URL must also be ``success`` (for
-    example ``(("windows", "gfx1151"),)`` when bumping ``rocm-pin.json``),
-    without rejecting on flaky test entries for those extra platforms.
+    whose ROCm and PyTorch builds and wheels URL must also be ``success``
+    without rejecting on test entries for those extra platforms.
     """
     newest = _newest_quartz_nightly()
-    rejected = []
+    rejected: List[str] = []
     for days_back in range(QUARTZ_LOOKBACK_DAYS):
         build_date = (newest - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
         url = _quartz_status_url(build_date)
@@ -467,38 +466,60 @@ def select_quartz_nightly_for_archs(
             continue
         document = _parse_quartz_status(url, body)
         reasons = []
-        for arch in gpu_archs:
-            reason = quartz_rejection(document, platform_name, arch)
-            if reason and reason not in reasons:
-                reasons.append(reason)
+        reason = quartz_rejection(document, platform_name, gpu_arch)
+        if reason:
+            reasons.append(reason)
         for extra_platform, extra_arch in require_platform_builds:
-            reason = quartz_rejection(
+            extra_reason = quartz_rejection(
                 document, extra_platform, extra_arch, check_tests=False
             )
-            if reason and reason not in reasons:
-                reasons.append(reason)
+            if extra_reason and extra_reason not in reasons:
+                reasons.append(extra_reason)
         if reasons:
             rejected.append(
                 f"  {build_date} ({document.get('rocm_version')}): {'; '.join(reasons)}"
             )
             continue
-        return _rocm_build_from_quartz(
-            document, url, platform_name, gpu_archs[0], "quartz", index_url
+        return (
+            _rocm_build_from_quartz(
+                document, url, platform_name, gpu_arch, "quartz", index_url
+            ),
+            rejected,
+            newest,
         )
-    arch_list = ", ".join(gpu_archs)
-    fail(
-        f"Quartz reports no usable ROCm nightly for {platform_name} {arch_list} in "
-        f"the {QUARTZ_LOOKBACK_DAYS} days up to {newest:%Y%m%d}:",
-        *rejected,
-        "Pass --rocm-version VERSION to install a specific build.",
+    return None, rejected, newest
+
+
+def find_quartz_nightly(
+    platform_name: str,
+    gpu_arch: str,
+    index_url: str = "",
+    *,
+    require_platform_builds: Tuple[Tuple[str, str], ...] = (),
+) -> Optional[RocmBuild]:
+    """The newest usable Quartz nightly for ``gpu_arch``, or None if none passed."""
+    build, _, _ = _find_quartz_nightly(
+        platform_name,
+        gpu_arch,
+        index_url,
+        require_platform_builds=require_platform_builds,
     )
+    return build
 
 
 def select_quartz_nightly(
     platform_name: str, gpu_arch: str, index_url: str = ""
 ) -> RocmBuild:
     """The newest nightly that Quartz reports usable for ``gpu_arch``."""
-    return select_quartz_nightly_for_archs(platform_name, (gpu_arch,), index_url)
+    build, rejected, newest = _find_quartz_nightly(platform_name, gpu_arch, index_url)
+    if build is not None:
+        return build
+    fail(
+        f"Quartz reports no usable ROCm nightly for {platform_name} {gpu_arch} in "
+        f"the {QUARTZ_LOOKBACK_DAYS} days up to {newest:%Y%m%d}:",
+        *rejected,
+        "Pass --rocm-version VERSION to install a specific build.",
+    )
 
 
 def describe_rocm_version(
@@ -535,8 +556,52 @@ def describe_rocm_version(
     )
 
 
-def read_rocm_pin(path: Optional[Path] = None) -> RocmBuild:
-    """Read the checked-in ROCm + rocm-libraries pin from ``rocm-pin.json``."""
+def _parse_rocm_pin_entry(entry: object, label: str, source_name: str) -> RocmBuild:
+    if not isinstance(entry, dict):
+        fail(f"{label} must be a JSON object.")
+    rocm_version = str(entry.get("rocm_version") or "").strip()
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+!-]*", rocm_version):
+        fail(
+            f"{label} has invalid rocm_version {entry.get('rocm_version')!r}.",
+            "Expected a ROCm wheel version such as 10.3.0a20261123.",
+        )
+    rocm_libraries_commit = (
+        str(entry.get("rocm_libraries_commit") or "").strip().lower()
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}", rocm_libraries_commit):
+        fail(
+            f"{label} has invalid rocm_libraries_commit "
+            f"{entry.get('rocm_libraries_commit')!r}.",
+            "Expected a 40-character commit SHA.",
+        )
+    therock_raw = entry.get("therock_commit")
+    therock_commit: Optional[str] = None
+    if therock_raw:
+        therock_commit = str(therock_raw).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", therock_commit):
+            fail(
+                f"{label} has invalid therock_commit {therock_raw!r}.",
+                "Expected a 40-character commit SHA.",
+            )
+    build_date = str(entry.get("build_date") or "").strip() or None
+    index_url = str(entry.get("index_url") or "").strip() or ROCM_TORCH_INDEX_URL
+    status_url = _quartz_status_url(build_date) if build_date else None
+    return RocmBuild(
+        rocm_version=rocm_version,
+        index_url=index_url,
+        source=source_name,
+        build_date=build_date,
+        therock_commit=therock_commit,
+        status_url=status_url,
+        untested=None,
+        rocm_libraries_commit=rocm_libraries_commit,
+    )
+
+
+def read_rocm_pins(
+    path: Optional[Path] = None,
+) -> Tuple[str, Dict[str, RocmBuild]]:
+    """Read all per-arch pins and the default arch key from ``rocm-pin.json``."""
     pin_path = ROCM_PIN_FILE if path is None else path
     try:
         data = json.loads(pin_path.read_text(encoding="utf-8"))
@@ -547,41 +612,40 @@ def read_rocm_pin(path: Optional[Path] = None) -> RocmBuild:
         )
     if not isinstance(data, dict):
         fail(f"{pin_path} must contain a JSON object.")
-    rocm_version = str(data.get("rocm_version") or "").strip()
-    if not re.fullmatch(r"[0-9][0-9A-Za-z.+!-]*", rocm_version):
-        fail(
-            f"{pin_path} has invalid rocm_version {data.get('rocm_version')!r}.",
-            "Expected a ROCm wheel version such as 10.3.0a20261123.",
+    archs_raw = data.get("archs")
+    if not isinstance(archs_raw, dict) or not archs_raw:
+        fail(f"{pin_path} must contain a non-empty 'archs' object.")
+    pins: Dict[str, RocmBuild] = {}
+    for arch_key, entry in archs_raw.items():
+        if not isinstance(arch_key, str) or not arch_key.strip():
+            fail(f"{pin_path} has an empty architecture key in 'archs'.")
+        norm_arch = arch_key.strip().lower()
+        pins[norm_arch] = _parse_rocm_pin_entry(
+            entry, f"{pin_path}['archs'][{norm_arch!r}]", pin_path.name
         )
-    rocm_libraries_commit = str(data.get("rocm_libraries_commit") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", rocm_libraries_commit):
+    default_arch = str(data.get("default") or "").strip().lower()
+    if default_arch not in pins:
         fail(
-            f"{pin_path} has invalid rocm_libraries_commit "
-            f"{data.get('rocm_libraries_commit')!r}.",
-            "Expected a 40-character commit SHA.",
+            f"{pin_path} has invalid default arch {data.get('default')!r}.",
+            f"Expected one of: {', '.join(pins)}.",
         )
-    therock_raw = data.get("therock_commit")
-    therock_commit: Optional[str] = None
-    if therock_raw:
-        therock_commit = str(therock_raw).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{40}", therock_commit):
-            fail(
-                f"{pin_path} has invalid therock_commit {therock_raw!r}.",
-                "Expected a 40-character commit SHA.",
-            )
-    build_date = str(data.get("build_date") or "").strip() or None
-    index_url = str(data.get("index_url") or "").strip() or ROCM_TORCH_INDEX_URL
-    status_url = _quartz_status_url(build_date) if build_date else None
-    return RocmBuild(
-        rocm_version=rocm_version,
-        index_url=index_url,
-        source=pin_path.name,
-        build_date=build_date,
-        therock_commit=therock_commit,
-        status_url=status_url,
-        untested=None,
-        rocm_libraries_commit=rocm_libraries_commit,
-    )
+    return default_arch, pins
+
+
+def read_rocm_pin(
+    gpu_arch: Optional[str] = None, path: Optional[Path] = None
+) -> RocmBuild:
+    """Read the checked-in ROCm + rocm-libraries pin for ``gpu_arch``.
+
+    Falls back to the ``default`` arch in ``rocm-pin.json`` when ``gpu_arch``
+    is None or has no explicit entry.
+    """
+    default_arch, pins = read_rocm_pins(path)
+    if gpu_arch:
+        norm = gpu_arch.strip().lower()
+        if norm in pins:
+            return pins[norm]
+    return pins[default_arch]
 
 
 def _fetch_therock_rocm_libraries_commit(
@@ -1250,7 +1314,7 @@ class Setup:
                     except OSError:
                         pass
                     return ref, "quartz", therock_commit
-        pin = read_rocm_pin()
+        pin = read_rocm_pin(self.gpu_arch or self.gpu_arch_override)
         return pin.rocm_libraries_commit or "", pin.source, pin.therock_commit
 
     def ensure_rocm_libraries_checkout(self) -> None:
@@ -1949,7 +2013,7 @@ class Setup:
             return select_quartz_nightly(platform_name, arch, self.torch_index_url)
         if self.rocm_version:
             if ROCM_PIN_FILE.is_file():
-                pin = read_rocm_pin()
+                pin = read_rocm_pin(arch)
                 if pin.rocm_version == self.rocm_version:
                     return dataclasses.replace(
                         pin,
@@ -1960,7 +2024,15 @@ class Setup:
             )
         if self.torch_index_url:
             return RocmBuild("", self.torch_index_url, "--torch-index-url")
-        return read_rocm_pin()
+        default_arch, pins = read_rocm_pins()
+        norm_arch = arch.strip().lower()
+        if norm_arch in pins:
+            return pins[norm_arch]
+        print(
+            f"{ROCM_PIN_FILE.name} has no entry for {arch}; "
+            f"using default ({default_arch})."
+        )
+        return pins[default_arch]
 
     def install_rocm_torch(self, build: RocmBuild, arch: str) -> None:
         """Install ROCm PyTorch and the ROCm SDK wheels of ``build``."""

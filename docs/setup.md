@@ -215,11 +215,13 @@ On Windows the default is `gfx1151`.
 
 ## ROCm nightly selection
 
-By default, `--torch-mode rocm` installs the ROCm nightly and matching
-`rocm-libraries` commit checked into `rocm-pin.json`. This keeps the ROCm
-PyTorch wheels, MIOpen and `miopen-provider` in lockstep without reading
-Quartz on every setup run, and isolates upstream regressions to scheduled bump
-PRs (`.github/workflows/bump-rocm-pin.yml`).
+By default, `--torch-mode rocm` installs the per-architecture ROCm nightly and
+matching `rocm-libraries` commit checked into `rocm-pin.json` (falling back to
+its `default` entry for unlisted architectures). This keeps the ROCm PyTorch
+wheels, MIOpen and `miopen-provider` in lockstep without reading Quartz on
+every setup run, lets each architecture advance independently as its Quartz
+tests pass, and isolates upstream regressions to scheduled bump PRs
+(`.github/workflows/bump-rocm-pin.yml`).
 
 To pull the newest passing nightly directly from
 [Quartz](https://github.com/ROCm/Quartz), pass `--rocm-version latest`:
@@ -299,11 +301,13 @@ CI (`setup.yml` gpu-test and `check-deserialize.yml`) uses `rocm-pin.json`.
 To test another build in CI, set the `ROCM_VERSION` repository variable (for
 example `latest` or a specific version). Each job prints the ROCm build and
 `rocm-libraries` commit in its log and in the job summary. The scheduled
-`.github/workflows/bump-rocm-pin.yml` workflow opens PRs to advance
-`rocm-pin.json` to the newest Quartz nightly passing Linux `gfx942` and
-`gfx950` tests and Windows `gfx1151` builds. When the `ROCM_PIN_BUMP_TOKEN`
-repository secret is configured, GitHub runs `gpu-tests` and
-`check-deserialize` on each bump PR automatically.
+`.github/workflows/bump-rocm-pin.yml` workflow checks each architecture in
+`rocm-pin.json` independently (`gfx90a`, `gfx942`, `gfx950` on Linux;
+`gfx1151` on Windows + Linux builds), advances only the architectures whose
+Quartz tests pass, leaves failing architectures untouched, and opens a bump PR
+with squash auto-merge enabled. When the `ROCM_PIN_BUMP_TOKEN` repository
+secret is configured, GitHub runs `gpu-tests` and `check-deserialize` on each
+bump PR automatically.
 
 ## rocm-libraries source
 

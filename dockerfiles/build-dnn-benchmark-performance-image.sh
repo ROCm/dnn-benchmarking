@@ -116,7 +116,7 @@ if rocm_version:
     except argparse.ArgumentTypeError as exc:
         print(f"ERROR: --rocm-version: {exc}", file=sys.stderr)
         sys.exit(2)
-pin = setup_env.read_rocm_pin()
+pin = setup_env.read_rocm_pin(device_target)
 if not rocm_version or rocm_version == pin.rocm_version:
     build = pin
 elif rocm_version == "latest":
