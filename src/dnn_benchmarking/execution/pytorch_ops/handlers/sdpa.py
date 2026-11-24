@@ -2056,17 +2056,33 @@ def compile_sdpa(
 
 def _decline_backward_philox(dropout: SdpaDropout) -> None:
     """Decline Philox dropout in the backward, as hipDNN does (PlanUtils.hpp,
-    rocm-libraries #14358).
+    rocm-libraries #14358): the backward graph API has no rng_dump output,
+    so the reference cannot replay the Philox mask. FlyDSL's backward
+    engines (rocm-libraries #15643) serve Philox backward dropout, but no
+    reference can validate them.
+
+    Probability 0 with no explicit mask, scale or scale_inv is no dropout
+    (PlanUtils.hpp's backward ``isSdpaZeroProbabilityDropout`` overload):
+    seed and offset are not read, whether named or absent.
 
     Runs before the forward dropout rules of ``_plan_sdpa_common``, whose
     messages name an ``rng_dump`` output that a backward node cannot have.
     """
+    if (
+        dropout.probability == 0.0
+        and dropout.mask_uid is None
+        and dropout.scale_uid is None
+        and dropout.scale_inv_uid is None
+    ):
+        return
     p = dropout.probability
     if p is not None and p != 0.0:
         raise ValueError(
             f"SDPA Philox backward dropout (dropout_probability={p}) is not "
             "supported: the hipDNN backward graph API has no rng_dump "
-            "output, so the reference cannot replay the Philox mask (see "
+            "output, so the reference cannot replay the Philox mask. "
+            "FlyDSL's backward engines (rocm-libraries #15643) serve Philox "
+            "backward dropout, but no reference can validate them (see "
             "rocm-libraries #14358)"
         )
     if dropout.seed_uid is not None or dropout.offset_uid is not None:

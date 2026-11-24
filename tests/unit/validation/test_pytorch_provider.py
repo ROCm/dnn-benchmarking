@@ -2392,26 +2392,9 @@ class TestPyTorchProviderNewOps:
                 id="probability_nonzero_with_seed_and_offset",
             ),
             pytest.param(
-                {
-                    "mask": None,
-                    "scale": None,
-                    "scale_inv": None,
-                    "probability": 0.0,
-                    "seed": True,
-                },
+                {"mask": None, "scale": None, "probability": 0.0},
                 None,
-                id="probability_zero_with_seed",
-            ),
-            pytest.param(
-                {
-                    "mask": None,
-                    "scale": None,
-                    "scale_inv": None,
-                    "probability": 0.0,
-                    "offset": True,
-                },
-                None,
-                id="probability_zero_with_offset",
+                id="probability_zero_with_scale_inv",
             ),
             pytest.param({"probability": 0.0}, None, id="probability_zero_with_mask"),
             pytest.param(
@@ -2442,6 +2425,87 @@ class TestPyTorchProviderNewOps:
             )
         if match != "Philox backward":
             assert "rng_dump" not in str(declined.value)
+
+    @pytest.mark.parametrize(
+        "has_seed,has_offset",
+        [
+            pytest.param(True, False, id="seed_only"),
+            pytest.param(False, True, id="offset_only"),
+            pytest.param(True, True, id="seed_and_offset"),
+        ],
+    )
+    def test_sdpa_backward_probability_zero_ignores_seed_and_offset(
+        self, has_seed, has_offset
+    ) -> None:
+        """Probability 0 with no mask, scale or scale_inv is no dropout
+        whether seed, offset, both or neither are named (PlanUtils.hpp's
+        backward ``isSdpaZeroProbabilityDropout`` overload,
+        ``TestSdpaBwdPlanZeroDropout``): dQ, dK and dV match the plain
+        backward (R13) exactly as they do with neither named
+        (``test_sdpa_backward_probability_zero_is_no_dropout``); seed and
+        offset are not read."""
+        graph = self._backward_dropout_graph(
+            mask=None,
+            scale=None,
+            scale_inv=None,
+            probability=0.0,
+            seed=has_seed,
+            offset=has_offset,
+        )
+        self._assert_backward_closed_form(graph, seed=31, inv=1.0)
+
+    @pytest.mark.parametrize(
+        "has_seed,has_offset",
+        [
+            pytest.param(True, False, id="seed_only"),
+            pytest.param(False, True, id="offset_only"),
+            pytest.param(True, True, id="seed_and_offset"),
+        ],
+    )
+    def test_sdpa_backward_probability_zero_with_dbias_ignores_seed_and_offset(
+        self, has_seed, has_offset
+    ) -> None:
+        """The same rule with a ``dbias`` output: dBias is also the plain
+        (no-dropout) gradient of the additive bias, not a dropout-scaled
+        one, whether seed, offset or both are named."""
+        provider = ReferenceProviderRegistry.get_provider("pytorch")
+        graph = self._backward_dropout_graph(
+            mask=None,
+            scale=None,
+            scale_inv=None,
+            probability=0.0,
+            seed=has_seed,
+            offset=has_offset,
+            attn_mask=(1, 4, 5, 7),
+            dbias=True,
+        )
+        inputs = self._backward_dropout_inputs(graph, seed=32)
+        q, k, v, do, bias = (
+            inputs[uid].astype(np.float64) for uid in (_Q, _K, _V, self._DO, _ATTN_MASK)
+        )
+        k_full, v_full = np.repeat(k, 2, axis=1), np.repeat(v, 2, axis=1)
+        scores = q @ k_full.swapaxes(-1, -2) * _ATTN_SCALE + bias
+        lse = np.log(np.exp(scores).sum(axis=-1, keepdims=True))
+        probs = np.exp(scores - lse)
+        o = probs @ v_full
+        d = (do * o).sum(axis=-1, keepdims=True)
+        dp = do @ v_full.swapaxes(-1, -2)
+        ds_unscaled = probs * (dp - d)
+        dbias = ds_unscaled.sum(axis=0, keepdims=True)  # bias batch dim is 1
+        ds = ds_unscaled * _ATTN_SCALE
+        dq = ds @ k_full
+        dk = (ds.swapaxes(-1, -2) @ q).reshape(2, 2, 2, 7, -1).sum(axis=2)
+        dv = (probs.swapaxes(-1, -2) @ do).reshape(2, 2, 2, 7, -1).sum(axis=2)
+
+        inputs[_O] = o.astype(np.float32)
+        inputs[_STATS] = lse.astype(np.float32)
+
+        out = provider.compute_reference(graph, inputs)
+
+        for uid, grad in zip(
+            (self._DQ, self._DK, self._DV, self._DBIAS), (dq, dk, dv, dbias)
+        ):
+            np.testing.assert_allclose(out[uid].data, grad, rtol=1e-4, atol=1e-4)
 
     def test_sdpa_backward_dropout_never_takes_fused_path(self, monkeypatch) -> None:
         """``fused()`` (:2496) must decline whenever dropout is active, before
