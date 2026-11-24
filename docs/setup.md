@@ -220,8 +220,8 @@ matching `rocm-libraries` commit checked into `rocm-pin.json` (falling back to
 its `default` entry for unlisted architectures). This keeps the ROCm PyTorch
 wheels, MIOpen and `miopen-provider` in lockstep without reading Quartz on
 every setup run, lets each architecture advance independently as its Quartz
-tests pass, and isolates upstream regressions to scheduled bump PRs
-(`.github/workflows/bump-rocm-pin.yml`).
+tests pass, and isolates upstream regressions to gated bump PRs
+(`tools/bump_rocm_pin.py` and `.github/workflows/bump-rocm-pin.yml`).
 
 To pull the newest passing nightly directly from
 [Quartz](https://github.com/ROCm/Quartz), pass `--rocm-version latest`:
@@ -300,14 +300,12 @@ Result files copy the build fields to `environment.rocm_build_version`,
 CI (`setup.yml` gpu-test and `check-deserialize.yml`) uses `rocm-pin.json`.
 To test another build in CI, set the `ROCM_VERSION` repository variable (for
 example `latest` or a specific version). Each job prints the ROCm build and
-`rocm-libraries` commit in its log and in the job summary. The scheduled
-`.github/workflows/bump-rocm-pin.yml` workflow checks each architecture in
+`rocm-libraries` commit in its log and in the job summary.
+`tools/bump_rocm_pin.py` (also runnable manually via
+`.github/workflows/bump-rocm-pin.yml`) checks each architecture in
 `rocm-pin.json` independently (`gfx90a`, `gfx942`, `gfx950` on Linux;
 `gfx1151` on Windows + Linux builds), advances only the architectures whose
-Quartz tests pass, leaves failing architectures untouched, and opens a bump PR
-with squash auto-merge enabled. When the `ROCM_PIN_BUMP_TOKEN` repository
-secret is configured, GitHub runs `gpu-tests` and `check-deserialize` on each
-bump PR automatically.
+Quartz tests pass, and leaves failing architectures untouched.
 
 ## rocm-libraries source
 
