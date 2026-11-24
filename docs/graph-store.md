@@ -75,33 +75,33 @@ are different. A change to a name or a tag does not change the key.
 
 ### 4. Upload
 
-Upload is a manual procedure. It needs write credentials. Use conditional
-writes, so that two uploads of one key cannot overwrite each other.
+Use [`tools/upload_graphs.py`](../tools/upload_graphs.py) from an environment
+with `dnn-benchmarking` installed and a recent AWS CLI v2 on `PATH`. Pass
+tagged graph JSON files or directories containing `*.json` files.
 
-1. Compute the key of the graph (rule 1).
-2. If the key is not in the store, put the object with `If-None-Match: *`:
+```bash
+# Preview against the public store without AWS credentials.
+python tools/upload_graphs.py /path/to/graphs
 
-   ```bash
-   aws s3api put-object --bucket therock-dvc \
-     --key dnn-benchmarking-graphs/<key> --body <key> \
-     --content-type application/json --if-none-match '*'
-   ```
+# Write with a named AWS profile that has graph-store write access.
+python tools/upload_graphs.py /path/to/graphs --profile graph-writer --apply
+```
 
-3. If the key is in the store:
-   1. Get the object and its ETag.
-   2. Make the union of its tags and your tags. Keep its `name`, unless you
-      intend to rename it.
-   3. Put the result with `If-Match: <etag>`
-      (`aws s3api put-object ... --if-match '"<etag>"'`).
-   4. If the put fails with `412 Precondition Failed`, another upload
-      changed the object. Start again at step 3.1.
-4. To change a tag, overwrite the object as in step 3. Do not delete an
-   object to change its tags.
+The script computes the object key from each graph, not its filename. It
+validates the input and reports `create`, `merge`, or `skip` for each key.
+Use `--store s3://BUCKET/PREFIX/` to select another store. A private store
+also needs `--profile` for the preview.
+The reader needs permission to get objects and list the destination prefix
+so S3 can distinguish a missing key from denied access.
 
-Before an upload, check each object against rules 1 to 3.
-`tools/sdpa_fwd_to_bwd.py` (the SDPA backward corpus) writes objects that
-obey these rules into a local folder. Run a folder with
-`dnn-benchmark -g <folder>` before you upload it.
+The script creates new objects with `If-None-Match: *`. For existing objects,
+it keeps the stored name and notes, adds only missing tags, and writes with
+`If-Match` using the ETag from the read. If another writer changes an object,
+the script stops. Earlier writes remain in place; run the preview again
+before you retry. The script does not remove tags or delete objects.
+
+`tools/sdpa_fwd_to_bwd.py` writes tagged graph files into a local folder. Run
+`dnn-benchmark -g <folder>` to check those graphs before you upload them.
 
 ## Old `Workloads/` sets
 
