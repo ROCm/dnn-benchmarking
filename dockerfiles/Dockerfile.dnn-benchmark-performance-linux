@@ -8,12 +8,6 @@ FROM ${BASE_IMAGE} AS builder
 
 ARG DEVICE_TARGET=gfx942
 ARG FETCHCONTENT_GIT_SSL_NO_VERIFY=false
-ARG ROCM_TORCH_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
-# The build context has no .git (see .dockerignore), so setup_env.py cannot
-# resolve the rocm-libraries submodule pin itself. The build script passes it
-# (`git rev-parse HEAD:rocm-libraries`); empty => setup warns and builds the
-# moving .gitmodules branch.
-ARG ROCM_LIBRARIES_REF=""
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HIP_PLATFORM=amd \
@@ -40,6 +34,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 WORKDIR ${WORKSPACE_DIR}
 
 COPY . .
+
+# The ROCm wheel version, rocm-libraries commit, and optional torch index URL.
+# Empty => setup_env.py reads them from rocm-pin.json in the build context.
+# Declared here, not at the stage top, so a new pin or index keeps the apt layer.
+ARG ROCM_TORCH_INDEX_URL=""
+ARG ROCM_VERSION=""
+ARG ROCM_LIBRARIES_REF=""
 
 RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
 set -eu
@@ -70,6 +71,9 @@ if [ -n "${ROCM_TORCH_INDEX_URL}" ]; then
 fi
 if [ -n "${ROCM_LIBRARIES_REF}" ]; then
     set -- "$@" --rocm-libraries-ref "${ROCM_LIBRARIES_REF}"
+fi
+if [ -n "${ROCM_VERSION}" ]; then
+    set -- "$@" --rocm-version "${ROCM_VERSION}"
 fi
 
 python3.12 setup_env.py "$@"
@@ -189,6 +193,12 @@ SCRIPT
 RUN useradd --create-home --user-group --groups video dnnbench && \
     chown dnnbench:dnnbench "${WORKSPACE_DIR}"
 USER dnnbench
+
+# The ROCm wheel version that the builder stage installed, when the build
+# named one. The results also record it, with its TheRock build date and
+# commit (environment.rocm_build_version, rocm_build_date, therock_commit).
+ARG ROCM_VERSION=""
+LABEL com.amd.dnn-benchmark.rocm-version="${ROCM_VERSION}"
 
 # One-shot benchmark CLI, not a long-running service.
 HEALTHCHECK NONE

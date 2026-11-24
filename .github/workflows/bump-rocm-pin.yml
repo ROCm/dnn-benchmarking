@@ -1,0 +1,105 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: bump-rocm-pin
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocm_version:
+        description: 'Optional ROCm nightly version (e.g. 10.3.0a20261123); blank or latest bumps each arch independently from Quartz.'
+        required: false
+        type: string
+        default: ''
+      archs:
+        description: 'Optional comma-separated archs to update (e.g. gfx942,gfx950); blank updates all archs in rocm-pin.json.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-rocm-pin
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Resolve per-arch ROCm pins from Quartz
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.rocm_version || '' }}
+          REQUESTED_ARCHS: ${{ inputs.archs || '' }}
+        run: |
+          python3 tools/bump_rocm_pin.py \
+            --rocm-version "${REQUESTED_VERSION}" \
+            --archs "${REQUESTED_ARCHS}" \
+            --body-file "${RUNNER_TEMP}/bump-rocm-pin-body.md" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Open or update bump PR
+        if: steps.resolve.outputs.changed == 'true'
+        env:
+          # Setting repository secret ROCM_PIN_BUMP_TOKEN (a PAT or GitHub App
+          # token) lets the pushed branch trigger pull_request CI checks
+          # automatically; otherwise GITHUB_TOKEN opens/updates the PR.
+          GH_TOKEN: ${{ secrets.ROCM_PIN_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          PR_TITLE: ${{ steps.resolve.outputs.title }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch="chore/bump-rocm-pin"
+          body_file="${RUNNER_TEMP}/bump-rocm-pin-body.md"
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          # Skip pushing when the open bump branch already carries this exact
+          # pin, so repeated runs do not trigger redundant GPU CI or overwrite
+          # manual fix-up commits on the bump PR.
+          if git fetch --quiet "${remote}" "refs/heads/${branch}" 2>/dev/null; then
+            if git show FETCH_HEAD:rocm-pin.json 2>/dev/null | cmp -s - rocm-pin.json; then
+              echo "Branch ${branch} already has this exact rocm-pin.json; skipping push."
+              exit 0
+            fi
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${branch}"
+          git add rocm-pin.json
+          git commit -m "${PR_TITLE}"
+          git push --force "${remote}" "HEAD:refs/heads/${branch}"
+
+          pr_number=$(gh pr list --repo "${REPO}" --head "${branch}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "${pr_number}" ]; then
+            gh api -X PATCH "repos/${REPO}/pulls/${pr_number}" \
+              -f title="${PR_TITLE}" \
+              -F body=@"${body_file}" >/dev/null
+            echo "Updated PR #${pr_number}"
+          else
+            pr_url=$(gh pr create --repo "${REPO}" --base main --head "${branch}" \
+              --title "${PR_TITLE}" \
+              --body-file "${body_file}")
+            echo "Created ${pr_url}"
+            pr_number="${pr_url##*/}"
+          fi
+
+          # Enable squash auto-merge so the bump PR merges as soon as required
+          # checks and CODEOWNER approval pass (main ruleset blocks direct push).
+          if ! gh pr merge "${pr_number}" --repo "${REPO}" --auto --squash; then
+            echo "::warning::Could not enable auto-merge on PR #${pr_number}; merge manually after review."
+          fi

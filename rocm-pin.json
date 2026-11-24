@@ -1,0 +1,33 @@
+{
+  "default": "gfx950",
+  "archs": {
+    "gfx90a": {
+      "rocm_version": "10.3.0a20261120",
+      "build_date": "20261120",
+      "therock_commit": "c65aaf72258393b6c47631bb2b7143b3a29f35a0",
+      "rocm_libraries_commit": "bd4da6582949103a3333938bd32b02f784b1640f",
+      "index_url": "https://nightly.repo.amd.com/rocm/whl-next/"
+    },
+    "gfx942": {
+      "rocm_version": "10.3.0a20261123",
+      "build_date": "20261123",
+      "therock_commit": "eaa2f988a7330c3e0d54c4bc7b52d06fda40c8ed",
+      "rocm_libraries_commit": "6b5f0a16f7562fdb94fe4405836998322b507431",
+      "index_url": "https://nightly.repo.amd.com/rocm/whl-next/"
+    },
+    "gfx950": {
+      "rocm_version": "10.3.0a20261123",
+      "build_date": "20261123",
+      "therock_commit": "eaa2f988a7330c3e0d54c4bc7b52d06fda40c8ed",
+      "rocm_libraries_commit": "6b5f0a16f7562fdb94fe4405836998322b507431",
+      "index_url": "https://nightly.repo.amd.com/rocm/whl-next/"
+    },
+    "gfx1151": {
+      "rocm_version": "10.3.0a20261123",
+      "build_date": "20261123",
+      "therock_commit": "eaa2f988a7330c3e0d54c4bc7b52d06fda40c8ed",
+      "rocm_libraries_commit": "6b5f0a16f7562fdb94fe4405836998322b507431",
+      "index_url": "https://nightly.repo.amd.com/rocm/whl-next/"
+    }
+  }
+}

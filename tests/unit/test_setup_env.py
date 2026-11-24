@@ -13,10 +13,19 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 _SETUP_ENV = Path(__file__).resolve().parents[2] / "setup_env.py"
+# Quartz nightly status.json files 20261113 to 20261119, recorded from
+# ROCm/quartz. Their `pipelines` block keeps only the rocm and pytorch test
+# entries of gfx94X-dcgpu, gfx950-dcgpu, gfx90a and gfx1151. Linux facts the
+# tests use: 20261116 has a ROCm build in progress, 20261114 a failed PyTorch
+# build. gfx94X-dcgpu ROCm tests fail on 20261114 and 20261115, and its
+# PyTorch tests fail on 20261113. gfx950-dcgpu has no ROCm test entry, and
+# its PyTorch tests fail on 20261113. gfx90a ROCm tests fail on every day.
+_QUARTZ_NIGHTLY = Path(__file__).resolve().parent / "data" / "quartz" / "nightly"
 
 
 @pytest.fixture(scope="module")
@@ -26,6 +35,53 @@ def setup_env():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def _no_quartz_network(setup_env, monkeypatch):
+    def refuse_url(url):
+        raise AssertionError(f"unit test fetched {url}")
+
+    def refuse_therock(
+        therock_commit, repo_url=setup_env.THEROCK_REPO_URL, *, required=True
+    ):
+        raise AssertionError(
+            f"unit test resolved TheRock {therock_commit} from {repo_url}"
+        )
+
+    monkeypatch.setattr(setup_env, "fetch_quartz_text", refuse_url)
+    monkeypatch.setattr(
+        setup_env, "resolve_therock_rocm_libraries_commit", refuse_therock
+    )
+
+
+def _quartz_document(build_date: str) -> dict:
+    return json.loads((_QUARTZ_NIGHTLY / build_date / "status.json").read_text())
+
+
+@pytest.fixture
+def quartz(setup_env, monkeypatch):
+    """Serve the recorded nightlies. ``latest`` is the build date that
+    nightly/latest.json names; ``documents`` replaces a recorded document by
+    build date; ``fetched`` lists every URL read. Setup reads the Linux
+    summary of the recorded nightlies on every host, Windows included."""
+    served = SimpleNamespace(latest="20261119", documents={}, fetched=[])
+
+    def fetch(url):
+        served.fetched.append(url)
+        relative = url.removeprefix(setup_env.QUARTZ_NIGHTLY_URL)
+        if relative == "latest.json":
+            # A git symlink: raw GitHub serves its target path.
+            return f"{served.latest}/status.json"
+        build_date = relative.split("/", 1)[0]
+        if build_date in served.documents:
+            return json.dumps(served.documents[build_date])
+        path = _QUARTZ_NIGHTLY / relative
+        return path.read_text() if path.is_file() else None
+
+    monkeypatch.setattr(setup_env, "fetch_quartz_text", fetch)
+    monkeypatch.setattr(setup_env, "quartz_platform", lambda: "linux")
+    return served
 
 
 def _setup(setup_env, tmp_path, *argv):
@@ -571,14 +627,32 @@ def rocm_libraries(setup_env, tmp_path, monkeypatch):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".gitmodules").write_text(
-        '[submodule "rocm-libraries"]\n'
-        "\tpath = rocm-libraries\n"
-        f"\turl = {origin.as_uri()}\n"
-        "\tbranch = main\n"
+    pin_file = repo / "rocm-pin.json"
+    entry = {
+        "rocm_version": _RECORDED_ROCM_VERSION,
+        "build_date": "20261115",
+        "therock_commit": "62d1ac21a0eda4df3871c6c8d4570cb0ee9a4637",
+        "rocm_libraries_commit": _head(src),
+        "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+    }
+    pin_file.write_text(
+        json.dumps(
+            {
+                "default": "gfx950",
+                "archs": {
+                    "gfx90a": entry,
+                    "gfx942": entry,
+                    "gfx950": entry,
+                    "gfx1151": entry,
+                },
+            }
+        )
+        + "\n"
     )
     monkeypatch.setattr(setup_env, "SCRIPT_DIR", repo)
+    monkeypatch.setattr(setup_env, "ROCM_PIN_FILE", pin_file)
     monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", repo / "rocm-libraries")
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_REPO_URL", origin.as_uri())
     return repo / "rocm-libraries"
 
 
@@ -1006,10 +1080,14 @@ def test_clean_with_existing_torch_mode_is_a_usage_error(setup_env) -> None:
     assert exc.value.code == 2
 
 
+_RECORDED_ROCM_VERSION = "10.3.0a20261115"
+
+
 def _reused_venv(setup_env, tmp_path, monkeypatch, mode, *argv, record=True):
     """A Setup over a venv that setup filled with ``mode`` torch from its
-    default index (gfx90a for rocm). ``record=False`` drops the TORCH_RECORD,
-    as on a venv set up before setup wrote one."""
+    default index (gfx90a and ROCm _RECORDED_ROCM_VERSION for rocm).
+    ``record=False`` drops the records, as on a venv set up before setup
+    wrote them."""
     setup = _setup(setup_env, tmp_path, "--torch-mode", mode, *argv)
     setup.venv_dir.mkdir(parents=True)
     if record:
@@ -1022,6 +1100,10 @@ def _reused_venv(setup_env, tmp_path, monkeypatch, mode, *argv, record=True):
         (setup.venv_dir / setup_env.TORCH_RECORD).write_text(
             json.dumps({"torch_index_url": index_url, "gpu_arch": arch})
         )
+        if mode == "rocm":
+            (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(
+                json.dumps({"rocm_version": _RECORDED_ROCM_VERSION})
+            )
     setup.installed_torch_mode = mode
     pip_calls = []
     monkeypatch.setattr(setup, "pip", lambda *a, **kw: pip_calls.append(a))
@@ -1034,8 +1116,9 @@ def _reused_venv(setup_env, tmp_path, monkeypatch, mode, *argv, record=True):
         [],
         ["--gpu-arch", "gfx90a"],
         ["--torch-index-url", "https://nightly.repo.amd.com/rocm/whl-next/"],
+        ["--rocm-version", _RECORDED_ROCM_VERSION],
     ],
-    ids=["no-flags", "same-arch", "same-index"],
+    ids=["no-flags", "same-arch", "same-index", "same-rocm-version"],
 )
 def test_reused_venv_keeps_torch_when_flags_match(
     setup_env, tmp_path, monkeypatch, argv
@@ -1050,10 +1133,17 @@ def test_reused_venv_keeps_torch_when_flags_match(
     [
         ("rocm", ["--gpu-arch", "gfx942"]),
         ("rocm", ["--torch-index-url", "https://example.invalid/"]),
+        ("rocm", ["--rocm-version", "10.3.0a20261110"]),
         ("cpu", ["--torch-index-url", "https://example.invalid/"]),
         ("cuda", ["--torch-index-url", "https://example.invalid/"]),
     ],
-    ids=["rocm-other-arch", "rocm-other-index", "cpu-other-index", "cuda-other-index"],
+    ids=[
+        "rocm-other-arch",
+        "rocm-other-index",
+        "rocm-other-version",
+        "cpu-other-index",
+        "cuda-other-index",
+    ],
 )
 def test_reused_venv_refuses_a_different_explicit_torch_source(
     setup_env, tmp_path, monkeypatch, capsys, mode, argv
@@ -1086,7 +1176,7 @@ def test_reused_venv_without_a_record_warns_and_keeps_torch(
 
 
 def test_fresh_torch_install_records_its_source(
-    setup_env, tmp_path, monkeypatch
+    setup_env, tmp_path, monkeypatch, quartz
 ) -> None:
     setup = _setup(setup_env, tmp_path, "--gpu-arch", "gfx942")
     setup.venv_dir.mkdir(parents=True)
@@ -1103,6 +1193,806 @@ def test_fresh_torch_install_records_its_source(
     other.installed_torch_mode = "rocm"
     with pytest.raises(SystemExit):
         other.install_torch()
+
+
+# --- ROCm nightly selection (Quartz) ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "latest, arch, build_date, therock_commit, untested",
+    [
+        (
+            "20261119",
+            "gfx942",
+            "20261119",
+            "93b7a6b2f355e70b833b7b057ef406f6e6d3024e",
+            (),
+        ),
+        (
+            "20261119",
+            "gfx950",
+            "20261119",
+            "93b7a6b2f355e70b833b7b057ef406f6e6d3024e",
+            ("rocm",),
+        ),
+        (
+            "20261116",
+            "gfx950",
+            "20261115",
+            "62d1ac21a0eda4df3871c6c8d4570cb0ee9a4637",
+            ("rocm",),
+        ),
+        (
+            "20261124",
+            "gfx942",
+            "20261119",
+            "93b7a6b2f355e70b833b7b057ef406f6e6d3024e",
+            (),
+        ),
+    ],
+    ids=[
+        "arch-tests-pass",
+        "no-rocm-test-entry",
+        "rocm-build-in-progress",
+        "days-without-a-nightly",
+    ],
+)
+def test_selection_takes_the_newest_nightly_that_passes_for_the_arch(
+    setup_env, quartz, latest, arch, build_date, therock_commit, untested
+) -> None:
+    quartz.latest = latest
+    build = setup_env.select_quartz_nightly("linux", arch)
+    assert build.build_date == build_date
+    assert build.rocm_version == f"10.3.0a{build_date}"
+    assert build.therock_commit == therock_commit
+    assert build.untested == untested
+    assert build.index_url == "https://nightly.repo.amd.com/rocm/whl-next/"
+    assert build.source == "quartz"
+    assert (
+        build.status_url
+        == f"https://raw.githubusercontent.com/ROCm/quartz/main/nightly/{build_date}/status.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "suite, status",
+    [
+        ("rocm", "failure"),
+        ("pytorch", "failure"),
+        ("pytorch", "in_progress"),
+        ("rocm", "cancelled"),
+    ],
+)
+def test_selection_skips_a_nightly_whose_arch_tests_did_not_pass(
+    setup_env, quartz, suite, status
+) -> None:
+    document = _quartz_document("20261119")
+    document["pipelines"][suite]["test"]["linux"]["gfx94X-dcgpu"]["status"] = status
+    quartz.documents["20261119"] = document
+
+    assert setup_env.select_quartz_nightly("linux", "gfx942").build_date == "20261118"
+    # gfx950 does not read the gfx94X-dcgpu entry.
+    assert setup_env.select_quartz_nightly("linux", "gfx950").build_date == "20261119"
+
+
+def test_selection_accepts_an_arch_without_test_entries(setup_env, quartz) -> None:
+    document = _quartz_document("20261119")
+    del document["pipelines"]["pytorch"]["test"]["linux"]["gfx950-dcgpu"]
+    quartz.documents["20261119"] = document
+
+    build = setup_env.select_quartz_nightly("linux", "gfx950")
+
+    assert build.build_date == "20261119"
+    assert build.untested == ("rocm", "pytorch")
+
+
+def test_selection_skips_a_nightly_without_the_gpu_arch(setup_env, quartz) -> None:
+    document = _quartz_document("20261117")
+    document["summary"]["linux"]["architectures"].remove("gfx950-dcgpu")
+    quartz.documents["20261117"] = document
+    quartz.latest = "20261117"
+    # 20261116 has the arch but a Linux ROCm build in progress.
+    build = setup_env.select_quartz_nightly("linux", "gfx950")
+    assert build.build_date == "20261115"
+
+
+@pytest.mark.parametrize(
+    "arch, target, matches",
+    [
+        ("gfx942", "gfx94X-dcgpu", True),
+        ("gfx950", "gfx950-dcgpu", True),
+        ("gfx1101", "gfx110X-all", True),
+        ("gfx90a", "gfx90a", True),
+        ("gfx90a", "gfx94X-dcgpu", False),
+        ("gfx942", "gfx950-dcgpu", False),
+        ("gfx9500", "gfx950-dcgpu", False),
+        ("gfx11011", "gfx110X-all", False),
+    ],
+)
+def test_arch_matches_a_therock_build_target(setup_env, arch, target, matches) -> None:
+    assert setup_env.quartz_arch_matches(arch, target) is matches
+
+
+@pytest.mark.parametrize(
+    "latest, arch, rejections",
+    [
+        (
+            "20261116",
+            "gfx942",
+            [
+                "20261116 (10.3.0a20261116): linux rocm build is in_progress\n",
+                "20261115 (10.3.0a20261115): linux rocm tests of gfx94X-dcgpu "
+                "are failure\n",
+                "20261114 (10.3.0a20261114): linux pytorch build is failure; "
+                "linux rocm tests of gfx94X-dcgpu are failure\n",
+                "20261113 (10.3.0a20261113): linux pytorch tests of gfx94X-dcgpu "
+                "are failure\n",
+                "20261103: no status.json\n",
+            ],
+        ),
+        (
+            "20261114",
+            "gfx950",
+            [
+                "20261114 (10.3.0a20261114): linux pytorch build is failure\n",
+                "20261113 (10.3.0a20261113): linux pytorch tests of gfx950-dcgpu "
+                "are failure\n",
+            ],
+        ),
+        (
+            "20261119",
+            "gfx90a",
+            [
+                f"{day} (10.3.0a{day}): linux rocm tests of gfx90a are failure\n"
+                for day in ("20261119", "20261118", "20261117", "20261115")
+            ],
+        ),
+        (
+            "20261119",
+            "gfx1151",
+            [
+                "20261119 (10.3.0a20261119): linux rocm tests of gfx1151 are "
+                "failure; linux pytorch tests of gfx1151 are in_progress\n",
+                "20261113 (10.3.0a20261113): linux rocm tests of gfx1151 are "
+                "cancelled; linux pytorch tests of gfx1151 are failure\n",
+            ],
+        ),
+    ],
+    ids=["gfx942", "gfx950", "gfx90a", "gfx1151"],
+)
+def test_selection_fails_and_names_each_failed_check(
+    setup_env, quartz, capsys, latest, arch, rejections
+) -> None:
+    quartz.latest = latest
+    with pytest.raises(SystemExit) as exc:
+        setup_env.select_quartz_nightly("linux", arch)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    for rejection in rejections:
+        assert f"  {rejection}" in err
+
+
+def test_selection_fails_when_no_nightly_in_the_window_qualifies(
+    setup_env, quartz, capsys
+) -> None:
+    # No recorded Windows build lists a gfx94X target.
+    with pytest.raises(SystemExit) as exc:
+        setup_env.select_quartz_nightly("windows", "gfx942")
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    for day in range(13, 20):
+        build_date = f"202611{day}"
+        assert f"{build_date} (10.3.0a{build_date}): gfx942 is not among" in err
+    assert "20261106: no status.json" in err
+    # latest.json, then exactly one bounded window of nightlies.
+    assert len(quartz.fetched) == 1 + setup_env.QUARTZ_LOOKBACK_DAYS
+
+
+def test_selection_stops_at_an_unsupported_schema_major(
+    setup_env, quartz, capsys
+) -> None:
+    document = _quartz_document("20261119")
+    document["schema_version"] = "3.0"
+    quartz.documents["20261119"] = document
+    with pytest.raises(SystemExit):
+        setup_env.select_quartz_nightly("linux", "gfx942")
+    assert "schema '3.0'" in capsys.readouterr().err
+
+
+def _fresh_rocm_setup(setup_env, tmp_path, monkeypatch, *argv, arch="gfx942"):
+    """A Setup that installs ROCm torch for ``arch`` into an empty venv."""
+    setup = _setup(setup_env, tmp_path, "--gpu-arch", arch, *argv)
+    setup.venv_dir.mkdir(parents=True)
+    pip_calls = []
+    monkeypatch.setattr(setup, "pip", lambda *a, **kw: pip_calls.append(a))
+    monkeypatch.setattr(setup, "get_torch_mode", lambda: "rocm")
+    return setup, pip_calls
+
+
+def _recorded_environment(setup, monkeypatch) -> dict:
+    from dnn_benchmarking.metrics import machine_info
+
+    monkeypatch.setattr(sys, "prefix", str(setup.venv_dir))
+    info = machine_info.collect_environment_info()
+    return {
+        key: info[key]
+        for key in (
+            "rocm_build_version",
+            "rocm_build_date",
+            "therock_commit",
+            "rocm_build_untested",
+        )
+    }
+
+
+@pytest.mark.parametrize(
+    "arch, latest, environment",
+    [
+        (
+            "gfx942",
+            "20261119",
+            {
+                "rocm_build_version": "10.3.0a20261119",
+                "rocm_build_date": "20261119",
+                "therock_commit": "93b7a6b2f355e70b833b7b057ef406f6e6d3024e",
+                "rocm_build_untested": [],
+            },
+        ),
+        (
+            "gfx950",
+            "20261116",
+            {
+                "rocm_build_version": "10.3.0a20261115",
+                "rocm_build_date": "20261115",
+                "therock_commit": "62d1ac21a0eda4df3871c6c8d4570cb0ee9a4637",
+                "rocm_build_untested": ["rocm"],
+            },
+        ),
+    ],
+)
+def test_rocm_install_latest_pins_the_selected_nightly_and_records_it(
+    setup_env, tmp_path, monkeypatch, quartz, capsys, arch, latest, environment
+) -> None:
+    quartz.latest = latest
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, "--rocm-version", "latest", arch=arch
+    )
+
+    setup.install_torch()
+    assert pip_calls == [
+        (
+            "install",
+            "--pre",
+            f"torch[device-{arch}]",
+            f"rocm[libraries,devel,device-{arch}]=={environment['rocm_build_version']}",
+            "--index-url",
+            "https://nightly.repo.amd.com/rocm/whl-next/",
+        )
+    ]
+    assert _recorded_environment(setup, monkeypatch) == environment
+    out = capsys.readouterr().out
+    assert ("Quartz has no rocm test result" in out) is bool(
+        environment["rocm_build_untested"]
+    )
+
+
+@pytest.mark.parametrize(
+    "version, warnings, untested",
+    [
+        (
+            "10.3.0a20261115",
+            ["linux rocm tests of gfx94X-dcgpu are failure"],
+            [],
+        ),
+        (
+            "10.3.0a20261114",
+            [
+                "linux pytorch build is failure",
+                "linux rocm tests of gfx94X-dcgpu are failure",
+            ],
+            ["pytorch"],
+        ),
+    ],
+    ids=["rocm-tests-failed", "pytorch-build-failed"],
+)
+def test_rocm_version_installs_a_failed_nightly_with_its_metadata(
+    setup_env, tmp_path, monkeypatch, quartz, capsys, version, warnings, untested
+) -> None:
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, "--rocm-version", version
+    )
+
+    setup.install_torch()
+
+    build_date = version.removeprefix("10.3.0a")
+    assert pip_calls[0][3] == f"rocm[libraries,devel,device-gfx942]=={version}"
+    err = capsys.readouterr().err
+    for warning in warnings:
+        assert warning in err
+    # Only the named build is read: no search for a newer one.
+    assert quartz.fetched == [f"{setup_env.QUARTZ_NIGHTLY_URL}{build_date}/status.json"]
+    assert _recorded_environment(setup, monkeypatch) == {
+        "rocm_build_version": version,
+        "rocm_build_date": build_date,
+        "therock_commit": _quartz_document(build_date)["therock_commit"],
+        "rocm_build_untested": untested,
+    }
+
+
+def test_rocm_version_unknown_to_quartz_records_no_build_metadata(
+    setup_env, tmp_path, monkeypatch, quartz, capsys
+) -> None:
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, "--rocm-version", "10.3.0a20261001"
+    )
+
+    setup.install_torch()
+
+    assert pip_calls[0][3:] == (
+        "rocm[libraries,devel,device-gfx942]==10.3.0a20261001",
+        "--index-url",
+        setup_env.ROCM_TORCH_INDEX_URL,
+    )
+    assert "Quartz has no nightly status.json" in capsys.readouterr().err
+    assert _recorded_environment(setup, monkeypatch) == {
+        "rocm_build_version": "10.3.0a20261001",
+        "rocm_build_date": None,
+        "therock_commit": None,
+        "rocm_build_untested": None,
+    }
+
+
+def test_torch_index_url_installs_its_newest_rocm_without_quartz(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    # The autouse guard fails the test on any Quartz fetch.
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, "--torch-index-url", "https://mirror.invalid/"
+    )
+    monkeypatch.setattr(setup, "installed_rocm_version", lambda: "10.3.0a20261117")
+
+    setup.install_torch()
+
+    assert pip_calls[0][3:] == (
+        "rocm[libraries,devel,device-gfx942]",
+        "--index-url",
+        "https://mirror.invalid/",
+    )
+    assert _recorded_environment(setup, monkeypatch)["rocm_build_version"] == (
+        "10.3.0a20261117"
+    )
+
+
+def test_rocm_version_needs_rocm_torch_mode(setup_env) -> None:
+    with pytest.raises(SystemExit) as exc:
+        setup_env.main(["--torch-mode", "cpu", "--rocm-version", "10.3.0a20261115"])
+    assert exc.value.code == 2
+
+
+def test_missing_toolchain_is_installed_at_the_recorded_rocm_version(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    setup, pip_calls = _reused_venv(setup_env, tmp_path, monkeypatch, "rocm")
+    roots = iter([None, "/devel"])
+    monkeypatch.setattr(setup, "_rocm_sdk_devel_root", lambda **kw: next(roots))
+
+    assert setup.ensure_rocm_wheel_devel_prefix("https://index.invalid/") == "/devel"
+    assert pip_calls == [
+        (
+            "install",
+            "--pre",
+            f"rocm-sdk-devel=={_RECORDED_ROCM_VERSION}",
+            "--index-url",
+            "https://index.invalid/",
+        )
+    ]
+
+
+# --- Checked-in rocm-pin.json & Quartz -> TheRock -> rocm-libraries ---------
+
+
+def test_rocm_install_defaults_to_rocm_pin_without_network(
+    setup_env, tmp_path, monkeypatch, rocm_libraries
+) -> None:
+    # The autouse guard fails on any Quartz or TheRock network call.
+    pin = setup_env.read_rocm_pin("gfx950")
+    setup, pip_calls = _fresh_rocm_setup(
+        setup_env, tmp_path, monkeypatch, arch="gfx950"
+    )
+
+    setup.install_torch()
+    setup.ensure_rocm_libraries_checkout()
+
+    assert pip_calls == [
+        (
+            "install",
+            "--pre",
+            "torch[device-gfx950]",
+            f"rocm[libraries,devel,device-gfx950]=={pin.rocm_version}",
+            "--index-url",
+            pin.index_url,
+        )
+    ]
+    assert _recorded_environment(setup, monkeypatch) == {
+        "rocm_build_version": pin.rocm_version,
+        "rocm_build_date": pin.build_date,
+        "therock_commit": pin.therock_commit,
+        "rocm_build_untested": None,
+    }
+    saved = json.loads((setup.venv_dir / setup_env.ROCM_BUILD_RECORD).read_text())
+    assert saved["source"] == "rocm-pin.json"
+    assert saved["rocm_libraries_commit"] == pin.rocm_libraries_commit
+    assert _head(rocm_libraries) == pin.rocm_libraries_commit
+
+
+def test_read_rocm_pin_selects_per_arch_and_falls_back_to_default(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    pin_file = tmp_path / "rocm-pin.json"
+    pin_file.write_text(
+        json.dumps(
+            {
+                "default": "gfx950",
+                "archs": {
+                    "gfx90a": {
+                        "rocm_version": "10.3.0a20261120",
+                        "build_date": "20261120",
+                        "therock_commit": "a" * 40,
+                        "rocm_libraries_commit": "b" * 40,
+                        "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+                    },
+                    "gfx950": {
+                        "rocm_version": "10.3.0a20261123",
+                        "build_date": "20261123",
+                        "therock_commit": "c" * 40,
+                        "rocm_libraries_commit": "d" * 40,
+                        "index_url": setup_env.ROCM_TORCH_INDEX_URL,
+                    },
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(setup_env, "ROCM_PIN_FILE", pin_file)
+
+    pin_90a = setup_env.read_rocm_pin("gfx90a")
+    assert pin_90a.rocm_version == "10.3.0a20261120"
+    assert pin_90a.rocm_libraries_commit == "b" * 40
+
+    pin_950 = setup_env.read_rocm_pin("gfx950")
+    assert pin_950.rocm_version == "10.3.0a20261123"
+    assert pin_950.rocm_libraries_commit == "d" * 40
+
+    # Unlisted arch falls back to default (gfx950) and prints a note.
+    setup, _ = _fresh_rocm_setup(setup_env, tmp_path, monkeypatch, arch="gfx1201")
+    fallback = setup.select_rocm_build("gfx1201")
+    assert fallback.rocm_version == "10.3.0a20261123"
+    assert fallback.rocm_libraries_commit == "d" * 40
+    assert "no entry for gfx1201; using default (gfx950)" in capsys.readouterr().out
+
+
+def test_read_rocm_pin_rejects_missing_or_invalid_fields(
+    setup_env, tmp_path, capsys
+) -> None:
+    missing = tmp_path / "missing.json"
+    with pytest.raises(SystemExit) as exc:
+        setup_env.read_rocm_pin(path=missing)
+    assert exc.value.code == 1
+    assert "cannot read ROCm pin file" in capsys.readouterr().err
+
+    bad_commit = tmp_path / "bad-commit.json"
+    bad_commit.write_text(
+        json.dumps(
+            {
+                "default": "gfx950",
+                "archs": {
+                    "gfx950": {
+                        "rocm_version": "10.3.0a20261123",
+                        "rocm_libraries_commit": "short",
+                    }
+                },
+            }
+        )
+    )
+    with pytest.raises(SystemExit) as exc:
+        setup_env.read_rocm_pin(path=bad_commit)
+    assert exc.value.code == 1
+    assert "invalid rocm_libraries_commit" in capsys.readouterr().err
+
+    bad_default = tmp_path / "bad-default.json"
+    bad_default.write_text(
+        json.dumps(
+            {
+                "default": "gfx942",
+                "archs": {
+                    "gfx950": {
+                        "rocm_version": "10.3.0a20261123",
+                        "rocm_libraries_commit": "a" * 40,
+                    }
+                },
+            }
+        )
+    )
+    with pytest.raises(SystemExit) as exc:
+        setup_env.read_rocm_pin(path=bad_default)
+    assert exc.value.code == 1
+    assert "invalid default arch" in capsys.readouterr().err
+
+
+def test_reused_venv_refuses_rocm_version_latest(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    setup, _ = _reused_venv(
+        setup_env, tmp_path, monkeypatch, "rocm", "--rocm-version", "latest"
+    )
+    with pytest.raises(SystemExit) as exc:
+        setup.install_torch()
+    assert exc.value.code == 1
+    assert "--rocm-version latest" in capsys.readouterr().err
+
+
+def test_find_quartz_nightly_per_arch_and_extra_platform_builds(
+    setup_env, quartz
+) -> None:
+    # On 20261116, rocm build is in_progress; on 20261115, gfx950 passes while
+    # gfx942 fails rocm tests -> per-arch lookup picks 20261115 for gfx950 and
+    # returns None for gfx942 (no passing nightly in recorded window).
+    quartz.latest = "20261116"
+    assert setup_env.find_quartz_nightly("linux", "gfx950").build_date == "20261115"
+    assert setup_env.find_quartz_nightly("linux", "gfx942") is None
+
+    # require_platform_builds checks extra platform builds/wheels without
+    # failing on flaky tests: on 20261119 Windows pytorch build is in_progress,
+    # so requiring Windows gfx1151 builds walks back to 20261118.
+    quartz.latest = "20261119"
+    build = setup_env.find_quartz_nightly(
+        "linux",
+        "gfx950",
+        require_platform_builds=(("windows", setup_env.WINDOWS_DEFAULT_GPU_ARCH),),
+    )
+    assert build is not None
+    assert build.build_date == "20261118"
+
+
+def _make_fake_therock_repo(
+    tmp_path: Path, rocm_libraries_commit: str | None
+) -> tuple[Path, str]:
+    """Create a local bare TheRock repo whose tip optionally pins rocm-libraries."""
+    src = tmp_path / "therock-src"
+    src.mkdir()
+    _git("init", "-q", "-b", "main", cwd=src)
+    if rocm_libraries_commit is not None:
+        _git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{rocm_libraries_commit},rocm-libraries",
+            cwd=src,
+        )
+    else:
+        (src / "README.md").write_text("no submodule\n")
+        _git("add", "README.md", cwd=src)
+    _git("commit", "-q", "-m", "therock pin", cwd=src)
+    commit = _head(src)
+    bare = tmp_path / "therock.git"
+    _git("clone", "-q", "--bare", str(src), str(bare))
+    _git("config", "uploadpack.allowfilter", "true", cwd=bare)
+    return bare, commit
+
+
+def test_resolve_therock_rocm_libraries_commit_reads_submodule_gitlink(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    monkeypatch.undo()
+    expected_sha = "1234567890abcdef" * 2 + "12345678"
+    bare, therock_commit = _make_fake_therock_repo(tmp_path, expected_sha)
+
+    resolved = setup_env.resolve_therock_rocm_libraries_commit(
+        therock_commit, repo_url=bare.as_uri()
+    )
+
+    assert resolved == expected_sha
+
+
+def test_resolve_therock_rocm_libraries_commit_fails_when_submodule_missing(
+    setup_env, tmp_path, monkeypatch, capsys
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    monkeypatch.undo()
+    bare, therock_commit = _make_fake_therock_repo(tmp_path, None)
+
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit(
+            therock_commit, repo_url=bare.as_uri()
+        )
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "no 'rocm-libraries' submodule entry" in err
+    assert "--rocm-libraries-ref" in err
+
+
+def test_resolve_therock_rocm_libraries_commit_rejects_bad_sha(
+    setup_env, monkeypatch, capsys
+) -> None:
+    monkeypatch.undo()
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit("not-a-sha")
+
+    assert exc.value.code == 1
+    assert "40-character TheRock commit SHA" in capsys.readouterr().err
+
+
+def test_resolve_therock_rocm_libraries_commit_handles_missing_git(
+    setup_env, monkeypatch, capsys
+) -> None:
+    monkeypatch.undo()
+
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(setup_env, "git_output", no_git)
+
+    with pytest.raises(SystemExit) as exc:
+        setup_env.resolve_therock_rocm_libraries_commit("f" * 40)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "git not found on PATH" in err
+    assert "--rocm-libraries-ref" in err
+
+
+def _two_commit_rocm_libraries(tmp_path: Path) -> tuple[str, str]:
+    """Advance the local rocm_libraries origin by one commit; return (first, second)."""
+    src = tmp_path / "src"
+    first = _head(src)
+    (src / "projects/hipdnn/matched.txt").write_text("matched\n")
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", "matched commit", cwd=src)
+    _git("fetch", "-q", str(src), "main:main", cwd=tmp_path / "origin.git")
+    return first, _head(src)
+
+
+def test_rocm_mode_checks_out_quartz_matched_rocm_libraries_and_caches_it(
+    setup_env, tmp_path, monkeypatch, rocm_libraries
+) -> None:
+    _, quartz_sha = _two_commit_rocm_libraries(tmp_path)
+    therock_sha = "a" * 40
+    calls = []
+    monkeypatch.setattr(
+        setup_env,
+        "resolve_therock_rocm_libraries_commit",
+        lambda sha, repo_url=setup_env.THEROCK_REPO_URL, *, required=True: (
+            calls.append(sha),
+            quartz_sha,
+        )[1],
+    )
+
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    record_path = setup.venv_dir / setup_env.ROCM_BUILD_RECORD
+    record_path.write_text(
+        json.dumps(
+            {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": therock_sha}
+        )
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert calls == [therock_sha]
+    assert _head(rocm_libraries) == quartz_sha
+    saved = json.loads(record_path.read_text())
+    assert saved["rocm_libraries_commit"] == quartz_sha
+
+    # A second run against the same venv reuses the cached rocm_libraries_commit
+    # without querying TheRock again.
+    setup.ensure_rocm_libraries_checkout()
+    assert calls == [therock_sha]
+
+
+def test_rocm_mode_warns_when_existing_checkout_differs_from_quartz_match(
+    setup_env, tmp_path, monkeypatch, capsys, rocm_libraries
+) -> None:
+    older_sha, quartz_sha = _two_commit_rocm_libraries(tmp_path)
+    therock_sha = "b" * 40
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", older_sha
+    ).ensure_rocm_libraries_checkout()
+    assert _head(rocm_libraries) == older_sha
+
+    monkeypatch.setattr(
+        setup_env,
+        "resolve_therock_rocm_libraries_commit",
+        lambda sha, repo_url=setup_env.THEROCK_REPO_URL, *, required=True: quartz_sha,
+    )
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(
+        json.dumps(
+            {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": therock_sha}
+        )
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == older_sha
+    err = capsys.readouterr().err
+    assert f"not {quartz_sha[:12]} (matched to TheRock {therock_sha[:12]})" in err
+
+
+def test_rocm_mode_reuses_existing_checkout_when_therock_lookup_fails(
+    setup_env, tmp_path, monkeypatch, capsys, rocm_libraries
+) -> None:
+    older_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    _setup(
+        setup_env, tmp_path, "--rocm-libraries-ref", older_sha
+    ).ensure_rocm_libraries_checkout()
+    assert _head(rocm_libraries) == older_sha
+
+    missing_repo = (tmp_path / "no-such-therock.git").as_uri()
+    monkeypatch.undo()
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", rocm_libraries)
+    monkeypatch.setattr(setup_env, "THEROCK_REPO_URL", missing_repo)
+    setup = _setup(setup_env, tmp_path)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(
+        json.dumps({"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "e" * 40})
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == older_sha
+    err = capsys.readouterr().err
+    assert "WARNING:" in err
+    assert missing_repo in err
+    assert "Keeping the existing rocm-libraries/ checkout." in err
+
+
+def test_explicit_rocm_libraries_ref_overrides_quartz_therock_commit(
+    setup_env, tmp_path, rocm_libraries
+) -> None:
+    explicit_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    setup = _setup(setup_env, tmp_path, "--rocm-libraries-ref", explicit_sha)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = "rocm"
+    record_path = setup.venv_dir / setup_env.ROCM_BUILD_RECORD
+    record_path.write_text(
+        json.dumps({"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "c" * 40})
+    )
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == explicit_sha
+    assert "rocm_libraries_commit" not in json.loads(record_path.read_text())
+
+
+@pytest.mark.parametrize(
+    "torch_mode, record",
+    [
+        ("cpu", {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": "d" * 40}),
+        ("rocm", {"rocm_version": _RECORDED_ROCM_VERSION, "therock_commit": None}),
+        ("rocm", None),
+    ],
+    ids=["cpu-mode", "rocm-without-therock-commit", "rocm-without-record"],
+)
+def test_rocm_libraries_falls_back_to_rocm_pin_without_quartz_therock_commit(
+    setup_env, tmp_path, rocm_libraries, torch_mode, record
+) -> None:
+    pin_sha, _ = _two_commit_rocm_libraries(tmp_path)
+    setup = _setup(setup_env, tmp_path, "--torch-mode", torch_mode)
+    setup.venv_dir.mkdir(parents=True)
+    setup.installed_torch_mode = torch_mode
+    if record is not None:
+        (setup.venv_dir / setup_env.ROCM_BUILD_RECORD).write_text(json.dumps(record))
+
+    setup.ensure_rocm_libraries_checkout()
+
+    assert _head(rocm_libraries) == pin_sha
 
 
 def _host_gpu_archs(setup_env, monkeypatch, archs):

@@ -78,3 +78,6 @@ credentials.*
 
 # default --profiling-output-dir
 profiling-output/
+
+# setup_env.py sparse-clones rocm-libraries at the commit pinned in rocm-pin.json
+/rocm-libraries/
