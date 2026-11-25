@@ -22,6 +22,8 @@ top level; any such probe runs in a subprocess against the *venv* interpreter.
 
 import argparse
 import contextlib
+import dataclasses
+import datetime
 import functools
 import json
 import os
@@ -32,15 +34,20 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import NoReturn
+from typing import Dict, List, NoReturn, Optional, Tuple
 
 
 IS_WINDOWS = platform.system() == "Windows"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+ROCM_PIN_FILE = SCRIPT_DIR / "rocm-pin.json"
 ROCM_LIBRARIES_DIR = SCRIPT_DIR / "rocm-libraries"
+ROCM_LIBRARIES_REPO_URL = "https://github.com/ROCm/rocm-libraries.git"
 # Root directories that setup and the hipDNN/provider configure read. Only
 # shared/ctest supplies a file from shared; the rest of that tree is unnecessary.
 ROCM_LIBRARIES_ROOT_DIRS = (".dvc", "cmake", "shared/ctest")
@@ -91,6 +98,28 @@ ROCM_NIGHTLY_BASE = "https://nightly.repo.amd.com/rocm"
 # and Windows always resolve the exact same torch/rocm-sdk-* build.
 ROCM_TORCH_INDEX_URL = f"{ROCM_NIGHTLY_BASE}/whl-next/"
 
+# Quartz (https://github.com/ROCm/Quartz) publishes one status.json for each
+# TheRock nightly. Setup reads it to pick the ROCm PyTorch nightly. The
+# consumer guide is docs/status-json in that repository.
+QUARTZ_NIGHTLY_URL = "https://raw.githubusercontent.com/ROCm/quartz/main/nightly/"
+# The status.json schema major that setup reads. A newer minor only adds
+# optional fields; another major can move the fields that setup reads.
+QUARTZ_SCHEMA_MAJOR = "2"
+# Setup searches the newest nightly and the nightlies of this many days in
+# total, then stops with an error.
+QUARTZ_LOOKBACK_DAYS = 14
+QUARTZ_TIMEOUT_S = 30
+# The Quartz test suites (pipelines.<suite>.test) whose result for the GPU
+# architecture setup checks.
+QUARTZ_TEST_SUITES = ("rocm", "pytorch")
+# The ROCm wheel version of a nightly, for example 10.3.0a20261117. The group
+# is the build date.
+_NIGHTLY_VERSION = re.compile(r"\d+\.\d+\.\d+a(\d{8})")
+# TheRock repository whose rocm-libraries submodule gitlink supplies the
+# rocm-libraries commit that a Quartz-selected ROCm nightly was built from.
+THEROCK_REPO_URL = "https://github.com/ROCm/TheRock.git"
+THEROCK_ROCM_LIBRARIES_PATH = "rocm-libraries"
+
 # Windows has no rocm_agent_enumerator/rocminfo to detect the local arch with,
 # so fall back to a default target known to have published wheels.
 WINDOWS_DEFAULT_GPU_ARCH = "gfx1151"
@@ -114,6 +143,13 @@ TORCH_RECORD = "dnn-bench-torch.json"
 # -D define after it drops off the configure line, so a dir configured
 # differently is wiped.
 BUILD_RECORD = "dnn-bench-prefixes.json"
+
+# Written into the venv after setup installs ROCm PyTorch: the ROCm wheel
+# version, the TheRock build date and commit from Quartz, the Quartz test
+# suites with no result for the GPU architecture, and what selected
+# the build. dnn_benchmarking.metrics.machine_info reads it into the result
+# environment, and a reused venv checks --rocm-version against it.
+ROCM_BUILD_RECORD = "dnn-bench-rocm-build.json"
 
 
 # --- Small process helpers -------------------------------------------------
@@ -198,6 +234,507 @@ def git_output(args) -> str:
     """Run git and return its stdout, stripped; raise on nonzero exit."""
     result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+
+# --- ROCm nightly selection (Quartz) ----------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RocmBuild:
+    """The TheRock build that setup installs ROCm PyTorch from.
+
+    ``rocm_version`` is the ROCm wheel version that pip pins; "" installs the
+    newest build on ``index_url``. ``build_date``, ``therock_commit``,
+    ``status_url``, ``untested`` and ``rocm_libraries_commit`` come from
+    ``rocm-pin.json`` or Quartz, or are None when unavailable. ``untested``
+    names the Quartz test suites with no result for the GPU architecture.
+    ``source`` names what selected the build.
+    """
+
+    rocm_version: str
+    index_url: str
+    source: str
+    build_date: Optional[str] = None
+    therock_commit: Optional[str] = None
+    status_url: Optional[str] = None
+    untested: Optional[Tuple[str, ...]] = None
+    rocm_libraries_commit: Optional[str] = None
+
+
+def quartz_platform() -> str:
+    """The ``summary`` key of this host's platform in a Quartz status.json."""
+    return "windows" if IS_WINDOWS else "linux"
+
+
+def fetch_quartz_text(url: str) -> Optional[str]:
+    """The body of ``url``, or None when the server answers 404 Not Found.
+
+    A nightly that did not run has no status.json, so 404 is an expected
+    answer. Every other failure stops setup with the URL.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=QUARTZ_TIMEOUT_S) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        fail(f"cannot read {url}: {exc}")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        fail(f"cannot read {url}: {exc}")
+
+
+def _parse_quartz_status(url: str, body: str) -> dict:
+    """The status.json document in ``body``; exit when setup cannot read it."""
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        fail(f"{url} is not valid JSON: {exc}")
+    major = str(document.get("schema_version", "")).split(".")[0]
+    if major != QUARTZ_SCHEMA_MAJOR:
+        fail(
+            f"{url} has status.json schema {document.get('schema_version')!r}; "
+            f"setup reads schema {QUARTZ_SCHEMA_MAJOR}.x only.",
+            "Update the Quartz reader in setup_env.py, or pass --rocm-version.",
+        )
+    return document
+
+
+def _quartz_status_url(build_date: str) -> str:
+    return f"{QUARTZ_NIGHTLY_URL}{build_date}/status.json"
+
+
+def quartz_arch_matches(gpu_arch: str, target: str) -> bool:
+    """True when the TheRock build target ``target`` covers ``gpu_arch``.
+
+    Quartz lists the targets that TheRock built: one GPU (``gfx90a``,
+    ``gfx950-dcgpu``) or a family whose last character is ``X``
+    (``gfx94X-dcgpu`` covers gfx942, ``gfx110X-all`` covers gfx1100 to
+    gfx1103). The part after ``-`` names a product line, not a GPU.
+    """
+    family = target.split("-", 1)[0].lower()
+    arch = gpu_arch.lower()
+    if family.endswith("x"):
+        return len(arch) == len(family) and arch.startswith(family[:-1])
+    return arch == family
+
+
+def quartz_target(targets, gpu_arch: str) -> Optional[str]:
+    """The TheRock build target among ``targets`` that covers ``gpu_arch``.
+
+    A target for the one GPU wins over a family target. None when no
+    target covers ``gpu_arch``.
+    """
+    matches = [target for target in targets if quartz_arch_matches(gpu_arch, target)]
+    exact = [t for t in matches if not t.split("-", 1)[0].lower().endswith("x")]
+    return (exact or matches or [None])[0]
+
+
+def quartz_arch_tests(
+    document: dict, platform_name: str, gpu_arch: str
+) -> Tuple[Dict[str, Tuple[str, str]], Tuple[str, ...]]:
+    """The Quartz test results of ``gpu_arch`` on ``platform_name``.
+
+    Returns ``{suite: (target, status)}`` for each suite in QUARTZ_TEST_SUITES
+    that has a test entry for a target that covers ``gpu_arch``, and the
+    suites without one. Setup reads the status of the target only. Quartz
+    rolls the PyTorch variants up into it: ``failure`` when a variant failed,
+    else ``in_progress`` while a variant runs.
+    """
+    pipelines = document.get("pipelines", {})
+    results = {}
+    untested = []
+    for suite in QUARTZ_TEST_SUITES:
+        entries = pipelines.get(suite, {}).get("test", {}).get(platform_name, {})
+        target = quartz_target(entries, gpu_arch)
+        if target is None:
+            untested.append(suite)
+        else:
+            results[suite] = (target, str(entries[target].get("status") or "absent"))
+    return results, tuple(untested)
+
+
+def quartz_rejection(
+    document: dict,
+    platform_name: str,
+    gpu_arch: str,
+    *,
+    check_tests: bool = True,
+) -> str:
+    """Why the build cannot supply ROCm PyTorch for ``gpu_arch``; "" if it can.
+
+    Setup needs the ROCm and the PyTorch build of ``platform_name`` to be
+    ``success``, and ``gpu_arch`` among the built architectures. When
+    ``check_tests`` is True, the ROCm and PyTorch tests of ``gpu_arch`` must
+    also be ``success`` when Quartz has them; a suite with no entry for
+    ``gpu_arch`` does not reject the build. Setup does not read the test
+    counters or ``overall_status``: they fold in every architecture, and some
+    are routinely red. The result names every check that fails, separated by
+    "; ".
+    """
+    if document.get("release_type") != "nightly":
+        return f"release_type is {document.get('release_type')!r}, not 'nightly'"
+    if document.get("build_variant", "release") != "release":
+        return f"build_variant is {document.get('build_variant')!r}"
+    if not _NIGHTLY_VERSION.fullmatch(str(document.get("rocm_version", ""))):
+        return f"rocm_version {document.get('rocm_version')!r} is not a nightly"
+    summary = document.get("summary", {}).get(platform_name)
+    if not summary:
+        return f"no {platform_name} build"
+    reasons = []
+    if quartz_target(summary.get("architectures", []), gpu_arch) is None:
+        reasons.append(f"{gpu_arch} is not among its {platform_name} architectures")
+    for pipeline in ("rocm", "pytorch"):
+        status = summary.get(pipeline, {}).get("build", {}).get("status")
+        if status != "success":
+            reasons.append(f"{platform_name} {pipeline} build is {status or 'absent'}")
+    if not summary.get("urls", {}).get("wheels"):
+        reasons.append(f"no {platform_name} wheels URL")
+    if check_tests:
+        results, _ = quartz_arch_tests(document, platform_name, gpu_arch)
+        for suite, (target, status) in results.items():
+            if status != "success":
+                reasons.append(
+                    f"{platform_name} {suite} tests of {target} are {status}"
+                )
+    return "; ".join(reasons)
+
+
+def _rocm_build_from_quartz(
+    document: dict,
+    url: str,
+    platform_name: str,
+    gpu_arch: str,
+    source: str,
+    index_url: str = "",
+) -> RocmBuild:
+    """The build that ``document`` describes. An explicit ``index_url`` wins
+    over the wheels URL of the document."""
+    urls = document.get("summary", {}).get(platform_name, {}).get("urls", {})
+    _, untested = quartz_arch_tests(document, platform_name, gpu_arch)
+    return RocmBuild(
+        rocm_version=document["rocm_version"],
+        index_url=index_url or urls.get("wheels") or ROCM_TORCH_INDEX_URL,
+        source=source,
+        build_date=document.get("build_date") or None,
+        therock_commit=document.get("therock_commit") or None,
+        status_url=url,
+        untested=untested,
+    )
+
+
+def _newest_quartz_nightly() -> datetime.date:
+    """The build date of the nightly that ``nightly/latest.json`` names.
+
+    The pointer is a git symlink, so raw GitHub serves its target path (for
+    example ``20261118/status.json``) instead of the document.
+    """
+    url = f"{QUARTZ_NIGHTLY_URL}latest.json"
+    body = fetch_quartz_text(url)
+    if body is None:
+        fail(f"Quartz publishes no {url}.", "Pass --rocm-version to install a build.")
+    if body.lstrip().startswith("{"):
+        build_date = str(_parse_quartz_status(url, body).get("build_date", ""))
+    else:
+        build_date = body.strip().split("/", 1)[0]
+    try:
+        return datetime.datetime.strptime(build_date, "%Y%m%d").date()
+    except ValueError:
+        fail(f"{url} names no nightly build date: {body.strip()[:80]!r}")
+
+
+def _find_quartz_nightly(
+    platform_name: str,
+    gpu_arch: str,
+    index_url: str = "",
+    *,
+    require_platform_builds: Tuple[Tuple[str, str], ...] = (),
+) -> Tuple[Optional[RocmBuild], List[str], datetime.date]:
+    """Search back QUARTZ_LOOKBACK_DAYS for a usable nightly for ``gpu_arch``.
+
+    ``require_platform_builds`` takes additional ``(platform, gpu_arch)`` pairs
+    whose ROCm and PyTorch builds and wheels URL must also be ``success``
+    without rejecting on test entries for those extra platforms.
+    """
+    newest = _newest_quartz_nightly()
+    rejected: List[str] = []
+    for days_back in range(QUARTZ_LOOKBACK_DAYS):
+        build_date = (newest - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
+        url = _quartz_status_url(build_date)
+        body = fetch_quartz_text(url)
+        if body is None:
+            rejected.append(f"  {build_date}: no status.json")
+            continue
+        document = _parse_quartz_status(url, body)
+        reasons = []
+        reason = quartz_rejection(document, platform_name, gpu_arch)
+        if reason:
+            reasons.append(reason)
+        for extra_platform, extra_arch in require_platform_builds:
+            extra_reason = quartz_rejection(
+                document, extra_platform, extra_arch, check_tests=False
+            )
+            if extra_reason and extra_reason not in reasons:
+                reasons.append(extra_reason)
+        if reasons:
+            rejected.append(
+                f"  {build_date} ({document.get('rocm_version')}): {'; '.join(reasons)}"
+            )
+            continue
+        return (
+            _rocm_build_from_quartz(
+                document, url, platform_name, gpu_arch, "quartz", index_url
+            ),
+            rejected,
+            newest,
+        )
+    return None, rejected, newest
+
+
+def find_quartz_nightly(
+    platform_name: str,
+    gpu_arch: str,
+    index_url: str = "",
+    *,
+    require_platform_builds: Tuple[Tuple[str, str], ...] = (),
+) -> Optional[RocmBuild]:
+    """The newest usable Quartz nightly for ``gpu_arch``, or None if none passed."""
+    build, _, _ = _find_quartz_nightly(
+        platform_name,
+        gpu_arch,
+        index_url,
+        require_platform_builds=require_platform_builds,
+    )
+    return build
+
+
+def select_quartz_nightly(
+    platform_name: str, gpu_arch: str, index_url: str = ""
+) -> RocmBuild:
+    """The newest nightly that Quartz reports usable for ``gpu_arch``."""
+    build, rejected, newest = _find_quartz_nightly(platform_name, gpu_arch, index_url)
+    if build is not None:
+        return build
+    fail(
+        f"Quartz reports no usable ROCm nightly for {platform_name} {gpu_arch} in "
+        f"the {QUARTZ_LOOKBACK_DAYS} days up to {newest:%Y%m%d}:",
+        *rejected,
+        "Pass --rocm-version VERSION to install a specific build.",
+    )
+
+
+def describe_rocm_version(
+    rocm_version: str, index_url: str, platform_name: str, gpu_arch: str
+) -> RocmBuild:
+    """The --rocm-version build, with its Quartz metadata when Quartz has it.
+
+    An explicit version is installed even when Quartz reports it unusable,
+    so an older run can be reproduced; setup only warns. A version that is
+    not a nightly, or a nightly from before Quartz, has no build date or
+    TheRock commit. ``index_url`` is --torch-index-url, "" when not given.
+    """
+    match = _NIGHTLY_VERSION.fullmatch(rocm_version)
+    url = _quartz_status_url(match[1]) if match else ""
+    body = fetch_quartz_text(url) if url else None
+    document = _parse_quartz_status(url, body) if body is not None else {}
+    if document.get("rocm_version") != rocm_version:
+        warn(
+            f"Quartz has no nightly status.json for ROCm {rocm_version}.",
+            "The results record no TheRock build date, commit or test coverage "
+            "for it.",
+        )
+        return RocmBuild(
+            rocm_version, index_url or ROCM_TORCH_INDEX_URL, "--rocm-version"
+        )
+    reason = quartz_rejection(document, platform_name, gpu_arch)
+    if reason:
+        warn(
+            f"Quartz reports that ROCm {rocm_version} is not usable: {reason}.",
+            "Installing it because --rocm-version names it.",
+        )
+    return _rocm_build_from_quartz(
+        document, url, platform_name, gpu_arch, "--rocm-version", index_url
+    )
+
+
+def _parse_rocm_pin_entry(entry: object, label: str, source_name: str) -> RocmBuild:
+    if not isinstance(entry, dict):
+        fail(f"{label} must be a JSON object.")
+    rocm_version = str(entry.get("rocm_version") or "").strip()
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+!-]*", rocm_version):
+        fail(
+            f"{label} has invalid rocm_version {entry.get('rocm_version')!r}.",
+            "Expected a ROCm wheel version such as 10.3.0a20261123.",
+        )
+    rocm_libraries_commit = (
+        str(entry.get("rocm_libraries_commit") or "").strip().lower()
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}", rocm_libraries_commit):
+        fail(
+            f"{label} has invalid rocm_libraries_commit "
+            f"{entry.get('rocm_libraries_commit')!r}.",
+            "Expected a 40-character commit SHA.",
+        )
+    therock_raw = entry.get("therock_commit")
+    therock_commit: Optional[str] = None
+    if therock_raw:
+        therock_commit = str(therock_raw).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", therock_commit):
+            fail(
+                f"{label} has invalid therock_commit {therock_raw!r}.",
+                "Expected a 40-character commit SHA.",
+            )
+    build_date = str(entry.get("build_date") or "").strip() or None
+    index_url = str(entry.get("index_url") or "").strip() or ROCM_TORCH_INDEX_URL
+    status_url = _quartz_status_url(build_date) if build_date else None
+    return RocmBuild(
+        rocm_version=rocm_version,
+        index_url=index_url,
+        source=source_name,
+        build_date=build_date,
+        therock_commit=therock_commit,
+        status_url=status_url,
+        untested=None,
+        rocm_libraries_commit=rocm_libraries_commit,
+    )
+
+
+def read_rocm_pins(
+    path: Optional[Path] = None,
+) -> Tuple[str, Dict[str, RocmBuild]]:
+    """Read all per-arch pins and the default arch key from ``rocm-pin.json``."""
+    pin_path = ROCM_PIN_FILE if path is None else path
+    try:
+        data = json.loads(pin_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        fail(
+            f"cannot read ROCm pin file {pin_path}: {exc}.",
+            "Restore rocm-pin.json, or pass --rocm-version and --rocm-libraries-ref.",
+        )
+    if not isinstance(data, dict):
+        fail(f"{pin_path} must contain a JSON object.")
+    archs_raw = data.get("archs")
+    if not isinstance(archs_raw, dict) or not archs_raw:
+        fail(f"{pin_path} must contain a non-empty 'archs' object.")
+    pins: Dict[str, RocmBuild] = {}
+    for arch_key, entry in archs_raw.items():
+        if not isinstance(arch_key, str) or not arch_key.strip():
+            fail(f"{pin_path} has an empty architecture key in 'archs'.")
+        norm_arch = arch_key.strip().lower()
+        pins[norm_arch] = _parse_rocm_pin_entry(
+            entry, f"{pin_path}['archs'][{norm_arch!r}]", pin_path.name
+        )
+    default_arch = str(data.get("default") or "").strip().lower()
+    if default_arch not in pins:
+        fail(
+            f"{pin_path} has invalid default arch {data.get('default')!r}.",
+            f"Expected one of: {', '.join(pins)}.",
+        )
+    return default_arch, pins
+
+
+def read_rocm_pin(
+    gpu_arch: Optional[str] = None, path: Optional[Path] = None
+) -> RocmBuild:
+    """Read the checked-in ROCm + rocm-libraries pin for ``gpu_arch``.
+
+    Falls back to the ``default`` arch in ``rocm-pin.json`` when ``gpu_arch``
+    is None or has no explicit entry.
+    """
+    default_arch, pins = read_rocm_pins(path)
+    if gpu_arch:
+        norm = gpu_arch.strip().lower()
+        if norm in pins:
+            return pins[norm]
+    return pins[default_arch]
+
+
+def _fetch_therock_rocm_libraries_commit(
+    therock_commit: str, repo_url: Optional[str] = None
+) -> str:
+    """Resolve the rocm-libraries gitlink at ``therock_commit`` in TheRock.
+
+    Raises ``RuntimeError`` on invalid input, missing git, fetch failure, or a
+    missing submodule entry so callers can choose fatal vs advisory handling.
+    """
+    url = repo_url or THEROCK_REPO_URL
+    commit = therock_commit.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError(
+            f"expected a 40-character TheRock commit SHA, got {therock_commit!r}."
+        )
+    with tempfile.TemporaryDirectory(prefix="therock-ref-") as tmp:
+        git = ["-C", tmp]
+        try:
+            git_output(["init", "--bare", "--quiet", tmp])
+            git_output(
+                [
+                    *git,
+                    "fetch",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    "--filter=tree:0",
+                    url,
+                    commit,
+                ]
+            )
+            entry = git_output(
+                [*git, "ls-tree", "FETCH_HEAD", "--", THEROCK_ROCM_LIBRARIES_PATH]
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"git not found on PATH; cannot resolve {THEROCK_ROCM_LIBRARIES_PATH} "
+                f"commit for TheRock {commit}."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            msg = (
+                f"cannot resolve {THEROCK_ROCM_LIBRARIES_PATH} commit for "
+                f"TheRock {commit} from {url}."
+            )
+            if detail:
+                msg = f"{msg}\n{detail}"
+            raise RuntimeError(msg) from exc
+    parts = entry.split()
+    if (
+        len(parts) != 4
+        or parts[0] != "160000"
+        or parts[1] != "commit"
+        or not re.fullmatch(r"[0-9a-f]{40}", parts[2])
+        or parts[3] != THEROCK_ROCM_LIBRARIES_PATH
+    ):
+        raise RuntimeError(
+            f"TheRock commit {commit} has no '{THEROCK_ROCM_LIBRARIES_PATH}' "
+            f"submodule entry in {url} (got {entry!r})."
+        )
+    return parts[2]
+
+
+def resolve_therock_rocm_libraries_commit(
+    therock_commit: str,
+    repo_url: Optional[str] = None,
+    *,
+    required: bool = True,
+) -> Optional[str]:
+    """The rocm-libraries submodule commit pinned by ``therock_commit`` in TheRock.
+
+    Uses a bare, tree-filtered git fetch of the single commit (~10 KB, no
+    GitHub REST API rate limit) and reads the ``rocm-libraries`` gitlink via
+    ``git ls-tree``. When ``required`` is True, exits with an actionable error
+    on failure; when False (advisory check for an existing checkout), warns and
+    returns None.
+    """
+    try:
+        return _fetch_therock_rocm_libraries_commit(therock_commit, repo_url)
+    except RuntimeError as exc:
+        lines = str(exc).splitlines()
+        if required:
+            fail(
+                *lines,
+                "Pass --rocm-libraries-ref <sha> to select rocm-libraries explicitly.",
+            )
+        warn(*lines, "Keeping the existing rocm-libraries/ checkout.")
+        return None
 
 
 def default_workspace() -> Path:
@@ -454,6 +991,19 @@ def _commit_sha(value: str) -> str:
     return sha
 
 
+def _rocm_version(value: str) -> str:
+    """--rocm-version: 'latest' (Quartz) or a wheel version such as 10.3.0a20261123."""
+    version = value.strip()
+    if version.lower() == "latest":
+        return "latest"
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+!-]*", version):
+        raise argparse.ArgumentTypeError(
+            f"expected 'latest' or a ROCm wheel version such as 10.3.0a20261123, "
+            f"got {value!r}"
+        )
+    return version
+
+
 def _cmake_define(value: str) -> str:
     """Normalise a --cmake-arg value to a `-DNAME=VALUE` CMake define.
 
@@ -492,7 +1042,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="rocm",
         help=(
             "Select how torch is provided. Default: rocm\n"
-            "  rocm: install ROCm torch nightly, use ROCm libraries/toolchain "
+            "  rocm: install the ROCm torch nightly pinned in rocm-pin.json "
+            "(or --rocm-version latest / VERSION), use ROCm libraries/toolchain "
             "from the torch wheel's bundled ROCm SDK packages, and build local "
             "hipDNN/provider artifacts when absent.\n"
             "  cuda: install CUDA torch from PyPI (or --torch-index-url) for the "
@@ -529,7 +1080,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--torch-index-url",
         default="",
-        help="Override the pip index URL used for torch.",
+        help=(
+            "Override the pip index URL used for torch. In rocm mode without "
+            "--rocm-version, setup does not read Quartz and installs the "
+            "newest ROCm torch on this index."
+        ),
+    )
+    parser.add_argument(
+        "--rocm-version",
+        type=_rocm_version,
+        default=None,
+        metavar="VERSION",
+        help=(
+            "ROCm wheel version for --torch-mode rocm: 'latest' (the newest "
+            f"nightly of the last {QUARTZ_LOOKBACK_DAYS} days that Quartz "
+            "reports usable for the GPU architecture) or a specific version "
+            "such as 10.3.0a20261123 (installed even when Quartz reports it "
+            "failed, to reproduce an older run). Default: the version pinned "
+            "in rocm-pin.json."
+        ),
     )
     parser.add_argument(
         "--gpu-arch",
@@ -576,7 +1145,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Delete and recreate the virtual environment and wipe the hipDNN/"
             "provider and binding CMake build directories. By default setup "
             "reuses the existing venv (and its torch) and rebuilds incrementally; "
-            "changing its --torch-mode, --gpu-arch or --torch-index-url then "
+            "changing its --torch-mode, --gpu-arch, --torch-index-url or "
+            "--rocm-version then "
             "requires --clean. A build directory configured with other CMake "
             "arguments (another --workspace, --rocm-prefix, GPU arch or "
             "--cmake-arg) is wiped without --clean."
@@ -589,10 +1159,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Full 40-character rocm-libraries commit to fetch when "
             "rocm-libraries/ is absent. "
-            "Default: the submodule commit pinned in this repository (`git "
-            "rev-parse HEAD:rocm-libraries`). Needed where no git metadata "
-            "exists (Docker builds, source tarballs); without it setup falls "
-            "back to the moving .gitmodules branch and warns."
+            "Default: in rocm mode with --rocm-version latest or a "
+            "Quartz-known --rocm-version, the rocm-libraries commit pinned by "
+            "that nightly's TheRock commit; otherwise rocm_libraries_commit "
+            "from rocm-pin.json."
         ),
     )
     parser.add_argument(
@@ -642,6 +1212,7 @@ class Setup:
         self.rocm_libraries_ref = args.rocm_libraries_ref
         self.gpu_arch_override = args.gpu_arch
         self.torch_index_url = args.torch_index_url
+        self.rocm_version = args.rocm_version
         self.editable_install = args.editable_install
         self.extra_cmake_args = list(args.cmake_args)
         self.resolved_torch_index_url = ""
@@ -697,29 +1268,74 @@ class Setup:
 
     # -- rocm-libraries checkout --------------------------------------------
 
+    def _resolve_rocm_libraries_ref(
+        self, *, required: bool = True
+    ) -> Tuple[str, str, Optional[str]]:
+        """Return ``(ref, source, therock_commit)`` for the rocm-libraries checkout.
+
+        Precedence:
+        1. Explicit ``--rocm-libraries-ref``.
+        2. In ``rocm`` mode (or ``existing`` on a ROCm venv), the cached
+           ``rocm_libraries_commit`` in ``ROCM_BUILD_RECORD`` (already set when
+           installed from ``rocm-pin.json``), or resolved from its Quartz
+           ``therock_commit`` via ``ROCm/TheRock`` so ``miopen-provider`` and
+           hipDNN stay in lockstep with the wheel's MIOpen.
+        3. ``rocm_libraries_commit`` from the checked-in ``rocm-pin.json``.
+        """
+        if self.rocm_libraries_ref:
+            return self.rocm_libraries_ref, "--rocm-libraries-ref", None
+        if self.installed_torch_mode == "rocm":
+            record = self._read_venv_record(ROCM_BUILD_RECORD)
+            if record:
+                therock_commit = record.get("therock_commit")
+                if not isinstance(therock_commit, str) or not therock_commit:
+                    therock_commit = None
+                recorded_ref = record.get("rocm_libraries_commit")
+                if isinstance(recorded_ref, str) and re.fullmatch(
+                    r"[0-9a-f]{40}", recorded_ref
+                ):
+                    source = str(record.get("source") or "quartz")
+                    return recorded_ref, source, therock_commit
+                if therock_commit:
+                    print(
+                        "Resolving rocm-libraries commit for TheRock "
+                        f"{therock_commit[:12]}..."
+                    )
+                    ref = resolve_therock_rocm_libraries_commit(
+                        therock_commit, required=required
+                    )
+                    if ref is None:
+                        return "", "quartz", therock_commit
+                    record["rocm_libraries_commit"] = ref
+                    try:
+                        (self.venv_dir / ROCM_BUILD_RECORD).write_text(
+                            json.dumps(record) + "\n"
+                        )
+                    except OSError:
+                        pass
+                    return ref, "quartz", therock_commit
+        pin = read_rocm_pin(self.gpu_arch or self.gpu_arch_override)
+        return pin.rocm_libraries_commit or "", pin.source, pin.therock_commit
+
     def ensure_rocm_libraries_checkout(self) -> None:
         """Fetch rocm-libraries if absent.
 
-        It is a git submodule (see .gitmodules), so `git submodule update
-        --init` also works. This is the fast path used only when the directory
-        isn't already a checkout: a sparse, blobless clone of the pinned
-        submodule commit (or --rocm-libraries-ref), limited to the hipDNN/
-        provider sources and root CMake tooling this script builds.
-        To build against a different ref, check it out directly, e.g.
+        Clones a sparse, blobless checkout of the resolved commit
+        (--rocm-libraries-ref, else the commit matched to the installed ROCm
+        build, else rocm-pin.json), limited to the hipDNN/provider sources and
+        root CMake tooling this script builds. To build against a different
+        ref, check it out directly, e.g.
         `git -C rocm-libraries fetch --depth 1 origin <ref> &&
          git -C rocm-libraries checkout FETCH_HEAD`.
         """
-        gitmodules = str(SCRIPT_DIR / ".gitmodules")
-        ref = self.rocm_libraries_ref or self._pinned_submodule_commit(
-            "rocm-libraries",
-            "The hipDNN/provider build is not reproducible. Pass "
-            "--rocm-libraries-ref <sha> (`git rev-parse "
-            "HEAD:rocm-libraries` in a checkout of this repository).",
+        has_checkout = (ROCM_LIBRARIES_DIR / ".git").exists()
+        ref, source, therock_commit = self._resolve_rocm_libraries_ref(
+            required=not has_checkout
         )
         # Only a full commit id can be compared with HEAD; a branch moves.
         pinned = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
 
-        if (ROCM_LIBRARIES_DIR / ".git").exists():
+        if has_checkout:
             # A sparse clone made by an older setup lacks root dirs added since.
             missing = [
                 path
@@ -734,11 +1350,24 @@ class Setup:
             # sparse clone would otherwise go unnoticed.
             head = git_output(["-C", str(ROCM_LIBRARIES_DIR), "rev-parse", "HEAD"])
             if pinned and head != ref:
-                warn(
-                    f"rocm-libraries is at {head[:12]}, not the pinned {ref[:12]}. "
-                    "Check out that commit in rocm-libraries/ (e.g. `git submodule "
-                    "update rocm-libraries`) or delete the directory to fetch it."
-                )
+                if source == "quartz":
+                    therock_note = (
+                        f" (matched to TheRock {therock_commit[:12]})"
+                        if therock_commit
+                        else " (matched to the Quartz ROCm nightly)"
+                    )
+                    warn(
+                        f"rocm-libraries is at {head[:12]}, not {ref[:12]}"
+                        f"{therock_note}. Check out that commit in "
+                        "rocm-libraries/ or delete the directory to fetch it "
+                        "(or pass --rocm-libraries-ref to override)."
+                    )
+                else:
+                    warn(
+                        f"rocm-libraries is at {head[:12]}, not the pinned "
+                        f"{ref[:12]}. Check out that commit in rocm-libraries/ "
+                        "or delete the directory to fetch it."
+                    )
             if not (ROCM_LIBRARIES_DIR / "CMakePresets.json").is_file():
                 warn(
                     "rocm-libraries/CMakePresets.json is missing (a non-cone "
@@ -746,14 +1375,13 @@ class Setup:
                 )
             return
 
-        # An uninitialised submodule leaves an empty directory; anything else
-        # here is not ours to delete without asking.
+        # Leave any non-empty non-git directory intact unless confirmed.
         if ROCM_LIBRARIES_DIR.exists() and any(ROCM_LIBRARIES_DIR.iterdir()):
             self._confirm(
                 f"replace {ROCM_LIBRARIES_DIR}, which is not a git checkout and "
                 "is not empty"
             )
-        url = git_output(["config", "-f", gitmodules, "submodule.rocm-libraries.url"])
+        url = ROCM_LIBRARIES_REPO_URL
         print(
             f"Fetching rocm-libraries ({ref}) via sparse checkout "
             f"({', '.join(ROCM_LIBRARIES_SPARSE_DIRS)})..."
@@ -1150,12 +1778,15 @@ class Setup:
                 "--rocm-prefix.",
             )
 
+        # The devel package must match the ROCm wheels already in the venv.
+        version = (self._read_venv_record(ROCM_BUILD_RECORD) or {}).get("rocm_version")
+        package = f"rocm-sdk-devel=={version}" if version else "rocm-sdk-devel"
         print(
             "ROCm SDK compiler/toolchain prefix not found; installing "
-            f"rocm-sdk-devel from {index_url}...",
+            f"{package} from {index_url}...",
             file=sys.stderr,
         )
-        self.pip("install", "--pre", "rocm-sdk-devel", "--index-url", index_url)
+        self.pip("install", "--pre", package, "--index-url", index_url)
 
         root = self._rocm_sdk_devel_root(report_errors=True)
         if root:
@@ -1359,41 +1990,127 @@ class Setup:
                 return
             arch = self._require_gpu_arch()
             print(f"GPU arch: {arch}")
-            print(f"Installing ROCm PyTorch from {index_url}")
-            # ROCm nightlies are pre-release, so --pre lets pip select them.
-            # device-<arch> is the pip extra that pulls the matching
-            # rocm-sdk-device-<arch> package; the base rocm-sdk-core/-libraries
-            # packages are OS/arch-agnostic on this index, so Linux and
-            # Windows always resolve the exact same nightly.
-            self.pip(
-                "install",
-                "--pre",
-                f"torch[device-{arch}]",
-                f"rocm[libraries,devel,device-{arch}]",
-                "--index-url",
-                index_url,
-            )
+            build = self.select_rocm_build(arch)
+            index_url = self.resolved_torch_index_url = build.index_url
+            self.install_rocm_torch(build, arch)
 
         self.installed_torch_mode = self.get_torch_mode()
         self.require_torch_mode(mode)
         (self.venv_dir / TORCH_RECORD).write_text(
             json.dumps({"torch_index_url": index_url, "gpu_arch": arch}) + "\n"
         )
+        if mode == "rocm":
+            self.write_rocm_build_record(build)
+
+    def select_rocm_build(self, arch: str) -> RocmBuild:
+        """The ROCm build to install: --rocm-version (latest or explicit), else
+        the newest build on --torch-index-url, else rocm-pin.json."""
+        platform_name = quartz_platform()
+        if self.rocm_version == "latest":
+            print(
+                f"Selecting the newest ROCm nightly from Quartz ({QUARTZ_NIGHTLY_URL})"
+            )
+            return select_quartz_nightly(platform_name, arch, self.torch_index_url)
+        if self.rocm_version:
+            if ROCM_PIN_FILE.is_file():
+                pin = read_rocm_pin(arch)
+                if pin.rocm_version == self.rocm_version:
+                    return dataclasses.replace(
+                        pin,
+                        index_url=self.torch_index_url or pin.index_url,
+                    )
+            return describe_rocm_version(
+                self.rocm_version, self.torch_index_url, platform_name, arch
+            )
+        if self.torch_index_url:
+            return RocmBuild("", self.torch_index_url, "--torch-index-url")
+        default_arch, pins = read_rocm_pins()
+        norm_arch = arch.strip().lower()
+        if norm_arch in pins:
+            return pins[norm_arch]
+        print(
+            f"{ROCM_PIN_FILE.name} has no entry for {arch}; "
+            f"using default ({default_arch})."
+        )
+        return pins[default_arch]
+
+    def install_rocm_torch(self, build: RocmBuild, arch: str) -> None:
+        """Install ROCm PyTorch and the ROCm SDK wheels of ``build``."""
+        if build.rocm_version:
+            print(
+                f"Installing ROCm PyTorch for ROCm {build.rocm_version} "
+                f"(TheRock {build.therock_commit or 'commit unknown'}, "
+                f"built {build.build_date or 'on an unknown date'}) "
+                f"from {build.index_url}"
+            )
+        else:
+            print(f"Installing the newest ROCm PyTorch from {build.index_url}")
+        if build.untested:
+            print(
+                f"Quartz has no {' or '.join(build.untested)} test result for "
+                f"{arch} in this nightly; setup records it as untested."
+            )
+        # The torch wheel requires rocm[libraries]==<its ROCm version>, so the
+        # pin on rocm also selects a torch of that build.
+        pin = f"=={build.rocm_version}" if build.rocm_version else ""
+        # ROCm nightlies are pre-release, so --pre lets pip select them.
+        # device-<arch> is the pip extra that pulls the matching
+        # rocm-sdk-device-<arch> package; the base rocm-sdk-core/-libraries
+        # packages are OS/arch-agnostic on this index, so Linux and
+        # Windows always resolve the exact same nightly.
+        self.pip(
+            "install",
+            "--pre",
+            f"torch[device-{arch}]",
+            f"rocm[libraries,devel,device-{arch}]{pin}",
+            "--index-url",
+            build.index_url,
+        )
+
+    def installed_rocm_version(self) -> str:
+        """The version of the ``rocm`` package in the venv."""
+        result = self.probe("import importlib.metadata as m; print(m.version('rocm'))")
+        if result.returncode != 0:
+            fail(
+                "cannot read the version of the installed rocm package.",
+                result.stderr.strip(),
+            )
+        return result.stdout.strip()
+
+    def write_rocm_build_record(self, build: RocmBuild) -> None:
+        """Record the installed ROCm build for the result environment."""
+        record = {
+            "rocm_version": build.rocm_version or self.installed_rocm_version(),
+            "build_date": build.build_date,
+            "therock_commit": build.therock_commit,
+            "rocm_libraries_commit": build.rocm_libraries_commit,
+            "source": build.source,
+            "status_url": build.status_url,
+            "index_url": build.index_url,
+            "untested": None if build.untested is None else list(build.untested),
+        }
+        (self.venv_dir / ROCM_BUILD_RECORD).write_text(json.dumps(record) + "\n")
+
+    def _read_venv_record(self, name: str) -> Optional[dict]:
+        """A JSON record that setup wrote into the venv, or None when absent
+        or unreadable."""
+        try:
+            return json.loads((self.venv_dir / name).read_text())
+        except (OSError, ValueError):
+            return None
 
     def require_same_torch_source(self, check_arch: bool = False) -> None:
         """Fail when an explicit flag differs from what the reused venv holds.
 
-        Compares --torch-index-url (and --gpu-arch with ``check_arch``) with
-        the TORCH_RECORD written when setup installed torch. A venv without
-        the record (torch installed some other way) cannot be checked. With
+        Compares --torch-index-url (and, with ``check_arch``, --gpu-arch and
+        --rocm-version) with the TORCH_RECORD and ROCM_BUILD_RECORD written
+        when setup installed torch. A venv without the record (torch
+        installed some other way) cannot be checked. With
         ``check_arch`` and no --gpu-arch, the build uses the recorded arch,
         and fails when the detected GPU has another arch; with no
         --torch-index-url, the toolchain uses the recorded index.
         """
-        try:
-            record = json.loads((self.venv_dir / TORCH_RECORD).read_text())
-        except (OSError, ValueError):
-            record = None
+        record = self._read_venv_record(TORCH_RECORD)
         if (
             check_arch
             and not self.gpu_arch_override
@@ -1420,22 +2137,37 @@ class Setup:
             self.resolved_torch_index_url = record.get(
                 "torch_index_url", self.resolved_torch_index_url
             )
-        checks = [("--torch-index-url", self.torch_index_url, "torch_index_url")]
+        checks = [
+            ("--torch-index-url", self.torch_index_url, TORCH_RECORD, "torch_index_url")
+        ]
         if check_arch:
-            checks.append(("--gpu-arch", self.gpu_arch_override, "gpu_arch"))
-        for flag, value, key in checks:
+            if self.rocm_version == "latest":
+                fail(
+                    "--rocm-version latest requests a fresh Quartz nightly and "
+                    f"cannot reuse {self.venv_dir}.",
+                    "Pass --clean to recreate the virtual environment, or omit "
+                    "--rocm-version to keep the installed build.",
+                )
+            checks.append(
+                ("--gpu-arch", self.gpu_arch_override, TORCH_RECORD, "gpu_arch")
+            )
+            checks.append(
+                ("--rocm-version", self.rocm_version, ROCM_BUILD_RECORD, "rocm_version")
+            )
+        for flag, value, record_name, key in checks:
             if not value:
                 continue
-            if record is None:
+            recorded = self._read_venv_record(record_name)
+            if recorded is None:
                 warn(
-                    f"{self.venv_dir} has no {TORCH_RECORD}, so setup cannot check "
+                    f"{self.venv_dir} has no {record_name}, so setup cannot check "
                     f"that its torch matches {flag} {value}.",
                     "Pass --clean if it does not.",
                 )
-            elif record.get(key) != value:
+            elif recorded.get(key) != value:
                 fail(
                     f"{flag} {value} differs from the "
-                    f"'{record.get(key) or 'default'}' that {self.venv_dir} "
+                    f"'{recorded.get(key) or 'default'}' that {self.venv_dir} "
                     "was set up with.",
                     "Pass --clean to recreate the virtual environment, or use "
                     "another --workspace.",
@@ -2176,6 +2908,8 @@ def main(argv=None) -> int:
         parser.error(
             "--clean deletes the virtual environment --torch-mode existing reuses"
         )
+    if args.rocm_version and args.torch_mode != "rocm":
+        parser.error("--rocm-version needs --torch-mode rocm")
     setup = Setup(args)
     try:
         return setup.run()
