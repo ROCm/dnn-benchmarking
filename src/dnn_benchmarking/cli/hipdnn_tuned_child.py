@@ -19,9 +19,10 @@ fills the inputs from the seed, and times the plan with the parent's timing
 policy. The first, untimed launch runs the search. It writes D/result.json
 (the timed loop, build time, workspace and whether the engine exposes the
 knob) and, with ``--save-outputs``, one ``output_<uid>.npy`` per output for
-the parent's validation. A failure goes to D/failure.json: kind ``stall``
-when the stall gate failed (the parent then remeasures the whole graph
-without it), else ``error``.
+the parent's validation. Before that output run, the outputs are zeroed and
+a Philox ``rng_dump`` output is filled with NaN instead. A failure goes to
+D/failure.json: kind ``stall`` when the stall gate failed (the parent then
+remeasures the whole graph without it), else ``error``.
 """
 
 import argparse
@@ -45,6 +46,7 @@ from ..execution.oracle import (
     TUNED_CHILD_ENV,
     output_file,
 )
+from ..execution.sdpa_dropout import find_rng_dump
 from ..execution.suite_runner import set_plugin_path
 from ..execution.timing import StallFallbackError
 from ..graph.loader import GraphLoader
@@ -106,6 +108,7 @@ def _run(args: argparse.Namespace) -> None:
     graph_json = loader.load_json(args.graph)
     loader.validate(graph_json)
     tensor_infos = loader.extract_tensor_info(graph_json)
+    rng_dump = find_rng_dump(graph_json)
     graph_json_str = json.dumps(graph_json)
     policy: TimingPolicy = args.timing_policy
 
@@ -124,7 +127,12 @@ def _run(args: argparse.Namespace) -> None:
         variant_pack = bm.create_variant_pack()
         m = executor.benchmark(handle, variant_pack)
         if args.save_outputs:
-            bm.zero_outputs()
+            # An engine that does not write its rng_dump then leaves NaN,
+            # which the parent's dump check rejects.
+            if rng_dump is not None:
+                bm.zero_outputs(nan_uids={rng_dump.uid})
+            else:
+                bm.zero_outputs()
             executor.execute_once(handle, variant_pack)
             for tensor_info in bm.get_output_tensors():
                 data = bm.get_output_data(tensor_info.uid)

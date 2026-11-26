@@ -24,9 +24,11 @@ from ._common import ReplayTensors
 from ._sdpa_backend import (
     PyTorchSdpaBackendState,
     PyTorchSdpaBackendUnavailableError,
+    current_philox_dumps,
     execute_selected_sdpa,
     reference_sdpa_pass,
     rocm_fa_library,
+    use_philox_dumps,
     use_pytorch_sdpa_backend,
 )
 from ._warnings import get_reference_warnings
@@ -54,6 +56,8 @@ __all__ = [
     "reference_sdpa_pass",
     "rocm_fa_library",
     "execute_selected_sdpa",
+    "use_philox_dumps",
+    "current_philox_dumps",
     "register_handler",
     "get_handler",
     "get_supported_operations",

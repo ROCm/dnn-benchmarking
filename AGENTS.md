@@ -112,6 +112,7 @@ src/dnn_benchmarking/
 │   ├── varlen_inputs.py      # seq_len, cu_seq_len and ragged offset-table inputs
 │   ├── pytorch_buffer_manager.py
 │   ├── pytorch_ops/          # graph node -> PyTorch op handlers
+│   ├── sdpa_dropout.py       # SDPA dropout attributes and the rng_dump output; no torch import
 │   ├── suite_runner.py       # one graph: engines, rows, clocks, warnings
 │   ├── oracle.py             # --oracle pass
 │   └── correctness.py        # output comparison for a row

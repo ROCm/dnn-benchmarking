@@ -10,8 +10,10 @@ graph type, and are encoded to raw words only when written to device storage.
 """
 
 import functools
+import math
+import struct
 import warnings
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Collection, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -22,6 +24,7 @@ from ..graph.loader import tensor_data_type
 from ..graph.tensor_info import TensorInfo
 from ..graph.varlen import sdpa_operands
 from .sdpa_backward_inputs import set_sdpa_backward_inputs
+from .sdpa_dropout import read_dropout
 from .varlen_inputs import generate_varlen_inputs
 
 
@@ -33,6 +36,9 @@ _FP8_FORMATS = {
     "fp8_e4m3_fnuz": (4, 3),
     "fp8_e5m2_fnuz": (5, 2),
 }
+
+# One float32 NaN in little-endian storage order.
+_NAN_WORD = struct.pack("<f", math.nan)
 
 
 def _f32_to_bf16(data_f32: np.ndarray) -> np.ndarray:
@@ -283,6 +289,97 @@ def _page_table_uids(graph_json: Optional[Dict[str, Any]]) -> Set[int]:
     return uids
 
 
+# Keep rate of a generated dropout mask when the graph gives no dropout_scale
+# value. An explicit-mask graph has no dropout_probability to take it from.
+_DEFAULT_DROPOUT_KEEP = 0.9
+
+
+def _dropout_input_roles(graph_json: Optional[Dict[str, Any]]) -> Dict[int, str]:
+    """Map tensor UID -> dropout role for every SDPA node in the graph.
+
+    The roles are ``mask``, ``scale``, ``scale_inv``, ``seed`` and ``offset``.
+    Forward and backward nodes both count: a backward node also carries the
+    mask, the scale and the scale_inv of its forward pass.
+    """
+    roles: Dict[int, str] = {}
+    if not graph_json:
+        return roles
+    for node in graph_json.get("nodes", []) or []:
+        if not str(node.get("type", "")).startswith("Sdpa"):
+            continue
+        dropout = read_dropout(node)
+        for uid, role in (
+            (dropout.mask_uid, "mask"),
+            (dropout.scale_uid, "scale"),
+            (dropout.scale_inv_uid, "scale_inv"),
+            (dropout.seed_uid, "seed"),
+            (dropout.offset_uid, "offset"),
+        ):
+            if uid is not None:
+                roles[uid] = role
+    return roles
+
+
+def _dropout_keep_rate(tensor_infos: List[TensorInfo], roles: Dict[int, str]) -> float:
+    """Keep rate of the generated dropout masks.
+
+    A ``dropout_scale`` value in the graph sets the keep rate to 1 / scale.
+    The first value sets the rate, and every value is checked. Without a
+    value the keep rate is 0.9.
+
+    Raises:
+        ValueError: A ``dropout_scale`` value gives a keep rate outside (0, 1].
+    """
+    keep: Optional[float] = None
+    for tensor_info in tensor_infos:
+        if not tensor_info.is_pass_by_value or roles.get(tensor_info.uid) != "scale":
+            continue
+        scale = float(tensor_info.value)
+        if not 1.0 <= scale < math.inf:
+            raise ValueError(
+                f"dropout_scale tensor {tensor_info.uid} has the value {scale}: "
+                "the keep rate 1/dropout_scale must be in (0, 1]"
+            )
+        if keep is None:
+            keep = 1.0 / scale
+    return _DEFAULT_DROPOUT_KEEP if keep is None else keep
+
+
+def _generate_dropout_input(
+    tensor_info: TensorInfo,
+    role: str,
+    keep: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Data for an SDPA dropout input.
+
+    The mask holds exact 0 and 1 values; each element is 1 with probability
+    ``keep``. The scale is 1 / keep and the scale_inv is keep, so the mask and
+    both scales agree. Integer seed and offset values are random and at least
+    1; a seed or offset of another type gets 1.
+    """
+    dims = list(tensor_info.dims)
+    dtype = tensor_info.dtype
+
+    if role == "mask":
+        # Draw one block at a time, so no full-size float32 draw exists.
+        data = np.empty(dims, dtype=dtype.numpy)
+        for index in iter_blocks(data.shape):
+            draw = rng.random(data[index].shape, dtype=np.float32)
+            data[index] = draw < np.float32(keep)
+        return data
+
+    if role in ("seed", "offset"):
+        high = 1
+        if dtype.numpy.kind in "iu":
+            high = min(2**31 - 1, int(np.iinfo(dtype.numpy).max))
+        values = rng.integers(1, high, size=dims, dtype=np.int64, endpoint=True)
+        return values.astype(dtype.numpy)
+
+    value = 1.0 / keep if role == "scale" else keep
+    return _decode(_encode(np.full(dims, value, dtype=np.float32), dtype), dtype)
+
+
 def _paged_metadata(graph_json: Optional[Dict[str, Any]]) -> int:
     """Number of pages, taken from the paged K container's own dims.
 
@@ -432,8 +529,8 @@ def generate_input_data(
     :func:`_signed_input_uids`). Both come from the same
     draw, so an unsigned tensor gets the same values with or without
     ``graph_json``. Integer and boolean inputs are zeros, except the SDPA
-    sequence lengths, cumulative lengths and ragged offset tables, and the
-    paged-SDPA page tables.
+    sequence lengths, cumulative lengths and ragged offset tables, the
+    paged-SDPA page tables, and SDPA dropout roles.
 
     ``graph_json`` selects the signed convolution operands and the SDPA
     tensors with invariants random data cannot satisfy. Lengths and offset
@@ -441,11 +538,21 @@ def generate_input_data(
     stream, so the float values do not change. Page tables come from
     :func:`_generate_paged_input`. It also makes the O and stats inputs of an
     SDPA backward node the exact forward outputs of its Q, K and V (see
-    :mod:`.sdpa_backward_inputs`).
+    :mod:`.sdpa_backward_inputs`). Dropout inputs get a 0/1 mask and scales
+    that agree with one keep rate, and nonzero seed and offset values (see
+    :func:`_generate_dropout_input`). The dropout inputs draw from their own
+    generator, spawned from ``seed``, so they do not change the values of the
+    other inputs.
+
+    Raises:
+        ValueError: A ``dropout_scale`` value gives a keep rate outside (0, 1].
     """
     rng = np.random.default_rng(seed)
     input_data: Dict[int, np.ndarray] = {}
     page_tables = _page_table_uids(graph_json)
+    dropout_roles = _dropout_input_roles(graph_json)
+    dropout_keep = _dropout_keep_rate(tensor_infos, dropout_roles)
+    dropout_rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
     signed_uids = _signed_input_uids(graph_json)
     varlen_values = generate_varlen_inputs(graph_json, tensor_infos, seed)
     num_pages = _paged_metadata(graph_json) if page_tables else 0
@@ -461,10 +568,15 @@ def generate_input_data(
             )
             continue
 
+        dropout_role = dropout_roles.get(tensor_info.uid)
         if tensor_info.uid in varlen_values:
             input_data[tensor_info.uid] = varlen_values[tensor_info.uid]
         elif tensor_info.uid in page_tables:
             input_data[tensor_info.uid] = _generate_paged_input(tensor_info, num_pages)
+        elif dropout_role is not None:
+            input_data[tensor_info.uid] = _generate_dropout_input(
+                tensor_info, dropout_role, dropout_keep, dropout_rng
+            )
         elif dtype.numpy.kind in "iub":
             # ponytail: zeros are safe for index/offset tensors (no OOB reads);
             # per-role structured generation (e.g. MoE offsets) is the upgrade path.
@@ -619,14 +731,28 @@ class BufferManager:
             if buffer is not None:
                 self._write_storage(buffer, _encode_to_storage(data, tensor_info))
 
-    def zero_outputs(self) -> None:
+    def zero_outputs(self, nan_uids: Collection[int] = ()) -> None:
         """Zero output tensor buffers.
+
+        Outputs in ``nan_uids`` are filled with float32 NaN instead: every
+        4-byte word of the buffer, padding included. An engine that does not
+        write such an output then leaves NaN, which no 0/1 check accepts.
 
         Raises:
             ExecutionError: If buffers not allocated.
+            ValueError: If an output in ``nan_uids`` is not FLOAT.
         """
         if not self._buffers:
             raise ExecutionError("Buffers not allocated. Call allocate_all() first.")
+
+        for uid in nan_uids:
+            tensor_info = self._tensor_info_by_uid.get(uid)
+            if tensor_info is None or tensor_info.dtype.name != "float":
+                data_type = None if tensor_info is None else tensor_info.data_type
+                raise ValueError(
+                    f"Cannot fill tensor UID {uid} with NaN: only a FLOAT "
+                    f"output can be filled (data type {data_type})"
+                )
 
         for tensor_info in self._tensor_infos:
             if not tensor_info.is_output:
@@ -635,15 +761,25 @@ class BufferManager:
             buffer = self._buffers.get(tensor_info.uid)
             if buffer is None:
                 continue
+            fill_nan = tensor_info.uid in nan_uids
             if self._device is None:
-                buffer.zeros()
+                if fill_nan:
+                    # One bytes object of the full storage size, padding
+                    # included: DeviceBuffer.copy_from_host accepts only bytes.
+                    buffer.copy_from_host(_NAN_WORD * (tensor_info.size_bytes // 4))
+                else:
+                    buffer.zeros()
+            elif fill_nan:
+                import torch
+
+                buffer.view(torch.float32).fill_(math.nan)
             else:
                 buffer.zero_()
 
         if self._device is not None:
             import torch
 
-            # zero_() runs on torch's stream; hipDNN runs on the handle stream.
+            # The fills run on torch's stream; hipDNN runs on the handle stream.
             if torch.device(self._device).type == "cuda":
                 torch.cuda.synchronize()
 

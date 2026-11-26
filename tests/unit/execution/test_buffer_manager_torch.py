@@ -31,6 +31,19 @@ def _strided(uid: int, data_type: str, is_output: bool) -> TensorInfo:
     )
 
 
+def _dump(uid: int, data_type: str = "float") -> TensorInfo:
+    # A packed [B, Hq, Sq, Skv] rng_dump output.
+    return TensorInfo(
+        uid=uid,
+        name=f"t{uid}",
+        dims=[1, 2, 2, 3],
+        strides=[12, 6, 3, 1],
+        data_type=data_type,
+        is_virtual=False,
+        is_output=True,
+    )
+
+
 class TestTorchBackend:
     def test_typed_views_match_host_decoding(self) -> None:
         x = _strided(1, "float", is_output=False)
@@ -83,6 +96,23 @@ class TestTorchBackend:
 
         assert calls == ["zero_", "sync"]
 
+    def test_zero_outputs_fills_listed_outputs_with_nan(self) -> None:
+        x = _strided(1, "float", is_output=False)
+        dump = _dump(2)
+        y = _strided(3, "float", is_output=True)
+        bm = BufferManager([x, dump, y], device="cpu")
+        bm.allocate_all()
+        x_data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        bm.load_input_data({x.uid: x_data})
+        bm._buffers[dump.uid].fill_(7)
+        bm._buffers[y.uid].fill_(7)
+
+        bm.zero_outputs(nan_uids={dump.uid})
+
+        assert np.isnan(bm.get_output_data(dump.uid)).all()
+        assert not bm.get_output_data(y.uid).any()
+        np.testing.assert_array_equal(bm.get_output_data(x.uid), x_data)
+
 
 class TestDeviceBufferBackend:
     def test_get_output_tensor_is_none(self) -> None:
@@ -109,3 +139,54 @@ class TestDeviceBufferBackend:
 
         with pytest.raises(ExecutionError, match="Buffers not allocated"):
             call(bm)
+
+    def test_zero_outputs_sends_one_nan_bytes_to_each_listed_buffer(self) -> None:
+        """DeviceBuffer takes only ``bytes``: the listed buffer gets one NaN
+        pattern of its full size, and every other output is zeroed."""
+        dump = _dump(2)
+        y = _dump(3)
+        bm = BufferManager([dump, y])
+        dump_buffer, y_buffer = MagicMock(), MagicMock()
+        bm._buffers.update({dump.uid: dump_buffer, y.uid: y_buffer})
+
+        bm.zero_outputs(nan_uids={dump.uid})
+
+        dump_buffer.copy_from_host.assert_called_once()
+        (data,), _ = dump_buffer.copy_from_host.call_args
+        assert isinstance(data, bytes) and len(data) == dump.size_bytes
+        assert np.isnan(np.frombuffer(data, dtype="<f4")).all()
+        y_buffer.copy_from_host.assert_not_called()
+        y_buffer.zeros.assert_called_once()
+
+
+@pytest.mark.parametrize("device", [None, "cpu"], ids=["device_buffer", "torch"])
+def test_zero_outputs_nan_fill_covers_strided_padding(device) -> None:
+    """A dump with non-packed strides is filled over its whole storage
+    (7 words: 6 elements and 1 padding word), not over its 6 elements."""
+    dump = _strided(2, "float", is_output=True)
+    bm = BufferManager([dump], device=device)
+    written = []
+    if device is None:
+        bm._buffers[dump.uid] = MagicMock(copy_from_host=written.append)
+    else:
+        bm.allocate_all()
+        bm._buffers[dump.uid].fill_(7)
+
+    bm.zero_outputs(nan_uids={dump.uid})
+
+    if device is None:
+        assert len(written) == 1
+        words = np.frombuffer(written[0], dtype="<f4")
+    else:
+        words = bm._buffers[dump.uid].view(torch.float32).numpy()
+    assert words.size * 4 == dump.size_bytes
+    assert np.isnan(words).all()
+
+
+def test_zero_outputs_rejects_a_listed_output_that_is_not_float() -> None:
+    dump = _dump(2, "bfloat16")
+    bm = BufferManager([dump], device="cpu")
+    bm.allocate_all()
+
+    with pytest.raises(ValueError):
+        bm.zero_outputs(nan_uids={dump.uid})

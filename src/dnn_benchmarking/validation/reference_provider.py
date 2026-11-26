@@ -9,7 +9,7 @@ enabling validation of GPU execution against known-correct implementations.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Type
 
 from ..config.benchmark_config import ReferencePrecision
 
@@ -81,6 +81,7 @@ class ReferenceProvider(ABC):
         *,
         precision: ReferencePrecision = ReferencePrecision.NATIVE,
         device: Optional[str] = None,
+        philox_dumps: Optional[Mapping[int, "np.ndarray"]] = None,
     ) -> Dict[int, ReferenceOutput]:
         """Compute reference outputs for given graph and inputs.
 
@@ -90,6 +91,10 @@ class ReferenceProvider(ABC):
             precision: ``FLOAT64`` requires :meth:`supports_float64`.
             device: Device to compute on; None is the host. Outputs computed
                 on a GPU stay there (``ReferenceOutput.device_data``).
+            philox_dumps: ``rng_dump`` UID -> the engine row's dump, a host
+                float array ``[B, Hq, Sq, Skv]``. A Philox dropout node
+                applies it as its dropout mask. The dump is not an input and
+                not an output of the reference.
 
         Returns:
             Mapping of output tensor UID to ReferenceOutput.
