@@ -44,7 +44,7 @@ jobs:
           - os: aws-linux-scale-rocm-small
             platform: linux
           - os: aws-windows-scale-rocm-prod
-            runner: aws-windows-scale-rocm-prod-mix
+            runner: az-windows-scale-rocm-default-prod
             platform: windows
     runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 30
