@@ -50,6 +50,7 @@ from ..execution.sdpa_dropout import find_rng_dump
 from ..execution.suite_runner import set_plugin_path
 from ..execution.timing import StallFallbackError
 from ..graph.loader import GraphLoader
+from ..graph.varlen import resolve_varlen_layouts
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -120,9 +121,11 @@ def _run(args: argparse.Namespace) -> None:
     # hipDNN ignores a knob the engine does not expose; such a tuned run
     # re-measures the OOTB configuration.
     tuning_available = BENCHMARKING_KNOB in executor.engine_knob_ids(args.engine)
+    input_data = generate_input_data(tensor_infos, args.seed, graph_json)
+    tensor_infos = resolve_varlen_layouts(tensor_infos, graph_json, input_data)
     with BufferManager(tensor_infos) as bm:
         bm.allocate_all()
-        bm.load_input_data(generate_input_data(tensor_infos, args.seed, graph_json))
+        bm.load_input_data(input_data)
         bm.zero_outputs()
         variant_pack = bm.create_variant_pack()
         m = executor.benchmark(handle, variant_pack)

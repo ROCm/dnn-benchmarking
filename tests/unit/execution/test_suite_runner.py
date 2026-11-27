@@ -628,6 +628,9 @@ def test_row_timing_throughput_and_noise_from_the_measurement(fake, monkeypatch)
         "first_call_ms": 5.0,
         "capped": True,
         "fallback_reason": "no stream wait",
+        "launch_mode": "raw",
+        "requested_warmup_iters": None,
+        "timed_work_notes": None,
     }
     assert row.ootb.workspace_bytes == 64
     assert row.ootb.cpu_build_time_ms == 2.0
@@ -1327,14 +1330,28 @@ def test_failed_cpu_float64_reference_falls_back_to_the_native_cpu_reference(
 
 
 @pytest.mark.parametrize("profiled", [False, True])
-def test_profiled_runs_keep_the_float64_reference_on_the_host(
+def test_profiled_runs_keep_float64_reference_on_device_and_free_before_profiling(
     fake_torch, monkeypatch, profiled
 ):
-    """Profiled runs keep host-only references, as the timed row does."""
+    """O-8: profiling keeps the float64 reference on device during OOTB timing
+    (matching unprofiled runs), then releases device references and clears the
+    torch cache before launching profiling children."""
     import torch
     from dnn_benchmarking.metrics import profiling_orchestrator
 
-    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
+    events = []
+    orig_release = suite_runner._release_torch_cache
+
+    def track_release():
+        events.append("release_torch_cache")
+        orig_release()
+
+    def track_profile(**kw):
+        events.append("profile")
+        return {}
+
+    monkeypatch.setattr(suite_runner, "_release_torch_cache", track_release)
+    monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", track_profile)
     fake_torch.discovered = [1]
     reference = fake_torch.cpu_reference
     reference.float64 = True
@@ -1367,11 +1384,10 @@ def test_profiled_runs_keep_the_float64_reference_on_the_host(
     assert graph.results[1].verdict == "passed"
     (ref,) = {id(r): r for r in seen}.values()
     assert ref.precision == "float64"
+    assert ref.device_data is not None and ref.data is None
     if profiled:
-        assert ref.device_data is None
-        assert ref.data.dtype == np.float64
-    else:
-        assert ref.device_data is not None and ref.data is None
+        assert "release_torch_cache" in events and "profile" in events
+        assert events.index("release_torch_cache") < events.index("profile")
 
 
 def test_owned_compacts_a_view_and_keeps_an_owning_tensor():
@@ -1535,12 +1551,12 @@ def test_reference_warnings_go_on_the_reference_row_only(fake_torch, monkeypatch
     assert "manual op" not in (engine.warnings or [])
 
 
-@pytest.mark.parametrize("profiling, device", [(False, "cuda"), (True, None)])
-def test_profiled_run_keeps_host_only_references(
-    fake_torch, monkeypatch, profiling, device
+@pytest.mark.parametrize("profiling", [False, True])
+def test_profiled_run_keeps_same_parent_buffer_backend_during_ootb(
+    fake_torch, monkeypatch, profiling
 ):
-    """A profiling child allocates its own VRAM, so a profiled run must not
-    keep the PyTorch reference (and hipDNN buffers) on the device."""
+    """O-8: profiling flags must not alter the parent hipDNN buffer backend
+    before OOTB timing; device references are freed after OOTB rows finish."""
     from dnn_benchmarking.metrics import profiling_orchestrator
 
     monkeypatch.setattr(profiling_orchestrator, "run_profiling_passes", lambda **kw: {})
@@ -1549,7 +1565,7 @@ def test_profiled_run_keeps_host_only_references(
 
     _validate(metrics=MetricsConfig(perf=profiling))
 
-    assert fake_torch.buffer_devices == [device]
+    assert fake_torch.buffer_devices == ["cuda"]
 
 
 def test_profiling_runs_after_teardown_with_the_rows_payload(fake, monkeypatch):

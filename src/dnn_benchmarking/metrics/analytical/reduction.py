@@ -59,6 +59,8 @@ def resample_bwd_flops(
     if not dy:
         return None
     elems = tensor_dim_product(dy)
+    if elems is None:
+        return None
     if str(node_param(node, "resample_mode", "")).upper() == "MAXPOOL":
         return elems
     window = _window_size(node)

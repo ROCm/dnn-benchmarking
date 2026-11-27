@@ -30,9 +30,9 @@ pins another commit: check these copies and the entry-point arguments of
 This module needs neither torch nor AITER at import time.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
-
 from ..common.exceptions import UnsupportedGraphError
 from ..graph.tensor_info import TensorInfo
 from .sdpa_graph import DenseSdpa, dense_sdpa
@@ -173,23 +173,78 @@ def _padded_head_sizes(p: DenseSdpa) -> Tuple[int, int]:
     return (-(-p.head_size_qk // 8) * 8, -(-p.head_size_v // 8) * 8)
 
 
+def _ck_asm_asymmetric_decode_bug(p: DenseSdpa) -> bool:
+    """True for single-query GQA decode with Dqk != Dv.
+
+    Pinned AITER CK (``mha_fwd_kernels.cu``) and ASM v3 (``asm_mha_fwd.cu``)
+    allocate/view O with ``Dv`` during the GQA-decode swap then reshape O
+    ending in ``Dqk``, failing with a shape mismatch when ``Dqk != Dv``.
+    """
+    return (
+        p.seqlen_q == 1
+        and p.num_query_heads > p.num_kv_heads
+        and p.head_size_qk != p.head_size_v
+    )
+
+
+def _env_flag_nonzero(name: str) -> bool:
+    """Match AITER's ``int(os.getenv(name, "0")) != 0`` flag parsing."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return False
+    try:
+        return int(raw.strip()) != 0
+    except ValueError:
+        return False
+
+
+def _auto_routes_to_opus(p: DenseSdpa, device: AiterDevice) -> bool:
+    """True when ``aiter:auto`` dispatches to OPUS on this device and env."""
+    if device.arch != "gfx950" or p.data_type != "bfloat16":
+        return False
+    heads = _padded_head_sizes(p)
+    if heads == (192, 128):
+        return not _env_flag_nonzero("AITER_DISABLE_FMHA_OPUS")
+    return (
+        heads == (128, 128)
+        and _kv_extent_fits(p, 128)
+        and _env_flag_nonzero("AITER_ENABLE_FMHA_OPUS")
+    )
+
+
 def _auto_runs(p: DenseSdpa, device: AiterDevice) -> bool:
     # flash_attn_func pads both head sizes to a multiple of 8. Above 256 no
     # v3, native, OPUS or FlyDSL path takes a dense fp16/bf16 problem, and the
     # Triton fallback runs only with CK disabled, so it ends in mha_fwd, which
     # checks head sizes <= 256 (csrc/py_itfs_ck/mha_fwd_kernels.cu).
-    return max(_padded_head_sizes(p)) <= _CK_MAX_HEAD_SIZE
+    if max(_padded_head_sizes(p)) > _CK_MAX_HEAD_SIZE:
+        return False
+    routes_opus = _auto_routes_to_opus(p, device)
+    # OPUS replaces explicit nonpositive scale with 1/sqrt(Dqk).
+    if routes_opus and p.scale <= 0:
+        return False
+    # When auto does not route to OPUS, asymmetric GQA decode hits CK/ASM's
+    # output reshape bug.
+    if _ck_asm_asymmetric_decode_bug(p) and not routes_opus:
+        return False
+    return True
 
 
 def _ck_runs(p: DenseSdpa, device: AiterDevice) -> bool:
     # mha_fwd takes head sizes that are multiples of 8 up to 256; this row
     # launches mha_fwd itself, without flash_attn_func's padding.
     heads = (p.head_size_qk, p.head_size_v)
-    return all(h % 8 == 0 for h in heads) and max(heads) <= _CK_MAX_HEAD_SIZE
+    return (
+        all(h % 8 == 0 for h in heads)
+        and max(heads) <= _CK_MAX_HEAD_SIZE
+        and not _ck_asm_asymmetric_decode_bug(p)
+    )
 
 
 def _asm_v3_runs(p: DenseSdpa, device: AiterDevice) -> bool:
     # AITER can_impl_fmha_v3_fwd, without the features this runtime rejects.
+    if _ck_asm_asymmetric_decode_bug(p):
+        return False
     heads = (p.head_size_qk, p.head_size_v)
     if heads == (192, 128):
         fits = _kv_extent_fits(p, 192) and _kv_extent_fits(p, 128)
@@ -201,6 +256,9 @@ def _asm_v3_runs(p: DenseSdpa, device: AiterDevice) -> bool:
 def _opus_runs(p: DenseSdpa, device: AiterDevice) -> bool:
     # AITER can_impl_fmha_fwd_bf16_opus. aiter:auto runs the 128/128 kernel
     # only with AITER_ENABLE_FMHA_OPUS=1; this row runs it directly.
+    # OPUS replaces scale <= 0 with 1/sqrt(Dqk) instead of honoring the graph.
+    if p.scale <= 0:
+        return False
     heads = (p.head_size_qk, p.head_size_v)
     if heads == (128, 128):
         fits = _kv_extent_fits(p, 128)

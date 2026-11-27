@@ -40,10 +40,18 @@ from ..config.benchmark_config import (
 )
 from ..execution.buffer_manager import BufferManager, generate_input_data
 from ..execution.executor import Executor
-from ..execution.timing import Measurement, StallFallbackError, Timer
+from ..execution.timing import (
+    MIXED_MODE_RERUN_REASON,
+    STALL_RERUN_REASON,
+    Measurement,
+    MixedModeFallbackError,
+    StallFallbackError,
+    Timer,
+)
 from ..graph.tensor_info import TensorInfo
 from ..graph.varlen import resolve_varlen_layouts
 from ..metrics import GpuSmiProbe, compute_flops, compute_io_bytes, derive_throughputs
+from ..metrics.analytical import ANALYTICAL_FORMULA_VERSION
 from ..metrics._diagnostic import warn_once
 from ..reporting.reporter import Reporter
 from ..reporting.statistics import (
@@ -180,8 +188,9 @@ def _report_row(
 def _throttled(after: Optional[Dict[str, Any]]) -> bool:
     # Only the SMU's throttle status counts: sclk alone moves with DPM demand
     # (1700 -> 1430 MHz over a 3-iteration loop on an idle MI210), so a lower
-    # after-sample is not evidence of throttling.
-    return bool(after and after.get("throttle_status"))
+    # after-sample is not evidence of throttling. Check both the post-loop
+    # status and any in-run sample.
+    return bool(after and (after.get("throttle_status") or after.get("throttle_any")))
 
 
 def _measure_row(
@@ -192,10 +201,14 @@ def _measure_row(
     """Run the timed loop and record stats, provenance, clocks and warnings."""
     basic = ctx.config.metrics.basic
     probe = GpuSmiProbe() if basic else None
-    m = benchmark()
-    if probe is not None:
-        row.clocks_after = probe.clocks()
-
+    if probe is not None and hasattr(probe, "sample_during"):
+        with probe.sample_during() as telemetry:
+            m = benchmark()
+        row.clocks_after = telemetry or None
+    else:
+        m = benchmark()
+        if probe is not None:
+            row.clocks_after = probe.clocks()
     kernel = BenchmarkStats.from_timings(m.kernel_ms)
     host = BenchmarkStats.from_timings(m.host_ms)
     row.ootb.gpu_kernel_stats = kernel
@@ -220,6 +233,9 @@ def _measure_row(
 
     if probe is not None:
         row.analytical_flops = ctx.flops
+        row.flops_formula_version = (
+            ANALYTICAL_FORMULA_VERSION if ctx.flops is not None else None
+        )
         row.analytical_io_bytes = ctx.io_bytes
         row.ootb.derived_tflops_per_s, row.ootb.derived_gbytes_per_s = (
             derive_throughputs(ctx.flops, ctx.io_bytes, kernel.median_ms)
@@ -516,11 +532,10 @@ def _time_pytorch_row(
                 # engine rows are graded against come from repeatable SDPA.
                 with pytorch_ops.reference_sdpa_pass():
                     executor.execute_once(tensors)
-                # A profiling child allocates its own VRAM, so profiled runs
-                # keep host-only references (and DeviceBuffer I/O).
-                outputs = _pytorch_reference_outputs_from_buffer(
-                    bm, keep_device=not config.metrics.opt_in_pass_requested
-                )
+                # Keep GPU reference outputs on the device during OOTB timing
+                # so profiling flags do not change the parent buffer backend.
+                # Device references are freed before any profiling child runs.
+                outputs = _pytorch_reference_outputs_from_buffer(bm, keep_device=True)
                 stage = "post"
         if role == "reference":
             row.warnings = (row.warnings or []) + pytorch_ops.get_reference_warnings(
@@ -665,8 +680,6 @@ def run_single_provider_engine(
             config=config,
             validate=_tuned_validator(ctx),
         )
-    if config.metrics.opt_in_pass_requested:
-        _run_profiling(row, ctx, engine_id, engine_name, plugin_path)
     return row
 
 
@@ -1043,14 +1056,10 @@ def _use_float64_reference(
         _release_torch_cache()
         _note_native_reference(ctx, row, error or "no outputs")
         return False
-    keep_device = not ctx.config.metrics.opt_in_pass_requested
     for ref in outputs.values():
         if ref.device_data is None:
             continue
-        if keep_device:
-            ref.device_data = _owned(ref.device_data)
-        else:
-            ref.data, ref.device_data = ref.host_data(), None
+        ref.device_data = _owned(ref.device_data)
     ctx.reference_outputs = outputs
     # Return the float64 temporaries and the replaced native outputs to the
     # device before the engine rows allocate.
@@ -1122,17 +1131,40 @@ def _with_stall_fallback(
     graph instead of mixing staged and events rows. Each rerun row records
     the reason in ``timing.fallback_reason`` and ``warnings``.
     """
+    mixed_mode = False
     try:
         return run(config)
     except StallFallbackError as e:
         reason = str(e)
+        mixed_mode = isinstance(e, MixedModeFallbackError)
     # Rerun outside the except block: the caught exception's traceback holds
     # every frame of the first attempt, with its inputs, references, device
     # buffers and workspaces, until the block exits.
     reporter.warning(f"{reason}; remeasuring every row of this graph without stalling")
     unstalled = copy.copy(config)
-    unstalled.timing_policy = replace(config.timing_policy, stall_gate=False)
-    return run(unstalled)
+    unstalled.timing_policy = replace(
+        config.timing_policy,
+        stall_gate=False,
+        stall_fallback_reason=(
+            MIXED_MODE_RERUN_REASON if mixed_mode else STALL_RERUN_REASON
+        ),
+    )
+    result = run(unstalled)
+    if mixed_mode:
+        for row in result.results:
+            for plan in (row.ootb, row.oracle):
+                if (
+                    plan is not None
+                    and plan.timing is not None
+                    and plan.timing.fallback_reason == STALL_RERUN_REASON
+                ):
+                    plan.timing.fallback_reason = MIXED_MODE_RERUN_REASON
+            if row.warnings:
+                row.warnings = [
+                    w.replace(STALL_RERUN_REASON, MIXED_MODE_RERUN_REASON)
+                    for w in row.warnings
+                ]
+    return result
 
 
 @dataclass
@@ -1245,6 +1277,31 @@ def _run_graph(
 
     for plan in plans:
         graph.results.extend(plan.rows(ctx))
+    if config.timing_policy.stall_gate and config.timing_policy.timing_block == 1:
+        modes = {
+            r.ootb.timing.mode
+            for r in graph.results
+            if r.status == "success" and r.ootb.timing is not None
+        }
+        if "staged" in modes and "events" in modes:
+            raise MixedModeFallbackError(
+                "mixed staged and events timing within this graph"
+            )
+    if ctx is not None and config.metrics.opt_in_pass_requested:
+        # Free GPU reference tensors before launching external profiler
+        # children so profiling never shifts parent buffer allocation during
+        # OOTB timing and children still get full VRAM.
+        ctx.reference_outputs = None
+        _release_torch_cache()
+        for row in graph.results:
+            if (
+                row.runtime == "hipdnn"
+                and row.role == "engine"
+                and row.status == "success"
+                and isinstance(row.engine_id, int)
+            ):
+                plugin = Path(row.plugin_path) if row.plugin_path else None
+                _run_profiling(row, ctx, row.engine_id, row.engine_name or "", plugin)
     return graph
 
 

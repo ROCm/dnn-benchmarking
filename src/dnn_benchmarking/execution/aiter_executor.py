@@ -12,13 +12,15 @@ the first launch in a process. ``prepare`` makes that first launch, so
 cache lookup otherwise.
 """
 
+import atexit
 import importlib.util
 import os
 import shutil
+import stat
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
-
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 import torch
 
 from ..common import torch_support
@@ -34,6 +36,47 @@ Launch = Callable[[], Any]
 #: Backends whose entry point allocates and returns the output; the others
 #: write the graph's O tensor.
 _ALLOCATES_OUTPUT = frozenset({"auto", "triton", "gluon"})
+
+#: Profiler env vars that can inject tool warnings into ``hipconfig --version``
+#: stdout when AITER probes the ROCm version under rocprofv3.
+_PROFILER_ENV_VARS = (
+    "LD_PRELOAD",
+    "ROCP_TOOL_LIBRARIES",
+    "HSA_TOOLS_LIB",
+    "ROCPROFILER_METRICS_PATH",
+    "ROCP_METRICS",
+)
+_hipconfig_shim_dir: Optional[tempfile.TemporaryDirectory[str]] = None
+
+
+def _isolate_hipconfig_from_profiler() -> None:
+    """Prepend a clean ``hipconfig`` wrapper when profiler env vars are active.
+
+    AITER runs ``hipconfig --version`` and parses its stdout. Under rocprofv3,
+    inherited tool variables can emit profiler messages onto stdout and break
+    version parsing. Stripping profiler vars for ``hipconfig`` only keeps
+    kernel profiling intact while isolating metadata probing.
+    """
+    global _hipconfig_shim_dir
+    if sys.platform == "win32":
+        return
+    if not any(os.environ.get(v) for v in _PROFILER_ENV_VARS):
+        return
+    if _hipconfig_shim_dir is not None:
+        return
+    real_hipconfig = shutil.which("hipconfig")
+    if not real_hipconfig:
+        return
+    shim_dir = tempfile.TemporaryDirectory(prefix="dnn-bench-hipconfig-")
+    shim_path = Path(shim_dir.name) / "hipconfig"
+    unset_args = " ".join(f"-u {v}" for v in _PROFILER_ENV_VARS)
+    shim_path.write_text(f'#!/bin/sh\nexec env {unset_args} {real_hipconfig!r} "$@"\n')
+    shim_path.chmod(
+        shim_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+    _hipconfig_shim_dir = shim_dir
+    atexit.register(shim_dir.cleanup)
+    os.environ["PATH"] = os.pathsep.join([shim_dir.name, os.environ.get("PATH", "")])
 
 
 def prepare_aiter_environment() -> None:
@@ -54,6 +97,7 @@ def prepare_aiter_environment() -> None:
     interpreter's ``bin``, which holds the SDK's ``hipcc``, first on
     ``PATH``. The first ``import aiter`` compiles AITER's core module.
     """
+    _isolate_hipconfig_from_profiler()
     if sys.prefix != sys.base_prefix:
         os.environ.setdefault("AITER_JIT_DIR", str(Path(sys.prefix) / "aiter-jit"))
     spec = importlib.util.find_spec("_rocm_sdk_devel")
@@ -69,6 +113,7 @@ def prepare_aiter_environment() -> None:
         hipcc is None or Path(hipcc).parent != bin_dir
     ):
         os.environ["PATH"] = os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")])
+    _isolate_hipconfig_from_profiler()
 
 
 def _launch_for(
@@ -178,13 +223,10 @@ class AiterExecutor:
         self._o: Optional[torch.Tensor] = None
         self.build_time_ms: Optional[float] = None
 
-    def prepare(self, tensors: Dict[int, torch.Tensor]) -> None:
-        """Bind the backend to the graph tensors and launch it once.
-
-        Raises:
-            ExecutionError: The first launch fails (an AITER compile error, a
-                shape that the backend rejects, a HIP error).
-        """
+    def _bind_tensors(
+        self, tensors: Dict[int, torch.Tensor]
+    ) -> Tuple[Launch, torch.Tensor]:
+        """Validate packed BSHD views and bind this backend to ``tensors``."""
         p = self._problem
         # Graph order is [B, H, S, D] over packed BSHD memory; the permuted
         # views are the contiguous [B, S, H, D] tensors AITER reads.
@@ -194,10 +236,21 @@ class AiterExecutor:
         )
         if not all(t.is_contiguous() for t in (q, k, v, o)):
             raise ExecutionError("AITER runtime needs packed BSHD Q/K/V/O tensors")
+        return _launch_for(self._backend, p, q, k, v, o), o
+
+    def prepare(self, tensors: Dict[int, torch.Tensor]) -> None:
+        """Bind the backend to the graph tensors and launch it once.
+
+        Raises:
+            ExecutionError: The first launch fails (an AITER compile error, a
+                shape that the backend rejects, a HIP error).
+        """
         try:
-            launch = _launch_for(self._backend, p, q, k, v, o)
+            launch, o = self._bind_tensors(tensors)
             with Timer() as t:
                 self._run_once(launch, o)
+        except ExecutionError:
+            raise
         except Exception as e:
             raise ExecutionError(
                 f"AITER {self._backend.name} failed: {type(e).__name__}: {e}"
@@ -222,6 +275,23 @@ class AiterExecutor:
                 o.copy_(out)
             self._stream.synchronize()
 
+    def _timed_work_notes(self) -> list[str]:
+        """Extra work inside the timed AITER call beyond pure attention."""
+        notes: list[str] = []
+        name = self._backend.name
+        p = self._problem
+        if name in _ALLOCATES_OUTPUT:
+            notes.append("output_allocated")
+        if name in ("auto", "triton", "gluon") and (
+            p.head_size_qk % 8 != 0 or p.head_size_v % 8 != 0
+        ):
+            notes.append("head_padding")
+        if name == "triton":
+            notes.append("triton_buffer_fills")
+        if name == "native_splitkv":
+            notes.append("split_kv_scratch")
+        return notes
+
     def benchmark(self) -> Measurement:
         """Time the backend per the executor's policy.
 
@@ -242,6 +312,7 @@ class AiterExecutor:
                     policy=self._policy,
                     timer=self._timer,
                     torch_stream=self._stream,
+                    timed_work_notes=self._timed_work_notes() or None,
                 )
         finally:
             self._stream.synchronize()

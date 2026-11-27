@@ -189,6 +189,7 @@ class TimingPolicy:
     cache_mode: str = "warm"
     timing_block: int = 1
     stall_gate: bool = True
+    stall_fallback_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate loop bounds and the cache mode; messages name CLI flags."""

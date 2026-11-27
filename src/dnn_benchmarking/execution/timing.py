@@ -29,7 +29,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 from ..common.exceptions import ExecutionError
 from ..config.benchmark_config import TimingPolicy
@@ -67,6 +67,9 @@ class Measurement:
     capped: bool = False
     fallback_reason: Optional[str] = None
     timing_block: int = 1
+    launch_mode: str = "raw"
+    requested_warmup_iters: Optional[int] = None
+    timed_work_notes: Optional[List[str]] = None
 
 
 class StallFallbackError(RuntimeError):
@@ -75,10 +78,19 @@ class StallFallbackError(RuntimeError):
     whole graph without stalling (see ``suite_runner``)."""
 
 
+class MixedModeFallbackError(StallFallbackError):
+    """A row in this graph fell back to events mode while another ran staged,
+    so the suite runner remeasures the whole graph uniformly in events mode."""
+
+
 #: ``fallback_reason`` of a row that a stall-gate failure remeasured unstalled.
 STALL_RERUN_REASON = "stall gate failed in this graph; every row remeasured unstalled"
 
-
+#: ``fallback_reason`` of a row remeasured in events mode because another row
+#: on the same graph fell back to events mode.
+MIXED_MODE_RERUN_REASON = (
+    "another row in this graph fell back to events; every row remeasured in events mode"
+)
 _HIP_API = ("HipEvent", "hip_get_device_count", "hip_device_synchronize")
 _STAGED_HIP_API = ("HipStallGate", "hip_can_use_stream_wait_value")
 
@@ -347,6 +359,9 @@ def measure(
     policy: TimingPolicy,
     timer: str = "hip",
     torch_stream: Any = None,
+    after_iteration: Optional[Callable[[], None]] = None,
+    launch_mode: str = "raw",
+    timed_work_notes: Optional[Sequence[str]] = None,
 ) -> Measurement:
     """Prime, warm up, then time ``enqueue`` per ``policy`` (a ``TimingPolicy``).
 
@@ -371,19 +386,26 @@ def measure(
         policy: Warmup/iteration counts, time budget, and cache mode.
         timer: ``hip`` or ``torch`` timer.
         torch_stream: torch.cuda.Stream the enqueue runs on, if torch-driven.
+        after_iteration: Optional callback invoked after every synchronized
+            iteration outside the timed bracket (e.g. releasing rocKE's
+            retained eager scratch).
+        launch_mode: ``"raw"`` or ``"graph_replay"`` launch provenance.
+        timed_work_notes: Extra non-core work inside the timed closure.
 
     Raises:
         ExecutionError: If the cold-cache flush buffer cannot be allocated.
-        StallFallbackError: If stall-gated timing failed (see
             ``StalledRegionTimer``); the caller remeasures without stalling.
         RuntimeError: If the timer is unavailable.
     """
     events = EventTimer(timer, stream, torch_stream)
+    notes = list(timed_work_notes) if timed_work_notes else None
 
     t0 = time.perf_counter()
     enqueue()
     device_sync(timer)
     first_call_ms = (time.perf_counter() - t0) * 1000.0
+    if after_iteration is not None:
+        after_iteration()
     primed = 1
     reason: Optional[str] = None
     if torch_stream is not None:
@@ -391,18 +413,28 @@ def measure(
         # A detected sync costs a second (unchecked) enqueue.
         primed += 1 if reason is None else 2
         device_sync(timer)
+        if after_iteration is not None:
+            after_iteration()
 
     if policy.timing_block > 1:
         return _measure_blocks(
-            enqueue, events, policy, timer, first_call_ms, primed, reason
+            enqueue,
+            events,
+            policy,
+            timer,
+            first_call_ms,
+            primed,
+            reason,
+            after_iteration=after_iteration,
+            launch_mode=launch_mode,
+            timed_work_notes=notes,
         )
-
     staged: Optional[StalledRegionTimer] = None
     if reason is None:
         if timer != "hip":
             reason = "staged timing requires the hip timer"
         elif not policy.stall_gate:
-            reason = STALL_RERUN_REASON
+            reason = policy.stall_fallback_reason or STALL_RERUN_REASON
         else:
             reason = _staged_unavailable_reason()
     if reason is None:
@@ -418,13 +450,17 @@ def measure(
         if cold:
             _flush_cache(timer)
         if staged is not None:
-            return staged.measure(enqueue)
-        events.start()
-        t0 = time.perf_counter()
-        enqueue()
-        t1 = time.perf_counter()
-        events.stop()
-        return (t1 - t0) * 1000.0, events.elapsed_ms()
+            sample = staged.measure(enqueue)
+        else:
+            events.start()
+            t0 = time.perf_counter()
+            enqueue()
+            t1 = time.perf_counter()
+            events.stop()
+            sample = (t1 - t0) * 1000.0, events.elapsed_ms()
+        if after_iteration is not None:
+            after_iteration()
+        return sample
 
     for _ in range(primed, policy.warmup_iters):
         iteration()
@@ -452,6 +488,9 @@ def measure(
         first_call_ms=first_call_ms,
         capped=capped,
         fallback_reason=reason,
+        launch_mode=launch_mode,
+        requested_warmup_iters=policy.warmup_iters,
+        timed_work_notes=notes,
     )
 
 
@@ -463,6 +502,10 @@ def _measure_blocks(
     first_call_ms: float,
     untimed: int,
     host_sync: Optional[str],
+    *,
+    after_iteration: Optional[Callable[[], None]] = None,
+    launch_mode: str = "raw",
+    timed_work_notes: Optional[List[str]] = None,
 ) -> Measurement:
     """rocKE block timing (``time_launches`` / Solera ``measure()``).
 
@@ -491,6 +534,8 @@ def _measure_blocks(
             enqueue()
         untimed += policy.warmup_iters
         device_sync(timer)
+        if after_iteration is not None:
+            after_iteration()
         events.start()
         t0 = time.perf_counter()
         for _ in range(block):
@@ -498,6 +543,8 @@ def _measure_blocks(
         t1 = time.perf_counter()
         events.stop()
         kernel = events.elapsed_ms() / block
+        if after_iteration is not None:
+            after_iteration()
         if discard_first:
             discard_first = False
             continue
@@ -516,6 +563,9 @@ def _measure_blocks(
         capped=capped,
         fallback_reason=host_sync,
         timing_block=block,
+        launch_mode=launch_mode,
+        requested_warmup_iters=policy.warmup_iters,
+        timed_work_notes=timed_work_notes,
     )
 
 

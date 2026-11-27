@@ -10,8 +10,9 @@ rocKE launch synchronizes the host after every call.
 """
 
 import hashlib
+import inspect
 from pathlib import Path
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -203,14 +204,12 @@ class RockeExecutor:
         )
         self._stream = torch.cuda.default_stream(self._device)
         self._launch: Optional[Callable[[], None]] = None
+        self._launch_mode: str = "raw"
         self.build_time_ms: Optional[float] = None
 
-    def prepare(self, tensors: Dict[int, torch.Tensor]) -> None:
-        """Build the kernel and bind it to the graph tensors.
-
-        Raises:
-            ExecutionError: The build, the load or the first launch fails.
-        """
+    def _bshd_views(
+        self, tensors: Dict[int, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         p = self._problem
         # Graph order is [B, H, S, D] over packed BSHD memory; the permuted
         # views are the contiguous [B, S, H, D] tensors rocKE kernels read.
@@ -220,6 +219,15 @@ class RockeExecutor:
         )
         if not all(t.is_contiguous() for t in (q, k, v, o)):
             raise ExecutionError("rocKE runtime needs packed BSHD Q/K/V/O tensors")
+        return q, k, v, o
+
+    def prepare(self, tensors: Dict[int, torch.Tensor]) -> None:
+        """Build the kernel and bind it to the graph tensors.
+
+        Raises:
+            ExecutionError: The build, the load or the first launch fails.
+        """
+        q, k, v, o = self._bshd_views(tensors)
         try:
             if isinstance(self._kernel, CatalogKernel):
                 self._prepare_catalog(q, k, v, o)
@@ -270,6 +278,19 @@ class RockeExecutor:
         # scalar correctness kernel when the tiled path declines.
         backend = "tiled" if kernel.path == "2d" else "3d"
         stream = int(self._stream.cuda_stream)
+        extra_kwargs: Dict[str, Any] = {}
+        try:
+            sig = inspect.signature(run_unified_attention_torch)
+            if "use_graph" in sig.parameters:
+                # Force raw launches so rocKE auto matches hipDNN, catalog
+                # variants and other runtimes instead of silently timing
+                # internal HIP graph replay.
+                extra_kwargs["use_graph"] = False
+                self._launch_mode = "raw"
+            else:
+                self._launch_mode = "graph_replay"
+        except (TypeError, ValueError):
+            self._launch_mode = "raw"
 
         def launch() -> None:
             run_unified_attention_torch(
@@ -285,6 +306,7 @@ class RockeExecutor:
                 softcap=0.0,
                 backend=backend,
                 stream=stream,
+                **extra_kwargs,
             )
 
         with Timer() as t, torch.cuda.device(self._device):
@@ -317,9 +339,27 @@ class RockeExecutor:
                     policy=self._policy,
                     timer=self._timer,
                     torch_stream=self._stream,
+                    after_iteration=self._release_retained,
+                    launch_mode=self._launch_mode,
                 )
         finally:
             self._release()
+
+    def _release_retained(self) -> None:
+        """Drop rocKE's retained launch arguments after an external stream sync.
+
+        ``timing.measure`` synchronizes the stop event on every iteration;
+        clearing the completed bucket outside the timed bracket keeps eager 3D
+        scratch memory O(1) instead of accumulating across all iterations.
+        """
+        import rocke.runtime as rr
+
+        stream = int(self._stream.cuda_stream)
+        release = getattr(rr, "release_retained_for_stream", None)
+        if callable(release):
+            release(stream)
+        else:
+            rr.wait_stream_and_release(stream)
 
     def _release(self) -> None:
         """Drain the stream and free the kernel arguments rocKE retains."""

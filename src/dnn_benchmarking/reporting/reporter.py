@@ -9,6 +9,7 @@ line left open on a TTY is always terminated before anything else is
 written, including ``warn_once`` diagnostics routed through the sink.
 """
 
+import math
 import shutil
 import sys
 import textwrap
@@ -86,6 +87,8 @@ def _unit(ms: float) -> Tuple[float, str]:
 
 def _fmt_time(ms: float) -> str:
     """Per-launch time with an automatic µs/ms/s unit."""
+    if not math.isfinite(ms):
+        return "-"
     scale, suffix = _unit(ms)
     digits = 2 if suffix == "µs" else 3
     return f"{ms * scale:.{digits}f} {suffix}"
@@ -93,12 +96,20 @@ def _fmt_time(ms: float) -> str:
 
 def _fmt_duration(ms: float) -> str:
     """Wall-clock cost (setup, build): 2 significant digits below 10 ms."""
+    if not math.isfinite(ms):
+        return "-"
     if ms < 10:
         return f"{ms:.2g} ms"
     return f"{ms:.0f} ms" if ms < 1e3 else f"{ms / 1e3:.1f} s"
 
 
-def _iqr_pct(stats: BenchmarkStats) -> float:
+def _iqr_pct(stats: BenchmarkStats) -> Optional[float]:
+    if (
+        not math.isfinite(stats.median_ms)
+        or not math.isfinite(stats.p25_ms)
+        or not math.isfinite(stats.p75_ms)
+    ):
+        return None
     return stats.iqr_ms / stats.median_ms * 100 if stats.median_ms > 0 else 0.0
 
 
@@ -281,7 +292,9 @@ class Reporter:
             parts.append(_fmt_time(kernel.median_ms))
         detail = []
         if kernel is not None:
-            detail.append(f"iqr {_iqr_pct(kernel):.1f}%")
+            iqr = _iqr_pct(kernel)
+            if iqr is not None:
+                detail.append(f"iqr {iqr:.1f}%")
         if pe.ootb.timing is not None:
             detail.append(f"setup {_fmt_duration(pe.ootb.timing.first_call_ms)}")
         elif pe.elapsed_time_ms:
@@ -410,34 +423,45 @@ class Reporter:
             return
 
         rows = gr.results
-        best_candidates = [
-            pe.ootb.gpu_kernel_stats.median_ms
+        has_validated_engine = any(
+            pe.role == "engine" and pe.verdict in ("passed", "failed") for pe in rows
+        )
+        eligible_verdicts = (
+            ("passed",) if has_validated_engine else ("passed", "unchecked")
+        )
+        eligible_rows = [
+            pe
             for pe in rows
             if pe.role == "engine"
-            and pe.verdict in ("passed", "unchecked")
+            and pe.verdict in eligible_verdicts
             and pe.ootb.gpu_kernel_stats is not None
+            and math.isfinite(pe.ootb.gpu_kernel_stats.median_ms)
             and pe.ootb.gpu_kernel_stats.median_ms > 0
         ]
-        best = min(best_candidates) if best_candidates else None
+        eligible_modes = {
+            (pe.ootb.timing.mode, pe.ootb.timing.launch_mode)
+            for pe in eligible_rows
+            if pe.ootb.timing is not None
+        }
+        best = (
+            min(pe.ootb.gpu_kernel_stats.median_ms for pe in eligible_rows)
+            if eligible_rows and len(eligible_modes) <= 1
+            else None
+        )
         with_oracle = any(pe.oracle is not None or pe.oracle_error for pe in rows)
+
+        def iqr_cell(pe: ProviderEngineResult) -> str:
+            if pe.ootb.gpu_kernel_stats is None:
+                return "-"
+            pct = _iqr_pct(pe.ootb.gpu_kernel_stats)
+            return "-" if pct is None else f"{pct:.1f}"
 
         # (header, right-aligned, cells)
         columns: List[Tuple[str, bool, List[str]]] = [
             ("engine", False, [_display_name(pe) for pe in rows]),
             ("verdict", False, [pe.verdict for pe in rows]),
             ("kernel_med", True, [self._kernel_cell(pe) for pe in rows]),
-            (
-                "iqr%",
-                True,
-                [
-                    (
-                        "-"
-                        if pe.ootb.gpu_kernel_stats is None
-                        else f"{_iqr_pct(pe.ootb.gpu_kernel_stats):.1f}"
-                    )
-                    for pe in rows
-                ],
-            ),
+            ("iqr%", True, [iqr_cell(pe) for pe in rows]),
             (
                 "submit",
                 True,
@@ -463,7 +487,11 @@ class Reporter:
                     for pe in rows
                 ],
             ),
-            ("vs_best", True, [self._vs_best_cell(pe, best) for pe in rows]),
+            (
+                "vs_best",
+                True,
+                [self._vs_best_cell(pe, best, eligible_verdicts) for pe in rows],
+            ),
         ]
         if with_oracle:
             columns.append(("oracle", True, [self._oracle_cell(pe) for pe in rows]))
@@ -503,23 +531,35 @@ class Reporter:
 
     @staticmethod
     def _legend(rows: Sequence[ProviderEngineResult]) -> str:
-        timing = next(
-            (pe.ootb.timing for pe in rows if pe.ootb.timing is not None), None
+        pairs = list(
+            dict.fromkeys(
+                (pe.ootb.timing.mode, pe.ootb.timing.launch_mode)
+                for pe in rows
+                if pe.ootb.timing is not None
+            )
         )
-        how = (
-            f" ({_TIMING_MODE_LABEL.get(timing.mode, timing.mode)})"
-            if timing is not None
-            else ""
-        )
+        if len(pairs) > 1:
+            distinct_launches = {lm for _, lm in pairs}
+            labels = [
+                f"{m}/{lm}" if len(distinct_launches) > 1 else m for m, lm in pairs
+            ]
+            how = f" (mixed modes: {', '.join(labels)})"
+        elif len(pairs) == 1:
+            mode, launch = pairs[0]
+            label = _TIMING_MODE_LABEL.get(mode, mode)
+            how = f" ({label}, {launch})" if launch != "raw" else f" ({label})"
+        else:
+            how = ""
         return (
-            f"  kernel_med = median device time per launch{how}; "
-            "submit = host enqueue time; vs_best = best median / row median; * = noisy"
+            f"  kernel_med = median device event span per launch{how}; "
+            "submit = host enqueue time; tflops/gbps = graph-normalized rates; "
+            "vs_best = best median / row median; * = noisy or outlier"
         )
 
     @staticmethod
     def _kernel_cell(pe: ProviderEngineResult) -> str:
         stats = pe.ootb.gpu_kernel_stats
-        if stats is None:
+        if stats is None or not math.isfinite(stats.median_ms):
             return "- "
         # Always one marker column so the numbers stay aligned.
         return _fmt_time(stats.median_ms) + ("*" if noise_warnings(stats) else " ")
@@ -531,14 +571,19 @@ class Reporter:
         return f"{pe.ootb.derived_tflops_per_s:.2f}"
 
     @staticmethod
-    def _vs_best_cell(pe: ProviderEngineResult, best: Optional[float]) -> str:
+    def _vs_best_cell(
+        pe: ProviderEngineResult,
+        best: Optional[float],
+        eligible_verdicts: Tuple[str, ...] = ("passed", "unchecked"),
+    ) -> str:
         if pe.role == "reference":
             return "ref"
         stats = pe.ootb.gpu_kernel_stats
         if (
             best is None
-            or pe.verdict not in ("passed", "unchecked")  # best_candidates' rule
+            or pe.verdict not in eligible_verdicts
             or stats is None
+            or not math.isfinite(stats.median_ms)
             or stats.median_ms <= 0
         ):
             return "-"
@@ -598,11 +643,20 @@ class Reporter:
         if pe.ootb.timing is not None:
             t = pe.ootb.timing
             text = f"{t.mode}/{t.timer}, warmup {t.warmup_iters}"
+            if (
+                t.requested_warmup_iters is not None
+                and t.requested_warmup_iters != t.warmup_iters
+            ):
+                text += f" (requested {t.requested_warmup_iters})"
+            if t.launch_mode != "raw":
+                text += f", launch {t.launch_mode}"
             if t.capped:
                 text += ", capped at max iters"
             if t.fallback_reason:
                 text += f", fallback: {t.fallback_reason}"
             add("timing", text)
+            if t.timed_work_notes:
+                add("timed work", ", ".join(t.timed_work_notes))
         lines.extend(self._stats_lines(pe))
         clocks = self._clocks_text(pe.clocks_after)
         if clocks:

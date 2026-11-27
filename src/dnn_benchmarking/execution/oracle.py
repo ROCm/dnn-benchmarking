@@ -96,8 +96,17 @@ def _set_throughputs(oracle: OracleResult, row: ProviderEngineResult) -> None:
     )
 
 
-def _tuned_state(config: SuiteConfig) -> SelectionState:
-    """The tuned selection state that every tuned run shares, created."""
+def _tuned_state(
+    config: SuiteConfig, fresh_root: Optional[Path] = None
+) -> SelectionState:
+    """The tuned selection state, created.
+
+    When ``config.fresh_state`` is set and ``fresh_root`` is supplied, create
+    an isolated empty selection state inside the child's temporary directory
+    instead of reusing the persistent ``<work>/tuned`` state.
+    """
+    if config.fresh_state and fresh_root is not None:
+        return SelectionState.under(fresh_root / "tuned-state").create()
     return tuned_state(work_dir(config.benchmark_work_dir)).create()
 
 
@@ -149,13 +158,15 @@ def _hipdnn_tuned_argv(
 TUNED_CHILD_ENV = {"HIPDNN_FORCE_BENCHMARKING": "1"}
 
 
-def _hipdnn_tuned_env(config: SuiteConfig) -> Dict[str, str]:
+def _hipdnn_tuned_env(
+    config: SuiteConfig, fresh_root: Optional[Path] = None
+) -> Dict[str, str]:
     """The tuned child's environment: :data:`TUNED_CHILD_ENV` and the tuned
     selection state (``HIPDNN_CACHE_DIR``, ``MIOPEN_USER_DB_PATH``). An
     inherited ``HIPDNN_DISABLE_CACHE`` stays as it is."""
     env = dict(os.environ)
     env.update(TUNED_CHILD_ENV)
-    env.update(_tuned_state(config).env())
+    env.update(_tuned_state(config, fresh_root).env())
     return env
 
 
@@ -244,10 +255,15 @@ def _run_hipdnn_tuned_child(
     timeout_s = config.oracle_timeout_s or None
     release_flush_buffers()
     argv = _hipdnn_tuned_argv(
-        graph_path, engine_id, plugin_path, config, out_dir, save_outputs
+        graph_path,
+        engine_id,
+        plugin_path,
+        config,
+        out_dir,
+        save_outputs,
     )
     try:
-        proc = run_capped(argv, timeout_s, env=_hipdnn_tuned_env(config))
+        proc = run_capped(argv, timeout_s, env=_hipdnn_tuned_env(config, out_dir))
     except subprocess.TimeoutExpired:
         raise RuntimeError(
             f"tuned hipDNN child timed out after {timeout_s} s (--oracle-timeout)"
@@ -308,6 +324,8 @@ def _pytorch_tuned_argv(
         argv += ["--pytorch-rocm-fa-library", config.pytorch_rocm_fa_library]
     if config.pytorch_dispatch:
         argv.append("--pytorch-dispatch")
+    if config.fresh_state:
+        argv.append("--fresh-state")
     if not config.timing_policy.stall_gate:
         argv.append("--no-stall-gate")
     return argv
@@ -335,7 +353,9 @@ def _run_pytorch_tuned_child(graph_path: Path, config: SuiteConfig) -> Dict[str,
             proc = run_capped(
                 _pytorch_tuned_argv(graph_path, config, output),
                 timeout_s,
-                env=tuned_subprocess_env(state_dir, _tuned_state(config)),
+                env=tuned_subprocess_env(
+                    state_dir, _tuned_state(config, Path(state_dir))
+                ),
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(

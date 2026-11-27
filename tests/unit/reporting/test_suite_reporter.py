@@ -113,9 +113,11 @@ class TestTableLayout:
 
     def test_vs_best_is_best_successful_engine_median_over_row_median(self) -> None:
         text = _table(
-            _row("FAST", 0.020),
-            _row("MID", 0.025),
-            _row("SLOW", 0.040),
+            _row("FAST", 0.020, correctness=_verdict(True)),
+            _row("MID", 0.025, correctness=_verdict(True)),
+            _row("SLOW", 0.040, correctness=_verdict(True)),
+            # An unchecked row cannot win or score alongside validated rows (O-7).
+            _row("UNCHECKED", 0.008),
             # A wrong answer is not a "best", so it gets no ratio either; the
             # reference is not an engine.
             _row("WRONG", 0.005, correctness=_verdict(False)),
@@ -124,8 +126,15 @@ class TestTableLayout:
         assert _cells(text, "FAST")[-1] == "1.00x"
         assert _cells(text, "MID")[-1] == "0.80x"
         assert _cells(text, "SLOW")[-1] == "0.50x"
+        assert _cells(text, "UNCHECKED")[-1] == "-"
         assert _cells(text, "WRONG")[-1] == "-"
         assert _cells(text, "pytorch")[-1] == "ref"
+
+    def test_vs_best_ranks_unchecked_rows_when_validation_is_off(self) -> None:
+        """Default runs without --validate have only unchecked rows and rank them."""
+        text = _table(_row("FAST", 0.020), _row("SLOW", 0.040))
+        assert _cells(text, "FAST")[-1] == "1.00x"
+        assert _cells(text, "SLOW")[-1] == "0.50x"
 
     def test_skipped_and_error_rows_show_their_reason(self) -> None:
         skipped = ProviderEngineResult.skipped_row(

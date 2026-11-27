@@ -81,8 +81,9 @@ package, run `PYTHONPATH=src python -m dnn_benchmarking ...`.
 | 3 | At least one engine row failed validation. 3 wins over 1, and 1 wins over 0. Only `role == "engine"` rows count, as in `summary()`. |
 | 130 / 143 | SIGINT / SIGTERM. The result file is partial (`run.complete = false`). |
 
-`dnn-benchmark compare` uses 0 (no regression), 1 (regression) and 2 (usage
-or unreadable input).
+`dnn-benchmark compare` uses 0 (no regression), 1 (regression, or coverage
+loss under `--strict-coverage`), and 2 (usage, unreadable input, or
+incompatible `cache_mode`/`timing_block` without `--allow-mismatch`).
 
 ## Architecture
 

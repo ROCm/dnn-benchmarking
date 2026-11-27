@@ -20,8 +20,8 @@ from typing import Dict, Tuple
 
 from .work_dir import SelectionState
 
-# Always on. Each value is read from the environment by PyTorch itself.
-_DEFAULT_ENV = {
+# Always on for both OOTB and tuned PyTorch.
+_BASE_ENV = {
     # PyTorch's MIOpen conv path ignores channels-last strides unless this is
     # set, and instead transposes to NCHW inside the timed region.
     "PYTORCH_MIOPEN_SUGGEST_NHWC": "1",
@@ -30,27 +30,42 @@ _DEFAULT_ENV = {
     "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
 }
 
+# Explicitly disable TunableOp on the OOTB path so inherited shell flags
+# cannot silently tune the OOTB baseline. Tuned children preserve the
+# TunableOp=1 variables set by tuned_subprocess_env().
+_OOTB_ONLY_ENV = {
+    "PYTORCH_TUNABLEOP_ENABLED": "0",
+    "PYTORCH_TUNABLEOP_TUNING": "0",
+}
+
+_DEFAULT_ENV = {**_BASE_ENV, **_OOTB_ONLY_ENV}
+
 ENV_NAMES = tuple(_DEFAULT_ENV)
 
 
-def apply_pytorch_environment() -> Tuple[Dict[str, str], Dict[str, str]]:
+def apply_pytorch_environment(
+    *, tuned: bool = False
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Set the always-on PyTorch ROCm controls.
 
     Forced, not defaulted: the CLI is the only control, so a value inherited
-    from the shell cannot change what PyTorch rows measure.
+    from the shell cannot change what PyTorch rows measure. When ``tuned`` is
+    True (inside ``cli.pytorch_tuned_child``), TunableOp variables set by
+    :func:`tuned_subprocess_env` are preserved rather than forced to ``0``.
     Must run before the first conv or SDPA call, because PyTorch caches these.
 
     Returns:
         The settings in effect, and the inherited value of each setting
         whose inherited value was different and is now replaced.
     """
+    target = _BASE_ENV if tuned else _DEFAULT_ENV
     replaced = {
         name: os.environ[name]
-        for name, value in _DEFAULT_ENV.items()
+        for name, value in target.items()
         if os.environ.get(name, value) != value
     }
-    os.environ.update(_DEFAULT_ENV)
-    return dict(_DEFAULT_ENV), replaced
+    os.environ.update(target)
+    return dict(target), replaced
 
 
 def tuned_subprocess_env(state_dir: str, tuned: SelectionState) -> Dict[str, str]:

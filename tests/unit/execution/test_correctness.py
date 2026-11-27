@@ -227,7 +227,7 @@ def test_passing_outputs_report_diffs_without_message():
     "refs, outputs, reason",
     [
         ({}, {1: np.zeros(4, np.float32)}, "did not produce output tensor UID 1"),
-        ({1: _ref([0, 0, 0, 0])}, {}, "No output tensors to compare"),
+        ({1: _ref([0, 0, 0, 0])}, {}, "Engine did not produce output tensor UID 1"),
     ],
 )
 def test_missing_side_is_a_failure_not_a_pass(refs, outputs, reason):

@@ -387,6 +387,7 @@ class ProviderEngineResult:
     oracle_error: Optional[str] = None
     clocks_after: Optional[Dict[str, Any]] = None
     engine_name: Optional[str] = None
+    flops_formula_version: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Validate status and role."""
@@ -490,6 +491,7 @@ class ProviderEngineResult:
             "elapsed_s": self.elapsed_time_ms / 1000.0,
             "metrics": {
                 "flops": self.analytical_flops,
+                "flops_formula_version": self.flops_formula_version,
                 "io_bytes": self.analytical_io_bytes,
                 "clocks_after": self.clocks_after,
             },
@@ -502,10 +504,14 @@ class ProviderEngineResult:
 
 
 def timing_modes_differ(row: ProviderEngineResult) -> bool:
-    """True when the OOTB and tuned plans were timed in different modes."""
+    """True when the OOTB and tuned plans were timed in incompatible modes."""
     a = row.ootb.timing
     b = row.oracle.timing if row.oracle is not None else None
-    return a is not None and b is not None and a.mode != b.mode
+    return (
+        a is not None
+        and b is not None
+        and (a.mode != b.mode or a.launch_mode != b.launch_mode)
+    )
 
 
 def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
@@ -513,7 +519,7 @@ def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
 
     None when the row has no tuned run, either plan failed validation, the
     two plans were timed in different modes (one plan fell back to
-    ``events``), or a median is missing or
+    ``events``), or a median is missing, non-finite or
     non-positive. Rows with ``tuning_available`` False still get a ratio;
     callers report them as "no-search" and keep them out of averages. The
     speedup is derived, never stored in the result file.
@@ -529,7 +535,11 @@ def oracle_speedup(row: ProviderEngineResult) -> Optional[float]:
     if timing_modes_differ(row):
         return None
     ootb, tuned = row.ootb.gpu_kernel_stats.median_ms, oracle.gpu_kernel_stats.median_ms
-    if ootb <= 0.0 or tuned <= 0.0:
+    if (
+        not (math.isfinite(ootb) and math.isfinite(tuned))
+        or ootb <= 0.0
+        or tuned <= 0.0
+    ):
         return None
     return ootb / tuned
 

@@ -94,8 +94,8 @@ in the same way.
 | `--plugin-path PATHS` | see below | Plugin directory or plugin library file, or a comma list with one path for each `--engine` entry. A directory loads every plugin library in it; a file loads only that plugin. `--runtime rocke` needs directories. `--fast` needs one library file. |
 | `--autotune`, `--no-autotune` | off | Sets `HIPDNN_FORCE_BENCHMARKING=1`: each plan benchmarks its candidate kernels on the first execute and caches the winner in the tuned state of the work directory. See [Kernel selection](#kernel-selection---autotune). |
 | `--benchmark-work-dir PATH` | `$DNN_BENCH_WORKSPACE/work`, else `$XDG_CACHE_HOME/dnn-benchmark/work`, else `<system temp dir>/dnn-benchmark-<user>/work` | Work directory for the caches and the kernel-selection state. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.benchmark_work_dir`. |
-| `--fresh-state`, `--no-fresh-state` | off | Runs the command on a new, empty selection state in the system temporary directory, removed when the command ends. Use it for cold first-run numbers. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.fresh_state`. |
-| `--fast`, `--no-fast` | off | Runs every graph through one engine in this process: one hipDNN handle with only the plugin under test loaded, the engine primed once, and warm caches. Requires one `--engine` and a `--plugin-path` that names the plugin library file. See [Fast mode](#fast-mode---fast). |
+| `--fresh-state`, `--no-fresh-state` | off | Runs the command (and its `--oracle` tuned children) on a new, empty selection state in the system temporary directory, removed when the command ends. Use it for cold first-run numbers. See [Work directory](#work-directory---benchmark-work-dir). Recorded as `run.config.fresh_state`. |
+| `--fast`, `--no-fast` | off | Run every graph through one hipDNN engine in this process, keeping handle and plugin state across graphs. Requires one `--engine` and one plugin library `--plugin-path`. See [Fast mode](#fast-mode---fast). |
 | `--pytorch-sdpa-backend {default,flash,math,efficient,cudnn,overrideable}` | default | PyTorch SDPA category. A non-default category is strict: the graph fails if PyTorch cannot use it. GQA and MQA graphs use `enable_gqa` with `default` and `flash`. Other categories get K and V expanded once before timing. See [PyTorch SDPA setup](methodology.md#pytorch-sdpa-setup). SDPA backward graphs run the backward kernel of the selected category (`default`, `flash` or `efficient`); see [PyTorch SDPA backward](methodology.md#pytorch-sdpa-backward). |
 | `--pytorch-rocm-fa-library LIBRARY` | none | ROCm Flash Attention implementation for PyTorch, for example `aotriton`. Requires `--pytorch-sdpa-backend flash`. |
 | `--pytorch-dispatch`, `--no-pytorch-dispatch` | off | Records the SDPA backend and the GPU kernels of each PyTorch row in the plan's `dispatch` object. The tool runs one untimed `torch.profiler` launch after the timed loop. See [PyTorch dispatch record](#pytorch-dispatch-record). Recorded as `run.config.pytorch_dispatch`. |
@@ -1096,7 +1096,8 @@ reads JSON only, not CSV.
 | `--by {best,ref,engine}` | best | `best`: the fastest usable engine row of each graph. `ref`: the reference rows. `engine`: the same engine in both files. |
 | `--metric {kernel,host}` | kernel | Compare kernel medians or submit medians. |
 | `--threshold PCT` | 5 | Regression threshold in percent. |
-| `--allow-mismatch` | off | Compare also when `run.config.cache_mode` or `run.config.timing_block` is different. |
+| `--allow-mismatch` | off | Compare also when `run.config` (`cache_mode`, `timing_block`), row timing/launch mode, or validation state differs. |
+| `--strict-coverage` | off | Exit 1 if validation failures, incompatible modes, unknown spread, or missing graphs/rows reduce comparison coverage. |
 | `--csv` | off | Write CSV to stdout. Not with `--json`. |
 | `--json` | off | Write JSON to stdout. Not with `--csv`. |
 
@@ -1126,32 +1127,38 @@ Rules:
   rows with `--by ref`. Rows join on runtime, engine ID and engine name.
   When a file has more than one row with the same key, the rows pair in
   order of appearance.
-- `best` and `ref` select only rows with the verdict `passed`, `unchecked`
-  or `reference`. In `engine` mode, a `failed` row gets a speedup with the
-  label `A failed`, `B failed` or `A+B failed`, but it is not in the
-  geometric mean. Rows with `error` or `skipped` get no speedup.
-- A row with a `null` median (the writer stores NaN and infinity as `null`)
-  gets no speedup and is not in the geometric mean. In `engine` mode the
-  pair label is `A no time` or `B no time`. `best` and `ref` skip the row;
-  when no row is left, the label is `no A row` or `no B row`.
+- When validation ran on a graph (any engine row has verdict `passed` or
+  `failed`), `best` selects only `passed` rows and excludes `unchecked` rows.
+  When no passing row exists but a `failed` row exists, `best` reports
+  `A failed` / `B failed` rather than `no A/B row`. A nonpositive median never
+  preempts a positive-median sibling.
+- Pairs whose kernel `timing.mode` (`staged` vs `events` vs `block`) or
+  `timing.launch_mode` (`raw` vs `graph_replay`) differ are excluded from the
+  geometric mean with label `mixed timing (...)` / `mixed launch (...)` unless
+  `--allow-mismatch` is given.
+- Pairs where one side is `passed` and the other is `unchecked` are excluded
+  from the geometric mean with label `mixed validation (...)` unless
+  `--allow-mismatch` is given.
+- A row with a `null` or nonpositive median, or missing quartile spread
+  (`p25_ms`/`p75_ms`), does not enter the geometric mean (`A/B no time` or
+  `unknown spread`).
 - A pair is `within noise` when the relative change is not more than
-  `max(threshold / 100, 2 * sqrt(r_A^2 + r_B^2))`, where `threshold` is the
-  `--threshold` percent and `r` is `(p75_ms - p25_ms) / median_ms` of the compared
-  metric in each file (`a_rel_iqr`, `b_rel_iqr` in the
-  `--json` and `--csv` output). A slower B beyond that limit is a
-  `REGRESSION`. A faster B is `faster`.
+  `max(threshold / 100, 2 * sqrt(r_A^2 + r_B^2))` (within floating-point
+  tolerance), where `threshold` is the `--threshold` percent and `r` is
+  `(p75_ms - p25_ms) / median_ms` of the compared metric in each file
+  (`a_rel_iqr`, `b_rel_iqr` in the `--json` and `--csv` output). A slower B
+  beyond that limit is a `REGRESSION`. A faster B is `faster`.
 - A different `run.config` value gives a warning on stderr. A different
-  `cache_mode` or `timing_block` stops the comparison, unless you give
-  `--allow-mismatch`. The error names the keys that differ.
-- When no pair gets a speedup (for example, the files share no graph), the
-  tool writes `warning: no timings were compared` on stderr. The exit code
-  stays 0.
+  `cache_mode`, `timing_block`, or `input_recipe` stops the comparison, unless
+  you give `--allow-mismatch`. The error names the keys that differ.
+- When no pair enters the geometric mean, the tool writes
+  `warning: no timings were compared` on stderr.
 
-Exit codes: 0 no regression, 1 one or more regressions, 2 usage error, a
-file that cannot be read, has a different schema version or has malformed
-rows (missing keys, wrong types), or a different `cache_mode` or
-`timing_block` without `--allow-mismatch`.
-
+Exit codes: 0 no regression (and full coverage if `--strict-coverage` is off),
+1 one or more regressions (or lost coverage with `--strict-coverage`), 2 usage
+error, a file that cannot be read, has a different schema version or has
+malformed rows (missing keys, wrong types), or a gated `run.config` mismatch
+without `--allow-mismatch`.
 ```bash
 dnn-benchmark -g 'graphs/*.json' -o base.json
 dnn-benchmark -g 'graphs/*.json' -o new.json

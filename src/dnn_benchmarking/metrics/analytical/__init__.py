@@ -63,12 +63,16 @@ via :mod:`.._diagnostic.warn_once`.
 """
 
 from functools import partial
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ...graph.tensor_info import TensorInfo
 from ...graph.varlen import read_input_ints
 from .._diagnostic import warn_once
 from ._common import tensor_lookup
+
+#: Version of the analytical graph-rate formulas emitted into result files.
+ANALYTICAL_FORMULA_VERSION = 2
 from .conv import conv_dgrad_flops, conv_fwd_flops, conv_wgrad_flops
 from .elementwise import (
     block_scale_dequantize_flops,
@@ -182,14 +186,13 @@ def compute_flops(
 
 
 def compute_io_bytes(tensor_infos: Iterable[TensorInfo]) -> int:
-    """Sum bytes of all non-virtual tensors (inputs + outputs + weights).
+    """Sum graph-footprint bytes of all non-virtual tensors (inputs + outputs + weights).
 
-    Virtual tensors are intermediate buffers that hipDNN may allocate
-    inside a fused kernel and never materialise to global memory, so
-    they are excluded. Uses :attr:`TensorInfo.size_bytes`, which already
-    accounts for non-contiguous strides. A tensor with a variable-length
-    layout counts only its valid elements (:attr:`TensorInfo.valid_elements`),
-    because the padding is never read or written.
+    This is a graph-level footprint metric, not a lower bound on hardware HBM
+    traffic: strided spans may include unreferenced holes, paged KV caches
+    count full pool storage, and non-ragged padded outputs may still be written
+    to memory. Virtual tensors are excluded. A tensor with a variable-length
+    layout counts its valid elements (:attr:`TensorInfo.valid_elements`).
     """
     total = 0
     for ti in tensor_infos:
@@ -207,27 +210,28 @@ def derive_throughputs(
     io_bytes: Optional[int],
     kernel_median_ms: Optional[float],
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Derive TFLOPs/s and GB/s from totals + median kernel time.
+    """Derive graph-normalized TFLOP/s and GB/s from totals + median event span.
 
-    The median is the denominator the rocKE benchmark pipeline
-    (Solera -> Strata) uses for its TFLOP/s, so the two sources are
-    comparable for the same shape. It is also robust to a single noisy
-    iteration, unlike the mean.
-
-    Args:
-        flops: Total analytical FLOPs (or ``None``).
-        io_bytes: Total non-virtual tensor bytes (or ``None``).
-        kernel_median_ms: Median GPU kernel time in ms (or ``None``).
+    Units use decimal SI prefixes:
+    ``tflops = flops / (kernel_median_ms / 1000) / 1e12 = flops / (kernel_median_ms * 1e9)``
+    ``gbps   = io_bytes / (kernel_median_ms / 1000) / 1e9 = io_bytes / (kernel_median_ms * 1e6)``
 
     Returns:
-        ``(tflops_per_s, gbytes_per_s)`` — either component is ``None``
-        when its inputs are missing or zero.
+        ``(tflops_per_s, gbytes_per_s)`` — either component is ``None`` when
+        ``kernel_median_ms`` is missing/non-finite/non-positive or its
+        numerator is ``None``; a known-zero numerator yields ``0.0``.
     """
-    if not kernel_median_ms or kernel_median_ms <= 0:
+    if (
+        kernel_median_ms is None
+        or not math.isfinite(kernel_median_ms)
+        or kernel_median_ms <= 0
+    ):
         return None, None
     seconds = kernel_median_ms / 1000.0
-    tflops = (flops / seconds / 1e12) if flops else None
-    gbytes = (io_bytes / seconds / 1e9) if io_bytes else None
+    tflops = (flops / seconds / 1e12) if flops is not None and flops >= 0 else None
+    gbytes = (
+        (io_bytes / seconds / 1e9) if io_bytes is not None and io_bytes >= 0 else None
+    )
     return tflops, gbytes
 
 

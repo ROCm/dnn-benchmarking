@@ -248,6 +248,7 @@ def main(argv: Optional[Sequence[str]] = None, *, tuned_child: bool = False) -> 
             reporter=reporter,
             tarball_source=tarball_source,
             argv=[sys.argv[0], *argv],
+            tuned_child=tuned_child,
         )
     finally:
         for td in tmpdirs:

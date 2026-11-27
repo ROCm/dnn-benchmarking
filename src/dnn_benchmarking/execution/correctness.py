@@ -241,8 +241,12 @@ def check_correctness(
                 )
             rtol, atol = tolerance_for(config, ti)
             result = _compare_output(buffer_manager, ti, ref, rtol, atol)
-            if result is not None:
-                compared.append((ti.uid, rtol, atol, result))
+            if result is None:
+                return mismatch(
+                    config,
+                    f"Engine did not produce output tensor UID {ti.uid}",
+                )
+            compared.append((ti.uid, rtol, atol, result))
     except (ValueError, RuntimeError, ExecutionError) as e:
         return mismatch(config, str(e))
 

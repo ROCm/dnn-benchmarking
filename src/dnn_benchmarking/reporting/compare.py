@@ -10,8 +10,9 @@ side, robust to a few outlier samples); a regression is B
 slower than that. Failed/error rows never enter the geomean.
 
 Exit codes: 0 no regression (stderr warns when no timings were compared),
-1 regression beyond threshold, 2 usage error, unreadable or incompatible input
-(run.config cache_mode or timing_block differs, unless ``--allow-mismatch``).
+1 regression beyond threshold (or coverage loss under ``--strict-coverage``),
+2 usage error, unreadable or incompatible input (run.config ``cache_mode``
+or ``timing_block`` differs, unless ``--allow-mismatch``).
 """
 
 import argparse
@@ -78,7 +79,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--allow-mismatch",
         action="store_true",
-        help="compare even when run.config cache_mode or timing_block differs",
+        help="compare even when timing mode, cache_mode, timing_block "
+        "or validation state differs",
+    )
+    p.add_argument(
+        "--strict-coverage",
+        action="store_true",
+        help="exit 1 if validation failures, incompatible modes, or missing "
+        "rows drop comparison coverage",
     )
     fmt = p.add_mutually_exclusive_group()
     fmt.add_argument("--csv", action="store_true", help="CSV on stdout")
@@ -91,28 +99,71 @@ def _engine_label(row: Dict[str, Any]) -> str:
     return e["name"] or e["id"] or row["runtime"]
 
 
+def _timing_meta(
+    row: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return ``(mode, timer, launch_mode)`` from a row's ``ootb.timing``."""
+    timing = (row.get("ootb") or {}).get("timing") or {}
+    if not isinstance(timing, dict):
+        return None, None, None
+    return timing.get("mode"), timing.get("timer"), timing.get("launch_mode")
+
+
 def _stat(row: Dict[str, Any], metric: str) -> Tuple[Optional[float], Optional[float]]:
     s = (row["ootb"] or {}).get(metric)
     if row["verdict"] in ("error", "skipped") or not s:
         return None, None
     # The writer stores NaN/inf as null; a null median leaves the pair unusable.
     median, p25, p75 = s["median_ms"], s["p25_ms"], s["p75_ms"]
-    if median is None or p25 is None or p75 is None or median <= 0:
+    if median is None or not math.isfinite(median):
+        return None, None
+    if median <= 0:
+        return median, None
+    if p25 is None or p75 is None or not math.isfinite(p25) or not math.isfinite(p75):
         return median, None
     return median, (p75 - p25) / median
 
 
 def _pick(graph: Dict[str, Any], by: str, metric: str) -> Optional[Dict[str, Any]]:
-    """Row to compare for ``best``/``ref``: fastest usable row of that role."""
+    """Row to compare for ``best``/``ref``: fastest usable positive-median row.
+
+    When validation ran on this graph (any engine row has verdict ``passed``
+    or ``failed``), ``unchecked`` engine rows are excluded so they cannot beat
+    or replace validated rows. Nonpositive medians never preempt a usable
+    sibling. When no passing row exists but a failed row does, the failed row
+    is returned so the pair reports validation failure rather than a missing row.
+    """
     role = "reference" if by == "ref" else "engine"
-    usable = [
-        r
-        for r in graph["results"]
-        if r["role"] == role
-        and r["verdict"] in _USABLE
-        and _stat(r, metric)[0] is not None
+    role_rows = [r for r in graph["results"] if r["role"] == role]
+    if role == "engine" and any(
+        r["verdict"] in ("passed", "failed") for r in role_rows
+    ):
+        allowed = ("passed",)
+    else:
+        allowed = _USABLE
+
+    eligible = [r for r in role_rows if r["verdict"] in allowed]
+    positive = [
+        r for r in eligible if (ms := _stat(r, metric)[0]) is not None and ms > 0
     ]
-    return min(usable, key=lambda r: _stat(r, metric)[0], default=None)
+    if positive:
+        return min(positive, key=lambda r: _stat(r, metric)[0])
+
+    nonpositive = [r for r in eligible if _stat(r, metric)[0] is not None]
+    if nonpositive:
+        return nonpositive[0]
+
+    failed = [r for r in role_rows if r["verdict"] == "failed"]
+    if failed:
+        timed_failed = [
+            r for r in failed if (ms := _stat(r, metric)[0]) is not None and ms > 0
+        ]
+        return (
+            min(timed_failed, key=lambda r: _stat(r, metric)[0])
+            if timed_failed
+            else failed[0]
+        )
+    return None
 
 
 def _keyed(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
@@ -134,6 +185,8 @@ def _pair(
     metric: str,
     threshold: float,
     kind: str = "engine",
+    *,
+    allow_mismatch: bool = False,
 ) -> Pair:
     a_ms, a_iqr = _stat(ra, metric) if ra else (None, None)
     b_ms, b_iqr = _stat(rb, metric) if rb else (None, None)
@@ -156,22 +209,43 @@ def _pair(
             pair.label = pair.label or f"no {side} row"
         elif ms is None or ms <= 0:
             why = (
-                row["verdict"] if row["verdict"] in ("error", "skipped") else "no time"
+                row["verdict"]
+                if row["verdict"] in ("error", "skipped", "failed")
+                else "no time"
             )
             pair.label = pair.label or f"{side} {why}"
     if pair.label:
         return pair
-    pair.speedup = a_ms / b_ms
     failed = [s for s, r in (("A", ra), ("B", rb)) if r["verdict"] == "failed"]
     if failed:
+        pair.speedup = a_ms / b_ms
         pair.label = f"{'+'.join(failed)} failed"
+        return pair
+    if metric == "kernel" and not allow_mismatch:
+        mode_a, _, launch_a = _timing_meta(ra)
+        mode_b, _, launch_b = _timing_meta(rb)
+        if mode_a is not None and mode_b is not None and mode_a != mode_b:
+            pair.label = f"mixed timing ({mode_a} vs {mode_b})"
+            return pair
+        if launch_a is not None and launch_b is not None and launch_a != launch_b:
+            pair.label = f"mixed launch ({launch_a} vs {launch_b})"
+            return pair
+    if not allow_mismatch and {ra["verdict"], rb["verdict"]} == {"passed", "unchecked"}:
+        pair.speedup = a_ms / b_ms
+        pair.label = f"mixed validation (A {ra['verdict']}, B {rb['verdict']})"
+        return pair
+    pair.speedup = a_ms / b_ms
+    if a_iqr is None or b_iqr is None:
+        pair.label = "unknown spread"
         return pair
     pair.in_geomean = True
     # hypot: the two runs' spreads are independent. 2x: heuristic margin so a
     # median shift inside the combined IQR (ordinary run-to-run drift) is noise.
-    band = max(threshold / 100.0, 2.0 * math.hypot(a_iqr or 0.0, b_iqr or 0.0))
+    band = max(threshold / 100.0, 2.0 * math.hypot(a_iqr, b_iqr))
     change = b_ms / a_ms - 1.0  # positive = B slower
-    if abs(change) <= band:
+    # 1e-12 avoids false regressions when exact decimal ratios (e.g. 2.1/2.0-1)
+    # round slightly above the threshold in binary floating point.
+    if abs(change) <= band + 1e-12:
         pair.label = "within noise"
     else:
         pair.label = "REGRESSION" if change > 0 else "faster"
@@ -240,24 +314,58 @@ def compare(
     by: str = "best",
     metric: str = "kernel",
     threshold: float = 5.0,
+    allow_mismatch: bool = False,
 ) -> Dict[str, Any]:
     """Compare two loaded v2 or v3 documents; returns the JSON-shaped report."""
     matched, only_a, only_b, ambiguous = _match_graphs(a, b, _join_key(a, b))
     pairs: List[Pair] = []
+    timer_mismatches = 0
     for ga, gb in matched:
         name = ga["graph_name"]
         if by != "engine":
             ra, rb = _pick(ga, by, metric), _pick(gb, by, metric)
             kind = "ref" if by == "ref" else "engine"
-            pairs.append(_pair(name, ra, rb, metric, threshold, kind))
+            if ra is not None and rb is not None and metric == "kernel":
+                _, ta, _ = _timing_meta(ra)
+                _, tb, _ = _timing_meta(rb)
+                if ta is not None and tb is not None and ta != tb:
+                    timer_mismatches += 1
+            pairs.append(
+                _pair(
+                    name,
+                    ra,
+                    rb,
+                    metric,
+                    threshold,
+                    kind,
+                    allow_mismatch=allow_mismatch,
+                )
+            )
             continue
         # Reference rows are compared with --by ref, not here.
         rows_b = _keyed([r for r in gb["results"] if r["role"] == "engine"])
         engines_a = [r for r in ga["results"] if r["role"] == "engine"]
         for key, ra in _keyed(engines_a).items():
-            pairs.append(_pair(name, ra, rows_b.pop(key, None), metric, threshold))
-        pairs.extend(_pair(name, None, rb, metric, threshold) for rb in rows_b.values())
+            rb = rows_b.pop(key, None)
+            if rb is not None and metric == "kernel":
+                _, ta, _ = _timing_meta(ra)
+                _, tb, _ = _timing_meta(rb)
+                if ta is not None and tb is not None and ta != tb:
+                    timer_mismatches += 1
+            pairs.append(
+                _pair(name, ra, rb, metric, threshold, allow_mismatch=allow_mismatch)
+            )
+        pairs.extend(
+            _pair(name, None, rb, metric, threshold, allow_mismatch=allow_mismatch)
+            for rb in rows_b.values()
+        )
     ratios = [p.speedup for p in pairs if p.in_geomean]
+    validation_failures = sum(p.label.endswith(" failed") for p in pairs)
+    mixed_timing = sum(
+        p.label.startswith(("mixed timing", "mixed launch")) for p in pairs
+    )
+    mixed_validation = sum(p.label.startswith("mixed validation") for p in pairs)
+    unknown_spread = sum(p.label == "unknown spread" for p in pairs)
     return {
         "convention": CONVENTION,
         "by": by,
@@ -269,6 +377,11 @@ def compare(
         "ambiguous": ambiguous,
         "geomean_speedup": geometric_mean(ratios) if ratios else None,
         "regressions": sum(p.label == "REGRESSION" for p in pairs),
+        "validation_failures": validation_failures,
+        "mixed_timing": mixed_timing,
+        "mixed_validation": mixed_validation,
+        "unknown_spread": unknown_spread,
+        "timer_mismatches": timer_mismatches,
     }
 
 
@@ -344,10 +457,20 @@ def _print_table(
         print(_clip(line, width), file=out)
     geo = report["geomean_speedup"]
     n = sum(p["in_geomean"] for p in pairs)
+    extras = []
+    if report.get("validation_failures"):
+        extras.append(f"{report['validation_failures']} validation failure(s)")
+    if report.get("mixed_timing"):
+        extras.append(f"{report['mixed_timing']} mixed-timing")
+    if report.get("mixed_validation"):
+        extras.append(f"{report['mixed_validation']} mixed-validation")
+    if report.get("unknown_spread"):
+        extras.append(f"{report['unknown_spread']} unknown-spread")
+    extra_str = ("; " + ", ".join(extras)) if extras else ""
     footer = (
         f"{len(pairs)} pairs, {n} in geomean; geomean B speedup vs A: "
         f"{'-' if geo is None else f'{geo:.3f}x'}; "
-        f"{report['regressions']} regression(s); "
+        f"{report['regressions']} regression(s){extra_str}; "
         f"graphs only in A: {len(report['only_in_a'])}, "
         f"graphs only in B: {len(report['only_in_b'])}"
     )
@@ -436,8 +559,46 @@ def main(argv: List[str]) -> int:
         )
         return 2
     try:
-        report = compare(a, b, by=args.by, metric=args.metric, threshold=args.threshold)
-        if all(p["speedup"] is None for p in report["pairs"]):
+        report = compare(
+            a,
+            b,
+            by=args.by,
+            metric=args.metric,
+            threshold=args.threshold,
+            allow_mismatch=args.allow_mismatch,
+        )
+        if report["mixed_timing"]:
+            print(
+                f"warning: {report['mixed_timing']} pair(s) excluded from geomean "
+                "due to mixed timing or launch mode (pass --allow-mismatch to pool)",
+                file=sys.stderr,
+            )
+        if report["mixed_validation"]:
+            print(
+                f"warning: {report['mixed_validation']} pair(s) excluded from geomean "
+                "due to mixed validation state (passed vs unchecked; pass "
+                "--allow-mismatch to pool)",
+                file=sys.stderr,
+            )
+        if report["validation_failures"]:
+            print(
+                f"warning: {report['validation_failures']} pair(s) excluded due to "
+                "validation failure",
+                file=sys.stderr,
+            )
+        if report["unknown_spread"]:
+            print(
+                f"warning: {report['unknown_spread']} pair(s) excluded due to "
+                "missing quartile spread",
+                file=sys.stderr,
+            )
+        if report["timer_mismatches"]:
+            print(
+                f"warning: {report['timer_mismatches']} pair(s) used different "
+                "event timers (e.g. hip vs torch)",
+                file=sys.stderr,
+            )
+        if all(not p["in_geomean"] for p in report["pairs"]):
             print("warning: no timings were compared", file=sys.stderr)
         if report["ambiguous"]:
             print(
@@ -460,4 +621,11 @@ def main(argv: List[str]) -> int:
     except (KeyError, TypeError, ValueError) as e:  # malformed input, not a regression
         print(f"error: {e}", file=sys.stderr)
         return 2
-    return 1 if report["regressions"] else 0
+    coverage_lost = bool(
+        report["only_in_a"]
+        or report["only_in_b"]
+        or any(not p["in_geomean"] for p in report["pairs"])
+    )
+    if report["regressions"] or (args.strict_coverage and coverage_lost):
+        return 1
+    return 0
