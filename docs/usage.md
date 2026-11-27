@@ -79,9 +79,11 @@ in the same way.
 | `-w`, `--warmup N` | 10 | Untimed launches per engine before the timed loop. The first launch is timed separately as `first_call_ms`. The other launches use the timed-iteration path (same mode and cache flush) and are discarded. At least one launch always runs. |
 | `-i`, `--iters N` | 100 | Minimum timed iterations per engine. |
 | `--min-time-ms MS` | 0 | Continue until the summed kernel time is `MS` or more. `0` gives exactly `--iters` samples. A cap of `max(10000, --iters)` samples applies. |
-| `--cache-mode {warm,cold}` | warm | `cold` flushes L2 and MALL with a 512 MiB write before each warmup and timed iteration. |
-| `--timing-block N` | 1 | Launches per timed sample. `1` times each launch on its own. `N > 1` uses rocKE block timing: before each sample, `--warmup` untimed launches and a drain; then `N` back-to-back launches in one event pair, recorded as `elapsed / N`. The first sample is discarded. Requires `--cache-mode warm`. |
+| `--cache-mode {warm,cold,rotate}` | warm | `cold` runs a calibrated read-only capacity sweep before each warmup and timed iteration. `rotate` cycles independent I/O buffer sets across launches within a 60% free-VRAM budget (works with `--timing-block`). |
+| `--rotate-buffers N` | 0 | Number of rotated I/O buffer sets for `--cache-mode rotate` (`0` = auto-size from active GPU cache capacity and free VRAM, or `>= 2`). |
+| `--timing-block N` | 1 | Launches per timed sample. `1` times each launch on its own. `N > 1` uses rocKE block timing: before each sample, `--warmup` untimed launches and a drain; then `N` back-to-back launches in one event pair, recorded as `elapsed / N`. The first sample is discarded. Requires `--cache-mode warm` or `rotate`. |
 | `-s`, `--seed SEED` | 0 | Random seed for the input data. The lengths (`seq_len`), the cumulative lengths (`cu_seq_len`) and the ragged offset tables of a graph are the same for the same seed. |
+| `--input-recipe {centered,llm,heavy_tail,legacy,zeros}` | centered | Named input distribution recipe. `centered` uses seeded `N(0, 1)` for unconstrained operands (SDPA Q/K in `N(0, d^-0.25)`, SDPA V in `U[0, 1)`, fp16 conv in `U[-1, 1)`, fp32/fp64 conv in `U[0, 1)`, positive `U[0.5, 1.5)` for norm variances/inverse RMS/scales). `llm` uses fitted heavy-tailed model-like distributions. `heavy_tail` uses an outlier mixture. `legacy` uses `U[0, 1)`. `zeros` is a diagnostic zero fill. |
 
 [methodology.md](methodology.md) explains each value.
 
@@ -896,7 +898,7 @@ operation graph build and the workspace allocation are not timed.
    against a reference built from the child's own `rng_dump` (see
    [SDPA dropout](#sdpa-dropout)). A failed child sets `oracle_error` and keeps
    the row. With `--cache-mode cold`, the benchmark process frees its
-   512 MiB flush buffer before each child starts.
+   per-architecture flush buffer before each child starts.
 4. `--oracle-timeout` (default 1800 s) bounds each child. A hung search thus
    costs the tuned result of one row. After Ctrl-C, the partial result file
    keeps every graph that finished, with its tuned results; the graph that
@@ -1096,7 +1098,7 @@ reads JSON only, not CSV.
 | `--by {best,ref,engine}` | best | `best`: the fastest usable engine row of each graph. `ref`: the reference rows. `engine`: the same engine in both files. |
 | `--metric {kernel,host}` | kernel | Compare kernel medians or submit medians. |
 | `--threshold PCT` | 5 | Regression threshold in percent. |
-| `--allow-mismatch` | off | Compare also when `run.config` (`cache_mode`, `timing_block`), row timing/launch mode, or validation state differs. |
+| `--allow-mismatch` | off | Compare also when `run.config` (`cache_mode`, `timing_block`, `input_recipe`), row timing/launch mode, or validation state differs. |
 | `--strict-coverage` | off | Exit 1 if validation failures, incompatible modes, unknown spread, or missing graphs/rows reduce comparison coverage. |
 | `--csv` | off | Write CSV to stdout. Not with `--json`. |
 | `--json` | off | Write JSON to stdout. Not with `--csv`. |
@@ -1176,7 +1178,7 @@ Each requested pass runs this child process under its profiler:
 
 ```text
 python -m dnn_benchmarking --internal-profiling-run --graph G --engine E \
-    --warmup W --iters 5 --seed S [--plugin-path P]
+    --warmup W --iters 5 --seed S [--plugin-path P] [--input-recipe R] [--cache-mode rotate --rotate-buffers N]
 ```
 
 The child does not recurse and does not print on success.

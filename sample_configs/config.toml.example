@@ -23,10 +23,11 @@ graphs = [
 warmup = 10          # untimed warmup launches per engine
 iters = 100          # minimum timed iterations per engine
 min_time_ms = 0.0    # keep timing until summed kernel time reaches this (0 = exactly iters)
-cache_mode = "warm"  # "warm" or "cold" (flush L2/MALL before each timed iteration)
-timing_block = 1     # launches per timed sample; N > 1 = rocKE block timing (warm cache only)
+cache_mode = "warm"  # "warm", "cold" (read-only sweep), or "rotate" (I/O buffer ring)
+rotate_buffers = 0   # buffer copies for cache_mode = "rotate" (0 = auto, or >= 2)
+timing_block = 1     # launches per timed sample; N > 1 = rocKE block timing (warm or rotate)
 seed = 0             # random seed for input data
-
+input_recipe = "centered"  # centered, llm, heavy_tail, legacy, zeros
 # --- Runtime / selection -----------------------------------------------------
 runtime = "hipdnn"   # "hipdnn" or "pytorch"
 
@@ -36,7 +37,6 @@ runtime = "hipdnn"   # "hipdnn" or "pytorch"
 # plugin_path = "<selected-prefix>/lib/hipdnn_plugins/engines"
 
 autotune = false     # benchmark candidate kernels and cache the winner
-# Work dir: cache/ (compile caches), ootb/ (hipDNN cache and MIOpen user DB of
 # runs that do not tune, fast included, kept) and tuned/ (the same for
 # autotune and oracle tuned runs, kept). Default: $DNN_BENCH_WORKSPACE/work,
 # else $XDG_CACHE_HOME/dnn-benchmark/work, else a directory in the system

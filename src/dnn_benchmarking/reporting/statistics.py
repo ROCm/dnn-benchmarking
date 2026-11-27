@@ -168,6 +168,9 @@ class TimingInfo:
     fallback_reason: Optional[str] = None
     launch_mode: str = "raw"
     requested_warmup_iters: Optional[int] = None
+    flush_method: Optional[str] = None
+    flush_bytes: Optional[int] = None
+    rotated_buffers: int = 1
     timed_work_notes: Optional[List[str]] = None
 
     @classmethod
@@ -184,6 +187,9 @@ class TimingInfo:
             fallback_reason=m.fallback_reason,
             launch_mode=getattr(m, "launch_mode", "raw"),
             requested_warmup_iters=getattr(m, "requested_warmup_iters", None),
+            flush_method=getattr(m, "flush_method", None),
+            flush_bytes=getattr(m, "flush_bytes", None),
+            rotated_buffers=getattr(m, "rotated_buffers", 1),
             timed_work_notes=list(notes) if notes else None,
         )
 

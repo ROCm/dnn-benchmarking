@@ -3,10 +3,9 @@
 
 """PyTorch GPU executor for graph benchmarking."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
-
 from ..common import torch_support
 from ..common.exceptions import ExecutionError, UnsupportedGraphError
 from ..config.benchmark_config import TimingPolicy
@@ -96,34 +95,67 @@ class PyTorchCudaExecutor:
             self._execute_graph(tensors)
             stream.synchronize()
 
-    def benchmark(self, tensors: Dict[int, torch.Tensor]) -> Measurement:
+    def benchmark(
+        self,
+        tensors: Dict[int, torch.Tensor],
+        *,
+        tensors_ring: Optional[Sequence[Dict[int, torch.Tensor]]] = None,
+        rotated_bytes: Optional[int] = None,
+    ) -> Measurement:
         """Prime and time the graph per the executor's policy.
 
         Inputs are wrapped in ``ReplayTensors`` so constant host reads
         (epsilon/scale ``.item()``, paged SDPA lengths) resolve once during
         priming and every timed iteration is a pure asynchronous enqueue.
-
-        Args:
-            tensors: Mapping of tensor UIDs to CUDA tensors.
-
-        Raises:
-            ExecutionError: If executor not prepared or execution fails.
+        When ``tensors_ring`` holds multiple independent buffer sets
+        (``--cache-mode rotate``), each launch rotates to the next set.
         """
         stream = self._get_stream()
-        replay = pytorch_ops.ReplayTensors(tensors)
-        self.notes = replay.notes
-        self._replay = replay
+        if tensors_ring and len(tensors_ring) > 1:
+            replays = tuple(pytorch_ops.ReplayTensors(t) for t in tensors_ring)
+            active_replay = replays[0]
+            self.notes = active_replay.notes
+            self._replay = active_replay
+            idx = 0
+
+            def enqueue_rotating() -> None:
+                nonlocal idx
+                r = replays[idx]
+                idx = (idx + 1) % len(replays)
+                self._execute_graph(r)
+
+            enqueue_fn = enqueue_rotating
+            n_rot = len(replays)
+        else:
+            active_replay = pytorch_ops.ReplayTensors(tensors)
+            self.notes = active_replay.notes
+            self._replay = active_replay
+            enqueue_fn = lambda: self._execute_graph(active_replay)
+            n_rot = 1
+
         # One stream context around the whole loop: entering it per iteration
         # would put its host cost inside the submit bracket.
+        def prime_remaining_ring() -> None:
+            # Prime sets 1..N-1 after the cold first call on set 0 so
+            # first_call_ms still reflects one-time kernel/runtime setup while
+            # every ReplayTensors populates its scalar/length host-read cache
+            # before _probe_host_sync and the timed loop run.
+            for extra_replay in replays[1:]:
+                self._execute_graph(extra_replay)
+            stream.synchronize()
+
         with torch.cuda.device(self._device), torch.cuda.stream(stream):
             measurement = measure(
-                lambda: self._execute_graph(replay),
+                enqueue_fn,
                 stream=int(stream.cuda_stream),
                 policy=self._policy,
                 timer=self._timer,
                 torch_stream=stream,
+                post_first_call=prime_remaining_ring if n_rot > 1 else None,
+                rotated_buffers=n_rot,
+                rotated_bytes=rotated_bytes if n_rot > 1 else None,
             )
-            work_notes = getattr(replay, "timed_work_notes", None)
+            work_notes = getattr(active_replay, "timed_work_notes", None)
             if work_notes:
                 measurement.timed_work_notes = list(work_notes)
             return measurement

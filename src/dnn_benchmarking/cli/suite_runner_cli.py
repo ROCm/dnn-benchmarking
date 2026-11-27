@@ -18,6 +18,7 @@ from ..common.exceptions import UnsupportedGraphError
 from ..common.pytorch_tuning import apply_pytorch_environment
 from ..common.work_dir import env_switch_on, ootb_state, tuned_state, work_dir
 from ..config.benchmark_config import (
+    INPUT_RECIPE_VERSION,
     RuntimeName,
     PyTorchSdpaBackendName,
     ReferenceProviderName,
@@ -216,8 +217,11 @@ def _run_config(config: SuiteConfig) -> Dict[str, Any]:
         "iters": config.benchmark_iters,
         "min_time_ms": config.min_time_ms,
         "cache_mode": config.cache_mode,
+        "rotate_buffers": config.rotate_buffers,
         "timing_block": config.timing_block,
         "seed": config.seed,
+        "input_recipe": config.input_recipe,
+        "input_recipe_version": INPUT_RECIPE_VERSION,
         "validate": (
             config.validation.provider.value if config.validation.enabled else None
         ),

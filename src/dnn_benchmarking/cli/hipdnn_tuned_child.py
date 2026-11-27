@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import sys
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
@@ -37,7 +38,11 @@ import numpy as np
 
 from ..common.rocm_runtime import initialize_pip_rocm_runtime
 from ..config.benchmark_config import TimingPolicy
-from ..execution.buffer_manager import BufferManager, generate_input_data
+from ..execution.buffer_manager import (
+    BufferManager,
+    buffer_set_bytes,
+    generate_input_data,
+)
 from ..execution.executor import Executor
 from ..execution.oracle import (
     BENCHMARKING_KNOB,
@@ -59,6 +64,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--graph", required=True, type=Path)
     parser.add_argument("--engine", required=True, type=int)
     parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument("--input-recipe", default="centered", type=str)
     parser.add_argument(
         "--timing-policy",
         required=True,
@@ -68,6 +74,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--plugin-path", type=Path)
     parser.add_argument("--save-outputs", action="store_true")
+    parser.add_argument("--rotate-count", type=int, default=1)
     return parser.parse_args(argv)
 
 
@@ -121,14 +128,30 @@ def _run(args: argparse.Namespace) -> None:
     # hipDNN ignores a knob the engine does not expose; such a tuned run
     # re-measures the OOTB configuration.
     tuning_available = BENCHMARKING_KNOB in executor.engine_knob_ids(args.engine)
-    input_data = generate_input_data(tensor_infos, args.seed, graph_json)
+    if args.input_recipe == "centered":
+        input_data = generate_input_data(tensor_infos, args.seed, graph_json)
+    else:
+        input_data = generate_input_data(
+            tensor_infos, args.seed, graph_json, recipe=args.input_recipe
+        )
     tensor_infos = resolve_varlen_layouts(tensor_infos, graph_json, input_data)
-    with BufferManager(tensor_infos) as bm:
-        bm.allocate_all()
-        bm.load_input_data(input_data)
-        bm.zero_outputs()
+    n_rot = max(1, int(args.rotate_count))
+    with ExitStack() as stack:
+        bms = [stack.enter_context(BufferManager(tensor_infos)) for _ in range(n_rot)]
+        for bm in bms:
+            bm.allocate_all()
+            bm.load_input_data(input_data)
+            bm.zero_outputs()
+        bm = bms[0]
         variant_pack = bm.create_variant_pack()
-        m = executor.benchmark(handle, variant_pack)
+        if n_rot > 1:
+            vps = [m.create_variant_pack() for m in bms]
+            rot_bytes = n_rot * buffer_set_bytes(tensor_infos)
+            m = executor.benchmark(
+                handle, variant_pack, variant_packs=vps, rotated_bytes=rot_bytes
+            )
+        else:
+            m = executor.benchmark(handle, variant_pack)
         if args.save_outputs:
             # An engine that does not write its rng_dump then leaves NaN,
             # which the parent's dump check rejects.

@@ -116,12 +116,16 @@ def build_inner_argv(
     warmup_iters: int,
     iters: int,
     plugin_path: Optional[Path],
+    *,
+    input_recipe: str = "centered",
+    rotate_buffers: int = 1,
 ) -> List[str]:
     """Argv for the ``--internal-profiling-run`` child (frozen contract).
 
     ``-m dnn_benchmarking --internal-profiling-run --graph G --engine E
-    --warmup W --iters I --seed S [--plugin-path P]``. No profiling flag
-    is ever forwarded, so the child cannot recurse.
+    --warmup W --iters I --seed S [--plugin-path P] [--input-recipe R]
+    [--cache-mode rotate --rotate-buffers N]``.
+    No profiling flag is ever forwarded, so the child cannot recurse.
     """
     argv = [
         sys.executable,
@@ -141,6 +145,10 @@ def build_inner_argv(
     ]
     if plugin_path is not None:
         argv += ["--plugin-path", str(plugin_path)]
+    if input_recipe != "centered":
+        argv += ["--input-recipe", input_recipe]
+    if rotate_buffers > 1:
+        argv += ["--cache-mode", "rotate", "--rotate-buffers", str(rotate_buffers)]
     return argv
 
 
@@ -212,6 +220,9 @@ def run_profiling_passes(
     plugin_path: Optional[Path],
     iters: int = PROFILING_ITERS,
     out_dir: Optional[Path] = None,
+    *,
+    input_recipe: str = "centered",
+    rotate_buffers: int = 1,
 ) -> Dict[str, Any]:
     """Run every requested profiling source. Returns a merged dict.
 
@@ -239,7 +250,14 @@ def run_profiling_passes(
     if out_dir is None:
         out_dir = resolve_output_dir(metrics_config)
     inner_argv = build_inner_argv(
-        graph_path, engine_id, seed, warmup_iters, iters, plugin_path
+        graph_path,
+        engine_id,
+        seed,
+        warmup_iters,
+        iters,
+        plugin_path,
+        input_recipe=input_recipe,
+        rotate_buffers=rotate_buffers,
     )
     context = f"{graph_path.stem}/{engine_name}"
     sources = (

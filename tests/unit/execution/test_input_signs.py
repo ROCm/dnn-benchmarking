@@ -83,8 +83,7 @@ def test_both_operands_of_each_convolution_direction_are_signed(
 
 
 def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
-    """A batch-norm variance must not be negative, even in a graph that also
-    has a convolution. A tensor that feeds both kinds of node keeps U[0, 1)."""
+    """Batch-norm variance stays strictly positive under both centered and legacy."""
     graph = {
         "tensors": [_output(3)],
         "nodes": [
@@ -106,11 +105,16 @@ def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
     }
     x, w, variance = _tensor(1, [4096]), _tensor(2, [4096]), _tensor(4, [4096])
 
-    data = generate_input_data([x, w, variance], seed=0, graph_json=graph)
+    centered = generate_input_data([x, w, variance], seed=0, graph_json=graph)
+    assert centered[1].min() < 0
+    assert centered[4].min() > 0
 
-    assert data[1].min() < 0
-    assert data[2].min() >= 0
-    assert data[4].min() >= 0
+    legacy = generate_input_data(
+        [x, w, variance], seed=0, graph_json=graph, recipe="legacy"
+    )
+    assert legacy[1].min() < 0
+    assert legacy[2].min() >= 0
+    assert legacy[4].min() >= 0
 
 
 @pytest.mark.parametrize(
@@ -123,7 +127,7 @@ def test_tensor_shared_with_a_non_convolution_node_stays_non_negative() -> None:
         ("half", "unset", "half", True),  # "unset" takes the graph io type
     ],
 )
-def test_output_dtype_decides_whether_operands_are_signed(
+def test_legacy_output_dtype_decides_whether_operands_are_signed(
     operand_type: str, output_type: str, io_data_type, signed: bool
 ) -> None:
     graph = {
@@ -140,7 +144,7 @@ def test_output_dtype_decides_whether_operands_are_signed(
         graph["io_data_type"] = io_data_type
     x, w = _tensor(1, [4096], operand_type), _tensor(2, [4096], operand_type)
 
-    data = generate_input_data([x, w], seed=0, graph_json=graph)
+    data = generate_input_data([x, w], seed=0, graph_json=graph, recipe="legacy")
 
     assert [bool(data[uid].min() < 0) for uid in (1, 2)] == [signed, signed]
 
@@ -149,7 +153,7 @@ def test_output_dtype_decides_whether_operands_are_signed(
     "io_data_type, intermediate_data_type, signed",
     [("half", "float", False), ("float", "half", True)],
 )
-def test_unset_virtual_output_takes_the_intermediate_data_type(
+def test_legacy_unset_virtual_output_takes_the_intermediate_data_type(
     io_data_type: str, intermediate_data_type: str, signed: bool
 ) -> None:
     """A fused convolution writes a virtual tensor that hipDNN fills from
@@ -168,14 +172,14 @@ def test_unset_virtual_output_takes_the_intermediate_data_type(
     }
     x, w = _tensor(1, [4096], io_data_type), _tensor(2, [4096], io_data_type)
 
-    data = generate_input_data([x, w], seed=0, graph_json=graph)
+    data = generate_input_data([x, w], seed=0, graph_json=graph, recipe="legacy")
 
     assert [bool(data[uid].min() < 0) for uid in (1, 2)] == [signed, signed]
 
 
-def test_fp32_output_convolution_inputs_are_unchanged_by_the_graph() -> None:
-    """fp32 convolution correctness results stay comparable across versions:
-    with an fp32 output, the operands get exactly the pre-0.3.0 values."""
+def test_fp32_output_convolution_inputs_stay_non_negative() -> None:
+    """FP32-output convolutions keep U[0, 1) under both centered and legacy
+    so outputs stay away from zero where the fixed fp32 atol applies."""
     graph = {
         "tensors": [_output(3, "float")],
         "nodes": [
@@ -188,17 +192,19 @@ def test_fp32_output_convolution_inputs_are_unchanged_by_the_graph() -> None:
     }
     x, w = _tensor(1, [4096], "float"), _tensor(2, [4096], "float")
 
-    with_graph = generate_input_data([x, w], seed=5, graph_json=graph)
-    without = generate_input_data([x, w], seed=5)
+    centered = generate_input_data([x, w], seed=5, graph_json=graph)
+    legacy = generate_input_data([x, w], seed=5, graph_json=graph, recipe="legacy")
+    legacy_no_graph = generate_input_data([x, w], seed=5, recipe="legacy")
 
     for uid in (1, 2):
-        np.testing.assert_array_equal(with_graph[uid], without[uid])
+        assert centered[uid].min() >= 0.0 and centered[uid].max() < 1.0
+        np.testing.assert_array_equal(legacy[uid], legacy_no_graph[uid])
 
 
-def test_operand_shared_with_an_fp32_output_convolution_stays_non_negative() -> None:
-    """x feeds an fp16-output and an fp32-output convolution. Signing x would
-    put the fp32 output near zero, so x keeps U[0, 1); the fp16 convolution's
-    own filter is still signed."""
+def test_legacy_operand_shared_with_an_fp32_output_convolution_stays_non_negative() -> (
+    None
+):
+    """Under legacy recipe, x feeds an fp16-output and an fp32-output conv."""
     graph = {
         "tensors": [_output(4, "half"), _output(5, "float")],
         "nodes": [
@@ -216,18 +222,21 @@ def test_operand_shared_with_an_fp32_output_convolution_stays_non_negative() -> 
     }
     x, w16, w32 = (_tensor(uid, [4096]) for uid in (1, 2, 3))
 
-    data = generate_input_data([x, w16, w32], seed=0, graph_json=graph)
+    data = generate_input_data([x, w16, w32], seed=0, graph_json=graph, recipe="legacy")
 
     assert [bool(data[uid].min() < 0) for uid in (1, 2, 3)] == [False, True, False]
 
 
-def test_unsigned_inputs_do_not_change_when_the_graph_has_a_convolution() -> None:
-    """Signed and unsigned tensors use the same random draw, so a tensor that
-    is not a convolution operand keeps the values it had before."""
+def test_legacy_unsigned_inputs_do_not_change_when_the_graph_has_a_convolution() -> (
+    None
+):
+    """Under legacy recipe, signed and unsigned tensors use the same random draw."""
     x, dy, other = _tensor(2, [64]), _tensor(1, [64]), _tensor(7, [64])
 
-    with_graph = generate_input_data([x, dy, other], seed=3, graph_json=_wrw_graph())
-    without = generate_input_data([x, dy, other], seed=3)
+    with_graph = generate_input_data(
+        [x, dy, other], seed=3, graph_json=_wrw_graph(), recipe="legacy"
+    )
+    without = generate_input_data([x, dy, other], seed=3, recipe="legacy")
 
     np.testing.assert_array_equal(with_graph[7], without[7])
 
@@ -253,6 +262,59 @@ def test_pointwise_attributes_in_the_inputs_map_are_not_tensors() -> None:
     }
     a, b = _tensor(1, [64]), _tensor(2, [64])
 
-    data = generate_input_data([a, b], seed=0, graph_json=graph)
+    data = generate_input_data([a, b], seed=0, graph_json=graph, recipe="legacy")
 
     assert data[1].min() >= 0 and data[2].min() >= 0
+
+
+def test_centered_sdpa_keeps_qk_centered_and_v_non_negative() -> None:
+    """Under centered, SDPA Q/K are zero-mean N(0, d^-0.25) while V stays in U[0,1)
+    so Q@K^T stays unit-variance and O = softmax(QK^T)V stays away from zero."""
+    graph = {
+        "tensors": [{"uid": 4, "data_type": "bfloat16"}],
+        "nodes": [
+            {
+                "type": "SdpaAttributes",
+                "inputs": {
+                    "q_tensor_uid": 1,
+                    "k_tensor_uid": 2,
+                    "v_tensor_uid": 3,
+                },
+                "outputs": {"o_tensor_uid": 4},
+            }
+        ],
+    }
+    d = 64
+    q, k, v = (_tensor(uid, [1, 4, 64, d], "bfloat16") for uid in (1, 2, 3))
+    data = generate_input_data([q, k, v], seed=0, graph_json=graph, recipe="centered")
+
+    expected_std = d**-0.25
+    for uid in (1, 2):
+        arr = data[uid].astype(np.float32)
+        assert arr.min() < -0.5 and arr.max() > 0.5
+        assert abs(float(arr.mean())) < 0.05
+        assert 0.85 * expected_std <= float(arr.std()) <= 1.15 * expected_std
+    assert data[3].min() >= 0.0 and data[3].max() <= 1.0
+    assert 0.4 <= float(data[3].astype(np.float32).mean()) <= 0.6
+
+
+@pytest.mark.parametrize("recipe", ("centered", "llm", "heavy_tail", "legacy"))
+def test_batchnorm_variance_and_rmsnorm_inv_rms_stay_strictly_positive(
+    recipe: str,
+) -> None:
+    """BatchnormInferenceAttributesVarianceExt variance_tensor_uid and
+    RMSNormBackwardAttributes inv_rms_tensor_uid must be strictly positive."""
+    import json
+    from pathlib import Path
+    from dnn_benchmarking.graph.loader import GraphLoader
+
+    repo = Path(__file__).resolve().parents[3]
+    for fname, key in (
+        ("graphs/sample_batchnorm_inference_variance.json", "variance_tensor_uid"),
+        ("graphs/sample_rmsnorm_backward.json", "inv_rms_tensor_uid"),
+    ):
+        graph_json = json.loads((repo / fname).read_text())
+        infos = GraphLoader().extract_tensor_info(graph_json)
+        uid = int(graph_json["nodes"][0]["inputs"][key])
+        data = generate_input_data(infos, seed=0, graph_json=graph_json, recipe=recipe)
+        assert float(data[uid].min()) > 0.0, (fname, recipe, data[uid])

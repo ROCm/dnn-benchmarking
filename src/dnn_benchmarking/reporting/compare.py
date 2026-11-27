@@ -11,8 +11,8 @@ slower than that. Failed/error rows never enter the geomean.
 
 Exit codes: 0 no regression (stderr warns when no timings were compared),
 1 regression beyond threshold (or coverage loss under ``--strict-coverage``),
-2 usage error, unreadable or incompatible input (run.config ``cache_mode``
-or ``timing_block`` differs, unless ``--allow-mismatch``).
+2 usage error, unreadable or incompatible input (run.config ``cache_mode``,
+``timing_block``, or ``input_recipe`` differs, unless ``--allow-mismatch``).
 """
 
 import argparse
@@ -32,7 +32,7 @@ from .suite_results import SuiteResult
 CONVENTION = "speedup = A_median / B_median (B speedup vs A; >1 means B is faster)"
 _USABLE = ("passed", "unchecked", "reference")
 # Config keys that change what is timed; a difference blocks the comparison.
-_GATED = ("cache_mode", "timing_block")
+_GATED = ("cache_mode", "timing_block", "input_recipe")
 
 
 @dataclass
@@ -79,8 +79,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--allow-mismatch",
         action="store_true",
-        help="compare even when timing mode, cache_mode, timing_block "
-        "or validation state differs",
+        help="compare even when timing mode, cache_mode, timing_block, "
+        "input_recipe or validation state differs",
     )
     p.add_argument(
         "--strict-coverage",
@@ -385,12 +385,21 @@ def compare(
     }
 
 
+def _config_value(cfg: Dict[str, Any], key: str) -> Any:
+    """Read a config key; missing ``input_recipe`` defaults to ``'legacy'``
+    for result files written before versioned input recipes existed."""
+    if key == "input_recipe":
+        val = cfg.get(key)
+        return "legacy" if val is None else val
+    return cfg.get(key)
+
+
 def _config_warnings(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     ca, cb = a["run"]["config"], b["run"]["config"]
     return [
-        f"run.config.{k} differs: A={ca.get(k)!r} B={cb.get(k)!r}"
+        f"run.config.{k} differs: A={_config_value(ca, k)!r} B={_config_value(cb, k)!r}"
         for k in sorted(set(ca) | set(cb))
-        if ca.get(k) != cb.get(k)
+        if _config_value(ca, k) != _config_value(cb, k)
     ]
 
 
@@ -550,7 +559,7 @@ def main(argv: List[str]) -> int:
             file=sys.stderr,
         )
     ca, cb = a["run"]["config"], b["run"]["config"]
-    gated = [k for k in _GATED if ca.get(k) != cb.get(k)]
+    gated = [k for k in _GATED if _config_value(ca, k) != _config_value(cb, k)]
     if gated and not args.allow_mismatch:
         print(
             f"error: run.config differs in {', '.join(gated)}; timings are not "
