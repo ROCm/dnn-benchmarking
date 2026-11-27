@@ -2589,3 +2589,229 @@ def test_rocke_install_honours_no_editable(
 
     package_dirs = {name: str(rocke / name) for name in ("platform", "library")}
     assert calls == [tuple(package_dirs.get(a, a) for a in call) for call in expected]
+
+
+# --- hybrid prebuilt hipDNN mode --------------------------------------------
+
+
+def _populate_prebuilt_hipdnn(
+    setup_env,
+    install_prefix: Path,
+    toolchain_prefix: Path,
+    *,
+    windows: bool = False,
+    include_hip_kernel: bool = True,
+) -> None:
+    for rel in setup_env._PREBUILT_HIPDNN_CMAKE_CONFIGS:
+        cfg = toolchain_prefix / rel
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("")
+    if not windows:
+        comgr = toolchain_prefix / "lib" / "libamd_comgr.so.3"
+        comgr.parent.mkdir(parents=True, exist_ok=True)
+        comgr.write_text("")
+    if windows:
+        files = [
+            install_prefix / "bin" / "hipdnn_backend.dll",
+            install_prefix / "bin" / "hipdnn_plugins" / "engines" / "miopen_plugin.dll",
+            install_prefix
+            / "bin"
+            / "hipdnn_plugins"
+            / "engines"
+            / "hipblaslt_plugin.dll",
+        ]
+        if include_hip_kernel:
+            files.append(
+                install_prefix
+                / "bin"
+                / "hipdnn_plugins"
+                / "engines"
+                / "hip_kernel_provider.dll"
+            )
+    else:
+        files = [
+            install_prefix / "lib" / "libhipdnn_backend.so",
+            install_prefix
+            / "lib"
+            / "hipdnn_plugins"
+            / "engines"
+            / "libmiopen_plugin.so",
+            install_prefix
+            / "lib"
+            / "hipdnn_plugins"
+            / "engines"
+            / "libhipblaslt_plugin.so",
+        ]
+        if include_hip_kernel:
+            files.append(
+                install_prefix
+                / "lib"
+                / "hipdnn_plugins"
+                / "engines"
+                / "libhip_kernel_provider.so"
+            )
+    for path in files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+
+def test_hybrid_mode_linux_builds_only_hip_kernel_provider(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(setup_env, install_prefix, toolchain_prefix)
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup_env, "ROCM_LIBRARIES_DIR", tmp_path / "rl")
+    monkeypatch.setattr(setup_env, "require_working_cmake", lambda: "cmake")
+    monkeypatch.setattr(setup_env.shutil, "which", lambda name: name)
+    commands = []
+    monkeypatch.setattr(
+        setup_env, "run", lambda cmd, **kwargs: commands.append(list(cmd))
+    )
+
+    setup = _setup(setup_env, tmp_path)
+    monkeypatch.setattr(setup, "_build_env", lambda: {})
+    setup.build_superbuild(str(install_prefix), str(toolchain_prefix))
+
+    assert commands[0][1:3] == [
+        "-S",
+        str(tmp_path / "rl" / "dnn-providers" / "hip-kernel-provider"),
+    ]
+    assert "--preset" not in commands[0]
+    assert len(commands) == 3  # configure, build, install
+
+
+def test_hybrid_mode_windows_skips_superbuild_when_all_plugins_prebuilt(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(setup_env, install_prefix, toolchain_prefix, windows=True)
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", True)
+    commands = []
+    monkeypatch.setattr(
+        setup_env, "run", lambda cmd, **kwargs: commands.append(list(cmd))
+    )
+
+    setup = _setup(setup_env, tmp_path)
+    setup.build_superbuild(str(install_prefix), str(toolchain_prefix))
+
+    assert commands == []
+
+
+@pytest.mark.parametrize(
+    "extra_argv, include_hip_kernel",
+    [
+        ((), False),
+        (("--cmake-arg", "ENABLE_ASM_SDPA_ENGINE=OFF"), True),
+    ],
+)
+def test_hybrid_mode_windows_builds_hip_kernel_provider_when_needed(
+    setup_env, tmp_path, monkeypatch, extra_argv, include_hip_kernel
+) -> None:
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(
+        setup_env,
+        install_prefix,
+        toolchain_prefix,
+        windows=True,
+        include_hip_kernel=include_hip_kernel,
+    )
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", True)
+    setup = _setup(setup_env, tmp_path, *extra_argv)
+
+    assert setup.select_superbuild_components(
+        str(install_prefix), str(toolchain_prefix)
+    ) == ("hip-kernel-provider",)
+
+
+@pytest.mark.parametrize(
+    "extra_argv",
+    [
+        ("--build-from-source",),
+        ("--rocm-libraries-ref", "a" * 40),
+    ],
+)
+def test_explicit_source_flags_force_full_superbuild(
+    setup_env, tmp_path, monkeypatch, extra_argv
+) -> None:
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(setup_env, install_prefix, toolchain_prefix)
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", False)
+    setup = _setup(setup_env, tmp_path, *extra_argv)
+
+    assert (
+        setup.select_superbuild_components(str(install_prefix), str(toolchain_prefix))
+        == setup_env.SUPERBUILD_ALL_COMPONENTS
+    )
+
+
+def test_local_rocm_libraries_divergence_forces_full_superbuild(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(setup_env, install_prefix, toolchain_prefix)
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", False)
+    setup = _setup(setup_env, tmp_path)
+    setup._rocm_libraries_matches_pin = False
+
+    assert (
+        setup.select_superbuild_components(str(install_prefix), str(toolchain_prefix))
+        == setup_env.SUPERBUILD_ALL_COMPONENTS
+    )
+
+
+def test_missing_prebuilt_plugin_falls_back_to_full_superbuild(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(setup_env, install_prefix, toolchain_prefix)
+    (
+        install_prefix / "lib" / "hipdnn_plugins" / "engines" / "libmiopen_plugin.so"
+    ).unlink()
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", False)
+    setup = _setup(setup_env, tmp_path)
+
+    assert (
+        setup.select_superbuild_components(str(install_prefix), str(toolchain_prefix))
+        == setup_env.SUPERBUILD_ALL_COMPONENTS
+    )
+
+
+def test_build_from_source_and_reuse_artifacts_rejected(setup_env, tmp_path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        setup_env.main(
+            [
+                "--workspace",
+                str(tmp_path / "ws"),
+                "--build-from-source",
+                "--reuse-artifacts",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_reuse_artifacts_accepts_hipdnn_configs_in_toolchain_prefix(
+    setup_env, tmp_path, monkeypatch
+) -> None:
+    """Hybrid mode leaves CMake configs in rocm-sdk-devel (toolchain_prefix)."""
+    install_prefix = tmp_path / "libs"
+    toolchain_prefix = tmp_path / "devel"
+    _populate_prebuilt_hipdnn(setup_env, install_prefix, toolchain_prefix)
+    monkeypatch.setattr(setup_env, "IS_WINDOWS", False)
+    setup = _setup(setup_env, tmp_path, "--reuse-artifacts")
+    monkeypatch.setattr(setup, "select_binding_prefix", lambda: str(install_prefix))
+    setup.__dict__["toolchain_prefix"] = str(toolchain_prefix)
+    monkeypatch.setattr(setup, "write_activate_local", lambda *a, **kw: None)
+
+    setup.build_hipdnn()
+
+    assert setup.install_prefix == str(install_prefix)
+    assert setup.plugin_engines_dir == (
+        install_prefix / "lib" / "hipdnn_plugins" / "engines"
+    )

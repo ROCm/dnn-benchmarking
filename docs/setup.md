@@ -34,9 +34,13 @@ stages are:
    `--reuse-artifacts`.
 6. `Provider descriptor artifacts`: `dvc pull` the DVC-tracked
    kernel-ingestor descriptors. Skipped with `--reuse-artifacts`.
-7. `hipDNN and provider plugins`: build hipDNN and the MIOpen, hipBLASLt and
-   hip-kernel providers, and install them into the ROCm SDK prefix. With
-   `--reuse-artifacts`, only check that hipDNN is in the prefix.
+7. `hipDNN and provider plugins`: reuse prebuilt hipDNN, MIOpen and hipBLASLt
+   binaries from the ROCm SDK prefix when present and matched to the pinned
+   `rocm-libraries` commit, building only `hip-kernel-provider` (for rocKE and
+   the kernel ingestor on Linux; skipped on Windows when all plugins are
+   prebuilt). Pass `--build-from-source` (or `--rocm-libraries-ref`) to build
+   hipDNN and every provider from source. With `--reuse-artifacts`, only check
+   that hipDNN CMake configs exist in the prefix or toolchain.
 8. `hipDNN Python bindings`: build `hipdnn_frontend` against that prefix.
    With `--reuse-artifacts`, build nothing and instead check that the venv
    has the `hipdnn_frontend` package, without importing it (its native
@@ -74,6 +78,7 @@ The setup prints the prefix as `Using hipDNN/ROCm prefix: ...`.
 | `--gpu-arch GPU_ARCH` | GPU architecture for the ROCm PyTorch nightly and the build. See [GPU architecture](#gpu-architecture). |
 | `--rocm-prefix ROCM_PREFIX` | ROCm and hipDNN prefix for the binding and provider builds. This prefix has priority over the venv ROCm SDK. |
 | `--reuse-artifacts` | Reuse an installed hipDNN prefix and `hipdnn_frontend` package without building them. `rocm`, `cpu` and `none` need a pre-existing venv with matching PyTorch (`none`: no torch) and reject `--clean` before workspace changes. `existing` keeps the installed torch. CUDA-only setup needs no hipDNN bindings. |
+| `--build-from-source` | Build hipDNN and all provider plugins (MIOpen, hipBLASLt and hip-kernel) from source instead of reusing prebuilt hipDNN, MIOpen and hipBLASLt binaries from the ROCm SDK prefix. Implied by `--rocm-libraries-ref`. |
 | `--no-aiter` | Skip the `AITER` stage. Only `--runtime aiter` needs it. |
 | `--clean` | Delete and create again the venv, and delete the hipDNN, provider and binding build directories. Not allowed with `--torch-mode existing`. |
 | `--rocm-libraries-ref SHA` | Full 40-character `rocm-libraries` commit to fetch when `rocm-libraries/` is absent. Default: matched to `--rocm-version` (`latest` or explicit), else `rocm_libraries_commit` from `rocm-pin.json`. Abbreviated SHAs and branch names are rejected. |
