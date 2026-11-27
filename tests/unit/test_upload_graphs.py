@@ -6,7 +6,9 @@ import runpy
 from io import BytesIO
 from pathlib import Path
 
-import boto3
+import pytest
+
+boto3 = pytest.importorskip("boto3")
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
